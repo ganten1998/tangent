@@ -4798,6 +4798,10 @@ impl Arrangement {
                         f.u64(u64::from(bay));
                         f.u64(u64::from(id));
                     }
+                    crate::automation::AutoParam::SendTo { to } => {
+                        f.u64(5);
+                        f.u64(u64::from(to.0));
+                    }
                 }
                 // The tenant under the writer's own condition: written only
                 // when there is one, so a tag word says which.

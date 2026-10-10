@@ -529,12 +529,33 @@ fn counted_in(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arr
         .iter()
         .enumerate()
         .filter(|(n, r)| {
-            matches!(r.kind, Some(crate::desk_model::RowKind::Midi | crate::desk_model::RowKind::Audio))
-                || r.added
-                || r.folder
-                || arr.clips.iter().any(|c| c.lane == *n)
+            // A bus first, whatever else it carries: never counted.
+            r.kind != Some(crate::desk_model::RowKind::Bus)
+                && (matches!(r.kind, Some(crate::desk_model::RowKind::Midi | crate::desk_model::RowKind::Audio))
+                    || r.added
+                    || r.folder
+                    || arr.clips.iter().any(|c| c.lane == *n))
         })
         .count()
+}
+
+/// **How far a desk is from every bus being a bus** (design 9), for the
+/// undo sentinel: the clips standing on bus rows, the bus rows with an input
+/// or an arm, and the sends aimed at a track that is no bus.
+#[cfg(test)]
+fn bus_faults(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arrangement) -> usize {
+    let bus = |r: &crate::desk_model::TrackRow| r.kind == Some(crate::desk_model::RowKind::Bus);
+    let buses: std::collections::BTreeSet<crate::desk_id::TrackId> =
+        desk.rows.iter().filter(|r| bus(r)).map(|r| r.id).collect();
+    let clips = arr.clips.iter().filter(|c| desk.rows.get(c.lane).is_some_and(|r| bus(r))).count();
+    let switched = desk.rows.iter().filter(|r| bus(r) && (!r.input.is_empty() || r.arm)).count();
+    let stray = desk
+        .rows
+        .iter()
+        .flat_map(|r| &r.sends)
+        .filter(|x| x.to.track().is_some_and(|t| !buses.contains(&t)))
+        .count();
+    clips + switched + stray
 }
 
 /// **What a gesture changes about the desk's shape**, for the line
@@ -3382,6 +3403,14 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
 /// (`TangentApp::track_id_at`). The counter never mints it (`mint_id`).
 const NO_TRACK: crate::desk_id::TrackId = crate::desk_id::TrackId(u32::MAX);
 
+/// What a bus says when somebody tries to give it an input or record on it
+/// (design 9: what reaches a bus is what the desk routes and sends there).
+const BUS_TAKES_NO_INPUT: &str =
+    "A bus takes no input. Route or send tracks to it; to record, use a track.";
+
+/// What a bus says when a clip is aimed at it.
+const BUS_HOLDS_NO_CLIPS: &str = "A bus holds no clips. Put them on a track, and route or send it to the bus.";
+
 /// **The rows' ids of the document at `doc`**, lane by lane, as many as it
 /// has: what its kit sidecar's `track_kits` keys name. The identity desk
 /// when the document has no desk this build reads (missing, damaged,
@@ -6124,7 +6153,9 @@ impl TangentApp {
                     .map_or(0.0, |(_, r)| r.gain),
                 _ => 0.0,
             },
-            H::Routing(_) => 0.0,
+            H::Routing(_) | H::SendAdd(_) | H::SendMore(_) => 0.0,
+            // A send's own level, by its place in THIS strip's list.
+            H::SendLevel(i, k) => self.strip_bus_send_at(i, k).map_or(0.0, |(_, x)| x.level as f32),
             H::Pan(i) => view.strips.get(i).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
             H::Mono(_) | H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::ToTheory(_)
             | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
@@ -6192,6 +6223,15 @@ impl TangentApp {
                     _ => {}
                 }
                 self.save_settings();
+            }
+            // **A send row goes home to unity**, the level a send is made at
+            // and the one the routing window's sliders double-click to. Not
+            // to dry: dry is taking the send away, which is its own gesture.
+            H::SendLevel(i, k) => {
+                if let Some((sr, x)) = self.strip_bus_send_at(i, k) {
+                    self.write_strip_send(sr, x.to, x.pre, 1.0);
+                    self.save_settings();
+                }
             }
             _ => {}
         }
@@ -6468,7 +6508,7 @@ impl TangentApp {
             // `value` this call carries means nothing to it.
             H::Routing(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
-                    self.dialog = Some(self.routing_dialog(n, None));
+                    self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Main));
                 }
                 return;
             }
@@ -6484,6 +6524,30 @@ impl TangentApp {
                         // gain is dragged: debounced, like the faders.
                         self.save_settings_soon();
                     }
+                }
+                return;
+            }
+            // **A send row's level**, by its place in this strip's list of
+            // sends to buses, written through the send's one writer. Its
+            // moment is the drag's release, as a fader's is; a curve on it
+            // with nothing but its base follows (`auto_sync_base`, below)
+            // once a send's curve is played (`AutoParam::plays`).
+            H::SendLevel(i, k) => {
+                if let Some((sr, x)) = self.strip_bus_send_at(i, k) {
+                    self.write_strip_send(sr, x.to, x.pre, f64::from(v));
+                }
+            }
+            // **Doors**: the plus opens the routing window on its list of
+            // buses and returns, the +N chip on everything the strip sends.
+            H::SendAdd(i) => {
+                if let Some(Strip::Channel(n)) = i.strip() {
+                    self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Send));
+                }
+                return;
+            }
+            H::SendMore(i) => {
+                if let Some(Strip::Channel(n)) = i.strip() {
+                    self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Main));
                 }
                 return;
             }
@@ -6573,6 +6637,12 @@ impl TangentApp {
                     // icon opens the input menu that answers what feeds it.
                     // The trailing add, past the last row: Add.
                     Some(Strip::Channel(n)) if n >= self.desk_extent() => self.press_trailing_add(),
+                    // **A bus's badge opens its routing window**: it has no
+                    // input to choose, and where it goes and what it sends
+                    // are the questions a bus's own strip answers.
+                    Some(Strip::Channel(n)) if self.is_bus(n) => {
+                        self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Main));
+                    }
                     Some(Strip::Channel(n)) => {
                         if self.channel_used(n) {
                             self.open_input_menu(n);
@@ -6806,6 +6876,7 @@ impl TangentApp {
     /// The master's fader is the one that is not a channel: it is the last
     /// COLUMN, and its row is one past the channels.
     fn auto_row_of_hit(
+        &self,
         hit: crate::mixer_panel::Hit,
     ) -> Option<(AutoLane, crate::automation::AutoParam)> {
         use crate::automation::AutoParam;
@@ -6824,9 +6895,19 @@ impl TangentApp {
             H::Pan(i) => (channel_of(i)?, AutoParam::Pan),
             H::Send(i) => (channel_of(i)?, AutoParam::Send),
             H::Mute(i) => (channel_of(i)?, AutoParam::Mute),
+            // A post-fader send to a bus has a curve of its own; a pre-fader
+            // one is a cue feed and has none (`AutoParam::SendTo`).
+            H::SendLevel(i, k) => {
+                let (_, x) = self.strip_bus_send_at(i, k).filter(|(_, x)| !x.pre)?;
+                (channel_of(i)?, AutoParam::SendTo { to: x.to.track()? })
+            }
             _ => return None,
         };
-        Some(row)
+        // **A control whose curve nothing plays stands on no row**
+        // (`AutoParam::plays`): moving it writes no point
+        // (`record_automation_move`) and drags no base (`auto_sync_base`),
+        // since a curve made either way would move nothing anybody hears.
+        Some(row).filter(|(_, p)| p.plays())
     }
 
     /// **Moving a control moves the base node of a lane that has only one.**
@@ -6847,7 +6928,7 @@ impl TangentApp {
     /// shape, the curve is *meant* to overrule the hand, and dragging its
     /// first node from a fader would silently flatten an evening's work.
     fn auto_sync_base(&mut self, hit: crate::mixer_panel::Hit) {
-        let Some((lane, param)) = Self::auto_row_of_hit(hit) else {
+        let Some((lane, param)) = self.auto_row_of_hit(hit) else {
             return;
         };
         let lone = self
@@ -7606,6 +7687,21 @@ impl TangentApp {
                     Strip::Channel(n) => self.is_armed(n),
                     _ => false,
                 },
+                // **The strip's sends to buses**, each by its bus's name as
+                // the desk names it now: a bus renamed or moved is read
+                // fresh, since a send names its bus by identity.
+                sends: match s {
+                    Strip::Channel(_) if !empty => self
+                        .strip_bus_sends(sr)
+                        .into_iter()
+                        .map(|x| crate::mixer_panel::SendRow {
+                            label: self.node_label(x.to),
+                            level: x.level as f32,
+                            pre: x.pre,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
             }
         };
         let master = StripRef::Master;
@@ -7707,6 +7803,8 @@ impl TangentApp {
                         self.strip_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
                     }),
                     plus: crate::mixer_panel::Plus::Row,
+                    // Nothing past the master to send to.
+                    sends: Vec::new(),
                 },
             },
             any_solo: self.any_solo(),
@@ -9762,7 +9860,11 @@ impl TangentApp {
     fn set_armed_rows(&mut self, rows: &[usize]) {
         let mut moved = false;
         for (n, row) in self.settings.rows.iter_mut().enumerate() {
-            let on = rows.contains(&n);
+            // **A bus is never armed**: it has no input to record and hears
+            // no MIDI (design 9), so every road that arms a set of rows (a
+            // press spread across a selection, alt's exclusive arm) leaves
+            // it out here, at the one writer.
+            let on = rows.contains(&n) && row.kind != Some(crate::desk_model::RowKind::Bus);
             moved |= row.arm != on;
             row.arm = on;
         }
@@ -10110,6 +10212,10 @@ impl TangentApp {
         lane: usize,
         start_s: f64,
     ) -> Result<(), String> {
+        // **A drop on a BUS makes a new track** (design 9): a bus holds no
+        // clips, so the file lands where a drop below the last lane would,
+        // on a new row at the end, asking the creation gate for it.
+        let lane = if self.is_bus(lane) { self.desk_extent() } else { lane };
         // A MIDI lane cannot take audio — the one refusal, in the one
         // place, whichever gesture asked.
         if self.channel_kind(lane) == Some(recorder::ChannelKind::Midi) {
@@ -10169,6 +10275,8 @@ impl TangentApp {
     ) -> Result<(), String> {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
+        // A .mid dropped on a bus makes a new track, as audio does.
+        let lane = if self.is_bus(lane) { self.desk_extent() } else { lane };
         // The same gate as the audio import, first: a .mid on a bare lane,
         // or below the last row, makes a MIDI track.
         let grows = lane >= self.desk_extent();
@@ -11597,7 +11705,10 @@ impl TangentApp {
                     (None, false) => "NO ROOM".to_owned(),
                 }
             }
-            None => String::new(),
+            // **A bus has no input to name**: what reaches it is the desk's
+            // routes and sends, and its strip draws a readout in this band
+            // rather than a chip (`mixer_panel`'s bus chip).
+            Some(recorder::ChannelKind::Bus) | None => String::new(),
         }
     }
 
@@ -11624,7 +11735,8 @@ impl TangentApp {
                     (None, false) => "IN !".to_owned(),
                 }
             }
-            None => String::new(),
+            // No input on a bus, in the short form as in the long.
+            Some(recorder::ChannelKind::Bus) | None => String::new(),
         }
     }
 
@@ -11648,6 +11760,11 @@ impl TangentApp {
     /// second path that wrote the string directly would be a second set of
     /// those rules.
     pub fn set_channel_midi_sel(&mut self, ch: usize, sel: recorder::MidiInputSel) {
+        // **A bus hears no MIDI** (design 9): nothing is written.
+        if self.is_bus(ch) {
+            self.notify(crate::notify::Kind::Info, BUS_TAKES_NO_INPUT);
+            return;
+        }
         // An input binding: it waits out a record or an export with the
         // line (`desk_shape_held_for`), before anything is written.
         if self.row(ch).is_some_and(|r| r.midi != sel) && self.desk_shape_held_for(ShapeChange::Input) {
@@ -11681,6 +11798,17 @@ impl TangentApp {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
         if ch >= self.desk_extent() {
+            return false;
+        }
+        // **A bus takes no input** (design 9): what reaches it is what the
+        // desk routes and sends there. The input IS the kind on this desk,
+        // so a binding here would quietly turn the bus into a track, and
+        // that is a gesture of its own (`set_channel_kind`, which asks the
+        // creation gate). Refused with the line, changing nothing.
+        if self.is_bus(ch) {
+            if !spec.is_empty() {
+                self.notify(crate::notify::Kind::Info, BUS_TAKES_NO_INPUT);
+            }
             return false;
         }
         // **An input binding, which is also the kind**: under a record or an
@@ -11797,11 +11925,14 @@ impl TangentApp {
 
     /// Whether a freeze would render anything: a used channel that is not a
     /// folder, not already frozen, and carries a clip or a loaded bay.
-    /// A folder is its children's fold and freezes with them, not alone.
+    /// A folder is its children's fold and freezes with them, not alone, and
+    /// a BUS is never frozen (design 9): what its rack runs over is what
+    /// other strips send it, live, which a render of its own row cannot hold.
     pub fn can_freeze(&self, lane: usize) -> bool {
         lane < self.desk_extent()
             && self.channel_used(lane)
             && !self.is_folder(lane)
+            && !self.is_bus(lane)
             && self.lane_frozen(lane).is_none()
             && (self.arrangement.clips.iter().any(|c| c.lane == lane)
                 || (0..recorder::INSERTS).any(|b| self.row_plugin(lane, b).is_some()))
@@ -12420,6 +12551,11 @@ impl TangentApp {
         if t1 - t0 < min_len {
             return;
         }
+        // **A bus holds no clips** (design 9), drawn ones included.
+        if self.is_bus(lane) {
+            self.notify(crate::notify::Kind::Info, BUS_HOLDS_NO_CLIPS);
+            return;
+        }
         if !self.row_counted(lane) && !self.admit_tracks(1) {
             return;
         }
@@ -12610,9 +12746,11 @@ impl TangentApp {
         if !self.admit_tracks(1) {
             return;
         }
+        // (A bus is no track and never counted, but it is no empty row
+        // either: Add with one selected makes a track beside it.)
         if let Some(sel) = self
             .selected_row()
-            .filter(|n| *n < self.desk_extent() && !self.row_counted(*n) && self.in_folder(*n))
+            .filter(|n| *n < self.desk_extent() && !self.row_counted(*n) && !self.is_bus(*n) && self.in_folder(*n))
         {
             if self.add_bare_track(sel) {
                 self.select_alone(sel);
@@ -12673,8 +12811,8 @@ impl TangentApp {
         if !self.track_on_clipboard() || n >= self.desk_extent() {
             return false;
         }
-        // The same gate `insert_track_below` asks.
-        if !self.admit_tracks(1) {
+        // The same gate `insert_track_below` asks, for what the paste makes.
+        if !self.admit_tracks(self.pasted_tracks()) {
             return false;
         }
         // **The desk's shape hold, before the moment and before a row is
@@ -12723,7 +12861,10 @@ impl TangentApp {
     fn add_bare_track(&mut self, n: usize) -> bool {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if n >= self.desk_extent() {
+        // **A bus is not an empty row**: it is never counted, so it would
+        // read as one here, and a bare track made "on" it would be a bus
+        // with a fresh identity and an added flag, and no track.
+        if n >= self.desk_extent() || self.is_bus(n) {
             return false;
         }
         let fresh = !self.row_counted(n);
@@ -12826,6 +12967,16 @@ impl TangentApp {
         self.track_clipboard.is_some()
     }
 
+    /// **How many counted tracks a paste of the clipboard makes**: one, or
+    /// none for a copied bus, which pastes as a new bus on every tier.
+    fn pasted_tracks(&self) -> usize {
+        usize::from(
+            self.track_clipboard
+                .as_ref()
+                .is_some_and(|c| c.kind != Some(recorder::ChannelKind::Bus)),
+        )
+    }
+
     /// **Hold this bay's effect for a later paste.**
     ///
     /// A REFERENCE — the bay it is sitting in, by identity — and not the
@@ -12925,8 +13076,9 @@ impl TangentApp {
             return;
         };
         // Always a new track (the refusals above leave only empty rows), so
-        // always asked, and before the moment's hold below.
-        if !self.admit_tracks(1) {
+        // always asked, and before the moment's hold below. A copied BUS is
+        // a new bus, which no tier counts.
+        if !self.admit_tracks(self.pasted_tracks()) {
             return;
         }
         // **The desk's shape hold, before anything is written**: the copy's
@@ -12957,7 +13109,8 @@ impl TangentApp {
         // `set_channel_kind`, which then finds the row counted.
         self.mint_row_id(into);
         if let Some(row) = self.row_mut(into) {
-            row.added = true;
+            // A bus is a strip by its kind, never an added track.
+            row.added = copy.kind != Some(recorder::ChannelKind::Bus);
         }
         self.set_channel_kind(into, copy.kind);
         if let Some(name) = self.row_mut(at).map(|r| &mut r.name) {
@@ -13208,6 +13361,37 @@ impl TangentApp {
             if let crate::routing::Target::Node(n) = &mut r.target {
                 *n = rekey.node(*n);
             }
+        }
+        // **The sends into it, and the curves that draw them**, from every
+        // strip: a row can be a send's destination before it is a track (a
+        // Placeholder), and a send left naming the old id would name nobody.
+        for r in &mut s.rows {
+            for snd in &mut r.sends {
+                snd.to = rekey.node(snd.to);
+            }
+        }
+        for special in Node::SPECIALS {
+            if let Some(sp) = s.specials.get_mut(special) {
+                for snd in &mut sp.sends {
+                    snd.to = rekey.node(snd.to);
+                }
+            }
+        }
+        if self.arrangement.automation.curves().iter().any(|c| c.param.send_to() == Some(from)) {
+            let curves = self
+                .arrangement
+                .automation
+                .curves()
+                .iter()
+                .cloned()
+                .map(|mut c| {
+                    if c.param.send_to() == Some(from) {
+                        c.param = crate::automation::AutoParam::SendTo { to };
+                    }
+                    c
+                })
+                .collect();
+            self.arrangement.automation = crate::automation::Automation::from_curves(curves);
         }
         self.retarget_bay_aims(&rekey);
     }
@@ -14425,7 +14609,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for curve in self.arrangement.automation.curves() {
             // Only a lone base, and only the controls this desk owns. A
             // plugin's parameter lives in the plugin and is not ours to set.
-            if curve.points().len() != 1 || matches!(curve.param, AutoParam::Plugin { .. }) {
+            // And only a curve that is played (`AutoParam::plays`): the node
+            // wins because the node is what is heard, and where nothing
+            // plays the curve it is the control that is heard.
+            if curve.points().len() != 1 || matches!(curve.param, AutoParam::Plugin { .. }) || !curve.param.plays() {
                 continue;
             }
             let Some(v) = curve.points().first().map(|p| p.value) else {
@@ -14772,6 +14959,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .map(|st| st.label.as_str())
                 .filter(|l| !l.is_empty())
                 .unwrap_or("AUDIO"),
+            // A bus is named when it is made ("Bus 2", "Return 1"); one
+            // whose name was typed away reads as what it is.
+            Some(recorder::ChannelKind::Bus) => "BUS",
             None => {
                 if self.lane_has_clips(n) {
                     "AUDIO"
@@ -15440,13 +15630,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let lane_to = (lane0 as i64 + lane_d)
                     .clamp(0, self.desk_extent() as i64 - 1)
                     as usize;
-                let lane_ok = match kind {
-                    Some(crate::arrangement::ClipKind::Midi) => true,
-                    Some(crate::arrangement::ClipKind::Audio) => {
-                        self.channel_kind(lane_to) != Some(recorder::ChannelKind::Midi)
-                    }
-                    None => false,
-                };
+                // Never onto a bus, which holds no clips (design 9): the
+                // clip keeps its own lane and moves in time alone.
+                let lane_ok = !self.is_bus(lane_to)
+                    && match kind {
+                        Some(crate::arrangement::ClipKind::Midi) => true,
+                        Some(crate::arrangement::ClipKind::Audio) => {
+                            self.channel_kind(lane_to) != Some(recorder::ChannelKind::Midi)
+                        }
+                        None => false,
+                    };
                 if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == cid) {
                     let ns = (start + dt_all).max(0.0);
                     if (c.start_s - ns).abs() > 1e-9 {
@@ -15468,7 +15661,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The lane rules mirror the imports': MIDI never lands on an AUDIO
         // channel, audio never on a MIDI one, and an unused lane takes
         // either — it becomes a clip lane, as a drop would make it.
-        let retarget = lane_at.filter(|l| *l < self.desk_extent()).filter(|l| {
+        let retarget = lane_at.filter(|l| *l < self.desk_extent() && !self.is_bus(*l)).filter(|l| {
             let kind = self.channel_kind(*l);
             match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.kind) {
                 // A MIDI clip goes ANYWHERE — on an audio channel it just
@@ -15598,6 +15791,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .collect();
         let rank = |p: &AutoParam| match p {
             AutoParam::Plugin { bay, id } => (1u8, u32::from(*bay), *id),
+            // After the desk's four and before the plugins, by bus: the
+            // order the menu offers them in.
+            AutoParam::SendTo { to } => (0, AutoParam::ALL.len() as u32, to.0),
             other => (
                 0,
                 AutoParam::ALL.iter().position(|q| q == other).unwrap_or(0) as u32,
@@ -15627,6 +15823,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         if !self.arr_auto_open.remove(&row) {
+            // **No row opens for a curve nothing plays** (`AutoParam::plays`).
+            // The A menu offers none; this is the belt to its brace, so a key
+            // from anywhere else cannot open a row to draw, arm or dial a
+            // curve that moves nothing.
+            if !param.plays() {
+                return;
+            }
             self.arr_auto_open.insert(row);
             self.arr_seed_first_node(lane, param);
         }
@@ -16438,6 +16641,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .collect(),
         };
         let mut groups = vec![desk];
+        // **A track's sends to buses, each with a curve of its own**
+        // (`AutoParam::SendTo`), named by the bus: the post-fader ones, in
+        // the order the strip lists them. A pre-fader send is a cue feed set
+        // once, and has none. **Only curves the engine plays**
+        // (`AutoParam::plays`): until a send's is played the group is not
+        // offered, since a row drawn on would be a curve that moves nothing.
+        if let AutoLane::Row(row) = lane {
+            let rows: Vec<dialogs::AutoRow> = self
+                .strip_bus_sends(recorder::StripRef::Row(row))
+                .into_iter()
+                .filter(|x| !x.pre)
+                .filter_map(|x| Some(AutoParam::SendTo { to: x.to.track()? }))
+                .filter(|p| p.plays())
+                .map(|p| dialogs::AutoRow { key: p.key(), label: self.auto_param_label(lane, p), on: self.arr_auto_is_open(lane, p) })
+                .collect();
+            if !rows.is_empty() {
+                groups.push(dialogs::AutoGroup { name: "Sends".to_owned(), rows });
+            }
+        }
         // **The master has SIX bays, in two racks, and both are offered.**
         //
         // Its strip grew three more (`MASTER_EXTRA_SEAT`) and this menu only
@@ -17323,6 +17545,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 Some(Strip::Channel(n)) => (AutoLane::Row(n), AutoParam::Send, f64::from(v)),
                 _ => return,
             },
+            // A send row's level writes its send's curve, the post-fader
+            // ones that have one, once that curve is played
+            // (`auto_row_of_hit`).
+            H::SendLevel(..) => match self.auto_row_of_hit(hit) {
+                Some((lane, param)) => (lane, param, f64::from(v)),
+                None => return,
+            },
             // A mute is a press rather than a value, so it writes the state
             // it is about to BE — which is the opposite of what it reads.
             H::Mute(i) => match i.strip() {
@@ -18122,6 +18351,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     #[cfg(test)]
     fn cap_sentinel(&self, state: &Moment) {
         self.desk_sentinel();
+        // **And a bus stays a bus** (design 9), on every tier: no gesture
+        // ends with more clips, inputs or arms on buses, or more sends
+        // aimed at rows that are no bus, than the moment it stood on. Every
+        // road that could has its own refusal; this catches the road added
+        // later without one. Against the standing moment rather than zero,
+        // as the cap is: a desk read from a hand-edited file may hold such a
+        // thing, and the reader keeps what it is given.
+        if let Some(top) = self.history.get(self.hist_at) {
+            let (was, now) = (bus_faults(&top.desk, &top.arr), bus_faults(&state.desk, &state.arr));
+            assert!(now <= was, "a gesture left a bus with a clip, an input or an arm, or a send aimed at no bus: {was} -> {now}");
+        }
         let Some(cap) = self.track_cap() else {
             return;
         };
@@ -20473,6 +20713,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let lane_d = lane_d.max(-lo);
         let landing = |c: &crate::arrangement::ArrClip| (c.lane as i64 + lane_d).max(0) as usize;
         let width = self.desk_extent();
+        // **No clip lands on a bus** (design 9). The paste is a group, kept
+        // whole, so a group that would put one there is refused whole with
+        // the line rather than pasted with a hole in it.
+        if pasted.iter().map(landing).any(|lane| lane < width && self.is_bus(lane)) {
+            self.notify(crate::notify::Kind::Info, BUS_HOLDS_NO_CLIPS);
+            return;
+        }
         // **A clip landing on an empty row MAKES a track there** (a row with
         // clips counts), so a paste that lands on rows nobody is using, or on
         // rows past the end, asks the creation gate for each of them, whole,
@@ -27938,7 +28185,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     Some(A::HdrRouting(n)) => {
                         self.touch_track(n);
-                        self.dialog = Some(self.routing_dialog(n, None));
+                        self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Main));
                     }
                     Some(A::HdrBay(n, bay)) => {
                         // The mixer's own door, from here: picker when
@@ -30372,7 +30619,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Build the routing window for a channel, with the lists only the app
     /// can assemble: the device's jacks, the channels worth sending to, and
     /// what this channel already routes to.
-    fn routing_dialog(&self, channel: usize, picking: Option<bool>) -> Dialog {
+    fn routing_dialog(&self, channel: usize, page: dialogs::RoutingPage) -> Dialog {
         let hardware = crate::routing::hardware_targets(self.device_outs)
             .into_iter()
             .filter_map(|t| match t {
@@ -30395,23 +30642,62 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **Named as the desk names them** (`channel_display_name`, the
         // strip's and the header's one function), so the picker can lead
         // with the name: see `dialogs::picker_rows`.
-        let channels = (0..self.desk_extent())
+        //
+        // **The buses and returns first** (design 9): a route into a bus is
+        // what a bus is for, and a long desk's buses would otherwise sit
+        // under every track there is. Desk order inside each half.
+        let mut channels: Vec<(usize, String)> = (0..self.desk_extent())
             .filter(|n| *n != channel && self.channel_used(*n) && !self.is_folder(*n))
             .map(|n| (n, self.channel_display_name(n).to_owned()))
             .collect();
+        channels.sort_by_key(|(n, _)| !self.is_bus(*n));
+        // **Every row a new route or send from here would close a loop
+        // through**, from one walk of the desk (`Topology::upstream`):
+        // greyed in both lists, rather than offered and howling.
+        let me = self.row_node(channel);
+        let topo = self.desk_topology();
+        let upstream = topo.upstream(me);
+        let looped = (0..self.desk_extent()).filter(|n| upstream.contains(&self.row_node(*n))).collect();
+        // **A route in an old loop says so** (design 9: a legacy saved
+        // cycle opens and sounds the same, and is drawn as feedback): it is
+        // played one block late, as it always was, and it is named for what
+        // it is rather than quietly taken away.
         let existing = self
             .settings
             .routes
-            .from(self.row_node(channel))
+            .from(me)
             .into_iter()
-            .filter_map(|(at, r)| Some((at, self.route_dest(r.target)?, r.target.label(|n| self.node_label(n)), r.gain)))
+            .filter_map(|(at, r)| {
+                let mut label = r.target.label(|n| self.node_label(n));
+                if let crate::routing::Target::Node(to) = r.target {
+                    if topo.in_loop(me, to) {
+                        label.push_str(" (feedback)");
+                    }
+                }
+                Some((at, self.route_dest(r.target)?, label, r.gain))
+            })
+            .collect();
+        let sends = self
+            .strip_bus_sends(recorder::StripRef::Row(channel))
+            .into_iter()
+            .filter_map(|x| {
+                let row = self.row_of(x.to.track()?)?;
+                Some((row, self.node_label(x.to), x.level as f32, x.pre))
+            })
+            .collect();
+        let buses = (0..self.desk_extent())
+            .filter(|n| *n != channel && self.is_bus(*n))
+            .map(|n| (n, self.channel_display_name(n).to_owned()))
             .collect();
         Dialog::Routing {
             channel,
-            picking,
+            page,
             hardware,
             channels,
+            looped,
             existing,
+            sends,
+            buses,
             filter: String::new(),
         }
     }
@@ -30545,6 +30831,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 AutoParam::Pan => 0.5,
                 AutoParam::Send => 0.0,
                 AutoParam::Mute => 0.0,
+                // The master sends nowhere: its own curves name its own
+                // controls, and nothing past it takes a send.
+                AutoParam::SendTo { .. } => 0.0,
                 AutoParam::Plugin { id, .. } => self
                     .auto_param_sb(lane, param)
                     .and_then(|sb| self.bay_fx_params(sb))
@@ -30566,6 +30855,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             AutoParam::Pan => f64::from(self.channel_pan(lane) + 1.0) * 0.5,
             AutoParam::Send => {
                 f64::from(self.row(lane).map_or(0.0, |r| crate::desk_model::fx_send_level(&r.sends)) as f32)
+            }
+            // The row's post-fader send to that bus, and nothing when it has
+            // none: a curve drawn for a send that was taken away rests flat
+            // at the floor rather than at a level nobody can hear.
+            AutoParam::SendTo { to } => {
+                self.strip_send_to(recorder::StripRef::Row(lane), crate::desk_id::Node::Track(to), false).unwrap_or(0.0)
             }
             // A switch written as a curve: muted above half. It rests where
             // the switch is.
@@ -30626,6 +30921,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             AutoParam::Gain => self.apply_mixer_hit(M::Fader(col), v as f32),
             AutoParam::Pan => self.apply_mixer_hit(M::Pan(col), v as f32),
             AutoParam::Send => self.apply_mixer_hit(M::Send(col), v as f32),
+            // **The send to a bus, through the send's own writer**: the one
+            // road its level takes from the strip's rows, the routing window
+            // and the curve alike. A send the strip no longer has is not
+            // made again by a dial: taking it away was somebody's gesture.
+            AutoParam::SendTo { to } => {
+                let (s, bus) = (recorder::StripRef::Row(lane), crate::desk_id::Node::Track(to));
+                if self.strip_send_to(s, bus, false).is_none() {
+                    return;
+                }
+                self.write_strip_send(s, bus, false, v);
+            }
             // A switch written as a curve: above half is muted. Only acted on
             // when it would CHANGE, because `Mute` is a toggle and re-sending
             // it every frame of a drag would chatter.
@@ -30700,6 +31006,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         lane: AutoLane,
         param: crate::automation::AutoParam,
     ) -> String {
+        // A send names its bus as the desk names it now (a bus renamed or
+        // moved is read fresh), and "a removed track" once it has gone.
+        if let crate::automation::AutoParam::SendTo { to } = param {
+            return format!("send to {}", self.node_label(crate::desk_id::Node::Track(to)));
+        }
         let crate::automation::AutoParam::Plugin { id, .. } = param else {
             return param.label();
         };
@@ -33685,9 +33996,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **Does row `n` count against the cap?** MIDI, AUDIO, a bare added
     /// track, a folder, or any row with clips. A Placeholder (only the
     /// folder indent set: the indented plus) and a Vacant row do not, and
-    /// neither will a bus.
+    /// neither does a bus, whatever else it carries (design section 9: the
+    /// track count is the one lever, and a bus is no track).
     fn row_counted(&self, n: usize) -> bool {
-        self.channel_used(n) || self.is_folder(n)
+        !self.is_bus(n) && (self.channel_used(n) || self.is_folder(n))
     }
 
     /// How many tracks this desk holds, by `row_counted`. Folders count
@@ -34259,7 +34571,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             A::HdrRouting(n) => {
                 self.touch_track(n);
-                self.dialog = Some(self.routing_dialog(n, None));
+                self.dialog = Some(self.routing_dialog(n, dialogs::RoutingPage::Main));
             }
             A::HdrInput(n) => {
                 // The menu opens where the CHIP is, since there is no
@@ -34977,6 +35289,318 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.strip_send(s)
     }
 
+    // ── Buses, returns and sends (design section 9) ──────────────────────
+    //
+    // A BUS is a row of its own kind (`ChannelKind::Bus`): it takes routes
+    // and sends, runs its rack once over what arrives, and goes on to the
+    // master or wherever it is routed. A RETURN is a bus that is sent to;
+    // the two differ in their name and nothing else (`recorder::BusRole`).
+    // Neither is a track, so neither asks the creation gate, on any tier,
+    // and nothing here counts them: a free desk at thirty-two tracks makes
+    // its hundredth bus like its first.
+    //
+    // A SEND is a copy of a strip into a bus, kept on the strip beside the
+    // knob's own Fx entry (`TrackRow::sends`), any number of them, by the
+    // bus's identity so no reorder moves one. Every gesture on a send is one
+    // moment: made, moved (a drag commits at its release, `done`), switched
+    // to the other side of the fader, or taken away.
+
+    /// **Whether row `n` is a bus** (a return is one too).
+    pub fn is_bus(&self, n: usize) -> bool {
+        self.channel_kind(n) == Some(recorder::ChannelKind::Bus)
+    }
+
+    /// **Every send a strip makes**, the knob's own Fx entry among them, in
+    /// the order they were made. Empty for a strip that sends nowhere.
+    pub fn strip_sends(&self, s: recorder::StripRef) -> &[crate::desk_model::Send] {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.settings.specials.get(n).map_or(&[], |sp| sp.sends.as_slice()),
+            (None, Some(r)) => self.row(r).map_or(&[], |row| row.sends.as_slice()),
+            (None, None) => &[],
+        }
+    }
+
+    /// [`Self::strip_sends`]' writer.
+    fn strip_sends_mut(&mut self, s: recorder::StripRef) -> Option<&mut Vec<crate::desk_model::Send>> {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.settings.specials.get_mut(n).map(|sp| &mut sp.sends),
+            (None, Some(r)) => self.row_mut(r).map(|row| &mut row.sends),
+            (None, None) => None,
+        }
+    }
+
+    /// **A strip's sends to BUSES**, in the order they were made: every send
+    /// but the ones into the effects return, which its knob answers for.
+    /// What the strip's send rows draw and the routing window lists.
+    pub fn strip_bus_sends(&self, s: recorder::StripRef) -> Vec<crate::desk_model::Send> {
+        self.strip_sends(s).iter().filter(|x| x.to.track().is_some()).copied().collect()
+    }
+
+    /// **The k-th send to a bus of the strip in column `col`**, the one its
+    /// k-th send row draws: by place in the strip's own list, translated to
+    /// the send here, so the panel never holds a send of its own.
+    fn strip_bus_send_at(&self, col: recorder::Column, k: usize) -> Option<(recorder::StripRef, crate::desk_model::Send)> {
+        let sr = col.strip_ref();
+        self.strip_sends(sr).iter().filter(|x| x.to.track().is_some()).nth(k).map(|x| (sr, *x))
+    }
+
+    /// The level of a strip's send to `to` on one side of its fader, when
+    /// it has one.
+    pub fn strip_send_to(&self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool) -> Option<f64> {
+        crate::desk_model::send_of(self.strip_sends(s), to, pre).map(|x| x.level)
+    }
+
+    /// **One send's level, written**, 0..=1, debounced to the file: the one
+    /// writer a send's row, its window and its curve all end in. Takes no
+    /// moment, which the gesture owns, and makes no send: a send is made by
+    /// [`Self::add_send`] alone, so a dial or a curve cannot bring back one
+    /// somebody took away. Answers whether the level moved.
+    fn write_strip_send(&mut self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool, level: f64) -> bool {
+        if self.strip_send_to(s, to, pre).is_none() {
+            return false;
+        }
+        let Some(sends) = self.strip_sends_mut(s) else {
+            return false;
+        };
+        let moved = crate::desk_model::put_send(sends, to, pre, level.clamp(0.0, 1.0));
+        if moved {
+            self.save_settings_soon();
+        }
+        moved
+    }
+
+    /// **The desk's audio graph**, for the one question a picker asks of it
+    /// (`desk_topology::Topology::would_cycle`).
+    fn desk_topology(&self) -> crate::desk_topology::Topology {
+        crate::desk_topology::Topology::of_desk(&self.settings.rows, &self.settings.specials, &self.settings.routes)
+    }
+
+    /// **Why strip `s` may not send to row `to`**, or `None` when it may.
+    /// A send goes to a bus or a return and nowhere else (design 9: only a
+    /// bus row runs a rack over what is sent to it), never to its own
+    /// strip, and never round a loop (`desk_topology::would_cycle`): the
+    /// picker greys all three, and this is what the gesture asks again, so
+    /// a desk that changed under an open window cannot make one either.
+    fn send_refusal(&self, s: recorder::StripRef, to: usize) -> Option<&'static str> {
+        use recorder::StripRef;
+        if matches!(s, StripRef::Fx | StripRef::Click | StripRef::Master)
+            || s.row().is_some_and(|r| r >= self.desk_extent())
+        {
+            return Some("That strip has no sends.");
+        }
+        if !self.is_bus(to) {
+            return Some("A send goes to a bus or a return.");
+        }
+        let (from, bus) = (self.strip_node(s), self.row_node(to));
+        if from == bus {
+            return Some("A bus cannot send to itself.");
+        }
+        if self.desk_topology().would_cycle(from, bus) {
+            return Some("That send would feed the bus back into itself.");
+        }
+        None
+    }
+
+    /// **Send strip `s` to the bus on row `to`**: a new post-fader send at
+    /// unity, the level a route arrives at and for the route's reason (a
+    /// send that arrived silent would read as a send that does not work).
+    /// One moment.
+    ///
+    /// Refused with its line, changing nothing: anything
+    /// [`Self::send_refusal`] says, a send the strip already makes to that
+    /// bus (turn it up instead; a second would be two faders on one path),
+    /// and a running realtime export, which plays through every send as it
+    /// plays through every route (`ShapeChange::Route`).
+    pub fn add_send(&mut self, s: recorder::StripRef, to: usize) -> bool {
+        if let Some(line) = self.send_refusal(s, to) {
+            self.notify(crate::notify::Kind::Error, line);
+            return false;
+        }
+        let bus = self.row_node(to);
+        if self.strip_send_to(s, bus, false).is_some() || self.strip_send_to(s, bus, true).is_some() {
+            self.notify(crate::notify::Kind::Info, "That strip already sends there.");
+            return false;
+        }
+        if self.desk_shape_held_for(ShapeChange::Route) {
+            return false;
+        }
+        let Some(sends) = self.strip_sends_mut(s) else {
+            return false;
+        };
+        crate::desk_model::put_send(sends, bus, false, 1.0);
+        self.desk_index_dirty();
+        self.save_settings();
+        self.undo_commit();
+        true
+    }
+
+    /// **A send's level**, 0..=1, from the routing window: the one road a
+    /// send's own fader takes outside the strip's rows (`Hit::SendLevel`,
+    /// whose release commits). `done` is the end of the gesture: a drag
+    /// calls this once a pointer move and takes its one moment when the
+    /// hand lets go; a typed or one-step change is done at once.
+    pub fn set_send_level(&mut self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool, level: f64, done: bool) {
+        self.write_strip_send(s, to, pre, level);
+        if done {
+            self.save_settings();
+            self.undo_commit();
+        }
+    }
+
+    /// **Move a send to the other side of its fader**, keeping its level:
+    /// pre-fader is a cue feed the fader does not ride, post-fader the
+    /// default (owner call 10). `pre` is the side it is on now. One
+    /// moment. Refused, changing nothing, when the strip already sends to
+    /// that bus from the other side, which would make one send of two.
+    pub fn set_send_pre(&mut self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool) -> bool {
+        let Some(level) = self.strip_send_to(s, to, pre) else {
+            return false;
+        };
+        if self.strip_send_to(s, to, !pre).is_some() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "That strip already sends there from the other side of its fader.",
+            );
+            return false;
+        }
+        if self.desk_shape_held_for(ShapeChange::Route) {
+            return false;
+        }
+        let Some(sends) = self.strip_sends_mut(s) else {
+            return false;
+        };
+        // In place, so the bus still sums it where it always did.
+        if let Some(x) = sends.iter_mut().find(|x| x.to == to && x.pre == pre) {
+            x.pre = !pre;
+            x.level = level;
+        }
+        self.desk_index_dirty();
+        self.save_settings();
+        self.undo_commit();
+        true
+    }
+
+    /// **Take a send away.** One moment, and one undo brings it back at the
+    /// level it had. A curve that drew its level stays in the document, as
+    /// a plugin's does when its plugin leaves: it is somebody's work, it
+    /// moves nothing while there is no send (`auto_set_control`), and it is
+    /// the send's again if the send is made again.
+    pub fn remove_send(&mut self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool) -> bool {
+        if self.strip_send_to(s, to, pre).is_none() {
+            return false;
+        }
+        if self.desk_shape_held_for(ShapeChange::Route) {
+            return false;
+        }
+        let Some(sends) = self.strip_sends_mut(s) else {
+            return false;
+        };
+        crate::desk_model::take_send(sends, to, pre);
+        self.desk_index_dirty();
+        self.save_settings();
+        self.undo_commit();
+        true
+    }
+
+    /// **The name a new bus or return wears**: its role's word and the
+    /// lowest number no row of the desk is already called, so the third
+    /// return made after the first was removed is "Return 1" again rather
+    /// than "Return 3" beside a missing one.
+    fn next_bus_name(&self, role: recorder::BusRole) -> String {
+        let word = role.word();
+        (1usize..)
+            .map(|k| format!("{word} {k}"))
+            .find(|name| !self.settings.rows.iter().any(|r| r.name == *name))
+            .unwrap_or_else(|| word.to_owned())
+    }
+
+    /// **Make a bus or a return on row `at`**, which the caller opened: a
+    /// new strip, so a new identity; a bus kind, a name, dry (no knob send
+    /// into the effects return, the way every added track starts), no
+    /// input, no arm. Takes the caller's moment.
+    fn make_bus_on(&mut self, at: usize, role: recorder::BusRole) {
+        self.desk_index_dirty();
+        if !self.row_counted(at) && !self.is_bus(at) {
+            self.mint_row_id(at);
+        }
+        let name = self.next_bus_name(role);
+        if let Some(row) = self.row_mut(at) {
+            row.kind = Some(crate::desk_model::RowKind::Bus);
+            row.name = name;
+            row.input.clear();
+            row.midi = recorder::MidiInputSel::EVERYTHING;
+            row.arm = false;
+        }
+        self.settings.set_strip_send(recorder::StripRef::Row(at), 0.0);
+        self.undo_commit();
+    }
+
+    /// **A new bus, or a new return**, at the end of the desk, selected.
+    ///
+    /// Never asks the creation gate (a bus is no track, on any tier), and
+    /// never waits on a record or an export: it takes the row after the last
+    /// one drawn, which moves nobody (`open_trailing_row`). One moment.
+    /// Answers its row; `None` only when the id counter is spent.
+    pub fn new_bus(&mut self, role: recorder::BusRole) -> Option<usize> {
+        self.begin_one_moment();
+        let at = self.open_trailing_row();
+        if let Some(at) = at {
+            self.make_bus_on(at, role);
+            self.select_alone(at);
+        }
+        self.save_settings();
+        self.commit_undo_moment();
+        at
+    }
+
+    /// **A new return with strip `s` already sent to it**: the routing
+    /// window's New Return. One moment for both, so one undo takes the
+    /// return and the send together. Refused, making nothing, for a strip
+    /// with no sends and under a running export (which holds sends).
+    pub fn send_to_new_return(&mut self, s: recorder::StripRef) -> Option<usize> {
+        use recorder::StripRef;
+        if matches!(s, StripRef::Fx | StripRef::Click | StripRef::Master)
+            || s.row().is_some_and(|r| r >= self.desk_extent())
+        {
+            return None;
+        }
+        if self.desk_shape_held_for(ShapeChange::Route) {
+            return None;
+        }
+        self.begin_one_moment();
+        let at = self.open_trailing_row();
+        if let Some(at) = at {
+            self.make_bus_on(at, recorder::BusRole::Return);
+            let bus = self.row_node(at);
+            if let Some(sends) = self.strip_sends_mut(s) {
+                crate::desk_model::put_send(sends, bus, false, 1.0);
+            }
+        }
+        self.save_settings();
+        self.commit_undo_moment();
+        at
+    }
+
+    /// **A new bus with row `from` already routed into it**: the routing
+    /// window's New Bus. One moment for both. Refused, making nothing,
+    /// under a running export (which holds routes).
+    pub fn route_to_new_bus(&mut self, from: usize) -> Option<usize> {
+        if from >= self.desk_extent() || self.desk_shape_held_for(ShapeChange::Route) {
+            return None;
+        }
+        self.begin_one_moment();
+        let at = self.open_trailing_row();
+        if let Some(at) = at {
+            self.make_bus_on(at, recorder::BusRole::Bus);
+            let (src, bus) = (self.row_node(from), self.row_node(at));
+            self.settings.routes.add(crate::routing::Route::new(src, crate::routing::Target::Node(bus)));
+            self.refresh_route_labels();
+        }
+        self.save_settings();
+        self.commit_undo_moment();
+        at
+    }
+
     /// How often the click sounds — see `Settings::metronome_div`.
     pub fn metronome_div(&self) -> u32 {
         self.settings.metronome_div.clamp(0, 8) as u32
@@ -35300,9 +35924,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Set it, saving. The kind lives BESIDE the channel — fader, send,
     /// colour, name and bays all stay put when it cycles.
     ///
-    /// **A kind on an empty row makes a track**, so that one change asks the
-    /// creation gate; cycling, clearing or setting the kind of a row that is
-    /// already a track never does.
+    /// **A TRACK's kind on a row that is no track makes one**, so that one
+    /// change asks the creation gate: an empty row given MIDI or AUDIO, and
+    /// a BUS given either (design 5.3: a bus is never counted, so turning
+    /// one into a track spends a track). Cycling, clearing or setting the
+    /// kind of a row that is already a track never asks, and nor does
+    /// making a bus, on any tier.
+    ///
+    /// **A bus holds no clips and takes no input** (design 9), so a row with
+    /// clips on it is refused the bus kind with the line, and a row that
+    /// becomes a bus lets go of its input and its arm. A bus that becomes a
+    /// track keeps its identity (every route into it and every key and
+    /// curve naming it are still its own) and lets go of the sends into it,
+    /// which only a bus takes; one undo brings them back with the bus.
     pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
@@ -35311,16 +35945,46 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if n < self.desk_extent() && self.channel_kind(n) != kind && self.desk_shape_held_for(ShapeChange::Kind) {
             return;
         }
-        let fresh = kind.is_some() && n < self.desk_extent() && !self.row_counted(n);
+        let was_bus = self.is_bus(n);
+        let to_bus = kind == Some(recorder::ChannelKind::Bus);
+        if to_bus && !was_bus && self.lane_has_clips(n) {
+            self.notify(
+                crate::notify::Kind::Error,
+                "A bus holds no clips. Move them to a track first, or make a new bus.",
+            );
+            return;
+        }
+        let fresh =
+            kind.is_some_and(recorder::ChannelKind::is_track) && n < self.desk_extent() && !self.row_counted(n);
         if fresh && !self.admit_tracks(1) {
             return;
         }
-        // An empty row given a kind is a new track: a new id.
-        if fresh {
+        // A row that was no strip and becomes one (a track or a bus) is a
+        // new strip: a new id. A bus turned track, or a track turned bus,
+        // is the same strip and keeps its own.
+        if kind.is_some() && !was_bus && !self.row_counted(n) && n < self.desk_extent() {
             self.mint_row_id(n);
         }
         if let Some(row) = self.row_mut(n) {
             row.kind = kind.map(recorder::ChannelKind::row_kind);
+            if to_bus {
+                row.input.clear();
+                row.midi = recorder::MidiInputSel::EVERYTHING;
+                row.arm = false;
+            }
+        }
+        if was_bus && !to_bus && n < self.desk_extent() {
+            let gone = self.row_node(n);
+            for row in &mut self.settings.rows {
+                row.sends.retain(|x| x.to != gone);
+            }
+            for special in crate::desk_id::Node::SPECIALS {
+                if let Some(sp) = self.settings.specials.get_mut(special) {
+                    sp.sends.retain(|x| x.to != gone);
+                }
+            }
+        }
+        if n < self.desk_extent() {
             self.save_settings();
         }
     }
@@ -38635,10 +39299,51 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.save_settings();
             }
             DialogAction::OpenRouting(channel) => {
-                self.dialog = Some(self.routing_dialog(channel, None));
+                self.dialog = Some(self.routing_dialog(channel, dialogs::RoutingPage::Main));
             }
-            DialogAction::RoutingPick { channel, hardware } => {
-                self.dialog = Some(self.routing_dialog(channel, Some(hardware)));
+            DialogAction::RoutingPick { channel, page } => {
+                self.dialog = Some(self.routing_dialog(channel, page));
+            }
+            // **The sends**, each through its own gesture (one moment each),
+            // the window rebuilt after every one that changes the list: its
+            // rows are by row and index, and a stale one would act on the
+            // wrong send. A level is not rebuilt, for `SetRouteGain`'s
+            // reason: a drag that rebuilt the window under the hand would
+            // drop the grab every frame.
+            DialogAction::AddSend { from, to } => {
+                let _ = self.add_send(recorder::StripRef::Row(from), to);
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
+            }
+            DialogAction::SetSendLevel { from, to, pre, level, done } => {
+                let bus = self.row_node(to);
+                self.set_send_level(recorder::StripRef::Row(from), bus, pre, f64::from(level), done);
+                if let Some(Dialog::Routing { sends, .. }) = self.dialog.as_mut() {
+                    if let Some(row) = sends.iter_mut().find(|(at, _, _, p)| *at == to && *p == pre) {
+                        row.2 = level.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            DialogAction::FlipSendPre { from, to, pre } => {
+                let bus = self.row_node(to);
+                let _ = self.set_send_pre(recorder::StripRef::Row(from), bus, pre);
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
+            }
+            DialogAction::RemoveSend { from, to, pre } => {
+                let bus = self.row_node(to);
+                let _ = self.remove_send(recorder::StripRef::Row(from), bus, pre);
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
+            }
+            DialogAction::SendToNewReturn(from) => {
+                let _ = self.send_to_new_return(recorder::StripRef::Row(from));
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
+            }
+            DialogAction::RouteToNewBus(from) => {
+                let _ = self.route_to_new_bus(from);
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
+            }
+            DialogAction::NewBus(role) => {
+                self.dialog = None;
+                let _ = self.new_bus(role);
             }
             DialogAction::AddRoute { from, target } => {
                 // Not under a realtime export: see `routes_held`.
@@ -38648,10 +39353,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // `add` owns the no-duplicates rule; the picker greys what is
                 // taken, so a duplicate refusal means the desk changed under
                 // the open window rather than that the user did something
-                // wrong. A refusal at the CAP is different: the engine's
-                // table is full, and route sixty-five would be stored, drawn
-                // and never published — a fader that moves and does nothing —
-                // so that one is said out loud.
+                // wrong. There is no count to refuse at any more (design 9:
+                // routes are unlimited on every tier), so the full-table
+                // notice went with the cap.
                 // The window named rows, and it is modal: the tracks on them
                 // are the route's ends.
                 let target = match target {
@@ -38660,21 +39364,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     crate::routing::LaneTarget::Channel(row) => crate::routing::Target::Node(self.row_node(row)),
                 };
-                if self.settings.routes.add(crate::routing::Route::new(self.row_node(from), target)) {
+                let src = self.row_node(from);
+                // **No new loop** (`desk_topology::would_cycle`): the picker
+                // greys every strip that already feeds this one, and this is
+                // the gesture asking again, for a desk that changed under the
+                // open window. A loop a legacy file saved stays and plays.
+                let loops = match target {
+                    crate::routing::Target::Node(to) => self.desk_topology().would_cycle(src, to),
+                    crate::routing::Target::Hardware { .. } => false,
+                };
+                if loops {
+                    self.notify(crate::notify::Kind::Error, "That route would feed the channel back into itself.");
+                } else if self.settings.routes.add(crate::routing::Route::new(src, target)) {
                     self.refresh_route_labels();
                     self.save_settings();
-                } else if self.settings.routes.0.len() >= crate::routing::MAX_ROUTES {
-                    self.notify(
-                        crate::notify::Kind::Error,
-                        format!(
-                            "The routing table is full at {} routes. Remove one to add another.",
-                            crate::routing::MAX_ROUTES
-                        ),
-                    );
+                    // A press, so a moment.
+                    self.undo_commit();
                 }
-                // Back to the two kinds, so adding several routes in a row is
-                // one window rather than one window per route.
-                self.dialog = Some(self.routing_dialog(from, None));
+                // Back to the list, so adding several routes in a row is one
+                // window rather than one window per route.
+                self.dialog = Some(self.routing_dialog(from, dialogs::RoutingPage::Main));
             }
             DialogAction::InsertMedia(lane) => {
                 // The dialog stands down so the OS panel is not raised behind
@@ -38720,12 +39429,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.routes.remove(index);
                 self.refresh_route_labels();
                 self.save_settings();
+                // A press, so a moment.
+                self.undo_commit();
                 // Rebuilt rather than left standing: every row below the one
                 // that went now has a different index, and a stale window
                 // would remove the wrong route on the next click.
                 if let Some(ch) = channel {
                     if matches!(self.dialog, Some(Dialog::Routing { .. })) {
-                        self.dialog = Some(self.routing_dialog(ch, None));
+                        self.dialog = Some(self.routing_dialog(ch, dialogs::RoutingPage::Main));
                     }
                 }
             }
@@ -43124,6 +43835,9 @@ impl TangentApp {
                         // A door, not a fader: without this it fell through
                         // to the drag branch and a click did nothing at all.
                         | crate::mixer_panel::Hit::Routing(_)
+                        // The send rows' two doors, on the same footing.
+                        | crate::mixer_panel::Hit::SendAdd(_)
+                        | crate::mixer_panel::Hit::SendMore(_)
                         | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
@@ -78348,7 +79062,7 @@ mod folder_tests {
 
         // The picker offers the other used channels...
         let offered = |a: &TangentApp| -> Vec<usize> {
-            match a.routing_dialog(0, None) {
+            match a.routing_dialog(0, dialogs::RoutingPage::Main) {
                 Dialog::Routing { channels, .. } => {
                     channels.into_iter().map(|(n, _)| n).collect()
                 }
@@ -85534,3 +86248,10 @@ mod save_tests;
 #[cfg(test)]
 #[path = "app_width_tests.rs"]
 mod width_tests;
+
+/// **Buses, returns and sends** (W7-buses-ui): the workflow and its undo,
+/// what a bus refuses, the free tier's hundred buses, loops, and every
+/// route, send and key end through structural edits.
+#[cfg(test)]
+#[path = "app_bus_tests.rs"]
+mod bus_tests;

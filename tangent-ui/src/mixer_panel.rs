@@ -113,6 +113,21 @@ pub struct StripView<'a> {
     /// **What an empty strip's plus is**: an empty row's, or the desk's one
     /// trailing add, open or locked. Read only on an `empty` strip.
     pub plus: Plus,
+    /// **This strip's sends to buses and returns**, in the order they were
+    /// made: what its send rows draw (the knob is its send into the effects
+    /// return and is not here). Empty on a strip that sends nowhere.
+    /// Appended.
+    pub sends: Vec<SendRow>,
+}
+
+/// **One send as a strip's row draws it**: the bus's name, the level, and
+/// whether it is taken before the fader.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendRow {
+    pub label: String,
+    /// 0..=1.
+    pub level: f32,
+    pub pre: bool,
 }
 
 /// **What the plus on an empty strip or lane is** (docs/design/
@@ -142,6 +157,19 @@ impl StripView<'_> {
     /// with nothing in it to send.
     fn sends(&self) -> bool {
         self.strip.is_some_and(Strip::sends) && !self.empty
+    }
+
+    /// **Whether this strip is a bus** (or a return): a row of its own kind,
+    /// with no input to choose and nothing to arm (design 9).
+    pub fn is_bus(&self) -> bool {
+        self.kind == Some(crate::recorder::ChannelKind::Bus)
+    }
+
+    /// **Whether it wears the send rows**: a track's strip (a folder's and a
+    /// bus's included) that is there. The click sends nowhere and the
+    /// master has nothing past it to send to.
+    fn send_rows(&self) -> bool {
+        matches!(self.strip, Some(Strip::Channel(_))) && !self.empty
     }
 
     /// Whether it has controls at all. An empty slot has one: the plus.
@@ -365,7 +393,9 @@ impl MixerView<'_> {
         if !s.live() {
             return true;
         }
-        if self.any_solo {
+        // **A bus is solo-safe** (design 9, owner call 4): another strip's
+        // solo never silences it, so it is not drawn as silenced by one.
+        if self.any_solo && !s.is_bus() {
             return s.soloed;
         }
         !s.muted
@@ -407,6 +437,16 @@ pub enum Hit {
     /// from the top of THIS channel's list — not an index into the desk's
     /// table, which the panel has no business knowing.
     RouteGain(Column, usize),
+    /// **One send row's level**, dragged sideways like a route's. The
+    /// second field is which send, counting from the top of THIS strip's
+    /// list of sends to buses (`StripView::sends`).
+    SendLevel(Column, usize),
+    /// **The send rows' plus**: open the routing window on its list of
+    /// buses and returns to send to.
+    SendAdd(Column),
+    /// **The +N chip** on a strip with more sends than rows: open the
+    /// routing window, where every one of them is.
+    SendMore(Column),
     /// The decibel readout: type a number into it.
     Db(Column),
     /// The channel's name: type a new one.
@@ -559,7 +599,10 @@ impl Hit {
             | Hit::FxMenu(i, ..)
             | Hit::InputChip(i)
             | Hit::Routing(i)
-            | Hit::RouteGain(i, _) => i,
+            | Hit::RouteGain(i, _)
+            | Hit::SendLevel(i, _)
+            | Hit::SendAdd(i)
+            | Hit::SendMore(i) => i,
             // The click's sound button is on the click's column, which is
             // where it is drawn. It answered `Column(Strip::Click.index())`,
             // the click's DESK index read as a column, which was the master's
@@ -583,11 +626,15 @@ impl Hit {
             // down, and a control that fills to the right has to be swept to
             // the right or the picture and the hand disagree.
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
+            // A send row lies down too: the same picture, the same sweep.
+            Hit::SendLevel(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
             | Hit::MetFile
-            | Hit::Routing(_) => None,
+            | Hit::Routing(_)
+            | Hit::SendAdd(_)
+            | Hit::SendMore(_) => None,
         }
     }
 
@@ -598,11 +645,14 @@ impl Hit {
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
+            Hit::SendLevel(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
             | Hit::MetFile
-            | Hit::Routing(_) => None,
+            | Hit::Routing(_)
+            | Hit::SendAdd(_)
+            | Hit::SendMore(_) => None,
         }
     }
 }
@@ -1488,6 +1538,33 @@ const SEND_TRAVEL: f32 = 420.0;
 /// and the routing window remains where they are managed.
 pub const STRIP_ROUTES: usize = 3;
 
+/// **How many send rows a strip shows**; past them, the last row is a +N
+/// chip that opens the routing window, where every send is.
+///
+/// **A band every strip that can send wears, whatever it sends**: the route
+/// strips' pattern, minus the thing the owner struck out of it. Those grew
+/// one strip per route and took each out of the fader's travel, "so a column
+/// changed shape as you routed it"; these rows are always there (an empty
+/// one is the plus that makes the first send), so making a send or ten
+/// moves nothing on the strip. Two, because a dry track, a reverb return and
+/// a delay return is what most strips send to, and the knob above them is
+/// already the send into the effects. The room comes out of that knob band,
+/// which had the most to spare: the fader keeps every point of its travel.
+pub const STRIP_SENDS: usize = 2;
+
+/// **What one of a strip's send rows holds this frame.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendCell {
+    /// Nothing: a row past the plus.
+    Empty,
+    /// The strip's k-th send to a bus, a level lying down.
+    Level(usize),
+    /// The plus that sends the strip to a bus or a return.
+    Add,
+    /// "+n": this many sends past the rows above, behind one chip.
+    More(usize),
+}
+
 /// Where everything on one strip is, and where the strips are.
 ///
 /// Fractions of the rect rather than points, so the same layout holds at every
@@ -1607,6 +1684,16 @@ pub struct StripStrip {
     /// One small strip per route: a label and its own fader. `NOTHING` past
     /// what this channel actually routes. See [`STRIP_ROUTES`].
     pub routes: [Rect; STRIP_ROUTES],
+    /// **The send rows**, under the knobs. See [`STRIP_SENDS`]: the band is
+    /// laid on every strip that can send, and what each row is this frame
+    /// is [`Self::send_cells`]; a row holding nothing is `NOTHING`.
+    pub sends: [Rect; STRIP_SENDS],
+    pub send_cells: [SendCell; STRIP_SENDS],
+    /// **A BUS says so**, in the band a track names its input in: a readout
+    /// like the folder's chip, not a door. A bus has no input to choose
+    /// (design 9), and an empty chip there would read as one that failed to
+    /// draw.
+    pub bus_chip: Rect,
     /// The plus on an empty slot.
     pub add: Rect,
     /// The × at the top right of a removable channel. `NOTHING` on the rest.
@@ -1762,6 +1849,9 @@ impl StripStrip {
         inserts: [Rect::NOTHING; INSERTS * 2],
         routing: Rect::NOTHING,
         routes: [Rect::NOTHING; STRIP_ROUTES],
+        sends: [Rect::NOTHING; STRIP_SENDS],
+        send_cells: [SendCell::Empty; STRIP_SENDS],
+        bus_chip: Rect::NOTHING,
         add: Rect::NOTHING,
         close: Rect::NOTHING,
     };
@@ -1967,8 +2057,12 @@ impl Layout {
         // The knob band: a channel splits it — send LEFT, pan RIGHT, the
         // owner's rule that every channel has a pan knob. The click and the
         // bus keep the whole band for their send.
+        // A strip that wears the send rows gives them the foot of this band
+        // (`STRIP_SENDS`): the knobs are a little shorter, and nothing under
+        // them moves.
+        let send_rows = view.send_rows();
         let (send, pan) = if sends {
-            let band = cut(0.41, 0.53);
+            let band = if send_rows { cut(0.41, 0.494) } else { cut(0.41, 0.53) };
             if matches!(view.strip, Some(Strip::Channel(_) | Strip::Drums)) {
                 (
                     Rect::from_min_max(
@@ -2112,7 +2206,9 @@ impl Layout {
         // on the folder's own glyph now, and the theory send is the note
         // button at the strip's foot. A FOLDER is not a track and cannot
         // record, so it keeps only M and S.
-        let has_arm = has_arm && !view.is_folder;
+        // Nor can a BUS: it has no input to record and hears no MIDI, so it
+        // keeps the pair too (design 9).
+        let has_arm = has_arm && !view.is_folder && !view.is_bus();
         let (mute, solo, arm) = if switchable && has_arm {
             let gap = 3.0;
             let w = ((switches.width() - gap * 2.0) / 3.0).max(1.0);
@@ -2193,6 +2289,36 @@ impl Layout {
             Rect::NOTHING
         };
         let routes: [Rect; STRIP_ROUTES] = [Rect::NOTHING; STRIP_ROUTES];
+        // **The send rows**: the band is there on every strip that can send,
+        // and what fills each row is the strip's list. Up to the rows' count
+        // each send is a row and the next row is the plus; past it the last
+        // row is a +N chip for the rest (the routing window lists them all).
+        let send_band = if send_rows { cut(0.498, 0.546) } else { Rect::NOTHING };
+        let held = view.sends.len();
+        let send_cells: [SendCell; STRIP_SENDS] = std::array::from_fn(|k| {
+            if !send_band.is_positive() {
+                SendCell::Empty
+            } else if held > STRIP_SENDS {
+                if k + 1 < STRIP_SENDS { SendCell::Level(k) } else { SendCell::More(held - k) }
+            } else if k < held {
+                SendCell::Level(k)
+            } else if k == held {
+                SendCell::Add
+            } else {
+                SendCell::Empty
+            }
+        });
+        let send_rects: [Rect; STRIP_SENDS] = std::array::from_fn(|k| {
+            if send_cells[k] == SendCell::Empty {
+                return Rect::NOTHING;
+            }
+            let h = send_band.height() / STRIP_SENDS as f32;
+            let y = send_band.top() + h * k as f32;
+            Rect::from_min_max(
+                Pos2::new(send_band.left() + 2.0, y + 0.5),
+                Pos2::new(send_band.right() - 2.0, y + h - 0.5),
+            )
+        });
         let travel = cut(if sends { 0.55 } else { 0.42 }, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
@@ -2280,6 +2406,9 @@ impl Layout {
             panel,
             routing,
             routes,
+            sends: send_rects,
+            send_cells,
+            bus_chip: if view.is_bus() && has_icon { cut(0.152, 0.19) } else { Rect::NOTHING },
             icon,
             icon_room,
             // **Loosely fitting the text, not a band of face.** These were a
@@ -2299,8 +2428,9 @@ impl Layout {
                     full
                 }
             },
-            detail: if view.is_folder {
-                // The folder's extra bays live here now — see `rack`.
+            detail: if view.is_folder || view.is_bus() {
+                // The folder's extra bays live here now — see `rack`. A bus
+                // says what it is in its chip, in the same band.
                 Rect::NOTHING
             } else if has_icon {
                 cut(0.152, 0.19)
@@ -2312,6 +2442,7 @@ impl Layout {
             input_chip: if matches!(view.strip, Some(Strip::Channel(_)))
                 && !view.empty
                 && !view.is_folder
+                && !view.is_bus()
             {
                 cut(0.152, 0.19)
             } else {
@@ -2424,6 +2555,18 @@ impl Layout {
             ] {
                 if r.is_positive() {
                     out.push((r, hit));
+                }
+            }
+            // The send rows, each what its cell says it is this frame.
+            for (r, cell) in s.sends.iter().zip(s.send_cells) {
+                let hit = match cell {
+                    SendCell::Level(k) => Hit::SendLevel(i, k),
+                    SendCell::Add => Hit::SendAdd(i),
+                    SendCell::More(_) => Hit::SendMore(i),
+                    SendCell::Empty => continue,
+                };
+                if r.is_positive() {
+                    out.push((*r, hit));
                 }
             }
         }
@@ -2605,6 +2748,22 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                     travel(level, DragAxis::Horizontal),
                 )
             }
+            Hit::SendLevel(_, k) => {
+                let (to, level, pre) =
+                    s.sends.get(k).map_or(("a bus", 0.0, false), |x| (x.label.as_str(), x.level, x.pre));
+                Node::slider(
+                    id,
+                    r,
+                    format!("{who} send to {to}{}", if pre { ", before the fader" } else { "" }),
+                    f64::from(level),
+                    0.0,
+                    1.0,
+                    format!("{:.0}%", level * 100.0),
+                    travel(level, DragAxis::Horizontal),
+                )
+            }
+            Hit::SendAdd(_) => Node::button(id, r, format!("{who}: send to a bus or a return")),
+            Hit::SendMore(_) => Node::button(id, r, format!("{who}: every send, in the routing window")),
             // The insert menu is modal over the whole desk while it is up;
             // its two rows are not part of the desk's tab order.
             Hit::FxMenu(..) => continue,
@@ -2642,9 +2801,11 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Db(i)
         | Hit::Name(i)
         | Hit::Folder(i)
-        | Hit::Remove(i) => i,
+        | Hit::Remove(i)
+        | Hit::SendAdd(i)
+        | Hit::SendMore(i) => i,
         Hit::MetFile => Column::Click,
-        Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::FxMenu(i, _, _) => i,
+        Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::SendLevel(i, _) | Hit::FxMenu(i, _, _) => i,
     })
 }
 
@@ -2994,6 +3155,30 @@ pub(crate) fn auto_icon(strip: Option<Strip>, is_folder: bool) -> Option<crate::
     }
 }
 
+/// **The bus's badge**: three lines coming in from the left and running
+/// together into one going out to the right, in `ink`, inside `r`. Square
+/// in its rect, like every badge, and thick enough to read at a strip's
+/// smallest.
+pub(crate) fn bus_glyph(painter: &Painter, r: Rect, ink: Color32) {
+    if !r.is_positive() {
+        return;
+    }
+    let side = r.width().min(r.height());
+    let b = Rect::from_center_size(r.center(), Vec2::splat(side * 0.86));
+    let w = (side * 0.075).clamp(1.2, 3.0);
+    let stroke = Stroke::new(w, ink);
+    let join = Pos2::new(b.left() + b.width() * 0.58, b.center().y);
+    for k in 0..3 {
+        let y = b.top() + b.height() * (0.18 + 0.32 * k as f32);
+        let start = Pos2::new(b.left(), y);
+        let bend = Pos2::new(b.left() + b.width() * 0.28, y);
+        painter.line_segment([start, bend], stroke);
+        painter.line_segment([bend, join], stroke);
+    }
+    painter.line_segment([join, Pos2::new(b.right(), join.y)], stroke);
+    painter.circle_filled(join, w * 1.3, ink);
+}
+
 fn strip(
     painter: &Painter,
     l: &StripStrip,
@@ -3188,6 +3373,13 @@ fn strip(
         && crate::recorder_panel::draw_badge(painter, l.icon, ink, face, v.icon);
     let named = if badge {
         true
+    } else if v.is_bus() {
+        // **A bus wears its own drawing**: strips running together into one
+        // line, which is what a bus is. Drawn, not taken from the artwork:
+        // the set has no bus in it, and a borrowed instrument would say the
+        // strip plays one.
+        bus_glyph(painter, l.icon, ink);
+        true
     } else {
         match auto_icon(v.strip, v.is_folder) {
             Some(icon) => {
@@ -3279,6 +3471,25 @@ fn strip(
             p.engrave.gamma_multiply(0.85),
         );
     }
+    // **A BUS's chip**, the folder chip's twin: a readout of what the strip
+    // is, in the band a track names its input in, registered in no target
+    // list because a bus has no input to pick.
+    if l.bus_chip.is_positive() {
+        painter.rect_filled(l.bus_chip, 2.0, p.chip);
+        painter.rect_stroke(
+            l.bus_chip,
+            2.0,
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        centred(
+            painter,
+            l.bus_chip,
+            "BUS",
+            plain((h * 0.024).clamp(7.0, 11.0)),
+            p.engrave.gamma_multiply(0.85),
+        );
+    }
     // **The CLICK's own sound**, in the band a channel spends on its input
     // chip and wearing the same panel — it is the same kind of control,
     // "what is feeding this strip", and it opens the metronome panel. The
@@ -3364,6 +3575,49 @@ fn strip(
                 FontId::new(size, crate::fonts::courier_bold()),
                 p.face,
             );
+        }
+    }
+
+    // ── The send rows: a level lying down per send, the plus, the +N ─────
+    //
+    // The route strips' picture, because a send is the same kind of thing
+    // to look at: a tap off this strip at a level of its own. The name over
+    // the fill is the BUS's, and a send taken before the fader says so at
+    // the row's right end.
+    for (r, cell) in l.sends.iter().zip(l.send_cells) {
+        if !r.is_positive() {
+            continue;
+        }
+        let size = (r.height() * 0.62).clamp(5.0, 9.0);
+        let font = FontId::new(size, crate::fonts::courier_bold());
+        match cell {
+            SendCell::Level(k) => {
+                let Some(x) = v.sends.get(k) else { continue };
+                painter.rect_filled(*r, 1.0, p.slot);
+                let filled = Rect::from_min_max(
+                    r.min,
+                    Pos2::new(r.left() + r.width() * x.level.clamp(0.0, 1.0), r.bottom()),
+                );
+                if filled.width() > 0.5 {
+                    painter.rect_filled(filled, 1.0, p.lit.gamma_multiply(0.55));
+                }
+                painter.text(Pos2::new(r.left() + 3.0, r.center().y), egui::Align2::LEFT_CENTER, &x.label, font.clone(), p.face);
+                if x.pre {
+                    painter.text(Pos2::new(r.right() - 3.0, r.center().y), egui::Align2::RIGHT_CENTER, "PRE", font, p.face);
+                }
+            }
+            // A door, drawn as the routing button is: a quiet plate with its
+            // word on it.
+            SendCell::Add | SendCell::More(_) => {
+                painter.rect_filled(*r, 2.0, shade_face(p.face, 0.94));
+                painter.rect_stroke(*r, 2.0, Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+                let word = match cell {
+                    SendCell::More(n) => format!("+{n} SENDS"),
+                    _ => "+ SEND".to_owned(),
+                };
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, word, font, p.engrave.gamma_multiply(0.8));
+            }
+            SendCell::Empty => {}
         }
     }
 
@@ -4487,6 +4741,7 @@ mod tests {
             bypassed: [false; INSERTS * 2],
             frozen: false,
             plus: Plus::Row,
+            sends: Vec::new(),
         }
     }
 
@@ -5031,6 +5286,95 @@ mod tests {
             Some(Hit::Routing(Column::Track(1))),
             "the routing button cannot be pressed"
         );
+    }
+
+    /// **A strip's send rows are one band whatever it sends, and the fader
+    /// gives up nothing for them** (`STRIP_SENDS`): the owner struck the
+    /// route strips out because "a column changed shape as you routed it",
+    /// so the send rows are the same band on a strip that sends to none and
+    /// to forty, and only what fills them changes: the plus after the last
+    /// send, a +N chip for the sends past the rows. Each row answers its own
+    /// press, and a level row drags sideways.
+    #[test]
+    fn a_strips_send_rows_are_one_band_whatever_it_sends() {
+        let laid = |n: usize| {
+            let mut v = a_view();
+            v.strips[Column::Track(1)].sends =
+                (0..n).map(|k| SendRow { label: format!("B{k}"), level: 0.5, pre: k % 2 == 1 }).collect();
+            let l = Layout::new(rect(), &v).strips[Column::Track(1)];
+            let hits: Vec<Hit> = (0..STRIP_SENDS)
+                .filter(|k| l.sends[*k].is_positive())
+                .filter_map(|k| hit_test(rect(), &v, l.sends[k].center()))
+                .collect();
+            (l, hits)
+        };
+        let (none, hits) = laid(0);
+        assert_eq!(none.send_cells, [SendCell::Add, SendCell::Empty], "a strip with no send is not offered one");
+        assert_eq!(hits, vec![Hit::SendAdd(Column::Track(1))]);
+        let (one, hits) = laid(1);
+        assert_eq!(one.send_cells, [SendCell::Level(0), SendCell::Add]);
+        assert_eq!(hits, vec![Hit::SendLevel(Column::Track(1), 0), Hit::SendAdd(Column::Track(1))]);
+        let (two, _) = laid(2);
+        assert_eq!(two.send_cells, [SendCell::Level(0), SendCell::Level(1)], "two sends do not both show");
+        let (many, hits) = laid(5);
+        assert_eq!(many.send_cells, [SendCell::Level(0), SendCell::More(4)], "the chip does not count the rest");
+        assert_eq!(hits, vec![Hit::SendLevel(Column::Track(1), 0), Hit::SendMore(Column::Track(1))]);
+        for n in [1, 2, 5, 40] {
+            let (l, _) = laid(n);
+            assert_eq!(l.fader, none.fader, "{n} sends moved the fader");
+            assert_eq!(l.send, none.send, "{n} sends moved the knob");
+            for k in 0..STRIP_SENDS {
+                if l.sends[k].is_positive() && none.sends[0].is_positive() {
+                    assert!((l.sends[k].height() - none.sends[0].height()).abs() < 0.01, "{n} sends: row {k} changed size");
+                }
+            }
+        }
+        // The band sits under the knobs and over the fader, clear of both.
+        assert!(none.sends[0].top() >= none.send.bottom() && none.sends[0].bottom() <= none.fader.top());
+        // A level row lies down, and its travel is a send's.
+        assert_eq!(Hit::SendLevel(Column::Track(1), 0).axis(), Some(DragAxis::Horizontal));
+        assert_eq!(Hit::SendLevel(Column::Track(1), 0).travel(), Some(SEND_TRAVEL));
+        assert_eq!(Hit::SendAdd(Column::Track(1)).axis(), None, "the plus is a door, not a level");
+        // The click sends nowhere and nothing is past the master.
+        let l = Layout::new(rect(), &a_view());
+        for col in [CLICK, MASTER] {
+            assert!(l.strips[col].sends.iter().all(|r| !r.is_positive()), "{col:?} wears send rows");
+        }
+    }
+
+    /// **A bus says so, has no input to choose and nothing to arm**
+    /// (design 9): its chip reads BUS and is no door, there is no input chip
+    /// and no R, and it keeps its mute, solo, send rows and rack.
+    #[test]
+    fn a_bus_strip_says_bus_and_offers_no_input_and_no_arm() {
+        let mut v = a_view();
+        v.strips[Column::Track(2)].kind = Some(crate::recorder::ChannelKind::Bus);
+        let l = Layout::new(rect(), &v);
+        let (bus, track) = (&l.strips[Column::Track(2)], &l.strips[Column::Track(1)]);
+        assert!(bus.bus_chip.is_positive(), "a bus does not say so");
+        assert!(!bus.input_chip.is_positive(), "a bus offers an input");
+        assert!(!bus.arm.is_positive() && !bus.theory.is_positive(), "a bus can be armed");
+        assert!(bus.mute.is_positive() && bus.solo.is_positive());
+        assert!(bus.sends[0].is_positive() && bus.inserts[0].is_positive());
+        assert_eq!(
+            (bus.bus_chip.top(), bus.bus_chip.bottom(), bus.bus_chip.width()),
+            (track.input_chip.top(), track.input_chip.bottom(), track.input_chip.width()),
+            "the bus chip is not in the band an input chip is"
+        );
+        assert!(!track.bus_chip.is_positive(), "a track says it is a bus");
+        // Not a door: nothing answers a press on it but the strip.
+        assert!(
+            !l.targets().iter().any(|(r, h)| r.contains(bus.bus_chip.center()) && h.column() == Column::Track(2)),
+            "the bus chip answers a press"
+        );
+        // **Solo-safe**: another strip's solo does not draw it silenced, as
+        // it does every other strip that is not soloed; its own mute does.
+        v.any_solo = true;
+        v.strips[Column::Track(0)].soloed = true;
+        assert!(v.heard(Column::Track(2)), "another strip's solo drew the bus silenced");
+        assert!(!v.heard(Column::Track(1)), "fixture: a track not soloed is drawn silenced");
+        v.strips[Column::Track(2)].muted = true;
+        assert!(!v.heard(Column::Track(2)), "a muted bus is drawn heard");
     }
 
     /// **Every control can be pressed, and presses where it is drawn.**

@@ -127,6 +127,26 @@ pub enum AutoParam {
     /// SAME plugin apart: their parameter ids are identical, and a curve that
     /// named only the id would move both.
     Plugin { bay: u8, id: u32 },
+    /// **The strip's post-fader send to one bus or return row**, by the
+    /// bus's identity (design section 9). Appended: the variants above are
+    /// in files people have.
+    ///
+    /// A track, never the effects return: the send to Return 0 is [`Send`]
+    /// and keeps that one spelling, so one control has one curve. By
+    /// `TrackId` and not by the bus's row, for the reason a route names its
+    /// ends by identity: a curve on the bass that sends to "Verb" must
+    /// still send to Verb after Verb is dragged three rows up. The bus's
+    /// own row is the curve's lane only when the curve is ON the bus.
+    ///
+    /// Only a post-fader send has a curve. A pre-fader send is a cue mix,
+    /// set once and listened to on headphones; the desk the curves are
+    /// drawn on is the one that goes through the fader.
+    ///
+    /// Read from a file, saved and carried like any other curve, but not
+    /// played yet, so no gesture makes one: see [`SEND_CURVES_PLAY`].
+    ///
+    /// [`Send`]: AutoParam::Send
+    SendTo { to: crate::desk_id::TrackId },
 }
 
 impl AutoParam {
@@ -153,6 +173,10 @@ impl AutoParam {
             // written in decimal because that is what a plugin's own
             // documentation prints.
             Self::Plugin { bay, id } => format!("fx:{bay}:{id}"),
+            // **`send:t<id>`**: the bus in the desk's one text grammar
+            // (Appendix C), behind a prefix none of the names above can
+            // wear. `send` alone stays the effects return's.
+            Self::SendTo { to } => format!("send:{}", crate::desk_id::Node::Track(to)),
         }
     }
 
@@ -163,6 +187,14 @@ impl AutoParam {
                 bay: bay.parse().ok()?,
                 id: id.parse().ok()?,
             });
+        }
+        // Strict, the grammar's own rule: `send:t007` and `send:fx` are not
+        // keys, so nothing reads a curve onto a send it was not written for.
+        if let Some(rest) = k.strip_prefix("send:") {
+            return match rest.parse::<crate::desk_id::Node>().ok()? {
+                crate::desk_id::Node::Track(to) => Some(Self::SendTo { to }),
+                _ => None,
+            };
         }
         Self::ALL.into_iter().find(|p| p.key() == k)
     }
@@ -181,7 +213,9 @@ impl AutoParam {
     /// A plugin parameter has no name of its own here: the NAME lives with
     /// the plugin and reaches the app through `ports::FxParams`, so this
     /// answers with the address and the caller that has the list puts the
-    /// word in. See `TangentApp::auto_param_label`.
+    /// word in. See `TangentApp::auto_param_label`. A send to a bus is the
+    /// same bargain: the bus's name is the desk's, so this says which
+    /// track and the app says what it is called.
     pub fn label(self) -> String {
         match self {
             Self::Gain => "volume".to_owned(),
@@ -189,9 +223,58 @@ impl AutoParam {
             Self::Send => "send".to_owned(),
             Self::Mute => "mute".to_owned(),
             Self::Plugin { bay, id } => format!("bay {} parameter {id}", bay + 1),
+            Self::SendTo { to } => format!("send to {}", crate::desk_id::Node::Track(to)),
+        }
+    }
+
+    /// **The bus a send curve feeds**, for the one parameter that names
+    /// another row.
+    pub fn send_to(self) -> Option<crate::desk_id::TrackId> {
+        match self {
+            Self::SendTo { to } => Some(to),
+            _ => None,
+        }
+    }
+
+    /// **Whether a curve on this control is played**, live and in an
+    /// export. Every control's is but a send to a bus's, which waits on
+    /// [`SEND_CURVES_PLAY`]. The app offers, writes and follows only the
+    /// curves this answers yes for: a door that makes a curve nothing plays
+    /// is a control that moves and does nothing.
+    pub fn plays(self) -> bool {
+        match self {
+            Self::SendTo { .. } => SEND_CURVES_PLAY,
+            _ => true,
         }
     }
 }
+
+/// **Whether the engine plays a curve on a send to a bus**
+/// ([`AutoParam::SendTo`]). Not yet.
+///
+/// The engine reads the desk's four controls and the plugins' parameters
+/// off a lane's curves. A send to a bus has curves of its own in the
+/// engine (`instrument::SendCurve`), and nothing hands it any: the bridge
+/// carries each send at its fixed level. A curve drawn on a send would sit
+/// on screen and move nothing, live or in an export. So until one is played,
+/// no gesture makes one. The A menu offers no Sends group, the row cannot be
+/// opened, a send row moved while its lane writes lays no point down, and a
+/// lone base neither follows the send nor sets it on open
+/// ([`AutoParam::plays`]). A curve a file holds is kept whole, the way a
+/// curve waiting for its plugin is.
+///
+/// MERGE-ME(W7-slot-gaps item 5): set this true in the commit that maps
+/// `SendTo` onto the engine's `SendCurve`s through the bridge, live and in
+/// an export. The menu, the row, the writes and the base come back with
+/// it. `bus_e2e`'s `the_send_curve_switch_says_what_an_export_plays` fails
+/// until the switch and the engine agree, and `bus_tests` hold the app half
+/// to whichever state the switch is in. Two things to carry across. The
+/// engine names a send by its two ends, so one of its curves drives a
+/// strip's pre-fader AND post-fader send to one bus, while this curve is
+/// the post-fader send's alone. And the curve names its bus by `TrackId`,
+/// so the bridge resolves both ends to slots each frame, as
+/// `Bridge::read_sends` does.
+pub const SEND_CURVES_PLAY: bool = false;
 
 /// What a lane's automation does while the transport rolls.
 ///
@@ -933,6 +1016,20 @@ mod tests {
             assert_eq!(AutoParam::from_key(&p.key()), Some(p), "{p:?} does not round trip");
         }
         assert_eq!(AutoParam::from_key("nonesuch"), None);
+        // **A send to a bus**, appended: `send:t<id>` in the desk's own
+        // grammar, round-tripping, and never a second spelling of the
+        // effects return's `send` or of anything the grammar refuses.
+        let bus = AutoParam::SendTo { to: crate::desk_id::TrackId(40) };
+        assert_eq!(bus.key(), "send:t40");
+        assert_eq!(AutoParam::from_key("send:t40"), Some(bus));
+        assert_eq!(AutoParam::from_key("send:t0"), Some(AutoParam::SendTo { to: crate::desk_id::TrackId(0) }));
+        for refused in ["send:fx", "send:master", "send:drums", "send:t040", "send:T4", "send:", "send:t-1", "send:t4294967296"] {
+            assert_eq!(AutoParam::from_key(refused), None, "{refused} read as a parameter");
+        }
+        assert_eq!(AutoParam::from_key("send"), Some(AutoParam::Send), "the return's own spelling moved");
+        assert_eq!(bus.bay(), None);
+        assert_eq!(bus.send_to(), Some(crate::desk_id::TrackId(40)));
+        assert_eq!(AutoParam::Send.send_to(), None);
         assert_eq!(Shape::from_key(Shape::Hold.key()), Shape::Hold);
         assert_eq!(Shape::from_key(Shape::Linear.key()), Shape::Linear);
         // An unknown shape from a newer build reads as the ordinary one

@@ -40,7 +40,9 @@ use tangent_ui::automation::AutoLane;
 use tangent_ui::recorder::{ChannelKind, MidiRoute, StripRef};
 use tangent_ui::routing::Target;
 
-use crate::desk_plan::{InKey, InLane, InRoute, LaneFlags, PickId, PlanInputs, RouteEnd, Slot, SpecialFlags};
+use crate::desk_plan::{
+    InKey, InLane, InRoute, InSend, LaneFlags, PickId, PlanInputs, RouteEnd, SendFrom, SendTo, Slot, SpecialFlags,
+};
 use crate::desktop::{
     arm_stem_tap, effect_params_from, export_clip_placement, furnish_mirror_bay, is_instrument_sentinel,
     keys_patch_of, leaf_of, mirror_sampler_samples,
@@ -1141,6 +1143,7 @@ impl Bridge {
             let kind = match app.channel_kind(row) {
                 Some(ChannelKind::Midi) => LaneKind::Midi,
                 Some(ChannelKind::Audio) => LaneKind::Audio,
+                Some(ChannelKind::Bus) => LaneKind::Bus,
                 None if app.desk_index().is_folder(row) => LaneKind::Folder,
                 None => LaneKind::Empty,
             };
@@ -1196,21 +1199,18 @@ impl Bridge {
     }
 
     /// **Publish `inputs` if they decide anything new**, else carry only the
-    /// route gains that moved into every plan in flight (design 7.6: a gain
-    /// that stays on its side of zero scales, it does not reorder). Answers
-    /// what became of them.
+    /// route gains and send levels that moved into every plan in flight
+    /// (design 7.6: a gain that stays on its side of zero scales, it does not
+    /// reorder, and a send's level never orders anything). Answers what
+    /// became of them.
     fn publish(&mut self, e: &mut Engine, inputs: PlanInputs) -> Published {
-        let same_shape = self.published.as_ref().is_some_and(|p| structure(p) == structure(&inputs));
-        if same_shape {
-            if let Some(p) = self.published.as_ref() {
-                for (old, new) in p.routes.iter().zip(&inputs.routes) {
-                    if old.gain.to_bits() != new.gain.to_bits() {
-                        e.set_route_gain(new.from, new.to, new.gain);
-                    }
-                }
+        if let Some(p) = self.published.as_ref().filter(|p| structure(p) == structure(&inputs)) {
+            // What only scales goes into the plans in flight; the one move
+            // that cannot (`carry_scales`) publishes below like a new shape.
+            if carry_scales(e, p, &inputs) {
+                self.published = Some(inputs);
+                return Published::Same;
             }
-            self.published = Some(inputs);
-            return Published::Same;
         }
         match e.publish_plan(&inputs) {
             Ok(gen) => {
@@ -1278,7 +1278,11 @@ impl Bridge {
                 .with(F::MUTED, muted(row))
                 .with(F::SOLOED, soloed(row))
                 .with(F::PHASE, app.strip_inverted(StripRef::Row(row)))
-                .with(F::SUSPEND, app.auto_suspended(AutoLane::Row(row)));
+                .with(F::SUSPEND, app.auto_suspended(AutoLane::Row(row)))
+                // **A bus row** (design 9): its rack runs once over what is
+                // routed and sent to it, it is solo-safe, and it is the only
+                // lane a send may land on (`desk_plan::SendTo`).
+                .with(F::BUS, app.channel_kind(row) == Some(ChannelKind::Bus));
             let parent = parents
                 .get(row)
                 .and_then(|p| usize::try_from(*p).ok())
@@ -1331,7 +1335,52 @@ impl Bridge {
         // **The wiring, by identity** (`read_desk`): the routing table pruned
         // against the device, and the sidechain keys, in the engine's names.
         let (routes, keys) = self.read_desk(app, outs);
-        PlanInputs { lanes, specials, routes, sends: Vec::new(), keys }
+        PlanInputs { lanes, specials, routes, sends: self.read_sends(app), keys }
+    }
+
+    /// **The desk's sends to buses, read by identity** (W7-buses-ui, design
+    /// 9): every strip's sends whose bus is a bus row on this desk, in the
+    /// engine's names, the sender's lane (or the drum bus, or the click) and
+    /// the bus's lane, at the send's own level and side of the fader.
+    ///
+    /// **In the order of the senders' identities, not their rows**: a bus
+    /// sums its sends in the order it is handed them (`desk_plan::InSend`),
+    /// and f32 addition does not commute bit for bit, so an order by row
+    /// would change a bus's last bits on every reorder. By track id, each
+    /// strip's own sends in the order they were made, then the drum bus's
+    /// and the click's: no reorder moves a send, in the plan as on the desk.
+    ///
+    /// **The knob's send into the effects return is not here.** The engine
+    /// plays a strip's knob for a strip the plan carries no Fx entry for
+    /// (`set_lane_levels`), which is today's sound bit for bit; carrying the
+    /// knob as its post-fader Fx entry is the engine half of the sends
+    /// (W7-slot-gaps item 5), and this list leaves that road to it.
+    pub fn read_sends(&self, app: &TangentApp) -> Vec<InSend> {
+        // Each laned track's row and lane this frame, by identity, so the
+        // senders walk in id order and a bus is found in one look.
+        let laned: BTreeMap<TrackId, (usize, Slot)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (id, at))| Some((*id, (row, at.as_ref()?.slot))))
+            .collect();
+        let bus_lane = |n: Node| -> Option<Slot> {
+            let (row, slot) = *laned.get(&n.track()?)?;
+            (app.channel_kind(row) == Some(ChannelKind::Bus)).then_some(slot)
+        };
+        let mut out = Vec::new();
+        let mut push = |from: SendFrom, s: StripRef| {
+            for x in app.strip_sends(s) {
+                let Some(to) = bus_lane(x.to) else { continue };
+                out.push(InSend { from, to: SendTo::Lane(to), level: x.level as f32, pre: x.pre });
+            }
+        };
+        for (row, slot) in laned.values() {
+            push(SendFrom::Lane(*slot), StripRef::Row(*row));
+        }
+        push(SendFrom::Drums, StripRef::Drums);
+        push(SendFrom::Click, StripRef::Click);
+        out
     }
 
     /// **The continuous values, by slot**: each row's fader, pan and Fx send
@@ -1373,7 +1422,8 @@ impl Bridge {
 enum Published {
     /// Sent, at this generation.
     New(u64),
-    /// Nothing that decides an order moved; the gains, if any, were written.
+    /// Nothing that decides an order moved; the route gains and send levels
+    /// that moved, if any, were written.
     Same,
     /// The op ring was full.
     Failed,
@@ -1381,13 +1431,65 @@ enum Published {
 
 /// **What decides an order**, of a plan's inputs: everything but the route
 /// gains' size, which only scale (a gain crossing zero does decide, so its
-/// side is kept).
+/// side is kept), and the send levels, which only scale at any size:
+/// `build_plan` keeps a send whatever its level, and one at nothing is still
+/// gathered, ordered and compensated as a send, so not even its side of
+/// zero decides anything.
+///
+/// MERGE-ME(W7-slot-gaps item 5, "`Bridge::publish` carries send levels
+/// between plans, not only route gains"): done here for every send the
+/// inputs carry, so the knob's Fx entries that item adds ride it as they
+/// are. Keep one carry where the two lanes meet.
 fn structure(inputs: &PlanInputs) -> PlanInputs {
     let mut s = inputs.clone();
     for r in &mut s.routes {
         r.gain = if r.gain.is_finite() && r.gain > 0.0 { 1.0 } else { 0.0 };
     }
+    for x in &mut s.sends {
+        x.level = 0.0;
+    }
     s
+}
+
+/// **Write what only scales into every plan in flight**: each route gain
+/// and send level of `now` that moved since `was` (two inputs of one
+/// structure), found in each plan by the identity the engine keys it by
+/// (`Engine::set_route_gain`, `Engine::set_send_level`).
+///
+/// Answers false, writing nothing, when a moved send cannot be told from
+/// its twin. The engine names a send by its two ends, so a strip sending to
+/// one bus from both sides of its fader (a file can say so; no gesture
+/// makes one) would have one level written into both. That frame publishes
+/// a plan instead, which stores each level in its own cell.
+fn carry_scales(e: &Engine, was: &PlanInputs, now: &PlanInputs) -> bool {
+    let moved: Vec<&InSend> = was
+        .sends
+        .iter()
+        .zip(&now.sends)
+        .filter(|(a, b)| a.level.to_bits() != b.level.to_bits())
+        .map(|(_, b)| b)
+        .collect();
+    if !moved.is_empty() {
+        let ends_of = |s: &InSend| crate::desk_plan::send_key(s.from, s.to);
+        let mut ends: Vec<(u64, u64)> = now.sends.iter().map(ends_of).collect();
+        ends.sort_unstable();
+        let twinned = |s: &InSend| {
+            let k = ends_of(s);
+            ends.get(ends.partition_point(|x| *x < k) + 1) == Some(&k)
+        };
+        if moved.iter().any(|s| twinned(s)) {
+            return false;
+        }
+    }
+    for (old, new) in was.routes.iter().zip(&now.routes) {
+        if old.gain.to_bits() != new.gain.to_bits() {
+            e.set_route_gain(new.from, new.to, new.gain);
+        }
+    }
+    for s in moved {
+        e.set_send_level(s.from, s.to, s.level);
+    }
+    true
 }
 
 // ── the inputs: which device input each audio track takes ─────────────────

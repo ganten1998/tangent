@@ -554,22 +554,36 @@ pub enum Dialog {
     Welcome {
         dont_show_again: bool,
     },
-    /// Where a channel goes besides the master. Two steps in one window: the
-    /// kind first (a send or a pair of jacks), then the destination.
+    /// Where a channel goes besides the master, and what it sends. Two steps
+    /// in one window: what is there and the ways to add to it first, then
+    /// the destination (a pair of jacks, a strip to route into, a bus or a
+    /// return to send to).
     Routing {
         /// The channel this is about.
         channel: usize,
-        /// `None` while the two kinds are showing; `Some(true)` listing
-        /// hardware outputs, `Some(false)` listing channels to send to.
-        picking: Option<bool>,
+        /// Which list is showing. See [`RoutingPage`].
+        page: RoutingPage,
         /// Hardware destinations the OPEN DEVICE offers: label, first
         /// channel, stereo. Built by the app, because only the host knows
         /// what the interface has.
         hardware: Vec<(String, usize, bool)>,
-        /// Channels worth sending to: index and name. Empty slots are left
-        /// out — sending into a channel with nothing on it is a route to
-        /// silence, and the owner asked for used channels only.
+        /// Strips worth routing to: index and name, the buses and returns
+        /// first (a route into a bus is what a bus is for). Empty slots are
+        /// left out — sending into a channel with nothing on it is a route
+        /// to silence, and the owner asked for used channels only.
         channels: Vec<(usize, String)>,
+        /// **The rows a new route or send from this channel would close a
+        /// loop through** (`desk_topology::would_cycle`): offered, so the
+        /// list is the whole desk, and greyed with the reason, so nobody
+        /// makes a howl to find out. Appended.
+        looped: Vec<usize>,
+        /// **What this channel sends to buses**: the bus's row (it holds
+        /// still while this modal window is open), its name, the send's
+        /// level and whether it is pre-fader. Appended.
+        sends: Vec<(usize, String, f32, bool)>,
+        /// **The buses and returns a send may go to**: row and name, in desk
+        /// order, this channel itself left out. Appended.
+        buses: Vec<(usize, String)>,
         /// What this channel already routes to: the desk-table index, the
         /// destination (a jack, or the row it stands on while this modal
         /// window is open), its label, and the route's LEVEL. Greys the
@@ -930,6 +944,20 @@ impl Dialog {
             | Dialog::Export { .. } => true,
         }
     }
+}
+
+/// **Which list the routing window is showing.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPage {
+    /// What the channel routes and sends to now, each with its level and a
+    /// way off, and the ways to add one.
+    Main,
+    /// The open device's jacks, for a route out of the box.
+    Hardware,
+    /// The strips a route may MOVE the channel into, buses first.
+    Channel,
+    /// The buses and returns a send may COPY the channel into.
+    Send,
 }
 
 /// Which page of the IR wizard is showing.
@@ -1618,6 +1646,17 @@ fn track_insert_row_h(removable: bool) -> f32 {
 /// somebody the slot can receive a track. A live track's menu is about the
 /// track; a permanently dead paste row on every one of them would be a row
 /// that teaches people to stop reading this menu.
+/// What the New Bus / New Return row costs a row's menu: one row, on
+/// every menu that is a row's (an empty slot's included), since making a bus
+/// does not depend on what the row holds.
+fn track_bus_row_h(lane: usize) -> f32 {
+    if lane != NOT_A_ROW {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
 fn track_paste_row_h(removable: bool, can_paste: bool) -> f32 {
     if removable && can_paste {
         TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
@@ -1762,8 +1801,28 @@ pub enum DialogAction {
     SetShowWelcome(bool),
     /// Open the routing window for a channel.
     OpenRouting(usize),
-    /// Step into one of the two lists: `true` for hardware outputs.
-    RoutingPick { channel: usize, hardware: bool },
+    /// Step into one of the lists. See [`RoutingPage`].
+    RoutingPick { channel: usize, page: RoutingPage },
+    /// **Send this channel to the bus on row `to`**: a new post-fader send
+    /// at unity (`TangentApp::add_send`). Both by row: the window is modal.
+    AddSend { from: usize, to: usize },
+    /// **One send's level**, 0..=1, from the window's own slider. `done` is
+    /// the end of the gesture (the hand let go, or a one-step change), where
+    /// the app takes the send's one moment; only the window can know it.
+    SetSendLevel { from: usize, to: usize, pre: bool, level: f32, done: bool },
+    /// **Move one send to the other side of the fader.** `pre` is the side
+    /// it is on now.
+    FlipSendPre { from: usize, to: usize, pre: bool },
+    /// Take one send off.
+    RemoveSend { from: usize, to: usize, pre: bool },
+    /// **A new return, with this channel already sent to it**: the send
+    /// list's own way to a return that is not there yet.
+    SendToNewReturn(usize),
+    /// **A new bus, with this channel already routed into it.**
+    RouteToNewBus(usize),
+    /// **A new bus or return, at the end of the desk**: the track menu's
+    /// rows. Never asks the track cap.
+    NewBus(crate::recorder::BusRole),
     /// Make the route. The app owns the no-duplicates rule.
     AddRoute {
         from: usize,
@@ -7470,6 +7529,11 @@ pub fn picker_rows(channels: &[(usize, String)], filter: &str) -> Vec<(usize, St
         .collect()
 }
 
+/// **What a routing or send destination that would close a loop says**
+/// under its greyed row (`desk_topology::would_cycle`): the first sign of a
+/// loop on a desk is a howl, so the picker says it instead.
+pub const LOOP_HINT: &str = "greyed: it already feeds this channel, so this would loop";
+
 /// [`picker_rows`] for the key picker, whose sources are tracks by
 /// identity: each shown by the row it stands on and its name, as every
 /// picker shows a channel, and answered by the track.
@@ -11296,7 +11360,8 @@ fn show_on(
                         + track_export_row_h(midi_clips)
                         + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
-                        + track_insert_row_h(removable),
+                        + track_insert_row_h(removable)
+                        + track_bus_row_h(lane),
                 ),
                 Vec2::new(
                     520.0,
@@ -11304,7 +11369,8 @@ fn show_on(
                         + track_export_row_h(midi_clips)
                         + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
-                        + track_insert_row_h(removable),
+                        + track_insert_row_h(removable)
+                        + track_bus_row_h(lane),
                 ),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
@@ -11512,6 +11578,30 @@ fn show_on(
                                     action = Some(DialogAction::TrackPaste(lane));
                                 }
                                 ui.add_space(6.0);
+                            }
+                            // **A bus or a return, at the end of the desk**:
+                            // never a track, so never the cap's, on any tier
+                            // (design 9). Two halves of one row, because they
+                            // are one gesture with two names.
+                            if lane != NOT_A_ROW {
+                                ui.horizontal(|ui| {
+                                    let w = ((ui.available_width() - 6.0) * 0.5).max(1.0);
+                                    for (label, role) in [
+                                        ("New Bus", crate::recorder::BusRole::Bus),
+                                        ("New Return", crate::recorder::BusRole::Return),
+                                    ] {
+                                        if ui
+                                            .add_sized(
+                                                Vec2::new(w, TRACK_EXPORT_ROW_H),
+                                                Button::new(RichText::new(label).font(plain(11.0)).color(t.text)),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(DialogAction::NewBus(role));
+                                        }
+                                    }
+                                });
+                                ui.add_space(TRACK_EXPORT_ROW_GAP);
                             }
                             if lane != NOT_A_ROW {
                                 if ui
@@ -12030,22 +12120,25 @@ fn show_on(
 
         Dialog::Routing {
             channel,
-            picking,
+            page,
             hardware,
             channels,
+            looped,
             existing,
+            sends,
+            buses,
             filter,
         } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
             let ch = *channel;
-            let step = *picking;
+            let step = *page;
             show_dialog_viewport(
                 ctx,
                 placement,
                 &format!("Routing - Channel {}", ch + 1),
-                Vec2::new(420.0, 420.0),
-                Vec2::new(360.0, 300.0),
+                Vec2::new(440.0, 500.0),
+                Vec2::new(360.0, 320.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.field_bg;
@@ -12070,9 +12163,37 @@ fn show_on(
                                 ui.add_space(4.0);
                                 clicked
                             };
+                            // **A level and nothing else**, the route's and the
+                            // send's alike: the slider, its figure, and a
+                            // double-click home to unity (the keys knobs'
+                            // exemplar). Answers the new level when it moved,
+                            // and whether the gesture is over: the hand let go,
+                            // or a one-step change (a key) that has no release.
+                            let level = |ui: &mut egui::Ui, now: f32| -> Option<(f32, bool)> {
+                                let mut g = now;
+                                let resp = ui
+                                    .add(egui::Slider::new(&mut g, 0.0..=1.0).show_value(false))
+                                    .on_hover_text("double-click to reset");
+                                ui.label(
+                                    RichText::new(format!("{:>3.0}%", g.clamp(0.0, 1.0) * 100.0))
+                                        .font(bold(10.0))
+                                        .color(dim),
+                                );
+                                if resp.double_clicked() {
+                                    return Some((1.0, true));
+                                }
+                                let done = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                                (resp.changed() || done).then_some((g, done))
+                            };
                             match step {
-                                // ── which kind ────────────────────────────
-                                None => {
+                                // ── what is there, and the ways to add ────
+                                RoutingPage::Main => {
+                                    egui::ScrollArea::vertical()
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        )
+                                        .max_height((ui.available_height() - 36.0).max(60.0))
+                                        .show(ui, |ui| {
                                     ui.label(
                                         RichText::new("Send this channel somewhere else.")
                                             .font(bold(11.0))
@@ -12080,9 +12201,10 @@ fn show_on(
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Routing to a channel MOVES it there, through \
-                                             whatever is loaded on it. For a copy - a reverb \
-                                             feed - use the SEND knob instead.",
+                                            "Routing to a channel or a bus MOVES it there, through \
+                                             whatever is loaded on it. A SEND is a copy: the SND \
+                                             knob into the effects, or a send to a bus or a return \
+                                             below.",
                                         )
                                         .font(bold(9.0))
                                         .color(dim),
@@ -12113,37 +12235,9 @@ fn show_on(
                                                 // for the fader, so a person
                                                 // working in that view had no
                                                 // way to turn a route down.
-                                                let mut g = *gain;
-                                                let resp = ui.add(
-                                                    egui::Slider::new(&mut g, 0.0..=1.0)
-                                                        .show_value(false),
-                                                );
-                                                // Double-click puts it back to
-                                                // unity — the keys knobs'
-                                                // exemplar, on the one slider
-                                                // that had no way home.
-                                                if resp.double_clicked() {
-                                                    g = 1.0;
-                                                    action = Some(
-                                                        DialogAction::SetRouteGain(*at, g),
-                                                    );
-                                                } else if resp.changed() {
-                                                    action = Some(
-                                                        DialogAction::SetRouteGain(*at, g),
-                                                    );
+                                                if let Some((g, _)) = level(ui, *gain) {
+                                                    action = Some(DialogAction::SetRouteGain(*at, g));
                                                 }
-                                                let resp = resp.on_hover_text(
-                                                    "double-click to reset",
-                                                );
-                                                let _ = resp;
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{:>3.0}%",
-                                                        g.clamp(0.0, 1.0) * 100.0
-                                                    ))
-                                                    .font(bold(10.0))
-                                                    .color(dim),
-                                                );
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
                                                     |ui| {
@@ -12169,26 +12263,26 @@ fn show_on(
                                         ui,
                                         // Not "Sends" — a send is a COPY, and
                                         // this moves the channel. The SND
-                                        // knob is the copy, into the effects
-                                        // bus, and calling both the same
+                                        // knob and the sends below are the
+                                        // copies, and calling both the same
                                         // thing is how you end up expecting
                                         // to hear the track twice.
-                                        "Another Channel",
+                                        "A Bus or Another Channel",
                                         "moves it there, through whatever is loaded on it",
                                         !channels.is_empty(),
                                     ) {
                                         action = Some(DialogAction::RoutingPick {
                                             channel: ch,
-                                            hardware: false,
+                                            page: RoutingPage::Channel,
                                         });
                                     }
-                                    if channels.is_empty() {
-                                        ui.label(
-                                            RichText::new("(no other channel is in use yet)")
-                                                .font(bold(9.0))
-                                                .color(dim),
-                                        );
-                                        ui.add_space(4.0);
+                                    if row(
+                                        ui,
+                                        "A New Bus",
+                                        "makes a bus at the end of the desk and routes this channel into it",
+                                        true,
+                                    ) {
+                                        action = Some(DialogAction::RouteToNewBus(ch));
                                     }
                                     if row(
                                         ui,
@@ -12198,7 +12292,7 @@ fn show_on(
                                     ) {
                                         action = Some(DialogAction::RoutingPick {
                                             channel: ch,
-                                            hardware: true,
+                                            page: RoutingPage::Hardware,
                                         });
                                     }
                                     if hardware.is_empty() {
@@ -12210,57 +12304,167 @@ fn show_on(
                                             .color(dim),
                                         );
                                     }
+                                    // ── the sends: copies into buses ──────
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(if sends.is_empty() {
+                                            "No sends to buses yet."
+                                        } else {
+                                            "Now sending to:"
+                                        })
+                                        .font(bold(10.0))
+                                        .color(dim),
+                                    );
+                                    for (to, label, now, pre) in sends.iter() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(label)
+                                                    .font(bold(11.0))
+                                                    .color(t.text),
+                                            );
+                                            if let Some((g, done)) = level(ui, *now) {
+                                                action = Some(DialogAction::SetSendLevel {
+                                                    from: ch,
+                                                    to: *to,
+                                                    pre: *pre,
+                                                    level: g,
+                                                    done,
+                                                });
+                                            }
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(Button::new(
+                                                            RichText::new("Remove")
+                                                                .font(bold(10.0))
+                                                                .color(t.text),
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        action = Some(DialogAction::RemoveSend {
+                                                            from: ch,
+                                                            to: *to,
+                                                            pre: *pre,
+                                                        });
+                                                    }
+                                                    // Which side of the fader,
+                                                    // said as the word for the
+                                                    // side it is ON: a press
+                                                    // moves it to the other.
+                                                    if ui
+                                                        .add(Button::new(
+                                                            RichText::new(if *pre { "PRE" } else { "POST" })
+                                                                .font(bold(10.0))
+                                                                .color(t.text),
+                                                        ))
+                                                        .on_hover_text(
+                                                            "post-fader follows this channel's fader; \
+                                                             pre-fader does not",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action = Some(DialogAction::FlipSendPre {
+                                                            from: ch,
+                                                            to: *to,
+                                                            pre: *pre,
+                                                        });
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                    ui.add_space(6.0);
+                                    if row(
+                                        ui,
+                                        "Send to a Bus or Return",
+                                        "a copy, at its own level; the channel still reaches the master",
+                                        !buses.is_empty(),
+                                    ) {
+                                        action = Some(DialogAction::RoutingPick {
+                                            channel: ch,
+                                            page: RoutingPage::Send,
+                                        });
+                                    }
+                                    if row(
+                                        ui,
+                                        "Send to a New Return",
+                                        "makes a return at the end of the desk and sends this channel to it",
+                                        true,
+                                    ) {
+                                        action = Some(DialogAction::SendToNewReturn(ch));
+                                    }
+                                        });
                                 }
                                 // ── which destination ─────────────────────
-                                Some(is_hw) => {
+                                pick => {
                                     ui.label(
-                                        RichText::new(if is_hw {
-                                            "Pick an output:"
-                                        } else {
-                                            "Pick a channel to send to:"
+                                        RichText::new(match pick {
+                                            RoutingPage::Hardware => "Pick an output:",
+                                            RoutingPage::Send => "Pick a bus or a return to send to:",
+                                            _ => "Pick a bus or a channel to route to:",
                                         })
                                         .font(bold(11.0))
                                         .color(t.text),
                                     );
                                     ui.add_space(6.0);
-                                    if !is_hw {
+                                    if pick != RoutingPage::Hardware {
                                         picker_filter(ui, filter, bold(12.0), t.text);
                                     }
                                     egui::ScrollArea::vertical()
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .max_height(ui.available_height() - 40.0)
                                         .show(ui, |ui| {
-                                            if is_hw {
-                                                for (label, first, stereo) in hardware.iter() {
-                                                    // A destination already
-                                                    // routed from here is
-                                                    // greyed: the rule is no
-                                                    // duplicates, and saying
-                                                    // so before the click
-                                                    // beats refusing after.
-                                                    let dest = crate::routing::LaneTarget::Hardware {
-                                                        first: *first,
-                                                        stereo: *stereo,
-                                                    };
-                                                    let free =
-                                                        !existing.iter().any(|(_, d, _, _)| *d == dest);
-                                                    if row(ui, label, "", free) {
-                                                        action = Some(DialogAction::AddRoute {
-                                                            from: ch,
-                                                            target: dest,
-                                                        });
+                                            match pick {
+                                                RoutingPage::Hardware => {
+                                                    for (label, first, stereo) in hardware.iter() {
+                                                        // A destination already
+                                                        // routed from here is
+                                                        // greyed: the rule is no
+                                                        // duplicates, and saying
+                                                        // so before the click
+                                                        // beats refusing after.
+                                                        let dest = crate::routing::LaneTarget::Hardware {
+                                                            first: *first,
+                                                            stereo: *stereo,
+                                                        };
+                                                        let free =
+                                                            !existing.iter().any(|(_, d, _, _)| *d == dest);
+                                                        if row(ui, label, "", free) {
+                                                            action = Some(DialogAction::AddRoute {
+                                                                from: ch,
+                                                                target: dest,
+                                                            });
+                                                        }
                                                     }
                                                 }
-                                            } else {
-                                                for (idx, shown) in picker_rows(channels, filter) {
-                                                    let dest = crate::routing::LaneTarget::Channel(idx);
-                                                    let free =
-                                                        !existing.iter().any(|(_, d, _, _)| *d == dest);
-                                                    if row(ui, &shown, "", free) {
-                                                        action = Some(DialogAction::AddRoute {
-                                                            from: ch,
-                                                            target: dest,
-                                                        });
+                                                RoutingPage::Send => {
+                                                    for (idx, shown) in picker_rows(buses, filter) {
+                                                        // Greyed when it already
+                                                        // takes this channel, and
+                                                        // when it would close a
+                                                        // loop, which says why.
+                                                        let sent = sends.iter().any(|(to, ..)| *to == idx);
+                                                        let lp = looped.contains(&idx);
+                                                        let hint = if lp { LOOP_HINT } else { "" };
+                                                        if row(ui, &shown, hint, !sent && !lp) {
+                                                            action = Some(DialogAction::AddSend { from: ch, to: idx });
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    for (idx, shown) in picker_rows(channels, filter) {
+                                                        let dest = crate::routing::LaneTarget::Channel(idx);
+                                                        let taken = existing.iter().any(|(_, d, _, _)| *d == dest);
+                                                        let lp = looped.contains(&idx);
+                                                        let hint = if lp { LOOP_HINT } else { "" };
+                                                        if row(ui, &shown, hint, !taken && !lp) {
+                                                            action = Some(DialogAction::AddRoute {
+                                                                from: ch,
+                                                                target: dest,
+                                                            });
+                                                        }
                                                     }
                                                 }
                                             }
@@ -12275,7 +12479,7 @@ fn show_on(
                                 {
                                     result.close = true;
                                 }
-                                if step.is_some()
+                                if step != RoutingPage::Main
                                     && ui
                                         .add(Button::new(RichText::new("Back").color(t.text)))
                                         .clicked()
