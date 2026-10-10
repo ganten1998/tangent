@@ -1274,8 +1274,11 @@ pub struct TangentApp {
     /// A drag along the panel's tempo track, once one has begun.
     met_drag: bool,
     /// The meters' held picture: rise instant, fall exponential — the
-    /// engine hands raw per-frame maxima, and raw maxima flicker.
-    meter_hold: [[f32; 2]; recorder::STRIPS],
+    /// engine hands raw per-frame maxima, and raw maxima flicker. In the
+    /// host's legacy strip order, as `RecorderState::strip_peaks` arrives
+    /// (`desk_legacy::v32_strip`), and read by what a strip is through
+    /// `strip_meter`, never by index.
+    meter_hold: [[f32; 2]; crate::desk_legacy::V32_STRIPS],
     /// **The desk's shape, worked out once** (`desk_index::DeskIndex`):
     /// drawn order, ranks, classes, folders and clip counts, which every
     /// view reads so building one is O(visible). Rebuilt by `desk_index`
@@ -4529,7 +4532,7 @@ impl TangentApp {
             met_menu: None,
             met_at: None,
             met_drag: false,
-            meter_hold: [[0.0; 2]; recorder::STRIPS],
+            meter_hold: [[0.0; 2]; crate::desk_legacy::V32_STRIPS],
             desk_index: std::cell::RefCell::new(None),
             desk_index_gen: std::cell::Cell::new(0),
             desk_index_stale: std::cell::Cell::new(true),
@@ -6098,21 +6101,16 @@ impl TangentApp {
     /// So the alias makes the DEFAULT name — "x - 3" — and typing here
     /// replaces it, which is what a default is for.
     fn commit_mixer_name(&mut self, at: recorder::Column, name: String) {
-        // **A COLUMN, converted.** `at` is where the field was drawn and
-        // `strip_names` is a desk array, and the two agree on every column but
-        // the last — so the master's name was being written into the CLICK's
-        // slot while `mixer_view` read it back from `STRIPS`. Third time this
-        // aliasing shipped — and the reason `Column` is now a TYPE.
-        let at = at.desk_index();
+        // **A COLUMN, by what it is.** `at` is where the field was drawn,
+        // and a desk array indexed by a column agreed with it on every column
+        // but the last — so the master's name was written into the CLICK's
+        // slot while `mixer_view` read it back from past the strips. Third
+        // time this aliasing shipped, and the reason `Column` is a TYPE; the
+        // name now goes to the strip the column IS (`Settings::set_strip_name`),
+        // a row's to its row and a special's to the specials, with no index
+        // between them.
         let name = name.trim().to_owned();
-        if self.settings.strip_names.len() <= recorder::STRIPS {
-            self.settings
-                .strip_names
-                .resize(recorder::STRIPS + 1, String::new());
-        }
-        if let Some(slot) = self.settings.strip_names.get_mut(at) {
-            *slot = name;
-        }
+        self.settings.set_strip_name(at.strip_ref(), name);
         // A route into this strip is labelled by its name.
         self.refresh_route_labels();
         self.save_settings();
@@ -6125,9 +6123,9 @@ impl TangentApp {
         match hit {
             // A button, not a value: it opens a panel.
             H::MetFile => 0.0,
-            H::Phase(i) => {
-                f32::from(u8::from(self.settings.strip_phase & (1 << i.desk_index()) != 0))
-            }
+            H::Phase(i) => f32::from(u8::from(
+                self.settings.strip_switch(i.strip_ref(), crate::settings::StripSwitch::Phase),
+            )),
             H::Folder(i) => f32::from(u8::from(
                 i.strip()
                     .and_then(|s| match s {
@@ -6205,10 +6203,7 @@ impl TangentApp {
             // here rather than read from anywhere, so a future change to what
             // ships wet cannot quietly change what a double-click does.
             H::Send(i) => {
-                let at = i.desk_index();
-                if let Some(slot) = self.settings.strip_sends.get_mut(at) {
-                    *slot = 0.0;
-                }
+                self.settings.set_strip_send(i.strip_ref(), 0.0);
                 self.save_settings();
             }
             H::Pan(i) => {
@@ -6384,31 +6379,56 @@ impl TangentApp {
         }
     }
 
-    /// **What a switch mask becomes when one strip's bit is pressed.**
+    /// **Who is on after one member of a switch is pressed**: `live` is
+    /// who is on now, and the answer is who is on after.
     ///
     /// The arm's arithmetic, lifted so the mute and the solo can share it
     /// rather than growing their own copy of a rule the owner asked to be
-    /// the same. `alt` is the exclusive gesture: the pressed bit ALONE, or
-    /// nothing at all when it was already alone - which is what makes one
+    /// the same. `alt` is the exclusive gesture: the pressed member ALONE,
+    /// or nobody at all when it was already alone - which is what makes one
     /// key both arrive at a single strip and leave with none. Without it the
     /// press is an ordinary toggle, and whether that toggle spreads across
     /// the strip selection is decided a layer up in `apply_mixer_hit`.
-    fn switch_next(live: u64, index: usize, alt: bool) -> u64 {
-        let bit = 1u64 << index;
+    ///
+    /// Over MEMBERS rather than a mask's bits: the arm's are rows, and the
+    /// mute's and the solo's are strips by what they are (rows and
+    /// specials, which no longer share one word: W5).
+    fn switch_next<T: PartialEq + Copy>(live: &[T], pressed: T, alt: bool) -> Vec<T> {
+        let on = live.contains(&pressed);
         if alt {
-            if live == bit { 0 } else { bit }
+            if on && live.len() == 1 { Vec::new() } else { vec![pressed] }
+        } else if on {
+            live.iter().copied().filter(|x| *x != pressed).collect()
         } else {
-            live ^ bit
+            live.iter().copied().chain([pressed]).collect()
+        }
+    }
+
+    /// **A mute or a solo pressed on one strip**, by `switch_next` over
+    /// every strip that has the switch: the rows and the four specials,
+    /// each read and written by what it is (`Settings::strip_switch`), so
+    /// alt on a track stands the click and the master down as it always did.
+    fn press_switch(&mut self, s: recorder::StripRef, w: crate::settings::StripSwitch) {
+        let every: Vec<recorder::StripRef> = (0..recorder::CHANNELS)
+            .map(recorder::StripRef::Row)
+            .chain(recorder::StripRef::SPECIALS)
+            .collect();
+        let live: Vec<recorder::StripRef> =
+            every.iter().copied().filter(|x| self.settings.strip_switch(*x, w)).collect();
+        let next = Self::switch_next(&live, s, self.alt_down);
+        for x in every {
+            self.settings.set_strip_switch(x, w, next.contains(&x));
         }
     }
 
     /// Whether one of the four switches is on for channel `n`.
     fn strip_switch(&self, hit: crate::mixer_panel::Hit, n: usize) -> bool {
         use crate::mixer_panel::Hit as H;
-        let bit = recorder::Column::Track(n).desk_index();
+        use crate::settings::StripSwitch;
+        let row = recorder::StripRef::Row(n);
         match hit {
-            H::Mute(_) => self.settings.strip_muted & (1 << bit) != 0,
-            H::Solo(_) => self.settings.strip_soloed & (1 << bit) != 0,
+            H::Mute(_) => self.settings.strip_switch(row, StripSwitch::Mute),
+            H::Solo(_) => self.settings.strip_switch(row, StripSwitch::Solo),
             H::Arm(_) => self.armed_mask() & (1 << n) != 0,
             H::ToTheory(_) => self.to_theory(n),
             _ => false,
@@ -6510,12 +6530,7 @@ impl TangentApp {
                 // views of it move together.
                 None => self.settings.master_gain = gain,
             },
-            H::Send(i) => {
-                let i = i.desk_index();
-                if let Some(slot) = self.settings.strip_sends.get_mut(i) {
-                    *slot = f64::from(v);
-                }
-            }
+            H::Send(i) => self.settings.set_strip_send(i.strip_ref(), f64::from(v)),
             H::Pan(i) => {
                 let p = f64::from(v).mul_add(2.0, -1.0).clamp(-1.0, 1.0);
                 match i.strip() {
@@ -6553,18 +6568,16 @@ impl TangentApp {
             // what every other desk means by alt-clicking a solo, and it was
             // the only way to hear one track that meant clicking every other
             // track off.
-            H::Mute(i) => {
-                self.settings.strip_muted =
-                    Self::switch_next(self.settings.strip_muted, i.desk_index(), self.alt_down);
-            }
-            // **Polarity.** A bit beside the mute's, because it is the same
+            H::Mute(i) => self.press_switch(i.strip_ref(), crate::settings::StripSwitch::Mute),
+            // **Polarity.** A switch beside the mute's, because it is the same
             // kind of switch: one per strip, about the signal, either on or
-            // off. The engine reads the mask and turns it into a sign.
-            H::Phase(i) => self.settings.strip_phase ^= 1 << i.desk_index(),
-            H::Solo(i) => {
-                self.settings.strip_soloed =
-                    Self::switch_next(self.settings.strip_soloed, i.desk_index(), self.alt_down);
+            // off. The engine reads it and turns it into a sign.
+            H::Phase(i) => {
+                let (s, w) = (i.strip_ref(), crate::settings::StripSwitch::Phase);
+                let on = self.settings.strip_switch(s, w);
+                self.settings.set_strip_switch(s, w, !on);
             }
+            H::Solo(i) => self.press_switch(i.strip_ref(), crate::settings::StripSwitch::Solo),
             // **The icon, and the plus that stands where it will be.**
             //
             // On an UNUSED channel the whole panel is this target and pressing
@@ -6645,12 +6658,8 @@ impl TangentApp {
                 // Seeded with what is THERE, default or not: a name is
                 // edited, and starting from the default is how somebody makes
                 // "x - 3" into "x - 3 vox" without typing it twice.
-                let seed = match self
-                    .settings
-                    .strip_names
-                    .get(i.desk_index())
-                {
-                    Some(n) if !n.is_empty() => n.clone(),
+                let seed = match self.settings.strip_name(i.strip_ref()) {
+                    n if !n.is_empty() => n.to_owned(),
                     // Nothing typed yet, so the field starts from the DEFAULT —
                     // "x - 3" for an input, "BACKING" for the track. Editing a
                     // default in place is how somebody gets to "x - 3 vox"
@@ -6741,10 +6750,14 @@ impl TangentApp {
                     // **Through `switch_next`**, the rule lifted out of here
                     // for the mute and the solo: a copy kept beside it is
                     // where the next change to the gesture lands in one
-                    // place only. Exact in a `u32`, since `n < CHANNELS`.
+                    // place only. The arm word's lanes are its members.
                     let live = self.armed_mask();
-                    let next = u32::try_from(Self::switch_next(u64::from(live), n, self.alt_down))
-                        .unwrap_or(live);
+                    let lanes = u32::BITS as usize;
+                    let on: Vec<usize> = (0..lanes).filter(|r| live >> r & 1 == 1).collect();
+                    let next = Self::switch_next(&on, n, self.alt_down)
+                        .into_iter()
+                        .filter(|r| *r < lanes)
+                        .fold(0u32, |m, r| m | 1 << r);
                     self.set_armed_mask(next);
                 }
                 return;
@@ -7002,9 +7015,10 @@ impl TangentApp {
         if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == Some(gone)) {
             copy.files_at = Some(emptied);
         }
-        use crate::recorder::Strip;
         let d = Settings::default();
-        let at = Strip::Channel(n).index();
+        // The row's own strip facts: a track's are its row's (the specials
+        // keep theirs apart, W5).
+        let at = n;
         if let Some(k) = self.settings.channel_kinds.get_mut(n) {
             *k = recorder::ChannelKind::as_u8(None);
         }
@@ -7585,20 +7599,20 @@ impl TangentApp {
     /// (in row order), the first of which ranks `first` among the drawn.
     fn mixer_view_rows(&self, first: usize, rows: Vec<usize>) -> crate::mixer_panel::MixerView<'_> {
         use crate::recorder::{Strip, StripRef};
+        use crate::settings::StripSwitch;
         let g = self.settings.knobs().gains;
-        let desk = self.desk();
         let index = self.desk_index();
-        // **Borrowed, not copied.** This was `let peaks = self.meter_hold`,
-        // a copy of every strip's hold on every view build: thirty-five
-        // pairs is nothing, a desk that grows by appending is not.
-        let peaks = &self.meter_hold;
         // **The inputs that are open, and one spare to add to.** Four empty
         // microphone columns is not a rack with room in it, it is a desk that
         // is mostly plus signs. The first is always drawn — it is the band's
         // own microphone row seen a second time, and it is there whether or
         // not anything is plugged in.
+        //
+        // **Every setting by what the strip IS** (`sr`): a row's from its row,
+        // a special's from the specials (W5), never by an index into strip
+        // space, which no live array has any more.
         let strip = |s: Strip| {
-            let i = s.index();
+            let sr = StripRef::from(s);
             let kind = match s {
                 Strip::Channel(n) => self.channel_kind(n),
                 _ => None,
@@ -7670,13 +7684,12 @@ impl TangentApp {
                 // **What the user called it wins.** A desk is a set of names
                 // before it is a set of faders: "BELL KEYS" is what the app
                 // knows and "Rhodes" is what the person at the desk knows.
-                name: self
-                    .settings
-                    .strip_names
-                    .get(i)
-                    .map_or(name, |n| if n.is_empty() { name } else { n.as_str() }),
+                name: match self.settings.strip_name(sr) {
+                    "" => name,
+                    typed => typed,
+                },
                 detail,
-                color: self.strip_color(i),
+                color: self.strip_color(sr),
                 // **What the SOURCE is, not what the samples happen to be.**
                 // A mono microphone whose two bars are identical is a meter
                 // claiming a stereo signal; the input knows its own width and
@@ -7697,26 +7710,26 @@ impl TangentApp {
                 // Nth slot may live in another rack — the master's first
                 // three do. Every bay is the strip's node's.
                 inserts: std::array::from_fn(|n| {
-                    self.desk_slot_bay(i, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
+                    self.strip_slot_bay(sr, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
                 }),
                 // The dot on a keyed chip: the same bay, asked of the key
                 // table, which keys by bay too.
                 keyed: std::array::from_fn(|n| {
-                    self.desk_slot_bay(i, n).is_some_and(|sb| self.settings.insert_keys.get(sb).is_some())
+                    self.strip_slot_bay(sr, n).is_some_and(|sb| self.settings.insert_keys.get(sb).is_some())
                 }),
                 // **The same bay again, like the names beside it.** A bypass
                 // is keyed by the plugin's own bay, so the flag and the word
                 // on the chip are read out of one key and cannot end up
                 // describing different bays.
                 bypassed: std::array::from_fn(|n| {
-                    self.desk_slot_bay(i, n).is_some_and(|sb| self.bay_bypassed(sb))
+                    self.strip_slot_bay(sr, n).is_some_and(|sb| self.bay_bypassed(sb))
                 }),
                 frozen: matches!(s, Strip::Channel(n) if self.lane_frozen(n).is_some()),
                 kind,
                 icon,
                 empty,
                 gain,
-                send: desk.send[i],
+                send: self.settings.strip_send(sr) as f32,
                 pan: match s {
                     Strip::Channel(n) => self
                         .settings
@@ -7727,10 +7740,10 @@ impl TangentApp {
                     Strip::Drums => self.settings.drums_pan as f32,
                     _ => 0.0,
                 },
-                peak: peaks[i],
-                muted: desk.muted[i],
-                phase: self.settings.strip_phase & (1 << i) != 0,
-                soloed: desk.soloed[i],
+                peak: self.strip_meter(sr),
+                muted: self.strip_heard_muted(sr),
+                phase: self.settings.strip_switch(sr, StripSwitch::Phase),
+                soloed: self.strip_heard_soloed(sr),
                 // What the × means, where it means anything: a used general
                 // channel goes back to being an empty slot. The click and
                 // the bus are the desk's own and stay.
@@ -7745,7 +7758,7 @@ impl TangentApp {
                 },
             }
         };
-        let master = StripRef::MASTER_INDEX;
+        let master = StripRef::Master;
         let shown = index.shown_len();
         let tracks: Vec<_> = rows.into_iter().map(|row| strip(Strip::Channel(row))).collect();
         crate::mixer_panel::MixerView {
@@ -7763,7 +7776,7 @@ impl TangentApp {
                 click: strip(Strip::Click),
                 master: crate::mixer_panel::StripView {
                     mono: self.settings.master_mono,
-                    phase: self.settings.strip_phase & (1 << master) != 0,
+                    phase: self.settings.strip_switch(master, StripSwitch::Phase),
                     // The master is not a channel and has no MIDI to send.
                     to_theory: false,
                     is_folder: false,
@@ -7772,16 +7785,15 @@ impl TangentApp {
                     route_count: 0,
                     strip: None,
                     icon: 0,
-                    name: self
-                        .settings
-                        .strip_names
-                        .get(master)
-                        .map_or("MASTER", |n| if n.is_empty() { "MASTER" } else { n.as_str() }),
+                    name: match self.settings.strip_name(master) {
+                        "" => "MASTER",
+                        typed => typed,
+                    },
                     detail: "",
                     // **Through `strip_color`, like every other strip.**
                     //
                     // This read `strip_colors.last()` raw, so the master
-                    // never saw the palette at all: `strip_color(STRIPS)`
+                    // never saw the palette at all: `strip_color(Master)`
                     // answers `Palette::master()` — the same crimson in
                     // every palette, because the master is the one strip you
                     // go looking for — and nothing called it. A desk nobody
@@ -7799,7 +7811,7 @@ impl TangentApp {
                     // top three named the bottom three, and the bottom three
                     // named something that was never on the master at all.
                     inserts: std::array::from_fn(|n| {
-                        self.desk_slot_bay(master, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
+                        self.strip_slot_bay(master, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
                     }),
                     kind: None,
                     empty: false,
@@ -7820,17 +7832,17 @@ impl TangentApp {
                     armed: false,
                     // The master keys like any strip, by its bays.
                     keyed: std::array::from_fn(|n| {
-                        self.desk_slot_bay(master, n).is_some_and(|sb| self.settings.insert_keys.get(sb).is_some())
+                        self.strip_slot_bay(master, n).is_some_and(|sb| self.settings.insert_keys.get(sb).is_some())
                     }),
                     // The master's two racks, resolved the way its names
                     // are: slots 0..2 are the extra rack, 3..5 the original.
                     frozen: false,
                     bypassed: std::array::from_fn(|n| {
-                        self.desk_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
+                        self.strip_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
                     }),
                 },
             },
-            any_solo: desk.any_solo(),
+            any_solo: self.any_solo(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
             selected: self.selected_row(),
@@ -10854,6 +10866,9 @@ impl TangentApp {
             // puts every track back on its own id.
             ids: &s.track_ids,
             next_id: s.next_track_id,
+            // The specials' names, paint, sends and switches (W5): the rows'
+            // arrays above hold rows and nothing else.
+            specials: &s.specials,
         }
     }
 
@@ -10934,6 +10949,8 @@ impl TangentApp {
         for (i, k) in d.kinds.iter().take(recorder::CHANNELS).enumerate() {
             self.settings.channel_kinds[i] = (*k).min(2);
         }
+        // The rows' strip facts by row; the specials' are their own (W5),
+        // below with the masks.
         self.settings.strip_names = d.names.clone();
         for (i, c) in d.colors.iter().take(self.settings.strip_colors.len()).enumerate() {
             self.settings.strip_colors[i] = *c;
@@ -10945,11 +10962,26 @@ impl TangentApp {
         // error policy) never reaches a snapshot. An empty path is no bay.
         self.settings.plugins =
             d.plugins.iter().filter(|(_, p)| !p.is_empty()).map(|(sb, p)| (*sb, p.clone())).collect();
-        for (i, v) in d.sends.iter().take(recorder::STRIPS).enumerate() {
+        for (i, v) in d.sends.iter().take(self.settings.strip_sends.len()).enumerate() {
             self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
         }
         self.settings.strip_muted = d.muted;
         self.settings.strip_soloed = d.soloed;
+        // **The specials whole**, as the snapshot says them (it always
+        // does), each send clamped as a row's is. Their polarity is applied
+        // with the rows' below, and only when the snapshot says it.
+        {
+            use crate::settings::StripSwitch;
+            let phase = recorder::StripRef::SPECIALS.map(|sr| self.settings.strip_switch(sr, StripSwitch::Phase));
+            self.settings.specials = d.specials.clone();
+            for sr in recorder::StripRef::SPECIALS {
+                let send = self.settings.strip_send(sr);
+                self.settings.set_strip_send(sr, send.clamp(0.0, 1.0));
+            }
+            for (sr, on) in recorder::StripRef::SPECIALS.into_iter().zip(phase) {
+                self.settings.set_strip_switch(sr, StripSwitch::Phase, on);
+            }
+        }
         for (i, v) in d.gains.iter().take(recorder::CHANNELS).enumerate() {
             self.settings.channel_gains[i] = v.clamp(0.0, 8.0);
         }
@@ -11030,6 +11062,11 @@ impl TangentApp {
         // that is the whole point of carrying them.
         if let Some(v) = d.phase {
             self.settings.strip_phase = v;
+            for (node, sp) in d.specials.iter() {
+                if let Some(sr) = recorder::StripRef::of_special(node) {
+                    self.settings.set_strip_switch(sr, crate::settings::StripSwitch::Phase, sp.phase);
+                }
+            }
         }
         if let Some(v) = d.to_theory.as_ref() {
             for (i, slot) in self.settings.strip_to_theory.iter_mut().enumerate() {
@@ -11875,13 +11912,7 @@ impl TangentApp {
             // **A fresh binding's send rests at ZERO** — the owner's ruling:
             // only the shipped DX7 track arrives wired to the reverb; every
             // track anybody adds starts dry until they turn it up.
-            if let Some(send) = self
-                .settings
-                .strip_sends
-                .get_mut(recorder::Strip::Channel(ch).index())
-            {
-                *send = 0.0;
-            }
+            self.settings.set_strip_send(recorder::StripRef::Row(ch), 0.0);
             // **No arm.** A fresh binding used to arm itself — first
             // additively (the phantom multi-record), then exclusively
             // (which silently DISARMED whatever the player had up, the
@@ -12294,7 +12325,7 @@ impl TangentApp {
     fn reorder_channels(&mut self, order: &[usize]) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        use crate::recorder::{CHANNELS, STRIPS};
+        use crate::recorder::CHANNELS;
         if order.len() != CHANNELS {
             return;
         }
@@ -12331,8 +12362,8 @@ impl TangentApp {
         }
         // The channel block exactly fills a u32 at thirty-two, so the
         // "everything above the channels" complement has to dodge the
-        // 1<<32 overflow; the strip masks are u64 now (thirty-five strip
-        // seats) and get their own mover.
+        // 1<<32 overflow; the rows' strip masks are u64 and get their own
+        // mover (the specials' switches are theirs and do not move).
         let chan_bits_u32: u32 = if CHANNELS >= 32 {
             u32::MAX
         } else {
@@ -12371,12 +12402,12 @@ impl TangentApp {
             self.settings.tracks_added = out;
         }
 
-        // ── strip space, identity above the channels ─────────────────────
+        // ── the rows' strip facts; the specials keep theirs (W5) ─────────
         let colors = self.settings.strip_colors;
         for n in 0..CHANNELS {
             self.settings.strip_colors[n] = colors[order[n]];
         }
-        while self.settings.strip_names.len() < STRIPS + 1 {
+        while self.settings.strip_names.len() < CHANNELS {
             self.settings.strip_names.push(String::new());
         }
         let names = self.settings.strip_names.clone();
@@ -12755,13 +12786,7 @@ impl TangentApp {
         self.settings.tracks_added |= 1 << n;
         // Dry at birth — see the bind's own comment: only the shipped DX7
         // comes wired to the reverb.
-        if let Some(send) = self
-            .settings
-            .strip_sends
-            .get_mut(recorder::Strip::Channel(n).index())
-        {
-            *send = 0.0;
-        }
+        self.settings.set_strip_send(recorder::StripRef::Row(n), 0.0);
         self.save_settings();
         // **Its own moment.** Ctrl/Cmd+T, the header's circled plus and the
         // keyboard's `HdrAdd` all end here and nowhere else, so without
@@ -12786,7 +12811,8 @@ impl TangentApp {
         if n >= recorder::CHANNELS {
             return;
         }
-        let at = recorder::Strip::Channel(n).index();
+        // A track's strip facts are its row's (W5).
+        let at = n;
         // A paste means what was copied LAST — see the clip copy.
         self.auto_clipboard.clear();
         self.auto_clipboard_rows.clear();
@@ -12971,7 +12997,8 @@ impl TangentApp {
     fn paste_track_inner(&mut self, into: usize, copy: TrackCopy) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        let at = recorder::Strip::Channel(into).index();
+        // A track's strip facts are its row's (W5).
+        let at = into;
         // A paste is a NEW track, never the source again: its own id. Before
         // `set_channel_kind`, which then finds the row counted.
         self.mint_row_id(into);
@@ -13412,7 +13439,7 @@ impl TangentApp {
         // the next paint, from the desk as it now stands.
         self.click_moment = None;
         self.a11y_on = None;
-        self.meter_hold = [[0.0; 2]; recorder::STRIPS];
+        self.meter_hold = [[0.0; 2]; crate::desk_legacy::V32_STRIPS];
         self.refresh_route_labels();
         // **A drum panel left on no row** - its track removed, by the edit
         // or by an undo or redo - shows no kit (`drumpad_row`), so the last
@@ -13591,7 +13618,10 @@ impl TangentApp {
         });
     }
 
-    fn open_track_dialog(&mut self, lane: usize, removable: bool) {
+    fn open_track_dialog(&mut self, strip: recorder::StripRef, removable: bool) {
+        // The row the menu's row-only parts act on; a strip that is no row
+        // (the click) has none, and every such part asks `lane < CHANNELS`.
+        let lane = strip.row().unwrap_or(usize::MAX);
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(Dialog::Track {
             palette: self.settings.palette_choice,
@@ -13625,6 +13655,7 @@ impl TangentApp {
             } else {
                 0
             },
+            strip,
         });
     }
 
@@ -13659,8 +13690,8 @@ impl TangentApp {
         }
     }
 
-    pub fn strip_color(&self, i: usize) -> usize {
-        let manual = self.settings.strip_colors.get(i).copied().unwrap_or(0);
+    pub fn strip_color(&self, s: recorder::StripRef) -> usize {
+        let manual = self.settings.strip_paint(s);
         if manual != 0 {
             return manual as usize;
         }
@@ -13668,7 +13699,7 @@ impl TangentApp {
         // a bare channel is a bus somebody records onto by mistake. From
         // the AUTHORITY rather than the settings default, so desks that
         // migrated through v14 (which inserted a 0) get it too.
-        if i == recorder::Strip::Drums.index() {
+        if s == recorder::StripRef::Drums {
             return crate::mixer_panel::DRUMS_COLOR;
         }
         if self.settings.auto_palette {
@@ -13677,13 +13708,12 @@ impl TangentApp {
             // used to hold fixed amber and fixed red whatever the theme was,
             // which is how a purple theme ended up with an orange click and a
             // red master sitting next to sixteen channels that had all moved.
-            // By what the strip IS (`StripRef`, the one home of desk-index
-            // arithmetic), not by comparing the index against widths.
-            match recorder::StripRef::from_desk_index(i) {
-                Some(recorder::StripRef::Click) => return pal.click(),
-                Some(recorder::StripRef::Master) => return pal.master(),
-                Some(recorder::StripRef::Row(row)) => return pal.slot(row),
-                _ => {}
+            // By what the strip IS, never by comparing an index with widths.
+            match s {
+                recorder::StripRef::Click => return pal.click(),
+                recorder::StripRef::Master => return pal.master(),
+                recorder::StripRef::Row(row) => return pal.slot(row),
+                recorder::StripRef::Drums | recorder::StripRef::Fx => {}
             }
         }
         0
@@ -19774,7 +19804,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         rows.get(i).map(|(_, action, _)| *action)
     }
 
-    fn land_bay_carry(&mut self, to: Option<usize>, onto: Option<crate::desk_id::SeatBay>) {
+    fn land_bay_carry(&mut self, to: Option<recorder::StripRef>, onto: Option<crate::desk_id::SeatBay>) {
         let Some((from, _, active)) = self.bay_carry.take() else {
             return;
         };
@@ -19837,19 +19867,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the host picks the next free one — the gesture's oldest meaning,
         // kept for the surface that has nothing finer to aim at.
         //
-        // `to` is a DESK index here (which column the hand is over), so it is
-        // compared with the strip the carried bay is SHOWN on rather than
-        // with the bay: dropping a plugin from a track's lower rack onto
-        // that same track's paint is a drop where it already is, and used to
-        // copy it back into the track's first free bay.
+        // `to` is the STRIP the hand is over, so it is compared with the
+        // strip the carried bay is SHOWN on rather than with the bay:
+        // dropping a plugin from a track's lower rack onto that same track's
+        // paint is a drop where it already is, and used to copy it back into
+        // the track's first free bay. The host's request names the strip by
+        // its legacy strip index, its own form until its road moves onto
+        // identities (C11), crossed through the frozen map and nowhere else.
         let home = shown_on(from);
-        if let Some(to) = to.filter(|t| home.is_none() || home != self.desk_node(*t)) {
-            self.request_recorder(recorder::RecorderRequest::CopyInsert {
-                from_strip: strip,
-                from_bay: bay,
-                to_strip: to,
-                to_bay: None,
-            });
+        if let Some(to) = to.filter(|t| home.is_none() || home != Some(self.strip_node(*t))) {
+            if let Some(to_strip) = crate::desk_legacy::v32_strip(to) {
+                self.request_recorder(recorder::RecorderRequest::CopyInsert {
+                    from_strip: strip,
+                    from_bay: bay,
+                    to_strip,
+                    to_bay: None,
+                });
+            }
         }
     }
 
@@ -22853,7 +22887,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     std::array::from_fn(|i| self.pad_label(i))
                 })
             },
-            color: self.strip_color(clip.lane),
+            color: self.strip_color(recorder::StripRef::Row(clip.lane)),
         }
     }
 
@@ -27125,23 +27159,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // rack on this view had the menu except the one at the
                 // bottom of the mixer, and the owner found the master's six
                 // bays with no way to delete or replace what was in them.
-                // A bay is a bay: the only thing that differs is which seat
-                // the slot resolves to, and `seat_bay` already knows both
+                // A bay is a bay: the only thing that differs is which rack
+                // the slot resolves to, and `slot_key` already knows both
                 // answers. `BusBay` carries the master's column rather than
-                // a channel index, which is why it is `STRIPS` here and `n`
-                // above — the same split the left-click has always made.
+                // a row, which is why it is the column's strip here and the
+                // row's above — the same split the left-click has always made.
                 let bay_hit = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     match crate::arrangement_panel::hit_test(rect, &view, p) {
-                        Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((n, b)),
-                        Some(crate::arrangement_panel::Hit::BusBay(col, b)) => {
-                            Some((col.desk_index(), b))
-                        }
+                        Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((recorder::StripRef::Row(n), b)),
+                        Some(crate::arrangement_panel::Hit::BusBay(col, b)) => Some((col.strip_ref(), b)),
                         _ => None,
                     }
                 };
-                if let Some(sb) = bay_hit.and_then(|(n, b)| self.desk_slot_bay(n, b)) {
+                if let Some(sb) = bay_hit.and_then(|(s, b)| self.strip_slot_bay(s, b)) {
                     // Slots 3..5 are a FOLDER's second rack — and the
                     // MASTER's first three are its extra rack. Resolved to
                     // the bay HERE, by identity, so the menu's delete and
@@ -27168,7 +27200,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // way to say "put the copied track HERE" and no reason to
                     // aim at an empty row at all.
                     let used = self.channel_used(lane);
-                    self.open_track_dialog(lane, used);
+                    self.open_track_dialog(recorder::StripRef::Row(lane), used);
                     return;
                 }
                 // **A right-press ON A CLIP opens its own menu** — delete
@@ -27913,7 +27945,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // **And the mixer's own CARRY**, on the same terms —
                         // see `bay_carry`. A loaded bay arms; the window
                         // still opens on a press that does not travel.
-                        if let Some(sb) = self.desk_slot_bay(n, bay) {
+                        if let Some(sb) = self.strip_slot_bay(recorder::StripRef::Row(n), bay) {
                             if self.plugin(sb).is_some() {
                                 self.bay_carry = Some((sb, p, false));
                             } else {
@@ -28726,14 +28758,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let onto = match crate::arrangement_panel::hit_test(rect, &view, p) {
                     // Slots 3..5 are a FOLDER's second rack — through
                     // `slot_key` like every other caller on this header.
-                    Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => self.desk_slot_bay(n, b),
+                    Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => {
+                        self.strip_slot_bay(recorder::StripRef::Row(n), b)
+                    }
                     // The master's six slots live in two racks, and the
                     // header reaches them by their own variant.
                     Some(crate::arrangement_panel::Hit::BusBay(col, slot)) => self.slot_bay(col, slot),
                     _ => None,
                 };
                 let _ = (sb, active);
-                self.land_bay_carry(target, onto);
+                self.land_bay_carry(target.map(recorder::StripRef::Row), onto);
             }
         }
         if released {
@@ -29353,7 +29387,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     c.lane.min(self.desk_extent().saturating_sub(1)),
                     (c.start_s / domain) as f32,
                     (self.clip_len_resolved(c) / domain) as f32,
-                    self.strip_color(c.lane),
+                    self.strip_color(recorder::StripRef::Row(c.lane)),
                 )
             })
             .collect();
@@ -29455,11 +29489,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ) -> crate::arrangement_panel::ArrangeView<'a> {
         use crate::recorder::StripRef;
         let g = self.settings.knobs().gains;
-        let desk = self.desk();
-        // Borrowed, not copied: see `mixer_view_rows`.
-        let peaks = &self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
-        let master = StripRef::MASTER_INDEX;
+        let master = StripRef::Master;
         let (index, lane_scroll, ranks) = self.arr_lane_window();
         let window = index.window(ranks.start, ranks.len());
         crate::arrangement_panel::ArrangeView {
@@ -29485,12 +29516,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The master's two racks, in strip order — `slot_key` is the one
             // place that knows which of its six slots lives where.
             master_inserts: std::array::from_fn(|n| {
-                self.desk_slot_bay(master, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
+                self.strip_slot_bay(master, n).and_then(|sb| self.plugin(sb)).map_or("", insert_chip_name)
             }),
             // Which of them are out of circuit, read off the same bays as the
             // names above — see `Settings::bypass`.
             master_bypassed: std::array::from_fn(|n| {
-                self.desk_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
+                self.strip_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
             }),
             // No UI to open it yet — the row exists so the tempo work has
             // somewhere to land.
@@ -29557,7 +29588,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     bypassed: std::array::from_fn(|b| {
                         crate::desk_id::slot_key(self.row_node(n), b).is_some_and(|sb| self.bay_bypassed(sb))
                     }),
-                    color: self.strip_color(n),
+                    color: self.strip_color(StripRef::Row(n)),
                     kind,
                     // `channel_used`, with the clip count from the index
                     // rather than a walk over every clip in the song.
@@ -29565,9 +29596,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         || index.clip_count(n) > 0
                         || (self.settings.tracks_added >> n) & 1 == 1,
                     armed: self.armed_mask() & (1 << n) != 0,
-                    muted: desk.muted[n],
-                    phase: self.settings.strip_phase & (1 << n) != 0,
-                    soloed: desk.soloed[n],
+                    muted: self.strip_heard_muted(StripRef::Row(n)),
+                    phase: self.strip_inverted(StripRef::Row(n)),
+                    soloed: self.strip_heard_soloed(StripRef::Row(n)),
                     to_theory: self.to_theory(n),
                     is_folder: self.is_folder(n),
                     in_folder: index.in_folder(n),
@@ -29587,9 +29618,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         by_parent || own_group
                     },
                     gain: g.channels.get(n).copied().unwrap_or(1.0),
-                    send: desk.send[n],
+                    send: self.settings.strip_send(StripRef::Row(n)) as f32,
                     pan: self.channel_pan(n),
-                    peak: peaks[n],
+                    peak: self.strip_meter(StripRef::Row(n)),
                 })
             })
             .collect()),
@@ -29732,8 +29763,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let suggested = {
             let name = self
                 .drumpad_row()
-                .and_then(|lane| self.settings.strip_names.get(recorder::Strip::Channel(lane).index()))
-                .map(String::as_str)
+                .map(|lane| self.settings.strip_name(recorder::StripRef::Row(lane)))
                 .unwrap_or_default()
                 .trim()
                 .to_owned();
@@ -31490,13 +31520,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// how to turn one into the other.
     /// Whether the master is folded to mono on the way out. The host pushes
     /// it to the engine; see `Settings::master_mono`.
-    /// **Whether the master's own MUTE switch is down.**
-    ///
-    /// The master's bit in `strip_muted`, which is `STRIPS` — the index
-    /// `Column::desk_index` hands back for a column with no `Strip`. The
-    /// switch is new; the bit has always been reachable.
+    /// **Whether the master's own MUTE switch is down**: the master's own
+    /// flag among the specials (W5). It was the master's bit of the strip
+    /// mask, one past every strip; the specials have left strip space.
     pub fn master_muted(&self) -> bool {
-        self.settings.strip_muted & (1 << recorder::STRIPS) != 0
+        self.settings.strip_switch(recorder::StripRef::Master, crate::settings::StripSwitch::Mute)
     }
 
     pub fn master_mono(&self) -> bool {
@@ -34201,7 +34229,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             A::HdrBay(n, bay) => {
                 self.touch_track(n);
-                if let Some(sb) = self.desk_slot_bay(n, bay) {
+                if let Some(sb) = self.strip_slot_bay(recorder::StripRef::Row(n), bay) {
                     self.open_bay_face(sb);
                 }
             }
@@ -34892,9 +34920,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.undo_commit();
     }
 
-    /// **Which strips are polarity-inverted**, one bit per strip.
+    /// **Which ROWS are polarity-inverted**, one bit per row (the host's
+    /// plan reads it). A special's polarity is its own: [`Self::strip_inverted`].
     pub fn strip_phase(&self) -> u64 {
         self.settings.strip_phase
+    }
+
+    /// **Whether a strip's polarity is inverted**, by what the strip is: a
+    /// row's bit or a special's flag (`Settings::strip_switch`).
+    pub fn strip_inverted(&self, s: recorder::StripRef) -> bool {
+        self.settings.strip_switch(s, crate::settings::StripSwitch::Phase)
+    }
+
+    /// **How much of a strip goes to the effects return**, 0..=1, by what
+    /// the strip is: the send knob (`Settings::strip_send`).
+    pub fn strip_send(&self, s: recorder::StripRef) -> f64 {
+        self.settings.strip_send(s)
     }
 
     /// How often the click sounds — see `Settings::metronome_div`.
@@ -34950,17 +34991,35 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_camera_uid.as_deref()
     }
 
-    /// The desk's routing, for the host to push to the engine.
-    ///
-    /// **Read from settings every frame, like the gains beside it.** One live
-    /// value, so a fader moved, a file loaded and a hand-edited `settings.json`
-    /// all arrive by the same path.
+    /// **The desk in the legacy strip space**, for the host's take facts
+    /// (which strips a take was cut under) and nothing else: the strip-space
+    /// form the bridge was fed every frame before it read the desk by what
+    /// each strip is ([`Self::strip_send`], [`Self::strip_heard_muted`],
+    /// [`Self::strip_heard_soloed`]). Kept beside those until the host's
+    /// take road moves off it (C11), and built through the frozen strip map
+    /// (`desk_legacy::V32Desk::of`), so no index is worked out here.
     pub fn desk(&self) -> recorder::Desk {
-        recorder::Desk {
-            send: std::array::from_fn(|i| self.settings.strip_sends[i] as f32),
-            muted: std::array::from_fn(|i| self.heard_as_muted(i)),
-            soloed: std::array::from_fn(|i| self.heard_as_soloed(i)),
-        }
+        recorder::Desk::of(|s| {
+            (self.settings.strip_send(s) as f32, self.strip_heard_muted(s), self.strip_heard_soloed(s))
+        })
+    }
+
+    /// Whether anything the desk can solo is soloed, which is what makes
+    /// solo exclusive: a row, the drum bus, the click or the effects return
+    /// (the master has no solo of its own).
+    pub fn any_solo(&self) -> bool {
+        use recorder::StripRef;
+        (0..recorder::CHANNELS)
+            .map(StripRef::Row)
+            .chain([StripRef::Drums, StripRef::Click, StripRef::Fx])
+            .any(|s| self.settings.strip_switch(s, crate::settings::StripSwitch::Solo))
+    }
+
+    /// **A strip's meter**, held and falling (`meter_hold`), by what the
+    /// strip is. The host still pushes the peaks in its legacy strip order,
+    /// so the one crossing to that order is here (`desk_legacy::v32_strip`).
+    pub fn strip_meter(&self, s: recorder::StripRef) -> [f32; 2] {
+        crate::desk_legacy::v32_strip(s).and_then(|i| self.meter_hold.get(i)).copied().unwrap_or([0.0; 2])
     }
 
     /// **What the ENGINE is told about this strip's mute — folders included.**
@@ -34977,15 +35036,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// would destroy whatever the child had chosen: mute the folder, unmute
     /// it, and a track that was muted on its own comes back audible.
     ///
-    /// `desk()` is the single crossing to the engine and the take's own
-    /// record of what was heard, so folding it in at that one point makes it
-    /// true of playback, monitoring and the file together.
-    fn heard_as_muted(&self, i: usize) -> bool {
-        if self.settings.strip_muted & (1 << i) != 0 {
+    /// This is the single answer the engine (through the bridge) and the
+    /// take's own record of what was heard both read, so folding it in at
+    /// that one point makes it true of playback, monitoring and the file
+    /// together.
+    pub fn strip_heard_muted(&self, s: recorder::StripRef) -> bool {
+        use crate::settings::StripSwitch;
+        if self.settings.strip_switch(s, StripSwitch::Mute) {
             return true;
         }
-        self.folder_of(i)
-            .is_some_and(|f| self.settings.strip_muted & (1 << f) != 0)
+        s.row()
+            .and_then(|r| self.folder_of(r))
+            .is_some_and(|f| self.settings.strip_switch(recorder::StripRef::Row(f), StripSwitch::Mute))
     }
 
     /// The same for solo: soloing a folder solos the GROUP.
@@ -34993,12 +35055,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Solo is exclusive here — with anything soloed, only the soloed are
     /// heard — so a folder whose children were left out would solo itself
     /// and silence the very tracks it groups.
-    fn heard_as_soloed(&self, i: usize) -> bool {
-        if self.settings.strip_soloed & (1 << i) != 0 {
+    pub fn strip_heard_soloed(&self, s: recorder::StripRef) -> bool {
+        use crate::settings::StripSwitch;
+        if self.settings.strip_switch(s, StripSwitch::Solo) {
             return true;
         }
-        self.folder_of(i)
-            .is_some_and(|f| self.settings.strip_soloed & (1 << f) != 0)
+        s.row()
+            .and_then(|r| self.folder_of(r))
+            .is_some_and(|f| self.settings.strip_switch(recorder::StripRef::Row(f), StripSwitch::Solo))
     }
 
     /// The user effect the host should put across the effects bus, if any.
@@ -35023,18 +35087,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::desk_id::Node::Track(self.track_id_at(n))
     }
 
-    /// **The node at a strip's desk index** (`StripRef`, the one home of
-    /// that index's layout): a row's track, a bus, or the master. `None`
-    /// past the master.
-    fn desk_node(&self, desk_index: usize) -> Option<crate::desk_id::Node> {
+    /// **The node a strip is**: a row's track, by its identity, or the
+    /// special itself.
+    fn strip_node(&self, s: recorder::StripRef) -> crate::desk_id::Node {
         use crate::desk_id::Node;
-        Some(match recorder::StripRef::from_desk_index(desk_index)? {
+        match s {
             recorder::StripRef::Row(n) => self.row_node(n),
             recorder::StripRef::Drums => Node::Drums,
             recorder::StripRef::Click => Node::Click,
             recorder::StripRef::Fx => Node::Fx,
             recorder::StripRef::Master => Node::Master,
-        })
+        }
     }
 
     /// **The bay a MIXER SLOT means**, which is not always the slot itself:
@@ -35042,12 +35105,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// place that turns a `Hit::Insert(col, n)` into a bay goes through
     /// here, so none of them has to know the rule.
     fn slot_bay(&self, col: recorder::Column, n: usize) -> Option<crate::desk_id::SeatBay> {
-        self.desk_slot_bay(col.desk_index(), n)
+        self.strip_slot_bay(col.strip_ref(), n)
     }
 
-    /// [`Self::slot_bay`] for a strip by its desk index.
-    fn desk_slot_bay(&self, desk_index: usize, slot: usize) -> Option<crate::desk_id::SeatBay> {
-        crate::desk_id::slot_key(self.desk_node(desk_index)?, slot)
+    /// [`Self::slot_bay`] for a strip by what it is.
+    fn strip_slot_bay(&self, s: recorder::StripRef, slot: usize) -> Option<crate::desk_id::SeatBay> {
+        crate::desk_id::slot_key(self.strip_node(s), slot)
     }
 
     /// **Bay `bay` of row `n`'s own rack** (its first chain): where a
@@ -35142,7 +35205,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // and the name is cached (see `tend_click_word`), so a shot taken
         // without this shows the one chip on the desk blank.
         self.tend_click_word();
-        let strips = recorder::STRIPS;
         // A plausible desk: two MIDI channels, one AUDIO, the rest unused —
         // through the ordinary setters, so the picture is what a settings
         // file would produce.
@@ -35160,23 +35222,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         // A long name and a short one, in the first bay and the last, so the
-        // picture shows both what fits and what has to be cut.
+        // picture shows both what fits and what has to be cut. By displayed
+        // slot: the master's own first bay is its slot 3, under its extra rack.
+        use recorder::StripRef;
         for (strip, slot, path) in [
-            (recorder::Strip::Channel(1).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
-            (recorder::Strip::Channel(1).index(), 2, "/x/Pro-Q 4.vst3"),
-            (recorder::Strip::Channel(2).index(), 0, "/x/Pro-C 3.vst3"),
-            (recorder::Strip::Channel(4).index(), 1, "/x/Saturn 2.vst3"),
-            (strips, 0, "/x/Pro-L 2.vst3"),
+            (StripRef::Row(1), 0, "/x/FabFilter Pro-R 2.vst3"),
+            (StripRef::Row(1), 2, "/x/Pro-Q 4.vst3"),
+            (StripRef::Row(2), 0, "/x/Pro-C 3.vst3"),
+            (StripRef::Row(4), 1, "/x/Saturn 2.vst3"),
+            (StripRef::Master, 3, "/x/Pro-L 2.vst3"),
         ] {
-            self.set_insert(strip, slot, Some(path));
+            if let Some(sb) = self.strip_slot_bay(strip, slot) {
+                self.set_plugin(sb, Some(path));
+            }
         }
-        if let Some(c) = self
-            .settings
-            .strip_colors
-            .get_mut(recorder::Strip::Channel(1).index())
-        {
-            *c = 3;
-        }
+        self.settings.set_strip_paint(StripRef::Row(1), 3);
     }
 
     /// What feeds general channel `n`, or `None` for a channel not yet added.
@@ -38269,11 +38329,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     *cur = icon.min(recorder_panel::ICON_MAX);
                 }
             }
-            DialogAction::TrackColor(lane, idx) => {
-                for n in self.selection_with(lane) {
-                    if let Some(c) = self.settings.strip_colors.get_mut(n) {
-                        *c = idx.clamp(0, 26);
+            DialogAction::TrackColor(strip, idx) => {
+                // A track paints with its selection; the click (the one
+                // other strip with this menu) paints alone, among the
+                // specials (W5).
+                let paint = idx.clamp(0, 26);
+                match strip {
+                    recorder::StripRef::Row(lane) => {
+                        for n in self.selection_with(lane) {
+                            self.settings.set_strip_paint(recorder::StripRef::Row(n), paint);
+                        }
                     }
+                    other => self.settings.set_strip_paint(other, paint),
                 }
                 self.save_settings();
                 self.undo_commit();
@@ -40754,6 +40821,7 @@ impl TangentApp {
                 midi_clips: 0,
                 frozen: false,
                 can_freeze: false,
+                strip: recorder::StripRef::Row(0),
             });
         }
         // **Audio Setup**, which is now where the interface's short name is
@@ -42821,12 +42889,12 @@ impl TangentApp {
                                         recorder::Strip::Channel(n)
                                             if self.channel_used(n)
                                     );
-                                    self.open_track_dialog(strip.index(), used);
+                                    self.open_track_dialog(strip.into(), used);
                                 }
                             } else if let Some(strip) = i.strip() {
                                 let used =
                                     matches!(strip, recorder::Strip::Channel(_));
-                                self.open_track_dialog(strip.index(), used);
+                                self.open_track_dialog(strip.into(), used);
                             }
                         }
                         // An open overlay owns the surface; the button waits.
@@ -42846,7 +42914,7 @@ impl TangentApp {
                                     strip,
                                     recorder::Strip::Channel(n) if self.channel_used(n)
                                 );
-                                self.open_track_dialog(strip.index(), used);
+                                self.open_track_dialog(strip.into(), used);
                             }
                         }
                     }
@@ -43065,7 +43133,7 @@ impl TangentApp {
                 } else {
                     let view = self.mixer_view_in(rect);
                     let target = crate::mixer_panel::strip_at(rect, &view, p)
-                        .map(recorder::Column::desk_index);
+                        .map(recorder::Column::strip_ref);
                     // The BAY under the hand, by identity like the carry
                     // itself — `slot_bay` is the one place that knows a
                     // strip's Nth slot may live in another rack.
@@ -50611,8 +50679,7 @@ mod tests {
         // `strip_names` is a Vec that grows on demand, so a fresh settings
         // has none — the same shape `copy_track` reads through `get`.
         app.settings
-            .strip_names
-            .resize(recorder::STRIPS + 1, String::new());
+            .strip_names.resize(recorder::CHANNELS, String::new());
         app.settings.strip_names[at] = "Rhodes".to_owned();
         app.settings.strip_colors[at] = 5;
         app.settings.channel_icons[1] = 2;
@@ -50786,7 +50853,7 @@ mod tests {
         let root = project_scratch("trackinsert");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        app.settings.strip_names.resize(recorder::STRIPS + 1, String::new());
+        app.settings.strip_names.resize(recorder::CHANNELS, String::new());
         app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
         app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
         let name_of = |app: &TangentApp, ch: usize| {
@@ -50874,7 +50941,7 @@ mod tests {
             let root = project_scratch("lanes-held");
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.bootstrap_project(&root.join("Projects"));
-            app.settings.strip_names.resize(recorder::STRIPS + 1, String::new());
+            app.settings.strip_names.resize(recorder::CHANNELS, String::new());
             app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
             app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
             // Two tracks to insert under and group, and further down a
@@ -51106,8 +51173,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         app.settings
-            .strip_names
-            .resize(recorder::STRIPS + 1, String::new());
+            .strip_names.resize(recorder::CHANNELS, String::new());
         app.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
         app.settings.channel_gains[1] = 0.33;
 
@@ -51773,10 +51839,10 @@ mod tests {
     /// A rack that half works is harder to spot than one that does not.
     #[test]
     fn every_master_bay_opens_its_picker() {
-        use crate::recorder::{INSERTS, STRIPS};
+        use crate::recorder::INSERTS;
         for slot in 0..INSERTS * 2 {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-            let sb = app.desk_slot_bay(STRIPS, slot).expect("a master bay");
+            let sb = app.strip_slot_bay(recorder::StripRef::Master, slot).expect("a master bay");
             app.open_insert_picker(sb);
             assert_eq!(app.picker_insert, Some(sb), "master slot {slot} ({sb}) opened nothing");
         }
@@ -54234,12 +54300,15 @@ mod tests {
     fn a_column_moves_its_own_fader_and_no_other() {
         use crate::mixer_panel::Hit;
         use crate::recorder::Strip;
+        // Every fader on the desk, by its NAME: a column's own is the one
+        // it may move, and no position in a list stands in for it.
         let snapshot = |s: &Settings| {
-            let mut v: Vec<f64> = s.channel_gains.to_vec();
-            v.push(s.drums_gain);
-            v.push(s.metronome_gain);
-            v.push(s.fx_return_gain);
-            v.push(s.master_gain);
+            let mut v: Vec<(String, f64)> =
+                s.channel_gains.iter().enumerate().map(|(n, g)| (format!("ch{n}"), *g)).collect();
+            v.push(("drums".to_owned(), s.drums_gain));
+            v.push(("click".to_owned(), s.metronome_gain));
+            v.push(("fx".to_owned(), s.fx_return_gain));
+            v.push(("master".to_owned(), s.master_gain));
             v
         };
         for col in recorder::Column::every(recorder::CHANNELS) {
@@ -54248,20 +54317,23 @@ mod tests {
             // A position nothing defaults to, so "it changed" is unambiguous.
             app.apply_mixer_hit(Hit::Fader(col), 0.31);
             let after = snapshot(&app.settings);
-            let moved: Vec<usize> = (0..before.len())
-                .filter(|i| (before[*i] - after[*i]).abs() > 1e-9)
+            let moved: Vec<String> = before
+                .iter()
+                .zip(&after)
+                .filter(|((_, b), (_, a))| (b - a).abs() > 1e-9)
+                .map(|((name, _), _)| name.clone())
                 .collect();
-            // Which slot in the snapshot this column owns.
+            // Which fader this column owns.
             let want = match col.strip() {
-                Some(Strip::Channel(n)) => n,
-                Some(Strip::Drums) => recorder::CHANNELS,
-                Some(Strip::Click) => recorder::CHANNELS + 1,
-                Some(Strip::Fx) => recorder::CHANNELS + 2,
-                None => before.len() - 1,
+                Some(Strip::Channel(n)) => format!("ch{n}"),
+                Some(Strip::Drums) => "drums".to_owned(),
+                Some(Strip::Click) => "click".to_owned(),
+                Some(Strip::Fx) => "fx".to_owned(),
+                None => "master".to_owned(),
             };
             assert_eq!(
                 moved,
-                vec![want],
+                vec![want.clone()],
                 "column {col:?} ({:?}) moved {moved:?}, not just {want}",
                 col.strip()
             );
@@ -54330,16 +54402,12 @@ mod tests {
             app.reset_mixer_hit(Hit::Send(col));
         }
         for col in recorder::Column::every(recorder::CHANNELS) {
-            let at = col.desk_index();
-            // The master column has no send row of its own, so it indexes
-            // one past the table - it is the one strip this question does
-            // not apply to.
-            let Some(now) = app.settings.strip_sends.get(at).copied() else {
-                continue;
-            };
+            // By what the strip is (W5); the master has no send, so it reads
+            // dry whatever happened.
+            let now = app.settings.strip_send(col.strip_ref());
             assert!(
                 now.abs() < 1e-9,
-                "strip {at} reset its send to {now}, not to dry - the dial \
+                "strip {col} reset its send to {now}, not to dry - the dial \
                  has to mean one thing on every strip"
             );
         }
@@ -54381,29 +54449,88 @@ mod tests {
     /// **Every column names ITSELF, the master included.**
     ///
     /// Written as a sweep rather than one case, because the fault is never in
-    /// one arm: `Hit::Name` carries a COLUMN and `strip_names` is a DESK array,
-    /// and those agree on every column but the last — so the master's name was
-    /// written into the CLICK's slot while the view read it back from `STRIPS`,
-    /// and renaming the master looked like a field that simply did nothing.
-    /// That is the third time this aliasing has shipped.
+    /// one arm: `Hit::Name` carries a COLUMN, and a desk array indexed by it
+    /// agreed with it on every column but the last — so the master's name was
+    /// written into the CLICK's slot while the view read it back from past
+    /// the strips, and renaming the master looked like a field that simply
+    /// did nothing. That is the third time this aliasing shipped. Names are
+    /// kept by what each strip is now (W5), and every strip is swept: the
+    /// rows and all four specials.
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
-        use crate::recorder::STRIPS;
+        use recorder::StripRef;
         for col in recorder::Column::every(recorder::CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, format!("{col:?}"));
-            let named: Vec<usize> = (0..=STRIPS)
-                .filter(|i| {
-                    app.settings.strip_names.get(*i).is_some_and(|n| !n.is_empty())
-                })
+            let named: Vec<StripRef> = (0..recorder::CHANNELS)
+                .map(StripRef::Row)
+                .chain(StripRef::SPECIALS)
+                .filter(|s| !app.settings.strip_name(*s).is_empty())
                 .collect();
             assert_eq!(
                 named,
-                vec![col.desk_index()],
+                vec![col.strip_ref()],
                 "column {col:?} ({:?}) named {named:?}",
                 col.strip()
             );
         }
+    }
+
+    /// **The specials keep their own settings, and a row's follow its
+    /// row** (W5-identity-maps: "the specials leave strip space"; "sends are
+    /// kept per row and per special"). The click named and muted through
+    /// its own column, the master inverted through its own, the drum bus
+    /// painted and sent: none of it sits in a row's array or mask. A track
+    /// named and sent on row 2 carries both when it is dragged to row 5,
+    /// and the drag moves no special's; the undo takes the track back and
+    /// still moves none; and the desk a document carries (format 2, saved
+    /// and read back) puts every special back as it was on a fresh app.
+    #[test]
+    fn the_specials_keep_their_own_settings_and_a_rows_follow_its_row() {
+        use crate::mixer_panel::Hit;
+        use crate::settings::StripSwitch;
+        use recorder::{Column, StripRef};
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let _ = app.add_bare_track(2);
+        app.commit_mixer_name(Column::Track(2), "Gtr".to_owned());
+        app.apply_mixer_hit(Hit::Send(Column::Track(2)), 0.7);
+        app.commit_mixer_name(Column::Click, "TICK".to_owned());
+        app.apply_mixer_hit(Hit::Mute(Column::Click), 0.0);
+        app.apply_mixer_hit(Hit::Phase(Column::Master), 0.0);
+        app.settings.set_strip_paint(StripRef::Drums, 9);
+        app.settings.set_strip_send(StripRef::Drums, 0.4);
+        app.undo_commit();
+        let specials = app.settings.specials.clone();
+        assert_eq!(app.settings.strip_name(StripRef::Click), "TICK");
+        assert!(app.settings.strip_switch(StripRef::Click, StripSwitch::Mute), "the click's mute");
+        assert!(app.settings.strip_switch(StripRef::Master, StripSwitch::Phase), "the master's polarity");
+        assert_eq!(app.settings.strip_send(StripRef::Drums), 0.4, "the drum bus's send");
+        assert_eq!(app.settings.strip_paint(StripRef::Drums), 9, "the drum bus's paint");
+        // No row holds any of it: the rows' arrays are rows.
+        assert_eq!((app.settings.strip_muted, app.settings.strip_phase), (0, 0), "a special sat in a row's mask");
+        assert_eq!(app.settings.strip_names.iter().filter(|n| !n.is_empty()).count(), 1, "a special's name sat in a row");
+
+        // A drag carries the row's and moves no special's.
+        app.move_channel(2, 5);
+        assert_eq!(app.settings.strip_name(StripRef::Row(5)), "Gtr", "the name stayed on the row");
+        assert!((app.settings.strip_send(StripRef::Row(5)) - 0.7).abs() < 1e-6, "the send stayed on the row");
+        assert_eq!(app.settings.strip_send(StripRef::Row(2)), 0.0, "the send was left behind as well");
+        assert_eq!(app.settings.specials, specials, "a drag moved a special's settings");
+        // Its undo takes the track back and still moves none of them.
+        app.undo();
+        assert_eq!(app.settings.strip_name(StripRef::Row(2)), "Gtr", "the undo did not take the track back");
+        assert_eq!(app.settings.specials, specials, "the undo moved a special's settings");
+
+        // And the document's desk carries them, through format 2.
+        let snap = TangentApp::desk_snapshot_of(&app.settings);
+        assert_eq!(snap.specials, specials, "the snapshot dropped a special");
+        let mut doc = crate::arrangement::Arrangement::default();
+        doc.desk = Some(snap);
+        let back = crate::arrangement::Arrangement::from_json(&doc.to_json()).desk.expect("the desk reads back");
+        let (_ctx, mut fresh) = headless_with(Caps::DESKTOP, Settings::default());
+        fresh.apply_desk_snapshot(&back);
+        assert_eq!(fresh.settings.specials, specials, "an open lost a special's settings");
+        assert_eq!(fresh.settings.strip_name(StripRef::Row(2)), "Gtr", "an open lost the row's name");
     }
 
     /// And what it names is what the desk reads back for that column.
@@ -54698,7 +54825,7 @@ mod tests {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.project_doc = crate::arrangement::doc_in(&song);
         let (strip, slot) = (2, 0);
-        let sb = app.desk_slot_bay(strip, slot).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(strip), slot).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: seat,
@@ -54785,7 +54912,7 @@ mod tests {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.project_doc = crate::arrangement::doc_in(&song);
         let (strip, slot) = (2, 0);
-        let sb = app.desk_slot_bay(strip, slot).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(strip), slot).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: seat,
@@ -54837,7 +54964,7 @@ mod tests {
         let gone = root.join("IRs").join("Gone.wav").to_string_lossy().into_owned();
         let (ctx, mut app) = headless(Caps::DESKTOP);
         let (strip, slot) = (3, 1);
-        let sb = app.desk_slot_bay(strip, slot).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(strip), slot).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         let knob = |id: u32, symbol: &str| crate::ports::BuiltinFaceParam {
             id,
@@ -55937,8 +56064,7 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         // Dress channel 1 (the DX7) distinctly.
         app.settings
-            .strip_names
-            .resize(recorder::STRIPS + 1, String::new());
+            .strip_names.resize(recorder::CHANNELS, String::new());
         app.settings.strip_names[1] = "LEAD".to_owned();
         app.settings.channel_icons[1] = 2; // guitar badge
         app.settings.strip_colors[1] = 7;
@@ -56757,7 +56883,7 @@ mod tests {
             target: crate::routing::Target::Node(app.row_node(4)),
             gain: 0.5,
         }]);
-        let keyed = app.desk_slot_bay(3, 1).expect("a bay");
+        let keyed = app.strip_slot_bay(recorder::StripRef::Row(3), 1).expect("a bay");
         let from = app.row_node(0);
         app.settings.insert_keys.set(keyed, Some(from));
         let bypassed = app.legacy_bay(2, 1).expect("a bay");
@@ -57132,7 +57258,8 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
-        let bit = |n: usize| 1u64 << Column::Track(n).desk_index();
+        // A row's switch is its row's bit (the specials keep theirs, W5).
+        let bit = |n: usize| 1u64 << n;
         app.settings.strip_muted = 0;
         app.settings.strip_soloed = 0;
 
@@ -57492,8 +57619,7 @@ mod tests {
         // Channel 0 ships used (the DX7). Dress it further, then remove it.
         app.set_insert(0, 1, Some("/x/Grand 8.vst3"));
         app.settings
-            .strip_names
-            .resize(recorder::STRIPS + 1, String::new());
+            .strip_names.resize(recorder::CHANNELS, String::new());
         app.settings.strip_names[0] = "BELL KEYS".to_owned();
         app.settings.strip_colors[0] = 14;
         app.settings.strip_muted |= 1;
@@ -58664,7 +58790,7 @@ mod tests {
             app.arrangement_open = true;
             let _ = run_frame(&ctx, &mut app);
             // A LOADED bay — an empty one is the header's press, by design.
-            let sb = app.desk_slot_bay(recorder::STRIPS, slot).expect("a master bay");
+            let sb = app.strip_slot_bay(recorder::StripRef::Master, slot).expect("a master bay");
             app.set_plugin(sb, Some("@tangent-comp"));
             let _ = run_frame(&ctx, &mut app);
 
@@ -60592,7 +60718,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         three_clips_on_two_lanes(&mut app);
 
-        app.open_track_dialog(1, true);
+        app.open_track_dialog(recorder::StripRef::Row(1), true);
         let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
@@ -60600,7 +60726,7 @@ mod tests {
 
         // A lane with nothing on it offers no row at all — hidden, not
         // greyed: Export is not what a lane is FOR.
-        app.open_track_dialog(7, true);
+        app.open_track_dialog(recorder::StripRef::Row(7), true);
         let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
@@ -60609,7 +60735,7 @@ mod tests {
         // The row takes the whole lane, selection or no selection.
         app.arr_multi = vec![2];
         app.arr_selected = Some(2);
-        app.open_track_dialog(1, true);
+        app.open_track_dialog(recorder::StripRef::Row(1), true);
         app.apply_dialog_action(DialogAction::ExportMidi(1));
         assert!(app.dialog.is_none(), "the dialog stayed up in front of the panel");
         let req = app.take_save_request().expect("the row asked for no panel");
@@ -60742,7 +60868,7 @@ mod tests {
             "the clip menu offered an export a plugin cannot answer: {rows:?}"
         );
 
-        app.open_track_dialog(1, true);
+        app.open_track_dialog(recorder::StripRef::Row(1), true);
         let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
@@ -64403,7 +64529,7 @@ mod tests {
     ///
     /// It hung off nothing: `met_anchor` looked the click's rectangles up by
     /// `Strip::index`, which is a DESK index, in an array laid out in COLUMN
-    /// order — and the click is `CHANNELS + 1` in one and `CHANNELS` in the
+    /// order — and the click sat one further along in the first than in the
     /// other, so what came back was the MASTER's, whose `met` is `NOTHING`.
     /// The panel opened anchored to a degenerate rectangle. That is half of
     /// "the chip was never wired to the menu"; the other half is
@@ -64510,7 +64636,7 @@ mod tests {
         // here — the target bay is the host's to choose, because only the
         // host can lay the plugin's state beside it.
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(4), None);
+        app.land_bay_carry(Some(recorder::StripRef::Row(4)), None);
         let req = app.take_recorder_request();
         assert!(
             matches!(
@@ -64532,7 +64658,7 @@ mod tests {
         // EDITOR, which is a request of its own — the assertion is about
         // which one, not about whether anything was asked.
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), false));
-        app.land_bay_carry(Some(4), None);
+        app.land_bay_carry(Some(recorder::StripRef::Row(4)), None);
         let req = app.take_recorder_request();
         assert!(
             matches!(req, Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))),
@@ -64550,7 +64676,7 @@ mod tests {
         // compressor to the channel it is already on is a second instance of
         // it in the next bay, which is never what the gesture meant.
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), None);
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), None);
         assert!(app.take_recorder_request().is_none(), "it copied onto itself");
 
         // ── **and a drop on another LOADED bay trades them** ────────────
@@ -64562,7 +64688,7 @@ mod tests {
         // them back the other way round.
         app.set_insert(0, 0, Some("/x/EQ.vst3"));
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), app.legacy_bay(0, 0));
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(0, 0));
         let req = app.take_recorder_request();
         assert!(
             matches!(
@@ -64587,7 +64713,7 @@ mod tests {
         // Across channels, the same trade.
         app.set_insert(4, 2, Some("/x/Verb.vst3"));
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(4), app.legacy_bay(4, 2));
+        app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(4, 2));
         assert!(matches!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::SwapInserts {
@@ -64603,7 +64729,7 @@ mod tests {
         // to the channel and let the host pick the first free one.
         app.set_insert(4, 2, None);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(4), app.legacy_bay(4, 2));
+        app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(4, 2));
         assert!(matches!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::CopyInsert { to_strip: 4, to_bay: Some(2), .. })
@@ -64615,7 +64741,7 @@ mod tests {
         // which is what this channel-shaped drop used to get.
         assert!(app.insert(0, 2).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), app.legacy_bay(0, 2));
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(0, 2));
         assert!(matches!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::MoveInsert {
@@ -64634,7 +64760,7 @@ mod tests {
         let lower = recorder::folder_extra_seat(0);
         assert!(app.insert(lower, 0).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), app.legacy_bay(lower, 0));
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(lower, 0));
         assert!(
             matches!(
                 app.take_recorder_request(),
@@ -64653,7 +64779,7 @@ mod tests {
         // copy."
         let elsewhere = recorder::folder_extra_seat(4);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(4), app.legacy_bay(elsewhere, 1));
+        app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(elsewhere, 1));
         assert!(
             matches!(
                 app.take_recorder_request(),
@@ -64669,7 +64795,7 @@ mod tests {
 
         // And a drop on the bay it started in is nothing at all.
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), app.legacy_bay(0, 1));
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(0, 1));
         assert!(
             app.take_recorder_request().is_none(),
             "a bay dropped on itself asked for something"
@@ -64680,7 +64806,7 @@ mod tests {
         // compares the carry's OWNER to the column under the hand, which is
         // the only comparison that is true of a bay in a second rack.
         app.bay_carry = Some((app.legacy_bay(lower, 0).expect("a bay"), Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0), None);
+        app.land_bay_carry(Some(recorder::StripRef::Row(0)), None);
         assert!(
             app.take_recorder_request().is_none(),
             "a lower-rack bay dropped on its own track's paint asked for a copy"
@@ -66331,7 +66457,7 @@ mod tests {
             steps: 0,
             value,
         };
-        let sb = app.desk_slot_bay(2, 1).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         let face = |params| crate::ports::BuiltinFace {
             strip: seat,
@@ -66380,7 +66506,7 @@ mod tests {
             steps: 0,
             value,
         };
-        let sb = app.desk_slot_bay(2, 1).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         let face = |params| crate::ports::BuiltinFace {
             strip: seat,
@@ -66578,7 +66704,7 @@ mod tests {
             steps: 0,
             value,
         };
-        let sb = app.desk_slot_bay(2, 1).expect("a shown bay");
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: seat,
@@ -67931,7 +68057,7 @@ mod tests {
         // something. Channels 0 (drumpad) and 1 (DX7) each hold one bay-0
         // instrument; every other bay everywhere is empty.
         assert!(
-            (2..=recorder::STRIPS)
+            (2..=crate::desk_legacy::V32_STRIPS)
                 .all(|st| (0..recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none()))
                 && (1..recorder::INSERTS).all(|b| bay_of(&s, 0, b).is_none())
                 && (1..recorder::INSERTS).all(|b| bay_of(&s, 1, b).is_none()),
@@ -69361,7 +69487,7 @@ mod tests {
         let jack = Target::Hardware { first: 0, stereo: true };
         let lane_jack = LaneTarget::Hardware { first: 0, stereo: true };
         assert!(app.settings.routes.add(Route::new(app.row_node(0), jack)));
-        let keyed = app.desk_slot_bay(0, 1).expect("a bay");
+        let keyed = app.strip_slot_bay(recorder::StripRef::Row(0), 1).expect("a bay");
         let source = app.row_node(2);
         app.settings.insert_keys.set(keyed, Some(source));
         for (label, state) in [
@@ -75649,7 +75775,7 @@ mod velocity_selection_tests {
         app.select_track(5, egui::Modifiers::SHIFT);
         assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
 
-        app.apply_dialog_action(DialogAction::TrackColor(3, 9));
+        app.apply_dialog_action(DialogAction::TrackColor(recorder::StripRef::Row(3), 9));
         for n in [2, 3, 4, 5] {
             assert_eq!(
                 app.settings.strip_colors.get(n).copied(),
@@ -75689,7 +75815,7 @@ mod velocity_selection_tests {
         let (_c, mut app) = headless(Caps::DESKTOP);
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
-        app.apply_dialog_action(DialogAction::TrackColor(9, 7));
+        app.apply_dialog_action(DialogAction::TrackColor(recorder::StripRef::Row(9), 7));
         assert_eq!(app.settings.strip_colors.get(9).copied(), Some(7));
         for n in [2, 3, 4, 5] {
             assert_ne!(
@@ -76524,11 +76650,15 @@ mod folder_tests {
                 Some("/x/Channel5.vst3"),
                 "{era}: channel 5's plugin moved"
             );
+            // In the legacy strip space the bit was written in: the strip it
+            // lands on is a special, so the desk keeps it as that special's
+            // own switch (W5) and the rows' mask stays clear.
             assert_eq!(
-                app.settings.strip_muted,
+                app.settings.strip_space().muted,
                 1 << want_bit,
                 "{era}: the mute bit is not at {want_bit}"
             );
+            assert_eq!(app.settings.strip_muted, 0, "{era}: a row took a special's mute");
             let occupied = app.settings.legacy_inserts().iter().filter(|p| !p.is_empty()).count();
             assert_eq!(occupied, 2, "{era}: a lift duplicated or dropped a plugin");
         }
@@ -78101,7 +78231,7 @@ mod folder_tests {
         for n in 0..8 {
             a.add_bare_track(n);
         }
-        a.settings.strip_names = vec![String::new(); recorder::STRIPS + 1];
+        a.settings.strip_names = vec![String::new(); CHANNELS];
         a.settings.strip_names[Strip::Channel(3).index()] = "Loud Guitar".to_owned();
         a.set_insert(Strip::Channel(5).index(), 0, Some("/some/Plugin.vst3"));
         assert_eq!(
@@ -79849,7 +79979,7 @@ mod folder_tests {
         }
         // `strip_names` is grown lazily, so it is empty until something
         // sizes it — the same trap the template test hit.
-        a.settings.strip_names = vec![String::new(); recorder::STRIPS + 1];
+        a.settings.strip_names = vec![String::new(); recorder::CHANNELS];
         for n in 0..6 {
             a.settings.strip_names[recorder::Strip::Channel(n).index()] =
                 format!("t{n}");
@@ -82506,7 +82636,7 @@ mod sampler_road_tests {
             .0
             .clone();
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(0, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: dragged.to_string_lossy().into_owned(),
         });
         let stored = app.take_sampler_load().map(|(_, _, p)| p);
@@ -82567,7 +82697,7 @@ mod sampler_road_tests {
 
         // A file out of the library, into a session nobody has written yet.
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(0, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: library.join("Upright.wav").to_string_lossy().into_owned(),
         });
         let (_, _, upright) = app.take_sampler_load().expect("the library file was not queued");
@@ -82583,7 +82713,7 @@ mod sampler_road_tests {
             .0
             .clone();
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(0, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: dragged.to_string_lossy().into_owned(),
         });
         let (_, _, take) = app.take_sampler_load().expect("the take was not queued");
@@ -82677,11 +82807,11 @@ mod sampler_road_tests {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         assert_eq!(app.take_sampler_load(), None);
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(0, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: "/m/Takes/one.wav".to_owned(),
         });
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(1, 2).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(1), 2).expect("a bay"),
             path: "/m/Takes/two.aiff".to_owned(),
         });
         let first = app.take_sampler_load().expect("nothing queued");
@@ -82712,7 +82842,7 @@ mod sampler_road_tests {
     fn a_picked_sample_is_auditioned_on_the_drumpads_own_road() {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(1, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(1), 0).expect("a bay"),
             path: "/m/Takes/one.wav".to_owned(),
         });
         let mut asked = Vec::new();
@@ -82730,7 +82860,7 @@ mod sampler_road_tests {
         // And a file the sampler cannot play is not auditioned either — the
         // refusal is the whole answer.
         app.apply_dialog_action(DialogAction::PickSample {
-            bay: app.desk_slot_bay(1, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(1), 0).expect("a bay"),
             path: "/m/part.mid".to_owned(),
         });
         let mut asked = Vec::new();
@@ -82754,7 +82884,7 @@ mod sampler_road_tests {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         for bad in ["/m/part.mid", "/m/kit.tgkit", "/m/song.tan", "/m/notes.txt"] {
             app.apply_dialog_action(DialogAction::PickSample {
-                bay: app.desk_slot_bay(0, 0).expect("a bay"),
+                bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
                 path: bad.to_owned(),
             });
             assert_eq!(app.take_sampler_load(), None, "{bad} was queued as audio");
@@ -82928,7 +83058,7 @@ mod sampler_road_tests {
             extra: vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
         });
         app.apply_dialog_action(DialogAction::FaceSavePreset {
-            bay: app.desk_slot_bay(0, 0).expect("a bay"),
+            bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             name: "Room Kick".to_owned(),
         });
         let mut asked = None;
@@ -84527,7 +84657,7 @@ mod lane_refs_tests {
             hit: crate::mixer_panel::Hit::Fader(Column::Track(2)),
             travel: None,
         });
-        app.meter_hold = [[0.5; 2]; recorder::STRIPS];
+        app.meter_hold = [[0.5; 2]; crate::desk_legacy::V32_STRIPS];
     }
 
     /// The row aims `aim` sets that still stand.
@@ -84702,7 +84832,7 @@ mod lane_refs_tests {
         ("pedal_stack", Shape("self.pedal_stack = None;")),
         ("click_moment", Shape("self.click_moment = None;")),
         ("a11y_on", Shape("self.a11y_on = None;")),
-        ("meter_hold", Shape("self.meter_hold = [[0.0; 2]; recorder::STRIPS];")),
+        ("meter_hold", Shape("self.meter_hold = [[0.0; 2]; crate::desk_legacy::V32_STRIPS];")),
         ("route_labels", Shape("self.refresh_route_labels();")),
         // ── (a) the seat-keyed fields design 4 handed to W5, by bay ──────
         ("fx_params", Identity),

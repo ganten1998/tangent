@@ -450,6 +450,250 @@ pub const fn pad_insert_index(pad: usize) -> usize {
     ROW0_PADS + pad
 }
 
+// ── Strip space: the legacy per-strip arrays ───────────────────────────────
+//
+// **Retired here from `recorder` (W5).** The live app keeps a strip's name,
+// colour, send and switches by what the strip IS (`recorder::StripRef`): a
+// track's in the row arrays at its row, a special's in `Settings::specials`
+// (design 4's `Specials`), so nothing live works out where in one array a
+// strip's settings sit. The legacy files spelled the desk in STRIP SPACE
+// (names and colours 36 wide, sends 35, the u64 mute/solo/phase masks;
+// Appendix A: rows 0..=31, then the drum bus, the click, the effects return,
+// and the master last), and so do the readers that still speak it: the
+// engine's legacy shims and their tests, and the host's take manifest and
+// meters. This is that space at its frozen V32 places, and the one road
+// between it and a strip by what it is.
+
+use crate::recorder::{Strip, StripRef};
+
+/// **Where a strip sat in the legacy strip space**, by what it is: row r at
+/// r, the drum bus, the click and the effects return after the rows, the
+/// master last ([`encode_v32_strip`]). `None` for a row past the frozen
+/// width, which no legacy array has a place for.
+pub fn v32_strip(s: StripRef) -> Option<usize> {
+    encode_v32_strip(match s {
+        StripRef::Row(r) => LegacyOwner::Row(u16::try_from(r).ok()?),
+        StripRef::Drums => LegacyOwner::Drums,
+        StripRef::Click => LegacyOwner::Click,
+        StripRef::Fx => LegacyOwner::Fx,
+        StripRef::Master => LegacyOwner::Master,
+    })
+}
+
+/// [`v32_strip`]'s inverse: the strip a legacy strip index was. `None` past
+/// the master.
+pub fn strip_at_v32(strip: usize) -> Option<StripRef> {
+    Some(match decode_v32_strip(strip)? {
+        LegacyOwner::Row(r) => StripRef::Row(usize::from(r)),
+        LegacyOwner::Drums => StripRef::Drums,
+        LegacyOwner::Click => StripRef::Click,
+        LegacyOwner::Fx => StripRef::Fx,
+        LegacyOwner::Master => StripRef::Master,
+    })
+}
+
+impl Strip {
+    /// **Its place in the legacy strip space** ([`v32_strip`]), for the
+    /// readers that index strip-space arrays: the engine's legacy shims and
+    /// their tests, which keep a strip where the 32-channel builds did. A row
+    /// past the frozen width has no place and answers past every strip, so
+    /// a `get` on a strip-space array finds nothing for it.
+    pub fn index(self) -> usize {
+        v32_strip(StripRef::from(self)).unwrap_or(usize::MAX)
+    }
+
+    /// Every strip of the legacy desk, in strip order: the thirty-two rows,
+    /// then the drum bus, the click and the effects return. The master is
+    /// the one past them, which is no `Strip`.
+    pub fn all() -> [Strip; V32_STRIPS] {
+        std::array::from_fn(|i| match decode_v32_strip(i) {
+            Some(LegacyOwner::Drums) => Strip::Drums,
+            Some(LegacyOwner::Click) => Strip::Click,
+            Some(LegacyOwner::Fx) => Strip::Fx,
+            // Every other strip below the master is the row it numbers.
+            _ => Strip::Channel(i),
+        })
+    }
+}
+
+/// **The strip-space desk**: what each legacy strip sends to the effects
+/// bus, and what is heard. It was the live `recorder::Desk` the app built
+/// for the bridge every frame; the bridge reads the desk by identity now
+/// (`TangentApp::strip_send`, `strip_heard_muted`), and this shape is
+/// kept, re-exported as `recorder::Desk`, for the readers that speak strip
+/// space: the engine's legacy shims and their tests, and the host's take
+/// facts (`TangentApp::desk`), each until it moves onto the desk by what a
+/// strip is (C11: a new form beside the old, the old deleted by the lane
+/// that stops using it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct V32Desk {
+    /// How much of each strip goes to the effects bus, 0..=1, at its legacy
+    /// strip ([`Strip::index`]); the effects return's own slot stays zero.
+    pub send: [f32; V32_STRIPS],
+    pub muted: [bool; V32_STRIPS],
+    pub soloed: [bool; V32_STRIPS],
+}
+
+impl Default for V32Desk {
+    /// **The routing this app had before it had a mixer**: the first
+    /// channel sends everything, nothing else sends anything, nothing is
+    /// muted and nothing is soloed, so a desk nobody has touched sounds as
+    /// the old instrument bus did.
+    fn default() -> Self {
+        let mut send = [0.0; V32_STRIPS];
+        send[0] = 1.0;
+        Self { send, muted: [false; V32_STRIPS], soloed: [false; V32_STRIPS] }
+    }
+}
+
+impl V32Desk {
+    /// **The strip-space desk of a desk read by what each strip is**: `of`
+    /// answers a strip's send, whether it is muted and whether it is soloed,
+    /// and each lands at its legacy strip.
+    pub fn of(of: impl Fn(StripRef) -> (f32, bool, bool)) -> Self {
+        let mut d = V32Desk { send: [0.0; V32_STRIPS], muted: [false; V32_STRIPS], soloed: [false; V32_STRIPS] };
+        for i in 0..V32_STRIPS {
+            if let Some(s) = strip_at_v32(i) {
+                (d.send[i], d.muted[i], d.soloed[i]) = of(s);
+            }
+        }
+        d
+    }
+
+    /// Whether anything is soloed, which is what makes solo exclusive.
+    pub fn any_solo(&self) -> bool {
+        self.soloed.iter().any(|s| *s)
+    }
+
+    /// **Whether a strip is heard**, which is also whether it is recorded:
+    /// solo wins, and a soloed strip is heard even if it is also muted. A
+    /// strip with no legacy place is heard unless something is soloed.
+    pub fn heard(&self, strip: Strip) -> bool {
+        let at = strip.index();
+        if self.any_solo() {
+            return self.soloed.get(at).copied().unwrap_or(false);
+        }
+        !self.muted.get(at).copied().unwrap_or(false)
+    }
+}
+
+/// The four specials in legacy strip order, by what each is.
+const SPECIAL_STRIPS: [StripRef; 4] = [StripRef::Drums, StripRef::Click, StripRef::Fx, StripRef::Master];
+
+/// **A legacy strip-space array's ROWS**: the entries the array reaches at
+/// rows 0..=31's strips, in row order.
+pub fn strip_rows<T: Clone>(strips: &[T]) -> Vec<T> {
+    (0..V32_CHANNELS)
+        .map_while(|r| strips.get(v32_strip(StripRef::Row(r))?).cloned())
+        .collect()
+}
+
+/// **A legacy strip mask's ROWS**: bit r set for each row r whose strip's
+/// bit is set.
+pub fn strip_mask_rows(mask: u64) -> u64 {
+    (0..V32_CHANNELS)
+        .filter(|&r| v32_strip(StripRef::Row(r)).is_some_and(|s| s < 64 && mask >> s & 1 == 1))
+        .fold(0, |m, r| m | 1 << r)
+}
+
+/// **A strip mask of the rows' bits and the specials' switches**, at their
+/// legacy strips: [`strip_mask_rows`] and [`read_specials`]'s inverse.
+pub fn strip_mask_of(rows: u64, special: impl Fn(StripRef) -> bool) -> u64 {
+    let mut mask = 0u64;
+    for r in 0..V32_CHANNELS {
+        if let Some(s) = v32_strip(StripRef::Row(r)).filter(|_| rows >> r & 1 == 1) {
+            mask |= 1 << s;
+        }
+    }
+    for sr in SPECIAL_STRIPS {
+        if let Some(s) = v32_strip(sr).filter(|_| special(sr)) {
+            mask |= 1 << s;
+        }
+    }
+    mask
+}
+
+/// **The specials' strip-space facts, read off legacy strip arrays** (names
+/// and colours 36 wide, sends 35) **and masks**, onto `sp`: each special's
+/// name, colour, effects send and switches, from its legacy strip. A special
+/// an array does not reach keeps what `sp` held for it; a mask always
+/// reaches, and `phase` is `None` for a desk that never said it.
+pub fn read_specials(
+    sp: &mut crate::desk_model::Specials,
+    names: &[String],
+    colors: &[i64],
+    sends: &[f64],
+    masks: (u64, u64, Option<u64>),
+) {
+    let (muted, soloed, phase) = masks;
+    let bit = |mask: u64, s: usize| s < 64 && mask >> s & 1 == 1;
+    for sr in SPECIAL_STRIPS {
+        let (Some(node), Some(s)) = (sr.special(), v32_strip(sr)) else { continue };
+        let Some(special) = sp.get_mut(node) else { continue };
+        if let Some(n) = names.get(s) {
+            special.name.clone_from(n);
+        }
+        if let Some(c) = colors.get(s) {
+            special.color = *c;
+        }
+        if let Some(v) = sends.get(s) {
+            crate::desk_model::set_fx_send_level(&mut special.sends, *v);
+        }
+        special.mute = bit(muted, s);
+        special.solo = bit(soloed, s);
+        if let Some(p) = phase {
+            special.phase = bit(p, s);
+        }
+    }
+}
+
+/// **The specials onto legacy strip arrays and masks**: [`read_specials`]'s
+/// inverse. Colours grow to the master's strip and sends to the effects
+/// return's (the master has no send in any legacy shape); names grow past
+/// the rows only when a special has one, so a desk that names no special
+/// keeps its names array as long as its rows had it.
+pub fn write_specials(
+    sp: &crate::desk_model::Specials,
+    names: &mut Vec<String>,
+    colors: &mut Vec<i64>,
+    sends: &mut Vec<f64>,
+    masks: (&mut u64, &mut u64, &mut u64),
+) {
+    let (muted, soloed, phase) = masks;
+    let named = SPECIAL_STRIPS
+        .iter()
+        .any(|sr| sr.special().and_then(|n| sp.get(n)).is_some_and(|x| !x.name.is_empty()));
+    if named && names.len() < V32_STRIPS + 1 {
+        names.resize(V32_STRIPS + 1, String::new());
+    }
+    if colors.len() < V32_STRIPS + 1 {
+        colors.resize(V32_STRIPS + 1, 0);
+    }
+    if sends.len() < V32_STRIPS {
+        sends.resize(V32_STRIPS, 0.0);
+    }
+    for sr in SPECIAL_STRIPS {
+        let (Some(node), Some(s)) = (sr.special(), v32_strip(sr)) else { continue };
+        let Some(special) = sp.get(node) else { continue };
+        if let Some(n) = names.get_mut(s) {
+            n.clone_from(&special.name);
+        }
+        if let Some(c) = colors.get_mut(s) {
+            *c = special.color;
+        }
+        if let Some(v) = sends.get_mut(s) {
+            *v = crate::desk_model::fx_send_level(&special.sends);
+        }
+        for (mask, on) in [(&mut *muted, special.mute), (&mut *soloed, special.solo), (&mut *phase, special.phase)] {
+            if on {
+                *mask |= 1 << s;
+            } else {
+                *mask &= !(1 << s);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,7 +746,8 @@ mod tests {
     #[test]
     fn the_frozen_numbers_are_still_the_live_desks() {
         assert_eq!(V32_CHANNELS, recorder::CHANNELS);
-        assert_eq!(V32_STRIPS, recorder::STRIPS);
+        // `V32_STRIPS` has no live twin to agree with: the specials left
+        // strip space (W5), so the strip count lives here alone.
         assert_eq!(V32_TOTAL_SEATS, TOTAL_SEATS);
         assert_eq!(V32_INSERT_SPACE, INSERT_SPACE);
         assert_eq!(BAYS, recorder::INSERTS);
@@ -641,19 +886,22 @@ mod tests {
     }
 
     /// The strip decode is `Strip::index`'s inverse, the master being the one
-    /// past `Strip::all()` as `Column::desk_index` writes it.
+    /// past `Strip::all()`, and `v32_strip` agrees with both.
     #[test]
     fn the_strip_decode_is_strip_index_inverted() {
-        for strip in recorder::Strip::all() {
+        for strip in Strip::all() {
             let expect = match strip {
-                recorder::Strip::Channel(c) => LegacyOwner::Row(c as u16),
-                recorder::Strip::Drums => LegacyOwner::Drums,
-                recorder::Strip::Click => LegacyOwner::Click,
-                recorder::Strip::Fx => LegacyOwner::Fx,
+                Strip::Channel(c) => LegacyOwner::Row(c as u16),
+                Strip::Drums => LegacyOwner::Drums,
+                Strip::Click => LegacyOwner::Click,
+                Strip::Fx => LegacyOwner::Fx,
             };
             assert_eq!(decode_v32_strip(strip.index()), Some(expect), "{strip:?}");
+            assert_eq!(v32_strip(StripRef::from(strip)), Some(strip.index()), "{strip:?}");
         }
-        assert_eq!(recorder::Strip::all().len(), V32_STRIPS);
+        assert_eq!(Strip::all().len(), V32_STRIPS);
+        assert_eq!(v32_strip(StripRef::Master), Some(V32_STRIPS));
+        assert_eq!(v32_strip(StripRef::Row(V32_CHANNELS)), None, "a row past the frozen map has a strip");
         assert_eq!(decode_v32_strip(MASTER_SEAT), Some(LegacyOwner::Master));
     }
 

@@ -9650,9 +9650,9 @@ ArrangeView {
             Some(Hit::BusGain(Column::Master)),
             "the master's level cannot be pressed"
         );
-        // (It answers the master's COLUMN by name: it was `CHANNELS + 1`, a
-        // number that moved whenever the desk grew, pinned here by an
-        // equality that is now the type itself.)
+        // (It answers the master's COLUMN by name: it was the number two
+        // past the last channel, which moved whenever the desk grew, pinned
+        // here by an equality that is now the type itself.)
 
         // **Hidden, and the tracks take the room back.** Not removed: a
         // session always has an output.
@@ -9946,8 +9946,9 @@ ArrangeView {
         assert!(has("Automation lane 1 on Master"), "the dial row misnames the bus");
         // And nothing anywhere in the tree calls the bus a track.
         // The number a reader heard when the master was the lane one past
-        // the channels.
-        let ghost = format!("Track {}", CHANNELS + 1);
+        // the channels: its automation lane, counted from one.
+        let master_lane = StripRef::Master.auto_lane().expect("the master has a lane");
+        let ghost = format!("Track {}", master_lane + 1);
         assert!(
             !nodes.iter().any(|n| n.label.contains(&ghost)),
             "a node still calls the master {ghost}"

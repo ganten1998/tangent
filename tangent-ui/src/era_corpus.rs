@@ -83,10 +83,15 @@ fn occupied<'a>(bays: impl IntoIterator<Item = (usize, &'a str)>) -> String {
 pub(crate) fn observe_settings(text: &str) -> String {
     let s = Settings::from_json(text);
     let flags = s.shelf_shuffles().names();
+    // The strip rows in the legacy STRIP SPACE (`Settings::strip_space`):
+    // the live desk keeps the rows and the specials apart (W5), and the
+    // picture joins them back at their frozen strips, so it says exactly
+    // what it said while they shared one array.
+    let strips = s.strip_space();
     [
-        format!("colors {}", json(&s.strip_colors[..=V32_STRIPS])),
-        format!("sends {}", json(&s.strip_sends[..V32_STRIPS])),
-        format!("names {}", json(&s.strip_names[..s.strip_names.len().min(V32_STRIPS + 1)])),
+        format!("colors {}", json(&strips.colors[..=V32_STRIPS])),
+        format!("sends {}", json(&strips.sends[..V32_STRIPS])),
+        format!("names {}", json(&strips.names[..strips.names.len().min(V32_STRIPS + 1)])),
         format!(
             "inserts {}",
             occupied(
@@ -97,7 +102,7 @@ pub(crate) fn observe_settings(text: &str) -> String {
                     .map(|(b, p)| (b, p.as_str()))
             )
         ),
-        format!("muted {:#x} soloed {:#x} phase {:#x}", s.strip_muted, s.strip_soloed, s.strip_phase),
+        format!("muted {:#x} soloed {:#x} phase {:#x}", strips.muted, strips.soloed, strips.phase),
         format!("kinds {}", json(&s.channel_kinds[..V32_CHANNELS])),
         format!("inputs {}", json(&s.channel_inputs)),
         format!("shuffles {}", flags.join(" ")),
@@ -116,12 +121,14 @@ pub(crate) fn observe_document(text: &str) -> String {
         .iter()
         .map(|c| format!("{}:{}", c.lane, c.param.key()))
         .collect();
+    // Joined back into strip space, for `observe_settings`' reason.
+    let strips = d.strip_space();
     [
-        format!("colors {}", json(&d.colors)),
-        format!("sends {}", json(&d.sends)),
-        format!("names {}", json(&d.names)),
+        format!("colors {}", json(&strips.colors)),
+        format!("sends {}", json(&strips.sends)),
+        format!("names {}", json(&strips.names)),
         format!("inserts {}", occupied(d.legacy_bays().iter().map(|(b, p)| (*b, p.as_str())))),
-        format!("muted {:#x} soloed {:#x} phase {:?}", d.muted, d.soloed, d.phase),
+        format!("muted {:#x} soloed {:#x} phase {:?}", strips.muted, strips.soloed, d.phase.map(|_| strips.phase)),
         format!("tracks_added {:#x} armed {:#x}", d.tracks_added, d.armed),
         format!("curves {}", curves.join(" ")),
     ]
@@ -402,30 +409,49 @@ fn a_27_sends_file_lifts_its_buses_master_and_master_curves() {
 }
 
 fn a_27_sends_file_lifts() {
+    use crate::recorder::StripRef;
+    use crate::settings::StripSwitch;
     let (_, text) = fixture!("settings-v20-27.json");
     let s = Settings::from_json(text);
     // The fixture paints strip i with 100 + i: drums 24, click 25, fx 26,
-    // master 27 in the window; 32, 33, 34, 35 in V32.
-    assert_eq!(&s.strip_colors[32..36], &[124, 125, 126, 127], "the buses and master");
-    assert_eq!(&s.strip_colors[24..32], &[0; 8], "the widened channels came up painted");
-    assert_eq!(s.strip_names[35], "s27", "the master's name");
+    // master 27 in the window; 32, 33, 34, 35 in V32. Read in the legacy
+    // strip space the specials were joined back into (W5: the live desk
+    // keeps them apart, by what each is, as the second half checks).
+    let strips = s.strip_space();
+    assert_eq!(&strips.colors[32..36], &[124, 125, 126, 127], "the buses and master");
+    assert_eq!(&strips.colors[24..32], &[0; 8], "the widened channels came up painted");
+    assert_eq!(strips.names[35], "s27", "the master's name");
+    let paint: Vec<i64> = StripRef::SPECIALS.iter().map(|sr| s.strip_paint(*sr)).collect();
+    assert_eq!(paint, [124, 125, 126, 127], "the specials do not hold their own paint");
+    assert_eq!(s.strip_name(StripRef::Master), "s27", "the master does not hold its own name");
     assert_eq!(s.legacy_inserts()[32 * 3], "/x/s24.vst3", "the drum bus's bay");
     assert_eq!(s.legacy_inserts()[35 * 3 + 2], "/x/s27b2.vst3", "the master's bay");
     assert_eq!(s.legacy_inserts()[164 * 3 + 1], "/x/master-extra.vst3", "the master's extra rack");
     assert_eq!(s.legacy_inserts()[(165 + 2 * 128 + 5) * 3], "/x/c3pad5.vst3", "channel 3's pad 5");
-    assert_eq!(s.strip_muted, (1 << 33) | (1 << 2), "the muted click");
-    assert_eq!(s.strip_soloed, (1 << 34) | (1 << 21), "the soloed fx");
-    assert_eq!(s.strip_phase, (1 << 32) | (1 << 35) | (1 << 3), "the inverted drum bus and master");
+    assert_eq!(strips.muted, (1 << 33) | (1 << 2), "the muted click");
+    assert_eq!(strips.soloed, (1 << 34) | (1 << 21), "the soloed fx");
+    assert_eq!(strips.phase, (1 << 32) | (1 << 35) | (1 << 3), "the inverted drum bus and master");
+    assert_eq!((s.strip_muted, s.strip_soloed, s.strip_phase), (1 << 2, 1 << 21, 1 << 3), "the rows' own switches");
+    assert!(s.strip_switch(StripRef::Click, StripSwitch::Mute), "the click does not hold its mute");
+    assert!(s.strip_switch(StripRef::Fx, StripSwitch::Solo), "the fx return does not hold its solo");
+    assert!(
+        s.strip_switch(StripRef::Drums, StripSwitch::Phase) && s.strip_switch(StripRef::Master, StripSwitch::Phase),
+        "the drum bus and the master do not hold their polarity"
+    );
 
     let (_, text) = fixture!("doc-v6-27.json");
     let a = Arrangement::from_json(text);
     let d = a.desk.as_ref().expect("a desk");
-    assert_eq!(&d.colors[32..36], &[124, 125, 126, 127], "the document's buses and master");
+    let doc_strips = d.strip_space();
+    assert_eq!(&doc_strips.colors[32..36], &[124, 125, 126, 127], "the document's buses and master");
+    let paint: Vec<i64> = d.specials.iter().map(|(_, sp)| sp.color).collect();
+    assert_eq!(paint, [124, 125, 126, 127], "the document's specials do not hold their own paint");
     let bays = d.legacy_bays();
     let seat = |bay: usize| bays.iter().find(|(b, _)| *b == bay).map(|(_, p)| p.as_str());
     assert_eq!(seat(32 * 3), Some("/x/drumbus.vst3"));
     assert_eq!(seat(35 * 3 + 2), Some("/x/master.vst3"));
-    assert_eq!(d.muted, (1 << 33) | (1 << 23), "the document's muted click");
+    assert_eq!(doc_strips.muted, (1 << 33) | (1 << 23), "the document's muted click");
+    assert!(d.specials.click.mute && d.muted == 1 << 23, "the document's click does not hold its own mute");
     let lanes: Vec<(usize, String)> =
         a.automation.curves().iter().map(|c| (c.lane, c.param.key())).collect();
     assert!(lanes.contains(&(32, "gain".to_owned())), "the master's gain curve: {lanes:?}");
@@ -439,12 +465,22 @@ fn a_27_sends_file_lifts() {
 /// phase mask where the file had it. Red at the base.
 #[test]
 fn a_sixteen_era_phase_inverted_drum_bus_lands_on_strip_32() {
+    use crate::recorder::StripRef;
+    use crate::settings::StripSwitch;
     let (_, text) = fixture!("settings-v19.json");
     let s = Settings::from_json(text);
-    assert_eq!(s.strip_phase, (1 << 32) | (1 << 35), "phase did not follow the drum bus and master");
+    // In the legacy strip space the specials were joined back into, and by
+    // what each strip is (W5).
+    let strips = s.strip_space();
+    assert_eq!(strips.phase, (1 << 32) | (1 << 35), "phase did not follow the drum bus and master");
+    assert_eq!(s.strip_phase, 0, "a row took the drum bus's polarity");
+    assert!(
+        s.strip_switch(StripRef::Drums, StripSwitch::Phase) && s.strip_switch(StripRef::Master, StripSwitch::Phase),
+        "the drum bus and the master do not hold their polarity"
+    );
     // And it is the same lift that moved mute and solo.
-    assert_eq!(s.strip_muted, (1 << 33) | (1 << 2));
-    assert_eq!(s.strip_soloed, (1 << 34) | (1 << 5));
+    assert_eq!(strips.muted, (1 << 33) | (1 << 2));
+    assert_eq!(strips.soloed, (1 << 34) | (1 << 5));
 }
 
 // ── provenance, the shelf map and the scans ─────────────────────────────
