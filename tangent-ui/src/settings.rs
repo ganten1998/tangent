@@ -6776,7 +6776,7 @@ mod tests {
         let back = Settings::from_json(&s.to_json());
         assert!(back.device_send_enabled);
         assert_eq!(back.device_send_name, "CABLE Input (VB-Audio Virtual Cable)");
-        assert_eq!(back, s);
+        assert_eq!(back, as_format2_says(s));
 
         // A file from before the feature: not sending, nothing chosen, and
         // everything else it says still read.
@@ -7242,14 +7242,24 @@ mod tests {
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
         assert_eq!(new.strip_colors[Strip::Channel(0).index()], 26);
 
-        // And what is written back is the NEW key, or the next launch would
-        // migrate the already-migrated numbers a second time.
+        // And what is written back reads back as ITSELF, or the next launch
+        // would migrate the already-migrated numbers a second time: a format-2
+        // desk says each row's colour outright, and the legacy writer says the
+        // new key.
         let text = new.to_json();
-        assert!(text.contains("strip_colors_v2"), "the new key is not written");
+        assert_eq!(
+            Settings::from_json(&text).strip_colors[Strip::Channel(0).index()],
+            26,
+            "a saved colour was remapped again on the way back in"
+        );
         assert!(
             !text.contains(r#""strip_colors":"#),
             "the old key is still written, so every launch would remap again"
         );
+        let legacy = serde_json::to_string(&Value::Object(new.to_map_as(crate::desk_format::Format::Legacy)))
+            .expect("json");
+        assert!(legacy.contains("strip_colors_v2"), "the legacy writer does not write the new key");
+        assert!(!legacy.contains(r#""strip_colors":"#), "the legacy writer still writes the old key");
         // Every index the map produces has to exist in the table it indexes.
         for (i, to) in PALETTE_V1_TO_V2.iter().enumerate() {
             assert!(*to < STRIP_COLORS.len(), "old colour {i} maps off the end");
@@ -7506,7 +7516,13 @@ mod tests {
                 Value::Null => Value::Null,
             }
         }
-        let mut map = Settings::first_launch().to_map();
+        // **The LEGACY shape, which spells the desk one key per field.**
+        // Format 2 writes the desk as one object whose structure (its
+        // `format`, its row ids, its kinds by name) a blind bump would turn
+        // into a desk nobody can read, and then nothing on it would have
+        // moved at all; the legacy keys move one value each and read back
+        // through the legacy chain, which every old file still takes.
+        let mut map = Settings::first_launch().to_map_as(crate::desk_format::Format::Legacy);
         for (k, v) in &mut map {
             if BOOKKEEPING.contains(&k.as_str()) {
                 continue;
@@ -7558,6 +7574,15 @@ mod tests {
         "pad_state_shift_v18",
     ];
 
+    /// `s` with `fresh`'s row ids: the reset desk as the key walk compares
+    /// it, since the ids are the one desk field a reset mints anew.
+    fn with_fresh_ids(s: &Settings, fresh: &Settings) -> Settings {
+        let mut out = s.clone();
+        out.track_ids = fresh.track_ids.clone();
+        out.next_track_id = fresh.next_track_id;
+        out
+    }
+
     /// **The five scopes partition the settings.** Apply all of them and you
     /// are where a fresh install is.
     ///
@@ -7575,7 +7600,11 @@ mod tests {
         for scope in ResetScope::PARTS {
             s.reset(scope);
         }
-        let (got, want) = (s.to_map(), fresh.to_map());
+        // **The rows' ids are the one desk field a reset does NOT put back**
+        // (below), and the format-2 `desk` key spells them, so the walk reads
+        // the reset desk under the fresh desk's ids: anything else left on it
+        // is still named, by the one key the whole desk now is.
+        let (got, want) = (with_fresh_ids(&s, &fresh).to_map(), fresh.to_map());
         let stragglers: Vec<&String> = want
             .keys()
             .filter(|k| !BOOKKEEPING.contains(&k.as_str()))
@@ -7648,7 +7677,10 @@ mod tests {
             narrow.reset(scope);
         }
         assert_eq!(wide.to_map(), narrow.to_map(), "Everything is not the parts");
-        let (got, want) = (wide.to_map(), Settings::first_launch().to_map());
+        // Under the fresh desk's ids, which a reset mints anew by design
+        // (see `the_scopes_together_are_everything`).
+        let fresh = Settings::first_launch();
+        let (got, want) = (with_fresh_ids(&wide, &fresh).to_map(), fresh.to_map());
         for (k, v) in &want {
             if BOOKKEEPING.contains(&k.as_str()) {
                 continue;
@@ -8125,6 +8157,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **`s` as its format-2 desk spells it**: every row says its name, its
+    /// input and its arm, so a struct that left them UNSAID (a short array,
+    /// `None` for an arm from before arms were kept) reads back with them
+    /// said, and nothing else about it moves. The arm is said by the shipped
+    /// rule, as `app::default_armed` resolves an unsaid one at launch.
+    fn as_format2_says(mut s: Settings) -> Settings {
+        s.strip_names.resize(crate::recorder::STRIPS + 1, String::new());
+        s.channel_inputs.resize(crate::recorder::CHANNELS, String::new());
+        let armed = s.channel_armed.unwrap_or_else(|| {
+            crate::arrangement::armed_by_default(&s.channel_kinds, |n| {
+                s.strip_inserts.get(n * crate::recorder::INSERTS).map_or("", String::as_str)
+                    == crate::dialogs::BUILTIN_PATH
+            })
+        });
+        s.channel_armed = Some(armed);
+        s
+    }
+
     /// The settings a plugin carries in its project file are the same text the
     /// standalone writes, unknown keys included. Anything else and a project
     /// saved by the plugin would quietly drop whatever a newer build knew
@@ -8156,7 +8206,7 @@ mod tests {
         );
 
         let back = Settings::from_json(&s.to_json());
-        assert_eq!(back, s, "a project round trip changed the settings");
+        assert_eq!(back, as_format2_says(s), "a project round trip changed the settings");
         assert_eq!(
             back.extra.get("a_key_from_a_later_build"),
             Some(&Value::String("kept".into())),
@@ -8208,11 +8258,16 @@ mod tests {
         s.window_size_percent = 50;
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path).window_size_percent, 50);
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            1,
-            "exactly one file"
-        );
+        // Exactly the settings file, and the one marker the first format-2
+        // write leaves for the global shelf's conversion (design 6.6): no
+        // temp file, no second copy.
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [SHELF_PENDING_NAME, "settings.json"], "exactly one file and the shelf's marker");
 
         // The rename must not have reordered the keys: the file order is
         // Python's insertion order and unknown keys keep their place.
@@ -8333,11 +8388,14 @@ mod tests {
             (s.strip_keys_params[clav_pickup] - 0.35).abs() < 1e-6,
             "a new sound inherited an old strip's knob"
         );
-        // Round trip: the full rack comes back exactly, and the legacy key
-        // still carries the two old sounds at the old stride.
-        let m = s.to_map();
-        let back = Settings::from_map(m.clone());
+        // Round trip: the full rack comes back exactly through the file this
+        // build writes (format 2, the rack in each row's `keys`), and the
+        // LEGACY writer's key still carries the two old sounds at the old
+        // stride.
+        let back = Settings::from_map(s.to_map());
         assert_eq!(back.strip_keys_params, s.strip_keys_params);
+        let m = s.to_map_as(crate::desk_format::Format::Legacy);
+        assert_eq!(Settings::from_map(m.clone()).strip_keys_params, s.strip_keys_params);
         let legacy = m["strip_keys_params"].as_array().expect("legacy key");
         assert_eq!(legacy.len(), n * 16, "the legacy key changed shape");
         assert!(
@@ -8400,18 +8458,22 @@ mod tests {
     #[test]
     fn insert_keys_round_trip_and_stay_absent_until_one_is_made() {
         // Absent from an untouched desk, so a file from an install that
-        // never keyed anything keeps its byte-for-byte shape.
-        assert!(!Settings::default().to_map().contains_key("insert_keys"));
+        // never keyed anything keeps its byte-for-byte shape. (The legacy
+        // writer's key: a format-2 file spells the keys inside its `desk`.)
+        let legacy = |s: &Settings| s.to_map_as(crate::desk_format::Format::Legacy);
+        assert!(!legacy(&Settings::default()).contains_key("insert_keys"));
 
         let mut s = Settings::default();
         s.insert_keys.set(3, 1, Some(7));
         s.insert_keys.set(35, 5, Some(0)); // the master's second rack
-        let out = s.to_map();
+        let out = legacy(&s);
         // Written at the END, ahead only of the preserved extras — the
         // additive-key law every new key here follows.
         assert_eq!(out.keys().last().map(String::as_str), Some("insert_keys"));
         let back = Settings::from_map(out);
         assert_eq!(back.insert_keys, s.insert_keys);
+        // And through the file this build writes.
+        assert_eq!(Settings::from_map(s.to_map()).insert_keys, s.insert_keys, "format 2 lost a key");
 
         // A file with keys AND an unknown future key keeps both.
         let s2 = Settings::from_map(map_of(
@@ -8434,10 +8496,11 @@ mod tests {
     /// default would open every one of them with every MIDI track deaf.
     #[test]
     fn the_midi_device_sets_round_trip_at_the_end_and_are_absent_until_narrowed() {
+        // The legacy writer's key, which every file before format 2 carries;
+        // a format-2 file spells each row's set inside its `desk` (below).
+        let legacy = |s: &Settings| s.to_map_as(crate::desk_format::Format::Legacy);
         assert!(
-            !Settings::default()
-                .to_map()
-                .contains_key("channel_midi_inputs"),
+            !legacy(&Settings::default()).contains_key("channel_midi_inputs"),
             "a desk nobody has narrowed wrote the key"
         );
 
@@ -8458,7 +8521,7 @@ mod tests {
             devices: vec!["Keystation 88".to_owned()],
             channel: Some(2),
         };
-        let out = s.to_map();
+        let out = legacy(&s);
         assert_eq!(
             out.keys().last().map(String::as_str),
             Some("channel_midi_inputs"),
@@ -8466,12 +8529,20 @@ mod tests {
         );
         let back = Settings::from_map(out);
         assert_eq!(back.channel_midi_inputs, s.channel_midi_inputs);
+        // Through the file this build writes, where every row says its set:
+        // the three narrowed here, and every other row listening to
+        // everything, which is what the legacy key's absence meant.
+        let says_the_sets = |read: &Settings| {
+            read.channel_midi_inputs[..3] == s.channel_midi_inputs[..]
+                && read.channel_midi_inputs[3..].iter().all(crate::recorder::MidiInputSel::is_everything)
+        };
+        assert!(says_the_sets(&Settings::from_map(s.to_map())), "format 2 lost a device set");
 
         // Through the PLUGIN's road too — the same text, and the same
         // constraint: a project saved by the plugin and a settings file
         // written by the app say the same thing.
         let json = Settings::from_json(&s.to_json());
-        assert_eq!(json.channel_midi_inputs, s.channel_midi_inputs);
+        assert!(says_the_sets(&json), "the plugin's road lost a device set");
 
         // A file with sets AND an unknown future key keeps both.
         let s2 = Settings::from_map(map_of(
@@ -8544,7 +8615,10 @@ mod tests {
     /// look for in a settings file.
     #[test]
     fn insert_bypass_round_trips_at_the_end_and_is_absent_until_one_is_made() {
-        assert!(!Settings::default().to_map().contains_key("insert_bypass"));
+        // The legacy writer's key; a format-2 file spells the bypassed bays
+        // inside its `desk` (the round trip below).
+        let legacy = |s: &Settings| s.to_map_as(crate::desk_format::Format::Legacy);
+        assert!(!legacy(&Settings::default()).contains_key("insert_bypass"));
         assert!(
             !Settings::default().insert_bypass.contains(0, 0),
             "a fresh desk came up with a bay switched off"
@@ -8557,7 +8631,7 @@ mod tests {
         assert!(s.insert_bypass.set(3, 0, true));
         // Setting a bay that is already set changes nothing and says so.
         assert!(!s.insert_bypass.set(3, 0, true));
-        let out = s.to_map();
+        let out = legacy(&s);
         assert_eq!(
             out.keys().last().map(String::as_str),
             Some("insert_bypass"),
@@ -8565,6 +8639,7 @@ mod tests {
         );
         let back = Settings::from_map(out);
         assert_eq!(back.insert_bypass, s.insert_bypass);
+        assert_eq!(Settings::from_map(s.to_map()).insert_bypass, s.insert_bypass, "format 2 lost a bypass");
         assert_eq!(
             back.insert_bypass.0,
             vec![(3, 0), (3, 2), (crate::recorder::MASTER_EXTRA_SEAT, 1)],
@@ -9081,7 +9156,10 @@ mod tests {
         s.strip_inserts[far] = "/x/Brusfri.vst3".to_owned();
         s.strip_inserts[pad] = "/x/PadComp.vst3".to_owned();
         s.strip_inserts[5 * crate::recorder::INSERTS] = "/x/Channel5.vst3".to_owned();
-        let map = s.to_map();
+        // The legacy writer's shape, which every file before format 2 holds
+        // and the legacy reader still takes; the round trip below is through
+        // the file this build writes.
+        let map = s.to_map_as(crate::desk_format::Format::Legacy);
         let head = map.get("strip_inserts").and_then(Value::as_array).expect("the head");
         assert_eq!(head.len(), crate::arrangement::HEAD_BAYS, "the head is not written whole");
         assert_eq!(head[5 * crate::recorder::INSERTS], Value::String("/x/Channel5.vst3".into()));
@@ -9099,9 +9177,15 @@ mod tests {
         assert!(!back.extra.contains_key("strip_inserts_tail"), "the tail became a stranger");
         assert_eq!(back.strip_inserts.len(), crate::recorder::INSERT_SPACE);
 
+        let legacy = serde_json::to_string(&Value::Object(map)).expect("json");
+        assert_eq!(Settings::from_json(&legacy).strip_inserts, s.strip_inserts, "the legacy shape read differently");
+
         // A desk with nothing past the head writes no tail at all.
         let plain = Settings::default();
-        assert!(!plain.to_map().contains_key("strip_inserts_tail"), "an empty tail was written");
+        assert!(
+            !plain.to_map_as(crate::desk_format::Format::Legacy).contains_key("strip_inserts_tail"),
+            "an empty tail was written"
+        );
         assert_eq!(Settings::from_json(&plain.to_json()).strip_inserts, plain.strip_inserts);
     }
 

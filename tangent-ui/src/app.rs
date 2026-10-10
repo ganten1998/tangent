@@ -49273,8 +49273,12 @@ mod tests {
         let doc =
             crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&shelf));
         let desk = doc.desk.expect("the seed left the desk out");
+        // Compared as the desks they WRITE: format 2 writes rows, so the
+        // shipped desk's short arrays come back at the desk's width.
+        let written = |d: &crate::arrangement::DeskSnap| d.to_value_as(crate::desk_format::Format::current());
         assert_eq!(
-            desk, TangentApp::template_desk(),
+            written(&desk),
+            written(&TangentApp::template_desk()),
             "the seed captured the session that was open"
         );
         assert_ne!(
@@ -55671,8 +55675,10 @@ mod tests {
         // in the snapshot a document is saved from, so the next launch and
         // the next open find the arms this session left.
         assert_eq!(app.settings.channel_armed, Some(2), "the arm was not kept");
-        assert!(
-            app.settings.to_json().contains("\"channel_armed\""),
+        // In the file as each row's `arm`: read back, the file says it.
+        assert_eq!(
+            Settings::from_json(&app.settings.to_json()).channel_armed,
+            Some(2),
             "the arm never reached the settings file"
         );
         assert_eq!(
@@ -55765,7 +55771,10 @@ mod tests {
         let doc = app.project_doc.clone();
 
         // Strip the six keys out of the document on disk, the way a file
-        // written by an older build simply would not have them.
+        // written by an older build simply would not have them: in the
+        // LEGACY shape, which is the only one an older build wrote.
+        let saved = crate::arrangement::Arrangement::load_from(&doc);
+        saved.save_to_as(&doc, crate::desk_format::Format::Legacy);
         let text = std::fs::read_to_string(&doc).expect("the document");
         let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
         let desk = value
@@ -75335,7 +75344,9 @@ mod folder_tests {
         desk.set_bay(3 * INSERTS, dialogs::DRUMPAD_PATH);
         desk.set_bay(2 * INSERTS, "/x/EP.vst3");
         arr.desk = Some(desk);
-        arr.save_to(&doc);
+        // The v7 tail is a LEGACY document's key: a format-2 desk names each
+        // plugin by its bay, never by a number a file can make up.
+        arr.save_to_as(&doc, crate::desk_format::Format::Legacy);
         let text = std::fs::read_to_string(&doc).expect("the document");
         let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
         json["desk"].as_object_mut().expect("a desk").insert(
@@ -78945,9 +78956,13 @@ mod folder_tests {
         let mut arr = crate::arrangement::Arrangement::default();
         arr.desk = Some(snap.clone());
         let back = crate::arrangement::Arrangement::from_json(&arr.to_json());
-        assert_eq!(
-            back.desk.as_ref().unwrap(),
-            &snap,
+        let read = back.desk.as_ref().unwrap();
+        // As the desks they write (format 2 writes rows, so arrays the live
+        // desk keeps short come back at its width), and the flags by name.
+        let written = |d: &crate::arrangement::DeskSnap| d.to_value_as(crate::desk_format::Format::current());
+        assert_eq!(written(read), written(&snap), "the folders did not survive the document");
+        assert!(
+            read.is_folder[1] && read.in_folder[2] && read.in_folder[3] && read.folder_shut[1],
             "the folders did not survive the document"
         );
 

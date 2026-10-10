@@ -127,11 +127,17 @@ mod rt_alloc;
 /// Render goldens of today's engine, to the bit, over built-in units.
 #[cfg(all(test, feature = "recorder"))]
 mod render_golden;
-/// The one seam between the app and the engine: the desk-structure pushes
-/// (`Bridge::sync`) and the offline furnishing every export, probe and
-/// freeze is built by (`furnish_offline`). docs/design/unlimited-tracks.md, C9.
+/// The one seam between the app and the engine: which lane is whose track,
+/// the desk's shape as one plan (`Bridge::sync`), and the offline engine
+/// every export, probe and freeze is built by (`full_build`).
+/// docs/design/unlimited-tracks.md, C9.
 #[cfg(feature = "recorder")]
 mod engine_bridge;
+/// The plugin-state shelves, named by identity, and the one copy of the
+/// legacy global shelf into those names. docs/design/unlimited-tracks.md,
+/// section 6.6 and C10.
+#[cfg(feature = "recorder")]
+mod shelf;
 /// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
 /// a drop-in for the handful of midir calls `midi` makes, so the difference is
 /// one `use` and not a second code path. A target gate, not a feature gate —

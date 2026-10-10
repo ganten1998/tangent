@@ -193,7 +193,7 @@ pub fn full_build_with(
         freeze,
         probe: probe.then_some(&ctx.probe),
     };
-    let synced = bridge.sync_shape(app, &mut e, shape, &mut |_, _, _, _| {});
+    let synced = bridge.sync_shape(app, &mut e, shape, &mut |_, _, _| {});
     e.set_monitor_on(false);
     e.set_drums(app.drums_gain(), app.drums_pan());
     if probe {
@@ -299,12 +299,11 @@ pub fn full_build_with(
             let Some(at) = bridge.engine_bay(sb) else {
                 continue;
             };
-            // The live engine's own seat for the bay, through ITS bridge,
-            // and the shelf's name for it: the two engines' lanes sit at
-            // different slots once anything has moved.
+            // The live engine's own seat for the bay, through ITS bridge: the
+            // two engines' lanes sit at different slots once anything has
+            // moved. The shelf names the bay by identity.
             let live = ctx.live.and_then(|(le, lb)| lb.engine_bay(sb).map(|seat| (le, seat)));
-            let shelf = app_seat_of(app.track_ids(), sb);
-            if let Err(err) = furnish_mirror_bay(&mut e, live, at, shelf, &path) {
+            if let Err(err) = furnish_mirror_bay(&mut e, live, at, Some(sb), &path) {
                 ctx.refused.push(format!("{} ({err})", leaf_of(&path)));
             }
         }
@@ -447,16 +446,6 @@ pub fn lane_of_engine_seat(seat: usize) -> Option<Slot> {
     }
 }
 
-/// **The same rack at row `row`'s seat**: an engine seat of some lane,
-/// renamed to the seat the app (and the legacy shelf) keeps that rack at
-/// for the row the track stands on.
-pub fn seat_at_row(engine_seat: usize, row: usize) -> Option<usize> {
-    match decode_v32_seat(engine_seat)? {
-        (LegacyOwner::Row(_), rack) => encode_v32_seat(LegacyOwner::Row(u16::try_from(row).ok()?), rack),
-        _ => Some(engine_seat),
-    }
-}
-
 /// The engine seat of a special's rack (the drum bus, the click, the
 /// return, the master), the same in every engine.
 fn special_bay(node: Node, rack: Rack, bay: u8) -> Option<(usize, usize)> {
@@ -479,9 +468,9 @@ fn row_bit(word: u64, row: usize) -> bool {
 }
 
 /// **What the host does with a lane whose track has gone**, called by the
-/// bridge while the lane's plugins are alive: the engine, the track, its
-/// lane, and the row it last stood on.
-pub type Retire<'a> = dyn FnMut(&Engine, TrackId, LaneAt, Option<usize>) + 'a;
+/// bridge while the lane's plugins are alive: the engine, the track and its
+/// lane. The track's bays are named by its identity, so no row is needed.
+pub type Retire<'a> = dyn FnMut(&Engine, TrackId, LaneAt) + 'a;
 
 /// One track's lane in the engine: where it sits, and which lane it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -779,17 +768,17 @@ impl Bridge {
     /// lane, which only a host with a shelf has.
     #[cfg_attr(not(test), allow(dead_code, reason = "the host passes its shelf"))]
     pub fn sync(&mut self, app: &TangentApp, e: &mut Engine) -> Synced {
-        self.sync_shape(app, e, Shape::Live, &mut |_, _, _, _| {})
+        self.sync_shape(app, e, Shape::Live, &mut |_, _, _| {})
     }
 
     /// **Push the desk into the live engine**, once a frame: adopt, install
     /// and send home by identity, publish the shape when it moved, store the
     /// continuous values. `on_retire` is called for each lane the frame its
     /// track goes, while every plugin in it is still alive and before
-    /// anything is sent home, with the row the track last stood on, so the
-    /// host can write every bay's state to the shelf first (design 7.13: "the
-    /// lane comes home whole ... the host writes each bay's state to its
-    /// pstate file on the global shelf, then drops it").
+    /// anything is sent home, so the host can write every bay's state to the
+    /// shelf first (design 7.13: "the lane comes home whole ... the host
+    /// writes each bay's state to its pstate file on the global shelf, then
+    /// drops it").
     pub fn sync_with(&mut self, app: &TangentApp, e: &mut Engine, on_retire: &mut Retire<'_>) -> Synced {
         self.sync_shape(app, e, Shape::Live, on_retire)
     }
@@ -805,8 +794,7 @@ impl Bridge {
         let gone: Vec<TrackId> = self.lanes.keys().filter(|id| !wanted.contains(id)).copied().collect();
         for id in gone {
             if let Some(h) = self.lanes.remove(&id) {
-                let last_row = self.rows.iter().position(|(t, _)| *t == id);
-                on_retire(e, id, h.at, last_row);
+                on_retire(e, id, h.at);
                 self.leaving.push(Leaving {
                     id,
                     at: h.at,
@@ -2328,6 +2316,90 @@ mod tests {
         assert_eq!((order.first(), order.last()), (Some(&Slot(1)), Some(&Slot(0))), "the drag did not move every row");
     }
 
+    /// **A reorder and its undo keep every plugin state by its track, and
+    /// touch no state file** (W4-integrate (B), done-when: "after (B) 0
+    /// sidecar filesystem calls"). Rows 2, 3 and 4 hold a plugin on the
+    /// chain, in the second rack and on the third pedal; Insert Track under
+    /// row 1 brings the free row 5 up into the gap, which is a CYCLE (three
+    /// rows shift down one), and the undo is its inverse. Every bay's state
+    /// file is named by its track (`pstate-t3-c1-b1.bin`), so the names the
+    /// desk holds are the same names after the reorder and after the undo,
+    /// every file is found by them, and the shelf is not called once: the
+    /// files the old builds moved row by row on every reorder are simply
+    /// never asked to move.
+    #[test]
+    fn a_reorder_and_its_undo_keep_every_state_by_its_track() {
+        let ids = tangent_ui::desk_legacy::identity_ids(32);
+        let racks = [(Rack::Chain(0), 0u8), (Rack::Chain(1), 1), (Rack::Pedal(2), 0)];
+        let mut s = blank();
+        kind(&mut s, &[0, 1, 2, 3, 4], ChannelKind::Audio);
+        for row in 2..5 {
+            for (n, (rack, b)) in racks.into_iter().enumerate() {
+                let sb = SeatBay::new(Node::Track(ids[row]), rack, b);
+                let (seat, b) = app_seat_of(&ids, sb).expect("an app seat");
+                bay(&mut s, seat, b, &format!("/x/row{row}-{n}.vst3"));
+            }
+        }
+        let mut app = app_with(s);
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-reorder-states-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let named = desk_bays(&app);
+        assert_eq!(named.len(), 9, "the fixture seats nine plugins");
+        for (sb, path) in &named {
+            assert!(crate::shelf::write_state_in(&dir, *sb, path, path.as_bytes()), "a state file");
+        }
+        let files = |dir: &Path| -> BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .expect("the shelf")
+                .flatten()
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).expect("read")))
+                .collect()
+        };
+        let before = files(&dir);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        // The desk before the reorder is a moment of its own, as the gesture
+        // that came before it would have left it: the undo returns there.
+        // (Escape closes whatever the first frame opened over the desk, which
+        // would otherwise take the Cmd+Z.)
+        key(&mut app, egui::Key::F24, egui::Modifiers::NONE);
+        key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        app.commit_undo_moment();
+
+        let calls = crate::shelf::fs_calls();
+        let mut retired = 0usize;
+        app.move_channel(5, 2);
+        p.sync_with(&app, &mut e, &mut |_, _, _| retired += 1);
+        let moved = desk_bays(&app);
+        let rows_moved = app.track_ids()[2..6].to_vec();
+        key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        p.sync_with(&app, &mut e, &mut |_, _, _| retired += 1);
+        let undone = desk_bays(&app);
+        let rows_undone = app.track_ids()[2..6].to_vec();
+        let shelf_calls = crate::shelf::fs_calls() - calls;
+
+        assert_eq!(rows_moved, [ids[5], ids[2], ids[3], ids[4]], "fixture: the insert did not shift three rows");
+        assert_eq!(rows_undone, [ids[2], ids[3], ids[4], ids[5]], "fixture: the undo did not put them back");
+        assert_eq!(moved, named, "a reorder renamed a bay's state file");
+        assert_eq!(undone, named, "its undo renamed a bay's state file");
+        assert_eq!(retired, 0, "a reorder retired a lane");
+        assert_eq!(shelf_calls, 0, "a reorder and its undo made {shelf_calls} shelf filesystem calls");
+        for (sb, path) in &named {
+            assert_eq!(
+                crate::shelf::read_state(&dir, *sb, path).as_deref(),
+                Some(path.as_bytes()),
+                "{sb}'s plugin no longer finds its own state"
+            );
+        }
+        assert_eq!(files(&dir), before, "a state file moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A removed track's states are written before its plugins drop, and
     /// its undo brings it back with every state** (W4-integrate, done-when).
     /// A COMP dialled on row 1, the track removed: the host is asked for the
@@ -2356,7 +2428,7 @@ mod tests {
         key(&mut app, egui::Key::F24, egui::Modifiers::NONE);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::TrackRemove(1));
         assert!(!app.track_ids().contains(&gone), "the removal kept the track's id");
-        let mut retire = |e: &Engine, id: TrackId, lane: LaneAt, _row: Option<usize>| {
+        let mut retire = |e: &Engine, id: TrackId, lane: LaneAt| {
             let (seat, bay) = lane_bay(lane.slot, Rack::Chain(0), 0).expect("the lane's first bay");
             let alive = e.insert(seat, bay).is_some();
             if let Some(state) = e.save_insert_state(seat, bay) {
@@ -2374,7 +2446,7 @@ mod tests {
         key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(app.track_ids().get(1), Some(&gone), "the undo did not bring the track back");
         for _ in 0..3 {
-            p.sync_with(&app, &mut e, &mut |_, _, _, _| {});
+            p.sync_with(&app, &mut e, &mut |_, _, _| {});
         }
         let back = p.lane_of(gone).expect("the restored track has no lane");
         let sb = seat_bay_at(app.track_ids(), 1, 0).expect("the bay");

@@ -42,12 +42,13 @@ use crate::recorder::MidiInputSel;
 /// The `format` a format-2 desk says it is.
 pub const DESK_FORMAT: u64 = 2;
 
-/// **The one switch.** While false, production writes today's bytes: no
-/// format-2 desk, no stamp 23 or 8, no backup, no pending marker, no
-/// pstate name. Tests reach the format-2 writers through their own entry
-/// points and never flip this. MERGE-ME(W4-integrate (B)): flipped there,
-/// in the commit that lands the copy-only shelf.
-pub const WRITE_V8: bool = false;
+/// **The one switch.** On: settings, documents, templates and DAW blobs
+/// write the format-2 desk, stamped 23 and 8, with the backups, the pending
+/// marker, the drumpad's track keys and the host's pstate names that come
+/// with it. Flipped by W4-integrate (B) in the commit that lands the
+/// copy-only shelf (`tangent/src/shelf.rs`), so nothing is ever written in
+/// format 2 before every plugin state can be found by its new name.
+pub const WRITE_V8: bool = true;
 
 /// [`WRITE_V8`], or a test on this thread that asked for format 2
 /// ([`with_format2`]). Every format-2 side effect reads THIS, so a test can
@@ -801,6 +802,13 @@ mod tests {
         assert_eq!(seen.len(), PICTURES.len(), "the tables are out of step");
         for ((name, got), (want_name, want)) in seen.iter().zip(PICTURES) {
             assert_eq!(*name, want_name, "the tables are out of step");
+            // The 24-channel window opens LIFTED under the switch that turned
+            // the lift on with the copy-only shelf (`V24_PICTURES`); the
+            // table keeps the picture it opened to before.
+            let want = V24_PICTURES
+                .iter()
+                .find(|(n, _)| crate::desk_lift::V24_LIFT && *n == want_name)
+                .map_or(want, |(_, w)| *w);
             assert_eq!(got, want, "{name} opened as a different desk");
         }
     }

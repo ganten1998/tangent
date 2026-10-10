@@ -6239,7 +6239,9 @@ mod tests {
         snap.set_bay(seat, crate::dialogs::BUILTIN_PATH);
         snap.armed = 1 << 1;
 
-        let mut value = snap.to_value();
+        // A document from before the arm was written down is a LEGACY one:
+        // a format-2 desk says every row's arm.
+        let mut value = snap.to_value_as(crate::desk_format::Format::Legacy);
         let obj = value.as_object_mut().expect("a desk object");
         assert!(obj.remove("armed").is_some(), "the key was never written");
         let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
@@ -6901,7 +6903,11 @@ mod tests {
     fn the_seats_are_a_whole_head_and_a_sparse_tail_from_any_shape() {
         let a = a_document_with_everything_in_it();
         let d = a.desk.clone().expect("a desk");
-        let written = serde_json::from_str::<Value>(&a.to_json()).expect("json");
+        // The LEGACY writer's shape, which every document before format 2
+        // holds and the legacy reader still takes: format 2 names each
+        // plugin by its bay instead.
+        let legacy = |a: &Arrangement| a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::Legacy);
+        let written = serde_json::from_str::<Value>(&legacy(&a)).expect("json");
         let desk = written.get("desk").and_then(Value::as_object).expect("a desk object");
         let head = desk.get("inserts").and_then(Value::as_array).expect("the head array");
         assert_eq!(head.len(), HEAD_BAYS, "the head is not written whole");
@@ -6909,7 +6915,8 @@ mod tests {
         let tail = desk.get("inserts_tail").and_then(Value::as_object).expect("a tail");
         assert_eq!(tail.get("12447"), Some(&Value::String("brusfri".into())));
         assert_eq!(tail.len(), 1, "a head seat leaked into the tail");
-        assert!(a.to_json().matches("\"\"").count() < 200, "thousands of empties again");
+        assert!(legacy(&a).matches("\"\"").count() < 200, "thousands of empties again");
+        assert!(a.to_json().matches("\"\"").count() < 200, "thousands of empties in format 2");
 
         // The dense shape every earlier build wrote.
         let mut dense = vec![Value::String(String::new()); crate::recorder::INSERT_SPACE];
@@ -6922,7 +6929,7 @@ mod tests {
         let from_dense = Arrangement::from_json(&old.to_string());
         assert_eq!(from_dense.desk.as_ref(), Some(&d), "the dense shape read differently");
         assert_eq!(from_dense.fingerprint(), a.fingerprint(), "the dense shape hashes apart");
-        assert_eq!(from_dense.to_json(), a.to_json(), "the dense shape is not rewritten as v7");
+        assert_eq!(legacy(&from_dense), legacy(&a), "the dense shape is not rewritten as v7");
 
         // The fully sparse object.
         let mut sparse = written.clone();
@@ -7047,9 +7054,19 @@ mod tests {
     /// property the fingerprint is allowed to lean on.
     #[test]
     fn a_round_trip_keeps_the_fingerprint() {
-        let a = a_document_with_everything_in_it();
-        let json = a.to_json();
-        let back = Arrangement::from_json(&json);
+        // **The document as the reader hands it over.** Format 2 writes the
+        // desk's ROWS, not the lengths of the arrays they came from, so this
+        // fixture's three-entry arrays come back as the live desk's width,
+        // the same rows with nothing else said: the asterisk compares against
+        // a document that has been through the reader, and that is the one
+        // whose number may not move.
+        let fixture = a_document_with_everything_in_it();
+        let json = fixture.to_json();
+        let a = Arrangement::from_json(&json);
+        assert_eq!(a.to_json(), json, "the reader's document writes other bytes than the fixture");
+        let model = |a: &Arrangement| a.desk.as_ref().map(|d| d.desk_model().model);
+        assert_eq!(model(&a), model(&fixture), "the reader's desk is not the fixture's, row for row");
+        let back = Arrangement::from_json(&a.to_json());
         assert_eq!(back.to_json(), json, "the document is not a fixed point");
         assert_eq!(
             back.fingerprint(),
@@ -7083,7 +7100,9 @@ mod tests {
     fn a_seventeen_digit_float_is_a_fixed_point() {
         let awkward = 0.999_999_999_999_999_9_f64;
         assert_ne!(awkward, 1.0, "the literal rounded to 1.0 at compile time");
-        let mut a = a_document_with_everything_in_it();
+        // Through the reader once first, for `a_round_trip_keeps_the_fingerprint`'s
+        // reason: format 2 writes the fixture's short arrays as whole rows.
+        let mut a = Arrangement::from_json(&a_document_with_everything_in_it().to_json());
         a.clips[0].fade_out_s = awkward;
         let json = a.to_json();
         assert!(
