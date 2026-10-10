@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 use tangent_record::audio::Timebase;
 use tangent_ui::app::TangentApp;
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
-use tangent_ui::desk_legacy::{bind, decode_v32_strip};
 use tangent_ui::automation::AutoLane;
 use tangent_ui::recorder::{ChannelKind, MidiRoute, StripRef};
 use tangent_ui::routing::Target;
@@ -48,8 +47,8 @@ use crate::desktop::{
     keys_patch_of, leaf_of, mirror_sampler_samples,
 };
 use crate::instrument::{
-    Engine, LaneKind, LanePart, LaneSpec, PadBank, PadKit, Placed, PlacedMidi, RackAddr, RackOwner, SlotAutomation,
-    SlotPlaced, SlotPlacedMidi, LEGACY_LANES,
+    Engine, LaneKind, LanePart, LaneSpec, PadBank, PadKit, Placed, PlacedMidi, RackAddr, RackOwner, SendCurve,
+    SlotAutomation, SlotPlaced, SlotPlacedMidi, LEGACY_LANES,
 };
 
 /// **A bay, by the engine's identity for its rack** (`RackAddr`: a lane's by
@@ -279,6 +278,10 @@ pub fn full_build_with(
         None => app.engine_automation(),
     };
     e.set_automation_slotted(bridge.slot_automation(&auto));
+    // **And the sends' own curves** (`Bridge::send_curves`), so a level
+    // drawn on a send to a bus plays in the export as it does live. A fresh
+    // engine's ring is empty, so they land.
+    let _ = e.set_send_curves(bridge.send_curves(&auto, &send_bus_of));
     // Each DX7 lane's sound out of its strip's OWN cartridge: the sync
     // above shipped an instance to every DX7 row (a fresh offline engine
     // has none). An export whose second DX7 track rendered with the first
@@ -418,6 +421,18 @@ pub fn dx7_voice(app: &TangentApp, strip: usize) -> crate::dx7::Voice {
     cart.voices.get(patch).or_else(|| cart.voices.first()).copied().unwrap_or_default()
 }
 
+/// **Which bus a curve's control is the send to** (`AutoParam::SendTo {
+/// to }`), the decoder [`Bridge::send_curves`] is handed by the live push
+/// and the export. MERGE-ME(W7-buses-ui): that lane appends the variant
+/// (`automation.rs`, key `send:t<id>`), and at the merge this answers
+/// `match param { AutoParam::SendTo { to } => Some(to), _ => None }`. Until
+/// then no control is a send to a bus, which is true of every desk this
+/// base can hold: nothing here can draw a curve on a bus send.
+pub fn send_bus_of(param: tangent_ui::automation::AutoParam) -> Option<TrackId> {
+    let _ = param;
+    None
+}
+
 /// **Every bay the desk seats, by identity**: the app's own map (C11's
 /// `plugins`), read directly. A track's bays are wherever the track is, so
 /// a reorder changes nothing here; a bay whose track no row holds is not in
@@ -426,15 +441,20 @@ pub fn desk_bays(app: &TangentApp) -> BTreeMap<SeatBay, String> {
     app.plugins().iter().filter(|(_, p)| !p.is_empty()).map(|(sb, p)| (*sb, p.clone())).collect()
 }
 
-/// **The bay at the host's `(seat, bay)`, by identity**, under row ids
-/// `ids`: the frozen map's crossing (`desk_legacy::bay_at`), for the host's
-/// roads that still hold a seat.
+/// **The bay the frozen map names `(seat, bay)`, by identity**, under row
+/// ids `ids` (`desk_legacy::bay_at`): the tests' way to name their legacy
+/// fixtures' bays. No road of the host's holds a seat any more
+/// (W7-slot-gaps): the frozen map has none for a track past its
+/// thirty-second row.
+#[cfg(test)]
 pub fn seat_bay_at(ids: &[TrackId], seat: usize, bay: usize) -> Option<SeatBay> {
     tangent_ui::desk_legacy::bay_at(ids, seat, bay)
 }
 
 /// **Where the frozen map keeps a bay**, `(seat, bay)`, under row ids
-/// `ids`: [`seat_bay_at`]'s inverse. `None` for a track no row holds.
+/// `ids`: [`seat_bay_at`]'s inverse, for the tests. `None` for a track no
+/// row holds.
+#[cfg(test)]
 pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
     tangent_ui::desk_legacy::seat_of(ids, sb)
 }
@@ -537,21 +557,6 @@ pub fn track_bay(app: &TangentApp, id: TrackId, rack: Rack, bay: u8) -> Option<&
 /// instrument.
 pub fn row_instrument(app: &TangentApp, row: usize) -> Option<&str> {
     track_bay(app, app.track_at(row)?, Rack::Chain(0), 0)
-}
-
-/// **The node a strip of the app's desk is**, for the roads that still hand
-/// the host a strip (a face, a drop on a column): the frozen strip space
-/// (`decode_v32_strip`) bound to the desk's rows, so a track is named by its
-/// identity and no strip index is turned into a seat by hand.
-pub fn strip_node(app: &TangentApp, strip: usize) -> Option<Node> {
-    bind(decode_v32_strip(strip)?, &app.track_ids())
-}
-
-/// **The bay of a strip's displayed slot, by identity** (`desk_id::slot_key`,
-/// the one display-slot resolver: the master's two racks show the other way
-/// round).
-pub fn strip_slot(app: &TangentApp, strip: usize, slot: usize) -> Option<SeatBay> {
-    tangent_ui::desk_id::slot_key(strip_node(app, strip)?, slot)
 }
 
 /// **The plugin path in a bay, by identity**, off the app's map.
@@ -767,15 +772,35 @@ impl Bridge {
     /// **The engine's name for a bay, by identity**: a track's through its
     /// lane, a special's as it always was. `None` for a track with no lane
     /// (gone, or waiting for one).
+    ///
+    /// **And `None` for a pad's bay while its track's lane has no pad bank**
+    /// (`Held::pads`: a lane installed for a track whose first bay was not
+    /// the drumpad). The bay is not wanted anywhere until the bank is sent
+    /// (`attach_pads`), and from that frame the reconcile finds it wanted
+    /// and not loaded, and seats it. It used to be wanted at once: the load
+    /// went to a lane with nowhere to put a pad's rack past slot 31, the
+    /// plugin went home with the rack, and the ledger still said it was
+    /// seated, so when the drumpad came back the kit played that pad dry,
+    /// live, for good, while an export built the lane with its bank and
+    /// played it through its effect (W7-slot-gaps). A pad of a lane of the
+    /// frozen map has its rack in the frozen bank either way; it waits for
+    /// the bank too, as it can be heard through nothing else.
     pub fn engine_bay(&self, sb: SeatBay) -> Option<EngineBay> {
         match sb.seat.node {
-            Node::Track(id) => lane_bay(self.lanes.get(&id)?.at.slot, sb.seat.rack, sb.bay),
+            Node::Track(id) => {
+                let h = self.lanes.get(&id)?;
+                if matches!(sb.seat.rack, Rack::Pad(_)) && !h.pads {
+                    return None;
+                }
+                lane_bay(h.at.slot, sb.seat.rack, sb.bay)
+            }
             node => special_bay(node, sb.seat.rack, sb.bay),
         }
     }
 
-    /// **The engine's name for the app's `(seat, bay)`**, under the app's
-    /// rows now: the app still keeps its bays by position.
+    /// **The engine's name for the frozen map's `(seat, bay)`** under the
+    /// app's rows now, for the tests' legacy fixtures (see [`seat_bay_at`]).
+    #[cfg(test)]
     pub fn engine_seat(&self, app: &TangentApp, seat: usize, bay: usize) -> Option<EngineBay> {
         self.engine_bay(seat_bay_at(&app.track_ids(), seat, bay)?)
     }
@@ -783,7 +808,9 @@ impl Bridge {
     /// **The bay the engine names `at`, by identity**: the inverse of
     /// [`Self::engine_bay`], for what the engine reports by its racks. A
     /// lane's rack is its track's wherever the row is; one whose slot no
-    /// track holds (a lane on its way home) is nobody's.
+    /// track holds (a lane on its way home) is nobody's. A pad's rack is
+    /// named whether or not its lane has its bank yet: one with none holds
+    /// nothing to report.
     pub fn bay_at_engine(&self, at: EngineBay) -> Option<SeatBay> {
         let (addr, bay) = at;
         let node = match addr.owner {
@@ -795,12 +822,6 @@ impl Bridge {
         };
         let sb = SeatBay::new(node, addr.desk_rack()?, u8::try_from(bay).ok()?);
         sb.is_valid().then_some(sb)
-    }
-
-    /// **The app's `(seat, bay)` for the engine's bay**, under the app's rows
-    /// now.
-    pub fn app_seat(&self, app: &TangentApp, at: EngineBay) -> Option<(usize, usize)> {
-        app_seat_of(&app.track_ids(), self.bay_at_engine(at)?)
     }
 
     /// Every row whose first bay holds `sentinel`, with its lane: the drum,
@@ -866,6 +887,39 @@ impl Bridge {
         gens.sort_unstable_by_key(|(s, _)| *s);
         gens.dedup();
         SlotAutomation { curves: tangent_ui::automation::Automation::from_curves(curves), gens, master: MASTER_CURVES }
+    }
+
+    /// **The curves that automate a strip's send to a bus, as the plan's
+    /// send curves** (design 9: send automation works per return;
+    /// W7-slot-gaps, the bridge's half of `AutoParam::SendTo`): each such
+    /// curve on a row becomes a [`SendCurve`] from that row's lane to the
+    /// bus's lane, stamped with the source lane's generation, so the engine
+    /// finds its send by its two ends in whichever plan plays
+    /// (`Engine::set_send_curves`) and a curve drawn for a track that has
+    /// gone plays on nobody. `bus_of` reads which bus a curve's control
+    /// names (`AutoParam::SendTo { to }`, the variant W7-buses-ui appends);
+    /// a curve naming none, or a bus with no lane, is no send curve. A send
+    /// to Return 0 is not here: `AutoParam::Send` stays the Fx send, on the
+    /// lane's own curves.
+    pub fn send_curves(
+        &self,
+        auto: &tangent_ui::automation::Automation,
+        bus_of: &dyn Fn(tangent_ui::automation::AutoParam) -> Option<TrackId>,
+    ) -> Vec<SendCurve> {
+        auto.curves()
+            .iter()
+            .filter_map(|c| {
+                let AutoLane::Row(row) = c.lane else { return None };
+                let from = self.lane(row)?;
+                let to = self.lane_of(bus_of(c.param)?)?;
+                Some(SendCurve {
+                    from: SendFrom::Lane(from.slot),
+                    to: SendTo::Lane(to.slot),
+                    gen: from.gen,
+                    curve: c.clone(),
+                })
+            })
+            .collect()
     }
 
     /// **The bypassed bays, by the engine's names**: the desk keeps them by
@@ -1100,14 +1154,16 @@ impl Bridge {
     ///
     /// **The lowest free slot below [`LEGACY_LANES`] first, and one on its
     /// way home there is waited for** (a frame or two, design 7.13), before
-    /// any slot past them is taken. The engine still keeps some parts only
-    /// for the legacy slots (a drum lane's pad effect racks; routes, sends
-    /// and keys until W6-engine-buses-sends), and an export builds its
-    /// engine fresh with row r at slot r: a track Ctrl/Cmd+T made on a
-    /// shipped desk's hidden row took slot 32 the frame that row's old lane
-    /// started home, so live it lost what its export had. Waiting for the
-    /// lane it replaces gives it the slot the export gives it. A slot past
-    /// them is taken only when none below is free or coming free.
+    /// any slot past them is taken. An export builds its engine fresh with
+    /// row r at slot r: a track Ctrl/Cmd+T made on a shipped desk's hidden
+    /// row took slot 32 the frame that row's old lane started home, so live
+    /// it stood on another slot than its export gave it, and while the
+    /// engine kept parts for the legacy slots alone (routes, sends and keys
+    /// until W6-engine-buses-sends; a drum lane's pad effects and a
+    /// sampler's file until W7-slot-gaps) it lost what its export had.
+    /// Nothing is kept that way now; the wait still gives a track the slot
+    /// its export gives it, so the two engines agree slot for slot. A slot
+    /// past them is taken only when none below is free or coming free.
     fn install(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) -> Vec<Slot> {
         let legacy = u32::try_from(LEGACY_LANES).unwrap_or(u32::MAX);
         let mut taken: BTreeSet<Slot> = self.lanes.values().map(|h| h.at.slot).collect();
@@ -1173,7 +1229,9 @@ impl Bridge {
 
     /// **A lane that has just become a drum lane gets its pad bank**,
     /// attached behind its Install (design 7.13: "Attach(Pads) then
-    /// Attach(Kit). Nothing reloads").
+    /// Attach(Kit). Nothing reloads"). From the frame it is sent the track's
+    /// pad bays have their engine names ([`Self::engine_bay`]), so the
+    /// reconcile seats each pad's effects then, behind the bank on the ring.
     fn attach_pads(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) {
         for (_, id) in rows {
             let Some(h) = self.lanes.get_mut(id) else { continue };
@@ -1335,7 +1393,17 @@ impl Bridge {
         // **The wiring, by identity** (`read_desk`): the routing table pruned
         // against the device, and the sidechain keys, in the engine's names.
         let (routes, keys) = self.read_desk(app, outs);
-        PlanInputs { lanes, specials, routes, sends: self.read_sends(app), keys }
+        PlanInputs { lanes, specials, routes, sends: self.plan_sends(app), keys }
+    }
+
+    /// **Every send the plan carries**: each strip's knob as its Fx entry
+    /// (`knob_sends`, W7-slot-gaps) and every send to a bus (`read_sends`,
+    /// W7-buses-ui). The two never share a pair of ends, so `carry_scales`
+    /// tells each from the other.
+    fn plan_sends(&self, app: &TangentApp) -> Vec<InSend> {
+        let mut out = self.knob_sends(app);
+        out.extend(self.read_sends(app));
+        out
     }
 
     /// **The desk's sends to buses, read by identity** (W7-buses-ui, design
@@ -1350,11 +1418,8 @@ impl Bridge {
     /// strip's own sends in the order they were made, then the drum bus's
     /// and the click's: no reorder moves a send, in the plan as on the desk.
     ///
-    /// **The knob's send into the effects return is not here.** The engine
-    /// plays a strip's knob for a strip the plan carries no Fx entry for
-    /// (`set_lane_levels`), which is today's sound bit for bit; carrying the
-    /// knob as its post-fader Fx entry is the engine half of the sends
-    /// (W7-slot-gaps item 5), and this list leaves that road to it.
+    /// **The knob's send into the effects return is not here**: it is
+    /// `knob_sends`, and `plan_sends` hands the plan both.
     pub fn read_sends(&self, app: &TangentApp) -> Vec<InSend> {
         // Each laned track's row and lane this frame, by identity, so the
         // senders walk in id order and a bus is found in one look.
@@ -1381,6 +1446,33 @@ impl Bridge {
         push(SendFrom::Drums, StripRef::Drums);
         push(SendFrom::Click, StripRef::Click);
         out
+    }
+
+    /// **Each strip's send knob, as its post-fader Return 0 entry** (design
+    /// 9: "today's knob becomes the Fx entry"; W7-slot-gaps): a row's at its
+    /// lane, the drum bus's and the click's at their own, at the knob's
+    /// level, and NO entry for a knob at nothing, which is how the desk keeps
+    /// it (`desk_model::Send`: a send at nothing is not a send). The engine
+    /// hears a strip with an entry through its entries alone, summed where
+    /// the knob was (`InSend`), so this moves no bit; it makes the knob a
+    /// plan send, whose level rides across plans by its ends
+    /// (`Engine::set_send_level`, `publish`) and whose curves are the plan's
+    /// own. A knob crossing zero makes or takes an entry, so it republishes,
+    /// as a route's gain crossing zero does. Sends to buses are the desk's
+    /// other entries (W7-buses-ui).
+    fn knob_sends(&self, app: &TangentApp) -> Vec<InSend> {
+        let entry = |from: SendFrom, s: StripRef| {
+            let level = app.strip_send(s) as f32;
+            (level.is_finite() && level > 0.0).then_some(InSend { from, to: SendTo::Fx, level, pre: false })
+        };
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (_, at))| entry(SendFrom::Lane(at.as_ref()?.slot), StripRef::Row(row)));
+        rows.chain(entry(SendFrom::Drums, StripRef::Drums))
+            .chain(entry(SendFrom::Click, StripRef::Click))
+            .collect()
     }
 
     /// **The continuous values, by slot**: each row's fader, pan and Fx send
@@ -1432,14 +1524,9 @@ enum Published {
 /// **What decides an order**, of a plan's inputs: everything but the route
 /// gains' size, which only scale (a gain crossing zero does decide, so its
 /// side is kept), and the send levels, which only scale at any size:
-/// `build_plan` keeps a send whatever its level, and one at nothing is still
-/// gathered, ordered and compensated as a send, so not even its side of
-/// zero decides anything.
-///
-/// MERGE-ME(W7-slot-gaps item 5, "`Bridge::publish` carries send levels
-/// between plans, not only route gains"): done here for every send the
-/// inputs carry, so the knob's Fx entries that item adds ride it as they
-/// are. Keep one carry where the two lanes meet.
+/// `build_plan` keeps a send whatever its level. A knob at nothing is no
+/// entry at all (`knob_sends`), so a knob crossing zero still republishes,
+/// by the entry it makes or takes, not by its level.
 fn structure(inputs: &PlanInputs) -> PlanInputs {
     let mut s = inputs.clone();
     for r in &mut s.routes {
@@ -2693,7 +2780,7 @@ mod tests {
                 let mut ctx = Furnish {
                     live: Some((&live, &live_bridge)),
                     dx7: (0..CHANNELS)
-                        .filter(|ch| app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
+                        .filter(|ch| row_instrument(&app, *ch) == Some(tangent_ui::dialogs::BUILTIN_PATH))
                         .map(|ch| (ch, factory_voice(&app, ch)))
                         .collect(),
                     ..Furnish::default()
@@ -2897,6 +2984,55 @@ mod tests {
         // Armed MIDI hears the keys; every other lane is deaf.
         assert!(!flags(40).contains(F::MIDI_OFF), "the armed row forty took no notes");
         assert!(flags(39).contains(F::MIDI_OFF), "an unarmed row heard the keys");
+    }
+
+    /// **A curve on a strip's send to a bus is that send's curve, between
+    /// its two lanes, at any row** (W7-slot-gaps item 5, the bridge's half
+    /// of `AutoParam::SendTo`). This base has no control that names a bus
+    /// send (W7-buses-ui appends it), so a decoder stands in for the
+    /// variant: it reads `AutoParam::Send` as a send to row 120's track and
+    /// `AutoParam::Pan` as one to a track the desk does not hold. A curve on
+    /// each of rows 1, 31, 32, 33, 40 and 200 is a [`SendCurve`] from that
+    /// row's lane to row 120's, stamped with the source lane's generation;
+    /// the curve to a track with no lane, the master's and the one the
+    /// decoder names no bus for are none.
+    #[test]
+    fn a_send_curve_runs_between_its_two_lanes_at_any_row() {
+        const ROWS: [usize; 6] = [1, 31, 32, 33, 40, 200];
+        let mut s = blank();
+        let mut next = s.next_track_id;
+        while s.rows.len() < 201 {
+            s.rows.push(tangent_ui::desk_model::TrackRow::vacant(TrackId(next as u32)));
+            next += 1;
+        }
+        s.next_track_id = next;
+        kind(&mut s, &[1, 31, 32, 33, 40, 120, 200], ChannelKind::Audio);
+        let app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        let bus = app.track_ids()[120];
+        let gone = TrackId(u32::MAX - 1);
+        assert!(app.row_of(gone).is_none(), "fixture: the gone track is on the desk");
+        let decode = |param: AutoParam| match param {
+            AutoParam::Send => Some(bus),
+            AutoParam::Pan => Some(gone),
+            _ => None,
+        };
+        let flat = |lane: AutoLane, param| Curve::sanitised(lane, param, vec![Point { at_s: 0.0, value: 0.5, shape: Shape::Hold }]);
+        let mut curves: Vec<Curve> = ROWS.iter().map(|r| flat(AutoLane::Row(*r), AutoParam::Send)).collect();
+        curves.push(flat(AutoLane::Row(40), AutoParam::Pan));
+        curves.push(flat(AutoLane::Row(33), AutoParam::Gain));
+        curves.push(flat(AutoLane::Master, AutoParam::Send));
+        let got = p.send_curves(&Automation::from_curves(curves), &decode);
+        let to = SendTo::Lane(p.lane_of(bus).expect("the bus's lane").slot);
+        let have: Vec<(SendFrom, SendTo, u32)> = got.iter().map(|c| (c.from, c.to, c.gen)).collect();
+        assert_eq!(have.len(), ROWS.len(), "not one send curve a row: {have:?}");
+        for row in ROWS {
+            let l = p.lane(row).expect("a row's lane");
+            assert!(have.contains(&(SendFrom::Lane(l.slot), to, l.gen)), "row {row}'s curve is no send from its lane to the bus's: {have:?}");
+        }
+        assert!(got.iter().all(|c| c.curve.param == AutoParam::Send), "a curve the decoder sent nowhere became a send curve");
     }
 
     /// **Both offline builders are one builder, and the host pushes no desk
@@ -3622,17 +3758,18 @@ mod tests {
     /// the engine keeps of a bay's tenant live in that rack's one record. A
     /// lane at slot 40, past the frozen seat map's thirty-two rows: its
     /// chain, its extra rack and a pedal each seat a comp by identity, each
-    /// answers what it holds and the state it plays, and a lane's pad rack
-    /// past the map's pads is named but not made yet, so it holds nothing.
-    /// When the lane goes home, its racks' records go with it.
+    /// answers what it holds and the state it plays, and so does a pad's
+    /// rack past the map's pads, made by the load (W7-slot-gaps: it was
+    /// named and never made, so a kit there played its pads dry). When the
+    /// lane goes home, its racks' records go with it, the pad's included.
     #[test]
     fn a_plugin_is_reached_through_its_racks_host_record_at_any_slot() {
         let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
         let slot = Slot(40);
-        e.install_lanes(vec![(slot, LaneSpec { kind: LaneKind::Audio, drum: false })]).expect("a lane at 40");
+        e.install_lanes(vec![(slot, LaneSpec { kind: LaneKind::Audio, drum: true })]).expect("a lane at 40");
         e.settle_offline();
         let dial = dialled(COMP_PATH, &[(0, 0.2), (1, 0.9)]);
-        let racks = [Rack::Chain(0), Rack::Chain(1), Rack::Pedal(3)];
+        let racks = [Rack::Chain(0), Rack::Chain(1), Rack::Pedal(3), Rack::Pad(5)];
         for rack in racks {
             let (addr, bay) = lane_bay(slot, rack, 2).expect("a rack of the lane");
             assert_eq!(addr.lane(), Some(slot), "{rack:?}: the rack is not the lane's");
@@ -3647,12 +3784,6 @@ mod tests {
             );
             assert_eq!(e.save_insert_state_at(addr, bay), Some(dial.clone()), "{rack:?}: the bay lost its dial");
         }
-        let (pad, bay) = lane_bay(slot, Rack::Pad(5), 0).expect("a pad rack is a rack of the lane");
-        assert_eq!(
-            e.load_insert_at(pad, bay, Some(Path::new(COMP_PATH)), None).expect("no error"),
-            None,
-            "a pad rack past the map's pads seated a plugin"
-        );
         e.remove_lanes(&[slot]).expect("the lane goes home");
         let mut out = vec![0.0f32; 256 * 2];
         e.render_offline(&mut out);
@@ -3668,8 +3799,8 @@ mod tests {
     /// a Plan without it, then Remove"), and a new track never takes its
     /// slot while it fades: it WAITS for a legacy slot on its way home, and
     /// takes one below thirty-two once it is (`Bridge::install`; W6 had it
-    /// take slot 32 at once, where the engine still keeps a drum lane's pad
-    /// racks only for the legacy slots and an export gives the track its
+    /// take slot 32 at once, where the engine then kept a drum lane's pad
+    /// racks only for the legacy slots, and an export gives the track its
     /// row's). Driven on an offline engine through the live road
     /// (`stage_removals_for_test`), a block rendered between frames for the
     /// callback that takes each op.

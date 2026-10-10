@@ -2013,8 +2013,8 @@ mod tests {
         let mut a = app();
         a.bootstrap_project(&root.join("Projects"));
         assert!(a.save_project_first(&root.join("Projects").join("Song.tan")), "fixture: no first save");
-        a.set_insert(0, 1, Some("/x/a.vst3"));
-        a.set_insert(1, 1, Some("/x/b.vst3"));
+        a.set_plugin(chain_bay(&a, 0, 1), Some("/x/a.vst3"));
+        a.set_plugin(chain_bay(&a, 1, 1), Some("/x/b.vst3"));
         a.save_project_doc();
         let song = root.join("Projects").join("Song");
         for (row, bundle) in [(0, "/x/a.vst3"), (1, "/x/b.vst3")] {
@@ -2038,7 +2038,7 @@ mod tests {
                 "fixture: the session holds unsaved work"
             );
         } else {
-            session.set_insert(1, 2, Some("/x/c.vst3"));
+            session.set_plugin(chain_bay(&session, 1, 2), Some("/x/c.vst3"));
         }
         (session, home)
     }
@@ -2328,7 +2328,7 @@ mod tests {
         // it is written, the debt is let go and writes nothing.
         let root = scratch("knobs-alone-seated");
         let (mut app, home) = a_session(Session::KeptKnobs, &ctx, &root);
-        app.set_insert(2, 1, Some("/x/d.vst3"));
+        app.set_plugin(chain_bay(&app, 2, 1), Some("/x/d.vst3"));
         let state = files(&home.join("state"));
         let live = scratch("knobs-alone-seated-live");
         turn(&app, &live);
@@ -2392,7 +2392,7 @@ mod tests {
             // Since: every knob turned, and a plugin seated, but where the
             // later road writes no document (nothing is unsaved).
             if !matches!(later, Later::MirrorAlone) {
-                app.set_insert(2, 1, Some("/x/d.vst3"));
+                app.set_plugin(chain_bay(&app, 2, 1), Some("/x/d.vst3"));
             }
             knobs(&app, "later");
             match later {
@@ -2591,7 +2591,7 @@ mod tests {
         assert!(earlier.is_some(), "fixture: the earlier road wrote no debt");
         app.save_project_doc();
         // Killed: no mirror, no settling.
-        app.set_insert(2, 1, Some("/x/d.vst3"));
+        app.set_plugin(chain_bay(&app, 2, 1), Some("/x/d.vst3"));
         knobs(&app, "later");
         let debt = owe_mirror(&live, &home, RoadDoc::Writes(app.session_doc_text().as_bytes()));
         app.save_project_doc();
@@ -2634,7 +2634,7 @@ mod tests {
         knobs(&app, "older");
         let older = owed(&app);
         app.save_project_doc();
-        app.set_insert(2, 1, Some("/x/d.vst3"));
+        app.set_plugin(chain_bay(&app, 2, 1), Some("/x/d.vst3"));
         knobs(&app, "later");
         let newer = owed(&app);
         app.save_project_doc();
