@@ -8,11 +8,12 @@
 //! hundred buses; loops greyed in the pickers) are `tangent-ui`'s
 //! `bus_tests`. What this file adds is that the plan the engine plays
 //! carries a bus as a bus and every send to one, in an order no reorder
-//! moves; that a send is heard, through its bus and nowhere else; that the
-//! switch the app's send curves wait on says what an export plays; that a
-//! free desk's hundred buses and thousand sends reach one plan; and that a
-//! route loop a legacy file saved plays exactly as the legacy shim played
-//! it, which is the road the render goldens pin.
+//! moves; that a send's level moves as a number in that plan, never as a
+//! plan of its own; that a send is heard, through its bus and nowhere else;
+//! that the switch the app's send curves wait on says what an export
+//! plays; that a free desk's hundred buses and thousand sends reach one
+//! plan; and that a route loop a legacy file saved plays exactly as the
+//! legacy shim played it, which is the road the render goldens pin.
 //!
 //! **Nothing here touches the real home**: the licence stores are temp
 //! directories of their own (`composite::tiers`), every project is under
@@ -214,6 +215,92 @@ fn a_bus_row_is_a_bus_lane_and_its_sends_reach_the_plan() {
     let p4 = b.published_for_test().expect("a plan").clone();
     assert!(p4.lanes.iter().all(|l| !l.flags.contains(LaneFlags::BUS)), "a track kept the BUS flag");
     assert!(p4.sends.is_empty(), "a send into a track reached the plan");
+}
+
+/// **A send's level moved is carried into the plan that plays, and
+/// publishes no plan** (design 7.6: what only scales stays a number). A
+/// drag writes the level on every pointer move, and the bridge used to read
+/// each move as a new shape: two `build_plan`s, an op on the ring and one
+/// more shadow, every frame of the drag. Now each level lands in its own
+/// cell of the plan that plays, found by the send's two ends, and the count
+/// of plans stands still. A send moved to the other side of its fader does
+/// decide where it is gathered, and publishes. And a strip sending to one
+/// bus from both sides of its fader (a file can say so; no gesture makes
+/// one), whose two sends the engine cannot tell apart by their ends,
+/// publishes a plan rather than write one level into both.
+#[test]
+fn a_moved_send_level_is_carried_into_the_playing_plan_and_publishes_none() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use tangent_ui::desk_model::Send;
+    // The level row `from`'s send to the bus on row `bus`, on `pre`'s side
+    // of its fader, holds in the plan that plays: its cell found by the
+    // send's ends in a plan built from the inputs the bridge published,
+    // which numbers its cells as the engine's own does.
+    let cell = |b: &Bridge, e: &mut Engine, from: usize, bus: usize, pre: bool| -> f32 {
+        e.settle_offline();
+        let lane = |row: usize| b.lane(row).expect("a lane").slot;
+        let shape = crate::desk_plan::build_plan(b.published_for_test().expect("a plan"), None);
+        let ends = crate::desk_plan::send_key(SendFrom::Lane(lane(from)), SendTo::Lane(lane(bus)));
+        let i = shape
+            .sends
+            .find(ends)
+            .find(|&i| shape.sends.sends[i as usize].pre == pre)
+            .expect("the send is in the plan");
+        let gains = e.plan_gains().expect("a plan plays");
+        f32::from_bits(gains[shape.sends.sends[i as usize].gain as usize].load(Relaxed))
+    };
+    // Synced until the desk has settled (a reused row's old lane goes
+    // home), then the count of plans an unchanged frame must leave alone.
+    let settle = |app: &TangentApp, b: &mut Bridge, e: &mut Engine| {
+        for _ in 0..4 {
+            b.sync(app, e);
+        }
+        let plans = b.stats().plans;
+        b.sync(app, e);
+        assert_eq!(b.stats().plans, plans, "fixture: an unchanged frame published a plan");
+        plans
+    };
+
+    let (_ctx, mut app) = app_on(desk(3), tiers::free("buses-carry"));
+    let bus = app.new_bus(BusRole::Return).expect("a return");
+    let to = app.track_at(bus).map(Node::Track).expect("the return's track");
+    assert!(app.add_send(StripRef::Row(0), bus));
+    assert!(app.add_send(StripRef::Row(1), bus));
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+    let mut b = Bridge::new();
+    let plans = settle(&app, &mut b, &mut e);
+    // A drag on row 0's send: thirty pointer moves, the last one released.
+    for k in 0..30 {
+        let v = 1.0 - f64::from(k) / 40.0;
+        app.set_send_level(StripRef::Row(0), to, false, v, k == 29);
+        b.sync(&app, &mut e);
+        assert_eq!(cell(&b, &mut e, 0, bus, false), v as f32, "move {k} is not in the plan that plays");
+    }
+    assert_eq!(b.stats().plans, plans, "a send's level rebuilt the plan");
+    assert_eq!(cell(&b, &mut e, 1, bus, false), 1.0, "the drag moved another strip's send");
+    // The side of the fader decides where a send is gathered.
+    assert!(app.set_send_pre(StripRef::Row(1), to, false));
+    b.sync(&app, &mut e);
+    assert_eq!(b.stats().plans, plans + 1, "a send moved ahead of its fader is not one plan");
+    assert_eq!(cell(&b, &mut e, 1, bus, true), 1.0, "the send lost its level moving ahead of its fader");
+
+    // Twins: row 0 sends to the return on row 2 from both sides of its fader.
+    let mut s = desk(2);
+    s.rows[2].kind = Some(RowKind::Bus);
+    s.rows[2].name = "Return 1".to_owned();
+    let ret = Node::Track(s.rows[2].id);
+    s.rows[0].sends.push(Send { to: ret, level: 0.5, pre: false });
+    s.rows[0].sends.push(Send { to: ret, level: 0.25, pre: true });
+    let (_ctx, mut app) = app_on(s, tiers::free("buses-carry-twins"));
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+    let mut b = Bridge::new();
+    let plans = settle(&app, &mut b, &mut e);
+    assert_eq!((cell(&b, &mut e, 0, 2, false), cell(&b, &mut e, 0, 2, true)), (0.5, 0.25), "fixture: the twins' levels");
+    app.set_send_level(StripRef::Row(0), ret, false, 0.75, true);
+    b.sync(&app, &mut e);
+    assert_eq!(b.stats().plans, plans + 1, "a twin's level was carried by the ends it shares");
+    assert_eq!(cell(&b, &mut e, 0, 2, false), 0.75, "the moved twin's level is not in the plan that plays");
+    assert_eq!(cell(&b, &mut e, 0, 2, true), 0.25, "the other twin took its level");
 }
 
 /// **A send is heard, through its bus and nowhere else**: with the send at

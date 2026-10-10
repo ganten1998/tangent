@@ -1199,21 +1199,18 @@ impl Bridge {
     }
 
     /// **Publish `inputs` if they decide anything new**, else carry only the
-    /// route gains that moved into every plan in flight (design 7.6: a gain
-    /// that stays on its side of zero scales, it does not reorder). Answers
-    /// what became of them.
+    /// route gains and send levels that moved into every plan in flight
+    /// (design 7.6: a gain that stays on its side of zero scales, it does not
+    /// reorder, and a send's level never orders anything). Answers what
+    /// became of them.
     fn publish(&mut self, e: &mut Engine, inputs: PlanInputs) -> Published {
-        let same_shape = self.published.as_ref().is_some_and(|p| structure(p) == structure(&inputs));
-        if same_shape {
-            if let Some(p) = self.published.as_ref() {
-                for (old, new) in p.routes.iter().zip(&inputs.routes) {
-                    if old.gain.to_bits() != new.gain.to_bits() {
-                        e.set_route_gain(new.from, new.to, new.gain);
-                    }
-                }
+        if let Some(p) = self.published.as_ref().filter(|p| structure(p) == structure(&inputs)) {
+            // What only scales goes into the plans in flight; the one move
+            // that cannot (`carry_scales`) publishes below like a new shape.
+            if carry_scales(e, p, &inputs) {
+                self.published = Some(inputs);
+                return Published::Same;
             }
-            self.published = Some(inputs);
-            return Published::Same;
         }
         match e.publish_plan(&inputs) {
             Ok(gen) => {
@@ -1425,7 +1422,8 @@ impl Bridge {
 enum Published {
     /// Sent, at this generation.
     New(u64),
-    /// Nothing that decides an order moved; the gains, if any, were written.
+    /// Nothing that decides an order moved; the route gains and send levels
+    /// that moved, if any, were written.
     Same,
     /// The op ring was full.
     Failed,
@@ -1433,13 +1431,65 @@ enum Published {
 
 /// **What decides an order**, of a plan's inputs: everything but the route
 /// gains' size, which only scale (a gain crossing zero does decide, so its
-/// side is kept).
+/// side is kept), and the send levels, which only scale at any size:
+/// `build_plan` keeps a send whatever its level, and one at nothing is still
+/// gathered, ordered and compensated as a send, so not even its side of
+/// zero decides anything.
+///
+/// MERGE-ME(W7-slot-gaps item 5, "`Bridge::publish` carries send levels
+/// between plans, not only route gains"): done here for every send the
+/// inputs carry, so the knob's Fx entries that item adds ride it as they
+/// are. Keep one carry where the two lanes meet.
 fn structure(inputs: &PlanInputs) -> PlanInputs {
     let mut s = inputs.clone();
     for r in &mut s.routes {
         r.gain = if r.gain.is_finite() && r.gain > 0.0 { 1.0 } else { 0.0 };
     }
+    for x in &mut s.sends {
+        x.level = 0.0;
+    }
     s
+}
+
+/// **Write what only scales into every plan in flight**: each route gain
+/// and send level of `now` that moved since `was` (two inputs of one
+/// structure), found in each plan by the identity the engine keys it by
+/// (`Engine::set_route_gain`, `Engine::set_send_level`).
+///
+/// Answers false, writing nothing, when a moved send cannot be told from
+/// its twin. The engine names a send by its two ends, so a strip sending to
+/// one bus from both sides of its fader (a file can say so; no gesture
+/// makes one) would have one level written into both. That frame publishes
+/// a plan instead, which stores each level in its own cell.
+fn carry_scales(e: &Engine, was: &PlanInputs, now: &PlanInputs) -> bool {
+    let moved: Vec<&InSend> = was
+        .sends
+        .iter()
+        .zip(&now.sends)
+        .filter(|(a, b)| a.level.to_bits() != b.level.to_bits())
+        .map(|(_, b)| b)
+        .collect();
+    if !moved.is_empty() {
+        let ends_of = |s: &InSend| crate::desk_plan::send_key(s.from, s.to);
+        let mut ends: Vec<(u64, u64)> = now.sends.iter().map(ends_of).collect();
+        ends.sort_unstable();
+        let twinned = |s: &InSend| {
+            let k = ends_of(s);
+            ends.get(ends.partition_point(|x| *x < k) + 1) == Some(&k)
+        };
+        if moved.iter().any(|s| twinned(s)) {
+            return false;
+        }
+    }
+    for (old, new) in was.routes.iter().zip(&now.routes) {
+        if old.gain.to_bits() != new.gain.to_bits() {
+            e.set_route_gain(new.from, new.to, new.gain);
+        }
+    }
+    for s in moved {
+        e.set_send_level(s.from, s.to, s.level);
+    }
+    true
 }
 
 // ── the inputs: which device input each audio track takes ─────────────────
