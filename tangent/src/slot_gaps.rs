@@ -24,7 +24,12 @@
 //! the automation's overlay on it), a sidechain key, and a strip's send knob
 //! as its Return 0 entry. And the scans that keep the host off the frozen
 //! map's seats, which is what made the faces' roads stop at the
-//! thirty-second row.
+//! thirty-second row. The parts that need a BUS on the desk (a key to a
+//! bus, a curve on a send to one, and the mixing leftovers of item 6, which
+//! each cross one) have no road from the desk until W7-buses-ui gives the
+//! bridge buses: the engine holds all three at these widths
+//! (`slot_engine::gaps`, `slot_engine::buses`), and the desk's half of the
+//! first two waits here as MERGE-ME tests.
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
 //! directory of the test's own (`composite::tiers`), every project and every
@@ -862,8 +867,8 @@ fn hold_keys(prefix: &str, comps: &[usize], path: &Path, dir: &Path, desk: &dyn 
 /// holds still and leaves its track at row 2's level. Keys past slot 31
 /// needed no fix: this proves them through the bridge, both ways. The key
 /// to a BUS is held at the engine
-/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`): the
-/// bridge makes no row a bus until W7-buses-ui.
+/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`) and from
+/// the desk by the MERGE-ME test below, which waits for the bridge's buses.
 #[test]
 fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
     let dir = scratch("keys");
@@ -890,6 +895,60 @@ fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
         s
     };
     let tags = hold_keys("gaps-keys", &comps, &path, &dir, &desk);
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    cleanup(&dir, &tags);
+}
+
+/// The quiet track row `i`'s bus is fed from, in the bus tests below.
+fn feeder(i: usize) -> usize {
+    101 + i
+}
+
+/// **A key reaches a comp on a BUS past slot 31 as it reaches row 1's, live
+/// and in the export, and no other comp** (W7-slot-gaps item 4, its bus
+/// half). Every subject and row 2 a bus with a hard comp in its first bay,
+/// each fed at unity by a quiet track of its own (rows 101 to 107), and the
+/// desk's key drawn from row 150 to one subject's comp at a time while a
+/// loud clip plays there.
+///
+/// MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send
+/// to one until that lane lands (`RowKind::Bus` reaches no plan flag and
+/// `TrackRow::sends` no `InSend`), so here every bus is an empty lane with
+/// nothing arriving and its comp squeezes nothing. The engine holds a key
+/// to a bus at these widths already
+/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`); this
+/// holds the road from the desk to it. Enable it at that merge.
+#[test]
+#[ignore = "MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send to one until that lane lands"]
+fn a_key_reaches_a_comp_on_a_bus_past_slot_31_as_on_row_1_live_and_in_the_export() {
+    use tangent_ui::desk_model::Send as DeskSend;
+    let dir = scratch("bus-keys");
+    wav(&dir.join("media").join("loud.wav"), 0.9, true);
+    wav(&dir.join("media").join("soft.wav"), 0.01, false);
+    let buses: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
+    let mut doc = Arrangement::default();
+    doc.add_clip(audio(150, "loud.wav"));
+    for i in 0..buses.len() {
+        doc.add_clip(audio(feeder(i), "soft.wav"));
+    }
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    let desk = |k: usize, host: &Host| {
+        let mut s = wide_desk();
+        for (i, &bus) in buses.iter().enumerate() {
+            s.rows[bus].kind = Some(RowKind::Bus);
+            s.plugins.insert(bay_of(&s, bus, Rack::Chain(0), 0), COMP_PATH.to_owned());
+            host.shelve(bay_of(&s, bus, Rack::Chain(0), 0), COMP_PATH, &hard_comp());
+            let to = Node::Track(s.rows[bus].id);
+            s.rows[feeder(i)].kind = Some(RowKind::Audio);
+            s.rows[feeder(i)].sends.push(DeskSend { to, level: 1.0, pre: false });
+        }
+        s.rows[150].kind = Some(RowKind::Audio);
+        let from = Node::Track(s.rows[150].id);
+        s.insert_keys.set(bay_of(&s, SUBJECTS[k], Rack::Chain(0), 0), Some(from));
+        s
+    };
+    let tags = hold_keys("gaps-bus-keys", &buses, &path, &dir, &desk);
     let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
     cleanup(&dir, &tags);
 }
@@ -994,6 +1053,80 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
     want.pop();
     assert_eq!(fx_entries(&p), want, "a knob at nothing still carries an entry");
     cleanup(&dir, &tags);
+}
+
+/// **The control a curve on a strip's send to `bus` is drawn on**:
+/// `AutoParam::SendTo { to: bus }`, the variant W7-buses-ui appends.
+/// MERGE-ME(W7-buses-ui): answer `Some(AutoParam::SendTo { to: bus })`.
+fn send_to(bus: TrackId) -> Option<tangent_ui::automation::AutoParam> {
+    let _ = bus;
+    None
+}
+
+/// **A curve on a strip's send to a bus plays on a track past slot 31 as on
+/// row 1, live and in the export** (W7-slot-gaps item 5, its curves). Every
+/// subject an audio track playing a steady tone into a bus of its own (rows
+/// 101 to 106) by a send at unity, and a curve on that send holding it at a
+/// quarter: each bus hears a quarter of its track, as row 1's does, on both
+/// engines (`Bridge::send_curves`, which the live push and `full_build_with`
+/// both hand the engine). Without the curve a bus hears its track whole.
+///
+/// MERGE-ME(W7-buses-ui): that lane appends `AutoParam::SendTo { to }` (the
+/// control the curve is drawn on: [`send_to`] answers it then, and
+/// `engine_bridge::send_bus_of` reads it, its body spelled out where it
+/// stands) and gives the bridge buses and their sends. The engine half is
+/// held already: the knob as a plan entry above, and
+/// `engine_bridge::tests::a_send_curve_runs_between_its_two_lanes_at_any_row`
+/// with a decoder standing in for the variant. Enable it at that merge.
+#[test]
+#[ignore = "MERGE-ME(W7-buses-ui): AutoParam::SendTo and the bridge's sends to a bus land with that lane"]
+fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export() {
+    use tangent_ui::automation::{Curve, Point, Shape};
+    use tangent_ui::desk_model::Send as DeskSend;
+    const TAGS: [&str; 2] = ["gaps-send-curves-save", "gaps-send-curves"];
+    let dir = scratch("send-curves");
+    wav(&dir.join("media").join("tone.wav"), 0.5, false);
+    let mut s = wide_desk();
+    let mut doc = Arrangement::default();
+    let mut buses = Vec::new();
+    for (i, row) in SUBJECTS.into_iter().enumerate() {
+        let bus = feeder(i);
+        s.rows[bus].kind = Some(RowKind::Bus);
+        s.rows[row].kind = Some(RowKind::Audio);
+        let to = Node::Track(s.rows[bus].id);
+        s.rows[row].sends.push(DeskSend { to, level: 1.0, pre: false });
+        doc.add_clip(audio(row, "tone.wav"));
+        buses.push((bus, s.rows[bus].id));
+    }
+    // The curves go into a document the app wrote, which carries its desk:
+    // a legacy document's reader drops every lane past 32 (see the faces).
+    let path = {
+        let mut first = open(TAGS[0], s, &doc, &dir);
+        first.save_project_doc();
+        first.project_doc().expect("the saved project").to_path_buf()
+    };
+    let mut saved = Arrangement::load_from(&path);
+    for (row, (_, bus)) in SUBJECTS.into_iter().zip(&buses) {
+        let param = send_to(*bus).expect("MERGE-ME(W7-buses-ui): no control is a send to a bus on this base");
+        let hold = |at_s| Point { at_s, value: 0.25, shape: Shape::Hold };
+        saved.automation.set(Curve::sanitised(row, param, vec![hold(0.0), hold(30.0)]));
+    }
+    saved.save_to(&path);
+    let mut app = open_saved(TAGS[1], wide_desk(), &path);
+    let (mut e, p) = live(&mut app, &mut Host::at(&dir));
+    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+    let rows: Vec<usize> = SUBJECTS.into_iter().chain(buses.iter().map(|(b, _)| *b)).collect();
+    for (road, got) in [("live", levels(&mut e, &p, &rows)), ("export", levels(&mut x, &xb, &rows))] {
+        let n = SUBJECTS.len();
+        let ratio = |i: usize| got[n + i] / got[i];
+        let reference = ratio(0);
+        assert!(reference > 0.05 && reference < 0.5, "{road}: row 1's bus heard {reference} of its track, not a quarter");
+        for (i, row) in SUBJECTS.iter().enumerate() {
+            let r = ratio(i);
+            assert!((r - reference).abs() <= 0.02 * reference, "{road}: row {row}'s bus heard {r} of its track, row 1's {reference}");
+        }
+    }
+    cleanup(&dir, &TAGS);
 }
 
 // ── the host is off the frozen map's seats ──────────────────────────────────

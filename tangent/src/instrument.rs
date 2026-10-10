@@ -43617,6 +43617,175 @@ mod slot_engine {
             assert!(near(rms(&bus), rms(&track)), "the bus no longer carries the track routed into it whole");
             assert!(near(rms(&twice), 2.0 * rms(&alone)), "the master does not hear the track twice, in step ({} against {})", rms(&twice), rms(&alone));
         }
+
+        // ── the mixing leftovers at the width slots (W7-slot-gaps) ──────
+
+        /// The slots item 6 is held at (`gaps`' subjects): lane 1, either
+        /// side of the frozen map's edge, past it and far past it.
+        const WIDE: [usize; 6] = [1, 31, 32, 33, 40, 200];
+
+        /// Wide enough for the lane after 200, and the buses and sources
+        /// (120, 150) the subjects are paired with.
+        const SPAN: usize = 202;
+
+        /// **A lined node's dry stem lands with its wet stem at every width,
+        /// on lane 1's frame** (item 6 at the width slots: the test above
+        /// holds slots 10 and 39 only). The node at each subject in turn,
+        /// sending into lookahead bus 120: a folder over the lane after it,
+        /// and a bus fed by a route from lane 150. Its dry stem peaks on its
+        /// wet stem's frame, and that is the frame lane 1's node's does.
+        #[test]
+        fn a_lined_nodes_dry_stem_lands_with_its_wet_stem_at_every_width() {
+            let render = |node: usize, folder: bool, dry: bool| -> Vec<f32> {
+                let mut e = wide(SPAN);
+                let buses: Vec<usize> = if folder { vec![120] } else { vec![node, 120] };
+                let mut inputs = bus_plan(&e, SPAN, &buses);
+                let source = if folder {
+                    inputs.lanes[node + 1].parent = Some(Slot(node as u32));
+                    node + 1
+                } else {
+                    inputs.routes = vec![route(150, node, 1.0)];
+                    150
+                };
+                inputs.sends = vec![send(node, 120, 1.0, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 120, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_clips_slotted(vec![impulse_at(&e, source, 4_000)]);
+                e.set_stems_dry(dry);
+                let (_, stems) = roll(&mut e, 16);
+                assert!(e.shared.max_latency.load(Ordering::Relaxed) > 100, "node {node}: the bus's lookahead is not in the desk's alignment");
+                column(&stems, e.stem_frame_width() / 2, node)
+            };
+            for folder in [true, false] {
+                let mut reference = None;
+                for node in WIDE {
+                    let (wet, dry) = (render(node, folder, false), render(node, folder, true));
+                    assert!(
+                        wet.iter().any(|v| *v != 0.0) && dry.iter().any(|v| *v != 0.0),
+                        "the node at {node} (folder {folder}): a stem is silent"
+                    );
+                    assert_eq!(peak_at(&dry), peak_at(&wet), "the node at {node} (folder {folder}): its dry stem is off its wet stem's frame");
+                    let lane_1 = *reference.get_or_insert(peak_at(&wet));
+                    assert_eq!(peak_at(&wet), lane_1, "the node at {node} (folder {folder}) lands on another frame than lane 1's");
+                }
+            }
+        }
+
+        /// **The bare drum bus's send into a lookahead bus lands with its own
+        /// way out at every width, on lane 1's frame** (item 6 at the width
+        /// slots: the test above holds bus 40 only). The lookahead bus at
+        /// each subject in turn, the bare kit the only thing sent into it:
+        /// the alignment covers that path, and the bus's share of the master
+        /// peaks on the frame the kit's own way out does, which is the frame
+        /// it does with the bus on lane 1.
+        #[test]
+        fn pdc_aligns_the_bare_drum_bus_send_across_a_lookahead_bus_at_every_width() {
+            let render = |bus: usize, level: f32| -> (Vec<f32>, u32) {
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[bus]);
+                inputs.sends = vec![InSend { from: SendFrom::Drums, to: SendTo::Lane(Slot(bus as u32)), level, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, bus, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                assert!(e.set_pad_kit(0, impulse_kit()), "the kit went nowhere");
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..4 {
+                    e.render_offline(&mut out);
+                }
+                e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                let (master, _) = roll(&mut e, 8);
+                (master, e.shared.max_latency.load(Ordering::Relaxed))
+            };
+            let mut reference = None;
+            for bus in WIDE {
+                let (alone, max) = render(bus, 0.0);
+                assert!(max > 100, "bus {bus}: the bare kit's path through it is not in the desk's alignment ({max})");
+                assert!(alone.iter().any(|v| *v != 0.0), "bus {bus}: the kit is silent");
+                let (both, _) = render(bus, 1.0);
+                let share: Vec<f32> = both.iter().zip(&alone).map(|(b, a)| b - a).collect();
+                assert!(share.iter().any(|v| v.abs() > 1e-4), "nothing of the kit came out of bus {bus}");
+                assert_eq!(peak_at(&share), peak_at(&alone), "the bare kit's send into bus {bus} landed off its own way out's frame");
+                let lane_1 = *reference.get_or_insert(peak_at(&alone));
+                assert_eq!(peak_at(&alone), lane_1, "the kit through bus {bus} lands on another frame than through bus 1");
+            }
+        }
+
+        /// **The click pays a bus that looks ahead uncompensated at every
+        /// width, as with the bus on lane 1** (item 6 at the width slots: the
+        /// pin above holds bus 40 only). The click sent into the lookahead
+        /// bus at each subject in turn: late by exactly the bus's lookahead,
+        /// the desk held back by nothing, on lane 1's frames.
+        #[test]
+        fn the_click_pays_a_lookahead_bus_uncompensated_at_every_width() {
+            let render = |bus: usize, ahead: bool| -> (Vec<f32>, u32, u32) {
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[bus]);
+                inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(bus as u32)), level: 1.0, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                if ahead {
+                    unit(&mut e, bus, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                }
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                let (_, stems) = roll(&mut e, 12);
+                let bays: u32 = (0..INSERTS)
+                    .filter_map(|b| e.shared.seat_cell(SeatKind::Latency, lane_seat(bus, CHAIN_OWN) * INSERTS + b))
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .sum();
+                (column(&stems, e.stem_frame_width() / 2, bus), e.shared.max_latency.load(Ordering::Relaxed), bays)
+            };
+            let mut reference = None;
+            for bus in WIDE {
+                let (plain, _, _) = render(bus, false);
+                let (ahead, max, lat) = render(bus, true);
+                assert!(lat > 100, "fixture: bus {bus} does not look ahead ({lat})");
+                assert_eq!(max, 0, "the click's send into bus {bus} held the desk back");
+                let (Some(at), Some(late)) = (onset(&plain), onset(&ahead)) else {
+                    panic!("the click never reached bus {bus}");
+                };
+                assert_eq!(late, at + lat as usize, "the click through bus {bus} is not late by exactly its lookahead");
+                let lane_1 = *reference.get_or_insert((at, late));
+                assert_eq!((at, late), lane_1, "the click through bus {bus} lands on other frames than through bus 1");
+            }
+        }
+
+        /// **A track in a folder that is also routed into a bus is summed by
+        /// both at every width, as on lane 1** (item 6 at the width slots:
+        /// the pin above holds folder 10 only). The folder at each subject
+        /// in turn over the lane after it, that track routed into bus 120:
+        /// the folder's column and the bus's each carry the track whole, the
+        /// master hears it twice over, in step, and as loud as with the
+        /// folder on lane 1.
+        #[test]
+        fn a_folded_track_routed_into_a_bus_is_summed_by_both_at_every_width() {
+            let render = |folder: usize, routed: bool| -> [Vec<f32>; 4] {
+                let track = folder + 1;
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[120]);
+                inputs.lanes[track].parent = Some(Slot(folder as u32));
+                if routed {
+                    inputs.routes = vec![route(track, 120, 1.0)];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, track, 0x1111)]);
+                let (master, stems) = roll(&mut e, 10);
+                let w = e.stem_frame_width() / 2;
+                let tail = |v: Vec<f32>| v[v.len() - BLOCK * 4..].to_vec();
+                [tail(master), tail(column(&stems, w, folder)), tail(column(&stems, w, 120)), tail(column(&stems, w, track))]
+            };
+            let near = |a: f64, b: f64| (a - b).abs() <= 1e-3 * b;
+            let mut reference = None;
+            for folder in WIDE {
+                let [alone, _, quiet_bus, _] = render(folder, false);
+                assert!(rms(&alone) > 1e-2, "the track in folder {folder} is silent");
+                assert!(rms(&quiet_bus) < 1e-6, "the bus sounded with nothing routed to it (folder {folder})");
+                let [twice, held, bus, track] = render(folder, true);
+                assert!(near(rms(&held), rms(&track)), "folder {folder} no longer carries its child whole");
+                assert!(near(rms(&bus), rms(&track)), "the bus no longer carries the track in folder {folder} whole");
+                assert!(near(rms(&twice), 2.0 * rms(&alone)), "the master does not hear the track in folder {folder} twice, in step");
+                let lane_1 = *reference.get_or_insert(rms(&twice));
+                assert!(near(rms(&twice), lane_1), "the master hears folder {folder}'s track at {}, folder 1's at {lane_1}", rms(&twice));
+            }
+        }
     }
 
     // ── a lane past slot 31 is every bit a lane (W7-slot-gaps) ──────────

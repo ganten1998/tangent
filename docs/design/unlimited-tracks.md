@@ -1792,6 +1792,13 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 
 **Done when.** A width test at slots {31, 32, 33, 40, 200} gives each item the same behaviour as on lane 1, live and in an export, each failing with its fix reverted; the full gate is green.
 
+**Recorded by the W7-slot-gaps fix round (2026-10-10):**
+- *Done-when is partial for two items until W7-buses-ui.* A key to a BUS (item 4) and a curve on a strip's send to a bus (item 5, `AutoParam::SendTo`) have no road from the desk while the bridge makes no row a bus. Their width tests wait in `tangent/src/slot_gaps.rs` as ignored MERGE-ME tests (`a_key_reaches_a_comp_on_a_bus_past_slot_31_...`, `a_send_curve_to_a_bus_past_slot_31_...`), written against `RowKind::Bus` and `TrackRow::sends`. W7-buses-ui enables both at its merge, with `slot_gaps::send_to` answering `AutoParam::SendTo { to }` and `engine_bridge::send_bus_of` given the body spelled out there. Their other halves are held at these widths already: the engine's key to a bus, and the bridge's mapping of a send curve with a decoder standing in for the variant.
+- *Item 6 is held at the width slots in the engine* (`slot_engine::buses::*_at_every_width`): every leftover crosses a bus, so its live and export roads wait for the same merge.
+- *The width suite drives the host's own roads*, not copies: `Host::frame` runs `DesktopApp`'s `bays_wanted`, `next_owed_bay`, `load_bay`, `deliver_samples`, `deliver_kits`, `push_pad_knobs`, `forget_moved_slots` and `set_insert_param`, and `slot_gaps::the_frame_runs_the_roads_this_suite_drives` holds that the frame takes them.
+- *A pad's bay has no engine name while its lane has no pad bank* (`Bridge::engine_bay`), and the engine makes no pad rack for such a lane (`HostSlot::banked`): a pad effect seated before its track's kit now waits for the kit rather than going home with its rack.
+- *A lane that comes or goes leaves no record of a sampler's file at its slot* (`forget_moved_slots`): the file is the lane's own, and marking every installed slot owed made a wide desk's reload hand an empty file to each new lane first.
+
 ### W7-scale-and-budgets
 
 **Goal.** Measure and tune at scale:
