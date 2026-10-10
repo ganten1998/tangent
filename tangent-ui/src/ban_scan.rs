@@ -30,7 +30,8 @@
 //!   ([`OTHER_HOMES`]).
 //!
 //! **Live code is what ships**: comments, string and char literals, items
-//! under `#[cfg(test)]` and files that are test-only modules are not read.
+//! under a test cfg (one no build outside a test satisfies, [`is_test_cfg`])
+//! and files that are test-only modules ([`test_only_files`]) are not read.
 //! A test may name what it pins as gone, and a comment may say what a thing
 //! used to be called, which is how this repo says why.
 
@@ -104,12 +105,175 @@ pub(crate) fn rust_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// **Whether an attribute makes what follows it test-only**: `cfg(test)`,
-/// or an `all(..)` that requires `test`. An `any(test, ..)` also builds
-/// outside tests, and `not(test)` is the opposite, so neither counts.
+/// **Whether an attribute makes what follows it test-only**: a `cfg` that no
+/// build outside a test can satisfy. `cfg(test)`, an `all(..)` with `test`
+/// among its terms, an `any(..)` every arm of which needs it; never a
+/// `not(test)`, and never a predicate that only SPELLS the word (`feature =
+/// "latest"`, `feature = "test-harness"`, `target_env = "contest"`), each of
+/// which ships.
+///
+/// **Decided by evaluating the predicate, not by searching its text**, which
+/// is what this was until W8's review: "an `all(` that contains `test` and
+/// not `not(test`" read each of those three inside an `all(..)` as a test,
+/// and `all(unix, not(any(test, ..)))` too, so the scans stopped reading
+/// code that ships. `test` is false, every other predicate is free, and
+/// the attribute is test-only exactly when no choice of them builds what it
+/// is on. One it cannot parse, or one with more free predicates than it
+/// will try, is read as shipping: a scan that reads a test as live can only
+/// say too much, while one that skips live code says nothing.
 pub(crate) fn is_test_cfg(attr: &str) -> bool {
-    let a: String = attr.split_whitespace().collect();
-    a.starts_with("#[cfg(test)]") || (a.starts_with("#[cfg(all(") && a.contains("test") && !a.contains("not(test"))
+    let Some(cfg) = Cfg::of_attribute(attr) else {
+        return false;
+    };
+    let mut free = Vec::new();
+    cfg.free(&mut free);
+    if free.len() > 16 {
+        return false;
+    }
+    (0..1u32 << free.len()).all(|choice| !cfg.holds(&free, choice))
+}
+
+/// A `cfg` predicate, as far as [`is_test_cfg`] needs one: `test`, any other
+/// predicate (an option or a `key = "value"`, kept as written), and the
+/// three combinators.
+#[derive(Debug)]
+enum Cfg {
+    Test,
+    Other(String),
+    All(Vec<Cfg>),
+    Any(Vec<Cfg>),
+    Not(Box<Cfg>),
+}
+
+/// One token of an attribute: a word, a string's contents, or a mark.
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    Str(String),
+    Mark(char),
+}
+
+impl Cfg {
+    /// The predicate of a whole `#[cfg(..)]` attribute, or nothing when the
+    /// attribute is not one or does not parse.
+    fn of_attribute(attr: &str) -> Option<Cfg> {
+        let toks = Self::tokens(attr)?;
+        let head = [Tok::Mark('#'), Tok::Mark('['), Tok::Word("cfg".to_owned()), Tok::Mark('(')];
+        if toks.len() < head.len() + 2 || toks[..head.len()] != head {
+            return None;
+        }
+        let mut at = head.len();
+        let cfg = Self::parse(&toks, &mut at)?;
+        (toks[at..] == [Tok::Mark(')'), Tok::Mark(']')]).then_some(cfg)
+    }
+
+    fn tokens(text: &str) -> Option<Vec<Tok>> {
+        let c: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < c.len() {
+            if c[i].is_whitespace() {
+                i += 1;
+            } else if c[i].is_alphanumeric() || c[i] == '_' {
+                let from = i;
+                while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+                    i += 1;
+                }
+                out.push(Tok::Word(c[from..i].iter().collect()));
+            } else if c[i] == '"' {
+                let mut lit = String::new();
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                    }
+                    lit.extend(c.get(i));
+                    i += 1;
+                }
+                if i >= c.len() {
+                    return None;
+                }
+                i += 1;
+                out.push(Tok::Str(lit));
+            } else {
+                out.push(Tok::Mark(c[i]));
+                i += 1;
+            }
+        }
+        Some(out)
+    }
+
+    /// One predicate from `toks[*at..]`, leaving `*at` past it.
+    fn parse(toks: &[Tok], at: &mut usize) -> Option<Cfg> {
+        let Tok::Word(name) = toks.get(*at)? else {
+            return None;
+        };
+        *at += 1;
+        match toks.get(*at) {
+            Some(Tok::Mark('(')) if matches!(name.as_str(), "all" | "any" | "not") => {
+                *at += 1;
+                let mut terms = Vec::new();
+                loop {
+                    if toks.get(*at) == Some(&Tok::Mark(')')) {
+                        *at += 1;
+                        break;
+                    }
+                    terms.push(Self::parse(toks, at)?);
+                    match toks.get(*at)? {
+                        Tok::Mark(',') => *at += 1,
+                        Tok::Mark(')') => {
+                            *at += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+                match name.as_str() {
+                    "all" => Some(Cfg::All(terms)),
+                    "any" => Some(Cfg::Any(terms)),
+                    _ if terms.len() == 1 => terms.pop().map(|t| Cfg::Not(Box::new(t))),
+                    _ => None,
+                }
+            }
+            Some(Tok::Mark('=')) => {
+                *at += 1;
+                let Tok::Str(value) = toks.get(*at)? else {
+                    return None;
+                };
+                *at += 1;
+                Some(Cfg::Other(format!("{name} = {value:?}")))
+            }
+            Some(Tok::Mark('(')) => None,
+            _ if name == "test" => Some(Cfg::Test),
+            _ => Some(Cfg::Other(name.clone())),
+        }
+    }
+
+    /// Every predicate but `test`, once each.
+    fn free<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Cfg::Test => {}
+            Cfg::Other(p) => {
+                if !out.contains(&p.as_str()) {
+                    out.push(p);
+                }
+            }
+            Cfg::All(terms) | Cfg::Any(terms) => terms.iter().for_each(|t| t.free(out)),
+            Cfg::Not(t) => t.free(out),
+        }
+    }
+
+    /// Whether a build where `test` is false and `free[k]` is bit `k` of
+    /// `choice` satisfies it.
+    fn holds(&self, free: &[&str], choice: u32) -> bool {
+        match self {
+            Cfg::Test => false,
+            Cfg::Other(p) => free.iter().position(|f| f == p).is_some_and(|k| choice >> k & 1 == 1),
+            Cfg::All(terms) => terms.iter().all(|t| t.holds(free, choice)),
+            Cfg::Any(terms) => terms.iter().any(|t| t.holds(free, choice)),
+            Cfg::Not(t) => !t.holds(free, choice),
+        }
+    }
 }
 
 /// **The files of `files` that are test-only modules**, by the `mod`
@@ -121,48 +285,42 @@ pub(crate) fn is_test_cfg(attr: &str) -> bool {
 /// app's `#[path = "app_width_tests.rs"]` suites, the engine's
 /// `render_golden.rs`) is a whole file of test code that says nothing
 /// about it at its top, so it has to be found from its declaration.
+///
+/// **However the declaration is laid out** ([`mod_decls`]): the attribute
+/// on the declaration's own line (`#[cfg(test)] mod x;`), or above it with
+/// a comment or a blank line between, as Rust allows. This read a line at a
+/// time and kept an attribute only while the very next line was another
+/// attribute, a doc comment or the declaration, so each of those was read
+/// as a module that ships.
 pub(crate) fn test_only_files(files: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut out = BTreeSet::new();
     for f in files {
         let src = std::fs::read_to_string(f).expect("a source file");
+        // Only a file that declares a module can declare a test-only one,
+        // and the lexer is the one cost here worth not paying for the rest.
+        if !src.contains("mod") {
+            continue;
+        }
         let here = f.parent().expect("a file has a directory");
         let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         // Where `mod x;` looks for `x`: beside a mod-rs file, in a directory
         // named for any other.
         let base = if matches!(stem, "lib" | "main" | "mod") { here.to_path_buf() } else { here.join(stem) };
-        let mut attrs: Vec<&str> = Vec::new();
-        for line in src.lines() {
-            let t = line.trim();
-            if t.starts_with("#[") || t.starts_with("///") || t.starts_with("//!") {
-                attrs.push(t);
+        for decl in mod_decls(&crate::copy_scan::lex(&src).bare) {
+            if !decl.attrs.iter().any(|a| is_test_cfg(a)) {
                 continue;
             }
-            let decl = t
-                .strip_prefix("pub(crate) ")
-                .or_else(|| t.strip_prefix("pub "))
-                .unwrap_or(t)
-                .strip_prefix("mod ")
-                .and_then(|r| r.strip_suffix(';'));
-            if let Some(name) = decl.map(str::trim) {
-                if attrs.iter().any(|a| is_test_cfg(a)) {
-                    let path = attrs.iter().find_map(|a| {
-                        let a: String = a.split_whitespace().collect();
-                        a.strip_prefix("#[path=\"").and_then(|r| r.strip_suffix("\"]")).map(str::to_owned)
-                    });
-                    match path {
-                        Some(p) => {
-                            out.insert(here.join(p));
-                        }
-                        None => {
-                            out.insert(base.join(format!("{name}.rs")));
-                            out.insert(base.join(name).join("mod.rs"));
-                            dirs.push(base.join(name));
-                        }
-                    }
+            match decl.attrs.iter().find_map(|a| path_attr(a)) {
+                Some(p) => {
+                    out.insert(here.join(p));
+                }
+                None => {
+                    out.insert(base.join(format!("{}.rs", decl.name)));
+                    out.insert(base.join(&decl.name).join("mod.rs"));
+                    dirs.push(base.join(&decl.name));
                 }
             }
-            attrs.clear();
         }
     }
     // A test-only module's own children are test-only too.
@@ -173,6 +331,161 @@ pub(crate) fn test_only_files(files: &[PathBuf]) -> BTreeSet<PathBuf> {
     }
     out.retain(|p| files.contains(p));
     out
+}
+
+/// A `mod name;` declaration (a module whose body is a file of its own),
+/// with the outer attributes on it as written.
+struct ModDecl {
+    name: String,
+    attrs: Vec<String>,
+}
+
+/// **Every file-module declaration in `text`, with its attributes**: `text`
+/// is a file as the lexer's `bare` view leaves it (comments blanked, strings
+/// and test items as written), read a token at a time, so an attribute
+/// belongs to the declaration it stands on whatever lies between them that
+/// is not a token: a newline, a blank line, a comment, nothing at all.
+/// Attributes gather across a visibility (`pub`, `pub(crate)`); anything
+/// else in between drops them. A string is passed over whole, raw ones
+/// included, so source quoted in a literal declares nothing.
+fn mod_decls(text: &str) -> Vec<ModDecl> {
+    let s: Vec<char> = text.chars().collect();
+    let n = s.len();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let skip_space = |mut i: usize| {
+        while i < n && s[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut out = Vec::new();
+    let mut attrs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = s[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some(end) = past_string(&s, i) {
+            attrs.clear();
+            i = end;
+            continue;
+        }
+        if c == '#' {
+            let open = skip_space(i + 1);
+            if let Some(close) = (s.get(open) == Some(&'[')).then(|| closing_bracket(&s, open)).flatten() {
+                attrs.push(s[i..=close].iter().collect());
+                i = close + 1;
+                continue;
+            }
+        }
+        if word(c) {
+            let from = i;
+            while i < n && word(s[i]) {
+                i += 1;
+            }
+            let w: String = s[from..i].iter().collect();
+            if w == "pub" {
+                let open = skip_space(i);
+                if s.get(open) == Some(&'(') {
+                    i = (open..n).find(|&k| s[k] == ')').map_or(n, |k| k + 1);
+                }
+                continue;
+            }
+            if w == "mod" {
+                let from = skip_space(i);
+                let mut to = from;
+                while to < n && word(s[to]) {
+                    to += 1;
+                }
+                let semi = skip_space(to);
+                if to > from && s.get(semi) == Some(&';') {
+                    out.push(ModDecl { name: s[from..to].iter().collect(), attrs: std::mem::take(&mut attrs) });
+                    i = semi + 1;
+                    continue;
+                }
+                i = to;
+            }
+            attrs.clear();
+            continue;
+        }
+        attrs.clear();
+        i += 1;
+    }
+    out
+}
+
+/// Where the string starting at `s[i]` ends (one past its closing quote),
+/// or nothing when no string starts there: `".."` with its escapes, and a
+/// raw `r".."`, `r#".."#` or `br".."` with any number of hashes.
+fn past_string(s: &[char], i: usize) -> Option<usize> {
+    let n = s.len();
+    if s[i] == '"' {
+        let mut j = i + 1;
+        while j < n && s[j] != '"' {
+            j += if s[j] == '\\' { 2 } else { 1 };
+        }
+        return Some((j + 1).min(n));
+    }
+    let after_r = match s[i] {
+        'r' => i + 1,
+        'b' if s.get(i + 1) == Some(&'r') => i + 2,
+        _ => return None,
+    };
+    if i > 0 && (s[i - 1].is_alphanumeric() || s[i - 1] == '_') {
+        return None;
+    }
+    let mut j = after_r;
+    while s.get(j) == Some(&'#') {
+        j += 1;
+    }
+    if s.get(j) != Some(&'"') {
+        return None;
+    }
+    let hashes = j - after_r;
+    let mut k = j + 1;
+    while k < n {
+        if s[k] == '"' && (1..=hashes).all(|h| s.get(k + h) == Some(&'#')) {
+            return Some(k + 1 + hashes);
+        }
+        k += 1;
+    }
+    Some(n)
+}
+
+/// The `]` that closes the `[` at `s[open]`, strings inside passed over.
+fn closing_bracket(s: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < s.len() {
+        if let Some(end) = past_string(s, i) {
+            i = end;
+            continue;
+        }
+        match s[i] {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The file a `#[path = ".."]` attribute names, or nothing for any other.
+fn path_attr(attr: &str) -> Option<String> {
+    match Cfg::tokens(attr)?.as_slice() {
+        [Tok::Mark('#'), Tok::Mark('['), Tok::Word(w), Tok::Mark('='), Tok::Str(p), Tok::Mark(']')] if w == "path" => {
+            Some(p.clone())
+        }
+        _ => None,
+    }
 }
 
 /// **What is wrong with one file's live code**, one entry per hit: `code`
@@ -537,6 +850,105 @@ fn test_only_modules_are_found_from_their_declarations() {
         .collect();
     assert_eq!(found, ["corpus.rs", "shipped_tests.rs", "suite/inner.rs", "suite/mod.rs"]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A test-only module is found however its declaration is laid out**
+/// (design W8-safe-tests): the attribute on the declaration's own line, or
+/// above it with a comment, a block comment or a blank line between, a
+/// `#[path]` on either side of the cfg. Rust allows every one of these, and
+/// until W8's review each was read as a module that ships, so the scans
+/// read a whole file of tests as live code. A declaration after an item the
+/// cfg was on, one quoted in a string, and one commented out declare no
+/// test-only module. Revert check: the line-at-a-time reader finds only
+/// `pathed`'s file here.
+#[test]
+fn a_test_only_module_is_found_however_its_declaration_is_laid_out() {
+    let dir = std::env::temp_dir().join(format!("tangent-ban-layout-{}-{:?}", std::process::id(), std::thread::current().id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch tree");
+    let lib = "#[cfg(test)] mod one_line;\n\
+               #[cfg(test)]\n// Why it is a test.\nmod commented;\n\
+               #[cfg(test)]\n\nmod spaced;\n\
+               #[cfg(test)]\n/* A block\n   comment. */\nmod blocked;\n\
+               #[cfg(test)]\n/// Its doc.\n#[path = \"suite_tests.rs\"]\nmod pathed;\n\
+               #[cfg(test)] #[path = \"inline_path.rs\"] pub(crate) mod inline;\n\
+               #[path = \"before.rs\"]\n// The path first, then the cfg.\n#[cfg(all(test, unix))]\nmod before_cfg;\n\
+               pub mod shipped;\n\
+               #[cfg(test)]\nfn helper() {}\nmod after_an_item;\n\
+               const QUOTED: &str = \"#[cfg(test)] mod quoted;\";\n\
+               const RAW: &str = r#\"#[cfg(test)]\nmod raw;\"#;\n\
+               // #[cfg(test)] mod commented_out;\n";
+    let mut paths = vec![dir.join("lib.rs")];
+    std::fs::write(&paths[0], lib).expect("lib.rs");
+    for name in [
+        "one_line", "commented", "spaced", "blocked", "suite_tests", "inline_path", "before", "shipped", "after_an_item",
+        "quoted", "raw", "commented_out",
+    ] {
+        let p = dir.join(format!("{name}.rs"));
+        std::fs::write(&p, "").expect("a scratch file");
+        paths.push(p);
+    }
+    paths.sort();
+    let found: Vec<String> = test_only_files(&paths)
+        .iter()
+        .map(|p| p.strip_prefix(&dir).expect("under the scratch tree").to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        found,
+        ["before.rs", "blocked.rs", "commented.rs", "inline_path.rs", "one_line.rs", "spaced.rs", "suite_tests.rs"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A cfg that only spells `test`, or says `not(test)`, ships, and both
+/// scans read what it is on** (design W8-safe-tests); a cfg no build
+/// outside a test satisfies does not ship, and neither scan reads it.
+/// Planted through the lexer both scans read by: a banned name for the ban
+/// scan, a literal for the phrase scan. Revert check: the text search this
+/// replaced reads the first three as tests, and the sixth too.
+#[test]
+fn a_cfg_that_only_spells_test_or_says_not_test_is_read_as_shipping() {
+    let shipping = [
+        "#[cfg(all(feature = \"latest\"))]",
+        "#[cfg(all(feature = \"test-harness\"))]",
+        "#[cfg(all(target_env = \"contest\"))]",
+        "#[cfg(all(unix, not(test)))]",
+        "#[cfg(all(not( test ), feature = \"x\"))]",
+        "#[cfg(all(unix, not(any(test, feature = \"x\"))))]",
+        "#[cfg(any(test, feature = \"x\"))]",
+        "#[cfg(not(test))]",
+        "#[cfg(feature = \"test\")]",
+        "#[cfg(all(test_harness, unix))]",
+        "#[cfg(all())]",
+        "#[cfg(all(test, feature = \"x\"]",
+    ];
+    let tests_only = [
+        "#[cfg(test)]",
+        "#[cfg( test )]",
+        "#[cfg(all(test, feature = \"recorder\"))]",
+        "#[cfg(all(feature = \"recorder\", test))]",
+        "#[cfg(all(\n    unix,\n    test,\n    not(feature = \"x\"),\n))]",
+        "#[cfg(any(test))]",
+        "#[cfg(not(not(test)))]",
+        "#[cfg(any(all(test, unix), all(windows, test)))]",
+    ];
+    let read = |attr: &str| {
+        let lexed = crate::copy_scan::lex(&format!("{attr}\nfn f() {{ let n = CHANNELS; let s = \"what ships\"; }}\n"));
+        (banned_in("tangent/src/x.rs", &lexed.code).len(), lexed.literals)
+    };
+    for attr in shipping {
+        assert!(!is_test_cfg(attr), "read as test-only: {attr}");
+        let (hits, literals) = read(attr);
+        assert_eq!(hits, 1, "the ban scan skipped the live code under {attr}");
+        // The attribute's own strings are literals too, read before it.
+        assert_eq!(literals.last().map(String::as_str), Some("what ships"), "the phrase scan skipped a live literal under {attr}");
+    }
+    for attr in tests_only {
+        assert!(is_test_cfg(attr), "read as shipping: {attr}");
+        let (hits, literals) = read(attr);
+        assert_eq!(hits, 0, "the ban scan read the test under {attr}");
+        assert!(literals.is_empty(), "the phrase scan read a test's literal under {attr}");
+    }
 }
 
 /// **A home found off the one road fails the scan** (design
