@@ -423,6 +423,92 @@ impl DrumpadDoc {
         Self::write_lanes(&by_lane, ids, primary, doc, format);
     }
 
+    /// **The kits held by track, filed by the rows of the document on
+    /// disk** (`disk`) when the live rows (`live`) may differ from them: the
+    /// sidecar saving itself between the document's saves. `primary` is the
+    /// panel's track.
+    ///
+    /// Each row of the document carries the kit of the track it names,
+    /// wherever that track stands now, so the document and its sidecar on
+    /// disk describe one desk however the rows have moved since it was
+    /// saved. Filed by the live rows, an unsaved drag and a pad edit put the
+    /// kit under the row its track had moved to, and the document reopened
+    /// with the kit on the track standing there on disk and the drum track
+    /// silent. A track the document does not hold (made since it was saved,
+    /// or a row given a new id) is filed on the row it stands on, by the
+    /// document's name for that row, unless a track the document holds
+    /// files its kit there; rows past the document's are its own. The next
+    /// save writes the rows as they stand. With `live == disk` this is
+    /// [`Self::save_track_kits`]' file.
+    pub fn save_track_kits_on(
+        kits: &TrackKits,
+        live: &[crate::desk_id::TrackId],
+        disk: &[crate::desk_id::TrackId],
+        primary: Option<crate::desk_id::TrackId>,
+        doc: &std::path::Path,
+    ) {
+        Self::save_track_kits_on_as(kits, live, disk, primary, doc, crate::desk_format::Format::current());
+    }
+
+    /// [`Self::save_track_kits_on`] in `format`.
+    pub(crate) fn save_track_kits_on_as(
+        kits: &TrackKits,
+        live: &[crate::desk_id::TrackId],
+        disk: &[crate::desk_id::TrackId],
+        primary: Option<crate::desk_id::TrackId>,
+        doc: &std::path::Path,
+        format: crate::desk_format::Format,
+    ) {
+        let (filed, ids) = Self::filed_on(kits, live, disk);
+        let empty = Self::default();
+        let by_lane: Vec<&Self> =
+            filed.iter().map(|t| t.and_then(|t| kits.get(&t)).unwrap_or(&empty)).collect();
+        // The panel's row in the file: where its track's kit was filed, else
+        // the row the file names it by, else row 0 - the live writer's own
+        // answer when the two desks are one.
+        let primary = primary
+            .and_then(|p| {
+                filed.iter().position(|t| *t == Some(p)).or_else(|| ids.iter().position(|t| *t == p))
+            })
+            .unwrap_or(0);
+        Self::write_lanes(&by_lane, &ids, primary, doc, format);
+    }
+
+    /// **Which track's kit each row of the file carries, and the id the
+    /// file names that row by**: `disk`'s rows, then the live rows past
+    /// them. See [`Self::save_track_kits_on`]. A kit that holds no sample
+    /// never takes a row from one that does: an empty kit is the absence
+    /// of one, the writers' rule.
+    fn filed_on(
+        kits: &TrackKits,
+        live: &[crate::desk_id::TrackId],
+        disk: &[crate::desk_id::TrackId],
+    ) -> (Vec<Option<crate::desk_id::TrackId>>, Vec<crate::desk_id::TrackId>) {
+        let has = |t: &crate::desk_id::TrackId| kits.get(t).is_some_and(|k| !k.is_empty());
+        let held: std::collections::BTreeSet<_> = disk.iter().copied().collect();
+        let mut ids = disk.to_vec();
+        ids.extend(live.iter().skip(disk.len()).copied());
+        // A row the document holds carries its own track's kit, wherever the
+        // track stands now; a row past them, its live track's, when the
+        // document holds that track nowhere.
+        let mut filed: Vec<Option<crate::desk_id::TrackId>> = ids
+            .iter()
+            .enumerate()
+            .map(|(row, t)| ((row < disk.len() || !held.contains(t)) && kits.contains_key(t)).then_some(*t))
+            .collect();
+        // Then each live track the document does not hold, on the row it
+        // stands on, where that row's own track has no kit.
+        for (row, t) in live.iter().enumerate().take(disk.len()) {
+            if held.contains(t) || !has(t) {
+                continue;
+            }
+            if let Some(slot) = filed.get_mut(row).filter(|s| !s.is_some_and(|s| has(&s))) {
+                *slot = Some(*t);
+            }
+        }
+        (filed, ids)
+    }
+
     /// The one writer under both forms: `kits[lane]` is the kit of the
     /// track `ids[lane]`, borrowed, so a map's kits are written without a
     /// clone each.
@@ -2321,6 +2407,68 @@ mod track_kit_tests {
             assert_eq!(back.len(), 3, "the empty kit took an entry, or a kit was lost ({format:?})");
             assert_eq!(back.get(&TrackId(7)), Some(&kit("c")), "({format:?})");
             assert_eq!(primary, Some(TrackId(7)), "the panel's track was not read back ({format:?})");
+            let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
+        }
+    }
+
+    /// **A kit saving itself is filed by the rows of the document on disk**
+    /// (W4-lane-refs, `save_track_kits_on`), in either format: each row the
+    /// document holds carries its own track's kit wherever the track stands
+    /// now, so the document and the sidecar read back as one desk. A track
+    /// the document does not hold is filed on the row it stands on, by the
+    /// document's name for that row, unless that row's own track has a kit;
+    /// past the document's rows, by its own. With one desk it is the map
+    /// writer's file, byte for byte.
+    #[test]
+    fn a_kit_saving_itself_is_filed_by_the_rows_of_the_document_on_disk() {
+        let t = TrackId;
+        let disk = [t(0), t(1), t(2), t(3)];
+        let mut kits = TrackKits::new();
+        kits.insert(t(0), kit("kick"));
+        kits.insert(t(2), kit("clap"));
+        // A panel opened on a track and left as it was.
+        kits.insert(t(3), DrumpadDoc::default());
+        for format in [Format::Legacy, Format::V2] {
+            let doc = scratch("on-disk");
+            let read = || std::fs::read(DrumpadDoc::sidecar(&doc)).expect("sidecar");
+            DrumpadDoc::save_track_kits_as(&kits, &disk, 2, &doc, format);
+            let want = read();
+            DrumpadDoc::save_track_kits_on_as(&kits, &disk, &disk, Some(t(2)), &doc, format);
+            assert_eq!(read(), want, "one desk wrote other bytes than the map writer ({format:?})");
+
+            // A drag since the save: the kick's track stands on row 2 now.
+            let live = [t(1), t(2), t(0), t(3)];
+            DrumpadDoc::save_track_kits_on_as(&kits, &live, &disk, Some(t(0)), &doc, format);
+            let (back, primary) = DrumpadDoc::load_track_kits(&doc, &disk, None);
+            assert_eq!(back.get(&t(0)), Some(&kit("kick")), "the drag moved a kit off its track on disk ({format:?})");
+            assert_eq!(back.get(&t(2)), Some(&kit("clap")), "({format:?})");
+            assert_eq!(back.len(), 2, "a kit landed on another track ({format:?})");
+            assert_eq!(primary, Some(t(0)), "the panel's track ({format:?})");
+
+            // Row 1 given a new id with a kit of its own (t40), and a track
+            // made past the document's rows (t41).
+            let mut made = kits.clone();
+            made.insert(t(40), kit("snare"));
+            made.insert(t(41), kit("hat"));
+            let live = [t(0), t(40), t(2), t(3), t(41)];
+            DrumpadDoc::save_track_kits_on_as(&made, &live, &disk, Some(t(40)), &doc, format);
+            let (back, primary) = DrumpadDoc::load_track_kits(&doc, &disk, None);
+            assert_eq!(back.get(&t(1)), Some(&kit("snare")), "a new id's kit missed its row on disk ({format:?})");
+            assert_eq!(primary, Some(t(1)), "the panel's row on disk ({format:?})");
+            let (wide, _) = DrumpadDoc::load_track_kits(&doc, &live, None);
+            assert_eq!(wide.get(&t(41)), Some(&kit("hat")), "a kit past the document's rows was lost ({format:?})");
+
+            // A track the document holds keeps its row from a new one: t1,
+            // dragged to row 2, has a kit, and t40 stands on its old row.
+            let mut both = TrackKits::new();
+            both.insert(t(1), kit("tom"));
+            both.insert(t(40), kit("snare"));
+            let live = [t(0), t(40), t(1), t(3)];
+            DrumpadDoc::save_track_kits_on_as(&both, &live, &disk, None, &doc, format);
+            let (back, _) = DrumpadDoc::load_track_kits(&doc, &disk, None);
+            assert_eq!(back.get(&t(1)), Some(&kit("tom")), "a new track's kit took a row from the document's own ({format:?})");
+            assert_eq!(back.len(), 1, "({format:?})");
+            assert!(!String::from_utf8_lossy(&read()).contains("snare"), "the new track's kit was filed over another ({format:?})");
             let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
         }
     }
