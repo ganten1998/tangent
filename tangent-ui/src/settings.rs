@@ -88,6 +88,29 @@ fn desk_channel_moved(old: usize) -> usize {
     }
 }
 
+/// **A strip's switch about its signal**: mute, solo or polarity, each one
+/// bit of a row's mask or one flag of a special (`Settings::strip_switch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripSwitch {
+    Mute,
+    Solo,
+    Phase,
+}
+
+/// **A desk's strip facts in the legacy strip space** (names and colours 36
+/// wide, sends 35, the masks over strip bits): what `Settings::strip_space`
+/// joins the rows and the specials into, for the legacy writer and the dense
+/// desk (`V22Desk`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct StripSpace {
+    pub(crate) names: Vec<String>,
+    pub(crate) colors: Vec<i64>,
+    pub(crate) sends: Vec<f64>,
+    pub(crate) muted: u64,
+    pub(crate) soloed: u64,
+    pub(crate) phase: u64,
+}
+
 /// The desk arrays exactly as the FILE had them, before anything clamps.
 ///
 /// **Because the desk is about to SHRINK, and truncation happens first.**
@@ -117,6 +140,21 @@ struct LegacyDesk {
     plugin_slots: Vec<Option<String>>,
     plugin_gains: Vec<f64>,
     input_gains: Vec<f64>,
+    /// **The desk's bays as they STAND when the file names none**: the
+    /// default desk's, as the frozen dense table. The migrations that seat
+    /// a plugin on a desk whose file staged no bays (`was < 17`'s drumpad,
+    /// `was < 18`'s pad move) write here, at the legacy seats they always
+    /// wrote; the fold binds whichever table the file ends up with to the
+    /// rows' identities, once.
+    standing: Vec<String>,
+    /// **The strip masks as the file wrote them**, over its own strip space:
+    /// staged here with the arrays for their reason, because the migrations
+    /// move them by the shape the file had, and only the fold knows where a
+    /// bit belongs once the specials have left strip space (W5). Absent is
+    /// zero, which is what a file with no such key always meant.
+    muted: u64,
+    soloed: u64,
+    phase: u64,
 }
 
 /// As many channels as a hand-edited file may claim before we stop reading.
@@ -181,6 +219,70 @@ pub const SHELF_DONE_NAME: &str = ".shelf-v23";
 /// Where a format-2 desk the reader refused is kept, beside the settings
 /// file: the first free of this name and `settings.desk-refused-N.json`.
 pub const DESK_REFUSED_NAME: &str = "settings.desk-refused.json";
+
+/// **The rows of one desk under another desk's ids**: row r's track
+/// `from[r]` becomes `to[r]`, and anything not a track a row of `from`
+/// holds stays itself. What a reset uses to put the fresh desk's bays and
+/// wiring on the rows' new ids: an id substitution, row for row, never a
+/// move between rows.
+pub(crate) struct Rekey(std::collections::BTreeMap<crate::desk_id::TrackId, crate::desk_id::TrackId>);
+
+impl Rekey {
+    pub(crate) fn node(&self, n: crate::desk_id::Node) -> crate::desk_id::Node {
+        match n {
+            crate::desk_id::Node::Track(id) => crate::desk_id::Node::Track(self.0.get(&id).copied().unwrap_or(id)),
+            other => other,
+        }
+    }
+
+    pub(crate) fn bay(&self, sb: crate::desk_id::SeatBay) -> crate::desk_id::SeatBay {
+        crate::desk_id::SeatBay::new(self.node(sb.seat.node), sb.seat.rack, sb.bay)
+    }
+
+    /// **A desk's four identity tables, re-keyed**: its bays, its bypass
+    /// flags, its routes and its key edges, each track end taken across and
+    /// every special and jack left as it is.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn tables(
+        &self,
+        s: &Settings,
+    ) -> (
+        std::collections::BTreeMap<crate::desk_id::SeatBay, String>,
+        std::collections::BTreeSet<crate::desk_id::SeatBay>,
+        crate::routing::Routes,
+        crate::routing::KeyEdges,
+    ) {
+        let plugins = s.plugins.iter().map(|(sb, p)| (self.bay(*sb), p.clone())).collect();
+        let bypass = s.bypass.iter().map(|sb| self.bay(*sb)).collect();
+        let routes = crate::routing::Routes(
+            s.routes
+                .0
+                .iter()
+                .map(|r| crate::routing::Route {
+                    from: self.node(r.from),
+                    target: match r.target {
+                        crate::routing::Target::Node(n) => crate::routing::Target::Node(self.node(n)),
+                        hw => hw,
+                    },
+                    gain: r.gain,
+                })
+                .collect(),
+        );
+        let keys = crate::routing::KeyEdges(
+            s.insert_keys
+                .0
+                .iter()
+                .map(|k| crate::routing::KeyEdge { seat: self.bay(k.seat), from: self.node(k.from) })
+                .collect(),
+        );
+        (plugins, bypass, routes, keys)
+    }
+}
+
+/// [`Rekey`] from `from` to `to`, row for row.
+pub(crate) fn rekey_rows(from: &[crate::desk_id::TrackId], to: &[crate::desk_id::TrackId]) -> Rekey {
+    Rekey(from.iter().copied().zip(to.iter().copied()).collect())
+}
 
 /// The first name of the `stem.ext`, `stem-2.ext`, ... ladder nothing
 /// stands on yet. `None` after a thousand, which only a folder somebody is
@@ -395,8 +497,8 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
         }
         out
     };
-    s.strip_muted = move_mask(s.strip_muted);
-    s.strip_soloed = move_mask(s.strip_soloed);
+    desk.muted = move_mask(desk.muted);
+    desk.soloed = move_mask(desk.soloed);
 
     // The click has a column now and a stored zero is not a choice — nobody
     // could paint a column that did not exist. Amber, distinct from the
@@ -452,8 +554,8 @@ fn migrate_retire_track(s: &mut Settings, desk: &mut LegacyDesk) {
         let above = mask >> (TRACK + 1);
         keep | (above << TRACK)
     };
-    s.strip_muted = move_mask(s.strip_muted);
-    s.strip_soloed = move_mask(s.strip_soloed);
+    desk.muted = move_mask(desk.muted);
+    desk.soloed = move_mask(desk.soloed);
     // The HOST must shuffle the insert-state sidecar files once — they are
     // named by desk index, and the click's, the bus's and the master's all
     // just moved. A flag rather than doing it here: this crate does not
@@ -485,14 +587,14 @@ fn migrate_add_drums(s: &mut Settings, desk: &mut LegacyDesk) {
         let above = mask >> AT;
         keep | (above << (AT + 1))
     };
-    s.strip_muted = move_mask(s.strip_muted);
-    s.strip_soloed = move_mask(s.strip_soloed);
+    desk.muted = move_mask(desk.muted);
+    desk.soloed = move_mask(desk.soloed);
     // The sidecars named 8, 9, 10 are the click's, the bus's and the
     // master's; the host walks them up one, once.
     s.desk_state_shift_v14 = true;
 }
 
-fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
+fn migrate_desk_channels(desk: &mut LegacyDesk) {
     // **On the staging arrays**, which are at the file's own length — see
     // `LegacyDesk`. Grown rather than bounds-checked against today's constant:
     // this move pushes rows UP, and a destination past the end of what the file
@@ -528,8 +630,8 @@ fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
         }
         out
     };
-    s.strip_muted = move_mask(s.strip_muted);
-    s.strip_soloed = move_mask(s.strip_soloed);
+    desk.muted = move_mask(desk.muted);
+    desk.soloed = move_mask(desk.soloed);
 }
 
 /// **A pre-lanes project's pad plugins follow their drumpad.**
@@ -655,137 +757,20 @@ impl Rgb {
     }
 }
 
-/// **Which insert bays are BYPASSED** — kept, loaded, editable, and not
-/// applied.
+/// **The legacy file's bypassed bays**: `(seat, bay)` in the frozen V32 seat
+/// map, sparse and sorted, as every settings file and document before
+/// format 2 wrote them (`insert_bypass`).
 ///
-/// The wording is `TangentApp::arr_auto_bypassed`'s, on purpose: a bypassed
-/// automation row is still drawn, still editable and still holds every node
-/// somebody put down, and simply does not move its parameter. A bypassed
-/// BAY is that same bargain one layer down — the plugin stays seated, its
-/// window still opens, its name still reads on the chip, its settings are
-/// untouched, and the audio walks past it. Nothing is unloaded, so putting
-/// it back is a click and not a reload.
-///
-/// **Addressed in SEAT space — `(seat, bay)`, the plugin's own address.**
-///
-/// This is the one thing here that had to be got right. A bay's tenant lives
-/// at `strip_inserts[seat * INSERTS + bay]`; storing the flag at any OTHER
-/// address needs a translation, and a translation is a thing that can be
-/// wrong. The master's six visible slots run 3..5 and then 0..2 across two
-/// racks, a folder's run 0..2 and then 3..5 across two others, and neither
-/// rule is guessable from a slot number — which is exactly why
-/// `recorder::seat_bay` exists and why every call site is made to go through
-/// it. Sharing the plugin's own address means the flag and the plugin are
-/// moved by the same permutation, in the same pass, or not at all.
-///
-/// It is also the only space wide enough. The DESK address —
-/// `(strip, visible slot)`, which [`crate::routing::KeyEdges`] uses because
-/// a key names a CHANNEL at both ends and channels are what a reorder moves
-/// — cannot name a pad seat or a pedal seat at all, and there are 224 pedal
-/// seats (`recorder::AMP_PEDAL_SEATS`).
-///
-/// **Sparse, and kept SORTED.** Sparse for the reason [`crate::routing::Routes`]
-/// is: almost nothing is ever bypassed, and a `TOTAL_SEATS * INSERTS` bitmap
-/// would put thirteen thousand zeroes in everybody's settings file. Sorted
-/// because a reorder rewrites the seats in place: a list left in the order
-/// the hand made it would come out of every drag shuffled, and turn every
-/// diff of a settings file into noise.
+/// The live desk keeps them by identity (`Settings::bypass`, a set of
+/// `SeatBay`), where a flag is the BAY's and so moves with nothing: a
+/// reorder, an insert above and a delete elsewhere leave it on its plugin
+/// with no remap, which is the one thing the seat-space set had to be
+/// carried through by hand. This is the shape on disk, read and written
+/// through `desk_legacy::{bay_at, seat_of}` under the desk's row ids.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BypassBays(pub Vec<(usize, usize)>);
 
 impl BypassBays {
-    /// Whether this bay's tenant is out of circuit.
-    ///
-    /// A linear scan, like [`crate::routing::KeyEdges::get`]: the list is a
-    /// handful of entries at the very most, and it is asked once per drawn
-    /// chip and once per published frame — a map would cost more to keep
-    /// than it could ever save.
-    pub fn contains(&self, seat: usize, bay: usize) -> bool {
-        self.0.contains(&(seat, bay))
-    }
-
-    /// Put one bay out of circuit, or back in. Answers whether anything
-    /// moved, so a caller can decline to save a file that would be
-    /// byte-identical.
-    pub fn set(&mut self, seat: usize, bay: usize, on: bool) -> bool {
-        let at = self.0.iter().position(|e| *e == (seat, bay));
-        match (at, on) {
-            (Some(_), true) | (None, false) => false,
-            (Some(at), false) => {
-                self.0.remove(at);
-                true
-            }
-            (None, true) => {
-                // Sorted on the way IN rather than at save time, so the list
-                // reads in one order everywhere — the file, the published
-                // table, a debug print — and no reader has to wonder which
-                // of them is canonical.
-                let at = self.0.partition_point(|e| *e < (seat, bay));
-                self.0.insert(at, (seat, bay));
-                true
-            }
-        }
-    }
-
-    /// Flip one bay, and answer what it now is — the gesture's own verb.
-    pub fn toggle(&mut self, seat: usize, bay: usize) -> bool {
-        let on = !self.contains(seat, bay);
-        self.set(seat, bay, on);
-        on
-    }
-
-    /// **Forget one bay, because whatever was in it has gone.**
-    ///
-    /// Called wherever a bay's tenant changes — see
-    /// `TangentApp::set_insert` — for the reason `insert_keys` is dropped on
-    /// a track delete: a flag left standing would silently bypass the NEXT
-    /// plugin to land here. An effect that is loaded, drawn, named on its
-    /// chip and inaudible for no reason anybody can see is the worst failure
-    /// this feature has available to it.
-    pub fn drop_bay(&mut self, seat: usize, bay: usize) -> bool {
-        self.set(seat, bay, false)
-    }
-
-    /// Every bay of one seat, for a rack whose whole contents have gone — a
-    /// deleted track's own seat and its folder-extra seat. Returns how many
-    /// went, so a caller can tell somebody, exactly as
-    /// [`crate::routing::KeyEdges::drop_channel`] does.
-    pub fn drop_seat(&mut self, seat: usize) -> usize {
-        let before = self.0.len();
-        self.0.retain(|(s, _)| *s != seat);
-        before - self.0.len()
-    }
-
-    /// **Follow a reorder.** `order[new] = old`, over the WHOLE seat space —
-    /// that is, exactly what `recorder::seat_order` returns, which is where
-    /// the knowledge lives that a channel's folder-extra seat and its seven
-    /// pedal seats travel with it while every other seat holds still.
-    ///
-    /// The inversion happens HERE rather than at the call site. A set NAMES
-    /// seats, so it needs `old -> new`, while every array in the reorder is
-    /// rebuilt by reading `new -> old`; passing the wrong one of those two
-    /// is silent, survives any test that only ever swaps two adjacent rows,
-    /// and lands a bypass on somebody else's plugin. One inversion, in one
-    /// function, and no caller can get it the wrong way round.
-    pub fn remap_seats(&mut self, order: &[usize]) {
-        let mut inv = vec![usize::MAX; order.len()];
-        for (new, old) in order.iter().enumerate() {
-            if let Some(slot) = inv.get_mut(*old) {
-                *slot = new;
-            }
-        }
-        for (seat, _) in &mut self.0 {
-            // A seat the permutation does not name holds still — the rule
-            // `KeyEdges::remap_channels` states for the buses and the
-            // master, and the one `seat_order` writes into its own identity
-            // entries.
-            if let Some(new) = inv.get(*seat).copied().filter(|n| *n != usize::MAX) {
-                *seat = new;
-            }
-        }
-        self.0.sort_unstable();
-    }
-
     pub fn to_json(&self) -> Value {
         Value::Array(
             self.0
@@ -818,7 +803,11 @@ impl BypassBays {
             ) else {
                 continue;
             };
-            out.set(seat as usize, bay as usize, true);
+            // Sorted and once each, as every writer kept it.
+            let at = (seat as usize, bay as usize);
+            if let Err(i) = out.0.binary_search(&at) {
+                out.0.insert(i, at);
+            }
         }
         out
     }
@@ -900,16 +889,27 @@ pub struct Settings {
     pub theme_name: String,
     /// Where each channel goes besides the master — see `crate::routing`.
     pub routes: crate::routing::Routes,
-    /// Which channel keys each sidechained insert — see
-    /// [`crate::routing::KeyEdges`]. Desk topology like `routes`, addressed
-    /// by (strip, visible slot) so it rides out seat renumbering.
+    /// Which strip keys each sidechained insert — see
+    /// [`crate::routing::KeyEdges`]. Desk topology like `routes`, and like
+    /// them by identity at both ends: the keyed bay and the source.
     pub insert_keys: crate::routing::KeyEdges,
-    /// Which insert bays are out of circuit — see [`BypassBays`]. Beside the
-    /// key edges because both are facts about a BAY rather than about the
-    /// plugin sitting in it, and both therefore have to outlive that plugin
-    /// being swapped for another build of itself; unlike the keys, this one
-    /// is addressed in SEAT space, for the reason the type's own docs give.
-    pub insert_bypass: BypassBays,
+    /// **Which insert bays are out of circuit — kept, loaded, editable, and
+    /// not applied**, by identity.
+    ///
+    /// The wording is `TangentApp::arr_auto_bypassed`'s, on purpose: a
+    /// bypassed automation row is still drawn, still editable and still
+    /// holds every node somebody put down, and simply does not move its
+    /// parameter. A bypassed BAY is that bargain one layer down: the plugin
+    /// stays seated, its window still opens, its name still reads on the
+    /// chip, and the audio walks past it.
+    ///
+    /// **Keyed by the bay itself**, the key `plugins` uses, so the flag and
+    /// its plugin are one address and nothing can move one without the
+    /// other: no edit renumbers a `SeatBay`, so a reorder carries no remap
+    /// for either. Beside the key edges because both are facts about a BAY
+    /// rather than about the plugin in it, and both outlive that plugin
+    /// being swapped for another build of itself.
+    pub bypass: std::collections::BTreeSet<crate::desk_id::SeatBay>,
     /// Wrap a saved project in its own folder. **On by default**, because a
     /// project is a DIRECTORY (document plus `media/`) and saving one into a
     /// folder that already has things in it scatters those parts among them.
@@ -1559,12 +1559,15 @@ pub struct Settings {
     /// reset itself while the seven beside it did not is the surprise, not
     /// the other way round.
     pub varispeed: crate::varispeed::Varispeed,
-    /// What colour each mixer channel is painted, and the master last.
+    /// What colour each TRACK is painted, by row.
     ///
     /// Indexes [`crate::mixer_panel::STRIP_COLORS`]; zero is the desk's own
-    /// wood, which is what an unpainted channel is. The master defaults to RED
-    /// because it is the one channel you look for.
-    pub strip_colors: [i64; crate::recorder::STRIPS + 1],
+    /// wood, which is what an unpainted channel is, and the palette answers
+    /// for it. The drum bus, the click, the effects return and the master
+    /// keep theirs in [`Self::specials`]: the specials have left strip space
+    /// (W5), so this array has no slot past the rows. Read and written
+    /// through [`Self::strip_paint`] by what a strip is.
+    pub strip_colors: [i64; crate::recorder::CHANNELS],
     /// What the user called each channel, or empty for its own name.
     ///
     /// **A desk is a set of names before it is a set of faders.** "BELL KEYS"
@@ -1572,8 +1575,9 @@ pub struct Settings {
     /// person at the desk knows, and the second one is the one they are
     /// looking for at 0:47.
     ///
-    /// Indexed by `Strip::index`, with the master last — the same shape as
-    /// `strip_colors`, and it moves with them when the desk changes.
+    /// By row, the same shape as `strip_colors`, and it moves with them
+    /// when the desk changes; the specials' names are in
+    /// [`Self::specials`]. Read and written through [`Self::strip_name`].
     pub strip_names: Vec<String>,
     /// A short name for the audio interface, used on every one of its inputs.
     ///
@@ -1592,17 +1596,21 @@ pub struct Settings {
     /// whatever that was: unplug the interface and the laptop's microphone
     /// was called "solo" while it recorded. See `devices::alias_for_open`.
     pub input_alias_for: Option<String>,
-    /// The effect in each of the desk's insert slots, as bundle paths.
+    /// **Every seated plugin, by the bay it sits in** (design 4): a bundle
+    /// path, or a built-in's sentinel, keyed by [`crate::desk_id::SeatBay`].
     ///
-    /// **Flat, `strip * INSERTS + slot`**, with the master last — the same
-    /// index `strip_colors` uses, plus a slot. A `Vec` rather than an array
-    /// because it is thirty-nine strings and an array of those is a large
-    /// thing to move around for no gain.
+    /// By identity and not by position. It used to be one flat string per
+    /// bay of a 13,176-cell seat map, `strip * INSERTS + slot`, so a bay's
+    /// address was where its track happened to stand: every reorder had to
+    /// carry the table through a seat permutation, and the seats the
+    /// permutation forgot (a lane's pad racks) parted those plugins from
+    /// their tracks. A `SeatBay` names the track, its rack and the bay, and
+    /// nothing renumbers it: a track's plugins are wherever the track is.
     ///
-    /// Empty means empty. The old `bus_effect` is read into the effects bus's
-    /// first slot and then left alone: a bus is a channel with a send instead
-    /// of a fader, and it had the only insert this app used to have.
-    pub strip_inserts: Vec<String>,
+    /// Sparse: an empty bay has no entry, and an entry is never empty. The
+    /// legacy files' dense table is read and written through
+    /// `desk_legacy::{bind_bays, dense_bays}` under the rows' ids.
+    pub plugins: std::collections::BTreeMap<crate::desk_id::SeatBay, String>,
     /// A user effect plugin across the effects bus, as a bundle path.
     ///
     /// **On the bus, not on every channel.** A reverb is a send effect: one
@@ -1623,24 +1631,35 @@ pub struct Settings {
     /// had no fader because it was not a channel yet — the instrument slots
     /// have had theirs since the rack did.
     pub fx_return_gain: f64,
-    /// How much of each strip goes to the effects bus, 0..=1, in
-    /// [`crate::recorder::Strip::ALL`] order.
+    /// How much of each TRACK goes to the effects bus, 0..=1, by row: each
+    /// row's send knob, kept with its row. A special's send is in its own
+    /// sends ([`Self::specials`]), so sends are kept per row and per special
+    /// and none of them in strip space (W5). Read and written through
+    /// [`Self::strip_send`].
     ///
     /// **The default is the routing this app had before the mixer**: the
     /// instrument sends everything and nothing else sends anything, which is
     /// what an insert on the instrument bus was.
-    pub strip_sends: [f64; crate::recorder::STRIPS],
-    /// Mute and solo, as bitmasks over the same order. A mask rather than five
-    /// keys, because "is anything soloed" is a question about all of them at
-    /// once and five keys is five chances to answer it from a stale half.
+    pub strip_sends: [f64; crate::recorder::CHANNELS],
+    /// Mute and solo, as bitmasks over the ROWS, bit r for row r. A mask
+    /// rather than a key per row, because "is anything soloed" is a question
+    /// about all of them at once (the specials' switches are flags of
+    /// theirs, [`Self::specials`]). Read through [`Self::strip_switch`].
     pub strip_muted: u64,
-    /// **Which strips have their polarity inverted**, one bit per strip.
+    /// **Which rows have their polarity inverted**, one bit per row.
     ///
     /// A mask beside `strip_muted` and `strip_soloed`, because it is the same
     /// kind of thing: a per-strip switch about the signal, held as bits so a
     /// whole desk is one number.
     pub strip_phase: u64,
     pub strip_soloed: u64,
+    /// **The drum bus, the click, the effects return and the master**: each
+    /// one's name, colour, sends and switches (design 4's `Specials`). They
+    /// sat at strips 32..=35 of the strip arrays and masks above, after the
+    /// rows; they live here now, by what each is, so the rows' arrays are
+    /// rows and nothing else and no strip is found by adding to the width.
+    /// Their faders never lived in strip space and keep their own keys.
+    pub specials: crate::desk_model::Specials,
     /// **Which channels are ARMED** — record-ready and live — one bit each,
     /// beside `strip_muted` and `strip_soloed` because it is the same kind of
     /// thing: a per-strip switch, held as bits so a whole desk is one number.
@@ -2143,7 +2162,7 @@ impl Default for Settings {
             theme_name: "Default".to_owned(),
             routes: crate::routing::Routes::default(),
             insert_keys: crate::routing::KeyEdges::default(),
-            insert_bypass: BypassBays::default(),
+            bypass: std::collections::BTreeSet::new(),
             project_subdir: true,
             prefer_flats: true,
             chord_detection_enabled: true,
@@ -2302,7 +2321,7 @@ impl Default for Settings {
             // somebody chose, so they sat out every palette and every theme:
             // sixteen channels would move and those two would not. They are
             // ZERO now and the palette answers for them; see `Palette::click`.
-            strip_colors: [0; crate::recorder::STRIPS + 1],
+            strip_colors: [0; crate::recorder::CHANNELS],
             bus_effect: None,
             guitar_intervals: true,
             fx_return_gain: 1.0,
@@ -2320,12 +2339,15 @@ impl Default for Settings {
             strip_names: Vec::new(),
             // Channel 0's first bay holds the DRUMPAD, and channel 1's holds
             // the built-in DX7 that is a fresh install's sound. See
-            // `channel_kinds` above for the order.
-            strip_inserts: {
-                let mut v = vec![String::new(); crate::recorder::INSERT_SPACE];
-                v[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
-                v[crate::recorder::INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
-                v
+            // `channel_kinds` above for the order. The rows are the identity
+            // ids `track_ids` below starts from.
+            plugins: {
+                use crate::desk_id::{Node, Rack, SeatBay, TrackId};
+                let first = |row: u32| SeatBay::new(Node::Track(TrackId(row)), Rack::Chain(0), 0);
+                std::collections::BTreeMap::from([
+                    (first(0), crate::dialogs::DRUMPAD_PATH.to_owned()),
+                    (first(1), crate::dialogs::BUILTIN_PATH.to_owned()),
+                ])
             },
             input_alias: String::new(),
             input_alias_for: None,
@@ -2336,6 +2358,8 @@ impl Default for Settings {
             frozen_lanes: Vec::new(),
             strip_phase: 0,
             strip_soloed: 0,
+            // Nothing named, painted, sent, muted, soloed or flipped.
+            specials: crate::desk_model::Specials::default(),
             show_take_summary: true,
             track_path: String::new(),
             project_path: String::new(),
@@ -3103,21 +3127,18 @@ impl Settings {
                 s.project_subdir = b;
             }
         }
-        if let Some(v) = map.shift_remove("routes") {
-            s.routes = crate::routing::Routes::from_json(&v);
-        }
+        // **The routes, keys and bypassed bays in the file's own terms**:
+        // lanes, strips and seats. Bound to the rows' identities after the
+        // desk is adopted, when the rows are known (see `bind_legacy_wiring`).
+        let legacy_routes = map.shift_remove("routes").map(|v| crate::routing::LaneRoutes::from_json(&v));
         // Beside the routes it belongs with; absent in every file from
         // before sidechains existed, and absence is simply no keys.
-        if let Some(v) = map.shift_remove("insert_keys") {
-            s.insert_keys = crate::routing::KeyEdges::from_json(&v);
-        }
+        let legacy_keys = map.shift_remove("insert_keys").map(|v| crate::routing::LaneKeys::from_json(&v));
         // And the bypassed bays, beside them; absent in every file written
         // before the gesture existed, and absence is simply "everything is
         // in circuit" — which is the only safe reading, because the opposite
         // default would open old sessions with plugins silently switched off.
-        if let Some(v) = map.shift_remove("insert_bypass") {
-            s.insert_bypass = BypassBays::from_json(&v);
-        }
+        let legacy_bypass = map.shift_remove("insert_bypass").map(|v| BypassBays::from_json(&v));
         if let Some(v) = map.shift_remove("theme_name") {
             if let Some(t) = v.as_str() {
                 s.theme_name = t.to_owned();
@@ -3348,7 +3369,10 @@ impl Settings {
         // **At the FILE's length, not at today's.** See `LegacyDesk`: the
         // clamp has to happen after the migration, or a desk that shrinks
         // destroys the rows past the new end before anything can move them.
-        let mut desk = LegacyDesk::default();
+        let mut desk = LegacyDesk {
+            standing: crate::desk_legacy::dense_bays(&s.plugins, &s.desk_ids()),
+            ..LegacyDesk::default()
+        };
         for (key, migrate) in [("strip_colors", true), ("strip_colors_v2", false)] {
             let Some(Value::Array(v)) = map.shift_remove(key) else {
                 continue;
@@ -3385,7 +3409,7 @@ impl Settings {
                 // master's extra, and the pads of every drum LANE. It has
                 // been too small twice; when the seat map grows, this grows
                 // with it or the tail is silently eaten on load.
-                .take(crate::recorder::INSERT_SPACE)
+                .take(crate::desk_legacy::V32_INSERT_SPACE)
                 .collect();
         }
         // **The far seats of a v21 file**, merged onto the staged array — a
@@ -3400,7 +3424,7 @@ impl Settings {
                 let (Ok(bay), Some(path)) = (k.parse::<usize>(), v.as_str()) else {
                     continue;
                 };
-                if path.is_empty() || bay >= crate::recorder::INSERT_SPACE {
+                if path.is_empty() || bay >= crate::desk_legacy::V32_INSERT_SPACE {
                     continue;
                 }
                 if desk.inserts.len() <= bay {
@@ -3424,14 +3448,16 @@ impl Settings {
         if let Some(Value::String(v)) = map.shift_remove("input_alias") {
             s.input_alias = v;
         }
+        // The three strip masks, at the file's own strip space: staged with
+        // the arrays (`LegacyDesk`), split into rows and specials at the fold.
         if let Some(n) = map.shift_remove("strip_phase").and_then(|v| v.as_u64()) {
-            s.strip_phase = n as u64;
+            desk.phase = n;
         }
         if let Some(n) = map.shift_remove("strip_muted").and_then(|v| v.as_u64()) {
-            s.strip_muted = n as u64;
+            desk.muted = n;
         }
         if let Some(n) = map.shift_remove("strip_soloed").and_then(|v| v.as_u64()) {
-            s.strip_soloed = n as u64;
+            desk.soloed = n;
         }
         if let Some(Value::Array(v)) = map.shift_remove("record_extra_inputs") {
             s.record_extra_inputs = v
@@ -3608,7 +3634,7 @@ impl Settings {
                 // A file from before the badges: DERIVE them rather than
                 // defaulting a drum onto whatever the user made of track 8.
                 // Deferred to after `adopt_desk` — at this point
-                // `s.strip_inserts` is still the DEFAULT desk (the file's
+                // `s.plugins` is still the DEFAULT desk (the file's
                 // is staged in `LegacyDesk`), and deriving from it painted
                 // the default's drum badge onto whatever the file keeps on
                 // channel 2 while the file's real drumpad went unbadged.
@@ -4009,6 +4035,7 @@ impl Settings {
         // the file had; from here on the desk is this build's shape. See
         // `LegacyDesk`.
         s.adopt_desk(desk);
+        s.bind_legacy_wiring(legacy_routes, legacy_keys, legacy_bypass);
         if let Some(raw) = desk2 {
             s.adopt_format2_desk(raw);
             // The rows said their badges; deriving would paint over them.
@@ -4018,11 +4045,7 @@ impl Settings {
             // Now the desk is the FILE's, migrations included — the badge
             // lands on the channel that really holds the drumpad.
             for i in 0..crate::recorder::CHANNELS {
-                s.channel_icons[i] = u8::from(
-                    s.strip_inserts
-                        .get(i * crate::recorder::INSERTS)
-                        .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH),
-                );
+                s.channel_icons[i] = u8::from(s.row_plugin(i, 0) == Some(crate::dialogs::DRUMPAD_PATH));
             }
         }
         // **After the migrations**, which are the last writers of
@@ -4069,9 +4092,11 @@ impl Settings {
         // era and was the one strip mask this lift left where the file had
         // it, so a phase-inverted drum bus came back as an inverted channel
         // 16 while the real drum bus played the right way up.
-        self.strip_muted = lift::lift_strip_mask(era, self.strip_muted, true);
-        self.strip_soloed = lift::lift_strip_mask(era, self.strip_soloed, true);
-        self.strip_phase = lift::lift_strip_mask(era, self.strip_phase, true);
+        let masks = (
+            lift::lift_strip_mask(era, desk.muted, true),
+            lift::lift_strip_mask(era, desk.soloed, true),
+            lift::lift_strip_mask(era, desk.phase, true),
+        );
         // The host renames the seat-numbered global sidecars once, by the
         // in-place shuffles that take this era to V32 (`shelf_shuffles`
         // names the same set). **The eight-channel era needs v20 as well
@@ -4115,42 +4140,304 @@ impl Settings {
             inserts.resize(lift::V32_INSERT_SPACE, String::new());
             move_legacy_pad_racks(&mut inserts);
         }
-        self.fold_v32_desk(colors, names, sends, inserts);
+        self.fold_v32_desk(colors, names, sends, masks, inserts, desk.standing);
     }
 
     /// **The one place the settings desk meets this build's widths.** A V32
     /// desk (`adopt_desk`'s output) copied into the live arrays from the
     /// front; a live desk of another width is a later wave's business, and
     /// every lift before this line is literal so that it can be.
+    ///
+    /// **And the one place a settings file's strip space is split** (W5):
+    /// the rows' entries go to the row arrays and the four specials' to
+    /// `specials`, through the frozen strip map (`desk_legacy`). An array
+    /// too short to reach a row or a special leaves it as it stood, which
+    /// is what a short array always meant here; the masks reach everybody.
     fn fold_v32_desk(
         &mut self,
         colors: Vec<i64>,
         names: Vec<String>,
         sends: Vec<f64>,
+        masks: (u64, u64, u64),
         inserts: Vec<String>,
+        standing: Vec<String>,
     ) {
-        for (dst, n) in self.strip_colors.iter_mut().zip(colors) {
-            *dst = n;
+        let (muted, soloed, phase) = masks;
+        self.set_strip_space(&StripSpace { names, colors, sends, muted, soloed, phase });
+        // **The bays, by identity, once**: the file's lifted table when it
+        // had one, else the desk as it stood (the default, as the
+        // migrations left it), each bay's row bound to its track by the
+        // identity rule every legacy desk obeys (legacy row r is
+        // `TrackId(r)`).
+        let table = if inserts.is_empty() { standing } else { inserts };
+        self.plugins = crate::desk_legacy::bind_bays(&table, &self.desk_ids());
+    }
+
+    /// **A legacy file's routes, keys and bypassed bays, by identity**: the
+    /// lanes, strips and seats the file wrote, bound to the rows the desk
+    /// adopted (`desk_ids`, the identity rule on every legacy desk). A key
+    /// a file does not carry leaves the desk's own standing, which is what
+    /// "absent" has always meant here. An entry naming no row is one the
+    /// publish never played (`Routes::prune`) and is not carried.
+    fn bind_legacy_wiring(
+        &mut self,
+        routes: Option<crate::routing::LaneRoutes>,
+        keys: Option<crate::routing::LaneKeys>,
+        bypass: Option<BypassBays>,
+    ) {
+        let ids = self.desk_ids();
+        if let Some(r) = routes {
+            self.routes = crate::routing::Routes::from_lanes(&r, &ids);
         }
-        for (dst, n) in self.strip_sends.iter_mut().zip(sends) {
-            *dst = n;
+        if let Some(k) = keys {
+            self.insert_keys = crate::routing::KeyEdges::from_lanes(&k, &ids);
         }
-        if !inserts.is_empty() {
-            self.strip_inserts = inserts;
-            self.strip_inserts.truncate(crate::recorder::INSERT_SPACE);
-            // **Back to full length.** The writer trims trailing empties so
-            // the file does not carry thousands of `""`, which means what
-            // comes back is SHORTER than what went out — and a round trip
-            // that changes the struct is a round trip that will eventually
-            // change something that matters. Padding here makes the file
-            // small and the value identical.
-            self.strip_inserts
-                .resize(crate::recorder::INSERT_SPACE, String::new());
+        if let Some(b) = bypass {
+            self.bypass = b.0.iter().filter_map(|&(seat, bay)| crate::desk_legacy::bay_at(&ids, seat, bay)).collect();
         }
-        if !names.is_empty() {
-            self.strip_names = names;
-            self.strip_names.truncate(crate::recorder::STRIPS + 1);
+    }
+
+    /// **Bay `bay` of row `row`'s own rack**, by identity: the track on the
+    /// row, its first chain. Where a track's instrument sits (bay 0), which
+    /// is what most row questions ask.
+    pub fn row_bay(&self, row: usize, bay: usize) -> Option<crate::desk_id::SeatBay> {
+        use crate::desk_id::{Node, Rack, SeatBay};
+        let id = *self.track_ids.get(row)?;
+        Some(SeatBay::new(Node::Track(id), Rack::Chain(0), u8::try_from(bay).ok()?))
+    }
+
+    /// The plugin in [`Self::row_bay`], if any.
+    pub fn row_plugin(&self, row: usize, bay: usize) -> Option<&str> {
+        self.plugins.get(&self.row_bay(row, bay)?).map(String::as_str).filter(|p| !p.is_empty())
+    }
+
+    /// **The bays as the frozen dense table** (`strip_inserts` as the legacy
+    /// files wrote it), under the rows' ids: what a test pins legacy seat
+    /// numbers against. Read-only; the desk is the map.
+    #[cfg(test)]
+    pub(crate) fn legacy_inserts(&self) -> Vec<String> {
+        crate::desk_legacy::dense_bays(&self.plugins, &self.desk_ids())
+    }
+
+    /// **Seat `path` at the frozen map's flat bay `flat`** under the rows'
+    /// ids, or empty it for an empty path: a test's way to build a desk by
+    /// legacy seat numbers.
+    #[cfg(test)]
+    pub(crate) fn set_legacy_insert(&mut self, flat: usize, path: &str) {
+        let Some(sb) = crate::desk_legacy::bay_of_flat(&self.desk_ids(), flat) else {
+            return;
+        };
+        if path.is_empty() {
+            self.plugins.remove(&sb);
+        } else {
+            self.plugins.insert(sb, path.to_owned());
         }
+    }
+
+    /// **Take `path` out of every bay it sits in**, with each bay's bypass:
+    /// the host's road for a plugin that killed the last launch, which must
+    /// not be loaded again from any bay. Answers how many bays it left.
+    pub fn pull_plugin(&mut self, path: &str) -> usize {
+        let gone: Vec<crate::desk_id::SeatBay> =
+            self.plugins.iter().filter(|(_, p)| p.as_str() == path).map(|(sb, _)| *sb).collect();
+        for sb in &gone {
+            self.plugins.remove(sb);
+            self.bypass.remove(sb);
+        }
+        gone.len()
+    }
+
+    // ── A strip's settings, by what the strip is (W5) ───────────────────
+    //
+    // The doors every reader and writer of a strip's name, colour, send and
+    // switches goes through. A track's are its ROW's entries in the row
+    // arrays (`strip_names`, `strip_colors`, `strip_sends` and the three
+    // masks), and a special's are in `specials`, keyed by
+    // `StripRef::special`: the specials have left strip space, so no array
+    // keeps a slot for one past the rows, and no caller works out where a
+    // strip's settings sit. A row past the desk is no strip: it reads as
+    // nothing and is not written.
+
+    /// What the user called a strip, or empty for its own name.
+    pub fn strip_name(&self, s: crate::recorder::StripRef) -> &str {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.specials.get(n).map_or("", |sp| sp.name.as_str()),
+            (None, Some(r)) => self.strip_names.get(r).map_or("", String::as_str),
+            (None, None) => "",
+        }
+    }
+
+    /// Name a strip; empty gives it its own name back. A row's name grows
+    /// the names array to the desk's width, the length a document read back
+    /// holds it at.
+    pub fn set_strip_name(&mut self, s: crate::recorder::StripRef, name: String) {
+        match (s.special(), s.row()) {
+            (Some(n), _) => {
+                if let Some(sp) = self.specials.get_mut(n) {
+                    sp.name = name;
+                }
+            }
+            (None, Some(r)) if r < crate::recorder::CHANNELS => {
+                if self.strip_names.len() <= r {
+                    self.strip_names.resize(crate::recorder::CHANNELS, String::new());
+                }
+                self.strip_names[r] = name;
+            }
+            _ => {}
+        }
+    }
+
+    /// **The colour a strip is painted by hand**, as an index into
+    /// `mixer_panel::STRIP_COLORS`; zero is unpainted, which the palette
+    /// answers for (`TangentApp::strip_color`).
+    pub fn strip_paint(&self, s: crate::recorder::StripRef) -> i64 {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.specials.get(n).map_or(0, |sp| sp.color),
+            (None, Some(r)) => self.strip_colors.get(r).copied().unwrap_or(0),
+            (None, None) => 0,
+        }
+    }
+
+    /// Paint a strip by hand, or give it back to the palette with zero.
+    pub fn set_strip_paint(&mut self, s: crate::recorder::StripRef, color: i64) {
+        match (s.special(), s.row()) {
+            (Some(n), _) => {
+                if let Some(sp) = self.specials.get_mut(n) {
+                    sp.color = color;
+                }
+            }
+            (None, Some(r)) => {
+                if let Some(c) = self.strip_colors.get_mut(r) {
+                    *c = color;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// **How much of a strip goes to the effects return**, 0..=1: the send
+    /// knob. A row's is its entry in `strip_sends`; a special's is the
+    /// effects entry of its own sends (`desk_model::fx_send_level`), the
+    /// shape a bus's sends will join.
+    pub fn strip_send(&self, s: crate::recorder::StripRef) -> f64 {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.specials.get(n).map_or(0.0, |sp| crate::desk_model::fx_send_level(&sp.sends)),
+            (None, Some(r)) => self.strip_sends.get(r).copied().unwrap_or(0.0),
+            (None, None) => 0.0,
+        }
+    }
+
+    /// Turn a strip's send knob.
+    pub fn set_strip_send(&mut self, s: crate::recorder::StripRef, level: f64) {
+        match (s.special(), s.row()) {
+            (Some(n), _) => {
+                if let Some(sp) = self.specials.get_mut(n) {
+                    crate::desk_model::set_fx_send_level(&mut sp.sends, level);
+                }
+            }
+            (None, Some(r)) => {
+                if let Some(v) = self.strip_sends.get_mut(r) {
+                    *v = level;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// **Whether one of a strip's signal switches is on**, as the strip
+    /// itself holds it. A folder's mute or solo reaching its children is
+    /// the app's to fold in (`TangentApp::strip_heard_muted`).
+    pub fn strip_switch(&self, s: crate::recorder::StripRef, w: StripSwitch) -> bool {
+        match (s.special(), s.row()) {
+            (Some(n), _) => self.specials.get(n).is_some_and(|sp| match w {
+                StripSwitch::Mute => sp.mute,
+                StripSwitch::Solo => sp.solo,
+                StripSwitch::Phase => sp.phase,
+            }),
+            (None, Some(r)) => r < 64 && self.switch_mask(w) >> r & 1 == 1,
+            (None, None) => false,
+        }
+    }
+
+    /// Throw one of a strip's signal switches.
+    pub fn set_strip_switch(&mut self, s: crate::recorder::StripRef, w: StripSwitch, on: bool) {
+        match (s.special(), s.row()) {
+            (Some(n), _) => {
+                if let Some(sp) = self.specials.get_mut(n) {
+                    *match w {
+                        StripSwitch::Mute => &mut sp.mute,
+                        StripSwitch::Solo => &mut sp.solo,
+                        StripSwitch::Phase => &mut sp.phase,
+                    } = on;
+                }
+            }
+            (None, Some(r)) if r < 64 => {
+                let mask = match w {
+                    StripSwitch::Mute => &mut self.strip_muted,
+                    StripSwitch::Solo => &mut self.strip_soloed,
+                    StripSwitch::Phase => &mut self.strip_phase,
+                };
+                if on {
+                    *mask |= 1 << r;
+                } else {
+                    *mask &= !(1 << r);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The rows' mask of one switch, bit r for row r.
+    fn switch_mask(&self, w: StripSwitch) -> u64 {
+        match w {
+            StripSwitch::Mute => self.strip_muted,
+            StripSwitch::Solo => self.strip_soloed,
+            StripSwitch::Phase => self.strip_phase,
+        }
+    }
+
+    /// **The desk's strip facts in the legacy STRIP SPACE**: the rows'
+    /// arrays and masks with the specials joined at their frozen strips
+    /// (`desk_legacy::write_specials`, Appendix A). What the legacy writer
+    /// spells and the dense desk (`V22Desk`) holds; nothing live reads it.
+    pub(crate) fn strip_space(&self) -> StripSpace {
+        let mut v = StripSpace {
+            names: self.strip_names.clone(),
+            colors: self.strip_colors.to_vec(),
+            sends: self.strip_sends.to_vec(),
+            muted: crate::desk_legacy::strip_mask_of(self.strip_muted, |_| false),
+            soloed: crate::desk_legacy::strip_mask_of(self.strip_soloed, |_| false),
+            phase: crate::desk_legacy::strip_mask_of(self.strip_phase, |_| false),
+        };
+        crate::desk_legacy::write_specials(
+            &self.specials,
+            &mut v.names,
+            &mut v.colors,
+            &mut v.sends,
+            (&mut v.muted, &mut v.soloed, &mut v.phase),
+        );
+        v
+    }
+
+    /// [`Self::strip_space`]'s inverse: legacy strip-space arrays and masks
+    /// split onto the rows and the specials. A row or a special an array
+    /// does not reach keeps what it had.
+    pub(crate) fn set_strip_space(&mut self, v: &StripSpace) {
+        use crate::desk_legacy::{read_specials, strip_mask_rows, strip_rows};
+        let names = strip_rows(&v.names);
+        for (r, n) in names.into_iter().enumerate() {
+            self.set_strip_name(crate::recorder::StripRef::Row(r), n);
+        }
+        for (dst, c) in self.strip_colors.iter_mut().zip(strip_rows(&v.colors)) {
+            *dst = c;
+        }
+        for (dst, x) in self.strip_sends.iter_mut().zip(strip_rows(&v.sends)) {
+            *dst = x;
+        }
+        self.strip_muted = strip_mask_rows(v.muted);
+        self.strip_soloed = strip_mask_rows(v.soloed);
+        self.strip_phase = strip_mask_rows(v.phase);
+        read_specials(&mut self.specials, &v.names, &v.colors, &v.sends, (v.muted, v.soloed, Some(v.phase)));
     }
 
     /// **The desk's row ids, sane**: `track_ids` when it is one distinct id
@@ -4209,7 +4496,7 @@ impl Settings {
         // rows the file never named, given ids nothing has held.
         let mut next = read.model.next_id;
         crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, crate::recorder::CHANNELS);
-        dense.into_settings(self);
+        dense.into_settings(self, &ids);
         self.track_ids = ids;
         self.next_track_id = next;
         self.desk_notice = dropped_notice("The desk in your settings", &read.dropped);
@@ -4327,7 +4614,7 @@ impl Settings {
             // **The desk grew four input columns where there had been one**,
             // and everything indexed by a channel moved with it. See
             // `desk_channel_moved`.
-            migrate_desk_channels(self, desk);
+            migrate_desk_channels(desk);
         }
         if was < 12 {
             migrate_split_desk(self, desk);
@@ -4358,15 +4645,15 @@ impl Settings {
             // eats itself; the vacated seats (new pads 0..15) are cleared.
             let per = 3usize;
             let new_len = (12 + 128) * per;
-            if self.strip_inserts.len() < new_len {
-                self.strip_inserts.resize(new_len, String::new());
+            if desk.standing.len() < new_len {
+                desk.standing.resize(new_len, String::new());
             }
             for pad in (0..16usize).rev() {
                 for bay in 0..per {
                     let from = (12 + pad) * per + bay;
                     let to = (12 + 36 + pad) * per + bay;
-                    let v = std::mem::take(&mut self.strip_inserts[from]);
-                    self.strip_inserts[to] = v;
+                    let v = std::mem::take(&mut desk.standing[from]);
+                    desk.standing[to] = v;
                 }
             }
             self.pad_state_shift_v18 = true;
@@ -4377,14 +4664,14 @@ impl Settings {
             // exactly what they built.
             //
             // On `desk` when the file staged one — the v11 rule: `adopt_desk`
-            // replaces `self.strip_inserts` WHOLESALE with the staging, so a
+            // replaces the standing bays WHOLESALE with the staging, so a
             // seat written on `self` here was silently thrown away, and every
             // pre-v17 upgrader got a MIDI-all channel 8 with three empty
             // bays and nothing to play. Channel 7's seats keep their index
             // through adoption (the pad rescale and the v19 widening both
             // move seats ABOVE them), so the staged write lands.
             let (seats, bay0): (&mut Vec<String>, usize) = if desk.inserts.is_empty() {
-                (&mut self.strip_inserts, 7 * V11_INSERTS)
+                (&mut desk.standing, 7 * V11_INSERTS)
             } else {
                 (&mut desk.inserts, 7 * V11_INSERTS)
             };
@@ -4762,11 +5049,15 @@ impl Settings {
             "guitar_intervals".into(),
             Value::Bool(self.guitar_intervals),
         );
+        // **The desk in strip space**, the shape these keys always had: the
+        // rows' arrays with the specials joined at their frozen strips
+        // (`strip_space`).
+        let strips = self.strip_space();
         map.insert(
             "strip_sends".into(),
-            Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
+            Value::Array(strips.sends.iter().map(|v| Value::from(*v)).collect()),
         );
-        map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        map.insert("strip_muted".into(), Value::from(strips.muted));
         // **The head whole, the far seats sparse.** The insert space is one
         // seat per strip, per pad, per folder and per amp pedal — 13,167 of
         // them — and all but a handful are empty in every real session. The
@@ -4792,20 +5083,21 @@ impl Settings {
         // Nothing reads this by length: `insert()` uses `get` and treats a
         // missing seat as empty, and `set_insert` resizes when it needs a
         // seat past the end.
+        let ids = self.desk_ids();
+        let dense = crate::desk_legacy::dense_bays(&self.plugins, &ids);
         map.insert(
             "strip_inserts".into(),
             Value::Array(
                 (0..crate::arrangement::HEAD_BAYS)
-                    .map(|i| {
-                        Value::String(self.strip_inserts.get(i).cloned().unwrap_or_default())
-                    })
+                    .map(|i| Value::String(dense.get(i).cloned().unwrap_or_default()))
                     .collect(),
             ),
         );
         map.insert(
             "strip_names".into(),
             Value::Array(
-                self.strip_names
+                strips
+                    .names
                     .iter()
                     .map(|n| Value::String(n.clone()))
                     .collect(),
@@ -4817,9 +5109,9 @@ impl Settings {
         }
         map.insert(
             "strip_colors_v2".into(),
-            Value::Array(self.strip_colors.iter().map(|c| Value::from(*c)).collect()),
+            Value::Array(strips.colors.iter().map(|c| Value::from(*c)).collect()),
         );
-        map.insert("strip_soloed".into(), Value::from(self.strip_soloed));
+        map.insert("strip_soloed".into(), Value::from(strips.soloed));
         map.insert(
             "record_extra_inputs".into(),
             Value::Array(
@@ -5055,7 +5347,7 @@ impl Settings {
             Value::Number(SETTINGS_VERSION.into()),
         );
         map.insert("theme_name".into(), Value::String(self.theme_name.clone()));
-        map.insert("routes".into(), self.routes.to_json());
+        map.insert("routes".into(), self.routes.to_lanes(&ids).to_json());
         map.insert("project_subdir".into(), Value::Bool(self.project_subdir));
         for (k, v) in [
             ("key_separator_color", self.key_separator_color),
@@ -5232,7 +5524,7 @@ impl Settings {
             Value::String(self.velocity_quiet_color.to_hex()),
         );
         map.insert("metronome_div".into(), Value::from(self.metronome_div));
-        map.insert("strip_phase".into(), Value::from(self.strip_phase));
+        map.insert("strip_phase".into(), Value::from(strips.phase));
         map.insert("click_sample".into(), Value::String(self.click_sample.clone()));
         // **New keys go HERE, at the end, and never in the middle.** The map
         // preserves insertion order and that order is the file's order; a key
@@ -5295,8 +5587,9 @@ impl Settings {
         // The sidechain key edges, at the END like every additive key, and
         // only when somebody has made one — so a desk that never keyed
         // anything keeps its byte-for-byte shape.
-        if !self.insert_keys.0.is_empty() {
-            map.insert("insert_keys".into(), self.insert_keys.to_json());
+        let keys = self.insert_keys.to_lanes(&ids);
+        if !keys.0.is_empty() {
+            map.insert("insert_keys".into(), keys.to_json());
         }
         // The IR folder override, at the END like every additive key, and
         // only when somebody chose one — the `preset_dir` rule exactly.
@@ -5313,8 +5606,11 @@ impl Settings {
         // when somebody has taken something out of circuit — so a desk that
         // has never used the gesture keeps its byte-for-byte shape, the same
         // bargain `insert_keys` and the folder overrides above make.
-        if !self.insert_bypass.0.is_empty() {
-            map.insert("insert_bypass".into(), self.insert_bypass.to_json());
+        let bypass = BypassBays(
+            self.bypass.iter().filter_map(|sb| crate::desk_legacy::seat_of(&ids, *sb)).collect(),
+        );
+        if !bypass.0.is_empty() {
+            map.insert("insert_bypass".into(), bypass.to_json());
         }
         // Which lane the MIDI editor's bottom strip holds, at the END like
         // every additive key, and only when it is the pedal — velocity is
@@ -5334,8 +5630,7 @@ impl Settings {
         }
         // The far seats — see `strip_inserts` above. At the END like every
         // additive key, only when one is occupied, in ascending order.
-        let tail: Map<String, Value> = self
-            .strip_inserts
+        let tail: Map<String, Value> = dense
             .iter()
             .enumerate()
             .skip(crate::arrangement::HEAD_BAYS)
@@ -5624,6 +5919,10 @@ impl Settings {
         self.me_dark = fresh.me_dark;
         self.fretboard_wood = fresh.fretboard_wood.clone();
         self.strip_colors = fresh.strip_colors;
+        // The specials' paint too: a colour, and the desk's, like the rows'.
+        for sr in crate::recorder::StripRef::SPECIALS {
+            self.set_strip_paint(sr, fresh.strip_paint(sr));
+        }
         self.custom_font_path = fresh.custom_font_path.clone();
         self.font_choice = fresh.font_choice.clone();
         self.varispeed_color = fresh.varispeed_color;
@@ -5734,10 +6033,18 @@ impl Settings {
         self.channel_icons = fresh.channel_icons;
         self.strip_names = fresh.strip_names.clone();
         self.strip_colors = fresh.strip_colors;
-        self.strip_inserts = fresh.strip_inserts.clone();
         self.strip_sends = fresh.strip_sends;
         self.strip_muted = fresh.strip_muted;
         self.strip_soloed = fresh.strip_soloed;
+        // And the specials' names, paint, sends, mutes and solos, which sat
+        // in the five lines above while they were strip space. Not their
+        // polarity: the rows' `strip_phase` is no part of this scope, and it
+        // held the specials' bits too.
+        let phase = crate::recorder::StripRef::SPECIALS.map(|sr| self.strip_switch(sr, StripSwitch::Phase));
+        self.specials = fresh.specials.clone();
+        for (sr, on) in crate::recorder::StripRef::SPECIALS.into_iter().zip(phase) {
+            self.set_strip_switch(sr, StripSwitch::Phase, on);
+        }
         // **The emptied rows are new tracks, so they wear new ids** (design
         // 3: "a cleared slot that is reused gets a fresh id"). They took the
         // fresh desk's identity ids 0..31 here, while the counter kept
@@ -5750,6 +6057,13 @@ impl Settings {
         let mut next = self.next_track_id.max(fresh.next_track_id);
         let mut ids = Vec::with_capacity(fresh.track_ids.len());
         crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, fresh.track_ids.len());
+        // **The fresh desk's bays and wiring, on those new ids**: each is
+        // keyed by the fresh desk's own row ids, and a row's things stay on
+        // the row (`rekey_rows`).
+        // The key edges among them: desk topology like the routes, and a
+        // wiped desk keeping them would key tracks that no longer exist.
+        (self.plugins, self.bypass, self.routes, self.insert_keys) =
+            rekey_rows(&fresh.track_ids, &ids).tables(fresh);
         self.track_ids = ids;
         self.next_track_id = next;
         // **Which channels EXIST**, and its absence here is why "Reset
@@ -5767,14 +6081,10 @@ impl Settings {
         self.master_mono = fresh.master_mono;
         self.input_alias = fresh.input_alias.clone();
         self.input_alias_for = fresh.input_alias_for.clone();
-        self.routes = fresh.routes.clone();
-        // The key edges are desk topology like the routes, and a wiped desk
-        // keeping them would key tracks that no longer exist.
-        self.insert_keys = fresh.insert_keys.clone();
-        // And the bypassed bays, for the plainer reason: the reset empties
-        // every rack, so a flag kept here would be waiting to switch off the
-        // first plugin somebody loads into the desk they have just wiped.
-        self.insert_bypass = fresh.insert_bypass.clone();
+        // The routes, the key edges and the bypassed bays came with the
+        // fresh bays above, for the plainer reason the bypass gives: the
+        // reset empties every rack, so a flag kept from the wiped desk would
+        // be waiting to switch off the first plugin somebody loads.
         self.master_gain = fresh.master_gain;
         self.varispeed = fresh.varispeed;
         self.lufs_window = fresh.lufs_window;
@@ -6854,14 +7164,13 @@ mod tests {
     #[test]
     fn a_renamed_channel_and_a_renamed_interface_survive_a_save() {
         let mut s = Settings::default();
-        s.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
-        s.strip_names[0] = "Rhodes".to_owned();
-        s.strip_names[crate::recorder::STRIPS] = "OUT".to_owned();
+        s.set_strip_name(StripRef::Row(0), "Rhodes".to_owned());
+        s.set_strip_name(StripRef::Master, "OUT".to_owned());
         s.input_alias = "x".to_owned();
         s.input_alias_for = Some("Scarlett 18i20 USB".to_owned());
         let back = Settings::from_json(&s.to_json());
         assert_eq!(back.strip_names[0], "Rhodes");
-        assert_eq!(back.strip_names[crate::recorder::STRIPS], "OUT");
+        assert_eq!(back.strip_name(StripRef::Master), "OUT");
         assert_eq!(back.input_alias, "x", "the interface's short name was lost");
         assert_eq!(
             back.input_alias_for.as_deref(),
@@ -6913,7 +7222,7 @@ mod tests {
         // The one input there was is OCCUPIED by definition, so the v12
         // occupancy pass gives it the first channel.
         assert_eq!(
-            s.strip_colors[Strip::Channel(0).index()] as usize,
+            s.strip_colors[0] as usize,
             crate::mixer_panel::PALETTE_V1_TO_V2[4],
             "the one input there was is not the first channel"
         );
@@ -6927,30 +7236,28 @@ mod tests {
         // was holding that red because it SHIPPED holding it, never because
         // anybody chose it, so it rejoins the palette on load.
         assert_eq!(
-            s.strip_colors[crate::recorder::STRIPS], 0,
+            s.strip_paint(StripRef::Master), 0,
             "the master did not rejoin the palette"
         );
         assert!(
-            (s.strip_sends[Strip::Fx.index()] - 0.5).abs() < 1.0e-9,
+            (s.strip_send(StripRef::Fx) - 0.5).abs() < 1.0e-9,
             "the bus's send moved to {}",
             Strip::Fx.index()
         );
-        assert_eq!(
-            s.strip_muted,
-            1 << Strip::Click.index(),
+        assert_eq!(on(&s, StripSwitch::Mute), vec![StripRef::Click],
             "the muted click now mutes something else"
         );
         // The channels the empty old slots became come up unmuted and
         // uncoloured, because nobody ever said anything about them.
         for ch in 2..crate::recorder::CHANNELS {
-            assert_eq!(s.strip_colors[Strip::Channel(ch).index()], 0, "channel {ch}");
+            assert_eq!(s.strip_colors[ch], 0, "channel {ch}");
             assert_eq!(s.strip_muted & (1 << Strip::Channel(ch).index()), 0);
         }
         // And a desk with no instrument anywhere gets the DX7 seeded into its
         // first unused channel, so the upgrade does not go silent.
         assert_eq!(s.channel_kinds[1], 1, "no channel took the built-in");
         assert_eq!(
-            s.strip_inserts[Strip::Channel(1).index() * crate::recorder::INSERTS].as_str(),
+            s.legacy_inserts()[Strip::Channel(1).index() * crate::recorder::INSERTS].as_str(),
             crate::dialogs::BUILTIN_PATH,
             "the seeded channel has no instrument in bay 1"
         );
@@ -6995,12 +7302,12 @@ mod tests {
         // the click/master normalisation in `adopt_desk`. The channel check
         // above is what holds the retirement shuffle honest.
         assert_eq!(
-            s.strip_colors[Strip::Click.index()],
+            s.strip_paint(StripRef::Click),
             0,
             "the click did not rejoin the palette"
         );
         assert_eq!(
-            s.strip_colors[crate::recorder::STRIPS],
+            s.strip_paint(StripRef::Master),
             0,
             "the master did not rejoin the palette"
         );
@@ -7010,20 +7317,19 @@ mod tests {
             !s.strip_sends.iter().any(|v| (*v - 0.3).abs() < 1e-9),
             "BACKING's send leaked"
         );
-        assert_eq!(s.strip_names[Strip::Click.index()], "TICK");
-        assert_eq!(s.strip_names[crate::recorder::STRIPS], "OUT");
-        assert_eq!(
-            s.strip_muted,
-            1 << Strip::Click.index(),
+        assert_eq!(s.strip_name(StripRef::Click), "TICK");
+        assert_eq!(s.strip_name(StripRef::Master), "OUT");
+        assert_eq!(on(&s, StripSwitch::Mute), vec![StripRef::Click],
             "the muted click drifted"
         );
         assert_eq!(s.strip_soloed, 1 << 3, "a solo below the track moved");
-        let bay = |strip: usize| s.strip_inserts[strip * crate::recorder::INSERTS].as_str();
+        let dense = s.legacy_inserts();
+        let bay = |strip: usize| dense[strip * crate::recorder::INSERTS].as_str();
         assert_eq!(bay(0), crate::dialogs::BUILTIN_PATH);
         assert_eq!(bay(Strip::Click.index()), "/x/Click-EQ.vst3");
-        assert_eq!(bay(crate::recorder::STRIPS), "/x/Pro-L 2.vst3");
+        assert_eq!(bay(crate::desk_legacy::V32_STRIPS), "/x/Pro-L 2.vst3");
         assert!(
-            !s.strip_inserts.iter().any(|p| p == "/x/Pro-G.vst3"),
+            !s.legacy_inserts().iter().any(|p| p == "/x/Pro-G.vst3"),
             "BACKING's gate leaked into another bay"
         );
         // The one-launch flag that asks the host to shuffle the insert-state
@@ -7043,7 +7349,8 @@ mod tests {
     /// onto the new empty channels.
     #[test]
     fn an_eight_channel_desk_grows_to_sixteen() {
-        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS, STRIPS};
+        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS};
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
         assert!(CHANNELS >= 16, "this test is about the 8 -> 16 widening");
         // v18 8-channel shape: STRIPS = 11 (0..7 channels, 8 drums, 9 click,
         // 10 fx), master at 11. Pad insert base 12.
@@ -7080,23 +7387,24 @@ mod tests {
         assert_eq!(s.strip_colors[2], 14, "a kept channel's paint moved");
         assert_eq!(s.strip_soloed, 1 << 2, "a solo below the widening moved");
         // The specials rode up to the 16-channel positions.
-        assert_eq!(s.strip_colors[Strip::Drums.index()], 9, "the drum bus");
-        assert_eq!(s.strip_colors[Strip::Fx.index()], 3, "the fx return");
+        assert_eq!(s.strip_paint(StripRef::Drums), 9, "the drum bus");
+        assert_eq!(s.strip_paint(StripRef::Fx), 3, "the fx return");
         // The click and the master ride up to their new positions like every
         // other strip, then rejoin the palette because the colours they were
         // carrying were defaults rather than choices.
-        assert_eq!(s.strip_colors[Strip::Click.index()], 0, "the click");
-        assert_eq!(s.strip_colors[STRIPS], 0, "the master");
-        assert_eq!(s.strip_muted, 1 << Strip::Click.index(), "the muted click drifted");
-        assert!((s.strip_sends[Strip::Fx.index()] - 0.9).abs() < 1e-9, "the fx send");
-        assert_eq!(s.strip_names[Strip::Drums.index()], "DRUMS");
-        assert_eq!(s.strip_names[STRIPS], "OUT");
+        assert_eq!(s.strip_paint(StripRef::Click), 0, "the click");
+        assert_eq!(s.strip_paint(StripRef::Master), 0, "the master");
+        assert_eq!(on(&s, StripSwitch::Mute), vec![StripRef::Click], "the muted click drifted");
+        assert!((s.strip_send(StripRef::Fx) - 0.9).abs() < 1e-9, "the fx send");
+        assert_eq!(s.strip_name(StripRef::Drums), "DRUMS");
+        assert_eq!(s.strip_name(StripRef::Master), "OUT");
         // The new channels 8..15 are empty ground.
         for ch in 8..CHANNELS {
             assert_eq!(s.strip_colors[ch], 0, "new channel {ch} came up painted");
         }
         // The bays followed their strips, pad 40 included.
-        let bay = |strip: usize| s.strip_inserts[strip * INSERTS].as_str();
+        let dense = s.legacy_inserts();
+        let bay = |strip: usize| dense[strip * INSERTS].as_str();
         assert_eq!(bay(Strip::Drums.index()), "/x/Bus-Comp.vst3");
         assert_eq!(bay(STRIPS), "/x/Pro-L 2.vst3");
         assert_eq!(bay(pad_insert_index(40)), "/x/Pad-Verb.vst3", "pad 40's FX moved");
@@ -7113,7 +7421,8 @@ mod tests {
     /// eight-to-sixteen test above extracts from its own era.
     #[test]
     fn a_sixteen_channel_desk_grows_to_twenty_four() {
-        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS, STRIPS};
+        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS};
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
         assert!(CHANNELS >= 24, "this test is about the 16 -> 24 widening");
         // 16-era shape: STRIPS = 19 (0..15 channels, 16 drums, 17 click,
         // 18 fx), master at 19, pad-insert base 20.
@@ -7145,16 +7454,17 @@ mod tests {
 
         assert_eq!(s.strip_colors[5], 14, "a kept channel's paint moved");
         assert_eq!(s.strip_soloed, 1 << 5, "a solo below the widening moved");
-        assert_eq!(s.strip_colors[Strip::Drums.index()], 9, "the drum bus");
-        assert_eq!(s.strip_colors[Strip::Fx.index()], 3, "the fx return");
-        assert_eq!(s.strip_muted, 1 << Strip::Click.index(), "the muted click drifted");
-        assert!((s.strip_sends[Strip::Fx.index()] - 0.9).abs() < 1e-9, "the fx send");
-        assert_eq!(s.strip_names[Strip::Drums.index()], "DRUMS");
-        assert_eq!(s.strip_names[STRIPS], "OUT");
+        assert_eq!(s.strip_paint(StripRef::Drums), 9, "the drum bus");
+        assert_eq!(s.strip_paint(StripRef::Fx), 3, "the fx return");
+        assert_eq!(on(&s, StripSwitch::Mute), vec![StripRef::Click], "the muted click drifted");
+        assert!((s.strip_send(StripRef::Fx) - 0.9).abs() < 1e-9, "the fx send");
+        assert_eq!(s.strip_name(StripRef::Drums), "DRUMS");
+        assert_eq!(s.strip_name(StripRef::Master), "OUT");
         for ch in 16..CHANNELS {
             assert_eq!(s.strip_colors[ch], 0, "new channel {ch} came up painted");
         }
-        let bay = |strip: usize| s.strip_inserts[strip * INSERTS].as_str();
+        let dense = s.legacy_inserts();
+        let bay = |strip: usize| dense[strip * INSERTS].as_str();
         assert_eq!(bay(Strip::Drums.index()), "/x/Bus-Comp.vst3");
         assert_eq!(bay(STRIPS), "/x/Pro-L 2.vst3");
         assert_eq!(bay(pad_insert_index(40)), "/x/Pad-Verb.vst3", "pad 40's FX moved");
@@ -7175,7 +7485,8 @@ mod tests {
     #[test]
     fn the_click_and_master_rejoin_the_palette_unless_they_were_really_painted() {
         use crate::mixer_panel::{LEGACY_CLICK_COLOR, LEGACY_MASTER_COLOR};
-        use crate::recorder::{Strip, STRIPS};
+        use crate::recorder::Strip;
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
 
         let mut colors = vec![0i64; STRIPS + 1];
         colors[Strip::Click.index()] = LEGACY_CLICK_COLOR;
@@ -7183,8 +7494,8 @@ mod tests {
         let shipped = Settings::from_json(&format!(
             r#"{{"settings_version": 19, "strip_colors_v2": {colors:?}}}"#
         ));
-        assert_eq!(shipped.strip_colors[Strip::Click.index()], 0, "the click held on");
-        assert_eq!(shipped.strip_colors[STRIPS], 0, "the master held on");
+        assert_eq!(shipped.strip_paint(StripRef::Click), 0, "the click held on");
+        assert_eq!(shipped.strip_paint(StripRef::Master), 0, "the master held on");
 
         // A desk where somebody went and painted them something else keeps
         // exactly what they painted.
@@ -7195,12 +7506,12 @@ mod tests {
             r#"{{"settings_version": 19, "strip_colors_v2": {colors:?}}}"#
         ));
         assert_eq!(
-            painted.strip_colors[Strip::Click.index()],
+            painted.strip_paint(StripRef::Click),
             17,
             "a click somebody painted teal was taken away from them"
         );
         assert_eq!(
-            painted.strip_colors[STRIPS],
+            painted.strip_paint(StripRef::Master),
             23,
             "a master somebody painted violet was taken away from them"
         );
@@ -7219,7 +7530,7 @@ mod tests {
         use crate::recorder::Strip;
         // The old defaults: 4 was teal and 6 was violet.
         let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
-        let teal = old.strip_colors[Strip::Channel(0).index()] as usize;
+        let teal = old.strip_colors[0] as usize;
         assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
         // And it is still a teal, not merely a different number. (The violet
         // at old index 6 was the BACKING track's, whose strip v13 retired —
@@ -7232,7 +7543,7 @@ mod tests {
         // anybody chose it. It comes back auto and the palette dresses it —
         // still a red, which is the part that actually mattered.
         assert_eq!(
-            old.strip_colors[crate::recorder::STRIPS], 0,
+            old.strip_paint(StripRef::Master), 0,
             "the master did not rejoin the palette"
         );
         let (r, g, b) = STRIP_COLORS[crate::mixer_panel::MASTER_COLOR];
@@ -7240,7 +7551,7 @@ mod tests {
 
         // A file already written by this build is taken at face value.
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
-        assert_eq!(new.strip_colors[Strip::Channel(0).index()], 26);
+        assert_eq!(new.strip_colors[0], 26);
 
         // And what is written back reads back as ITSELF, or the next launch
         // would migrate the already-migrated numbers a second time: a format-2
@@ -7476,11 +7787,11 @@ mod tests {
         // The default desk: the kit in channel 0's first bay, the DX7 in
         // channel 1's. See `Settings::default`.
         assert_eq!(
-            s.strip_inserts.first().map(String::as_str),
+            s.legacy_inserts().first().map(String::as_str),
             Some(crate::dialogs::DRUMPAD_PATH)
         );
         assert_eq!(
-            s.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
+            s.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
             Some(crate::dialogs::BUILTIN_PATH)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -7574,10 +7885,14 @@ mod tests {
         "pad_state_shift_v18",
     ];
 
-    /// `s` with `fresh`'s row ids: the reset desk as the key walk compares
-    /// it, since the ids are the one desk field a reset mints anew.
+    /// `s` with `fresh`'s row ids, and everything keyed by its rows' ids
+    /// taken across with them (`Rekey::tables`): the reset desk as the key
+    /// walk compares it, since the ids are the one desk field a reset mints
+    /// anew, and a bay or a route on a row is the row's whatever it wears.
     fn with_fresh_ids(s: &Settings, fresh: &Settings) -> Settings {
         let mut out = s.clone();
+        (out.plugins, out.bypass, out.routes, out.insert_keys) =
+            rekey_rows(&s.track_ids, &fresh.track_ids).tables(s);
         out.track_ids = fresh.track_ids.clone();
         out.next_track_id = fresh.next_track_id;
         out
@@ -7638,7 +7953,9 @@ mod tests {
             "a reset row took back an id the session had already handed out"
         );
         assert!(s.next_track_id > fresh.next_track_id, "the counter went back");
-        let mut levelled = s.clone();
+        // Under the fresh desk's ids, as the key walk read it: the bays and
+        // the wiring stand on the reset rows' new ids.
+        let mut levelled = with_fresh_ids(&s, &fresh);
         let mut baseline = fresh.clone();
         for side in [&mut levelled, &mut baseline] {
             side.track_ids = Vec::new();
@@ -7712,7 +8029,7 @@ mod tests {
             assert_eq!(s.project_path, before.project_path, "{scope:?}");
             assert_eq!(s.audio_system, before.audio_system, "{scope:?}");
             assert_eq!(s.channel_gains, before.channel_gains, "{scope:?}");
-            assert_eq!(s.strip_inserts, before.strip_inserts, "{scope:?}");
+            assert_eq!(s.legacy_inserts(), before.legacy_inserts(), "{scope:?}");
             assert_eq!(s.device_send_enabled, before.device_send_enabled, "{scope:?}");
             assert_eq!(s.device_send_name, before.device_send_name, "{scope:?}");
         }
@@ -7808,11 +8125,11 @@ mod tests {
         // The default desk: the kit in channel 0's first bay, the DX7 in
         // channel 1's. See `Settings::default`.
         assert_eq!(
-            s.strip_inserts.first().map(String::as_str),
+            s.legacy_inserts().first().map(String::as_str),
             Some(crate::dialogs::DRUMPAD_PATH)
         );
         assert_eq!(
-            s.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
+            s.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
             Some(crate::dialogs::BUILTIN_PATH)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -7902,55 +8219,52 @@ mod tests {
 
     #[test]
     fn a_pre_lanes_projects_pad_plugins_follow_their_drumpad() {
-        use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS, STRIPS};
+        use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS};
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
         // A session as an older build wrote it: the drumpad on channel 7,
         // and a plugin on pad 36 sitting in the ONE pad block that existed.
         // **The default desk already seeds a drumpad on channel 1**, and the
         // migration takes the LOWEST drum channel — correctly. So the fixture
         // has to be a bare desk, or it tests channel 1 while claiming to test
         // channel 7.
-        let bare = || {
-            let mut s = Settings::default();
-            s.strip_inserts.clear();
-            s.strip_inserts
-                .resize(crate::recorder::INSERT_SPACE, String::new());
-            s
-        };
+        // The migration works on the file's dense legacy table, before
+        // anything is bound to identity, so that is what it is handed here.
+        let bare = || vec![String::new(); crate::recorder::INSERT_SPACE];
         let mut s = bare();
-        s.strip_inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        s[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
         let legacy = (STRIPS + 1 + 36) * INSERTS;
-        s.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
+        s[legacy] = "/x/Kick.vst3".to_owned();
 
-        move_legacy_pad_racks(&mut s.strip_inserts);
+        move_legacy_pad_racks(&mut s);
 
         // It followed the drumpad to channel 7's block, and left nothing
         // behind on channel 0's — which is somebody else's kit now.
         assert_eq!(
-            s.strip_inserts[pad_rack_index(7, 36) * INSERTS],
+            s[pad_rack_index(7, 36) * INSERTS],
             "/x/Kick.vst3",
             "the pad plugin did not follow its drumpad"
         );
         assert!(
-            s.strip_inserts[legacy].is_empty(),
+            s[legacy].is_empty(),
             "the plugin was copied rather than moved, so channel 0 now has one too"
         );
 
         // A drumpad already on channel 0 is the identity — and running the
         // migration twice must not undo the first run.
         let mut z = bare();
-        z.strip_inserts[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
-        z.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
-        move_legacy_pad_racks(&mut z.strip_inserts);
-        move_legacy_pad_racks(&mut z.strip_inserts);
-        assert_eq!(z.strip_inserts[legacy], "/x/Kick.vst3", "channel 0 lost its pad plugin");
+        z[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        z[legacy] = "/x/Kick.vst3".to_owned();
+        move_legacy_pad_racks(&mut z);
+        move_legacy_pad_racks(&mut z);
+        assert_eq!(z[legacy], "/x/Kick.vst3", "channel 0 lost its pad plugin");
 
         // And a session with no per-pad plugins at all is untouched, which
         // is every session anybody actually has.
         let mut plain = bare();
-        plain.strip_inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
-        let before = plain.strip_inserts.clone();
-        move_legacy_pad_racks(&mut plain.strip_inserts);
-        assert_eq!(plain.strip_inserts, before, "an empty pad block was rewritten");
+        plain[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        let before = plain.clone();
+        move_legacy_pad_racks(&mut plain);
+        assert_eq!(plain, before, "an empty pad block was rewritten");
         let _ = DRUM_PADS;
     }
 
@@ -8122,12 +8436,12 @@ mod tests {
         // in channel 1's, and a first launch keeps that: the patch picker and
         // the patch editor are reached by clicking the bay it is in.
         assert_eq!(
-            first.strip_inserts.first().map(String::as_str),
+            first.legacy_inserts().first().map(String::as_str),
             Some(crate::dialogs::DRUMPAD_PATH),
             "a fresh install has no kit on the desk"
         );
         assert_eq!(
-            first.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
+            first.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
             Some(crate::dialogs::BUILTIN_PATH),
             "a fresh install has no instrument on the desk"
         );
@@ -8163,11 +8477,13 @@ mod tests {
     /// said, and nothing else about it moves. The arm is said by the shipped
     /// rule, as `app::default_armed` resolves an unsaid one at launch.
     fn as_format2_says(mut s: Settings) -> Settings {
-        s.strip_names.resize(crate::recorder::STRIPS + 1, String::new());
+        // A format-2 desk names every ROW (the specials' names are theirs,
+        // W5), so the names come back as wide as the desk.
+        s.strip_names.resize(crate::recorder::CHANNELS, String::new());
         s.channel_inputs.resize(crate::recorder::CHANNELS, String::new());
         let armed = s.channel_armed.unwrap_or_else(|| {
             crate::arrangement::armed_by_default(&s.channel_kinds, |n| {
-                s.strip_inserts.get(n * crate::recorder::INSERTS).map_or("", String::as_str)
+                s.legacy_inserts().get(n * crate::recorder::INSERTS).map_or("", String::as_str)
                     == crate::dialogs::BUILTIN_PATH
             })
         });
@@ -8227,6 +8543,18 @@ mod tests {
         }
     }
     use super::*;
+    use crate::recorder::StripRef;
+
+    /// **Every strip with switch `w` on**, rows then specials, by what each
+    /// is: what a legacy strip mask said, read the way the desk keeps it now
+    /// (the specials' switches are theirs, W5).
+    fn on(s: &Settings, w: StripSwitch) -> Vec<StripRef> {
+        (0..crate::recorder::CHANNELS)
+            .map(StripRef::Row)
+            .chain(StripRef::SPECIALS)
+            .filter(|x| s.strip_switch(*x, w))
+            .collect()
+    }
 
     /// A torn write costs the user every setting they ever chose, because
     /// `load_from` answers a parse error with all-defaults and then saves those
@@ -8463,9 +8791,12 @@ mod tests {
         let legacy = |s: &Settings| s.to_map_as(crate::desk_format::Format::Legacy);
         assert!(!legacy(&Settings::default()).contains_key("insert_keys"));
 
+        use crate::desk_id::{slot_key, Node, TrackId};
+        let t = |n: u32| Node::Track(TrackId(n));
         let mut s = Settings::default();
-        s.insert_keys.set(3, 1, Some(7));
-        s.insert_keys.set(35, 5, Some(0)); // the master's second rack
+        s.insert_keys.set(slot_key(t(3), 1).expect("a bay"), Some(t(7)));
+        // The master's displayed slot 5: its ORIGINAL rack's third bay.
+        s.insert_keys.set(slot_key(Node::Master, 5).expect("a bay"), Some(t(0)));
         let out = legacy(&s);
         // Written at the END, ahead only of the preserved extras — the
         // additive-key law every new key here follows.
@@ -8482,7 +8813,7 @@ mod tests {
                                 {"slot": 0, "from": 1}],
                 "future_key": true}"#,
         ));
-        assert_eq!(s2.insert_keys.get(2, 0), Some(9), "first edge wins the bay");
+        assert_eq!(s2.insert_keys.get(slot_key(t(2), 0).expect("a bay")), Some(t(9)), "first edge wins the bay");
         assert_eq!(s2.insert_keys.0.len(), 1, "the malformed row was skipped");
         assert!(s2.extra.contains_key("future_key"));
     }
@@ -8619,32 +8950,36 @@ mod tests {
         // inside its `desk` (the round trip below).
         let legacy = |s: &Settings| s.to_map_as(crate::desk_format::Format::Legacy);
         assert!(!legacy(&Settings::default()).contains_key("insert_bypass"));
+        let ids = crate::desk_legacy::identity_ids(crate::recorder::CHANNELS);
+        let bay = |seat: usize, b: usize| crate::desk_legacy::bay_at(&ids, seat, b).expect("a bay");
         assert!(
-            !Settings::default().insert_bypass.contains(0, 0),
+            Settings::default().bypass.is_empty(),
             "a fresh desk came up with a bay switched off"
         );
 
         let mut s = Settings::default();
         // Out of order and out of seat order, so the sorting is doing work.
-        assert!(s.insert_bypass.set(crate::recorder::MASTER_EXTRA_SEAT, 1, true));
-        assert!(s.insert_bypass.set(3, 2, true));
-        assert!(s.insert_bypass.set(3, 0, true));
+        assert!(s.bypass.insert(bay(crate::recorder::MASTER_EXTRA_SEAT, 1)));
+        assert!(s.bypass.insert(bay(3, 2)));
+        assert!(s.bypass.insert(bay(3, 0)));
         // Setting a bay that is already set changes nothing and says so.
-        assert!(!s.insert_bypass.set(3, 0, true));
+        assert!(!s.bypass.insert(bay(3, 0)));
         let out = legacy(&s);
         assert_eq!(
             out.keys().last().map(String::as_str),
             Some("insert_bypass"),
             "insert_bypass is not the last of our own keys"
         );
-        let back = Settings::from_map(out);
-        assert_eq!(back.insert_bypass, s.insert_bypass);
-        assert_eq!(Settings::from_map(s.to_map()).insert_bypass, s.insert_bypass, "format 2 lost a bypass");
+        // The legacy file keeps its seats sorted, whatever order they
+        // were flagged in.
         assert_eq!(
-            back.insert_bypass.0,
+            BypassBays::from_json(out.get("insert_bypass").expect("written")).0,
             vec![(3, 0), (3, 2), (crate::recorder::MASTER_EXTRA_SEAT, 1)],
-            "the list did not come back sorted"
+            "the list was not written sorted"
         );
+        let back = Settings::from_map(out);
+        assert_eq!(back.bypass, s.bypass);
+        assert_eq!(Settings::from_map(s.to_map()).bypass, s.bypass, "format 2 lost a bypass");
 
         // A file with bypasses AND an unknown future key keeps both, and a
         // malformed row is skipped rather than failing the list.
@@ -8655,15 +8990,15 @@ mod tests {
                                   {"bay": 0}],
                 "future_key": true}"#,
         ));
-        assert!(s2.insert_bypass.contains(5, 1));
-        assert_eq!(s2.insert_bypass.0.len(), 1, "a bad row or a repeat got in");
+        assert!(s2.bypass.contains(&bay(5, 1)));
+        assert_eq!(s2.bypass.len(), 1, "a bad row or a repeat got in");
         assert!(s2.extra.contains_key("future_key"));
 
         // And the desk reset takes them: a wiped desk keeping a flag would
         // be waiting to silence the first plugin loaded onto it.
         let mut wiped = s.clone();
         wiped.reset(ResetScope::Everything);
-        assert!(wiped.insert_bypass.0.is_empty());
+        assert!(wiped.bypass.is_empty());
     }
 
     #[test]
@@ -8899,7 +9234,8 @@ mod tests {
     /// visible to the migration, and the clamp happens after.
     #[test]
     fn a_shrinking_desk_reaches_the_migration_before_it_is_clamped() {
-        use crate::recorder::{INSERTS, STRIPS};
+        use crate::recorder::INSERTS;
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
 
         // A file from a desk WIDER than this build's, by two channels — which
         // is the shape a v11 file has the moment `STRIPS` drops.
@@ -8922,28 +9258,32 @@ mod tests {
         let s = Settings::from_json(&json);
 
         // What survives is this build's shape, taken from the FRONT — not a
-        // window that slid because something was dropped early.
+        // window that slid because something was dropped early. The rows'
+        // names are the rows' array (the specials' are theirs, W5), and
+        // every legacy strip, rows and specials alike, holds what the file
+        // put at its index.
         assert_eq!(
             s.strip_names.len(),
-            STRIPS + 1,
+            crate::recorder::CHANNELS,
             "the names were not clamped to this build's desk"
         );
         for i in 0..=STRIPS {
-            assert_eq!(s.strip_names[i], format!("ch{i}"), "channel {i} moved");
+            let strip = crate::desk_legacy::strip_at_v32(i).expect("a legacy strip");
+            assert_eq!(s.strip_name(strip), format!("ch{i}"), "strip {i} ({strip:?}) moved");
             assert_eq!(
-                s.strip_colors[i],
+                s.strip_paint(strip),
                 (i % 27) as i64,
-                "channel {i}'s colour moved"
+                "strip {i}'s ({strip:?}) colour moved"
             );
         }
         // The insert space carries the PAD seats past the master now, so
         // the clamp is wider than the strips — what matters is the FRONT
         // never slid.
         assert!(
-            s.strip_inserts.len() <= crate::recorder::INSERT_SPACE
+            s.legacy_inserts().len() <= crate::recorder::INSERT_SPACE
         );
-        for i in 0..((STRIPS + 1) * INSERTS).min(s.strip_inserts.len()) {
-            assert_eq!(s.strip_inserts[i], format!("/x/p{i}.vst3"), "bay {i} moved");
+        for i in 0..((STRIPS + 1) * INSERTS).min(s.legacy_inserts().len()) {
+            assert_eq!(s.legacy_inserts()[i], format!("/x/p{i}.vst3"), "bay {i} moved");
         }
     }
 
@@ -9036,13 +9376,10 @@ mod tests {
         );
 
         // Slot 0's instrument went to bay 1, its three effects kept two.
+        let dense = s.legacy_inserts();
         let bays = |ch: usize| {
             let row = Strip::Channel(ch).index() * INSERTS;
-            (
-                s.strip_inserts[row].as_str(),
-                s.strip_inserts[row + 1].as_str(),
-                s.strip_inserts[row + 2].as_str(),
-            )
+            (dense[row].as_str(), dense[row + 1].as_str(), dense[row + 2].as_str())
         };
         assert_eq!(
             bays(0),
@@ -9073,7 +9410,7 @@ mod tests {
         assert_eq!(s.strip_names[2], "Mic");
         assert_eq!(s.strip_names[3], "Amp");
         assert_eq!(
-            s.strip_names[crate::recorder::STRIPS], "Sum",
+            s.strip_name(StripRef::Master), "Sum",
             "the master lost its name in the shrink - the LegacyDesk bug again"
         );
 
@@ -9099,18 +9436,18 @@ mod tests {
 
         // The master's rack survived the move down.
         assert_eq!(
-            s.strip_inserts[crate::recorder::STRIPS * INSERTS].as_str(),
+            s.legacy_inserts()[crate::desk_legacy::V32_STRIPS * INSERTS].as_str(),
             "/x/Pro-L 2.vst3",
             "the master's limiter vanished"
         );
         // The track's own insert retires WITH the track — into no bay at all.
         assert!(
-            !s.strip_inserts.iter().any(|p| p == "/x/Pro-G.vst3"),
+            !s.legacy_inserts().iter().any(|p| p == "/x/Pro-G.vst3"),
             "the retired backing track's gate leaked into another bay"
         );
         // And the master's rack is at the master's row, not a bay adrift.
         assert_eq!(
-            s.strip_inserts[crate::recorder::STRIPS * INSERTS + 1].as_str(),
+            s.legacy_inserts()[crate::desk_legacy::V32_STRIPS * INSERTS + 1].as_str(),
             "",
             "something leaked into the master's second bay"
         );
@@ -9119,7 +9456,7 @@ mod tests {
         // that never existed — and it no longer has to be, because the click
         // is dressed by whichever palette is in force rather than by a colour
         // baked into the defaults.
-        assert_eq!(s.strip_colors[Strip::Click.index()], 0);
+        assert_eq!(s.strip_paint(StripRef::Click), 0);
     }
 
     /// A v11 desk that never loaded a VST keeps making a sound: the DX7 is
@@ -9133,7 +9470,7 @@ mod tests {
         assert_eq!(s.channel_kinds[0], 2);
         assert_eq!(s.channel_kinds[1], 1, "nothing took the built-in");
         assert_eq!(
-            s.strip_inserts[Strip::Channel(1).index() * INSERTS].as_str(),
+            s.legacy_inserts()[Strip::Channel(1).index() * INSERTS].as_str(),
             crate::dialogs::BUILTIN_PATH
         );
         assert!(
@@ -9153,9 +9490,9 @@ mod tests {
         let mut s = Settings::default();
         let far = 4149 * crate::recorder::INSERTS;
         let pad = 200;
-        s.strip_inserts[far] = "/x/Brusfri.vst3".to_owned();
-        s.strip_inserts[pad] = "/x/PadComp.vst3".to_owned();
-        s.strip_inserts[5 * crate::recorder::INSERTS] = "/x/Channel5.vst3".to_owned();
+        s.set_legacy_insert(far, &"/x/Brusfri.vst3".to_owned());
+        s.set_legacy_insert(pad, &"/x/PadComp.vst3".to_owned());
+        s.set_legacy_insert(5 * crate::recorder::INSERTS, &"/x/Channel5.vst3".to_owned());
         // The legacy writer's shape, which every file before format 2 holds
         // and the legacy reader still takes; the round trip below is through
         // the file this build writes.
@@ -9173,12 +9510,12 @@ mod tests {
         assert!(text.matches("\"\"").count() < 400, "thousands of empties again: {}", text.len());
 
         let back = Settings::from_json(&text);
-        assert_eq!(back.strip_inserts, s.strip_inserts, "the desk moved through the file");
+        assert_eq!(back.legacy_inserts(), s.legacy_inserts(), "the desk moved through the file");
         assert!(!back.extra.contains_key("strip_inserts_tail"), "the tail became a stranger");
-        assert_eq!(back.strip_inserts.len(), crate::recorder::INSERT_SPACE);
+        assert_eq!(back.legacy_inserts().len(), crate::recorder::INSERT_SPACE);
 
         let legacy = serde_json::to_string(&Value::Object(map)).expect("json");
-        assert_eq!(Settings::from_json(&legacy).strip_inserts, s.strip_inserts, "the legacy shape read differently");
+        assert_eq!(Settings::from_json(&legacy).legacy_inserts(), s.legacy_inserts(), "the legacy shape read differently");
 
         // A desk with nothing past the head writes no tail at all.
         let plain = Settings::default();
@@ -9186,7 +9523,7 @@ mod tests {
             !plain.to_map_as(crate::desk_format::Format::Legacy).contains_key("strip_inserts_tail"),
             "an empty tail was written"
         );
-        assert_eq!(Settings::from_json(&plain.to_json()).strip_inserts, plain.strip_inserts);
+        assert_eq!(Settings::from_json(&plain.to_json()).legacy_inserts(), plain.legacy_inserts());
     }
 
     /// **An older build's array and this build's tail meet on the dense
@@ -9210,18 +9547,18 @@ mod tests {
         })
         .to_string();
         let s = Settings::from_json(&json);
-        assert_eq!(s.strip_inserts[0], "/x/A.vst3");
-        assert_eq!(s.strip_inserts[3], "/x/B.vst3", "the tail's stale copy beat the array");
-        assert_eq!(s.strip_inserts[200], "/x/PadComp.vst3", "a pad-rack seat did not land");
-        assert_eq!(s.strip_inserts[4149 * INSERTS], "/x/Brusfri.vst3", "the far seat did not land");
-        assert!(s.strip_inserts[9000].is_empty(), "an empty path made a seat");
-        assert_eq!(s.strip_inserts.len(), crate::recorder::INSERT_SPACE, "a seat past the map grew it");
+        assert_eq!(s.legacy_inserts()[0], "/x/A.vst3");
+        assert_eq!(s.legacy_inserts()[3], "/x/B.vst3", "the tail's stale copy beat the array");
+        assert_eq!(s.legacy_inserts()[200], "/x/PadComp.vst3", "a pad-rack seat did not land");
+        assert_eq!(s.legacy_inserts()[4149 * INSERTS], "/x/Brusfri.vst3", "the far seat did not land");
+        assert!(s.legacy_inserts()[9000].is_empty(), "an empty path made a seat");
+        assert_eq!(s.legacy_inserts().len(), crate::recorder::INSERT_SPACE, "a seat past the map grew it");
         assert!(!s.extra.contains_key("strip_inserts_tail"));
     }
 
     /// **The v17 drumpad seat survives a staged desk.** Every real file
     /// carries `strip_inserts`, which stages into `LegacyDesk` and REPLACES
-    /// `self.strip_inserts` at adoption — so the migration's seat, written
+    /// `self.legacy_inserts()` at adoption — so the migration's seat, written
     /// on `self`, was thrown away: upgraders got a MIDI-all channel 8 with
     /// three empty bays and nothing to play.
     #[test]
@@ -9237,7 +9574,7 @@ mod tests {
         assert_eq!(s.channel_kinds[7], 1, "track 8 did not become MIDI");
         assert_eq!(s.channel_inputs[7], "midi:all");
         assert_eq!(
-            s.strip_inserts[7 * INSERTS].as_str(),
+            s.legacy_inserts()[7 * INSERTS].as_str(),
             crate::dialogs::DRUMPAD_PATH,
             "the drumpad seat was clobbered by the staged desk"
         );
@@ -9351,7 +9688,7 @@ mod perf_probe {
             text.len(),
             text.len() as f64 / 1024.0,
             map.len(),
-            s.strip_inserts.len()
+            s.legacy_inserts().len()
         );
         let dir = crate::perf_fixtures::scratch("settings");
         let path = dir.join("settings.json");
@@ -9378,9 +9715,7 @@ mod perf_probe {
             (200, "/Library/Audio/Plug-Ins/VST3/PadComp.vst3"),
             (4149 * crate::recorder::INSERTS, "/Library/Audio/Plug-Ins/VST3/Brusfri.vst3"),
         ] {
-            if let Some(slot) = owner.strip_inserts.get_mut(bay) {
-                *slot = path.to_owned();
-            }
+            owner.set_legacy_insert(bay, path);
         }
         let text = owner.to_json();
         let seats = owner
@@ -9402,8 +9737,8 @@ mod perf_probe {
         });
         say("settings", "-", "the owner's desk: load_from", load_o, true);
         assert_eq!(
-            Settings::load_from(&path).strip_inserts,
-            owner.strip_inserts,
+            Settings::load_from(&path).legacy_inserts(),
+            owner.legacy_inserts(),
             "the owner's desk did not round trip"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -9525,7 +9860,7 @@ mod format2_tests {
         assert_eq!(read.theme_name, "Kept Theme");
         assert!(read.dark_mode);
         let fresh = Settings::default();
-        assert_eq!(read.strip_inserts, fresh.strip_inserts, "the desk is not the default desk");
+        assert_eq!(read.legacy_inserts(), fresh.legacy_inserts(), "the desk is not the default desk");
         assert_eq!(read.channel_kinds, fresh.channel_kinds);
         let side = dir.join("settings.desk-refused-2.json");
         let kept: Value = serde_json::from_str(&std::fs::read_to_string(&side).expect("side file")).expect("json");

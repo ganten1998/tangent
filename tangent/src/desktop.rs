@@ -6253,6 +6253,28 @@ impl DesktopApp {
         //
         // **By identity**: the copied track's bays to the pasted track's,
         // whichever rows the two stand on now (`take_insert_state_copy_ids`).
+        //
+        // **And a plugin carried between bays** (a pad swap, its undo or
+        // redo) takes its settings to its new bay here too, before the
+        // reconcile rebuilds both: see `engine_bridge::carry_relabels`.
+        let relabels = self.app.take_bay_relabels();
+        if !relabels.is_empty() {
+            let shelf = crate::shelf::global_dir();
+            let written = crate::engine_bridge::carry_relabels(
+                &self.app,
+                &self.bridge,
+                self.recorder.engine.as_ref(),
+                &self.displaced_states,
+                &relabels,
+                &shelf,
+            );
+            for (sb, bundle) in written {
+                self.displaced_states.remove(&(sb, bundle));
+                if let Some(at) = self.bridge.engine_bay(sb) {
+                    self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+                }
+            }
+        }
         if let Some((from, to)) = self.app.take_insert_state_copy_ids() {
             use tangent_ui::desk_id::{slot_key, Node};
             // **All SIX slots, through the display-slot resolver.** A
@@ -14283,19 +14305,12 @@ impl DesktopApp {
         if (from_strip, from_bay) == (to_strip, to_bay) {
             return;
         }
-        let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
+        if self.app.insert(from_strip, from_bay).is_none() {
             return;
-        };
+        }
         if self.app.insert(to_strip, to_bay).is_some() {
             self.swap_inserts(from_strip, from_bay, to_strip, to_bay);
             return;
-        }
-        // Its live state, written under the bay that is going to read it —
-        // `copy_insert`'s ordering rule, for its reason.
-        if let Some(state) = self.live_state(from_strip, from_bay) {
-            self.write_bay_state(to_strip, to_bay, &bundle, &state);
-            // Newer than anything shelved for it here - see `copy_insert`.
-            self.forget_displaced(to_strip, to_bay, &bundle);
         }
         // **ONE moment for the drag**, through the app's trade. `set_insert`
         // commits its own, so filling the destination and clearing the
@@ -14303,6 +14318,14 @@ impl DesktopApp {
         // same plugin in BOTH bays, which is a desk nobody made and cannot
         // make by hand. And the plugin's automation goes with it: see
         // `TangentApp::trade_inserts`.
+        //
+        // **Its settings go with it as a relabel**, not as a file written
+        // here: the trade hands the host the move, and the next frame's
+        // carry writes the destination's file from the instance still
+        // playing at the source before any bay is rebuilt
+        // (`engine_bridge::carry_relabels`, `copy_insert`'s ordering rule
+        // kept). The moment keeps the relabels, so the undo carries the
+        // unit back the same way, with whatever it was dialled to since.
         self.app.trade_inserts((from_strip, from_bay), (to_strip, to_bay));
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
     }
@@ -14367,11 +14390,12 @@ impl DesktopApp {
     /// gesture that makes a rack re-orderable, and the reason the drop
     /// finally had to know which BAY it landed on rather than which channel.
     ///
-    /// **Both sidecars are written before either bay is re-pointed**, which
-    /// is `copy_insert`'s ordering rule and the same fault if it is got
-    /// wrong: the reconcile reads a bay's sidecar as it constructs the
-    /// instance, so a state written afterwards is a state the plugin has
-    /// already come up without.
+    /// **Both sidecars are written before either bay is rebuilt**, which is
+    /// `copy_insert`'s ordering rule and the same fault if it is got wrong:
+    /// the reconcile reads a bay's sidecar as it constructs the instance, so
+    /// a state written afterwards is a state the plugin has already come up
+    /// without. The relabel carry that writes them runs ahead of the
+    /// reconcile in the frame (`carry_relabels`).
     ///
     /// Each state is written under the bundle that is going to READ it —
     /// `shelf::saved_state` refuses a state file whose owner does not match, so
@@ -14382,33 +14406,20 @@ impl DesktopApp {
         if (a_strip, a_bay) == (b_strip, b_bay) {
             return;
         }
-        let (Some(a), Some(b)) = (
-            self.app.insert(a_strip, a_bay).map(str::to_owned),
-            self.app.insert(b_strip, b_bay).map(str::to_owned),
-        ) else {
+        if self.app.insert(a_strip, a_bay).is_none() || self.app.insert(b_strip, b_bay).is_none() {
             // Only two LOADED bays trade. An empty target is the carry's
             // older meaning and `copy_insert` still answers for it.
             return;
-        };
-        // The states they are playing at, not the ones on disk: a plugin
-        // somebody has been turning knobs on has not written a sidecar since
-        // it loaded. Both are read before either is written, or the second
-        // read finds the first write.
-        let (a_state, b_state) = (self.live_state(a_strip, a_bay), self.live_state(b_strip, b_bay));
-        // **Both files are about to be cross-tagged**, which buries each
-        // bay's own copy - and undoing the swap asks for both. The
-        // reconcile shelves what each plugin is PLAYING as it tears the two
-        // instances down (see `displaced_states`); what this road owes the
-        // shelf is that the two files written here are the newest word on
-        // each incoming plugin, so nothing shelved earlier outranks them.
-        if let Some(state) = a_state {
-            self.write_bay_state(b_strip, b_bay, &a, &state);
-            self.forget_displaced(b_strip, b_bay, &a);
         }
-        if let Some(state) = b_state {
-            self.write_bay_state(a_strip, a_bay, &b, &state);
-            self.forget_displaced(a_strip, a_bay, &b);
-        }
+        // **The two settings cross as relabels**, not as files written here.
+        // The trade below hands the host the swap, and the next frame's carry
+        // reads BOTH playing instances before it writes either bay's file,
+        // each under the bundle that is going to read it, then forgets
+        // whatever the shelf kept of either incoming plugin there and marks
+        // both bays to rebuild (`engine_bridge::carry_relabels`). The moment
+        // keeps the relabels, so the undo crosses them back with what each
+        // unit was dialled to since; two units of one bundle, whose NAMES a
+        // trade cannot tell apart, trade their settings the same way.
         // Which side had its window up, read BEFORE the bays are re-pointed
         // and the reconcile tears both instances down.
         let up = |at: Option<crate::engine_bridge::EngineBay>| {
@@ -19678,13 +19689,7 @@ impl DesktopApp {
             // Out of every bay it sits in, not just the first: the same
             // plugin on two channels would otherwise take the second launch.
             let want = bad.to_string_lossy();
-            let mut pulled = 0usize;
-            for slot in settings.strip_inserts.iter_mut() {
-                if *slot == want {
-                    slot.clear();
-                    pulled += 1;
-                }
-            }
+            let pulled = settings.pull_plugin(&want);
             eprintln!(
                 "tangent: the last launch was killed loading {}; \
                  removed it from {pulled} bay(s) so this one can start",
@@ -21370,11 +21375,16 @@ impl DesktopApp {
             |row| self.app.channel_kind(row) == Some(tangent_ui::recorder::ChannelKind::Audio),
             |row| self.app.folder_of(row),
             |row| {
+                // By identity at both ends: the row's track, and the rows
+                // its destinations stand on.
+                let Some(&id) = self.app.track_ids().get(row) else {
+                    return Vec::new();
+                };
                 routes
-                    .from(row)
+                    .from(tangent_ui::desk_id::Node::Track(id))
                     .into_iter()
                     .filter_map(|(_, r)| match r.target {
-                        tangent_ui::routing::Target::Channel(n) => Some(n),
+                        tangent_ui::routing::Target::Node(n) => self.app.row_of(n.track()?),
                         _ => None,
                     })
                     .collect()
@@ -26136,8 +26146,7 @@ mod tests {
         let scratch = root.join("Untitled");
         app.adopt_template(&template, &scratch);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
-            strip: 0,
-            slot: 0,
+            bay: crate::engine_bridge::seat_bay_at(app.track_ids(), 0, 0).expect("strip 0's first bay"),
             path: library.join("New.wav").to_string_lossy().into_owned(),
         });
         let (_, _, stored) = app.take_sampler_load().expect("the load was not queued");
@@ -28658,13 +28667,9 @@ mod tests {
             reconcile.contains("shelve_displaced(") && reconcile.contains("incoming_state("),
             "the reconcile no longer shelves the outgoing tenant, or no longer reads the shelf first"
         );
-        // Every write for an incoming tenant forgets that tenant's entry.
-        for road in [
-            "fn copy_insert(",
-            "fn move_insert(",
-            "fn paste_insert(",
-            "fn swap_inserts(",
-        ] {
+        // Every write for an incoming tenant forgets that tenant's entry: a
+        // copy's and a paste's, written by their own roads...
+        for road in ["fn copy_insert(", "fn paste_insert("] {
             let b = body(road);
             assert!(b.contains("self.write_bay_state("), "`{road}` no longer writes the bay's state");
             assert_eq!(
@@ -28673,6 +28678,26 @@ mod tests {
                 "`{road}` writes a state file and leaves an older shelved state outranking it"
             );
         }
+        // ...and a move's and a swap's, which are bay MOVES and so carried by
+        // the relabels the app's trade hands over (`carry_relabels`, both ways
+        // across the undo): the two roads write no state of their own, and the
+        // carry forgets every destination it wrote and has it rebuilt.
+        for road in ["fn move_insert(", "fn swap_inserts("] {
+            let b = body(road);
+            assert!(
+                !b.contains("self.write_bay_state(") && !b.contains("self.live_state("),
+                "`{road}` writes a bay's state itself: a bay move's settings ride its relabels, \
+                 or its undo has nothing to carry back"
+            );
+        }
+        let carry = &scan[scan.find("let relabels = self.app.take_bay_relabels();").expect("the relabel carry")..];
+        let carry = &carry[..carry.find("if let Some((from, to)) = self.app.take_insert_state_copy_ids()").expect("its end")];
+        assert!(
+            carry.contains("crate::engine_bridge::carry_relabels(")
+                && carry.contains("self.displaced_states.remove(&(sb, bundle));")
+                && carry.contains("RELOAD"),
+            "the relabel carry no longer forgets an older shelved state, or no longer rebuilds what it wrote"
+        );
         let copy = &scan[scan.find("crate::shelf::write_state(dst, &owner, &state);").expect("the Paste Track copy")..];
         let copy = &copy[..copy.find("// **And the bay is rebuilt even when").expect("the copy's end")];
         assert!(

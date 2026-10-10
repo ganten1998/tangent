@@ -33,7 +33,8 @@ use std::sync::Arc;
 use tangent_record::audio::Timebase;
 use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
 use tangent_ui::recorder::Desk;
-use tangent_ui::routing::{Route, Routes, Target};
+// The engine's shim speaks the legacy LANE table: routes by row number.
+use tangent_ui::routing::{LaneRoute as Route, LaneRoutes as Routes, LaneTarget as Target};
 
 use crate::builtin_fx::{
     CHORUS_PATH, COMP_PATH, DENOISE_PATH, EQ_PATH, PLATE_PATH, SAMPLER_PATH, TRIM_PATH,
