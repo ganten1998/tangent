@@ -6803,9 +6803,12 @@ pub enum LanePart {
 /// 128 pad racks of a lane below slot 32 stay in the frozen bank at
 /// `pad_rack_index`, addressed as `RackAddr { owner: Lane(slot), rack:
 /// LANE_RACKS + pad }`; a lane past slot 31 has no pad bays yet, and its kit
-/// sums dry. MERGE-ME(W5-engine-memory-inputs, drums at 50 lanes): pad
-/// racks per bank, their seats past the frozen map, and `RackShared` rows
-/// for them.
+/// sums dry. Its strikes are its own (`hits`, `offs`), so fifty kits are
+/// heard (W5-engine-memory-inputs). MERGE-ME(W6-rows-unlimited, the first
+/// wave a drum row past 31 exists): pad racks per bank, their seats past
+/// the frozen map, and `RackShared` rows for them. Seats for 128 pad racks
+/// per lane in the per-lane range would multiply every per-seat table on
+/// every lane, drum or not: it wants a sparse pad-seat range.
 pub struct PadBank {
     voices: [PadVoice; PADS],
     /// The kit's fader, slewed one-pole like every fader. Per lane: two
@@ -18566,7 +18569,7 @@ fn stream_layout(widths: &[u8], columns: &tangent_record::audio::Picks, channels
 impl Engine {
     /// How many slots the spine has room for, the ones on their way in
     /// included.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge keeps every lane below LEGACY_LANES until W5-engine-memory-inputs grows the spine"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge keeps every lane below LEGACY_LANES until its rows are unlimited (W6-rows-unlimited)"))]
     pub fn lane_capacity(&self) -> usize {
         self.slot_capacity
     }
@@ -23004,7 +23007,10 @@ impl Engine {
     /// layout that lands behind a ring the renderer has not taken in yet
     /// joins it (`lane_bank::apply_ops`). A full ring parks the plan here
     /// and `retire_tick` sends it, so this never refuses.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the monitor plan and capture rings are W5-engine-memory-inputs'"))]
+    /// The raw door, past the host's record of what the monitor was told
+    /// (`MonitorShadow`): the host's own roads are [`Engine::set_monitor`]
+    /// and [`Engine::set_monitor_inputs`], which keep it.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API's raw door: the host sends whole plans through `set_monitor` and `set_monitor_inputs`"))]
     pub fn set_monitor_plan(&mut self, mut plan: crate::lane_bank::MonitorPlan) -> Result<(), EngineBusy> {
         self.drain_retired_ops();
         plan.fresh = true;

@@ -1416,8 +1416,9 @@ impl Session {
     /// The monitor takes them from `take_monitor` below instead, which hands
     /// the ring and its layout over together so the two cannot disagree.
     /// This is the accessor for anyone who wants the standing answer: the
-    /// picks as ASKED, which the device then fits (`Picks::fitted`).
-    #[allow(dead_code)]
+    /// picks as ASKED, which the device then fits (`Picks::fitted`). The
+    /// bridge reads it every frame to lay a desk that names no input out
+    /// along the stream (`Bridge::sync_inputs`).
     pub fn picks(&self) -> &audio::Picks {
         &self.picks
     }
