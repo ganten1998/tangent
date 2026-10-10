@@ -235,3 +235,76 @@ fn a_track_added_then_kept_reopens_with_its_kit_on_every_save_road() {
         }
     }
 }
+
+/// **A drum track's removal leaves its kit on disk until a save writes the
+/// document without it** (W5-save-gaps 2). The removal took the kit out of
+/// the session and rewrote the sidecar at once, so Don't Save after it
+/// reopened the project with the drum track's kit gone while its document
+/// still held the track. Now the removal changes the session only:
+///
+/// - removed and not saved, the project reopens with the kit on its track,
+///   also after a pad of another drum track is edited (the sidecar saving
+///   itself files kits by the document's rows, the removed track's
+///   included);
+/// - removed and undone, then saved, the kit is there;
+/// - removed and saved, the kit is gone from disk, and the undo still brings
+///   it back in the session.
+#[test]
+fn a_removed_drum_tracks_kit_leaves_the_disk_with_the_save_and_not_before() {
+    let root = project_scratch("save-gaps-kit-removal");
+    let (_ctx, mut app) = headless(Caps::DESKTOP);
+    app.bootstrap_project(&root.join("Projects"));
+    assert!(app.save_project_first(&root.join("Projects").join("Drums.tan")), "fixture: no first save");
+    let doc = app.project_doc().expect("the project").to_path_buf();
+    for n in [3, 4] {
+        assert!(app.add_bare_track(n), "fixture: row {n} took no track");
+    }
+    app.kit_at_mut(3).pads[36].path = "media/kick.wav".into();
+    app.kit_at_mut(4).pads[38].path = "media/snare.wav".into();
+    app.drumpad_edited();
+    app.save_project_doc();
+    let drums = app.track_id_at(3);
+    let other = app.track_id_at(4);
+    let reopened = || {
+        let (_c, mut back) = headless(Caps::DESKTOP);
+        back.open_project(&doc);
+        back
+    };
+    let kick = |a: &TangentApp| a.row_of(drums).map(|r| a.kit_at(r).pads[36].path.clone());
+    let kicked = Some("media/kick.wav".to_owned());
+
+    // Removed, not saved: Don't Save reopens the document on disk.
+    app.remove_selected_channels(3);
+    assert_eq!(app.row_of(drums), None, "fixture: the drum track was not removed");
+    assert_eq!(kick(&reopened()), kicked, "a removal took the kit off the disk before any save");
+    // A pad of the other drum track edited after it: the sidecar saves itself.
+    app.set_drumpad_lane(app.row_of(other).expect("the other drum track"));
+    let row = app.row_of(other).expect("the other drum track");
+    app.kit_at_mut(row).pads[40].path = "media/tom.wav".into();
+    app.drumpad_edited();
+    let back = reopened();
+    assert_eq!(kick(&back), kicked, "a pad edit after the removal took the removed track's kit off the disk");
+    let back_row = back.row_of(other).expect("the other drum track on disk");
+    assert_eq!(back.kit_at(back_row).pads[40].path, "media/tom.wav", "the pad edit itself never reached the disk");
+
+    // Undone (the pad edit, then the removal), then saved: the kit is there.
+    app.undo();
+    app.undo();
+    assert_eq!(app.row_of(drums), Some(3), "fixture: the undo did not bring the drum track back");
+    assert_eq!(kick(&app), kicked, "the undo did not bring the kit back in the session");
+    app.save_project_doc();
+    assert_eq!(kick(&reopened()), kicked, "a removal undone and saved lost the kit");
+
+    // Removed and saved: gone from disk; the undo brings it back in the session.
+    app.remove_selected_channels(3);
+    app.save_project_doc();
+    let back = reopened();
+    assert_eq!(back.row_of(drums), None, "fixture: the saved document still holds the drum track");
+    assert!(
+        (0..recorder::CHANNELS).all(|r| back.kit_at(r).pads[36].path.is_empty()),
+        "a saved removal left the kit on a row of the document"
+    );
+    app.undo();
+    assert_eq!(kick(&app), kicked, "the undo of a saved removal did not bring the kit back");
+    let _ = std::fs::remove_dir_all(&root);
+}

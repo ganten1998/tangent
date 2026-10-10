@@ -7034,19 +7034,29 @@ impl TangentApp {
         self.auto_clipboard_from = aim(self.auto_clipboard_from);
         self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| *o != gone_node);
         self.arr_auto_hot = self.arr_auto_hot.filter(|(o, _, _)| *o != gone_node);
-        // And its drum KIT: a drum track made here later played the old
-        // one's samples at the old one's settings. It leaves the map with
-        // its track; the moment before this one keeps it for the undo.
-        // A drum panel open on it stands on no row from here (`drumpad_row`):
-        // it shows no kit and takes no edit until the undo brings the track
-        // back.
+        // And its drum KIT, which leaves the desk with its track and not the
+        // disk with it. A drum track made here later gets a new id and no
+        // kit (`mint_emptied_row_id`), so it never plays the old one's
+        // samples; the removed track's kit stays in the map under the
+        // removed id, inert like every entry keyed by a removed id (design
+        // 4), until an undo brings its track back or a session switch
+        // purges it. A drum panel open on it stands on no row from here
+        // (`drumpad_row`): it shows no kit and takes no edit until the undo.
+        //
+        // **Nothing is written.** The removal used to take the kit out of the
+        // map and save the sidecar at once (`drumpad_edited`), so Don't Save
+        // after removing a drum track reopened the project with its kit gone
+        // while its document still held the track. The sidecar's own writes
+        // file kits by the rows of the document on disk (`drumpad_save`),
+        // which name the removed track until a save writes both without it;
+        // the kit kept here is what they file for it. The engine's lane is
+        // told it lost its kit (`drumpad_dirty`).
         if self
             .drumpad_kits
-            .remove(&gone)
-            .is_some_and(|k| k != crate::drumpad::DrumpadDoc::default())
+            .get(&gone)
+            .is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default())
         {
             self.drumpad_dirty = true;
-            self.drumpad_edited();
         }
         // And the sidechain key edges, at BOTH ends: an edge keyed BY this
         // track would go on ducking to whatever slides into its index, and
@@ -13047,9 +13057,11 @@ impl TangentApp {
         if let Some(kit) = copy.kit.clone() {
             self.drumpad_kits.insert(self.track_id_at(into), kit);
             // The samples have to be decoded for the new lane and the kit
-            // pushed to the audio thread, which is what this asks for.
+            // pushed to the audio thread, which is what this asks for. The
+            // sidecar saves itself here whatever the panel stands on: this
+            // kit is the pasted track's (the paste's hold commits the moment).
             self.drumpad_dirty = true;
-            self.drumpad_edited();
+            self.drumpad_save();
         }
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
@@ -13968,9 +13980,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The samples alone left a real project whose kit lived only in
         // memory: reopened, it came up with every pad empty. A folder made
         // real by a take or an import never wrote the sidecar.
-        if !dir.join(crate::drumpad::FILE_NAME).exists()
-            && self.drumpad_kits.values().any(|k| !k.is_empty())
-        {
+        if !dir.join(crate::drumpad::FILE_NAME).exists() && self.desk_kits_hold_samples() {
             self.save_kits_beside(&self.project_doc);
         }
     }
@@ -18426,9 +18436,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // (`drumpad_save`), never by rows the document has not saved. An
         // absent sidecar and an empty one read alike, so a desk with no kit
         // and no sidecar writes none.
-        if crate::drumpad::DrumpadDoc::sidecar(&doc).exists()
-            || self.drumpad_kits.values().any(|k| !k.is_empty())
-        {
+        if crate::drumpad::DrumpadDoc::sidecar(&doc).exists() || self.desk_kits_hold_samples() {
             self.save_kits_beside(&doc);
         }
         self.note_doc_rows();
@@ -23436,8 +23444,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// to call the plain save: loading a kit, clearing a pad, renaming one,
     /// turning a knob. None of it was undoable, and an undo taken after any
     /// of it put the clips back and left the pads alone.
+    ///
+    /// **The panel of a removed track writes nothing**: it takes no edit
+    /// (`drumpad_mut`), and every road out of it still ends here. Its write
+    /// was harmless while a removal rewrote the sidecar itself, so that the
+    /// next write found nothing to change; a removal changes only the session
+    /// now (`remove_channel_inner`), and a refused knob or pad would have
+    /// been the first write after it, filing the kits again for an edit that
+    /// never happened. The paste, whose kit is not the panel's, writes
+    /// through `drumpad_save` itself.
     fn drumpad_edited(&mut self) {
-        self.drumpad_save();
+        if self.drumpad_row().is_some() {
+            self.drumpad_save();
+        }
         self.undo_commit();
     }
 
@@ -23504,6 +23523,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.drumpad_row().unwrap_or(0),
             doc,
         );
+    }
+
+    /// **Whether a track on the desk holds a kit with a sample in it**: what
+    /// a sidecar written beside the live rows (`save_kits_beside`) would
+    /// have in it. A removed track's kit is kept in the map for its undo
+    /// (`remove_channel_inner`) and is no row's, so it neither asks for a
+    /// sidecar nor puts one into a folder that has none.
+    fn desk_kits_hold_samples(&self) -> bool {
+        self.settings
+            .track_ids
+            .iter()
+            .any(|id| self.drumpad_kits.get(id).is_some_and(|k| !k.is_empty()))
     }
 
     /// One knob's current value, in its own units.
