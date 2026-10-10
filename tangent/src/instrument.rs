@@ -357,10 +357,11 @@ const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 
 /// **The width of the legacy desk, as the engine's own number.** Every
 /// engine is built with this many lanes installed, row r at slot r (design 3),
-/// and the engine's frozen seat map, its 32-bit instrument and arm words and
-/// its automation lanes reach exactly this far: a lane past it has no pad
-/// racks and no curve to name it until the waves that give it them. The
-/// bridge keeps every lane below it until then.
+/// and the engine's frozen seat map, its arm word and its automation lanes
+/// reach exactly this far: a lane past it has no pad racks and no curve to
+/// name it until the waves that give it them. (Its plugin racks, through
+/// their `HostRack`s, and its instruments are reached by identity at any
+/// slot.) The bridge keeps every lane below it until then.
 pub(crate) const LEGACY_LANES: usize = 32;
 
 /// How many pads the drumpad has: the identity grammar's (`desk_id::PADS`),
@@ -2777,7 +2778,7 @@ struct Shared {
     /// of reduction, as f32 bits — `fetch_max` since the UI last read it, the
     /// `strip_peak` idiom exactly. Written by the callback right after a
     /// block runs a comp bay ([`run_rack`]), read-and-RESET by
-    /// [`Engine::insert_gr_db`] once a frame for the face's meter. Same row
+    /// [`Engine::insert_gr_db_at`] once a frame for the face's meter. Same row
     /// law as `seat_latency` above: `seat * INSERTS + bay`.
     seat_gr: Vec<AtomicU32>,
     /// **The learn bay's threshold snapshot** — the denoise's 32 frozen
@@ -3007,7 +3008,7 @@ struct Shared {
     /// one block of not doing so is a meter flicker. The safe answer here is
     /// the OPPOSITE — a chunk that read "nothing is bypassed" would put
     /// every switched-off plugin back into the audio for one block, which is
-    /// a click on the master. So [`Engine::set_insert_bypass`] never clears
+    /// a click on the master. So [`Engine::set_insert_bypass_at`] never clears
     /// first: it walks the table once and moves each word straight from its
     /// old value to its new one. Each word is one atomic, so a racing chunk
     /// reads some bays' new state and some bays' old state and never a bay's
@@ -3855,7 +3856,7 @@ struct Prepared {
     display_name: String,
     /// Whether this tenant can take a sidechain key — decided the one moment
     /// it is decidable, before the instance leaves this thread. See
-    /// [`Engine::insert_wants_key`].
+    /// [`Engine::insert_wants_key_at`].
     wants_key: bool,
 }
 
@@ -6893,7 +6894,7 @@ pub struct LaneSpec {
 
 /// **Who owns a rack**, by identity (contract C8): a lane by its slot, or
 /// one of the four strips that are not rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RackOwner {
     Lane(Slot),
     Drums,
@@ -6903,14 +6904,62 @@ pub enum RackOwner {
 }
 
 /// One rack: its owner, and which of the owner's racks (a lane's are
-/// `[own, extra, pedal 0..7]`; a strip's are `[own, extra]`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `[own, extra, pedal 0..7]`, then its pads; a strip's are `[own, extra]`).
+/// The host's name for a rack (design 8: plugins are reconciled through one
+/// [`HostRack`] per rack, reached by this), ordered and hashable so a bay
+/// `(RackAddr, bay)` keys the host's ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RackAddr {
     pub owner: RackOwner,
     pub rack: u16,
 }
 
 impl RackAddr {
+    /// **The rack of `owner` the desk's `rack` names** (contract C1's
+    /// `Rack`): a lane's two chains, its seven pedals and its pads, or a
+    /// strip's two chains. `None` for a rack that owner never has (a pedal
+    /// or a pad of a strip that is not a row). Whether this engine has made
+    /// it yet is [`RackAddr::seat`]'s question.
+    pub fn of(owner: RackOwner, rack: tangent_ui::desk_id::Rack) -> Option<Self> {
+        use tangent_ui::desk_id::Rack;
+        let lane = matches!(owner, RackOwner::Lane(_));
+        let index = match rack {
+            Rack::Chain(c) => (usize::from(c) < tangent_ui::desk_id::STRIP_RACKS).then_some(usize::from(c))?,
+            Rack::Pedal(p) if lane => (usize::from(p) < tangent_ui::desk_id::AMP_PEDALS).then_some(2 + usize::from(p))?,
+            Rack::Pad(n) if lane => (usize::from(n) < PADS).then_some(LANE_RACKS + usize::from(n))?,
+            Rack::Pedal(_) | Rack::Pad(_) => return None,
+        };
+        Some(Self { owner, rack: u16::try_from(index).ok()? })
+    }
+
+    /// **The desk's name for this rack**: [`RackAddr::of`]'s inverse.
+    pub fn desk_rack(self) -> Option<tangent_ui::desk_id::Rack> {
+        use tangent_ui::desk_id::Rack;
+        let r = usize::from(self.rack);
+        let lane = matches!(self.owner, RackOwner::Lane(_));
+        Some(match r {
+            0 | 1 => Rack::Chain(self.rack),
+            _ if !lane => return None,
+            p if p < LANE_RACKS => Rack::Pedal(u8::try_from(p - 2).ok()?),
+            n => Rack::Pad(u8::try_from(n - LANE_RACKS).ok().filter(|n| usize::from(*n) < PADS)?),
+        })
+    }
+
+    /// **The seat a plan's key table names this rack by** (`InKey::seat`):
+    /// the plan is built for the engine, so it speaks the engine's private
+    /// seat, and this is the one door the host's translation reaches it by.
+    pub fn plan_seat(self) -> Option<u32> {
+        u32::try_from(self.seat()?).ok()
+    }
+
+    /// The lane this rack is a rack of, if it is a lane's.
+    pub fn lane(self) -> Option<Slot> {
+        match self.owner {
+            RackOwner::Lane(slot) => Some(slot),
+            _ => None,
+        }
+    }
+
     /// The engine-private seat this rack answers to. `None` for a rack the
     /// owner does not have.
     fn seat(self) -> Option<usize> {
@@ -17846,6 +17895,80 @@ struct Handoff {
     from_audio: Consumer<PluginBox>,
 }
 
+/// **The host's half of one rack** (design 8, item 8: plugins are
+/// reconciled "through one `HostRack` per bay", which "replaces the nine
+/// `Vec<[_; INSERTS]>` tables on `Engine`"): the UI thread's ends of the
+/// rack's bays' rings, and everything the host knows about each bay's
+/// tenant, kept together.
+///
+/// They were nine tables of `[_; INSERTS]` beside the ring ends, each indexed
+/// by the same seat, so every road that seated, emptied or forgot a bay had
+/// to remember all nine (and the LV2 one on the platforms that have it), and
+/// a lane coming home had to clear each of them by hand. One record per rack
+/// is one thing to make, to find and to forget. A rack is reached by its
+/// identity ([`RackAddr`]) from outside the engine; the seat it answers to
+/// ([`RackAddr::seat`]) is the engine's private index into the list.
+struct HostRack {
+    /// The UI thread's ends of each bay's hand-off. See `Rack`.
+    handoff: [Handoff; INSERTS],
+    /// What the host knows of each bay's tenant.
+    bays: [HostBay; INSERTS],
+}
+
+impl HostRack {
+    fn new(handoff: [Handoff; INSERTS]) -> Self {
+        Self { handoff, bays: std::array::from_fn(|_| HostBay::default()) }
+    }
+}
+
+/// **What the host keeps about one bay's tenant.** Field order is drop
+/// order, and it carries the lifetime rule `editor` is documented with: the
+/// window goes before the controller reference that built its view.
+#[derive(Default)]
+struct HostBay {
+    /// What is in the bay, if anything.
+    loaded: Option<Loaded>,
+    /// Whether the tenant can take a sidechain key, captured at load time,
+    /// because the one moment the answer is knowable for a VST3 is before
+    /// its instance crosses to the audio thread ([`Loaded`] carries no bus
+    /// layout, and there is no `&Instance` on this thread afterwards).
+    keyable: bool,
+    /// The open editor window, if the user has asked for one. **An insert
+    /// is a plugin with a window like any other**, and until this existed
+    /// there was no way to reach one: a reverb loaded into a channel came up,
+    /// worked, and could not be adjusted. The engine owns it because the
+    /// engine owns the plugin, and an editor must never outlive the instance
+    /// whose controller built its view: declared before `editor_handle`, so
+    /// even a plain drop releases the window and its `IPlugView` before the
+    /// controller reference that made them.
+    editor: Option<tangent_host::Editor>,
+    /// The tenant's edit controller, taken in [`Engine::load_seat`] BEFORE
+    /// the instance leaves for the audio thread, the one moment there is an
+    /// `&Instance` on this thread. See [`Engine::open_editor`].
+    editor_handle: Option<tangent_host::EditorHandle>,
+    /// An LV2 tenant's identity and its controls. See [`Lv2Bay`]. A bay
+    /// holds one format or another, and every site that clears one clears
+    /// them all, which is what one record per bay makes automatic.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    lv2: Option<Lv2Bay>,
+    /// A built-in tenant's unit and its controls. See
+    /// [`crate::builtin_fx::BuiltinBay`]: the host's record is the state,
+    /// because the instance is on the audio thread and cannot be asked.
+    builtin: Option<crate::builtin_fx::BuiltinBay>,
+    /// The tenant's processor reference, taken beside the editor's and for
+    /// the same reason: what lets a bay's settings survive a relaunch.
+    state_handle: Option<tangent_host::StateHandle>,
+    /// How to ask the tenant its latency again, from THIS thread: the audio
+    /// thread holds the instance and may not make the call. See
+    /// `poll_latency`.
+    latency_handle: Option<tangent_host::LatencyHandle>,
+    /// Why the bay's saved state was not restored, if it was not: a stale or
+    /// hand-edited blob must not stop the plugin loading, so the load goes on
+    /// with the defaults and the reason lands here, where
+    /// [`Engine::insert_state_error`] can put it in front of someone.
+    state_error: Option<String>,
+}
+
 /// How many routes the desk can carry at once.
 ///
 /// A ceiling rather than a `Vec`, because this table is read on the audio
@@ -17959,7 +18082,6 @@ fn unpack_aim(w: u64) -> Option<(usize, usize, u32)> {
 /// aims are `(slot, gen, rack, bay)`). `slot` is a [`RackOwner`], as in
 /// [`UiParam`], so the strips that are not rows can be aimed at; `gen` is
 /// read for a lane only.
-#[cfg_attr(not(test), allow(dead_code, reason = "the tap by identity: the host still aims it by seat (`set_insert_tap`) until the SeatBay maps of W5-identity-maps"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapAim {
     pub slot: RackOwner,
@@ -18053,10 +18175,14 @@ pub struct Engine {
     /// into the app-lifetime `midi::MidiFastLane` (once, at engine start).
     hw_midi_tx: Option<Producer<MidiEvent>>,
 
-    /// The UI thread's ends of every rack's hand-offs. See `Rack`.
-    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
-    /// every channel is too much to carry inline through a move.
-    insert_handoff: Vec<[Handoff; INSERTS]>,
+    /// **Every rack's host half** ([`HostRack`]): its rings' UI-thread ends
+    /// and what the host knows of each bay's tenant, by the engine-private
+    /// seat each rack answers to ([`RackAddr::seat`]). Heap, for the reason
+    /// `Renderer::racks` gives: a seat per pad of every channel is too much
+    /// to carry inline through a move, and the editor and state records it
+    /// holds were what once put a quarter of a megabyte inline in `Engine`,
+    /// which ran a debug build's moves off the end of a 2 MiB test stack.
+    host_racks: Vec<HostRack>,
     /// **The op ring's sending end, and the retire ring's receiving end**
     /// (design 7.4). See the slot API.
     ops_tx: RefCell<Producer<Op>>,
@@ -18110,15 +18236,17 @@ pub struct Engine {
     sampler_to_audio: Producer<(usize, Option<SamplerSample>)>,
     sampler_from_audio: Consumer<(usize, Option<SamplerSample>)>,
     /// The per-lane instruments' rings, and the host's own record of which
-    /// lanes it has shipped one to. The record lives HERE and not in an
-    /// atomic because only this thread creates or removes instances; the
-    /// audio thread's truth is whatever has actually arrived.
+    /// lanes it has shipped one to, by slot. The record lives HERE and not in
+    /// an atomic because only this thread creates or removes instances; the
+    /// audio thread's truth is whatever has actually arrived. A set of slots
+    /// and no word of bits: a lane past the thirty-second gets its
+    /// instrument like any other (see [`Engine::sync_instruments`]).
     dx7_to_audio: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     dx7_from_audio: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     keys_to_audio: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
     keys_from_audio: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
-    dx7_lanes_have: u32,
-    keys_lanes_have: u32,
+    dx7_have: std::collections::BTreeSet<Slot>,
+    keys_have: std::collections::BTreeSet<Slot>,
     /// The device rate the renderer was built at, kept so a lane gaining an
     /// instrument mid-session gets one built for the right clock.
     inst_rate: f32,
@@ -18137,84 +18265,9 @@ pub struct Engine {
     /// The device send ring's read end, handed to the desktop's
     /// `devsend::DeviceSend` once per engine. `None` after it has been taken.
     devsend_rx: Option<Consumer<f32>>,
-    /// What is in each of them, for the desk to name.
-    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
-    /// every channel is too much to carry inline through a move.
-    inserts_loaded: Vec<[Option<Loaded>; INSERTS]>,
-    /// Whether each bay's tenant can take a sidechain key — captured at load
-    /// time, because the one moment the answer is knowable for a VST3 is
-    /// before its instance crosses to the audio thread ([`Loaded`] carries no
-    /// bus layout, and there is no `&Instance` on this thread afterwards).
-    insert_keyable: Vec<[bool; INSERTS]>,
 
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
-
-    /// The open editor window for each loaded insert, if the user has asked
-    /// for one. **An insert is a plugin with a window like any other**, and
-    /// until this existed there was no way to reach one: a reverb loaded into
-    /// a channel came up, worked, and could not be adjusted — every control
-    /// it has is inside a window nothing opened.
-    ///
-    /// The engine owns them because the engine owns the plugins, and the two
-    /// have a lifetime rule: an editor must never outlive the instance whose
-    /// controller built its view. Declared **before** `insert_editor_handles`
-    /// so that even a plain `drop(engine)` releases every window and its
-    /// `IPlugView` before the controller references that made them.
-    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
-    /// every channel is too much to carry inline through a move.
-    insert_editors: Vec<[Option<tangent_host::Editor>; INSERTS]>,
-    /// Each loaded insert's edit controller, taken in [`Engine::load_insert`]
-    /// **before** the instance leaves for the audio thread — the one moment
-    /// there is an `&Instance` on this thread. See [`Engine::open_editor`].
-    /// Heap, for the reason `Renderer::racks` gives. These two were the
-    /// last of them and much the largest: a seat per pad of every
-    /// channel put a QUARTER OF A MEGABYTE inline in `Engine`, and a
-    /// test that opens two engines in one frame ran a debug build's
-    /// moves straight off the end of a 2 MiB test stack.
-    insert_editor_handles: Vec<[Option<tangent_host::EditorHandle>; INSERTS]>,
-    /// Each LV2 bay's identity and its controls. See [`Lv2Bay`].
-    ///
-    /// Kept beside the VST3 handles because a bay holds one format or the
-    /// other and every site that clears one must clear both.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    insert_lv2: Vec<[Option<Lv2Bay>; INSERTS]>,
-    /// Each built-in bay's unit and its controls. See
-    /// [`crate::builtin_fx::BuiltinBay`] — the LV2 arrangement, inherited:
-    /// the host's record is the state, because the instance is on the audio
-    /// thread and cannot be asked. Kept beside the other per-format records
-    /// because a bay holds exactly one format and every site that clears one
-    /// must clear them all.
-    insert_builtin: Vec<[Option<crate::builtin_fx::BuiltinBay>; INSERTS]>,
-    /// Each loaded insert's processor reference, taken beside the editor's and
-    /// for the same reason: after the handoff there is no `&Instance` to ask.
-    /// This is what lets a bay's settings survive a relaunch — no insert has
-    /// ever had one before, so every effect's knobs and every bay instrument's
-    /// preset died with the process.
-    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
-    /// every channel is too much to carry inline through a move.
-    insert_state_handles: Vec<[Option<tangent_host::StateHandle>; INSERTS]>,
-    /// How to ask each seated plugin its latency again, from THIS thread.
-    ///
-    /// The audio thread holds the instance and may not make the call; it can
-    /// only be told the figure has gone stale. See `poll_latency`.
-    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
-    /// every channel is too much to carry inline through a move.
-    insert_latency_handles: Vec<[Option<tangent_host::LatencyHandle>; INSERTS]>,
-    /// Why a bay's saved state was not restored, if it was not.
-    ///
-    /// A stale or hand-edited blob must not stop the plugin loading — the
-    /// user wants their piano more than they want their preset — so the load
-    /// continues with the plugin's defaults and the reason lands here, where
-    /// [`Engine::insert_state_error`] can put it in front of someone.
-    /// Silently ignoring it is how "it keeps forgetting my piano" becomes
-    /// unreportable.
-    /// Heap, for the reason `Renderer::racks` gives. These two were the
-    /// last of them and much the largest: a seat per pad of every
-    /// channel put a QUARTER OF A MEGABYTE inline in `Engine`, and a
-    /// test that opens two engines in one frame ran a debug build's
-    /// moves straight off the end of a 2 MiB test stack.
-    insert_state_errors: Vec<[Option<String>; INSERTS]>,
 
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
@@ -18324,58 +18377,35 @@ impl Engine {
         }
     }
 
-    /// The host's ends of every seat a lane's racks answer to, made to
-    /// exist. The per-seat tables grow on the host and never on the
-    /// callback: a seat is the engine's private name for a rack.
+    /// The host's half of every seat a lane's racks answer to, made to
+    /// exist. The list grows on the host and never on the callback: a seat
+    /// is the engine's private name for a rack.
     fn ensure_seats(&mut self, seats: usize) {
-        while self.insert_handoff.len() < seats {
+        while self.host_racks.len() < seats {
             let (_, ends) = new_rack();
-            self.insert_handoff.push(ends);
+            self.host_racks.push(HostRack::new(ends));
         }
-        let n = self.insert_handoff.len();
-        self.inserts_loaded.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_keyable.resize(n, [false; INSERTS]);
-        self.insert_editors.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_editor_handles.resize_with(n, || std::array::from_fn(|_| None));
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        self.insert_lv2.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_builtin.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_state_handles.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_latency_handles.resize_with(n, || std::array::from_fn(|_| None));
-        self.insert_state_errors.resize_with(n, || std::array::from_fn(|_| None));
+    }
+
+    /// **The host's record of one bay**, by the seat its rack answers to.
+    fn host_bay(&self, seat: usize, bay: usize) -> Option<&HostBay> {
+        self.host_racks.get(seat)?.bays.get(bay)
+    }
+
+    fn host_bay_mut(&mut self, seat: usize, bay: usize) -> Option<&mut HostBay> {
+        self.host_racks.get_mut(seat)?.bays.get_mut(bay)
     }
 
     /// **Forget everything the host held for one seat**: the window first,
-    /// then the controller and state references, then the records. For a
-    /// lane that has come home, whose plugins are about to be dropped here.
+    /// then the controller and state references, then the records (each
+    /// bay's record drops in that order). For a lane that has come home,
+    /// whose plugins are about to be dropped here.
     fn clear_seat(&mut self, seat: usize) {
         for bay in 0..INSERTS {
-            self.close_insert_editor(seat, bay);
+            self.close_seat_editor(seat, bay);
         }
-        if let Some(r) = self.insert_editor_handles.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(r) = self.insert_lv2.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.insert_builtin.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.insert_state_handles.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.insert_latency_handles.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.insert_state_errors.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.inserts_loaded.get_mut(seat) {
-            *r = std::array::from_fn(|_| None);
-        }
-        if let Some(r) = self.insert_keyable.get_mut(seat) {
-            *r = [false; INSERTS];
+        if let Some(r) = self.host_racks.get_mut(seat) {
+            r.bays = std::array::from_fn(|_| HostBay::default());
         }
     }
 
@@ -18388,8 +18418,8 @@ impl Engine {
         self.ensure_seats(lane_seat(slot, LANE_RACKS - 1) + 1);
         for r in 0..LANE_RACKS {
             let (rack, ends) = new_rack();
-            if let Some(cell) = self.insert_handoff.get_mut(lane_seat(slot, r)) {
-                *cell = ends;
+            if let Some(host) = self.host_racks.get_mut(lane_seat(slot, r)) {
+                host.handoff = ends;
             }
             racks.push(rack);
         }
@@ -18485,10 +18515,8 @@ impl Engine {
             // slot took its DX7 and keyboard home in its box, so the host's
             // record of what it shipped there is forgotten with it, or the
             // new track's instrument would never be sent.
-            if let Some(bit) = 1u32.checked_shl(slot.0) {
-                self.dx7_lanes_have &= !bit;
-                self.keys_lanes_have &= !bit;
-            }
+            self.dx7_have.remove(&slot);
+            self.keys_have.remove(&slot);
             let gen = self.mint_gen();
             list.push((slot, Some(self.build_lane(at, gen, spec))));
             self.host_slots[at] = HostSlot { gen, live: true, leaving: false };
@@ -18660,10 +18688,9 @@ impl Engine {
         hit
     }
 
-    /// **[`Engine::load_insert`], by rack identity** (contract C8): a lane's
-    /// rack by its slot, or a strip's. `Ok(None)` for a rack that does not
-    /// exist, as `load_insert` answers a seat that does not.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the host loads by the engine seat a lane's rack answers to until W5-identity-maps' HostRack"))]
+    /// **Seat a plugin in one bay, or empty it, by rack identity** (contract
+    /// C8): a lane's rack by its slot, or a strip's, through that rack's
+    /// [`HostRack`]. `Ok(None)` for a rack that does not exist.
     pub fn load_insert_at(
         &mut self,
         addr: RackAddr,
@@ -18674,16 +18701,30 @@ impl Engine {
         let Some(seat) = addr.seat() else {
             return Ok(None);
         };
-        self.load_insert(seat, bay, bundle, state)
+        self.load_seat(seat, bay, bundle, state)
+    }
+
+    /// [`Engine::load_insert_at`] by the seat a rack answers to: the shim the
+    /// engine's own tests, the bench and the goldens speak (design 13
+    /// W4-integrate (C): today's pub API, test-only).
+    #[cfg(test)]
+    pub fn load_insert(
+        &mut self,
+        seat: usize,
+        bay: usize,
+        bundle: Option<&Path>,
+        state: Option<&[u8]>,
+    ) -> Result<Option<Loaded>, String> {
+        self.load_seat(seat, bay, bundle, state)
     }
 
     /// Empty one bay, by rack identity.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the host unloads by the engine seat a lane's rack answers to until W5-identity-maps' HostRack"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the host empties a bay through `load_insert_at` with no bundle, as the reconcile wants; this is the slot API's spelling of it"))]
     pub fn unload_insert_at(&mut self, addr: RackAddr, bay: usize) -> Result<(), String> {
         let Some(seat) = addr.seat() else {
             return Ok(());
         };
-        self.load_insert(seat, bay, None, None).map(|_| ())
+        self.load_seat(seat, bay, None, None).map(|_| ())
     }
 
     /// **The ops the callback sent home, dropped here.** Lanes back from a
@@ -19215,12 +19256,12 @@ impl Engine {
             }
         }).collect();
         let mut rack_ends = rack_ends.into_iter();
-        let insert_handoff: Vec<[Handoff; INSERTS]> = (0..RACK_SEATS)
-            .map(|_| rack_ends.next().expect("one set per channel"))
+        let host_racks: Vec<HostRack> = (0..RACK_SEATS)
+            .map(|_| HostRack::new(rack_ends.next().expect("one set per channel")))
             .collect();
         // The effect across the bus used to have a pair of its own here. It
         // does not any more: the bus is a channel like the others and its
-        // effect is `insert_handoff[Strip::Fx.index()]`, so what was left was
+        // effect is `host_racks[Strip::Fx.index()]`'s, so what was left was
         // two rings built on every engine start with nothing on either end.
 
         let dev_ch = channels as usize;
@@ -19542,7 +19583,7 @@ impl Engine {
             midi: RefCell::new(midi_tx),
             ui_params: RefCell::new(ui_param_tx),
             hw_midi_tx: Some(hw_midi_tx),
-            insert_handoff,
+            host_racks,
             ops_tx: RefCell::new(ops_tx),
             retire_rx,
             host_slots: vec![
@@ -19577,8 +19618,8 @@ impl Engine {
             dx7_from_audio,
             keys_to_audio,
             keys_from_audio,
-            dx7_lanes_have: 0,
-            keys_lanes_have: 0,
+            dx7_have: std::collections::BTreeSet::new(),
+            keys_have: std::collections::BTreeSet::new(),
             inst_rate: rate as f32,
             preview_to_audio,
             preview_from_audio,
@@ -19588,8 +19629,6 @@ impl Engine {
             insert_tap_rx,
             reastream_rx: Some(reastream_rx),
             devsend_rx: Some(devsend_rx),
-            inserts_loaded: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_keyable: (0..RACK_SEATS).map(|_| [false; INSERTS]).collect(),
             tap: Some(RecorderTap {
                 rx: tap_rx,
                 channels: TAP_CHANNELS,
@@ -19597,14 +19636,6 @@ impl Engine {
                 dropped: shared,
             }),
             fault,
-            insert_editors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_editor_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            insert_lv2: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_builtin: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_state_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_latency_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
         })
@@ -19981,10 +20012,14 @@ impl Engine {
         })
     }
 
-    pub fn load_insert(
+    /// **Seat `bundle` in one bay, or empty it** (`None`), by the seat its
+    /// rack answers to: the engine-private half of [`Engine::load_insert_at`],
+    /// the host's road by rack identity. `Ok(None)` for a seat or bay no rack
+    /// has.
+    fn load_seat(
         &mut self,
-        strip: usize,
-        slot: usize,
+        seat: usize,
+        bay: usize,
         bundle: Option<&Path>,
         state: Option<&[u8]>,
     ) -> Result<Option<Loaded>, String> {
@@ -19994,81 +20029,44 @@ impl Engine {
         // FX bay stored a plugin, the host dispatched it, and the engine
         // dropped it on the floor: "drum FX slots do nothing". `mix_pads`
         // already runs each pad's rack; they just never got filled.
-        if strip >= self.insert_handoff.len() || slot >= INSERTS {
+        if seat >= self.host_racks.len() || bay >= INSERTS {
             return Ok(None);
         }
         let Some(bundle) = bundle else {
             // Window first, then the controller and state references, then the
-            // instance.
-            self.close_insert_editor(strip, slot);
-            if let Some(h) = self
-                .insert_editor_handles
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *h = None;
-            }
-            // A new tenant's ports are not the old one's, so the whole record
-            // goes rather than just the identity: values left standing would be
-            // pushed into the next plugin's window.
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            if let Some(h) = self
-                .insert_lv2
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *h = None;
-            }
-            if let Some(h) = self
-                .insert_builtin
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *h = None;
-            }
-            if let Some(h) = self
-                .insert_state_handles
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *h = None;
-            }
-            if let Some(h) = self
-                .insert_latency_handles
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *h = None;
+            // instance. A new tenant's ports are not the old one's, so the
+            // whole record goes rather than just the identity: values left
+            // standing would be pushed into the next plugin's window.
+            self.close_seat_editor(seat, bay);
+            if let Some(b) = self.host_bay_mut(seat, bay) {
+                b.editor_handle = None;
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                {
+                    b.lv2 = None;
+                }
+                b.builtin = None;
+                b.state_handle = None;
+                b.latency_handle = None;
             }
             // An emptied bay delays nothing. Left standing, its old figure
             // would hold every other lane late forever, waiting on a plugin
             // that is no longer there.
-            Rack::set_latency(&self.shared, strip, slot, 0);
+            Rack::set_latency(&self.shared, seat, bay, 0);
             // And its meter reads nothing: one stale fetch_max would flash
             // the next tenant's needle with the old compressor's work.
-            if let Some(cell) = self.shared.seat_cell(SeatKind::Gr, strip * INSERTS + slot) {
+            if let Some(cell) = self.shared.seat_cell(SeatKind::Gr, seat * INSERTS + bay) {
                 cell.store(0, Ordering::Relaxed);
             }
             // A refused UNLOAD changes nothing worth reporting: the box is
             // empty, and the seat keeps its tenant until the callback drains
             // the ring or the engine is torn down.
-            let _ = self.hand_off_insert(strip, slot, PluginBox(None));
-            self.inserts_loaded[strip][slot] = None;
+            let _ = self.hand_off_insert(seat, bay, PluginBox(None));
             // An emptied bay takes no key; a stale `true` would offer the
             // menu row for a tenant that is gone.
-            if let Some(k) = self
-                .insert_keyable
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *k = false;
-            }
-            if let Some(e) = self
-                .insert_state_errors
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *e = None;
+            if let Some(b) = self.host_bay_mut(seat, bay) {
+                b.loaded = None;
+                b.keyable = false;
+                b.state_error = None;
             }
             return Ok(None);
         };
@@ -20126,52 +20124,24 @@ impl Engine {
         } = prepared;
         // Whatever was in THIS bay is going away, so its window and then its
         // controller and state references go first — the lifetime rule from
-        // `editors`.
-        // `hand_off_insert` is where the old instance is dropped, and dropping
-        // it terminates the controller the old handle points at.
-        self.close_insert_editor(strip, slot);
-        if let Some(h) = self
-            .insert_editor_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = None;
-        }
-        // A new tenant's ports are not the old one's, so the whole record
-        // goes rather than just the identity: values left standing would be
-        // pushed into the next plugin's window.
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(h) = self
-            .insert_lv2
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = None;
-        }
-        if let Some(h) = self
-            .insert_builtin
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = None;
-        }
-        if let Some(h) = self
-            .insert_state_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = None;
-        }
-        if let Some(h) = self
-            .insert_latency_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = None;
+        // `editor`. `hand_off_insert` is where the old instance is dropped,
+        // and dropping it terminates the controller the old handle points
+        // at. A new tenant's ports are not the old one's, so the whole record
+        // goes rather than just the identity.
+        self.close_seat_editor(seat, bay);
+        if let Some(b) = self.host_bay_mut(seat, bay) {
+            b.editor_handle = None;
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                b.lv2 = None;
+            }
+            b.builtin = None;
+            b.state_handle = None;
+            b.latency_handle = None;
         }
         if let Some(refused) = self.hand_off_insert(
-            strip,
-            slot,
+            seat,
+            bay,
             PluginBox(Some(Box::new(Hosted {
                 backend,
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
@@ -20181,8 +20151,8 @@ impl Engine {
         ) {
             // **The seat never took it, so nothing here may say it did.**
             // The refused box dies NOW, on this thread — references first,
-            // the lifetime rule from `editors`: the fresh handles point at
-            // its controller and must not outlive it. The ledger is left
+            // the lifetime rule from `editor`: the fresh handles point at
+            // its controller and must not outlive it. The record is left
             // alone; the bay's previous tenant is still seated in the
             // callback (its retire rides the same full ring), and naming it
             // is more honest than naming the plugin that just died.
@@ -20195,62 +20165,24 @@ impl Engine {
                 display_name
             ));
         }
-        if let Some(h) = self
-            .insert_editor_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = editor_handle;
-        }
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(h) = self
-            .insert_lv2
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = lv2_bay;
-        }
-        if let Some(h) = self
-            .insert_builtin
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = builtin_bay;
-        }
-        if let Some(h) = self
-            .insert_state_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = state_handle;
-        }
-        if let Some(h) = self
-            .insert_latency_handles
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *h = latency_handle;
-        }
-        Rack::set_latency(&self.shared, strip, slot, latency_now);
-        self.inserts_loaded[strip][slot] = Some(loaded.clone());
-        if let Some(k) = self
-            .insert_keyable
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *k = wants_key;
-        }
-        if let Some(e) = self
-            .insert_state_errors
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *e = state_error.map(|err| err.to_string());
+        Rack::set_latency(&self.shared, seat, bay, latency_now);
+        if let Some(b) = self.host_bay_mut(seat, bay) {
+            b.editor_handle = editor_handle;
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                b.lv2 = lv2_bay;
+            }
+            b.builtin = builtin_bay;
+            b.state_handle = state_handle;
+            b.latency_handle = latency_handle;
+            b.loaded = Some(loaded.clone());
+            b.keyable = wants_key;
+            b.state_error = state_error.map(|err| err.to_string());
         }
         Ok(Some(loaded))
     }
 
-    /// Why the state handed to [`Engine::load_insert`] was not restored into
+    /// Why the state handed to [`Engine::load_insert_at`] was not restored into
     /// this bay.
     ///
     /// `None` is the normal answer: nothing was offered, or it was restored.
@@ -20259,17 +20191,27 @@ impl Engine {
     /// "it keeps forgetting my piano" and nothing else in the app would know.
     ///
     /// **Read back by the engine's own tests and by nothing else in the
-    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
-    /// accessor the desk happens not to ask for reads as dead however
-    /// thoroughly it is exercised.
-    #[allow(dead_code)]
-    pub fn insert_state_error(&self, strip: usize, slot: usize) -> Option<&str> {
-        self.insert_state_errors.get(strip)?.get(slot)?.as_deref()
+    /// binary**, by the seat a rack answers to (a test shim, design 13
+    /// W4-integrate (C)).
+    #[cfg(test)]
+    pub fn insert_state_error(&self, seat: usize, bay: usize) -> Option<&str> {
+        self.host_bay(seat, bay)?.state_error.as_deref()
     }
 
-    /// What is in one insert, if anything.
-    pub fn insert(&self, strip: usize, slot: usize) -> Option<&Loaded> {
-        self.inserts_loaded.get(strip)?.get(slot)?.as_ref()
+    /// **What is in one bay, if anything**, by rack identity.
+    pub fn insert_at(&self, addr: RackAddr, bay: usize) -> Option<&Loaded> {
+        self.seat_loaded(addr.seat()?, bay)
+    }
+
+    /// [`Engine::insert_at`] by the seat a rack answers to: the shim the
+    /// engine's own tests speak (design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn insert(&self, seat: usize, bay: usize) -> Option<&Loaded> {
+        self.seat_loaded(seat, bay)
+    }
+
+    fn seat_loaded(&self, seat: usize, bay: usize) -> Option<&Loaded> {
+        self.host_bay(seat, bay)?.loaded.as_ref()
     }
 
     /// **Put `next` in the seat and hand back what it displaced.**
@@ -20289,11 +20231,7 @@ impl Engine {
         slot: usize,
         next: PluginBox,
     ) -> Result<Option<PluginBox>, PluginBox> {
-        let Some(pair) = self
-            .insert_handoff
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        else {
+        let Some(pair) = self.host_racks.get_mut(strip).and_then(|r| r.handoff.get_mut(slot)) else {
             return Err(next);
         };
         while pair.from_audio.pop().is_ok() {}
@@ -20340,27 +20278,37 @@ impl Engine {
 
     // ── the plugins' own editors ────────────────────────────────────────────
 
-    /// One insert's own window: open it, or raise it if it is already up.
+    /// **One bay's own window, by rack identity: open it, or raise it if it
+    /// is already up.**
     ///
     /// The same handle trick as [`Engine::open_editor`] — see the long comment
     /// in `load_plugin_with_state` for why a reference taken at load time is
     /// the only way to reach a plugin the audio thread owns.
-    pub fn open_insert_editor(&mut self, strip: usize, slot: usize) -> Result<(), String> {
+    pub fn open_insert_editor_at(&mut self, addr: RackAddr, bay: usize) -> Result<(), String> {
+        match addr.seat() {
+            Some(seat) => self.open_seat_editor(seat, bay),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Engine::open_insert_editor_at`] by the seat a rack answers to (a
+    /// test shim).
+    #[cfg(test)]
+    pub fn open_insert_editor(&mut self, seat: usize, bay: usize) -> Result<(), String> {
+        self.open_seat_editor(seat, bay)
+    }
+
+    fn open_seat_editor(&mut self, strip: usize, slot: usize) -> Result<(), String> {
         // **The whole seat map, pads included** — the same stale bound
-        // `load_insert` had already been cured of. This still capped at
+        // `load_seat` had already been cured of. This still capped at
         // `STRIPS`, so a pad's effect loaded, ran, and answered every click
         // on its bay with a silent `Ok`: a plugin whose window could never
         // open, and whose controls could therefore never be touched.
-        if strip >= self.insert_handoff.len() || slot >= INSERTS {
+        if strip >= self.host_racks.len() || slot >= INSERTS {
             return Ok(());
         }
         self.poll_editor();
-        if let Some(editor) = self
-            .insert_editors
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(editor) = self.host_bay(strip, slot).and_then(|b| b.editor.as_ref()) {
             editor.focus();
             return Ok(());
         }
@@ -20370,14 +20318,8 @@ impl Engine {
         // loaded" about a plugin that is loaded and running. That is the worst
         // shape a bug can take: a true-sounding message about the wrong thing.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(uri) = self
-            .insert_lv2
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-            .map(|b| b.uri.clone())
-        {
-            let title = match self.insert(strip, slot) {
+        if let Some(uri) = self.host_bay(strip, slot).and_then(|b| b.lv2.as_ref()).map(|b| b.uri.clone()) {
+            let title = match self.seat_loaded(strip, slot) {
                 Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
                 None => format!("Insert {} - Tangent", slot + 1),
             };
@@ -20397,86 +20339,85 @@ impl Engine {
             // back to that default. The values come from the same handle the
             // automation lanes read, so the two agree by construction.
             let mut editor = editor;
-            if let Some(bay) = self.insert_lv2.get(strip).and_then(|r| r.get(slot)).and_then(Option::as_ref) {
+            if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.lv2.as_ref()) {
                 for p in &bay.params {
                     // `port_index`, not `index`: an LV2 UI addresses ports by
                     // their absolute number. See `lv2::ParamInfo::port_index`.
                     editor.port_changed(u32::try_from(p.port_index).unwrap_or(u32::MAX), p.value);
                 }
             }
-            if let Some(e) = self
-                .insert_editors
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                *e = Some(editor);
+            if let Some(b) = self.host_bay_mut(strip, slot) {
+                b.editor = Some(editor);
             }
             return Ok(());
         }
-        let Some(handle) = self
-            .insert_editor_handles
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        else {
+        let Some(handle) = self.host_bay(strip, slot).and_then(|b| b.editor_handle.as_ref()) else {
             return Err(format!("nothing is loaded in insert {}", slot + 1));
         };
         // The CHANNEL and the bay, both, because the same compressor on four
         // channels gives four windows that are otherwise identical.
-        let title = match self.insert(strip, slot) {
+        let title = match self.seat_loaded(strip, slot) {
             Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
             None => format!("Insert {} - Tangent", slot + 1),
         };
         let editor = tangent_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
-        if let Some(e) = self
-            .insert_editors
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *e = Some(editor);
+        if let Some(b) = self.host_bay_mut(strip, slot) {
+            b.editor = Some(editor);
         }
         Ok(())
     }
 
-    /// Close one insert's window if it is open. Safe when it is not.
-    pub fn close_insert_editor(&mut self, strip: usize, slot: usize) {
-        if let Some(e) = self
-            .insert_editors
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            *e = None;
+    /// Close one bay's window if it is open, by rack identity. Safe when it
+    /// is not.
+    pub fn close_insert_editor_at(&mut self, addr: RackAddr, bay: usize) {
+        if let Some(seat) = addr.seat() {
+            self.close_seat_editor(seat, bay);
         }
     }
 
-    /// Whether the plugin in this bay offers an editor to open.
+    /// [`Engine::close_insert_editor_at`] by seat (a test shim).
+    #[cfg(test)]
+    pub fn close_insert_editor(&mut self, seat: usize, bay: usize) {
+        self.close_seat_editor(seat, bay);
+    }
+
+    fn close_seat_editor(&mut self, seat: usize, bay: usize) {
+        if let Some(b) = self.host_bay_mut(seat, bay) {
+            b.editor = None;
+        }
+    }
+
+    /// **Whether the plugin in this bay offers an editor to open**, by rack
+    /// identity.
     ///
     /// `false` for an empty bay, for one that does not exist, and for a
     /// plugin that has no UI — which is the honest thing to grey a control
     /// on. The first call after a load is not free (VST3 has no `hasEditor`,
     /// so the only way to ask is to build a view and throw it away); every
     /// call after that is a cached bool.
-    pub fn insert_has_editor(&self, strip: usize, slot: usize) -> bool {
+    pub fn insert_has_editor_at(&self, addr: RackAddr, bay: usize) -> bool {
+        addr.seat().is_some_and(|seat| self.seat_has_editor(seat, bay))
+    }
+
+    /// [`Engine::insert_has_editor_at`] by seat (a test shim).
+    #[cfg(test)]
+    pub fn insert_has_editor(&self, seat: usize, bay: usize) -> bool {
+        self.seat_has_editor(seat, bay)
+    }
+
+    fn seat_has_editor(&self, strip: usize, slot: usize) -> bool {
         // Asked once per bay per frame by the menu that greys the item, so it
         // must not be the expensive question. `has_ui` is a metadata read; see
         // its own note on why it does not `dlopen`.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(bay) = self
-            .insert_lv2
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.lv2.as_ref()) {
             return tangent_host::lv2ui::Ui::has_ui(&bay.uri);
         }
-        self.insert_editor_handles
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
+        self.host_bay(strip, slot)
+            .and_then(|b| b.editor_handle.as_ref())
             .is_some_and(tangent_host::EditorHandle::has_editor)
     }
 
-    /// Is this insert's window open right now?
     /// **How many bays have an editor open, anywhere on the desk.**
     ///
     /// The host asks once a frame and uses the answer three ways: to gate
@@ -20489,19 +20430,25 @@ impl Engine {
     /// extra rack and all seven amp pedal seats of every lane, so a plugin
     /// in bay four was never asked whether its preset moved its latency,
     /// never had its state saved when its window closed, and on Linux had
-    /// its window frozen. Counted here instead, over every seat the engine
+    /// its window frozen. Counted here instead, over every rack the engine
     /// actually has.
     pub fn open_insert_editors(&self) -> usize {
-        (0..self.insert_handoff.len())
-            .map(|strip| (0..INSERTS).filter(|slot| self.insert_editor_open(strip, *slot)).count())
-            .sum()
+        self.host_racks.iter().map(|r| r.bays.iter().filter(|b| b.editor.is_some()).count()).sum()
     }
 
-    pub fn insert_editor_open(&self, strip: usize, slot: usize) -> bool {
-        self.insert_editors
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .is_some_and(Option::is_some)
+    /// Is this bay's window open right now? By rack identity.
+    pub fn insert_editor_open_at(&self, addr: RackAddr, bay: usize) -> bool {
+        addr.seat().is_some_and(|seat| self.seat_editor_open(seat, bay))
+    }
+
+    /// [`Engine::insert_editor_open_at`] by seat (a test shim).
+    #[cfg(test)]
+    pub fn insert_editor_open(&self, seat: usize, bay: usize) -> bool {
+        self.seat_editor_open(seat, bay)
+    }
+
+    fn seat_editor_open(&self, seat: usize, bay: usize) -> bool {
+        self.host_bay(seat, bay).is_some_and(|b| b.editor.is_some())
     }
 
     /// Ask any plugin that says its latency changed for the new figure.
@@ -20525,21 +20472,16 @@ impl Engine {
     /// figure rather than doing it every frame.
     pub fn poll_latency(&mut self) -> bool {
         let mut moved = false;
-        for strip in 0..self.insert_handoff.len() {
-            for slot in 0..INSERTS {
-                let Some(h) = self
-                    .insert_latency_handles
-                    .get(strip)
-                    .and_then(|r| r.get(slot))
-                    .and_then(Option::as_ref)
-                else {
+        for (seat, rack) in self.host_racks.iter().enumerate() {
+            for (bay, record) in rack.bays.iter().enumerate() {
+                let Some(h) = record.latency_handle.as_ref() else {
                     continue;
                 };
                 if !h.take_dirty() {
                     continue;
                 }
                 let now = h.latency_samples();
-                if Rack::set_latency(&self.shared, strip, slot, now) {
+                if Rack::set_latency(&self.shared, seat, bay, now) {
                     moved = true;
                 }
             }
@@ -20559,10 +20501,10 @@ impl Engine {
         // An insert's window closed by its own close button would otherwise
         // stay "open" here for ever, and
         // the click that should reopen it would silently raise nothing.
-        for rack in &mut self.insert_editors {
-            for editor in rack {
-                if editor.as_ref().is_some_and(tangent_host::Editor::closed) {
-                    *editor = None;
+        for rack in &mut self.host_racks {
+            for bay in &mut rack.bays {
+                if bay.editor.as_ref().is_some_and(tangent_host::Editor::closed) {
+                    bay.editor = None;
                 }
             }
         }
@@ -20582,8 +20524,9 @@ impl Engine {
             // `(seat, bay, id, value)`: the host's records speak seats, and
             // each becomes a `UiParam` by rack identity on its way out.
             let mut pending: Vec<(usize, usize, u32, f64)> = Vec::new();
-            for (strip, rack) in self.insert_editors.iter_mut().enumerate() {
-                for (bay, editor) in rack.iter_mut().enumerate() {
+            for (strip, rack) in self.host_racks.iter_mut().enumerate() {
+                for (bay, record) in rack.bays.iter_mut().enumerate() {
+                    let HostBay { editor, lv2, .. } = record;
                     let Some(editor) = editor.as_mut() else {
                         continue;
                     };
@@ -20595,11 +20538,7 @@ impl Engine {
                     // nearly all of them, and using one where the other is
                     // wanted moves a different knob — the sound changes, so it
                     // looks like it worked.
-                    let table = self
-                        .insert_lv2
-                        .get(strip)
-                        .and_then(|r| r.get(bay))
-                        .and_then(Option::as_ref);
+                    let table = lv2.as_ref();
                     for (id, value) in editor.drain_edits() {
                         let Some(index) = table.and_then(|t| {
                             t.params
@@ -20628,12 +20567,7 @@ impl Engine {
             // thread.** One source, so the automation lanes, the next opening of
             // the window and the saved session cannot disagree with the sound.
             for &(seat, bay, id, value) in &pending {
-                let Some(bay) = self
-                    .insert_lv2
-                    .get_mut(seat)
-                    .and_then(|r| r.get_mut(bay))
-                    .and_then(Option::as_mut)
-                else {
+                let Some(bay) = self.host_bay_mut(seat, bay).and_then(|b| b.lv2.as_mut()) else {
                     continue;
                 };
                 if let Some(p) = bay.params.get_mut(id as usize) {
@@ -20662,77 +20596,78 @@ impl Engine {
         }
     }
 
-    /// Is anything loaded at all?
-    ///
-    /// The take-source decision: a take records the instruments when there is an
-    /// instrument to record, and one full slot out of three is enough. Asking
-    /// per slot would make "record the plugin" mean "record slot 0".
-    /// Put the built-in instrument in a slot, or take it out.
-    ///
-    /// A slot holding it is not a plugin: nothing is opened, nothing can fail,
-    /// and it is playing on the next block.
-    /// Make the per-lane instrument instances match the desk's masks.
+    /// **Make the per-lane instrument instances match the desk, by slot**
+    /// (the bridge's road): the lanes that should hold a DX7 and those that
+    /// should hold the modelled keyboard, as slot lists. Answers the slots a
+    /// DX7 was just shipped to, each of which wants its strip's voice.
     ///
     /// **This is where the amount-limit died.** Instances are built and freed
     /// on THIS thread — a `Dx7` is a synth and a `Keys` is 3 MB of delay
     /// lines, neither of which the callback may allocate or drop — and travel
-    /// by the kit's swap protocol. The host's own `*_lanes_have` masks are
-    /// the diff's memory: a push that does not fit (the rings hold a whole
-    /// desk plus slack, so only a stall could fill them) leaves the bit
-    /// unchanged and the diff simply fires again next frame.
+    /// by the kit's swap protocol into the lane's own box, at any slot. The
+    /// host's own sets of the slots it has shipped one to are the diff's
+    /// memory: a push that does not fit (the rings hold a whole desk plus
+    /// slack, so only a stall could fill them) leaves the set unchanged and
+    /// the diff simply fires again next frame. Sets and no word of bits, so
+    /// a lane past the thirty-second is served like the rest; walked in slot
+    /// order, a slot's DX7 before its keyboard, the order the word's walk had.
     ///
-    /// Returns the lanes CREATED this call, `(dx7, keys)`, so the caller can
-    /// follow up with each new lane's cartridge voice — the patch, voicing
-    /// and width need no follow-up, being per-lane atomics a fresh instance
-    /// reads before its first strike.
-    /// **[`Engine::sync_instrument_lanes`], by slot** (the bridge's road): the
-    /// lanes that should hold a DX7 and those that should hold the modelled
-    /// keyboard, as slot lists; answers the slots a DX7 was just shipped to,
-    /// each of which wants its strip's voice. A slot past the instrument
-    /// words is not served in this wave (see [`LEGACY_LANES`]).
+    /// The patch, voicing and width need no follow-up, being per-lane
+    /// atomics a fresh instance reads before its first strike.
     pub fn sync_instruments(&mut self, dx7: &[Slot], keys: &[Slot]) -> Vec<Slot> {
-        let word = |slots: &[Slot]| {
-            slots
-                .iter()
-                .filter_map(|s| 1u32.checked_shl(s.0))
-                .fold(0u32, |w, b| w | b)
-        };
-        let (made, _) = self.sync_instrument_lanes(word(dx7), word(keys));
-        dx7.iter().copied().filter(|s| 1u32.checked_shl(s.0).is_some_and(|b| made & b != 0)).collect()
-    }
-
-    pub fn sync_instrument_lanes(&mut self, dx7_mask: u32, keys_mask: u32) -> (u32, u32) {
+        use std::collections::BTreeSet;
         // The displaced instances come home to die here, not in the callback.
         while self.dx7_from_audio.pop().is_ok() {}
         while self.keys_from_audio.pop().is_ok() {}
-        let mut made = (0u32, 0u32);
-        for ch in 0..CHANNELS.min(32) {
-            let bit = 1u32 << ch;
-            let want = dx7_mask & bit != 0;
-            let have = self.dx7_lanes_have & bit != 0;
+        let want_dx7: BTreeSet<Slot> = dx7.iter().copied().collect();
+        let want_keys: BTreeSet<Slot> = keys.iter().copied().collect();
+        let every: BTreeSet<Slot> = want_dx7
+            .iter()
+            .chain(&want_keys)
+            .chain(&self.dx7_have)
+            .chain(&self.keys_have)
+            .copied()
+            .collect();
+        let mut made = Vec::new();
+        for slot in every {
+            let ch = slot.0 as usize;
+            let (want, have) = (want_dx7.contains(&slot), self.dx7_have.contains(&slot));
             if want && !have {
                 let inst = Box::new(crate::dx7::Dx7::new(self.inst_rate));
                 if self.dx7_to_audio.push((ch, Some(inst))).is_ok() {
-                    self.dx7_lanes_have |= bit;
-                    made.0 |= bit;
+                    self.dx7_have.insert(slot);
+                    made.push(slot);
                 }
             } else if !want && have && self.dx7_to_audio.push((ch, None)).is_ok() {
-                self.dx7_lanes_have &= !bit;
+                self.dx7_have.remove(&slot);
             }
-            let want = keys_mask & bit != 0;
-            let have = self.keys_lanes_have & bit != 0;
+            let (want, have) = (want_keys.contains(&slot), self.keys_have.contains(&slot));
             if want && !have {
                 let inst = Box::new(crate::keys::Keys::new(self.inst_rate));
                 if self.keys_to_audio.push((ch, Some(inst))).is_ok() {
-                    self.keys_lanes_have |= bit;
-                    made.1 |= bit;
+                    self.keys_have.insert(slot);
                 }
             } else if !want && have && self.keys_to_audio.push((ch, None)).is_ok() {
-                self.keys_lanes_have &= !bit;
+                self.keys_have.remove(&slot);
             }
         }
         made
     }
+
+    /// [`Engine::sync_instruments`] by the desk's old words, a bit per lane
+    /// of the first thirty-two: the shim the engine's own tests and the
+    /// goldens speak (design 13 W4-integrate (C)). Answers the lanes CREATED
+    /// this call, `(dx7, keys)`, as words.
+    #[cfg(test)]
+    pub fn sync_instrument_lanes(&mut self, dx7_mask: u32, keys_mask: u32) -> (u32, u32) {
+        let slots = |mask: u32| (0..LEGACY_LANES as u32).filter(|ch| mask & (1 << ch) != 0).map(Slot).collect::<Vec<_>>();
+        let keys_before = self.keys_have.clone();
+        let made = self.sync_instruments(&slots(dx7_mask), &slots(keys_mask));
+        let word = |it: &mut dyn Iterator<Item = Slot>| it.filter(|s| s.0 < 32).fold(0u32, |w, s| w | (1 << s.0));
+        let keys_made = word(&mut self.keys_have.difference(&keys_before).copied());
+        (word(&mut made.into_iter()), keys_made)
+    }
+
     /// **Every channel the drumpad is on.** See `Shared::drum_strips`.
     #[cfg(test)]
     pub fn set_drum_strips(&self, mask: u32) {
@@ -20811,12 +20746,13 @@ impl Engine {
         self.shared.keys_strips.store(mask, Ordering::Relaxed);
     }
 
-    /// Which of the modelled keyboard's patches lane `ch` has loaded, by
-    /// index into `keys::Patch::ALL`. Stores; the callback picks it up next
-    /// block. Per lane, because the instruments are: a piano on lane 2 and
-    /// an EP on lane 5 is the arrangement this whole rework exists for.
-    pub fn set_keys_patch(&self, ch: usize, patch: crate::keys::Patch) {
-        let Some(cell) = self.shared.lanes.cells(ch).map(|l| &l.keys_patch) else {
+    /// Which of the modelled keyboard's patches the lane at `slot` has
+    /// loaded, by index into `keys::Patch::ALL`. Stores; the callback picks
+    /// it up next block. Per lane, because the instruments are: a piano on
+    /// one track and an EP on another is the arrangement this whole rework
+    /// exists for.
+    pub fn set_keys_patch(&self, slot: Slot, patch: crate::keys::Patch) {
+        let Some(cell) = self.shared.lanes.cells(slot.0 as usize).map(|l| &l.keys_patch) else {
             return;
         };
         let index = crate::keys::Patch::ALL
@@ -20826,21 +20762,21 @@ impl Engine {
         cell.store(index as u32, Ordering::Relaxed);
     }
 
-    /// One of the keyboard panel's knobs for lane `ch`, normalised 0..=1 and
-    /// indexed by the loaded patch's `ParamSpec` list. Applied before the
-    /// block's strikes.
-    pub fn set_keys_param(&self, ch: usize, index: usize, v: f32) {
-        if let Some(cell) = self.shared.lanes.cells(ch).and_then(|l| l.keys_params.get(index)) {
+    /// One of the keyboard panel's knobs for the lane at `slot`, normalised
+    /// 0..=1 and indexed by the loaded patch's `ParamSpec` list. Applied
+    /// before the block's strikes.
+    pub fn set_keys_param(&self, slot: Slot, index: usize, v: f32) {
+        if let Some(cell) = self.shared.lanes.cells(slot.0 as usize).and_then(|l| l.keys_params.get(index)) {
             cell.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
     }
 
-    /// Lane `ch`'s whole rack at once, in the patch's own order. A shorter
-    /// slice leaves the rest alone, which is what a session written by a
-    /// build with fewer knobs hands over.
-    pub fn set_keys_params(&self, ch: usize, values: &[f32]) {
+    /// The lane at `slot`'s whole rack at once, in the patch's own order. A
+    /// shorter slice leaves the rest alone, which is what a session written
+    /// by a build with fewer knobs hands over.
+    pub fn set_keys_params(&self, slot: Slot, values: &[f32]) {
         for (i, v) in values.iter().enumerate() {
-            self.set_keys_param(ch, i, *v);
+            self.set_keys_param(slot, i, *v);
         }
     }
 
@@ -20868,21 +20804,23 @@ impl Engine {
         }
     }
 
-    /// Load a patch into lane `ch`'s built-in DX7.
+    /// Load a patch into the built-in DX7 of the lane at `slot`.
     ///
     /// Sent as a message rather than written through, because the renderer owns
     /// the instances and they are on the audio thread. A voice is 155 small
     /// numbers and this happens when somebody clicks a name in a list, so the
     /// cost is nothing. One pending voice per lane: a second click on the same
     /// lane replaces the first rather than queueing behind it.
-    pub fn set_builtin_voice(&mut self, ch: usize, voice: crate::dx7::Voice) {
+    pub fn set_builtin_voice(&mut self, slot: Slot, voice: crate::dx7::Voice) {
+        let ch = slot.0 as usize;
         if let Ok(mut g) = self.shared.pending_voices.lock() {
             g.retain(|(lane, _)| *lane != ch);
             g.push((ch, voice));
         }
     }
 
-    /// **Hold `key` down on lane `ch`'s own instrument, or let go of it.**
+    /// **Hold `key` down on the own instrument of the lane at `slot`, or let
+    /// go of it.**
     ///
     /// The one note door in this engine that names a strip. [`Engine::send_midi`]
     /// is the other, and it names none: a note down that road reaches every
@@ -20898,10 +20836,10 @@ impl Engine {
     /// "nothing is being held", which is a thing the caller can say again and
     /// again at no cost and which is true from the moment the hand comes up.
     ///
-    /// A `ch` past the desk is dropped rather than wrapped: a bad index here
-    /// would sound a note on somebody else's instrument.
-    pub fn set_audition(&self, ch: usize, key: Option<u8>) {
-        if let Some(cell) = self.shared.lanes.cells(ch).map(|l| &l.audition) {
+    /// A slot with no lane's numbers is dropped rather than wrapped: a bad
+    /// index here would sound a note on somebody else's instrument.
+    pub fn set_audition(&self, slot: Slot, key: Option<u8>) {
+        if let Some(cell) = self.shared.lanes.cells(slot.0 as usize).map(|l| &l.audition) {
             cell.store(key.map_or(u32::MAX, u32::from), Ordering::Relaxed);
         }
     }
@@ -20943,7 +20881,18 @@ impl Engine {
     /// One insert's current state, for persisting. `None` for an empty bay —
     /// or for a plugin whose `getState` failed, which is a preset to choose
     /// again rather than an error to stop on.
-    pub fn save_insert_state(&self, strip: usize, slot: usize) -> Option<Vec<u8>> {
+    pub fn save_insert_state_at(&self, addr: RackAddr, bay: usize) -> Option<Vec<u8>> {
+        self.seat_state(addr.seat()?, bay)
+    }
+
+    /// [`Engine::save_insert_state_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn save_insert_state(&self, seat: usize, bay: usize) -> Option<Vec<u8>> {
+        self.seat_state(seat, bay)
+    }
+
+    fn seat_state(&self, strip: usize, slot: usize) -> Option<Vec<u8>> {
         // **An LV2 bay is saved from the LEDGER, not from the plugin.** See
         // `Lv2Bay`: the host is the only writer of an LV2 control port, so it
         // already holds every value, and the instance it would otherwise have
@@ -20951,38 +20900,25 @@ impl Engine {
         // same information a VST3 `getState` returns, arrived at from the other
         // end.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(bay) = self
-            .insert_lv2
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.lv2.as_ref()) {
             return Some(tangent_host::lv2::state_from_params(&bay.params).into_bytes());
         }
         // A built-in bay is saved from ITS ledger for the same reason the LV2
         // one is — the instance is on the audio thread, and every durable
         // value came through the host anyway.
-        if let Some(bay) = self
-            .insert_builtin
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.builtin.as_ref()) {
             return Some(
                 crate::builtin_fx::state_text(bay.spec, &bay.values, &bay.extra).into_bytes(),
             );
         }
-        self.insert_state_handles
-            .get(strip)?
-            .get(slot)?
-            .as_ref()
+        self.host_bay(strip, slot)?.state_handle.as_ref()
             .and_then(|h| h.save().ok())
     }
 
     /// **What a hosted bay is SET TO**, in the plugin's own words:
     /// `(title, normalised, display, units)`, empty for a bay that is not a
     /// VST3 or publishes no controller. Main thread only, like
-    /// [`Self::save_insert_state`].
+    /// [`Self::save_insert_state_at`].
     ///
     /// Diagnostic. A restored session that sounds wrong and a session the
     /// host restored wrong are the same observation until somebody can read
@@ -20994,11 +20930,14 @@ impl Engine {
     /// caller is `furnish_probe_engine`'s `TANGENT_READ` door, which is how
     /// a saved session's compressor was read without opening its window.
     #[cfg(test)]
+    pub fn insert_readings_at(&self, addr: RackAddr, bay: usize) -> Vec<(String, f64, String, String)> {
+        addr.seat().map(|seat| self.insert_readings(seat, bay)).unwrap_or_default()
+    }
+
+    /// [`Engine::insert_readings_at`] by seat.
+    #[cfg(test)]
     pub fn insert_readings(&self, strip: usize, slot: usize) -> Vec<(String, f64, String, String)> {
-        self.insert_state_handles
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
+        self.host_bay(strip, slot).and_then(|b| b.state_handle.as_ref())
             .map(tangent_host::StateHandle::readings)
             .unwrap_or_default()
     }
@@ -21010,7 +20949,18 @@ impl Engine {
     /// Read through the same main-thread handle `save_insert_state` uses, so
     /// it obeys the same rule: never from the audio thread, and only while
     /// the instance is alive.
-    pub fn insert_parameters(&self, strip: usize, slot: usize) -> Vec<tangent_host::ParamInfo> {
+    pub fn insert_parameters_at(&self, addr: RackAddr, bay: usize) -> Vec<tangent_host::ParamInfo> {
+        addr.seat().map(|seat| self.seat_parameters(seat, bay)).unwrap_or_default()
+    }
+
+    /// [`Engine::insert_parameters_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn insert_parameters(&self, seat: usize, bay: usize) -> Vec<tangent_host::ParamInfo> {
+        self.seat_parameters(seat, bay)
+    }
+
+    fn seat_parameters(&self, strip: usize, slot: usize) -> Vec<tangent_host::ParamInfo> {
         // **The LV2 list, and it is the better one.** A VST3 parameter is a
         // normalised 0..1 that the host must ask the plugin to render into
         // text; an LV2 control port declares its range in real engineering
@@ -21018,26 +20968,13 @@ impl Engine {
         // lane wants a normalised default, so that is what is computed — the
         // range travels with the automation curve, not with this.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(bay) = self
-            .insert_lv2
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.lv2.as_ref()) {
             return lanes_for_lv2(&bay.params);
         }
-        if let Some(bay) = self
-            .insert_builtin
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
-        {
+        if let Some(bay) = self.host_bay(strip, slot).and_then(|b| b.builtin.as_ref()) {
             return lanes_for_builtin(bay.spec);
         }
-        self.insert_state_handles
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(Option::as_ref)
+        self.host_bay(strip, slot).and_then(|b| b.state_handle.as_ref())
             .map(tangent_host::StateHandle::parameters)
             .unwrap_or_default()
     }
@@ -21045,7 +20982,8 @@ impl Engine {
     /// **One knob of one built-in bay, turned live from a face.**
     ///
     /// The LV2 window's road, driven from the other end: the LEDGER is
-    /// written first — `insert_builtin` is what `save_insert_state` reads, so
+    /// written first — the bay's `HostBay::builtin` is what its saved state is
+    /// read from, so
     /// the durable truth never lags the sound — and then the same value rides
     /// the `ui_params` ring the plugin windows already use, to be merged into
     /// the bay's per-block automation queue and applied by
@@ -21058,17 +20996,23 @@ impl Engine {
     /// that is not a number. A full ring still answers `true` — the ledger
     /// took the value, and the next movement of the same knob re-sends it,
     /// so the loss is a frame of lag on a drag.
-    pub fn set_insert_param(&mut self, strip: usize, slot: usize, id: u32, value: f32) -> bool {
+    pub fn set_insert_param_at(&mut self, addr: RackAddr, bay: usize, id: u32, value: f32) -> bool {
+        addr.seat().is_some_and(|seat| self.set_seat_param(seat, bay, id, value))
+    }
+
+    /// [`Engine::set_insert_param_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn set_insert_param(&mut self, seat: usize, bay: usize, id: u32, value: f32) -> bool {
+        self.set_seat_param(seat, bay, id, value)
+    }
+
+    fn set_seat_param(&mut self, strip: usize, slot: usize, id: u32, value: f32) -> bool {
         if !value.is_finite() {
             return false;
         }
         let value = value.clamp(0.0, 1.0);
-        let Some(bay) = self
-            .insert_builtin
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-            .and_then(Option::as_mut)
-        else {
+        let Some(bay) = self.host_bay_mut(strip, slot).and_then(|b| b.builtin.as_mut()) else {
             return false;
         };
         let Some(at) = bay.spec.params.iter().position(|p| p.id == id) else {
@@ -21113,36 +21057,46 @@ impl Engine {
     /// values — what the host pushes across the firewall as a face. `None`
     /// for an empty bay or a plugin bay; the values are the ledger's, which
     /// is the durable truth ([`crate::builtin_fx::BuiltinBay`]).
-    pub fn builtin_insert(
+    pub fn builtin_insert_at(
         &self,
-        strip: usize,
-        slot: usize,
+        addr: RackAddr,
+        bay: usize,
     ) -> Option<(&'static crate::builtin_fx::UnitSpec, &[f32])> {
-        let bay = self
-            .insert_builtin
-            .get(strip)?
-            .get(slot)?
-            .as_ref()?;
+        self.seat_builtin(addr.seat()?, bay)
+    }
+
+    /// [`Engine::builtin_insert_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn builtin_insert(&self, seat: usize, bay: usize) -> Option<(&'static crate::builtin_fx::UnitSpec, &[f32])> {
+        self.seat_builtin(seat, bay)
+    }
+
+    fn seat_builtin(&self, strip: usize, slot: usize) -> Option<(&'static crate::builtin_fx::UnitSpec, &[f32])> {
+        let bay = self.host_bay(strip, slot)?.builtin.as_ref()?;
         Some((bay.spec, &bay.values))
     }
 
     /// The bay's extra state lines (learned profiles, IR paths) — what the
     /// face push carries so a panel can SHOW what is loaded.
-    pub fn builtin_extra(&self, strip: usize, slot: usize) -> &[(String, String)] {
-        self.insert_builtin
-            .get(strip)
-            .and_then(|r| r.get(slot))
-            .and_then(|b| b.as_ref())
+    pub fn builtin_extra_at(&self, addr: RackAddr, bay: usize) -> &[(String, String)] {
+        addr.seat().map_or(&[][..], |seat| self.seat_builtin_extra(seat, bay))
+    }
+
+    fn seat_builtin_extra(&self, strip: usize, slot: usize) -> &[(String, String)] {
+        self.host_bay(strip, slot)
+            .and_then(|b| b.builtin.as_ref())
             .map(|b| b.extra.as_slice())
             .unwrap_or(&[])
     }
 
     /// **Write a built-in bay's extra state lines into the LEDGER, now.**
     ///
-    /// [`Self::set_insert_param`]'s sibling for the state that is not a knob,
+    /// [`Self::set_insert_param_at`]'s sibling for the state that is not a knob,
     /// and it exists for the reason that method's own note gives: the ledger
-    /// is the durable truth — `save_insert_state` reads `insert_builtin` and
-    /// nothing else — so anything that must survive a save has to land here
+    /// is the durable truth — a built-in bay's saved state is read from its
+    /// `HostBay::builtin` and nothing else — so anything that must survive a
+    /// save has to land here
     /// rather than only in a sidecar on disk.
     ///
     /// **It was the sampler's mute.** A picked sample was written to the
@@ -21170,18 +21124,19 @@ impl Engine {
     /// `false` for a bay that is empty, out of range, or not a built-in —
     /// the same three refusals `set_insert_param` makes, and reported rather
     /// than swallowed so a caller can say what did not happen.
-    pub fn set_builtin_extra(
-        &mut self,
-        strip: usize,
-        slot: usize,
-        extra: Vec<(String, String)>,
-    ) -> bool {
-        let Some(bay) = self
-            .insert_builtin
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-            .and_then(Option::as_mut)
-        else {
+    pub fn set_builtin_extra_at(&mut self, addr: RackAddr, bay: usize, extra: Vec<(String, String)>) -> bool {
+        addr.seat().is_some_and(|seat| self.set_seat_builtin_extra(seat, bay, extra))
+    }
+
+    /// [`Engine::set_builtin_extra_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn set_builtin_extra(&mut self, seat: usize, bay: usize, extra: Vec<(String, String)>) -> bool {
+        self.set_seat_builtin_extra(seat, bay, extra)
+    }
+
+    fn set_seat_builtin_extra(&mut self, strip: usize, slot: usize, extra: Vec<(String, String)>) -> bool {
+        let Some(bay) = self.host_bay_mut(strip, slot).and_then(|b| b.builtin.as_mut()) else {
             return false;
         };
         let path = bay.spec.path;
@@ -21197,7 +21152,18 @@ impl Engine {
     /// everything that is not a compressor working, including a bay out of
     /// range. Read once a frame by the host and forwarded to the open face;
     /// reading it twice a frame would flatten the needle.
-    pub fn insert_gr_db(&self, strip: usize, slot: usize) -> f32 {
+    pub fn insert_gr_db_at(&self, addr: RackAddr, bay: usize) -> f32 {
+        addr.seat().map_or(0.0, |seat| self.seat_gr_db(seat, bay))
+    }
+
+    /// [`Engine::insert_gr_db_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
+    pub fn insert_gr_db(&self, seat: usize, bay: usize) -> f32 {
+        self.seat_gr_db(seat, bay)
+    }
+
+    fn seat_gr_db(&self, strip: usize, slot: usize) -> f32 {
         let Some(cell) = self.shared.seat_cell(SeatKind::Gr, strip * INSERTS + slot) else {
             return 0.0;
         };
@@ -21224,11 +21190,9 @@ impl Engine {
             return;
         }
         let (strip, slot) = (flat as usize / INSERTS, flat as usize % INSERTS);
-        let Some(bay) = self
-            .insert_builtin
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-            .and_then(Option::as_mut)
+        // The bay by its rack's FIELD, so the shared thresholds below stay
+        // readable beside it.
+        let Some(bay) = self.host_racks.get_mut(strip).and_then(|r| r.bays.get_mut(slot)).and_then(|b| b.builtin.as_mut())
         else {
             return;
         };
@@ -21439,12 +21403,10 @@ impl Engine {
     /// exactly as [`Engine::set_insert_keys`] publishes keys: a bay absent
     /// from `bays` is a bay in circuit.
     ///
-    /// Each tuple is `(seat, bay)` in ENGINE terms — the seat space
-    /// `load_insert` speaks. The desk stores them in that space too
-    /// (`settings::BypassBays`), so unlike the key table there is no
-    /// `seat_bay` translation on the way here and therefore none to get
-    /// wrong. Out-of-range entries are ignored: the desk can shrink between
-    /// the write and the read.
+    /// Each pair is a bay by its rack's identity, `(RackAddr, bay)`: the
+    /// bridge translates the desk's bypassed bays to their tracks' lanes
+    /// (`Bridge::engine_bypass`). A rack that does not exist is ignored: the
+    /// desk can shrink between the write and the read.
     ///
     /// **No clear-then-fill phase**, which is the one place this deliberately
     /// departs from `set_insert_keys`. See `Shared::insert_bypass`: clearing
@@ -21470,7 +21432,19 @@ impl Engine {
         }
     }
 
+    pub fn set_insert_bypass_at(&self, bays: &[(RackAddr, usize)]) {
+        let seats: Vec<(usize, usize)> = bays.iter().filter_map(|(addr, bay)| Some((addr.seat()?, *bay))).collect();
+        self.write_insert_bypass(&seats);
+    }
+
+    /// [`Engine::set_insert_bypass_at`] by the seats racks answer to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
     pub fn set_insert_bypass(&self, bays: &[(usize, usize)]) {
+        self.write_insert_bypass(bays);
+    }
+
+    fn write_insert_bypass(&self, bays: &[(usize, usize)]) {
         for (i, cell) in self.shared.seat_cells(SeatKind::Bypass) {
             let want = u32::from(bays.contains(&(i / INSERTS, i % INSERTS)));
             if cell.load(Ordering::Relaxed) != want {
@@ -21484,10 +21458,15 @@ impl Engine {
     /// agree with what is actually being heard rather than with the desk.
     ///
     /// **Read back by the engine's own tests and by nothing else in the
-    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
-    /// accessor the desk happens not to ask for reads as dead however
-    /// thoroughly it is exercised.
-    #[allow(dead_code)]
+    /// binary**, by rack identity.
+    #[cfg(test)]
+    pub fn insert_bypassed_at(&self, addr: RackAddr, bay: usize) -> bool {
+        addr.seat().is_some_and(|seat| self.insert_bypassed(seat, bay))
+    }
+
+    /// [`Engine::insert_bypassed_at`] by the seat a rack answers to (a test
+    /// shim).
+    #[cfg(test)]
     pub fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
         self.shared
             .seat_cell(SeatKind::Bypass, seat * INSERTS + bay)
@@ -21502,12 +21481,19 @@ impl Engine {
     /// placeholder reports zero channels and is thereby excluded). False for
     /// everything else — including LV2, whose feed path does not exist yet,
     /// so greying here is what keeps an armed edge from lying on Linux.
+    pub fn insert_wants_key_at(&self, addr: RackAddr, bay: usize) -> bool {
+        addr.seat().is_some_and(|seat| self.seat_wants_key(seat, bay))
+    }
+
+    /// [`Engine::insert_wants_key_at`] by the seat a rack answers to (a test
+    /// shim, design 13 W4-integrate (C)).
+    #[cfg(test)]
     pub fn insert_wants_key(&self, seat: usize, bay: usize) -> bool {
-        self.insert_keyable
-            .get(seat)
-            .and_then(|r| r.get(bay))
-            .copied()
-            .unwrap_or(false)
+        self.seat_wants_key(seat, bay)
+    }
+
+    fn seat_wants_key(&self, seat: usize, bay: usize) -> bool {
+        self.host_bay(seat, bay).is_some_and(|b| b.keyable)
     }
 
     /// Take the hardware fast lane's write end, for `midi::MidiFastLane`.
@@ -21963,12 +21949,12 @@ impl Engine {
     /// retry, or the face draws a waveform over an engine that never got it
     /// — the drumpad's own lesson, where the pads lit up and struck the DX7.
     ///
-    /// **`lane` is which channel's sample this is.** A sampler is a lane's
+    /// **`slot` is which lane's sample this is.** A sampler is a lane's
     /// instrument exactly as a kit is, and two tracks each holding one must
     /// not share a sound.
-    pub fn set_sampler_sample(&mut self, lane: usize, s: Option<SamplerSample>) -> bool {
+    pub fn set_sampler_sample(&mut self, slot: Slot, s: Option<SamplerSample>) -> bool {
         while self.sampler_from_audio.pop().is_ok() {}
-        if self.sampler_to_audio.push((lane, s)).is_err() {
+        if self.sampler_to_audio.push((slot.0 as usize, s)).is_err() {
             return false;
         }
         let deadline = retire_deadline(self.offline.is_some());
@@ -22005,11 +21991,11 @@ impl Engine {
     /// Sanitised here, on the way in: a NaN survives `clamp` and a NaN in a
     /// gain does not stay in one sample.
     ///
-    /// **`lane` is whose kit these are.** Every knob here belongs to a pad OF
-    /// A KIT, and a drum instrument loads a full instance per channel — so a
-    /// gain shared between lanes would mean editing one kit reached into
-    /// another's sound.
-    pub fn set_pad_params(&self, lane: usize, kit: &tangent_ui::recorder::DrumKitParams) {
+    /// **`slot` is whose kit these are**, by the lane's slot. Every knob here
+    /// belongs to a pad OF A KIT, and a drum instrument loads a full instance
+    /// per channel — so a gain shared between lanes would mean editing one
+    /// kit reached into another's sound.
+    pub fn set_pad_params(&self, slot: Slot, kit: &tangent_ui::recorder::DrumKitParams) {
         let sane = |v: f32, lo: f32, hi: f32, or: f32| {
             if v.is_finite() {
                 v.clamp(lo, hi)
@@ -22018,7 +22004,7 @@ impl Engine {
             }
         };
         let sh = &self.shared;
-        let Some(row) = sh.lanes.cells(lane) else {
+        let Some(row) = sh.lanes.cells(slot.0 as usize) else {
             return;
         };
         let pg = &row.pads.gain;
@@ -22050,8 +22036,8 @@ impl Engine {
     /// The loudest sample each pad has made since this was last asked —
     /// read-and-reset, the strips' own idiom. What lights a pad from the
     /// audio rather than from the gesture, so a hardware strike shows too.
-    pub fn pad_peaks(&self, lane: usize) -> [f32; PADS] {
-        let Some(row) = self.shared.lanes.cells(lane).map(|l| &l.pads.peak) else {
+    pub fn pad_peaks(&self, slot: Slot) -> [f32; PADS] {
+        let Some(row) = self.shared.lanes.cells(slot.0 as usize).map(|l| &l.pads.peak) else {
             return [0.0; PADS];
         };
         std::array::from_fn(|i| f32::from_bits(row[i].swap(0, Ordering::Relaxed)))
@@ -22150,7 +22136,9 @@ impl Engine {
     /// still land after this, which one UI frame of drain absorbs unseen.
     ///
     /// The shim onto [`Engine::set_insert_tap_at`]: the seat's lane is named
-    /// at the generation the host last sent to its slot.
+    /// at the generation the host last sent to its slot. The engine's own
+    /// tests and the bench speak it (design 13 W4-integrate (C)).
+    #[cfg(test)]
     pub fn set_insert_tap(&mut self, at: Option<(usize, usize)>) {
         let word = at.map_or(0, |(seat, bay)| {
             let gen = seat_addr(seat)
@@ -22165,10 +22153,21 @@ impl Engine {
         while self.insert_tap_rx.pop().is_ok() {}
     }
 
+    /// **The tap's aim at one bay, by rack identity**: the rack's owner and,
+    /// for a lane, the generation the host last sent to its slot (a strip's
+    /// rack needs none). `None` for a lane slot holding nothing, or a bay
+    /// past a `u8`.
+    pub fn tap_aim(&self, (addr, bay): (RackAddr, usize)) -> Option<TapAim> {
+        let gen = match addr.owner {
+            RackOwner::Lane(slot) => self.lane_gen(slot)?,
+            _ => 0,
+        };
+        Some(TapAim { slot: addr.owner, gen, rack: addr.rack, bay: u8::try_from(bay).ok()? })
+    }
+
     /// **Aim the insert tap by rack identity** (contract C8), or disarm it
     /// with `None`. The callback checks the generation at use: an aim at a
     /// lane that is no longer the one in its slot taps nothing.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the tap by identity: the host still aims it by seat (`set_insert_tap`) until the SeatBay maps of W5-identity-maps"))]
     pub fn set_insert_tap_at(&mut self, aim: Option<TapAim>) {
         let word = aim.map_or(0, |a| {
             let seat = RackAddr { owner: a.slot, rack: a.rack }.seat().unwrap_or(usize::MAX);
@@ -22866,27 +22865,27 @@ impl Drop for Engine {
         // fields dropped in declaration order: `stream` is first, so the
         // callback box went, then the `Renderer`, then `racks`, and every
         // insert's `Hosted` was terminated — and only after all that did
-        // `insert_editors` drop and call `IPlugView::removed()` and
+        // the insert editors drop and call `IPlugView::removed()` and
         // `setFrame(null)` on a view whose controller no longer existed.
         //
-        // That is precisely the lifetime rule `editors` is documented with and
-        // ordered for, and it was reachable by quitting with an effect's
-        // window open. `load_insert(.., None)` is the whole teardown in the
-        // right order: close the window, drop the controller reference, then
-        // retire the instance and drop it HERE, on this thread.
+        // That is precisely the lifetime rule `HostBay::editor` is documented
+        // with and ordered for, and it was reachable by quitting with an
+        // effect's window open. `load_seat(.., None)` is the whole teardown in
+        // the right order: close the window, drop the controller reference,
+        // then retire the instance and drop it HERE, on this thread.
         //
         // **Every seat, the pad bays included.** This stopped at `STRIPS` —
-        // the stale bound `load_insert` was cured of — so a pad's effect was
+        // the stale bound `load_seat` was cured of — so a pad's effect was
         // never retired at all and its terminate ran inside the stream
         // teardown: the exact ordering this Drop exists to prevent, back for
         // the hundred and twenty-eight seats it forgot. Only OCCUPIED seats
         // are retired, because the hand-off's bounded wait is per seat: 444
         // empty round trips is seconds of quit on a live callback and nearly
         // two minutes on a stalled one.
-        for strip in 0..self.insert_handoff.len() {
-            for slot in 0..INSERTS {
-                if self.inserts_loaded[strip][slot].is_some() {
-                    let _ = self.load_insert(strip, slot, None, None);
+        for seat in 0..self.host_racks.len() {
+            for bay in 0..INSERTS {
+                if self.seat_loaded(seat, bay).is_some() {
+                    let _ = self.load_seat(seat, bay, None, None);
                 }
             }
         }
@@ -23539,6 +23538,9 @@ pub fn plugin_test(filter: Option<String>) {
         std::process::exit(1);
     };
 
+    // Each layer is a lane's own first rack, by identity: the engine's own
+    // road for a bay since its seat map became its private business.
+    let own = |lane: usize| RackAddr { owner: RackOwner::Lane(Slot(lane as u32)), rack: 0 };
     let mut engine = match Engine::start(None) {
         Ok(e) => e,
         Err(why) => {
@@ -23556,7 +23558,7 @@ pub fn plugin_test(filter: Option<String>) {
         "loading:  {} into channel 1's first bay (this blocks for the warm-up)",
         bundle.display()
     );
-    let loaded = match engine.load_insert(0, 0, Some(&bundle), None) {
+    let loaded = match engine.load_insert_at(own(0), 0, Some(&bundle), None) {
         Ok(Some(l)) => l,
         Ok(None) => {
             eprintln!("the bay refused the path");
@@ -23578,7 +23580,7 @@ pub fn plugin_test(filter: Option<String>) {
     // loaded WITH it: the layering measurement below rests on the three
     // instruments being identical, and "restored from channel 1's own bytes"
     // is a stronger claim than "the same plugin file".
-    let preset = engine.save_insert_state(0, 0);
+    let preset = engine.save_insert_state_at(own(0), 0);
     match &preset {
         Some(b) => println!("state:    {} bytes from channel 1", b.len()),
         None => println!("state:    this instrument handed over none"),
@@ -23718,7 +23720,7 @@ pub fn plugin_test(filter: Option<String>) {
     for slot in 0..LAYERS {
         if slot > 0 {
             println!("  loading channel {} with the same instrument...", slot + 1);
-            if let Err(why) = engine.load_insert(slot, 0, Some(&bundle), preset.as_deref()) {
+            if let Err(why) = engine.load_insert_at(own(slot), 0, Some(&bundle), preset.as_deref()) {
                 println!("  channel {} would not load: {why}", slot + 1);
                 break;
             }
@@ -23765,18 +23767,18 @@ pub fn plugin_test(filter: Option<String>) {
     // make.
     println!(
         "\neditor:   {}",
-        if engine.insert_has_editor(0, 0) {
+        if engine.insert_has_editor_at(own(0), 0) {
             "yes"
         } else {
             "this plugin has none"
         }
     );
-    if engine.insert_has_editor(0, 0) {
+    if engine.insert_has_editor_at(own(0), 0) {
         // This process will never call `[NSApp run]`: `main.rs` exits before
         // eframe starts. Without this the window opens behind everything, never
         // takes the keyboard, and looks broken.
         tangent_host::editor::become_foreground();
-        match engine.open_insert_editor(0, 0) {
+        match engine.open_insert_editor_at(own(0), 0) {
             Ok(()) => println!("          channel 1 open. Close the window to end this probe."),
             Err(why) => println!("          could not open it: {why}"),
         }
@@ -23790,7 +23792,7 @@ pub fn plugin_test(filter: Option<String>) {
     // always did. With an editor open it runs until the window is closed, and
     // the phrase repeats so there is always something playing while the
     // instrument is being changed underneath it.
-    let deadline = if engine.insert_editor_open(0, 0) {
+    let deadline = if engine.insert_editor_open_at(own(0), 0) {
         None
     } else {
         Some(Instant::now() + Duration::from_secs(5))
@@ -23804,7 +23806,7 @@ pub fn plugin_test(filter: Option<String>) {
         // 16 ms, so this loop runs at the rate the app's own frame loop would.
         tangent_host::editor::pump(Duration::from_millis(16));
         engine.poll_editor();
-        if deadline.is_none() && !engine.insert_editor_open(0, 0) {
+        if deadline.is_none() && !engine.insert_editor_open_at(own(0), 0) {
             println!("\neditor closed.");
             break;
         }
@@ -23838,7 +23840,7 @@ pub fn plugin_test(filter: Option<String>) {
     // Did anything the user did in the editor reach the bytes? This is the one
     // end of the persistence feature no test can check: pick a different piano
     // in the modelled piano's own UI, close the window, and watch the state change.
-    match (preset.as_deref(), engine.save_insert_state(0, 0)) {
+    match (preset.as_deref(), engine.save_insert_state_at(own(0), 0)) {
         (Some(before), Some(after)) if before == after.as_slice() => {
             println!("state:           unchanged, {} bytes", after.len());
         }
@@ -23857,7 +23859,7 @@ pub fn plugin_test(filter: Option<String>) {
     // property the per-slot handoff exists for. Slot 2 goes and slots 1 and 3
     // are asked to make a sound afterwards.
     if rows.len() == LAYERS {
-        let _ = engine.load_insert(1, 0, None, None);
+        let _ = engine.load_insert_at(own(1), 0, None, None);
         engine.meters();
         play_phrase(&engine);
         let until = Instant::now() + Duration::from_secs(2);
@@ -23874,7 +23876,7 @@ pub fn plugin_test(filter: Option<String>) {
         println!(
             "loaded now:      {:?}",
             (0..LAYERS)
-                .map(|s| engine.insert(s, 0).map(|l| l.class.as_str()))
+                .map(|s| engine.insert_at(own(s), 0).map(|l| l.class.as_str()))
                 .collect::<Vec<_>>()
         );
         peak = peak.max(after);
@@ -28127,7 +28129,7 @@ mod tests {
         let note = tangent_ui::recorder::AUDITION_NOTE;
 
         // A hand on a row of ANOTHER strip's picker.
-        e.set_audition(ELSEWHERE, Some(note));
+        e.set_audition(Slot(ELSEWHERE as u32), Some(note));
         let mut leaked = 0.0f32;
         for _ in 0..4 {
             out.fill(0.0);
@@ -28138,10 +28140,10 @@ mod tests {
             leaked < 1.0e-6,
             "an audition on strip {ELSEWHERE} sounded strip {SYNTH}'s synth: {leaked}"
         );
-        e.set_audition(ELSEWHERE, None);
+        e.set_audition(Slot(ELSEWHERE as u32), None);
 
         // And on its own.
-        e.set_audition(SYNTH, Some(note));
+        e.set_audition(Slot(SYNTH as u32), Some(note));
         out.fill(0.0);
         e.render_offline(&mut out);
         let struck = block_peak(&out);
@@ -28187,11 +28189,11 @@ mod tests {
         for op in &mut slow.ops {
             op.rate[3] = 60;
         }
-        e.set_builtin_voice(SYNTH, slow);
+        e.set_builtin_voice(Slot(SYNTH as u32), slow);
         out.fill(0.0);
         e.render_offline(&mut out);
 
-        e.set_audition(SYNTH, Some(tangent_ui::recorder::AUDITION_NOTE));
+        e.set_audition(Slot(SYNTH as u32), Some(tangent_ui::recorder::AUDITION_NOTE));
         out.fill(0.0);
         e.render_offline(&mut out);
         let struck = block_peak(&out);
@@ -28211,7 +28213,7 @@ mod tests {
         // The hand lifts. The block the off lands in still has the note list
         // to keep it alive; the one AFTER it has nothing but the tail, and
         // the tail is the thing being claimed.
-        e.set_audition(SYNTH, None);
+        e.set_audition(Slot(SYNTH as u32), None);
         out.fill(0.0);
         e.render_offline(&mut out);
         out.fill(0.0);
@@ -31628,8 +31630,8 @@ mod tests {
         // Lane 5's pad 0 is pulled to silence; lane 9's is left alone.
         let mut hushed = tangent_ui::recorder::DrumKitParams::default();
         hushed.pads[0].gain = 0.0;
-        e.set_pad_params(5, &hushed);
-        e.set_pad_params(9, &tangent_ui::recorder::DrumKitParams::default());
+        e.set_pad_params(Slot(5), &hushed);
+        e.set_pad_params(Slot(9), &tangent_ui::recorder::DrumKitParams::default());
 
         let mut out = vec![0.0f32; 1024 * 2];
         e.set_rolling(false);
@@ -31672,7 +31674,7 @@ mod tests {
 
         // And the reverse: hush BOTH and there is nothing left. This is the
         // control — without it a stuck level would pass the assertion above.
-        e.set_pad_params(9, &hushed);
+        e.set_pad_params(Slot(9), &hushed);
         let mut after = 0.0f32;
         for _ in 0..8 {
             out.fill(0.0);
@@ -32994,7 +32996,7 @@ mod tests {
             let mut kit = tangent_ui::recorder::DrumKitParams::default();
             kit.pads[0].obey = obey;
             kit.pads[0].trim_end = trim_end;
-            e.set_pad_params(7, &kit);
+            e.set_pad_params(Slot(7), &kit);
             e.set_midi_clips(vec![PlacedMidi {
                 pedal: Arc::new(Vec::new()),
                 strip: 7,
@@ -37527,7 +37529,7 @@ mod slot_engine {
         // The host's frame: what came home is let go of.
         e.retire_tick();
         assert!(e.offline.as_ref().expect("renderer").spine.lanes[36].is_none());
-        assert!(e.inserts_loaded[lane_seat(36, CHAIN_OWN)][0].is_none(), "the host kept a record");
+        assert!(e.host_racks[lane_seat(36, CHAIN_OWN)].bays[0].loaded.is_none(), "the host kept a record");
         let gens = e.install_lanes(vec![(Slot(36), audio())]).expect("the slot is free");
         e.settle_offline();
         assert_ne!(gens[0], old, "a reused slot kept its generation");
@@ -38980,7 +38982,7 @@ mod sampler_road {
         assert!(quiet < 1e-6, "a bay with no file and no notes made sound: {quiet}");
 
         assert!(
-            e.set_sampler_sample(CH, Some(a_sample("tone.wav", 0.8))),
+            e.set_sampler_sample(Slot(CH as u32), Some(a_sample("tone.wav", 0.8))),
             "the engine refused the sample"
         );
         e.set_midi_clips(vec![PlacedMidi {
@@ -39400,7 +39402,7 @@ mod sampler_road {
         let watch = Arc::clone(&first.clip);
         assert_eq!(Arc::strong_count(&watch), 2, "the test and the sample itself");
 
-        assert!(e.set_sampler_sample(2, Some(first)), "the engine refused the sample");
+        assert!(e.set_sampler_sample(Slot(2), Some(first)), "the engine refused the sample");
         let mut out = vec![0.0f32; 2 * 512];
         e.render_offline(&mut out);
         // Handed over: the engine's renderer holds the only other reference.
@@ -39410,7 +39412,7 @@ mod sampler_road {
             "the sample did not reach the audio thread whole"
         );
 
-        assert!(e.set_sampler_sample(2, None), "the engine refused to empty the bay");
+        assert!(e.set_sampler_sample(Slot(2), None), "the engine refused to empty the bay");
         e.render_offline(&mut out);
         e.retire_tick();
         assert_eq!(

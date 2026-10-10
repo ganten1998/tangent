@@ -356,7 +356,7 @@ fn sampler(on: bool) -> Engine {
     seat(&mut e, 3, 0, SAMPLER_PATH, None);
     if on {
         assert!(e.set_sampler_sample(
-            3,
+            crate::desk_plan::Slot(3),
             Some(SamplerSample {
                 clip: noise(0.5, 0x5a5a),
                 name: "golden.wav".to_owned(),

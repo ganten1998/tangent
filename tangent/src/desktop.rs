@@ -1168,7 +1168,7 @@ pub struct DesktopApp {
     /// on — a frame is long enough for the desk to change its mind about a
     /// bay.
     #[cfg(feature = "recorder")]
-    insert_announced: Option<(usize, usize)>,
+    insert_announced: Option<crate::engine_bridge::EngineBay>,
     /// How many bays the reconcile found outstanding THIS frame, with the
     /// engine exclusion applied. `inserts_pending` reads it back for the
     /// splash rather than walking the seat space a second time; see there.
@@ -1267,7 +1267,7 @@ pub struct DesktopApp {
     /// a backstop; a row that stopped being a comp reads zero, so a stale
     /// index costs nothing worse than one idle swap.
     #[cfg(feature = "recorder")]
-    comp_rows: Vec<(usize, usize)>,
+    comp_rows: Vec<crate::engine_bridge::EngineBay>,
     #[cfg(feature = "recorder")]
     comp_rows_stale: bool,
     #[cfg(feature = "recorder")]
@@ -1503,11 +1503,12 @@ pub struct DesktopApp {
     scope_buf: Vec<f32>,
     /// The INSERT tap drain's reusable buffer, and where the tap is aimed —
     /// `None` while no plugin face has it armed, which is also the gate on
-    /// draining it at all. Kept in ENGINE terms (seat, bay), translated once
-    /// where the request lands, so an engine rebuilt mid-session could be
-    /// re-armed from here without re-asking the UI.
+    /// draining it at all. Kept in ENGINE terms (the rack by identity, and
+    /// the bay), translated once where the request lands, so an engine rebuilt
+    /// mid-session could be re-armed from here without re-asking the UI.
     tap_buf: Vec<f32>,
-    insert_tap_at: Option<(usize, usize)>,
+    #[cfg(feature = "recorder")]
+    insert_tap_at: Option<crate::engine_bridge::EngineBay>,
     /// The IR wizard's host-side road: what is armed, the reference pass on
     /// hold, the worker chewing a finished capture, and the processed IRs
     /// waiting for a Save. See the "IRs on disk" section.
@@ -2284,15 +2285,15 @@ fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathB
 /// The plugin's short name comes from the app's own bay text rather than from
 /// the module, so the menu says exactly what the bay chip says.
 ///
-/// **Two seats, one bay**: `strip` is where the app keeps it (by row) and
-/// `seat` where the engine does (by the lane's slot, through the bridge).
-/// They are the same number until a reorder, and only one of them is right
-/// for each side after one.
+/// **Two names, one rack**: `strip` is where the app keeps it (by row) and
+/// `rack` what the engine calls it (the lane's own rack by its slot, through
+/// the bridge, and so through its `HostRack`). Only one of them is right for
+/// each side after a reorder.
 #[cfg(feature = "recorder")]
 fn push_fx_params(
     app: &mut TangentApp,
     engine: &crate::instrument::Engine,
-    (strip, seat): (usize, usize),
+    (strip, rack): (usize, crate::instrument::RackAddr),
     inserts: usize,
 ) {
     let bays: [tangent_ui::ports::FxParams; tangent_ui::desk_id::BAYS] =
@@ -2301,7 +2302,7 @@ fn push_fx_params(
                 return tangent_ui::ports::FxParams::default();
             }
             let params: Vec<tangent_ui::ports::FxParam> = engine
-                .insert_parameters(seat, bay)
+                .insert_parameters_at(rack, bay)
                 .into_iter()
                 .map(|p| tangent_ui::ports::FxParam {
                     id: p.id,
@@ -2320,7 +2321,7 @@ fn push_fx_params(
                 // Read here, once, with the parameters it travels with:
                 // whether the tenant reports an aux input bus a key could
                 // feed. The UI gates the bay menu's "Sidechain" row on it.
-                has_sidechain: engine_insert_wants_key(engine, seat, bay),
+                has_sidechain: engine_insert_wants_key(engine, rack, bay),
             }
         });
     app.set_fx_params(strip, bays);
@@ -2329,8 +2330,8 @@ fn push_fx_params(
 /// Whether the bay's tenant can take a key — the engine's own answer, one
 /// thin seam kept so the UI lane and the engine lane could land apart.
 #[cfg(feature = "recorder")]
-fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay: usize) -> bool {
-    engine.insert_wants_key(seat, bay)
+fn engine_insert_wants_key(engine: &crate::instrument::Engine, rack: crate::instrument::RackAddr, bay: usize) -> bool {
+    engine.insert_wants_key_at(rack, bay)
 }
 
 /// **Read one seat's bays and hand the app every built-in face on it** —
@@ -2341,15 +2342,15 @@ fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay:
 /// All three bays every time rather than just the one that moved, because an
 /// unload must CLEAR its face (the empty `BuiltinFace` is the tombstone) and
 /// the caller only knows which flat index changed, not what it used to hold.
-/// The app's seat and the engine's, as [`push_fx_params`] takes them.
+/// The app's seat and the engine's rack, as [`push_fx_params`] takes them.
 #[cfg(feature = "recorder")]
 fn push_builtin_faces(
     app: &mut TangentApp,
     engine: &crate::instrument::Engine,
-    (strip, seat): (usize, usize),
+    (strip, rack): (usize, crate::instrument::RackAddr),
 ) {
     for slot in 0..tangent_ui::desk_id::BAYS {
-        let face = match engine.builtin_insert(seat, slot) {
+        let face = match engine.builtin_insert_at(rack, slot) {
             Some((spec, values)) => tangent_ui::ports::BuiltinFace {
                 strip,
                 slot,
@@ -2382,7 +2383,7 @@ fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
-                extra: engine.builtin_extra(seat, slot).to_vec(),
+                extra: engine.builtin_extra_at(rack, slot).to_vec(),
             },
             None => tangent_ui::ports::BuiltinFace {
                 strip,
@@ -5308,7 +5309,7 @@ impl DesktopApp {
                 .bridge
                 .lanes_holding(&self.app, tangent_ui::dialogs::DRUMPAD_PATH)
                 .first()
-                .map_or(0, |(_, at)| at.slot.0 as usize);
+                .map_or(crate::desk_plan::Slot(0), |(_, at)| at.slot);
             let pads = e.pad_peaks(lane);
             pad_levels = pads;
             self.app.note_drumpad_peaks(pads);
@@ -5364,9 +5365,9 @@ impl DesktopApp {
             // Read by the engine's address, drawn at the app's: the needle
             // belongs to the track whose lane the comp is in, wherever its
             // row has gone.
-            for &(seat, bay) in &self.comp_rows {
-                let db = e.insert_gr_db(seat, bay);
-                if let Some((strip, slot)) = self.bridge.app_seat(&self.app, seat, bay) {
+            for &(rack, bay) in &self.comp_rows {
+                let db = e.insert_gr_db_at(rack, bay);
+                if let Some((strip, slot)) = self.bridge.app_seat(&self.app, (rack, bay)) {
                     self.app.set_insert_gr(strip, slot, db);
                 }
             }
@@ -6297,11 +6298,11 @@ impl DesktopApp {
         let inserts = tangent_ui::desk_id::BAYS;
         // **What the desk wants in every bay, by the ENGINE's address**: the
         // app's bays by identity (`engine_bridge::desk_bays`) at their
-        // tracks' lanes. The ledger is kept by the same address, so a reorder
+        // tracks' lanes' racks, each reached through its `HostRack` (design
+        // 8, item 8). The ledger is kept by the same address, so a reorder
         // changes neither side and the walk below finds nothing to do.
         let wanted = self.bays_wanted();
-        let mismatched =
-            |loaded: &InsertLedger, at: &(usize, usize)| wanted.get(at) != loaded.get(at);
+        let mismatched = |loaded: &InsertLedger, at: &crate::engine_bridge::EngineBay| wanted.get(at) != loaded.get(at);
         // **The bay this frame loads is the bay the LAST frame announced.**
         //
         // `busy.rs`'s law, which `announce`/`run_chore` keep for the blocking
@@ -6322,14 +6323,14 @@ impl DesktopApp {
             .take()
             .filter(|at| mismatched(&self.recorder.inserts_loaded, at));
         if let Some(at) = due {
-            let (seat, bay) = at;
+            let (rack, bay) = at;
             let want = wanted.get(&at).cloned();
             // **Where the APP keeps this bay**, for what the app keeps by
             // seat: its faces, its parameter lists, its open-on-load flags.
             // And the bay's identity, which its state file and the displaced
             // shelf are keyed by.
-            let app_at = self.bridge.app_seat(&self.app, seat, bay);
-            let sb = self.bridge.bay_at_engine(seat, bay);
+            let app_at = self.bridge.app_seat(&self.app, at);
+            let sb = self.bridge.bay_at_engine(at);
             // **The outgoing tenant's settings, asked while it is still
             // alive.** `load_insert` below drops whatever this bay holds, and
             // nothing on that road asks it for its state, so a plugin pasted
@@ -6346,12 +6347,12 @@ impl DesktopApp {
             if !self.racks_restoring {
                 if let Some(e) = self.recorder.engine.as_ref() {
                     let gone = e
-                        .insert(seat, bay)
+                        .insert_at(rack, bay)
                         .and_then(|l| l.bundle.to_str())
                         .filter(|g| want.as_deref() != Some(*g))
                         .map(str::to_owned);
                     if let (Some(gone), Some(sb)) = (gone, sb) {
-                        if let Some(blob) = e.save_insert_state(seat, bay) {
+                        if let Some(blob) = e.save_insert_state_at(rack, bay) {
                             shelve_displaced(&mut self.displaced_states, (sb, gone), blob);
                         }
                     }
@@ -6401,7 +6402,7 @@ impl DesktopApp {
                 // its instance for them. See `shelf`.
                 // Worked out above, where the shelf could still be read.
                 let state = bay_state;
-                match e.load_insert(seat, bay, path, state.as_deref()) {
+                match e.load_insert_at(rack, bay, path, state.as_deref()) {
                     Ok(_) => {
                         self.recorder.engine_error = None;
                         // **A shelved state is spent once it is seated.** The
@@ -6422,12 +6423,12 @@ impl DesktopApp {
                         // main thread, for a list that changes when somebody
                         // loads a plugin.
                         if let Some((strip, _)) = app_at {
-                            push_fx_params(&mut self.app, e, (strip, seat), inserts);
-                            // And the built-in faces on the same seat, values
+                            push_fx_params(&mut self.app, e, (strip, rack), inserts);
+                            // And the built-in faces on the same rack, values
                             // included — the face data has exactly the
                             // staleness window the parameter list has, so it
                             // travels with it.
-                            push_builtin_faces(&mut self.app, e, (strip, seat));
+                            push_builtin_faces(&mut self.app, e, (strip, rack));
                         }
                         // **The window, the moment the load lands.** Only for
                         // the pick that just happened — the app's flag answers
@@ -6437,7 +6438,7 @@ impl DesktopApp {
                         if path.is_some()
                             && app_at.is_some_and(|(s, b)| self.app.take_open_insert_on_load(s, b))
                         {
-                            if let Err(err) = e.open_insert_editor(seat, bay) {
+                            if let Err(err) = e.open_insert_editor_at(rack, bay) {
                                 self.recorder.engine_error =
                                     Some(format!("could not open the plugin's window: {err}"));
                             }
@@ -6450,9 +6451,9 @@ impl DesktopApp {
                             // A failed load leaves the bay empty, so the menu
                             // must not go on offering the last plugin's
                             // parameters.
-                            push_fx_params(&mut self.app, e, (strip, seat), inserts);
+                            push_fx_params(&mut self.app, e, (strip, rack), inserts);
                             // Nor its face: the tombstone push clears it.
-                            push_builtin_faces(&mut self.app, e, (strip, seat));
+                            push_builtin_faces(&mut self.app, e, (strip, rack));
                         }
                         let which = want
                             .as_deref()
@@ -6498,7 +6499,7 @@ impl DesktopApp {
         // AFTER the load above, so what it counts is what is left: over every
         // bay the desk wants or the engine holds, which is the only place a
         // difference can be.
-        let bays: Vec<(usize, usize)> = wanted
+        let bays: Vec<crate::engine_bridge::EngineBay> = wanted
             .keys()
             .chain(self.recorder.inserts_loaded.keys())
             .copied()
@@ -6690,7 +6691,7 @@ impl DesktopApp {
                 if let Some(e) = self.recorder.engine.as_mut() {
                     // The strip's track, at its lane.
                     if let Some(l) = self.bridge.lane(strip) {
-                        e.set_builtin_voice(l.slot.0 as usize, v);
+                        e.set_builtin_voice(l.slot, v);
                     }
                 }
             }
@@ -7230,7 +7231,7 @@ impl DesktopApp {
                         if let Some(e) = self.recorder.engine.as_mut() {
                             // The strip's track, at its lane.
                             if let Some(l) = self.bridge.lane(strip) {
-                                e.set_builtin_voice(l.slot.0 as usize, v);
+                                e.set_builtin_voice(l.slot, v);
                             }
                         }
                         self.push_patch_edit(None);
@@ -7274,7 +7275,7 @@ impl DesktopApp {
                     if let (Some(v), Some(e)) = (voice, self.recorder.engine.as_mut()) {
                         // The strip's track, at its lane.
                         if let Some(l) = self.bridge.lane(slot) {
-                            e.set_builtin_voice(l.slot.0 as usize, v);
+                            e.set_builtin_voice(l.slot, v);
                         }
                     }
                 }
@@ -7332,7 +7333,7 @@ impl DesktopApp {
                     ) {
                         // The strip's track, at its lane.
                         if let Some(l) = self.bridge.lane(slot) {
-                            e.set_builtin_voice(l.slot.0 as usize, v);
+                            e.set_builtin_voice(l.slot, v);
                         }
                     }
                 }
@@ -7403,7 +7404,7 @@ impl DesktopApp {
                                 if let Some(e) = self.recorder.engine.as_mut() {
                                     // The strip's track, at its lane.
                                     if let Some(l) = self.bridge.lane(strip) {
-                                        e.set_builtin_voice(l.slot.0 as usize, v);
+                                        e.set_builtin_voice(l.slot, v);
                                     }
                                 }
                             }
@@ -7442,7 +7443,7 @@ impl DesktopApp {
                 R::AuditionStrip { strip, key } => {
                     // The strip's track, held at its lane.
                     if let (Some(e), Some(l)) = (self.recorder.engine.as_ref(), self.bridge.lane(strip)) {
-                        e.set_audition(l.slot.0 as usize, key);
+                        e.set_audition(l.slot, key);
                     }
                 }
                 // An insert's own window. Same one-row-two-names bargain as an
@@ -7452,10 +7453,10 @@ impl DesktopApp {
                     // The app names the bay by its row; the window is the
                     // plugin's in the track's lane.
                     let at = self.engine_at(strip, slot);
-                    let up = at.zip(self.recorder.engine.as_ref()).is_some_and(|(at, e)| e.insert_editor_open(at.0, at.1));
+                    let up = at.zip(self.recorder.engine.as_ref()).is_some_and(|(at, e)| e.insert_editor_open_at(at.0, at.1));
                     if let (true, Some(at)) = (up, at) {
                         if let Some(e) = self.recorder.engine.as_mut() {
-                            e.close_insert_editor(at.0, at.1);
+                            e.close_insert_editor_at(at.0, at.1);
                         }
                     } else if self.recorder.engine.is_some() {
                         // **Opening one is not free and never was.** An LV2
@@ -7483,7 +7484,7 @@ impl DesktopApp {
                 R::SetInsertParam { strip, slot, id, value } => {
                     let at = self.engine_at(strip, slot);
                     if let (Some(e), Some(at)) = (self.recorder.engine.as_mut(), at) {
-                        e.set_insert_param(at.0, at.1, id, value);
+                        e.set_insert_param_at(at.0, at.1, id, value);
                         // **Push the face back, NOW.** The readings are
                         // host-printed strings and the EQ's curve is
                         // host-computed; a push that only happened at load
@@ -7500,11 +7501,11 @@ impl DesktopApp {
                         // Read on the unit's own scale, by the same
                         // `describe` that prints the reading, so what the
                         // field shows after Enter is the number typed.
-                        let value = e.builtin_insert(at.0, at.1).and_then(|(spec, values)| {
+                        let value = e.builtin_insert_at(at.0, at.1).and_then(|(spec, values)| {
                             crate::builtin_fx::value_for_reading(spec.path, id, &text, values)
                         });
                         if let Some(value) = value {
-                            e.set_insert_param(at.0, at.1, id, value);
+                            e.set_insert_param_at(at.0, at.1, id, value);
                         }
                         // Pushed either way: a refused word leaves the
                         // reading as it was, and the face has to be told
@@ -7522,7 +7523,7 @@ impl DesktopApp {
                     let sb = crate::engine_bridge::strip_slot(&self.app, strip, slot);
                     self.insert_tap_at = sb.and_then(|sb| self.bridge.engine_bay(sb)).filter(|_| on);
                     if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_insert_tap(self.insert_tap_at);
+                        e.set_insert_tap_at(self.insert_tap_at.and_then(|at| e.tap_aim(at)));
                     }
                     // Arming is also "a face just opened here": its preset
                     // shelf rides along, so the panel's list is filled by
@@ -7697,7 +7698,7 @@ impl DesktopApp {
                                         let here = at
                                             .zip(self.recorder.engine.as_ref())
                                             .and_then(|(at, e)| {
-                                                e.builtin_extra(at.0, at.1)
+                                                e.builtin_extra_at(at.0, at.1)
                                                     .iter()
                                                     .find(|(k, _)| k == "ir_path")
                                                     .map(|(_, v)| v.clone())
@@ -7971,13 +7972,13 @@ impl DesktopApp {
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(at.0, at.1) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::IR_PATH {
             return false;
         }
-        let mut extra = e.builtin_extra(at.0, at.1).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| k != "ir_path");
         extra.push(("ir_path".to_owned(), path.to_owned()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
@@ -8054,7 +8055,7 @@ impl DesktopApp {
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(at.0, at.1) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::SAMPLER_PATH {
@@ -8069,7 +8070,7 @@ impl DesktopApp {
         } else {
             crate::instrument::SAMPLER_ROOT_KEY
         };
-        let mut extra = e.builtin_extra(at.0, at.1).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| !matches!(k.as_str(), "sample_path" | "sample_name" | "root_key"));
         extra.push(("sample_path".to_owned(), path.to_owned()));
         extra.push(("sample_name".to_owned(), name));
@@ -8080,7 +8081,7 @@ impl DesktopApp {
         // line is the difference between a bay that plays the file and one
         // that plays silence until something else wakes the window.
         if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_builtin_extra(at.0, at.1, extra);
+            e.set_builtin_extra_at(at.0, at.1, extra);
         }
         // And the debt that carries it: `run_warm` decodes the file and
         // `reload_sampler` hands it to the audio thread, both a frame from
@@ -8123,13 +8124,13 @@ impl DesktopApp {
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(at.0, at.1) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::IR_PATH {
             return false;
         }
-        let mut extra = e.builtin_extra(at.0, at.1).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| k != "ir_path");
         extra.push(("ir_path".to_owned(), String::new()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
@@ -9426,7 +9427,7 @@ impl DesktopApp {
                     if let Some(e) = self.recorder.engine.as_mut() {
                         // The strip's track, at its lane.
                         if let Some(l) = self.bridge.lane(strip) {
-                            e.set_builtin_voice(l.slot.0 as usize, v);
+                            e.set_builtin_voice(l.slot, v);
                         }
                     }
                 }
@@ -12120,7 +12121,7 @@ impl DesktopApp {
         // old instance (see `chain_bay_pending`).
         self.racks_restoring = true;
         let wanted = self.bays_wanted();
-        let bays: std::collections::BTreeSet<(usize, usize)> =
+        let bays: std::collections::BTreeSet<crate::engine_bridge::EngineBay> =
             wanted.keys().chain(self.recorder.inserts_loaded.keys()).copied().collect();
         for at in bays {
             if bay_needs_reload(wanted.contains_key(&at), self.recorder.inserts_loaded.contains_key(&at)) {
@@ -12147,34 +12148,43 @@ impl DesktopApp {
     /// the plugin is still alive, and the ledger forgets the bay, so the
     /// reconcile neither unloads it one bay a frame nor reads it as loaded
     /// when a new track takes the slot. The plugins go home with the lane,
-    /// and an undo that brings the track back seats each bay from its file.
-    /// The bridge calls this through `sync_with` when a track's lane starts
-    /// to leave.
+    /// and an undo that brings the track back after the lane is home seats
+    /// each bay from its file. The bridge calls this through `sync_with` when
+    /// a track's lane starts to leave.
+    ///
+    /// **Answers what it forgot**, and the bridge keeps that on the leaving
+    /// lane: a track that comes back BEFORE its lane was sent home takes the
+    /// same lane back with every plugin still seated in it (design 7.13:
+    /// "nothing was sent home, so nothing reloads"), and its entries go back
+    /// into the ledger (`Synced::reclaimed`). Forgotten for good, the
+    /// reconcile found every bay of the reclaimed lane wanted and not loaded
+    /// and reloaded each live plugin in place from its file, and a bay whose
+    /// state could not be asked for here came back at its defaults.
     ///
     /// `shelf` is the live shelf's folder (`shelf::global_dir`), named by
     /// the caller so the write can be driven onto a scratch one.
     #[cfg(feature = "recorder")]
-    fn forget_lane(
+    pub(crate) fn forget_lane(
         ledger: &mut InsertLedger,
         shelf: &std::path::Path,
         e: &crate::instrument::Engine,
         id: tangent_ui::desk_id::TrackId,
         lane: crate::engine_bridge::LaneAt,
-    ) {
-        let mine: Vec<((usize, usize), String)> = ledger
+    ) -> crate::engine_bridge::Forgotten {
+        let mine: crate::engine_bridge::Forgotten = ledger
             .iter()
-            .filter(|(at, _)| crate::engine_bridge::lane_of_engine_seat(at.0) == Some(lane.slot))
+            .filter(|(at, _)| at.0.lane() == Some(lane.slot))
             .map(|(at, b)| (*at, b.clone()))
             .collect();
-        for (at, bundle) in mine {
-            ledger.remove(&at);
-            if bundle.starts_with('\u{1f}') || is_instrument_sentinel(&bundle) {
+        for (at, bundle) in &mine {
+            ledger.remove(at);
+            if bundle.starts_with('\u{1f}') || is_instrument_sentinel(bundle) {
                 continue;
             }
-            let ours = e.insert(at.0, at.1).is_some_and(|l| l.bundle == std::path::Path::new(&bundle));
+            let ours = e.insert_at(at.0, at.1).is_some_and(|l| l.bundle == std::path::Path::new(bundle));
             // The bay's identity: the leaving TRACK's, at the rack and bay
-            // the engine seat names.
-            let sb = tangent_ui::desk_legacy::decode_v32_seat(at.0).and_then(|(_, rack)| {
+            // the engine names.
+            let sb = at.0.desk_rack().and_then(|rack| {
                 let sb = tangent_ui::desk_id::SeatBay::new(
                     tangent_ui::desk_id::Node::Track(id),
                     rack,
@@ -12182,9 +12192,20 @@ impl DesktopApp {
                 );
                 sb.is_valid().then_some(sb)
             });
-            if let (true, Some(state), Some(sb)) = (ours, e.save_insert_state(at.0, at.1), sb) {
-                crate::shelf::write_state_in(shelf, sb, &bundle, &state);
+            if let (true, Some(state), Some(sb)) = (ours, e.save_insert_state_at(at.0, at.1), sb) {
+                crate::shelf::write_state_in(shelf, sb, bundle, &state);
             }
+        }
+        mine
+    }
+
+    /// **What `forget_lane` let go of, taken back** for every lane the bridge
+    /// handed back to its track this frame (`Synced::reclaimed`). An entry
+    /// the ledger already holds again is newer and stays.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn reclaim_lanes(ledger: &mut InsertLedger, synced: &crate::engine_bridge::Synced) {
+        for (at, bundle) in synced.reclaimed.iter().flatten() {
+            ledger.entry(*at).or_insert_with(|| bundle.clone());
         }
     }
 
@@ -13345,18 +13366,18 @@ impl DesktopApp {
         for lane in 0..crate::instrument::LEGACY_LANES {
             let slot = crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX));
             for bay in 0..tangent_ui::desk_id::BAYS {
-                let Some((seat, b)) =
+                let Some((rack, b)) =
                     crate::engine_bridge::lane_bay(slot, tangent_ui::desk_id::Rack::Chain(0), bay as u8)
                 else {
                     continue;
                 };
-                let Some((spec, _)) = e.builtin_insert(seat, b) else {
+                let Some((spec, _)) = e.builtin_insert_at(rack, b) else {
                     continue;
                 };
                 if spec.path != crate::builtin_fx::SAMPLER_PATH {
                     continue;
                 }
-                let extra = e.builtin_extra(seat, b);
+                let extra = e.builtin_extra_at(rack, b);
                 let read = |key: &str| {
                     extra
                         .iter()
@@ -13474,7 +13495,7 @@ impl DesktopApp {
                 .recorder
                 .engine
                 .as_mut()
-                .is_some_and(|e| e.set_sampler_sample(lane, sample));
+                .is_some_and(|e| e.set_sampler_sample(crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX)), sample));
             if landed {
                 if let Some(slot) = self.sampler_have.get_mut(lane) {
                     *slot = sent;
@@ -14084,10 +14105,11 @@ impl DesktopApp {
         );
     }
 
-    /// **The engine's `(seat, bay)` for the app's**, through the bridge: the
-    /// app keeps its bays by row, the engine by its lanes' slots.
+    /// **The engine's name for the app's `(seat, bay)`**, through the bridge:
+    /// the app keeps its bays by row, the engine its racks by identity (a
+    /// lane's by its slot), each reached through its `HostRack`.
     #[cfg(feature = "recorder")]
-    fn engine_at(&self, seat: usize, bay: usize) -> Option<(usize, usize)> {
+    fn engine_at(&self, seat: usize, bay: usize) -> Option<crate::engine_bridge::EngineBay> {
         self.bridge.engine_seat(&self.app, seat, bay)
     }
 
@@ -14095,7 +14117,7 @@ impl DesktopApp {
     #[cfg(feature = "recorder")]
     fn live_state(&self, seat: usize, bay: usize) -> Option<Vec<u8>> {
         let at = self.engine_at(seat, bay)?;
-        self.recorder.engine.as_ref()?.save_insert_state(at.0, at.1)
+        self.recorder.engine.as_ref()?.save_insert_state_at(at.0, at.1)
     }
 
     /// **Write a bay's state to the live shelf, the bay named by the app's
@@ -14229,11 +14251,11 @@ impl DesktopApp {
     fn follow_insert_window(&mut self, from: (usize, usize), to: (usize, usize)) {
         let at = self.engine_at(from.0, from.1);
         let was_up = at.is_some_and(|at| {
-            self.recorder.engine.as_ref().is_some_and(|e| e.insert_editor_open(at.0, at.1))
+            self.recorder.engine.as_ref().is_some_and(|e| e.insert_editor_open_at(at.0, at.1))
         });
         if let (true, Some(at)) = (was_up, at) {
             if let Some(e) = self.recorder.engine.as_mut() {
-                e.close_insert_editor(at.0, at.1);
+                e.close_insert_editor_at(at.0, at.1);
             }
             self.app.open_insert_when_loaded(to.0, to.1);
         }
@@ -14389,9 +14411,9 @@ impl DesktopApp {
         }
         // Which side had its window up, read BEFORE the bays are re-pointed
         // and the reconcile tears both instances down.
-        let up = |at: Option<(usize, usize)>| {
+        let up = |at: Option<crate::engine_bridge::EngineBay>| {
             at.zip(self.recorder.engine.as_ref())
-                .is_some_and(|(at, e)| e.insert_editor_open(at.0, at.1))
+                .is_some_and(|(at, e)| e.insert_editor_open_at(at.0, at.1))
         };
         let (a_up, b_up) = (up(self.engine_at(a_strip, a_bay)), up(self.engine_at(b_strip, b_bay)));
         // One moment, for the reason `move_insert` states: the halfway
@@ -14441,13 +14463,13 @@ impl DesktopApp {
     /// one's name is a state its own plugin rejects. What an engine teardown
     /// writes down.
     fn save_plugin_states_as_loaded(&mut self) {
-        let loaded: Vec<((usize, usize), String)> = self
+        let loaded: Vec<(crate::engine_bridge::EngineBay, String)> = self
             .recorder
             .inserts_loaded
             .iter()
             .map(|(at, b)| (*at, b.clone()))
             .collect();
-        for ((seat, bay), bundle) in loaded {
+        for (at, bundle) in loaded {
             // The reload marker and the instrument sentinels have no state to
             // ask for; a built-in EFFECT bay answers from its ledger like any
             // LV2 bay and must not be skipped here, or its knobs die at
@@ -14466,11 +14488,11 @@ impl DesktopApp {
                 .engine
                 .as_ref()
                 .filter(|e| {
-                    e.insert(seat, bay)
+                    e.insert_at(at.0, at.1)
                         .is_some_and(|l| l.bundle == std::path::Path::new(&bundle))
                 })
-                .and_then(|e| e.save_insert_state(seat, bay));
-            if let (Some(state), Some(sb)) = (state, self.bridge.bay_at_engine(seat, bay)) {
+                .and_then(|e| e.save_insert_state_at(at.0, at.1));
+            if let (Some(state), Some(sb)) = (state, self.bridge.bay_at_engine(at)) {
                 crate::shelf::write_state(sb, &bundle, &state);
             }
         }
@@ -15548,8 +15570,12 @@ impl DesktopApp {
                 let ledger = &mut self.recorder.inserts_loaded;
                 let shelf = crate::shelf::global_dir();
                 synced = self.bridge.sync_with(&self.app, e, &mut |e, id, lane| {
-                    Self::forget_lane(ledger, &shelf, e, id, lane);
+                    Self::forget_lane(ledger, &shelf, e, id, lane)
                 });
+                // **A lane taken back before it left keeps its plugins**, so
+                // the ledger takes back what it forgot of them: the reconcile
+                // then finds every bay as it was and reloads nothing.
+                Self::reclaim_lanes(&mut self.recorder.inserts_loaded, &synced);
                 self.bridge.desk()
             }
             None => self.app.desk(),
@@ -15625,16 +15651,16 @@ impl DesktopApp {
         // keyboard lane needs no follow-up, its patch and knobs being
         // per-lane atomics the bridge stores. Before the engine is borrowed:
         // the cache is this app's.
-        let voices: Vec<(usize, crate::dx7::Voice)> = synced
+        let voices: Vec<(crate::desk_plan::Slot, crate::dx7::Voice)> = synced
             .made_dx7
             .iter()
-            .map(|(row, slot)| (slot.0 as usize, self.voice_for_strip(*row)))
+            .map(|(row, slot)| (*slot, self.voice_for_strip(*row)))
             .collect();
         let Some(e) = self.recorder.engine.as_mut() else {
             return;
         };
-        for (lane, v) in voices {
-            e.set_builtin_voice(lane, v);
+        for (slot, v) in voices {
+            e.set_builtin_voice(slot, v);
         }
         let gains = self.app.gains();
         e.set_metronome_gain(gains.metronome);
@@ -15658,7 +15684,7 @@ impl DesktopApp {
             let params = self.app.drum_kit_params_of(row);
             let at = lane.slot.0 as usize;
             if self.pushed_pads.get(at).copied().flatten() != Some(params) {
-                e.set_pad_params(at, &params);
+                e.set_pad_params(lane.slot, &params);
                 if let Some(slot) = self.pushed_pads.get_mut(at) {
                     *slot = Some(params);
                 }
@@ -15841,7 +15867,7 @@ impl DesktopApp {
                 let Some((spec, saved)) = self
                     .bridge
                     .engine_seat(&self.app, seat, bay)
-                    .and_then(|(s, b)| engine.builtin_insert(s, b))
+                    .and_then(|(s, b)| engine.builtin_insert_at(s, b))
                 else {
                     continue;
                 };
@@ -17115,13 +17141,15 @@ fn ir_bindable(path: &str) -> bool {
 }
 
 /// **What the host has loaded into the engine, bay by bay**, keyed by the
-/// engine's own `(seat, bay)`: the seat of the bay's rack in its LANE (the
-/// lane's slot, through the bridge), never the row it is drawn on. A track
+/// engine's own name for the bay (`EngineBay`: its rack by identity, a lane's
+/// by the lane's slot through the bridge, and the bay), reached through that
+/// rack's `HostRack`, never by the row it is drawn on. A track
 /// keeps its lane through any reorder, so the ledger keeps its entries and
 /// the reconcile finds nothing to reload (design 7.13: a reorder is one
 /// plan). A lane that leaves takes its entries with it (see
 /// `DesktopApp::forget_lane`), so a slot a new track takes starts empty.
-type InsertLedger = std::collections::BTreeMap<(usize, usize), String>;
+#[cfg(feature = "recorder")]
+pub(crate) type InsertLedger = std::collections::BTreeMap<crate::engine_bridge::EngineBay, String>;
 
 /// **The ledger's "rebuild this bay" mark.** Never equal to a path the desk
 /// can want or to an empty bay, so a marked bay is a mismatch until the
@@ -17427,15 +17455,15 @@ fn encode_mp3(
 /// anything has moved, and the file is named by the bay's identity.
 #[cfg(feature = "recorder")]
 fn desk_insert_state(
-    live: Option<(&crate::instrument::Engine, (usize, usize))>,
+    live: Option<(&crate::instrument::Engine, crate::engine_bridge::EngineBay)>,
     shelf: Option<tangent_ui::desk_id::SeatBay>,
     bundle: &str,
 ) -> Option<Vec<u8>> {
-    live.filter(|(e, (seat, bay))| {
-        e.insert(*seat, *bay)
+    live.filter(|(e, (rack, bay))| {
+        e.insert_at(*rack, *bay)
             .is_some_and(|l| l.bundle == std::path::Path::new(bundle))
     })
-    .and_then(|(e, (seat, bay))| e.save_insert_state(seat, bay))
+    .and_then(|(e, (rack, bay))| e.save_insert_state_at(rack, bay))
     .or_else(|| shelf.and_then(|sb| crate::shelf::saved_state(sb, bundle)))
 }
 
@@ -17454,14 +17482,14 @@ fn desk_insert_state(
 #[cfg(feature = "recorder")]
 pub(crate) fn furnish_mirror_bay(
     mirror: &mut crate::instrument::Engine,
-    live: Option<(&crate::instrument::Engine, (usize, usize))>,
-    at: (usize, usize),
+    live: Option<(&crate::instrument::Engine, crate::engine_bridge::EngineBay)>,
+    at: crate::engine_bridge::EngineBay,
     shelf: Option<tangent_ui::desk_id::SeatBay>,
     bundle: &str,
 ) -> Result<(), String> {
     let state = desk_insert_state(live, shelf, bundle);
     mirror
-        .load_insert(at.0, at.1, Some(std::path::Path::new(bundle)), state.as_deref())
+        .load_insert_at(at.0, at.1, Some(std::path::Path::new(bundle)), state.as_deref())
         .map(|_| ())
 }
 
@@ -17516,7 +17544,7 @@ pub(crate) fn mirror_sampler_samples(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         mirror.set_sampler_sample(
-            lane,
+            crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX)),
             Some(crate::instrument::SamplerSample {
                 clip: Arc::new(clip),
                 name,
@@ -19993,6 +20021,7 @@ impl DesktopApp {
             stretch_seen: std::collections::HashMap::new(),
             scope_buf: Vec::new(),
             tap_buf: Vec::new(),
+            #[cfg(feature = "recorder")]
             insert_tap_at: None,
             ir: IrRoad::default(),
         };
@@ -21366,7 +21395,7 @@ impl DesktopApp {
                     crate::engine_bridge::bay_path(&self.app, sb),
                     at.and_then(|at| self.recorder.inserts_loaded.get(&at)).map(String::as_str),
                     at.zip(self.recorder.engine.as_ref())
-                        .is_some_and(|(at, e)| e.insert(at.0, at.1).is_some()),
+                        .is_some_and(|(at, e)| e.insert_at(at.0, at.1).is_some()),
                 )
             },
         )
@@ -22388,7 +22417,7 @@ impl DesktopApp {
                 // went by, and the track's lane is what holds the plugin.
                 let at = self.engine_at(strip, slot);
                 if let (Some(e), Some(at)) = (self.recorder.engine.as_mut(), at) {
-                    if let Err(err) = e.open_insert_editor(at.0, at.1) {
+                    if let Err(err) = e.open_insert_editor_at(at.0, at.1) {
                         self.recorder.engine_error =
                             Some(format!("could not open the effect's window: {err}"));
                     }
@@ -22859,28 +22888,28 @@ mod tests {
         // plugin itself spells each dial, plus whether its saved state
         // survives a round trip through this host.
         for sb in seat_bay_list("TANGENT_READ") {
-            let (Some(path), Some((seat, bay))) = (desk.get(&sb), mirror.engine_bay(sb)) else {
+            let (Some(path), Some((rack, bay))) = (desk.get(&sb), mirror.engine_bay(sb)) else {
                 continue;
             };
             let saved = crate::shelf::saved_state(sb, path).unwrap_or_default();
-            let again = e.save_insert_state(seat, bay).unwrap_or_default();
+            let again = e.save_insert_state_at(rack, bay).unwrap_or_default();
             println!(
                 "  {sb} {path}\n    saved {} B, re-saved {} B, identical {}",
                 saved.len(),
                 again.len(),
                 saved == again,
             );
-            for (title, v, shown, units) in e.insert_readings(seat, bay) {
+            for (title, v, shown, units) in e.insert_readings_at(rack, bay) {
                 println!("      {title:<24} {v:.6}  {shown} {units}");
             }
         }
         if std::env::var_os("TANGENT_SEATS").is_some() {
             for (sb, path) in &desk {
-                let Some((seat, bay)) = mirror.engine_bay(*sb) else {
+                let Some((rack, bay)) = mirror.engine_bay(*sb) else {
                     continue;
                 };
                 let saved = crate::shelf::saved_state(*sb, path).map_or(0, |v| v.len());
-                println!("    {sb}: state {saved} B  bypassed {}  {path}", e.insert_bypassed(seat, bay));
+                println!("    {sb}: state {saved} B  bypassed {}  {path}", e.insert_bypassed_at(rack, bay));
             }
         }
         Some(e)
@@ -25850,7 +25879,7 @@ mod tests {
             source: file,
             root_key: crate::instrument::SAMPLER_ROOT_KEY,
         };
-        assert!(e.set_sampler_sample(LANE, Some(sample)), "the engine refused the sample");
+        assert!(e.set_sampler_sample(crate::desk_plan::Slot(LANE as u32), Some(sample)), "the engine refused the sample");
         e.set_channel_gain(LANE, 0.5);
         e.set_master_gain(1.0);
         e.set_midi_clips(vec![PlacedMidi {
@@ -25959,10 +25988,12 @@ mod tests {
         // An export's mirror, seated as `start_offline_render` seats it, reads
         // the same file and plays it.
         let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
+        let at = crate::engine_bridge::lane_bay(crate::desk_plan::Slot(LANE as u32), tangent_ui::desk_id::Rack::Chain(0), BAY as u8)
+            .expect("the lane's first rack");
         furnish_mirror_bay(
             &mut mirror,
-            Some((&desk, (LANE, BAY))),
-            (LANE, BAY),
+            Some((&desk, at)),
+            at,
             crate::engine_bridge::seat_bay_at(&tangent_ui::desk_legacy::identity_ids(32), LANE, BAY),
             crate::builtin_fx::SAMPLER_PATH,
         )
@@ -26198,7 +26229,7 @@ mod tests {
         assert!(live.set_builtin_extra(LANE, BAY, extra), "the engine refused the bind");
         let decoded = tangent_record::decode::decode(&file, RATE).expect("the sample decodes");
         assert!(live.set_sampler_sample(
-            LANE,
+            crate::desk_plan::Slot(LANE as u32),
             Some(SamplerSample {
                 clip: Arc::new(decoded),
                 name: "tone.wav".to_owned(),
@@ -26209,10 +26240,12 @@ mod tests {
 
         // The export's mirror, seated as `start_offline_render` seats it.
         let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
+        let at = crate::engine_bridge::lane_bay(crate::desk_plan::Slot(LANE as u32), tangent_ui::desk_id::Rack::Chain(0), BAY as u8)
+            .expect("the lane's first rack");
         furnish_mirror_bay(
             &mut mirror,
-            Some((&live, (LANE, BAY))),
-            (LANE, BAY),
+            Some((&live, at)),
+            at,
             crate::engine_bridge::seat_bay_at(&tangent_ui::desk_legacy::identity_ids(32), LANE, BAY),
             crate::builtin_fx::SAMPLER_PATH,
         )
@@ -26438,7 +26471,7 @@ mod tests {
             .expect("sampler_bays is still called that");
         let walk = &walk[..walk.find("fn sampler_files").expect("sampler_files follows")];
         assert!(
-            walk.contains("e.builtin_extra(seat, b)") && walk.contains("read(\"sample_path\")"),
+            walk.contains("e.builtin_extra_at(rack, b)") && walk.contains("read(\"sample_path\")"),
             "the walk no longer reads the file out of the bay's own state"
         );
         assert!(
@@ -27936,7 +27969,7 @@ mod tests {
         let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         assert!(
             body.contains("chain_bay_pending(")
-                && body.contains(".is_some_and(|(at, e)| e.insert(at.0, at.1).is_some())"),
+                && body.contains(".is_some_and(|(at, e)| e.insert_at(at.0, at.1).is_some())"),
             "the room's gate no longer asks the engine whether the bay holds anything"
         );
     }
@@ -28620,7 +28653,7 @@ mod tests {
         let at = scan
             .find("// **The bay this frame loads is the bay the LAST frame announced.**")
             .expect("the reconcile");
-        let reconcile = &scan[at..at + scan[at..].find("e.load_insert(seat, bay").expect("its load")];
+        let reconcile = &scan[at..at + scan[at..].find("e.load_insert_at(rack, bay").expect("its load")];
         assert!(
             reconcile.contains("shelve_displaced(") && reconcile.contains("incoming_state("),
             "the reconcile no longer shelves the outgoing tenant, or no longer reads the shelf first"
@@ -28696,9 +28729,9 @@ mod tests {
             .find("// **The bay this frame loads is the bay the LAST frame announced.**")
             .expect("the reconcile");
         let load = at + src[at..]
-            .find("e.load_insert(seat, bay, path, state.as_deref())")
+            .find("e.load_insert_at(rack, bay, path, state.as_deref())")
             .expect("the reconcile's load");
-        assert!(src[at..load].contains(".save_insert_state(seat, bay)"),
+        assert!(src[at..load].contains(".save_insert_state_at(rack, bay)"),
             "the reconcile replaces a bay's tenant without asking it for its settings: undoing a \
              paste, a swap or a delete brings the plugin back at its last SAVED settings, or factory");
     }
@@ -31509,11 +31542,17 @@ mod tests {").expect("the tests module")];
         assert_eq!(body.matches("self.app.desk()").count(), 1, "the desk is built more than once a frame");
         assert!(body.contains("if synced.primed {"), "a fresh engine no longer forgets the pads");
         // **And a leaving lane is written down and forgotten** by the hook
-        // the sync calls while its plugins are alive.
+        // the sync calls while its plugins are alive, and what it forgot is
+        // taken back for a lane its track took back before it left.
         assert!(
-            body.contains("Self::forget_lane(ledger, &shelf, e, id, lane);")
+            body.contains("Self::forget_lane(ledger, &shelf, e, id, lane)\n")
                 && body.contains("let shelf = crate::shelf::global_dir();"),
             "a leaving lane's bays are not written down on the live shelf"
+        );
+        let reclaim = body.find("Self::reclaim_lanes(&mut self.recorder.inserts_loaded, &synced);");
+        assert!(
+            reclaim.is_some_and(|r| sync < r && r < took),
+            "a lane taken back before it left does not get its ledger entries back in the frame it is reclaimed"
         );
         assert!(body.contains("if !synced.moved.is_empty() {"), "a lane that came or went is not owed its lists again");
         let start = body_of("fn start_engine(&mut self");
@@ -31794,7 +31833,7 @@ mod tests {").expect("the tests module")];
         let at = src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state");
         let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
         let body = &src[at..end];
-        assert!(body.contains("for &(seat, bay) in &self.comp_rows {"), "the needle loop no longer walks the index");
+        assert!(body.contains("for &(rack, bay) in &self.comp_rows {"), "the needle loop no longer walks the index");
         let walk = body.find("self.comp_rows.extend(").expect("the index's rebuild");
         let rebuild = &body[body[..walk].rfind("if self.comp_rows_stale").expect("its gate")..walk];
         assert!(
@@ -35650,7 +35689,7 @@ mod tests {").expect("the tests module")];
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains("self.bridge.lane(strip)") && code.contains("set_audition(l.slot.0 as usize, key)"),
+            code.contains("self.bridge.lane(strip)") && code.contains("set_audition(l.slot, key)"),
             "the audition no longer reaches the strip's own door, at its track's lane"
         );
         for road in ["send_midi", "capture_app_midi", "note_event"] {
@@ -36085,9 +36124,9 @@ mod sidecar_walk_probe {
         let lane = LaneAt { slot: Slot(2), gen: 1 };
         let at = lane_bay(lane.slot, Rack::Chain(0), 0).expect("the lane's first bay");
         let other = lane_bay(Slot(3), Rack::Chain(0), 0).expect("another lane's bay");
-        e.load_insert(at.0, at.1, Some(std::path::Path::new(comp)), Some(&dial)).expect("the comp loads");
-        e.load_insert(other.0, other.1, Some(std::path::Path::new(comp)), None).expect("the other loads");
-        let playing = e.save_insert_state(at.0, at.1).expect("the comp's state");
+        e.load_insert_at(at.0, at.1, Some(std::path::Path::new(comp)), Some(&dial)).expect("the comp loads");
+        e.load_insert_at(other.0, other.1, Some(std::path::Path::new(comp)), None).expect("the other loads");
+        let playing = e.save_insert_state_at(at.0, at.1).expect("the comp's state");
         let mut ledger: InsertLedger = [(at, comp.to_owned()), (other, comp.to_owned())].into_iter().collect();
         let id = TrackId(40);
 
@@ -36106,7 +36145,7 @@ mod sidecar_walk_probe {
         );
         assert!(!ledger.contains_key(&at), "the ledger still holds the leaving lane's bay");
         assert!(ledger.contains_key(&other), "the ledger forgot another lane's bay");
-        assert!(e.insert(at.0, at.1).is_some(), "the hook dropped a plugin the lane takes home");
+        assert!(e.insert_at(at.0, at.1).is_some(), "the hook dropped a plugin the lane takes home");
         let _ = std::fs::remove_dir_all(&shelf);
     }
 
@@ -36462,6 +36501,13 @@ mod sidecar_walk_probe {
     /// on.
     const EXPORT_SEAT: usize = 2;
 
+    /// The export lane's first bay, by the engine's name for it: the lane at
+    /// slot `EXPORT_SEAT`'s own rack.
+    fn export_bay() -> crate::engine_bridge::EngineBay {
+        crate::engine_bridge::lane_bay(crate::desk_plan::Slot(EXPORT_SEAT as u32), Rack::Chain(0), 0)
+            .expect("the export lane's first bay")
+    }
+
     /// A compressor squeezing hard enough that its presence is not a matter
     /// of opinion: −30 dB threshold, 20:1, the fastest attack and release the
     /// unit offers. The same fixture `instrument.rs`'s stem tests use, spelled
@@ -36664,8 +36710,8 @@ mod sidecar_walk_probe {
         .expect("offline engine");
         furnish_mirror_bay(
             &mut from_desk,
-            Some((&desk, (EXPORT_SEAT, 0))),
-            (EXPORT_SEAT, 0),
+            Some((&desk, export_bay())),
+            export_bay(),
             Some(sb),
             crate::builtin_fx::COMP_PATH,
         )
@@ -36684,7 +36730,7 @@ mod sidecar_walk_probe {
         furnish_mirror_bay(
             &mut from_shelf,
             None,
-            (EXPORT_SEAT, 0),
+            export_bay(),
             Some(sb),
             crate::builtin_fx::COMP_PATH,
         )
