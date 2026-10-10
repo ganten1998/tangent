@@ -83,6 +83,10 @@ mod era_corpus;
 /// Test-only.
 #[cfg(test)]
 mod copy_scan;
+/// The ban scan over every crate's shipped code: no live code names the
+/// fixed desk's width or what grew from it. Test-only.
+#[cfg(test)]
+mod ban_scan;
 /// Musical time: the tempo map, the meter map, and the two conversions
 /// everything else in the app used to do with a multiply.
 pub mod tempo;

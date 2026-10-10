@@ -194,20 +194,42 @@ fn sentences(text: &str) -> Vec<String> {
 
 /// Every string literal in `src` outside test code, escapes resolved
 /// enough for prose: `\n` and `\t` are whitespace, a `\` line continuation
-/// joins its lines, `\"` is a quote.
+/// joins its lines, `\"` is a quote. [`lex`]'s literals.
+fn literals(src: &str) -> Vec<String> {
+    lex(src).literals
+}
+
+/// **A source file, lexed for the scans**: its string literals outside
+/// test code ([`literals`]), and its CODE outside test code, which is the
+/// text with every comment, string and char literal and test item blanked
+/// to spaces and every newline kept, so a scan reads only what ships and
+/// still names the line it found something on (`ban_scan`).
+pub(crate) struct Lexed {
+    pub(crate) literals: Vec<String>,
+    pub(crate) code: String,
+}
+
+/// **The one lexer both scans read through.**
 ///
 /// A small lexer rather than a text search, because a text search reads the
 /// comments (where a stale line is quoted on purpose) and cannot tell an
 /// item under `#[cfg(test)]` from one that ships. It knows `//` and nested
 /// `/* */` comments, normal, byte and raw strings, char literals (so `'"'`
-/// opens nothing) and lifetimes. An item under `#[cfg(test)]` is skipped to
-/// its end: the `;` or the `}` that closes its first `{`, counted with
+/// opens nothing) and lifetimes. An item under a test cfg (`#[cfg(test)]`,
+/// or an `all(..)` that needs `test`: `ban_scan::is_test_cfg`) is skipped
+/// to its end: the `;` or the `}` that closes its first `{`, counted with
 /// strings and comments still lexed so a brace inside one is not a brace.
-fn literals(src: &str) -> Vec<String> {
+pub(crate) fn lex(src: &str) -> Lexed {
     let s: Vec<char> = src.chars().collect();
     let n = s.len();
     let at = |i: usize, pat: &str| pat.chars().enumerate().all(|(k, c)| s.get(i + k) == Some(&c));
     let mut out = Vec::new();
+    let mut code = String::with_capacity(src.len());
+    // What a blanked stretch leaves in the code: its newlines, so every
+    // line after it keeps its number.
+    let blank = |code: &mut String, from: usize, to: usize| {
+        code.extend(s[from..to.min(n)].iter().map(|c| if *c == '\n' { '\n' } else { ' ' }));
+    };
     // `Some(depth)` while inside a skipped test item: the depth of `{` /
     // `(` / `[` reached in it, and whether its body has opened.
     let mut skipping: Option<(i32, bool)> = None;
@@ -215,12 +237,15 @@ fn literals(src: &str) -> Vec<String> {
     while i < n {
         let c = s[i];
         if at(i, "//") {
+            let from = i;
             while i < n && s[i] != '\n' {
                 i += 1;
             }
+            blank(&mut code, from, i);
             continue;
         }
         if at(i, "/*") {
+            let from = i;
             let mut depth = 0;
             while i < n {
                 if at(i, "/*") {
@@ -236,12 +261,34 @@ fn literals(src: &str) -> Vec<String> {
                     i += 1;
                 }
             }
+            blank(&mut code, from, i);
             continue;
         }
-        if at(i, "#[cfg(test)]") && skipping.is_none() {
-            skipping = Some((0, false));
-            i += "#[cfg(test)]".len();
-            continue;
+        if at(i, "#[cfg(") && skipping.is_none() {
+            // The attribute whole, to its `]`, strings inside it skipped.
+            let mut j = i + 2;
+            let mut depth = 1;
+            while j < n && depth > 0 {
+                match s[j] {
+                    '"' => {
+                        j += 1;
+                        while j < n && s[j] != '"' {
+                            j += if s[j] == '\\' { 2 } else { 1 };
+                        }
+                    }
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let attr: String = s[i..j.min(n)].iter().collect();
+            if crate::ban_scan::is_test_cfg(&attr) {
+                skipping = Some((0, false));
+                blank(&mut code, i, j);
+                i = j;
+                continue;
+            }
         }
         let ident_before = i > 0 && (s[i - 1].is_alphanumeric() || s[i - 1] == '_');
         // Raw strings: r"..", r#".."#, br"..", with any number of hashes.
@@ -262,7 +309,9 @@ fn literals(src: &str) -> Vec<String> {
                 if skipping.is_none() {
                     out.push(s[start..end.min(n)].iter().collect());
                 }
+                let from = i;
                 i = end + close.chars().count();
+                blank(&mut code, from, i);
                 continue;
             }
         }
@@ -293,10 +342,13 @@ fn literals(src: &str) -> Vec<String> {
             if skipping.is_none() {
                 out.push(lit);
             }
+            let from = i;
             i = j + 1;
+            blank(&mut code, from, i);
             continue;
         }
         if c == '\'' {
+            let from = i;
             if s.get(i + 1) == Some(&'\\') {
                 // '\n', '\'', '\u{..}': past the escaped character, to
                 // the closing quote.
@@ -310,9 +362,13 @@ fn literals(src: &str) -> Vec<String> {
             } else {
                 // A lifetime.
                 i += 1;
+                code.push(if skipping.is_some() { ' ' } else { '\'' });
+                continue;
             }
+            blank(&mut code, from, i);
             continue;
         }
+        let skipped = skipping.is_some();
         if let Some((depth, opened)) = skipping.as_mut() {
             match c {
                 '{' | '(' | '[' => {
@@ -334,9 +390,10 @@ fn literals(src: &str) -> Vec<String> {
                 _ => {}
             }
         }
+        code.push(if skipped && c != '\n' { ' ' } else { c });
         i += 1;
     }
-    out
+    Lexed { literals: out, code }
 }
 
 /// The repository root.
@@ -423,8 +480,13 @@ fn no_surface_says_a_key_is_only_a_thank_you() {
     hits.extend(stale(unreleased(&changelog)).into_iter().map(|h| format!("CHANGELOG.md [Unreleased]: {h}")));
     let mut scanned = 0;
     for dir in ["tangent-ui/src", "tools/tangent-fulfil/src"] {
-        for file in rust_files(&root.join(dir)) {
-            if file.file_name().is_some_and(|f| f == "copy_scan.rs") {
+        let files = rust_files(&root.join(dir));
+        // A test-only module is a whole file of assertions and fixtures,
+        // which no user reads: the same reason a `#[cfg(test)]` item is
+        // skipped inside a file.
+        let tests = crate::ban_scan::test_only_files(&files);
+        for file in files {
+            if tests.contains(&file) || file.file_name().is_some_and(|f| f == "copy_scan.rs") {
                 continue;
             }
             scanned += 1;
