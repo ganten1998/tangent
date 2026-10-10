@@ -23757,9 +23757,11 @@ impl Engine {
         self.shared.drum_strips.store(mask, Ordering::Relaxed);
     }
 
-    /// What the aligners are currently aiming at, in frames.
+    /// What the aligners are currently aiming at, in frames: read by the
+    /// width suite (`slot_gaps`) too, which holds what a bus that looks
+    /// ahead does to the desk's alignment through the bridge.
     #[cfg(test)]
-    fn published_max_latency_for_test(&self) -> u32 {
+    pub(crate) fn published_max_latency_for_test(&self) -> u32 {
         self.shared.max_latency.load(Ordering::Relaxed)
     }
 
