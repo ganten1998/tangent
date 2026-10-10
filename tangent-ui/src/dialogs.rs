@@ -31,6 +31,12 @@ use tangent_core::fretboard::{self, Tuning, TuningError, MAX_STRINGS};
 use tangent_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
 use tangent_core::OverrideInfo;
 
+/// **The lane a Track menu carries for a strip that is no row** (the
+/// click's): every row-only part of the menu is offered only on a real row.
+/// It was "past the channels", a width test against a desk that no longer
+/// has a width.
+pub const NOT_A_ROW: usize = usize::MAX;
+
 pub enum Dialog {
     /// **The Konami dialog.** Its words and its one button are the owner's
     /// spec, verbatim; dismissing it is what mints the Cheater unlock.
@@ -64,6 +70,8 @@ pub enum Dialog {
     /// anybody adjusts about a metronome, and three of them lived in
     /// different corners of the app while the fourth did not exist.
      Track {
+        /// The track's row, or [`NOT_A_ROW`] for a strip that is none (the
+        /// click): the menu's row-only parts are offered on a row alone.
         lane: usize,
         removable: bool,
         /// The lane's current badge, 0..=3 — the picker's lit slot.
@@ -387,7 +395,8 @@ pub enum Dialog {
     /// control that could only show one made that a thing you toggled
     /// between rather than saw.
     Automation {
-        lane: usize,
+        /// Whose rows: a track's, or the master's.
+        lane: crate::automation::AutoLane,
         /// What the track is called, for the title.
         who: String,
         groups: Vec<AutoGroup>,
@@ -1695,7 +1704,7 @@ pub enum DialogAction {
     SaveChangesDiscard,
     SaveChangesCancel,
     /// Show or hide one automation lane. The `String` is `AutoParam::key()`.
-    AutomationToggle(usize, String),
+    AutomationToggle(crate::automation::AutoLane, String),
     /// Expand or collapse one heading in the automation menu.
     AutomationGroup(String),
     /// New session from the `default` template.
@@ -11484,7 +11493,7 @@ fn show_on(
                             // slot's menu always says what it is for; a row
                             // that appears only sometimes is a row nobody
                             // learns is there.
-                            if empty && lane < crate::recorder::CHANNELS {
+                            if empty && lane != NOT_A_ROW {
                                 let label = if can_paste {
                                     "Paste Track"
                                 } else {
@@ -11504,7 +11513,7 @@ fn show_on(
                                 }
                                 ui.add_space(6.0);
                             }
-                            if lane < crate::recorder::CHANNELS {
+                            if lane != NOT_A_ROW {
                                 if ui
                                     .add_sized(
                                         Vec2::new(ui.available_width(), 26.0),
@@ -11528,7 +11537,7 @@ fn show_on(
                                 );
                                 ui.add_space(8.0);
                             }
-                            if lane < crate::recorder::CHANNELS {
+                            if lane != NOT_A_ROW {
                                 ui.label(
                                     RichText::new("ICON").font(bold(10.0)).color(dim),
                                 );

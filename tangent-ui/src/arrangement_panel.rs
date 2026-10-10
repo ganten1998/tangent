@@ -28,7 +28,7 @@
 //! vertically zooms (the app's half — the panel only names the surface).
 
 use crate::mixer_panel::STRIP_COLORS;
-use crate::recorder::{ChannelKind, Column, StripRef, VISIBLE_MAX};
+use crate::recorder::{ChannelKind, Column, VISIBLE_MAX};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One lane's header, as the painter sees it. Lane N IS channel N — name,
@@ -118,6 +118,10 @@ pub struct LaneView<'a> {
     /// Painted under frost with a snowflake on the header; its clips are
     /// shown and not editable. Appended, the struct's law.
     pub frozen: bool,
+    /// **What an unused lane's plus is**: an empty row's, or the desk's
+    /// trailing add under the last lane, open or locked
+    /// (`mixer_panel::Plus`). Read only on a lane that is not `used`.
+    pub plus: crate::mixer_panel::Plus,
 }
 
 /// One clip on a lane, resolved: `len_s` is real seconds (the host resolved
@@ -421,19 +425,29 @@ pub struct MarkerView {
 /// a binary search and a walk is O(visible).
 pub struct Lanes<'a> {
     lanes: Vec<(usize, LaneView<'a>)>,
+    /// The RANK of the first drawn lane carried, among every drawn lane of
+    /// the desk: zero for a whole desk, the scroll's own rank for the
+    /// window the app builds. See [`ArrangeView::lane_scroll`].
+    first: usize,
 }
 
 impl<'a> Lanes<'a> {
     /// The lanes of these rows, in row order.
     pub fn new(lanes: Vec<(usize, LaneView<'a>)>) -> Self {
         debug_assert!(lanes.windows(2).all(|w| w[0].0 < w[1].0), "rows out of order");
-        Self { lanes }
+        Self { lanes, first: 0 }
+    }
+
+    /// These lanes begin at drawn rank `first` (the app's window).
+    pub fn starting_at(mut self, first: usize) -> Self {
+        self.first = first;
+        self
     }
 
     /// Every lane from row 0, one per row: a whole desk, for a test or a
     /// picture of the whole song.
     pub fn dense(lanes: Vec<LaneView<'a>>) -> Self {
-        Self { lanes: lanes.into_iter().enumerate().collect() }
+        Self { lanes: lanes.into_iter().enumerate().collect(), first: 0 }
     }
 
     fn slot(&self, row: usize) -> Option<usize> {
@@ -497,9 +511,9 @@ impl<'a> std::ops::IndexMut<usize> for Lanes<'a> {
 /// It replaces two numbers that meant "the master" by being one and two
 /// past the channels (`MASTER_LANE` and `MASTER_COLUMN`), which moved every
 /// time the desk grew and made every comparison against them a width test
-/// in disguise. A row is a row and the master is the master; where a stored
-/// automation lane is needed, [`LaneId::auto_lane`] asks [`StripRef`], the
-/// one home of that arithmetic.
+/// in disguise. A row is a row and the master is the master, and so is a
+/// stored automation lane ([`LaneId::auto_lane`], `automation::AutoLane`).
+/// No number means the master any more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LaneId {
     /// The lane of the track on this row.
@@ -517,21 +531,20 @@ impl LaneId {
         }
     }
 
-    /// The lane the automation store files this lane's curves under.
-    pub fn auto_lane(self) -> usize {
-        let strip = match self {
-            LaneId::Row(r) => StripRef::Row(r),
-            LaneId::Master => StripRef::Master,
-        };
-        // A row and the master always have one; see `StripRef::auto_lane`.
-        strip.auto_lane().unwrap_or(usize::MAX)
+    /// Whose curves this lane's are in the automation store: a row's, or
+    /// the master's by name (`automation::AutoLane`).
+    pub const fn auto_lane(self) -> crate::automation::AutoLane {
+        match self {
+            LaneId::Row(r) => crate::automation::AutoLane::Row(r),
+            LaneId::Master => crate::automation::AutoLane::Master,
+        }
     }
 
     /// The lane a stored automation lane is: the master's own, or a row.
-    pub fn from_auto_lane(lane: usize) -> LaneId {
-        match StripRef::from_auto_lane(lane) {
-            Some(StripRef::Master) => LaneId::Master,
-            _ => LaneId::Row(lane),
+    pub const fn from_auto_lane(lane: crate::automation::AutoLane) -> LaneId {
+        match lane {
+            crate::automation::AutoLane::Row(r) => LaneId::Row(r),
+            crate::automation::AutoLane::Master => LaneId::Master,
         }
     }
 
@@ -580,12 +593,18 @@ pub struct ArrangeView<'a> {
     /// master row, in the same strip order as `master_inserts`.
     pub master_bypassed: [bool; crate::recorder::INSERTS * 2],
     /// The first lane shown — the arrangement has more lanes than fit, so a
-    /// window of them shows and this says which. Clamped by the app.
+    /// window of them shows and this says which — as its RANK among the
+    /// drawn lanes. Clamped by the app.
+    ///
+    /// A rank and not a row: the desk's vacant rows are not drawn, and
+    /// neither are a shut folder's children, so a scroll counted in rows
+    /// spent a wheel notch per hidden row moving nothing, and a legacy
+    /// desk's thirty empty rows let the tracks scroll clean away.
     pub lane_scroll: usize,
     /// How many lanes show at once — Shift+wheel over the headers zooms it.
     pub visible_lanes: usize,
-    /// How far the desk reaches (`TangentApp::desk_extent`): how many lanes
-    /// the field draws and the scroll can reach. Never a tier.
+    /// How many lanes the field draws, the trailing add's included: what
+    /// the scroll can reach, in ranks. Never a tier.
     pub active: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a
@@ -1627,11 +1646,10 @@ impl Layout {
         // nothing is hit, and its clips resolve to nothing through
         // `clip_rect`'s own `is_positive` filter — the same road a
         // scrolled-off lane already takes.
-        let placeable = || {
-            view.lanes
-                .rows()
-                .filter(move |(i, l)| *i >= first && *i < active && !l.hidden)
-        };
+        // By RANK (`ArrangeView::lane_scroll`): the drawn lanes the view
+        // carries, from the one at rank `first`.
+        let skip = first.saturating_sub(view.lanes.first);
+        let placeable = || view.lanes.rows().filter(|(_, l)| !l.hidden).skip(skip);
         // **The bus rows are ADDED to the stack, not taken out of it.**
         //
         // The master and the click are half a track each — one track's
@@ -1796,6 +1814,7 @@ impl Layout {
                         lane.used,
                         if lane.in_folder { FOLDER_INDENT } else { 0.0 },
                         lane.is_folder,
+                        lane.plus,
                     )
                 } else {
                     HeaderRow::NONE
@@ -1924,7 +1943,7 @@ impl Layout {
 
     /// The cells across one header, REAPER's row at Tangent's density:
     /// number, arm dot, name, gain knob, slim meter, M/S.
-    fn header_row(row: Rect, used: bool, indent: f32, folder: bool) -> HeaderRow {
+    fn header_row(row: Rect, used: bool, indent: f32, folder: bool, plus: crate::mixer_panel::Plus) -> HeaderRow {
         // **The indent moves the CONTENTS, and `panel` keeps the whole row.**
         //
         // The panel is what a press is tested against and what the plate is
@@ -1957,6 +1976,11 @@ impl Layout {
                 ),
                 Vec2::splat(d),
             );
+            // **The trailing add is the plus and nothing else**: it is no
+            // row yet, so it has no input to bind and no slot to select.
+            if plus != crate::mixer_panel::Plus::Row {
+                return HeaderRow { panel: row, add, ..HeaderRow::NONE };
+            }
             let ch_h = (r.height() * 0.30).clamp(12.0, 16.0);
             let input = Rect::from_min_size(
                 Pos2::new(add.right() + 6.0, r.center().y - ch_h * 0.5),
@@ -4187,7 +4211,17 @@ pub fn a11y_nodes_from(
                 format!("{} shows its tracks", who_row(i)),
                 !view.lanes.get(i).is_some_and(|l| l.folder_shut),
             ),
-            Hit::HdrAdd(i) => Node::button(id, r, format!("Add a track at row {}", i + 1)),
+            Hit::HdrAdd(i) => Node::button(
+                id,
+                r,
+                match view.lanes.get(i).map_or(crate::mixer_panel::Plus::Row, |l| l.plus) {
+                    crate::mixer_panel::Plus::Row => format!("Add a track at row {}", i + 1),
+                    crate::mixer_panel::Plus::Trailing => "Add a track".to_owned(),
+                    crate::mixer_panel::Plus::Locked => {
+                        "Add a track (the free desk is full: a supporter key lifts the limit)".to_owned()
+                    }
+                },
+            ),
             Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who_row(i)), who_row(i)),
             Hit::HdrInput(i) => Node::readout(
                 id,
@@ -6983,10 +7017,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // the audit computed its own ink instead of calling this. It calls
         // `on_ink` now, and so does the audit.
         let ink_on = on_ink(face);
+        // The trailing add is no row yet, so it wears no number.
+        let numbered = lane.used || lane.plus == crate::mixer_panel::Plus::Row;
         painter.text(
             Pos2::new(plate.left() + 4.0, plate.center().y),
             Align2::LEFT_CENTER,
-            format!("{}", i + 1),
+            if numbered { format!("{}", i + 1) } else { String::new() },
             num_font.clone(),
             if lane.used {
                 quiet(ink_on, face, 0.30)
@@ -7045,17 +7081,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
                 let w = (radius * 0.12).clamp(1.2, 2.2);
                 painter.circle_stroke(c, radius, Stroke::new(w, ink));
-                let arm = radius * 0.45;
-                painter.line_segment(
-                    [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
-                    Stroke::new(w, ink),
-                );
-                painter.line_segment(
-                    [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
-                    Stroke::new(w, ink),
-                );
+                if lane.plus == crate::mixer_panel::Plus::Locked {
+                    crate::mixer_panel::padlock(painter, c, radius, w, ink);
+                } else {
+                    let arm = radius * 0.45;
+                    painter.line_segment(
+                        [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
+                        Stroke::new(w, ink),
+                    );
+                    painter.line_segment(
+                        [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
+                        Stroke::new(w, ink),
+                    );
+                }
             }
-            chip(painter, row.input, "NO INPUT", false);
+            if lane.plus == crate::mixer_panel::Plus::Row {
+                chip(painter, row.input, "NO INPUT", false);
+            }
             continue;
         }
         // The arm dot: REAPER's record circle, lit when live. A FOLDER has
@@ -7998,7 +8040,7 @@ mod tests {
         }
     }
     use super::*;
-    use crate::recorder::CHANNELS;
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
@@ -8011,6 +8053,7 @@ LaneView {
     folder_silent: false,
     frozen: false,
             automation: Vec::new(),
+            plus: crate::mixer_panel::Plus::Row,
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS * 2],
@@ -9947,8 +9990,7 @@ ArrangeView {
         // And nothing anywhere in the tree calls the bus a track.
         // The number a reader heard when the master was the lane one past
         // the channels: its automation lane, counted from one.
-        let master_lane = StripRef::Master.auto_lane().expect("the master has a lane");
-        let ghost = format!("Track {}", master_lane + 1);
+        let ghost = format!("Track {}", crate::desk_lift::V32_MASTER_LANE + 1);
         assert!(
             !nodes.iter().any(|n| n.label.contains(&ghost)),
             "a node still calls the master {ghost}"
@@ -13488,13 +13530,15 @@ selected: false,
         visible: usize,
         lane_scroll: usize,
     ) -> ArrangeView<'a> {
+        // In RANKS among the drawn rows (`ArrangeView::lane_scroll`), as the
+        // app builds its window.
         let mut v = a_view(clips);
-        v.active = ix.extent();
+        v.active = ix.shown_len();
         v.visible_lanes = visible;
-        v.lane_scroll = lane_scroll.min(ix.extent().saturating_sub(visible));
+        v.lane_scroll = lane_scroll.min(ix.shown_len().saturating_sub(visible));
         let (first, can) = lane_window_start(v.lane_scroll, visible, v.active);
-        let rows = ix.window(ix.rank_at_or_after(first), can + 1);
-        v.lanes = Lanes::new(rows.iter().map(|r| (*r as usize, a_lane(true))).collect());
+        let rows = ix.window(first, can + 1);
+        v.lanes = Lanes::new(rows.iter().map(|r| (*r as usize, a_lane(true))).collect()).starting_at(first);
         v
     }
 
@@ -13542,9 +13586,9 @@ selected: false,
                         assert!(lanes.len() <= bound, "{what}: {} lanes answer presses", lanes.len());
                         let nodes = a11y_nodes_from(&v, &hits);
                         assert!(nodes.len() <= hits.len(), "{what}: more nodes than targets");
-                        // The first lane laid out is the first drawn row at
-                        // the (clamped) scroll.
-                        let first_drawn = ix.row_at(ix.rank_at_or_after(v.lane_scroll));
+                        // The first lane laid out is the drawn row at the
+                        // (clamped) scroll, a rank.
+                        let first_drawn = ix.row_at(v.lane_scroll);
                         let first_laid = l
                             .rows
                             .iter()

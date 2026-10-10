@@ -745,9 +745,9 @@ mod tests {
 
     #[test]
     fn the_frozen_numbers_are_still_the_live_desks() {
-        assert_eq!(V32_CHANNELS, recorder::CHANNELS);
-        // `V32_STRIPS` has no live twin to agree with: the specials left
-        // strip space (W5), so the strip count lives here alone.
+        // `V32_CHANNELS` and `V32_STRIPS` have no live twin to agree with:
+        // the specials left strip space (W5) and the desk is the list of
+        // rows that exist (W6), so the widths live here alone.
         assert_eq!(V32_TOTAL_SEATS, TOTAL_SEATS);
         assert_eq!(V32_INSERT_SPACE, INSERT_SPACE);
         assert_eq!(BAYS, recorder::INSERTS);

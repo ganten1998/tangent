@@ -8239,7 +8239,9 @@ fn fill_automation_params(
             let AutoParam::Plugin { bay, id } = curve.param else {
                 continue;
             };
-            let lane = curve.lane;
+            // The list's own number for the lane (`SlotAutomation::master` for
+            // the master's, a slot for a lane's; W6-rows-unlimited).
+            let lane = curve.lane.index_or(whose.master);
             if whose.held(lane, suspend, master_held) || !whose.plays(lane) {
                 continue;
             }
@@ -23152,6 +23154,20 @@ impl Engine {
         sh.soloed.store(soloed, Ordering::Relaxed);
     }
 
+    /// **One lane's meter and what its clips are sounding, by slot**
+    /// (W6-rows-unlimited): [`Self::strip_peaks`] and [`Self::lane_sounding`]
+    /// answer the legacy thirty-two, and a row's lane past them is read
+    /// here. The peak CLEARS as it reads, as `strip_peaks`' does; zero for a
+    /// slot that holds no lane.
+    pub fn lane_reading(&self, slot: Slot) -> ([f32; 2], u128) {
+        self.shared.lanes.cells(slot.0 as usize).map_or(([0.0; 2], 0), |l| {
+            let peak = std::array::from_fn(|c| f32::from_bits(l.peak[c].swap(0, Ordering::Relaxed)));
+            let lo = l.sounding[0].load(Ordering::Relaxed);
+            let hi = l.sounding[1].load(Ordering::Relaxed);
+            (peak, u128::from(lo) | (u128::from(hi) << 64))
+        })
+    }
+
     /// The loudest thing each strip has made since this was last called, and
     /// it CLEARS as it reads. Zero for a strip that has been silent.
     pub fn strip_peaks(&self) -> [[f32; 2]; STRIPS] {
@@ -28490,21 +28506,22 @@ mod tests {
         // MIDI Inputs dialog writes it.
         const A: usize = 2;
         const B: usize = 5;
+        // Each row's own input, kind and device set (W6: the desk is rows).
         let mut set = tangent_ui::settings::Settings::default();
-        set.channel_inputs = vec![String::new(); tangent_ui::desk_legacy::V32_CHANNELS];
-        set.channel_kinds = [0; tangent_ui::desk_legacy::V32_CHANNELS];
-        for ch in [A, B] {
-            set.channel_kinds[ch] = ChannelKind::as_u8(Some(ChannelKind::Midi));
+        for row in &mut set.rows {
+            (row.input, row.kind, row.midi) = (String::new(), None, MidiInputSel::EVERYTHING);
         }
-        set.channel_inputs[A] = "midi:Keyboard A".to_owned();
-        set.channel_inputs[B] = "midi:Keyboard B".to_owned();
-        set.channel_midi_inputs = vec![MidiInputSel::EVERYTHING; tangent_ui::desk_legacy::V32_CHANNELS];
+        for ch in [A, B] {
+            set.rows[ch].kind = Some(ChannelKind::Midi.row_kind());
+        }
+        set.rows[A].input = "midi:Keyboard A".to_owned();
+        set.rows[B].input = "midi:Keyboard B".to_owned();
         // Wire channel 2 is what a keyboard's own display calls CH 3.
-        set.channel_midi_inputs[A] = MidiInputSel {
+        set.rows[A].midi = MidiInputSel {
             devices: vec!["Keyboard A".to_owned()],
             channel: Some(2),
         };
-        set.channel_midi_inputs[B] = MidiInputSel {
+        set.rows[B].midi = MidiInputSel {
             devices: vec!["Keyboard B".to_owned()],
             channel: None,
         };
@@ -28513,22 +28530,18 @@ mod tests {
         // the seam: a setup that survives the dialog and not the file is a
         // setup somebody has to build again every launch.
         let back = tangent_ui::settings::Settings::from_json(&set.to_json());
-        assert_eq!(
-            back.channel_midi_inputs[A], set.channel_midi_inputs[A],
-            "the device set did not survive the settings file"
-        );
-        assert_eq!(
-            back.channel_midi_inputs[B], set.channel_midi_inputs[B],
-            "the second track's set did not survive the settings file"
-        );
+        assert_eq!(back.rows[A].midi, set.rows[A].midi, "the device set did not survive the settings file");
+        assert_eq!(back.rows[B].midi, set.rows[B].midi, "the second track's set did not survive the settings file");
 
         // The slot table the desktop's connections would have claimed.
         let slots = vec!["Keyboard A".to_owned(), "Keyboard B".to_owned()];
-        let kinds: Vec<_> = (0..tangent_ui::desk_legacy::V32_CHANNELS)
-            .map(|ch| ChannelKind::from_u8(back.channel_kinds[ch]))
-            .collect();
-        let routes =
-            tangent_ui::recorder::live_midi_routes(&back.channel_midi_inputs, &kinds, &slots);
+        let kinds: Vec<_> = back.rows.iter().map(|r| r.kind.and_then(ChannelKind::of_row)).collect();
+        let sels: Vec<MidiInputSel> = back.rows.iter().map(|r| r.midi.clone()).collect();
+        let routes = tangent_ui::recorder::live_midi_routes(&sels, &kinds, &slots);
+        // The engine's legacy shim takes the first thirty-two rows' routes.
+        let routes: [tangent_ui::recorder::MidiRoute; tangent_ui::desk_legacy::V32_CHANNELS] = std::array::from_fn(|ch| {
+            routes.get(ch).copied().unwrap_or(tangent_ui::recorder::MidiRoute::EVERYTHING)
+        });
 
         // Two synths, two lanes, both armed and both audible.
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");

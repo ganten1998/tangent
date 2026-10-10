@@ -11833,7 +11833,7 @@ mod tests {
                 let face = band_face(&set);
                 let mode = if dark { "dark" } else { "light" };
                 for pal in &crate::mixer_panel::PALETTES {
-                    for c in 0..crate::recorder::CHANNELS {
+                    for c in 0..crate::desk_lift::V32_CHANNELS {
                         let (sr, sg, sb) =
                             crate::mixer_panel::STRIP_COLORS[pal.slot(c)];
                         let tint = heart_shade(Color32::from_rgb(sr, sg, sb), face);
@@ -11881,7 +11881,7 @@ mod tests {
         let face = band_face(&set);
         let mut flat = 0;
         for pal in &crate::mixer_panel::PALETTES {
-            for c in 0..crate::recorder::CHANNELS {
+            for c in 0..crate::desk_lift::V32_CHANNELS {
                 let (r, g, b) = crate::mixer_panel::STRIP_COLORS[pal.slot(c)];
                 let raw = Color32::from_rgb(r, g, b);
                 if contrast_ratio(heart_shade(raw, face), face) <= contrast_ratio(raw, face) {
