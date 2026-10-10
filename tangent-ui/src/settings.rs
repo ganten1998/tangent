@@ -6348,12 +6348,12 @@ impl Settings {
     /// nobody finds again and one that fails outright inside a signed
     /// `.app`.
     ///
-    /// **An internal build keeps its own: `Documents/Tangent Media
-    /// Staging`.** See `tangent_core::config::STAGING`: the projects, takes
-    /// and templates such a build writes are in a format no release can
-    /// read, and the folder beside the real one is what keeps them from
-    /// landing in it. `TANGENT_MEDIA_ROOT` points either kind of build at
-    /// any folder, real files included, on purpose.
+    /// **`TANGENT_MEDIA_ROOT` points a build at any folder**, a developer's
+    /// switch beside `TANGENT_CONFIG_DIR`. The unlimited-tracks branch kept
+    /// its internal builds in `Documents/Tangent Media Staging` until its
+    /// last wave, so nothing it wrote landed among the release's projects;
+    /// the first build after it opens the real folder, and a legacy document
+    /// is kept as `<doc>.pre-v8` beside itself before its first format-2 save.
     pub fn media_root(&self) -> PathBuf {
         // **Never the owner's own folder under test**, for the reason
         // `Settings::path` gives: a test that built an app on
@@ -6370,19 +6370,19 @@ impl Settings {
         }
         #[cfg(not(test))]
         {
-            Self::default_media_root(tangent_core::config::STAGING)
+            Self::default_media_root()
         }
     }
 
-    /// `Documents/Tangent Media`, or its staging twin. Apart from
-    /// [`Self::media_root`] so that the choice is testable without the
-    /// environment and without the per-thread test root in the way; it
-    /// only names a path and creates nothing.
-    fn default_media_root(staging: bool) -> PathBuf {
+    /// `Documents/Tangent Media`. Apart from [`Self::media_root`] so that
+    /// the choice is testable without the environment and without the
+    /// per-thread test root in the way; it only names a path and creates
+    /// nothing.
+    fn default_media_root() -> PathBuf {
         dirs::document_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(if staging { "Tangent Media Staging" } else { "Tangent Media" })
+            .join("Tangent Media")
     }
 
     /// A folder the user actually chose, or nothing. An empty string is not
@@ -6399,10 +6399,25 @@ impl Settings {
     /// Kept so [`Self::pin_legacy_media_root`] can find an install that
     /// already has work in it.
     fn legacy_record_root() -> PathBuf {
-        dirs::video_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Tangent")
+        // **Never the owner's own take folder under test**, for the reason
+        // `media_root` gives: `Settings::load` runs the pin, so a test that
+        // loads settings would look in the real `Movies/Tangent` and, finding
+        // work there, aim that test's takes at it. The unlimited-tracks
+        // branch's internal builds kept the pin inert (`STAGING`), which hid
+        // this from every test; the pin runs again since its last wave, so a
+        // test looks in a per-thread folder that holds nothing. The rule
+        // itself is pinned on a temp folder through `pin_legacy_media_root_at`.
+        #[cfg(test)]
+        {
+            return test_path().with_file_name("Legacy Takes");
+        }
+        #[cfg(not(test))]
+        {
+            dirs::video_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Tangent")
+        }
     }
 
     /// **Throw away a `screen_reader_mode` that the app guessed at.**
@@ -6453,21 +6468,13 @@ impl Settings {
     /// purpose, knowing what is where.
     ///
     /// Runs once; `media_root_v20` is the marker.
-    ///
-    /// **Pins nothing in an internal build** (`tangent_core::config::STAGING`)
-    /// and leaves the marker alone: the old place is the release install's
-    /// work, and pinning to it is exactly the road by which a staging build
-    /// would write into it.
     pub fn pin_legacy_media_root(&mut self) -> bool {
-        if tangent_core::config::STAGING {
-            return false;
-        }
         self.pin_legacy_media_root_at(&Self::legacy_record_root())
     }
 
     /// [`Self::pin_legacy_media_root`]'s rule against a given old take
-    /// folder, staging or not: the test's road, on a temp folder rather
-    /// than the real `Movies/Tangent`.
+    /// folder: the test's road, on a temp folder rather than the real
+    /// `Movies/Tangent`.
     fn pin_legacy_media_root_at(&mut self, old: &std::path::Path) -> bool {
         if self.media_root_v20 {
             return false;
@@ -7075,23 +7082,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&old);
     }
 
-    /// **An internal build keeps its own media and pins nothing.** With no
-    /// override the root is `Documents/Tangent Media Staging`; the release
-    /// name is the other answer of the same chooser; and the legacy pin is
-    /// inert, marker included, so a staging build never adopts the release
-    /// install's take folder.
+    /// **With no override the media root is `Documents/Tangent Media`**,
+    /// the release's, in every build: the unlimited-tracks branch's staging
+    /// twin (`Tangent Media Staging`) went with its last wave. Through the
+    /// chooser, which names a path and touches nothing; the legacy pin's
+    /// rule is pinned above on a temp folder, never on the real
+    /// `Movies/Tangent`.
     #[test]
-    fn an_internal_build_pins_nothing_and_keeps_its_own_media() {
-        assert!(tangent_core::config::STAGING, "this branch's builds are internal");
-        let staged = Settings::default_media_root(true);
-        assert!(staged.ends_with("Tangent Media Staging"), "{}", staged.display());
-        let release = Settings::default_media_root(false);
-        assert!(release.ends_with("Tangent Media"), "{}", release.display());
-        assert_eq!(staged.parent(), release.parent(), "the twin is not beside the real one");
-        let mut s = Settings::default();
-        assert!(!s.pin_legacy_media_root(), "a staging build pinned the release's takes");
-        assert!(!s.media_root_v20, "a staging build spent the release's one-shot");
-        assert!(s.record_dir.is_none() && s.project_dir.is_none());
+    fn the_media_root_is_documents_tangent_media() {
+        let root = Settings::default_media_root();
+        assert!(root.ends_with("Tangent Media"), "{}", root.display());
+        assert!(!root.to_string_lossy().contains("Staging"), "{}", root.display());
     }
 
     /// A first launch shows the whole app; a corrupt file does not get
