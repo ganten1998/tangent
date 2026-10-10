@@ -233,6 +233,12 @@ pub(crate) struct Lexed {
     /// one never mistaken for the thing. Char literals go too, so a `'"'`
     /// opens no string for a reader that knows only strings.
     pub(crate) bare: String,
+    /// **What ships, strings and all**: the text with its comments, char
+    /// literals and test items blanked, and every other string as written.
+    /// What reads a path a shipped string spells, on the line it spells it
+    /// (`era_corpus::real_path_spellings`): `code` blanks the strings, and
+    /// `bare` keeps the tests.
+    pub(crate) live: String,
 }
 
 /// **The one lexer both scans read through.**
@@ -253,6 +259,7 @@ pub(crate) fn lex(src: &str) -> Lexed {
     let mut out = Vec::new();
     let mut code = String::with_capacity(src.len());
     let mut bare = String::with_capacity(src.len());
+    let mut live = String::with_capacity(src.len());
     // What a blanked stretch leaves in the code: its newlines, so every
     // line after it keeps its number.
     let blank = |code: &mut String, from: usize, to: usize| {
@@ -271,6 +278,7 @@ pub(crate) fn lex(src: &str) -> Lexed {
             }
             blank(&mut code, from, i);
             blank(&mut bare, from, i);
+            blank(&mut live, from, i);
             continue;
         }
         if at(i, "/*") {
@@ -292,6 +300,7 @@ pub(crate) fn lex(src: &str) -> Lexed {
             }
             blank(&mut code, from, i);
             blank(&mut bare, from, i);
+            blank(&mut live, from, i);
             continue;
         }
         if at(i, "#[cfg(") && skipping.is_none() {
@@ -317,6 +326,7 @@ pub(crate) fn lex(src: &str) -> Lexed {
                 skipping = Some((0, false));
                 blank(&mut code, i, j);
                 bare.extend(&s[i..j.min(n)]);
+                blank(&mut live, i, j);
                 i = j;
                 continue;
             }
@@ -344,6 +354,11 @@ pub(crate) fn lex(src: &str) -> Lexed {
                 i = end + close.chars().count();
                 blank(&mut code, from, i);
                 bare.extend(&s[from..i.min(n)]);
+                if skipping.is_none() {
+                    live.extend(&s[from..i.min(n)]);
+                } else {
+                    blank(&mut live, from, i);
+                }
                 continue;
             }
         }
@@ -389,6 +404,11 @@ pub(crate) fn lex(src: &str) -> Lexed {
             i = j + 1;
             blank(&mut code, from, i);
             bare.extend(&s[from..i.min(n)]);
+            if skipping.is_none() {
+                live.extend(&s[from..i.min(n)]);
+            } else {
+                blank(&mut live, from, i);
+            }
             continue;
         }
         if c == '\'' {
@@ -408,10 +428,12 @@ pub(crate) fn lex(src: &str) -> Lexed {
                 i += 1;
                 code.push(if skipping.is_some() { ' ' } else { '\'' });
                 bare.push('\'');
+                live.push(if skipping.is_some() { ' ' } else { '\'' });
                 continue;
             }
             blank(&mut code, from, i);
             blank(&mut bare, from, i);
+            blank(&mut live, from, i);
             continue;
         }
         let skipped = skipping.is_some();
@@ -438,9 +460,10 @@ pub(crate) fn lex(src: &str) -> Lexed {
         }
         code.push(if skipped && c != '\n' { ' ' } else { c });
         bare.push(c);
+        live.push(if skipped && c != '\n' { ' ' } else { c });
         i += 1;
     }
-    Lexed { literals: out, code, bare }
+    Lexed { literals: out, code, bare, live }
 }
 
 /// The repository root.
@@ -1006,6 +1029,16 @@ const LAST: &str = "nine";
     }
     for gone in ["nothing more", "nested", "not an unlock", "TEST_ONLY", "GATED", "mod tests", "quoted", "eight"] {
         assert!(!code.contains(gone), "the code kept `{gone}`:\n{code}");
+    }
+    // And what ships with its strings, which the path and home scans read:
+    // the same skips, the shipped strings as written, every line kept.
+    let live = lex(src).live;
+    assert_eq!(live.lines().count(), src.lines().count(), "the live view lost or gained a line");
+    for kept in ["const SHIPPED: &str = \"one\";", "r#\"two \"quoted\"\"#", "\"seven \\u{2014} eight\"", "\"nine\""] {
+        assert!(live.contains(kept), "the live view lost `{kept}`:\n{live}");
+    }
+    for gone in ["nothing more", "not an unlock", "TEST_ONLY", "also not shipped", "GATED", "not shipped either", "mod tests", "'\"'"] {
+        assert!(!live.contains(gone), "the live view kept `{gone}`:\n{live}");
     }
 }
 
