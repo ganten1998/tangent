@@ -142,6 +142,10 @@ mod konami_e2e;
 /// did. docs/design/unlimited-tracks.md, section 9 and W7-buses-ui.
 #[cfg(all(test, feature = "recorder"))]
 mod bus_e2e;
+/// Track 33 as much a track as track 1, end to end through the bridge, live
+/// and in an export: docs/design/unlimited-tracks.md, W7-slot-gaps.
+#[cfg(all(test, feature = "recorder"))]
+mod slot_gaps;
 /// The plugin-state shelves, named by identity, and the one copy of the
 /// legacy global shelf into those names. docs/design/unlimited-tracks.md,
 /// section 6.6 and C10.

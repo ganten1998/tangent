@@ -987,16 +987,16 @@ impl Shared {
     /// host has not made, or a seat past the map: a bay with nothing in it.
     fn seat_cell(&self, kind: SeatKind, flat: usize) -> Option<&AtomicU32> {
         let (seat, bay) = (flat / INSERTS, flat % INSERTS);
+        // **A pad of a lane past slot 31** (`pad_seat`'s sparse range): its
+        // lane's own pad rows, there once the pad has a rack.
+        if let Some((slot, pad)) = sparse_pad_of_seat(seat) {
+            let r = self.lanes.cells(slot)?.pad_racks.get()?.get(pad)?;
+            return rack_row(r, kind).get(bay);
+        }
         match lane_rack_of_seat(seat) {
             Some((slot, rack)) => {
                 let r = self.lanes.cells(slot)?.racks.get(rack)?;
-                let row = match kind {
-                    SeatKind::Latency => &r.latency,
-                    SeatKind::Gr => &r.gr,
-                    SeatKind::Key => &r.key,
-                    SeatKind::Bypass => &r.bypass,
-                };
-                row.get(bay)
+                rack_row(r, kind).get(bay)
             }
             None => match kind {
                 SeatKind::Latency => self.seat_latency.get(flat),
@@ -1009,7 +1009,9 @@ impl Shared {
 
     /// **Every bay cell there is, with its flat index**: the frozen map's
     /// seats in order, then the seats of every lane past it the host has
-    /// made. For the shims that rewrite a whole table at once.
+    /// made, then the pad racks those lanes have been given (W7-slot-gaps).
+    /// For the shims that rewrite a whole table at once, and the bypass and
+    /// key tables, which do.
     fn seat_cells(&self, kind: SeatKind) -> impl Iterator<Item = (usize, &AtomicU32)> + '_ {
         let legacy = (0..RACK_SEATS * INSERTS).filter_map(move |f| self.seat_cell(kind, f).map(|c| (f, c)));
         let past = self.lanes.rows().filter(|(slot, _)| *slot >= CHANNELS).flat_map(move |(slot, _)| {
@@ -1021,7 +1023,25 @@ impl Shared {
                 })
             })
         });
-        legacy.chain(past)
+        let pads = self.lanes.rows().filter(|(slot, _)| *slot >= CHANNELS).flat_map(move |(slot, l)| {
+            l.pad_racks.get().into_iter().flat_map(move |rows| {
+                rows.iter().enumerate().flat_map(move |(pad, r)| {
+                    let seat = pad_seat(slot, pad);
+                    rack_row(r, kind).iter().enumerate().filter_map(move |(b, c)| Some((seat?.checked_mul(INSERTS)? + b, c)))
+                })
+            })
+        });
+        legacy.chain(past).chain(pads)
+    }
+}
+
+/// **One of a rack's four rows of shared numbers**, by kind.
+fn rack_row(r: &RackShared, kind: SeatKind) -> &[AtomicU32; INSERTS] {
+    match kind {
+        SeatKind::Latency => &r.latency,
+        SeatKind::Gr => &r.gr,
+        SeatKind::Key => &r.key,
+        SeatKind::Bypass => &r.bypass,
     }
 }
 
@@ -2397,6 +2417,14 @@ pub(crate) struct LaneShared {
     racks: [RackShared; LANE_RACKS],
     /// The kit's numbers, read only on a drum lane.
     pads: PadShared,
+    /// **Its pad racks' numbers, for a lane past slot 31** (W7-slot-gaps):
+    /// each pad's bays' latency, gain reduction, key and bypass, made on the
+    /// host the first time one of this lane's pads is given a rack
+    /// (`Engine::make_pad_rack`) and kept for the store's life, as the row
+    /// is. Empty on every other lane, which pays a pointer for the
+    /// possibility: a lane of the frozen map keeps its pads' numbers in the
+    /// seat vectors, and a lane with no pad effects needs none.
+    pad_racks: std::sync::OnceLock<Box<[RackShared; PADS]>>,
 }
 
 impl LaneShared {
@@ -2420,6 +2448,7 @@ impl LaneShared {
             sounding: [const { AtomicU64::new(0) }; 2],
             racks: [const { RackShared::new() }; LANE_RACKS],
             pads: PadShared::new(),
+            pad_racks: std::sync::OnceLock::new(),
         }
     }
 
@@ -2459,7 +2488,7 @@ impl LaneShared {
         for (a, b) in self.sounding.iter().zip(&f.sounding) {
             copy64(a, b);
         }
-        for r in &self.racks {
+        for r in self.racks.iter().chain(self.pad_racks.get().into_iter().flat_map(|p| p.iter())) {
             for cells in [&r.latency, &r.gr, &r.key, &r.bypass] {
                 for c in cells {
                     c.store(0, Ordering::Relaxed);
@@ -6893,17 +6922,31 @@ pub(crate) struct LaneBody {
     /// and bus that does (`Engine::publish_plan`), so a lane that never
     /// becomes such a node pays nothing for it. See `run_node`.
     node_line: Option<Box<NodeLine>>,
+    /// **The file this lane's sampler plays** (W7-slot-gaps), swapped in by
+    /// `Renderer::swap_sampler_samples` and handed to every pass that runs
+    /// this lane's own chain: the lane pass, the room, the kit, a node's
+    /// run. It was a renderer table thirty-two lanes long, indexed by slot,
+    /// so a sampler on a lane past slot 31 was handed straight back and
+    /// played silence, live and in every export. In the box it is as wide
+    /// as the desk, it leaves with its lane (a new track on a reused slot
+    /// starts with no file rather than the last tenant's), and a Grow moves
+    /// it with the lane's pointer, so nothing copies or frees it on the
+    /// callback.
+    sample: Option<SamplerSample>,
 }
 
 /// **A node's delay between its own way out and its sends** (design 9: a
 /// bus destination gets PDC on its paths): one stereo ring over the node's
-/// signal after its racks, read where its shorter path needs it. Attached,
-/// never built with a lane (`LanePart::Line`).
-pub struct NodeLine(DelayLine);
+/// signal after its racks, read where its shorter path needs it, and a
+/// second over its DRY stem (W7-slot-gaps), which is taken before the racks
+/// and so has to wait for its own way out's delay on a ring of its own: one
+/// ring carries one signal. Attached, never built with a lane
+/// (`LanePart::Line`).
+pub struct NodeLine(DelayLine, DelayLine);
 
 impl NodeLine {
     pub fn new() -> Self {
-        Self(DelayLine::new())
+        Self(DelayLine::new(), DelayLine::new())
     }
 }
 
@@ -7003,6 +7046,7 @@ impl Lane {
                 node_fx: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 row_gate: 1.0,
                 node_line: None,
+                sample: None,
             }),
         }
     }
@@ -7058,7 +7102,7 @@ impl Lane {
             + rows(&b.send_pre)
             + rows(&b.send_post)
             + rows(&b.node_fx)
-            + b.node_line.as_ref().map_or(0, |l| size_of::<NodeLine>() + pdc(&l.0))
+            + b.node_line.as_ref().map_or(0, |l| size_of::<NodeLine>() + pdc(&l.0) + pdc(&l.1))
             + b.notes.capacity() * size_of::<Note>()
             + b.controls.capacity() * size_of::<Control>()
             + pdc(&b.pdc)
@@ -7103,6 +7147,37 @@ pub enum LanePart {
     /// a folder or a bus sending to a bus, so no bridge has to know about
     /// it. A lane that already holds one keeps it, and the one sent home.
     Line(Box<NodeLine>),
+    /// **One pad's effect rack, for a lane past slot 31** (W7-slot-gaps):
+    /// sent by `Engine::make_pad_rack` the first time a plugin is seated on
+    /// that pad, ahead of the plugin itself, into the lane's [`PadBank`]. A
+    /// lane with no bank (not a drum lane) sends it straight home, and so
+    /// does a pad that already holds one. Appended to contract C8, as `Line`
+    /// was.
+    PadRack { pad: u8, rack: Box<PadRack> },
+}
+
+/// **One pad's effect rack on a lane past slot 31** (W7-slot-gaps): the
+/// rack, made on the host the first time a plugin is seated on that pad
+/// (design 7's lazy pads) and attached to its lane's [`PadBank`], and its
+/// own knob edits for the chunk (`auto`, design 7.2: a rack owns its
+/// queues). A pad of the frozen map's lanes keeps its rack in the bank at
+/// `pad_rack_index` and its queue in `Wide::auto_params`; one past them has
+/// a seat in the sparse range (`pad_seat`) past every row those tables
+/// have, so it carries its own.
+pub struct PadRack {
+    rack: Rack,
+    auto: [Vec<tangent_host::ParamPoint>; INSERTS],
+}
+
+impl PadRack {
+    /// Around a rack the host has just made, its queues bought here so the
+    /// callback only ever clears and pushes them.
+    fn new(rack: Rack) -> Self {
+        Self {
+            rack,
+            auto: std::array::from_fn(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY)),
+        }
+    }
 }
 
 /// **A drum lane's own pad state**: the voices that are sounding, the
@@ -7116,16 +7191,14 @@ pub enum LanePart {
 /// **Two departures from design 7.2, recorded.** Its numbers ([`PadShared`])
 /// live in the lane's [`LaneShared`] row rather than in an `Arc` of the
 /// bank's own: the host writes a kit's knobs by lane into that row, which
-/// it already holds the last reference to. And it holds no pad RACKS: the
-/// 128 pad racks of a lane below slot 32 stay in the frozen bank at
-/// `pad_rack_index`, addressed as `RackAddr { owner: Lane(slot), rack:
-/// LANE_RACKS + pad }`; a lane past slot 31 has no pad bays yet, and its kit
-/// sums dry. Its strikes are its own (`hits`, `offs`), so fifty kits are
-/// heard (W5-engine-memory-inputs). MERGE-ME(W6-rows-unlimited, the first
-/// wave a drum row past 31 exists): pad racks per bank, their seats past
-/// the frozen map, and `RackShared` rows for them. Seats for 128 pad racks
-/// per lane in the per-lane range would multiply every per-seat table on
-/// every lane, drum or not: it wants a sparse pad-seat range.
+/// it already holds the last reference to. And the pad RACKS of a lane below
+/// slot 32 stay in the frozen bank at `pad_rack_index`, addressed as
+/// `RackAddr { owner: Lane(slot), rack: LANE_RACKS + pad }`. A lane past
+/// slot 31 keeps its own here (`racks`, W7-slot-gaps), one per pad it has
+/// seated a plugin on, at seats in the sparse range (`pad_seat`) with their
+/// shared numbers in its `LaneShared` row (`pad_racks`): it summed dry
+/// before. Its strikes are its own (`hits`, `offs`), so fifty kits are
+/// heard (W5-engine-memory-inputs).
 pub struct PadBank {
     voices: [PadVoice; PADS],
     /// The kit's fader, slewed one-pole like every fader. Per lane: two
@@ -7144,6 +7217,12 @@ pub struct PadBank {
     /// of a kit struck twice.
     hits: Vec<PadHit>,
     offs: Vec<PadHit>,
+    /// **The pad racks of a lane past slot 31**, by pad, each made the first
+    /// time a plugin is seated on its pad (`LanePart::PadRack`): a pointer a
+    /// pad until then. Empty on a lane of the frozen map, whose pad racks
+    /// are the bank's (`pad_rack_index`). They stay with the lane: a second
+    /// bank attached takes them over (`Lane::attach`).
+    racks: [Option<Box<PadRack>>; PADS],
 }
 
 impl PadBank {
@@ -7155,6 +7234,7 @@ impl PadBank {
             dry_pdc: DelayLine::new(),
             hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
+            racks: [const { None }; PADS],
         }
     }
 
@@ -7175,6 +7255,18 @@ fn kit_bank(lanes: &mut [Option<Box<Lane>>], slot: usize) -> Option<&mut PadBank
 /// [`kit_bank`], read.
 fn kit_bank_ref(lanes: &[Option<Box<Lane>>], slot: usize) -> Option<&PadBank> {
     lanes.get(slot)?.as_deref()?.peek().pads.as_deref()
+}
+
+/// **Pad `pad`'s rack on the lane at `slot`, past slot 31** (`PadRack`):
+/// `None` until a plugin has been seated on that pad, and always for a lane
+/// of the frozen map, whose pad racks are the bank's.
+fn pad_rack_mut(lanes: &mut [Option<Box<Lane>>], slot: usize, pad: usize) -> Option<&mut PadRack> {
+    kit_bank(lanes, slot)?.racks.get_mut(pad)?.as_deref_mut()
+}
+
+/// [`pad_rack_mut`], read.
+fn pad_rack_ref(lanes: &[Option<Box<Lane>>], slot: usize, pad: usize) -> Option<&PadRack> {
+    kit_bank_ref(lanes, slot)?.racks.get(pad)?.as_deref()
 }
 
 /// Whether lane `ch` holds a kit with anything loaded: what decides if
@@ -7199,7 +7291,15 @@ impl crate::lane_bank::Attach<LanePart> for Lane {
     fn attach(&mut self, part: LanePart) -> Option<LanePart> {
         let b = self.body_mut();
         match part {
-            LanePart::Pads(bank) => b.pads.replace(bank).map(LanePart::Pads),
+            // **The pad racks stay with the lane**: a bank replacing one
+            // takes over the racks the old one held (pointers swapped, no
+            // allocation), and the old goes home with the new one's.
+            LanePart::Pads(mut bank) => {
+                if let Some(old) = b.pads.as_deref_mut() {
+                    std::mem::swap(&mut old.racks, &mut bank.racks);
+                }
+                b.pads.replace(bank).map(LanePart::Pads)
+            }
             LanePart::Kit(kit) => {
                 // The voices index into the samples that are leaving: the
                 // shim's swap silences them for the same reason.
@@ -7218,6 +7318,18 @@ impl crate::lane_bank::Attach<LanePart> for Lane {
                     None
                 }
             },
+            // Into the lane's bank, on its pad. A pad already holding one
+            // keeps the rack it has (its plugins are in it), and a lane with
+            // no bank is no drum lane: either way the arrival goes home.
+            LanePart::PadRack { pad, rack } => {
+                match b.pads.as_deref_mut().and_then(|bank| bank.racks.get_mut(usize::from(pad))) {
+                    Some(cell @ None) => {
+                        *cell = Some(rack);
+                        None
+                    }
+                    _ => Some(LanePart::PadRack { pad, rack }),
+                }
+            }
         }
     }
 }
@@ -7356,14 +7468,14 @@ impl RackAddr {
         use tangent_ui::recorder::bus_extra_seat;
         let r = usize::from(self.rack);
         match self.owner {
-            // `[own, extra, pedal 0..7]`, then pad `p` as `LANE_RACKS + p`
-            // for a lane the frozen map gives pads (below slot 32); past it
-            // a lane's pads have no racks yet (see `PadBank`).
+            // `[own, extra, pedal 0..7]`, then pad `p` as `LANE_RACKS + p`:
+            // the frozen map's pad seat below slot 32, the sparse pad range
+            // past it (`pad_seat`, W7-slot-gaps).
             RackOwner::Lane(slot) => {
                 let s = slot.0 as usize;
                 match r.checked_sub(LANE_RACKS) {
                     None => Some(lane_seat(s, r)),
-                    Some(pad) => (s < CHANNELS && pad < PADS).then(|| pad_rack_index(s, pad)),
+                    Some(pad) => pad_seat(s, pad),
                 }
             }
             RackOwner::Master => match r {
@@ -7409,14 +7521,19 @@ pub enum EngineBusy {
 }
 
 /// The host's record of a slot: the generation of the lane it sent there,
-/// whether that lane is on its way home, and whether it has been sent its
-/// node line (`LanePart::Line`), which it then keeps for its life.
+/// whether that lane is on its way home, whether it has been sent its node
+/// line (`LanePart::Line`), which it then keeps for its life, and whether it
+/// has its pad bank (`banked`: built with one, as every legacy lane and a
+/// `LaneSpec::drum` lane are, or sent one, `LanePart::Pads`), which it keeps
+/// the same way. A pad's rack past slot 31 lives in that bank, so a lane
+/// without one has nowhere to seat a pad's plugin (`make_pad_rack`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HostSlot {
     gen: u32,
     live: bool,
     leaving: bool,
     lined: bool,
+    banked: bool,
 }
 
 /// Test doors onto a lane's body, by slot. A slot with no lane is a test
@@ -7444,6 +7561,12 @@ impl Renderer {
 /// slot 32 on, nine to a lane ([`lane_seat`]). A seat number is the engine's
 /// private name for a rack; nothing persists it.
 fn lane_rack_of_seat(seat: usize) -> Option<(usize, usize)> {
+    // The sparse pad range is no lane rack's (`pad_seat`): past every lane
+    // seat a spine can have, so this arithmetic would name a slot no desk
+    // reaches.
+    if seat >= PAD_SEAT_BASE {
+        return None;
+    }
     if let Some(past) = seat.checked_sub(RACK_SEATS) {
         return Some((CHANNELS + past / LANE_RACKS, past % LANE_RACKS));
     }
@@ -7473,6 +7596,41 @@ fn lane_seat(slot: usize, rack: usize) -> usize {
     }
 }
 
+/// **The first seat of the sparse pad range** (W7-slot-gaps): one past
+/// every lane seat any spine can have (`seat_space(MAX_ROWS)`), so a pad's
+/// seat can never be read as a lane's rack, whatever the spine grows to.
+const PAD_SEAT_BASE: usize = seat_space(tangent_ui::desk_id::MAX_ROWS);
+
+/// **The seat pad `pad` of the lane at `slot` answers to.** The frozen map's
+/// (`pad_rack_index`) for the first thirty-two lanes; past them a SPARSE
+/// range after every lane seat, a hundred and twenty-eight to a lane by
+/// arithmetic alone. Nothing is bought for such a seat until a plugin is
+/// seated in one of its bays (`Engine::make_pad_rack`, design 7's lazy
+/// pads): a seat per pad in the lanes' own range would put 128 rows in every
+/// per-seat table for every lane, drum or not, and was why a kit past slot
+/// 31 had no pad effects at all. `None` for a pad past the kit or a slot
+/// past `MAX_ROWS`.
+fn pad_seat(slot: usize, pad: usize) -> Option<usize> {
+    if pad >= PADS {
+        return None;
+    }
+    if slot < CHANNELS {
+        return Some(pad_rack_index(slot, pad));
+    }
+    if slot >= tangent_ui::desk_id::MAX_ROWS {
+        return None;
+    }
+    (slot - CHANNELS).checked_mul(PADS)?.checked_add(PAD_SEAT_BASE + pad)
+}
+
+/// [`pad_seat`]'s inverse over the sparse range: the lane past slot 31 and
+/// its pad. `None` for every other seat, the frozen map's pads included.
+fn sparse_pad_of_seat(seat: usize) -> Option<(usize, usize)> {
+    let past = seat.checked_sub(PAD_SEAT_BASE)?;
+    let slot = CHANNELS + past / PADS;
+    (slot < tangent_ui::desk_id::MAX_ROWS).then_some((slot, past % PADS))
+}
+
 /// **Who owns the rack at `seat`**: [`RackAddr::seat`]'s inverse, for the
 /// host's seat-speaking roads (an editor's knob, the tap), which still name
 /// a rack by its seat and must now name it by identity. `None` for a seat no
@@ -7480,6 +7638,10 @@ fn lane_seat(slot: usize, rack: usize) -> usize {
 fn seat_addr(seat: usize) -> Option<RackAddr> {
     use tangent_ui::recorder::bus_extra_of;
     let at = |owner: RackOwner, rack: usize| Some(RackAddr { owner, rack: u16::try_from(rack).ok()? });
+    // A pad of a lane past slot 31 (`pad_seat`'s sparse range).
+    if let Some((slot, pad)) = sparse_pad_of_seat(seat) {
+        return at(RackOwner::Lane(Slot(u32::try_from(slot).ok()?)), LANE_RACKS + pad);
+    }
     if let Some((slot, rack)) = lane_rack_of_seat(seat) {
         return at(RackOwner::Lane(Slot(u32::try_from(slot).ok()?)), rack);
     }
@@ -7539,6 +7701,24 @@ fn seat_rack<'a>(
         Some((ch, rack)) => lanes.get(ch)?.as_deref()?.rack(rack),
         None => bank.get(seat)?.as_ref(),
     }
+}
+
+/// **Lane `slot`'s rack `rack` and the file its sampler plays, borrowed
+/// together** (W7-slot-gaps): both are the lane's own (`LaneBody::sample`),
+/// so a pass that runs one of the lane's racks outside the fork (the room,
+/// the kit, the shim's fold and sends pass) takes the two in one borrow of
+/// the box, as the fork's own destructure does.
+fn lane_rack_with_sample(
+    lanes: &mut [Option<Box<Lane>>],
+    slot: usize,
+    rack: usize,
+) -> Option<(&mut Rack, Option<&SamplerSample>)> {
+    let LaneBody { chains, board, sample, .. } = lanes.get_mut(slot)?.as_deref_mut()?.body_mut();
+    let r = match rack {
+        0 | 1 => chains.get_mut(rack)?,
+        p => board.get_mut(p.checked_sub(2)?)?,
+    };
+    Some((r, sample.as_ref()))
 }
 
 /// **The renderer's per-slot tables: everything it sizes by the spine's
@@ -7862,7 +8042,7 @@ struct Wide {
 
 /// **How many rack seats a spine of `lanes` slots has**: the frozen map's,
 /// then nine for every lane past slot 31 (`lane_seat`).
-fn seat_space(lanes: usize) -> usize {
+const fn seat_space(lanes: usize) -> usize {
     RACK_SEATS + lanes.saturating_sub(CHANNELS) * LANE_RACKS
 }
 
@@ -10177,12 +10357,12 @@ struct Renderer {
     /// channel now and a bare kit could not say whose it was.
     pad_incoming: Consumer<(usize, PadKit)>,
     pad_retiring: Producer<(usize, PadKit)>,
-    /// **The sampler's file, per lane**, beside the kits above and swapped by
-    /// the same protocol — see [`SamplerSample`] and
-    /// [`Renderer::swap_sampler_samples`]. Indexed by CHANNEL, because a
-    /// sampler is a lane's instrument exactly as a kit is, and two tracks
-    /// each holding one must not share a sound.
-    sampler_samples: Vec<Option<SamplerSample>>,
+    /// **The sampler's file arriving for a lane, and the displaced one going
+    /// back**, by the kits' protocol — see [`SamplerSample`] and
+    /// [`Renderer::swap_sampler_samples`]. The file itself is the LANE's
+    /// (`LaneBody::sample`), because a sampler is a lane's instrument
+    /// exactly as a kit is, and two tracks each holding one must not share a
+    /// sound; the slot travels with it.
     sampler_incoming: Consumer<(usize, Option<SamplerSample>)>,
     sampler_retiring: Producer<(usize, Option<SamplerSample>)>,
     /// The media explorer's AUDITION: one clip at a time, swapped in like
@@ -10382,6 +10562,11 @@ struct Renderer {
     /// here. Filled by the bare kit's fold only while such a send exists.
     drums_send: [Vec<Vec<f32>>; 2],
     drums_sends: bool,
+    /// **The bare drum bus's send path this chunk**, frames: the longest of
+    /// the buses it sends to (`settle_plan_pdc`). Its kit's sends are read
+    /// off its line at this path's delay and the desk's alignment target
+    /// covers it (W7-slot-gaps), as a lane's send path is and does.
+    drums_send_lat: u32,
     /// **The bare drum bus's pre-fader gate**, walked once a chunk as a
     /// lane's is (`LaneBody::pre_gate`): its mute and solo reach its
     /// pre-fader sends. No polarity: its own way out has none either.
@@ -11155,9 +11340,10 @@ impl Renderer {
             let Ok((lane, next)) = self.sampler_incoming.pop() else {
                 break;
             };
-            match self.sampler_samples.get_mut(lane) {
-                Some(slot) => {
-                    let old = std::mem::replace(slot, next);
+            // **Into the lane's own box, at any slot** (`LaneBody::sample`).
+            match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
+                Some(l) => {
+                    let old = std::mem::replace(&mut l.body_mut().sample, next);
                     let _ = self.sampler_retiring.push((lane, old));
                 }
                 // A lane the desk does not have: hand it straight back
@@ -11223,6 +11409,13 @@ impl Renderer {
             for rack in b.chains.iter_mut().chain(b.board.iter_mut()) {
                 swapped += rack.swap();
             }
+            // **And the pad racks it has been given past the frozen map**
+            // (`PadRack`, W7-slot-gaps): its own, in its bank.
+            if let Some(bank) = b.pads.as_deref_mut() {
+                for pad in bank.racks.iter_mut().flatten() {
+                    swapped += pad.rack.swap();
+                }
+            }
         }
         if swapped > 0 {
             self.shared
@@ -11240,8 +11433,13 @@ impl Renderer {
             // one place a rack's contents change, so it is the one place
             // that can answer without walking two thousand seats — see the
             // early-out in `mix_pads`.
+            // The frozen map's pads, in the bank, and every lane's own past
+            // it (`PadRack`): a kit on lane 40 with a pad effect is as live
+            // as one on lane 1.
             self.pad_racks_live = (0..CHANNELS).any(|ch| {
                 (0..PADS).any(|i| seat_rack(&self.racks, &self.spine.lanes, pad_rack_index(ch, i)).is_some_and(|r| !r.is_empty()))
+            }) || self.spine.lanes.iter().flatten().any(|l| {
+                l.peek().pads.as_deref().is_some_and(|bank| bank.racks.iter().flatten().any(|p| !p.rack.is_empty()))
             });
         }
         swapped
@@ -13722,7 +13920,9 @@ impl Renderer {
                     // for exactly that word within sight of every `run_rack` —
                     // and the paragraph above pushed the guard out of sight.
                     if takes_rack {
-                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, own_seat) {
+                        // The lane's own chain and its own file, in one
+                        // borrow of its box (`lane_rack_with_sample`).
+                        if let Some((rack, sample)) = lane_rack_with_sample(&mut self.spine.lanes, slot, CHAIN_OWN) {
                             run_rack(
                             rack,
                             &mut self.fx_in,
@@ -13734,9 +13934,7 @@ impl Renderer {
                             &self.shared,
                             &self.spine.ext.desk.frozen,
                             own_seat,
-                            self.sampler_samples
-                                .get(strip.index())
-                                .and_then(Option::as_ref),
+                            sample,
                             // NOT a key pass: an input strip's seat is fed by
                             // the lane pass in `mix_channels`; this is its
                             // monitor run. See `KeyFeed`.
@@ -13751,7 +13949,7 @@ impl Renderer {
                         // Not a key pass either, for the same reason. Still
                         // inside the `!is_folder` arm; `run_extra_rack` holds
                         // the guard as well, so neither can drift.
-                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, lane_seat(slot, CHAIN_EXTRA)) {
+                        if let Some((rack, sample)) = lane_rack_with_sample(&mut self.spine.lanes, slot, CHAIN_EXTRA) {
                             run_extra_rack(
                                 rack,
                                 is_folder,
@@ -13764,9 +13962,7 @@ impl Renderer {
                                 n,
                                 notes,
                                 controls,
-                                self.sampler_samples
-                                    .get(strip.index())
-                                    .and_then(Option::as_ref),
+                                sample,
                                 None,
                         
                 None,
@@ -13976,7 +14172,10 @@ impl Renderer {
     /// anything set one without the other — which is exactly how a test
     /// ended up assigning a kit to lane 0 and a lane to channel 7.
     fn first_drum_lane(&self) -> Option<usize> {
-        self.spine.ext.desk.drums.iter().next().filter(|ch| *ch < CHANNELS)
+        // At any slot (W7-slot-gaps): it stopped at the thirty-second, so an
+        // audition on a desk whose only kit is past it played through the
+        // hidden drum bus's fader instead of that kit's.
+        self.spine.ext.desk.drums.iter().next()
     }
 
     fn lane_gain(&self, lane: usize) -> f32 {
@@ -14087,6 +14286,20 @@ impl Renderer {
             // The queues cover every seat of the spine (`seat_space`); one
             // past them, or past a rack's bays, names nothing.
             if bay >= INSERTS {
+                continue;
+            }
+            // **A pad of a lane past slot 31 keeps its own queues**
+            // (`PadRack::auto`, W7-slot-gaps): its seat is past every row
+            // here. Last value per id, as below; a pad with no rack yet has
+            // no plugin to hear it.
+            if let Some((slot, pad)) = sparse_pad_of_seat(lane) {
+                if let Some(q) = pad_rack_mut(&mut self.spine.lanes, slot, pad).and_then(|p| p.auto.get_mut(bay)) {
+                    if let Some(point) = q.iter_mut().find(|p| p.id == u.id) {
+                        point.value = u.value;
+                    } else if q.len() < q.capacity() {
+                        q.push(tangent_host::ParamPoint { offset: 0, id: u.id, value: u.value });
+                    }
+                }
                 continue;
             }
             let Some(q) = self.spine.ext.auto_params.get_mut(lane * INSERTS + bay) else {
@@ -14268,6 +14481,9 @@ impl Renderer {
             self.settle_plan_pdc();
             return;
         }
+        // The shim's desk sends nothing to a bus, so the bare drum bus has
+        // no send path to pay.
+        self.drums_send_lat = 0;
         let ext = &mut self.spine.ext;
         ext.folder_lat.fill(0);
         ext.send_lat.fill(0);
@@ -14356,6 +14572,17 @@ impl Renderer {
             }
             let through = self.spine.ext.folder_lat[lane].max(self.spine.ext.send_lat[lane]);
             max = max.max(l.saturating_add(through));
+        }
+        // **And the bare drum bus's path through a bus that looks ahead**
+        // (W7-slot-gaps): its kit sent into such a bus has to land with
+        // everything else, which needs the target to cover its rack and that
+        // bus, as a lane's send path is covered. Only while it is the drum
+        // bus that plays (no lane holds a kit) and sends into a bus that pays
+        // something: a kit whose sends cross nothing that looks ahead leaves
+        // the target the channels' alone, as it always was.
+        if self.drums_sends && self.drums_send_lat > 0 && self.spine.ext.desk.drums.is_empty() {
+            let own = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, Strip::Drums.index());
+            max = max.max(own.saturating_add(self.drums_send_lat));
         }
         // **The alignment target is the channels alone.** See `max_latency`:
         // the master delays every source equally, so aligning to it makes
@@ -15099,13 +15326,20 @@ impl Renderer {
         }
         // **Each pad's own bays, over its voice alone** — then the bus sum.
         // A pad with an empty rack skips the copy and sums straight across.
+        // **A pad's rack is where its lane's slot puts it** (W7-slot-gaps):
+        // the frozen map's bank for the first thirty-two lanes
+        // (`pad_rack_index`), the lane's own bank past them (`PadRack`, at a
+        // seat in the sparse range, `pad_seat`), made the first time a
+        // plugin is seated on that pad. A kit past slot 31 summed its voices
+        // dry here, its pad effects seated nowhere.
+        let sparse = lane_ix >= CHANNELS;
         for i in 0..PADS {
-            // **Pad racks exist for the frozen map's lanes only** (below slot
-            // 32, `pad_rack_index`). Past it the formula lands in other
-            // owners' seats, so a kit there sums its voices dry: its pads
-            // have no bays yet (see `PadBank`).
-            let rack_at = if lane_ix < CHANNELS { pad_rack_index(lane_ix, i) } else { usize::MAX };
-            let rack_live = seat_rack(&self.racks, &self.spine.lanes, rack_at).is_some_and(|r| !r.is_empty());
+            let rack_at = pad_seat(lane_ix, i).unwrap_or(usize::MAX);
+            let rack_live = if sparse {
+                pad_rack_ref(&self.spine.lanes, lane_ix, i).is_some_and(|p| !p.rack.is_empty())
+            } else {
+                seat_rack(&self.racks, &self.spine.lanes, rack_at).is_some_and(|r| !r.is_empty())
+            };
             // A live rack processes even silence — its tail is its own.
             if !sounded[i] && !rack_live {
                 continue;
@@ -15118,6 +15352,48 @@ impl Renderer {
                         }
                     }
                 }
+                if sparse {
+                    // **NOT-A-CHANNEL:** a pad's own rack on a lane past slot
+                    // 31, in its lane's bank, with its own knob edits
+                    // (`PadRack::auto`): its seat is past every row
+                    // `auto_params` has. The queues are spent here, the one
+                    // pass that runs this rack; an edit that lands while it
+                    // rests waits in them, kept to one point per parameter.
+                    if let Some(PadRack { rack, auto }) = pad_rack_mut(&mut self.spine.lanes, lane_ix, i) {
+                        let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                            std::array::from_fn(|b| auto[b].as_slice());
+                        run_rack(
+                            rack,
+                            &mut self.pad_io,
+                            frames,
+                            &mut self.fx_out,
+                            &[],
+                            &[],
+                            &seat_params,
+                            &self.shared,
+                            &self.spine.ext.desk.frozen,
+                            rack_at,
+                            // A pad seat is not a lane and has no sample of its own.
+                            None,
+                            // Not a key pass: a pad seat is not reachable from
+                            // the key picker. See `KeyFeed`.
+                            None,
+                            None,
+                            u64::MAX,
+                        );
+                        for q in auto.iter_mut() {
+                            q.clear();
+                        }
+                    }
+                    for c in 0..TAP_CHANNELS.min(2) {
+                        let src = &self.pad_io[c];
+                        if let Some(dst) = self.fx_in.get_mut(c) {
+                            for f in 0..frames {
+                                dst[f] += src[f];
+                            }
+                        }
+                    }
+                } else {
                 // **NOT-A-CHANNEL:** a PAD's own seat, one of a hundred and
                 // twenty-eight per drum lane — never one of the sixteen, so
                 // never a folder.
@@ -15166,6 +15442,7 @@ impl Renderer {
                             dst[f] += src[f];
                         }
                     }
+                }
                 }
             } else {
                 for c in 0..TAP_CHANNELS.min(2) {
@@ -15242,7 +15519,18 @@ impl Renderer {
                         .get((bus_rack) * INSERTS + b)
                         .map_or(&[][..], Vec::as_slice)
                 });
-            if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, bus_rack) {
+            // A drum lane's own chain and its own file in one borrow of its
+            // box (`lane_rack_with_sample`), at any slot; the bare drum bus's
+            // rack is in the bank and plays no sampler file. Never reached
+            // for a kit `folded_here` (above).
+            let (rack, sample) = match drum_lane {
+                Some(ch) => match lane_rack_with_sample(&mut self.spine.lanes, ch, CHAIN_OWN) {
+                    Some((r, s)) => (Some(r), s),
+                    None => (None, None),
+                },
+                None => (seat_rack_mut(&mut self.racks, &mut self.spine.lanes, bus_rack), None),
+            };
+            if let Some(rack) = rack {
                 run_rack(
                     rack,
                     &mut self.fx_in,
@@ -15254,7 +15542,7 @@ impl Renderer {
                     &self.shared,
                     &self.spine.ext.desk.frozen,
                     bus_rack,
-                    self.sampler_samples.get(bus_rack).and_then(Option::as_ref),
+                    sample,
                     // NOT a key pass — for a non-drum lane this is the seat's
                     // second run per chunk (the sends pass's bargain), and a
                     // pure drum lane's rack runs only here, where v1 does not
@@ -15293,10 +15581,16 @@ impl Renderer {
             // one (`run_lane_pdc`): a drum lane sending across a bus whose
             // path is not its own way out's reads the kit for those sends
             // off the same line, at the send path's delay, into `fold_tap`.
-            let tap = drum_lane
-                .filter(|&ch| !self.spine.ext.folder_is[ch] && self.spine.ext.sends_out.contains(ch))
-                .map(|ch| {
-                    let through = self.spine.ext.send_lat.get(ch).copied().unwrap_or(0);
+            // The bare drum bus reads its own the same way, at its send path
+            // (`drums_send_lat`, W7-slot-gaps): it had none, so a bare kit
+            // sent into a bus that looks ahead landed that lookahead late.
+            let through = match drum_lane {
+                Some(ch) => (!self.spine.ext.folder_is[ch] && self.spine.ext.sends_out.contains(ch))
+                    .then(|| self.spine.ext.send_lat.get(ch).copied().unwrap_or(0)),
+                None => self.drums_sends.then_some(self.drums_send_lat),
+            };
+            let tap = through
+                .map(|through| {
                     let max = self.shared.max_latency.load(Ordering::Relaxed);
                     usize::try_from(max.saturating_sub(own).saturating_sub(through)).unwrap_or(0)
                 })
@@ -17240,7 +17534,6 @@ impl Renderer {
             };
             let stems_dry = self.stems_dry;
             let keys_live = self.keys_live;
-            let samples = &self.sampler_samples;
             // **A new round for every fork, never zero**: a lane is born
             // with a zero stamp, and a round a lane already holds would read
             // as taken.
@@ -17284,6 +17577,7 @@ impl Renderer {
                     at,
                     len,
                     folds,
+                    sample,
                     ..
                 } = body;
                 let [rack, extra] = chains;
@@ -17325,7 +17619,8 @@ impl Renderer {
                     keys_live,
                     notes,
                     controls,
-                    sample: samples.get(ch).and_then(Option::as_ref),
+                    // The lane's own file, out of its own box.
+                    sample: sample.as_ref(),
                 };
                 // `Instant::now` on Apple silicon is a commpage read: no
                 // syscall, no lock, no allocation. It is still only paid
@@ -17873,7 +18168,6 @@ struct NodeDesk<'a> {
     shared: &'a Shared,
     frozen: &'a LaneSet,
     auto_params: &'a [Vec<tangent_host::ParamPoint>],
-    samples: &'a [Option<SamplerSample>],
     /// Last chunk's stems, for a bus's keyed bay (see `KeyFeed`).
     key_prev: &'a [f32],
     key_prev_frames: usize,
@@ -17901,7 +18195,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     let (Some(kind), true) = (prep.kind, prep.live) else {
         return;
     };
-    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate_from, node, node_fx, node_line, .. } = body;
+    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate_from, node, node_fx, node_line, sample, .. } = body;
     let [own, extra] = chains;
     let own_seat = lane_seat(slot, CHAIN_OWN);
     let extra_seat = lane_seat(slot, CHAIN_EXTRA);
@@ -17927,8 +18221,8 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
                 desk.frozen,
                 own_seat,
                 // A destination is a lane, so it can hold a sampler; handed
-                // the same file the lane pass hands it.
-                desk.samples.get(slot).and_then(Option::as_ref),
+                // the same file the lane pass hands it, its own box's.
+                sample.as_ref(),
                 // NOT a key pass: the lane pass fed this seat its key.
                 None,
                 None,
@@ -17995,7 +18289,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     // then extra, top to bottom as the strip draws them. No notes and no
     // controls: a bus is not played.
     if !own.is_empty() {
-        let sample = if kind == K::Bus { None } else { desk.samples.get(slot).and_then(Option::as_ref) };
+        let sample = if kind == K::Bus { None } else { sample.as_ref() };
         let (fx_out, key_io) = (&mut scratch.fx_out, &mut scratch.key_io);
         run_rack(
             own,
@@ -18056,6 +18350,14 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             tapped = true;
         } else {
             line.0.run(post, frames, 0);
+        }
+        // **And the dry stem waits for its own way out's delay too**
+        // (W7-slot-gaps): it is the sum before the racks, so it was early by
+        // exactly what the line holds the way out back, on top of the racks'
+        // own figure a dry stem is always early by. On its own ring, rested
+        // cleared while the two ways out agree, as the line is.
+        if prep.dry {
+            line.1.run(dry, frames, if parted { prep.wait_main as usize } else { 0 });
         }
     }
     // The fader and pan, per frame, exactly as `fold_folders` slews them.
@@ -18292,8 +18594,9 @@ impl Renderer {
                             .get(ch * INSERTS + b)
                             .map_or(&[][..], Vec::as_slice)
                     });
-                // THE-FOLD: the folder's own first chain, out of its lane.
-                if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, ch) {
+                // THE-FOLD: the folder's own first chain, out of its lane,
+                // with the lane's own file (`lane_rack_with_sample`).
+                if let Some((rack, sample)) = lane_rack_with_sample(&mut self.spine.lanes, ch, CHAIN_OWN) {
                     run_rack(
                         rack,
                         &mut self.fx_in,
@@ -18308,7 +18611,7 @@ impl Renderer {
                         // Still one of the sixteen — see the note above about
                         // where a folded lane's rack runs — so it keeps its own
                         // sample, exactly as it keeps its own automation row.
-                        self.sampler_samples.get(ch).and_then(Option::as_ref),
+                        sample,
                         // Not a key pass in v1: a folder's rack runs here, after
                         // the chunk's snapshot customers were decided — keying a
                         // bus comp IN a group is a second pass this feature does
@@ -18646,7 +18949,7 @@ impl Renderer {
             // destination at all is a question for the desk, not
             // something to answer quietly down here.
             if seat_rack(&self.racks, &self.spine.lanes, dest).is_some_and(|r| !r.is_empty()) {
-                if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, dest) {
+                if let Some((rack, sample)) = lane_rack_with_sample(&mut self.spine.lanes, dest, CHAIN_OWN) {
                     run_rack(
                         rack,
                         &mut self.send_io,
@@ -18662,7 +18965,7 @@ impl Renderer {
                         // can hold a sampler; handed the same file the
                         // lane pass hands it, or the bay would play one
                         // sound on the lane and silence on the send.
-                        self.sampler_samples.get(dest).and_then(Option::as_ref),
+                        sample,
                         // NOT a key pass — this is the SEND-BARGAIN's
                         // second run of a rack the lane pass already
                         // fed; feeding it again would clock a keyed
@@ -19127,20 +19430,8 @@ impl Renderer {
             if r >= n {
                 continue;
             }
-            let pay = |me: &Self, t: u32| -> u32 {
-                let t = t as usize;
-                let Some(l) = me.plan.lanes.get(t) else { return 0 };
-                let s = l.slot.0 as usize;
-                let frozen = &me.spine.ext.desk.frozen;
-                let mut lat = Rack::latency(&me.shared, frozen, lane_seat(s, CHAIN_OWN))
-                    .saturating_add(Rack::latency(&me.shared, frozen, lane_seat(s, CHAIN_EXTRA)));
-                if l.flags.contains(crate::desk_plan::LaneFlags::BUS) {
-                    lat = lat.saturating_add(me.pedal_latency(s));
-                }
-                lat.saturating_add(me.node_out_lat(t))
-            };
-            let main = self.plan.post.pdc_main.row(r).iter().map(|t| pay(self, *t)).max().unwrap_or(0);
-            let send = self.plan.post.pdc_send.row(r).iter().map(|t| pay(self, *t)).max().unwrap_or(0);
+            let main = self.plan.post.pdc_main.row(r).iter().map(|t| self.node_pay(*t)).max().unwrap_or(0);
+            let send = self.plan.post.pdc_send.row(r).iter().map(|t| self.node_pay(*t)).max().unwrap_or(0);
             self.spine.ext.pdc_rank[r] = [main, send];
         }
         for r in 0..n {
@@ -19156,6 +19447,37 @@ impl Renderer {
                 *c = send;
             }
         }
+        // **The bare drum bus's send path** (W7-slot-gaps): the drum bus is
+        // no rank, so the walk above never reached it, and a kit sent into a
+        // bus that looks ahead landed that bus's lookahead late. Its path is
+        // what a lane's send path is: the longest of the buses it sends to,
+        // each paid down its own way out. Read by the bare kit's send tap
+        // (`mix_pad_lane`) and by the alignment target (`publish_latency`).
+        self.drums_send_lat = 0;
+        for i in 0..self.plan.sends.sends.len() {
+            let s = self.plan.sends.sends[i];
+            if let (crate::desk_plan::PlanSendFrom::Drums, crate::desk_plan::PlanSendTo::Lane(t)) = (s.from, s.to) {
+                self.drums_send_lat = self.drums_send_lat.max(self.node_pay(t));
+            }
+        }
+    }
+
+    /// **What one node charges what passes through it**: its two racks, a
+    /// bus's armed board, and whatever its own way out pays further on
+    /// (`node_out_lat`). The one sum every path down the compensation graph
+    /// adds up, a lane's main path and its send path alike, and the bare
+    /// drum bus's sends (`settle_plan_pdc`).
+    fn node_pay(&self, rank: u32) -> u32 {
+        let t = rank as usize;
+        let Some(l) = self.plan.lanes.get(t) else { return 0 };
+        let s = l.slot.0 as usize;
+        let frozen = &self.spine.ext.desk.frozen;
+        let mut lat = Rack::latency(&self.shared, frozen, lane_seat(s, CHAIN_OWN))
+            .saturating_add(Rack::latency(&self.shared, frozen, lane_seat(s, CHAIN_EXTRA)));
+        if l.flags.contains(crate::desk_plan::LaneFlags::BUS) {
+            lat = lat.saturating_add(self.pedal_latency(s));
+        }
+        lat.saturating_add(self.node_out_lat(t))
     }
 
     /// **What a node's output pays on its way out**, settled down the
@@ -19402,7 +19724,6 @@ impl Renderer {
                 shared: &self.shared,
                 frozen: &self.spine.ext.desk.frozen,
                 auto_params: &self.spine.ext.auto_params,
-                samples: &self.sampler_samples,
                 key_prev: &self.spine.desk.key_prev,
                 key_prev_frames: self.spine.desk.key_prev_frames,
                 stride: self.stride(),
@@ -20185,6 +20506,53 @@ impl HostRack {
     }
 }
 
+/// **Every rack's host half, by seat** (W7-slot-gaps): the frozen map and
+/// every lane seat past it in one dense row (`lane_seat`), and the sparse
+/// pad range (`pad_seat`) in a map, a record made only for a pad somebody
+/// has seated a plugin on (`Engine::make_pad_rack`). One door for both, so
+/// no road indexes the dense row with a pad's seat or walks only one half.
+#[derive(Default)]
+struct HostRacks {
+    dense: Vec<HostRack>,
+    pads: std::collections::BTreeMap<usize, HostRack>,
+}
+
+impl HostRacks {
+    fn get(&self, seat: usize) -> Option<&HostRack> {
+        if seat >= PAD_SEAT_BASE {
+            self.pads.get(&seat)
+        } else {
+            self.dense.get(seat)
+        }
+    }
+
+    fn get_mut(&mut self, seat: usize) -> Option<&mut HostRack> {
+        if seat >= PAD_SEAT_BASE {
+            self.pads.get_mut(&seat)
+        } else {
+            self.dense.get_mut(seat)
+        }
+    }
+
+    /// Every record with its seat: the dense row ascending, then the pads.
+    fn iter(&self) -> impl Iterator<Item = (usize, &HostRack)> {
+        self.dense.iter().enumerate().chain(self.pads.iter().map(|(s, r)| (*s, r)))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut HostRack)> {
+        self.dense.iter_mut().enumerate().chain(self.pads.iter_mut().map(|(s, r)| (*s, r)))
+    }
+
+    /// The pad records of the lane at `slot`, by seat: what a lane coming
+    /// home lets go of beside its nine.
+    fn pad_seats_of(&self, slot: usize) -> Vec<usize> {
+        match (pad_seat(slot, 0), pad_seat(slot, PADS - 1)) {
+            (Some(lo), Some(hi)) if lo >= PAD_SEAT_BASE => self.pads.range(lo..=hi).map(|(s, _)| *s).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// **What the host keeps about one bay's tenant.** Field order is drop
 /// order, and it carries the lifetime rule `editor` is documented with: the
 /// window goes before the controller reference that built its view.
@@ -20323,9 +20691,13 @@ fn unpack_tap(w: u64) -> Option<(usize, usize)> {
     Some(((w & 0xffff_ffff) as usize, ((w >> 32) & 0xff) as usize))
 }
 
-/// The seat field of [`pack_aim`]: 23 bits, past every seat the spine can
-/// have (`seat_space(MAX_ROWS)` is under 600,000). A seat that does not fit
-/// is stored as all ones, which no rack answers to.
+/// The seat field of [`pack_aim`]: 23 bits, past every lane seat the spine
+/// can have (`seat_space(MAX_ROWS)` is under 600,000) and every sparse pad
+/// seat of a lane below slot 60,927 (`pad_seat`: 128 a lane past
+/// `PAD_SEAT_BASE`, W7-slot-gaps). A seat that does not fit is stored as all
+/// ones, which no rack answers to: the tap cannot be aimed at a pad of a
+/// lane that far out, and draws nothing there. The other three fields fill
+/// the word, so widening this one is a new word, not a wider field.
 const AIM_SEAT: u64 = (1 << 23) - 1;
 
 /// **The host's aim, with the generation it was made for**: seat (23 bits),
@@ -20447,7 +20819,14 @@ pub struct Engine {
     /// to carry inline through a move, and the editor and state records it
     /// holds were what once put a quarter of a megabyte inline in `Engine`,
     /// which ran a debug build's moves off the end of a 2 MiB test stack.
-    host_racks: Vec<HostRack>,
+    /// The pads of a lane past slot 31 are kept apart, sparse
+    /// ([`HostRacks`]).
+    host_racks: HostRacks,
+    /// **The bypassed bays as last written, by seat** (W7-slot-gaps): a pad
+    /// rack made after the table was stored (`make_pad_rack`) takes its
+    /// bays' bypass from here, since the bridge stores the table only when
+    /// it moves and the rack's cells did not exist when it did.
+    bypass_seats: RefCell<Vec<(usize, usize)>>,
     /// **The op ring's sending end, and the retire ring's receiving end**
     /// (design 7.4). See the slot API.
     ops_tx: RefCell<Producer<Op>>,
@@ -20484,9 +20863,7 @@ pub struct Engine {
     auto_to_audio: Producer<AutoList>,
     auto_from_audio: Consumer<AutoList>,
     /// The sends' curves' pair: see [`Engine::set_send_curves`].
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by `set_send_curves`, the slot API W7-buses-ui's bridge calls"))]
     send_curves_to_audio: Producer<Vec<SendCurve>>,
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by `set_send_curves`, the slot API W7-buses-ui's bridge calls"))]
     send_curves_from_audio: Consumer<Vec<SendCurve>>,
     track_to_audio: Producer<Schedule<Placed>>,
     track_from_audio: Consumer<Schedule<Placed>>,
@@ -20748,6 +21125,18 @@ impl Engine {
             .map(|h| h.gen)
     }
 
+    /// **Every slot holding a lane the host sent and has not sent home**,
+    /// ascending: the legacy thirty-two and every lane past them. What a
+    /// host walk over "every lane" walks (a sampler's file, W7-slot-gaps),
+    /// rather than a width it would have to know.
+    pub fn lane_slots(&self) -> impl Iterator<Item = Slot> + '_ {
+        self.host_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.live && !h.leaving)
+            .filter_map(|(at, _)| u32::try_from(at).ok().map(Slot))
+    }
+
     /// **A lane's numbers**, for the host to write its fader, pan and send
     /// into and read its meters from (design 7.2). Made on the host when the
     /// lane is installed; `None` for a slot that never held one.
@@ -20806,9 +21195,9 @@ impl Engine {
     /// exist. The list grows on the host and never on the callback: a seat
     /// is the engine's private name for a rack.
     fn ensure_seats(&mut self, seats: usize) {
-        while self.host_racks.len() < seats {
+        while self.host_racks.dense.len() < seats {
             let (_, ends) = new_rack();
-            self.host_racks.push(HostRack::new(ends));
+            self.host_racks.dense.push(HostRack::new(ends));
         }
     }
 
@@ -20858,6 +21247,72 @@ impl Engine {
             lane.body_mut().pads = Some(Box::new(PadBank::new()));
         }
         lane
+    }
+
+    /// **The rack of a pad of a lane past slot 31, made the first time a
+    /// plugin is seated on that pad** (W7-slot-gaps, design 7's lazy pads):
+    /// an empty rack built here, on the host, sent on the op ring into its
+    /// lane's bank (`LanePart::PadRack`) behind everything already sent that
+    /// lane, its shared numbers made (`ensure_pad_cells`), and the host's
+    /// record of it kept at its sparse seat (`pad_seat`). The plugin follows
+    /// on the rack's own ring, so it reaches the callback no sooner than the
+    /// rack does, and `Rack::swap` seats it the block the rack lands.
+    ///
+    /// `Ok(false)` for a seat that is no pad of a lane the host has live
+    /// (a lane gone, or going), or of a lane with no pad bank yet (not a
+    /// drum lane, `HostSlot::banked`): there is nothing to seat it in. Such a
+    /// rack went home on arrival with the plugin pushed into it, and the
+    /// plugin was built for nothing and dropped there; the host that asked
+    /// heard it was seated, so the pad played dry once the bank came, for
+    /// good (W7-slot-gaps). Now nothing is built, the load answers that it
+    /// seated nothing, and the bridge offers no such bay until the bank is
+    /// sent (`Bridge::engine_bay`). `Err` when the op ring is full: the
+    /// callback has stalled, and the load says so rather than seating a
+    /// plugin nowhere.
+    fn make_pad_rack(&mut self, seat: usize) -> Result<bool, String> {
+        let Some((slot, pad)) = sparse_pad_of_seat(seat) else {
+            return Ok(false);
+        };
+        let Some(h) = self.host_slots.get(slot).copied().filter(|h| h.live && !h.leaving && h.banked) else {
+            return Ok(false);
+        };
+        let (Ok(pad), Ok(at)) = (u8::try_from(pad), u32::try_from(slot)) else {
+            return Ok(false);
+        };
+        self.drain_retired_ops();
+        let (rack, ends) = new_rack();
+        let part = LanePart::PadRack { pad, rack: Box::new(PadRack::new(rack)) };
+        let op = crate::lane_bank::EngineOp::Attach { slot: Slot(at), gen: h.gen, part };
+        if self.ops_tx.borrow_mut().push(op).is_err() {
+            return Err("the audio engine did not take the pad's rack: its op ring is full, \
+                        which means the callback has stalled"
+                .to_owned());
+        }
+        self.ensure_pad_cells(slot);
+        self.host_racks.pads.insert(seat, HostRack::new(ends));
+        Ok(true)
+    }
+
+    /// **The shared numbers of the lane at `slot`'s pad racks**, made if
+    /// they are not there yet (`LaneShared::pad_racks`), and the bypass
+    /// table as last written laid onto them: the bridge stores that table
+    /// only when it moves, so a pad bypassed before its rack was made would
+    /// otherwise play in circuit until the next edit to any bypass.
+    fn ensure_pad_cells(&self, slot: usize) {
+        let Some(row) = self.shared.lanes.ensure(slot) else {
+            return;
+        };
+        let made = row.pad_racks.get().is_none();
+        let cells = row.pad_racks.get_or_init(|| Box::new([const { RackShared::new() }; PADS]));
+        if !made {
+            return;
+        }
+        for &(seat, bay) in self.bypass_seats.borrow().iter() {
+            let ours = sparse_pad_of_seat(seat).filter(|(s, _)| *s == slot);
+            if let (Some((_, pad)), true) = (ours, bay < INSERTS) {
+                cells[pad].bypass[bay].store(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The next generation: counts up from the legacy desk's, never zero.
@@ -20944,7 +21399,7 @@ impl Engine {
             self.keys_have.remove(&slot);
             let gen = self.mint_gen();
             list.push((slot, Some(self.build_lane(at, gen, spec))));
-            self.host_slots[at] = HostSlot { gen, live: true, leaving: false, lined: false };
+            self.host_slots[at] = HostSlot { gen, live: true, leaving: false, lined: false, banked: spec.drum };
             gens.push(gen);
         }
         let op = crate::lane_bank::EngineOp::Install(list.into_boxed_slice());
@@ -20991,6 +21446,11 @@ impl Engine {
     /// **A part for a lane, behind its Install** (design 7.5 rule 2). The
     /// callback checks the generation and sends a part for any other lane
     /// straight home.
+    ///
+    /// **A pad bank sent to the lane the host holds there is noted**
+    /// (`HostSlot::banked`): from here on a pad's rack can be made for that
+    /// lane (`make_pad_rack`), and it reaches the callback behind the bank,
+    /// on the same ring.
     pub fn attach(&mut self, slot: Slot, gen: u32, part: LanePart) -> Result<(), EngineBusy> {
         // **What the callback sent home since the host last spoke, dropped
         // first**, here, where the host already is: it keeps the retire
@@ -20999,8 +21459,13 @@ impl Engine {
         if self.ops_tx.borrow().slots() < 1 {
             return Err(EngineBusy::Busy);
         }
+        let bank = matches!(part, LanePart::Pads(_));
         let op = crate::lane_bank::EngineOp::Attach { slot, gen, part };
-        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)
+        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)?;
+        if let Some(h) = self.host_slots.get_mut(slot.0 as usize).filter(|h| bank && h.live && h.gen == gen) {
+            h.banked = true;
+        }
+        Ok(())
     }
 
     /// **The desk's shape, as one validated plan** (design 7.6). Built here
@@ -21150,7 +21615,6 @@ impl Engine {
 
     /// **A send's level, into every plan published and not yet home**, by
     /// the send's identity: [`Engine::set_route_gain`]'s rule for sends.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge carries bus sends and their levels from W7-buses-ui"))]
     pub fn set_send_level(&self, from: crate::desk_plan::SendFrom, to: crate::desk_plan::SendTo, level: f32) -> usize {
         use crate::desk_plan::{PlanSendFrom, PlanSendTo, SendFrom, SendTo};
         let mut hit = 0;
@@ -21230,6 +21694,14 @@ impl Engine {
                             for r in 0..LANE_RACKS {
                                 self.clear_seat(lane_seat(at, r));
                             }
+                            // **And its pad racks past the frozen map**: they
+                            // came home in its bank, so their records go too,
+                            // windows first, and a lane installed here later
+                            // makes its own.
+                            for seat in self.host_racks.pad_seats_of(at) {
+                                self.clear_seat(seat);
+                                self.host_racks.pads.remove(&seat);
+                            }
                         }
                         if let Some(h) = self.host_slots.get_mut(at) {
                             h.leaving = false;
@@ -21281,6 +21753,33 @@ impl Engine {
                         drop(old);
                     }
                 },
+                // **A pad's rack the callback would not seat** (its lane has
+                // no bank, holds one on that pad already, or is another lane
+                // now): nobody will ever run it, so the host's record of it
+                // goes (windows first), and whatever was pushed into its
+                // rings on the way is dropped here with its count taken off
+                // `pending_swaps`, which it can now never pay. The next load
+                // onto that pad makes a rack afresh.
+                EngineOp::Attach { slot, part: LanePart::PadRack { pad, mut rack }, .. } => {
+                    if let Some(seat) = pad_seat(slot.0 as usize, usize::from(pad)) {
+                        if seat >= PAD_SEAT_BASE {
+                            self.clear_seat(seat);
+                            self.host_racks.pads.remove(&seat);
+                        }
+                    }
+                    let mut stranded = 0u32;
+                    for ring in &mut rack.rack.incoming {
+                        while ring.pop().is_ok() {
+                            stranded = stranded.saturating_add(1);
+                        }
+                    }
+                    if stranded > 0 {
+                        let _ = self.shared.pending_swaps.fetch_update(Ordering::Release, Ordering::Relaxed, |n| {
+                            Some(n.saturating_sub(stranded))
+                        });
+                    }
+                    drop(rack);
+                }
                 other => drop(other),
             }
         }
@@ -21784,9 +22283,12 @@ impl Engine {
             }
         }).collect();
         let mut rack_ends = rack_ends.into_iter();
-        let host_racks: Vec<HostRack> = (0..RACK_SEATS)
-            .map(|_| HostRack::new(rack_ends.next().expect("one set per channel")))
-            .collect();
+        let host_racks = HostRacks {
+            dense: (0..RACK_SEATS)
+                .map(|_| HostRack::new(rack_ends.next().expect("one set per channel")))
+                .collect(),
+            pads: std::collections::BTreeMap::new(),
+        };
         // The effect across the bus used to have a pair of its own here. It
         // does not any more: the bus is a channel like the others and its
         // effect is `host_racks[Strip::Fx.index()]`'s, so what was left was
@@ -21969,7 +22471,6 @@ impl Engine {
             midi_retiring,
             pad_incoming,
             pad_retiring,
-            sampler_samples: (0..CHANNELS).map(|_| None).collect(),
             sampler_incoming,
             sampler_retiring,
             preview_incoming,
@@ -22003,6 +22504,7 @@ impl Engine {
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
+            drums_send_lat: 0,
             drums_gate: 0.0,
             drums_gate_from: 0.0,
             fx_drums: None,
@@ -22129,6 +22631,7 @@ impl Engine {
             ui_params: RefCell::new(ui_param_tx),
             hw_midi_tx: Some(hw_midi_tx),
             host_racks,
+            bypass_seats: RefCell::new(Vec::new()),
             ops_tx: RefCell::new(ops_tx),
             retire_rx,
             host_slots: vec![
@@ -22137,6 +22640,7 @@ impl Engine {
                     live: true,
                     leaving: false,
                     lined: false,
+                    banked: true,
                 };
                 CHANNELS
             ],
@@ -22584,8 +23088,16 @@ impl Engine {
         // FX bay stored a plugin, the host dispatched it, and the engine
         // dropped it on the floor: "drum FX slots do nothing". `mix_pads`
         // already runs each pad's rack; they just never got filled.
-        if seat >= self.host_racks.len() || bay >= INSERTS {
+        if bay >= INSERTS {
             return Ok(None);
+        }
+        // **A pad past slot 31 is given its rack the first time a plugin is
+        // seated on it** (`make_pad_rack`); emptying a pad that never had one
+        // is already done.
+        if self.host_racks.get(seat).is_none() {
+            if bundle.is_none() || !self.make_pad_rack(seat)? {
+                return Ok(None);
+            }
         }
         let Some(bundle) = bundle else {
             // Window first, then the controller and state references, then the
@@ -22859,7 +23371,7 @@ impl Engine {
         // `STRIPS`, so a pad's effect loaded, ran, and answered every click
         // on its bay with a silent `Ok`: a plugin whose window could never
         // open, and whose controls could therefore never be touched.
-        if strip >= self.host_racks.len() || slot >= INSERTS {
+        if self.host_racks.get(strip).is_none() || slot >= INSERTS {
             return Ok(());
         }
         self.poll_editor();
@@ -22988,7 +23500,7 @@ impl Engine {
     /// its window frozen. Counted here instead, over every rack the engine
     /// actually has.
     pub fn open_insert_editors(&self) -> usize {
-        self.host_racks.iter().map(|r| r.bays.iter().filter(|b| b.editor.is_some()).count()).sum()
+        self.host_racks.iter().map(|(_, r)| r.bays.iter().filter(|b| b.editor.is_some()).count()).sum()
     }
 
     /// Is this bay's window open right now? By rack identity.
@@ -23027,7 +23539,7 @@ impl Engine {
     /// figure rather than doing it every frame.
     pub fn poll_latency(&mut self) -> bool {
         let mut moved = false;
-        for (seat, rack) in self.host_racks.iter().enumerate() {
+        for (seat, rack) in self.host_racks.iter() {
             for (bay, record) in rack.bays.iter().enumerate() {
                 let Some(h) = record.latency_handle.as_ref() else {
                     continue;
@@ -23056,7 +23568,7 @@ impl Engine {
         // An insert's window closed by its own close button would otherwise
         // stay "open" here for ever, and
         // the click that should reopen it would silently raise nothing.
-        for rack in &mut self.host_racks {
+        for (_, rack) in self.host_racks.iter_mut() {
             for bay in &mut rack.bays {
                 if bay.editor.as_ref().is_some_and(tangent_host::Editor::closed) {
                     bay.editor = None;
@@ -23079,7 +23591,7 @@ impl Engine {
             // `(seat, bay, id, value)`: the host's records speak seats, and
             // each becomes a `UiParam` by rack identity on its way out.
             let mut pending: Vec<(usize, usize, u32, f64)> = Vec::new();
-            for (strip, rack) in self.host_racks.iter_mut().enumerate() {
+            for (strip, rack) in self.host_racks.iter_mut() {
                 for (bay, record) in rack.bays.iter_mut().enumerate() {
                     let HostBay { editor, lv2, .. } = record;
                     let Some(editor) = editor.as_mut() else {
@@ -24020,6 +24532,12 @@ impl Engine {
     }
 
     fn write_insert_bypass(&self, bays: &[(usize, usize)]) {
+        // Kept for a pad rack made after this write (`ensure_pad_cells`).
+        {
+            let mut kept = self.bypass_seats.borrow_mut();
+            kept.clear();
+            kept.extend_from_slice(bays);
+        }
         for (i, cell) in self.shared.seat_cells(SeatKind::Bypass) {
             let want = u32::from(bays.contains(&(i / INSERTS, i % INSERTS)));
             if cell.load(Ordering::Relaxed) != want {
@@ -25604,7 +26122,6 @@ impl Engine {
     /// send is found by its two ends, so a plan republished for a reorder
     /// keeps its curves. The list it replaces comes home and is dropped
     /// here, on the next call. `Busy` when the last one has not landed yet.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge carries bus sends and their curves from W7-buses-ui"))]
     pub fn set_send_curves(&mut self, curves: Vec<SendCurve>) -> Result<(), EngineBusy> {
         while self.send_curves_from_audio.pop().is_ok() {}
         self.send_curves_to_audio.push(curves).map_err(|_| EngineBusy::Busy)
@@ -25786,7 +26303,8 @@ impl Drop for Engine {
         // are retired, because the hand-off's bounded wait is per seat: 444
         // empty round trips is seconds of quit on a live callback and nearly
         // two minutes on a stalled one.
-        for seat in 0..self.host_racks.len() {
+        let seats: Vec<usize> = self.host_racks.iter().map(|(seat, _)| seat).collect();
+        for seat in seats {
             for bay in 0..INSERTS {
                 if self.seat_loaded(seat, bay).is_some() {
                     let _ = self.load_seat(seat, bay, None, None);
@@ -28821,6 +29339,7 @@ mod tests {
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
+            drums_send_lat: 0,
             drums_gate: 0.0,
             drums_gate_from: 0.0,
             fx_drums: None,
@@ -28868,7 +29387,6 @@ mod tests {
             midi_retiring: RingBuffer::<Schedule<PlacedMidi>>::new(2).0,
             pad_incoming: RingBuffer::<(usize, PadKit)>::new(2).1,
             pad_retiring: RingBuffer::<(usize, PadKit)>::new(2).0,
-            sampler_samples: (0..CHANNELS).map(|_| None).collect(),
             sampler_incoming: RingBuffer::<(usize, Option<SamplerSample>)>::new(2).1,
             sampler_retiring: RingBuffer::<(usize, Option<SamplerSample>)>::new(2).0,
             preview_incoming: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).1,
@@ -40558,7 +41076,10 @@ mod slot_engine {
         // The host's frame: what came home is let go of.
         e.retire_tick();
         assert!(e.offline.as_ref().expect("renderer").spine.lanes[36].is_none());
-        assert!(e.host_racks[lane_seat(36, CHAIN_OWN)].bays[0].loaded.is_none(), "the host kept a record");
+        assert!(
+            e.host_racks.get(lane_seat(36, CHAIN_OWN)).expect("the seat's record").bays[0].loaded.is_none(),
+            "the host kept a record"
+        );
         let gens = e.install_lanes(vec![(Slot(36), audio())]).expect("the slot is free");
         e.settle_offline();
         assert_ne!(gens[0], old, "a reused slot kept its generation");
@@ -40625,12 +41146,30 @@ mod slot_engine {
         assert_eq!(lane(3, 0), Some(3));
         assert_eq!(lane(3, 1), Some(folder_extra_seat(3)));
         assert_eq!(lane(3, 2 + 4), Some(amp_pedal_seat(3, 4)));
-        // A legacy lane's pads are racks of its own, after its nine; past
-        // slot 31 a lane has no pad racks (see `PadBank`).
+        // A legacy lane's pads are racks of its own, after its nine, at the
+        // frozen map's pad seats; past slot 31 a lane's pads are seats of
+        // the sparse range past every lane seat (`pad_seat`, W7-slot-gaps:
+        // they were none, and a kit there summed dry), naming the lane's
+        // pad back and no lane's rack.
         assert_eq!(lane(3, LANE_RACKS as u16), Some(pad_rack_index(3, 0)));
         assert_eq!(lane(0, (LANE_RACKS + PADS - 1) as u16), Some(pad_rack_index(0, PADS - 1)));
         assert_eq!(lane(3, (LANE_RACKS + PADS) as u16), None);
-        assert_eq!(lane(40, LANE_RACKS as u16), None);
+        assert_eq!(lane(40, (LANE_RACKS + PADS) as u16), None);
+        let mut pads_seen = std::collections::HashSet::new();
+        for s in [32u32, 33, 40, 200, 256, 65_535] {
+            for p in [0usize, 36, PADS - 1] {
+                let seat = lane(s, (LANE_RACKS + p) as u16).expect("a pad's seat past slot 31");
+                assert!(seat >= PAD_SEAT_BASE, "lane {s} pad {p} landed among the lane seats");
+                assert!(pads_seen.insert(seat), "seat {seat} named twice");
+                assert_eq!(lane_rack_of_seat(seat), None, "lane {s} pad {p}'s seat read as a lane rack");
+                assert_eq!(sparse_pad_of_seat(seat), Some((s as usize, p)));
+                assert_eq!(
+                    seat_addr(seat),
+                    Some(RackAddr { owner: RackOwner::Lane(Slot(s)), rack: (LANE_RACKS + p) as u16 }),
+                    "lane {s} pad {p}'s seat does not name it back"
+                );
+            }
+        }
         let strip = |o: RackOwner, r: u16| RackAddr { owner: o, rack: r }.seat();
         assert_eq!(strip(RackOwner::Master, 0), Some(MASTER_SEAT));
         assert_eq!(strip(RackOwner::Master, 1), Some(MASTER_EXTRA_SEAT));
@@ -40768,8 +41307,8 @@ mod slot_engine {
     /// channel-10 strike, and the lane's stem carries the pad. The kit lives
     /// in the lane's box and nowhere else; a renderer table beside it is
     /// what made this silent at every slot. Without the attach, silence.
-    /// Below 32 a pad's rack is addressable by `RackAddr`; past it there is
-    /// none yet (see `PadBank`).
+    /// A pad's rack is addressable by `RackAddr` below 32 and past it, where
+    /// the load makes it (W7-slot-gaps; it was refused there).
     #[test]
     fn a_slot_api_drum_lane_sounds_below_and_past_slot_31() {
         for slot in [3usize, 37] {
@@ -40790,7 +41329,14 @@ mod slot_engine {
                     .load_insert_at(pad_rack, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
                     .expect("a pad rack load")
                     .is_some();
-                assert_eq!(seated, slot < CHANNELS, "slot {slot}'s pad rack");
+                // Below slot 32 a pad's rack is the frozen bank's, there with
+                // or without the lane's bank. Past it the rack lives in the
+                // lane's bank, so a lane with none has nowhere to seat the
+                // plugin: the load builds nothing and says so, where it used
+                // to answer "seated" for a rack that went home with the
+                // plugin in it (W7-slot-gaps).
+                let room = attach || slot < CHANNELS;
+                assert_eq!(seated, room, "slot {slot}'s pad rack, with the bank {attach}: seated {seated}");
                 let inputs = plan(&e, 40, &|x| if x == slot { LaneFlags::DRUM } else { LaneFlags::MIDI_OFF });
                 e.publish_plan(&inputs).expect("the plan goes");
                 e.set_stems(true);
@@ -42909,6 +43455,662 @@ mod slot_engine {
             let all = render(&[0, 10, 11, 12]);
             assert!(close(&all, &feeders), "the carrying folder's own clip, or its other child, played through the bus's solo");
         }
+
+        // ── the mixing leftovers (W7-slot-gaps) ─────────────────────────
+
+        /// **A lined node's dry stem lands with its wet stem** (W6's
+        /// leftover): a folder or a bus sending across a bus that looks
+        /// further ahead than its own way out holds that way out back on its
+        /// line (`run_node`), and its DRY stem, the sum before its racks, was
+        /// left early by exactly that wait. Folder 10 { 11 } sending into
+        /// lookahead bus 40, and bus 39 (fed by 11) sending into it: each
+        /// node's racks are empty, so its dry stem is its wet stem, and lands
+        /// on the same frame.
+        #[test]
+        fn a_lined_nodes_dry_stem_lands_with_its_wet_stem() {
+            let render = |case: usize, dry: bool| -> Vec<f32> {
+                let mut e = wide(41);
+                let (buses, node): (&[usize], usize) = if case == 0 { (&[40], 10) } else { (&[39, 40], 39) };
+                let mut inputs = bus_plan(&e, 41, buses);
+                if case == 0 {
+                    inputs.lanes[11].parent = Some(Slot(10));
+                    inputs.sends = vec![send(10, 40, 1.0, false)];
+                } else {
+                    inputs.routes = vec![route(11, 39, 1.0)];
+                    inputs.sends = vec![send(39, 40, 1.0, false)];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_clips_slotted(vec![impulse_at(&e, 11, 4_000)]);
+                e.set_stems_dry(dry);
+                let (_, stems) = roll(&mut e, 16);
+                assert!(e.shared.max_latency.load(Ordering::Relaxed) > 100, "case {case}: the bus's lookahead is not in the desk's alignment");
+                column(&stems, e.stem_frame_width() / 2, node)
+            };
+            for case in 0..2 {
+                let (wet, dry) = (render(case, false), render(case, true));
+                assert!(wet.iter().any(|v| *v != 0.0) && dry.iter().any(|v| *v != 0.0), "case {case}: a stem is silent");
+                assert_eq!(peak_at(&dry), peak_at(&wet), "case {case}: the node's dry stem is off its wet stem's frame");
+            }
+        }
+
+        /// A kit whose pad 0 is one frame at a quarter: an impulse to strike.
+        fn impulse_kit() -> PadKit {
+            let mut kit = PadKit::default();
+            let mut click = vec![0.0f32; 4_800 * 2];
+            click[0] = 0.25;
+            click[1] = 0.25;
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples: click, rate: 48_000, source: PathBuf::new() }));
+            kit
+        }
+
+        /// **The bare drum bus's send across a bus that looks ahead lands with
+        /// its own way out** (W6's leftover: the drum bus is no rank, so the
+        /// compensation graph never reached it, and its kit through such a
+        /// bus came out that bus's lookahead late). The bare kit is the only
+        /// thing sent into lookahead bus 40, so the desk's alignment target
+        /// has to cover that path, and the kit's send is read off its own
+        /// line at the path's delay: the bus's share of the master (the
+        /// master with the send at unity, less the master with it at nothing)
+        /// peaks on the frame the kit's own way out does.
+        #[test]
+        fn pdc_aligns_the_bare_drum_bus_send_across_a_lookahead_bus() {
+            let render = |level: f32| -> (Vec<f32>, u32) {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.sends = vec![InSend { from: SendFrom::Drums, to: SendTo::Lane(Slot(40)), level, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                assert!(e.set_pad_kit(0, impulse_kit()), "the kit went nowhere");
+                // Settled, the kit in, then struck once.
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..4 {
+                    e.render_offline(&mut out);
+                }
+                e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                let (master, _) = roll(&mut e, 8);
+                (master, e.shared.max_latency.load(Ordering::Relaxed))
+            };
+            let (alone, max) = render(0.0);
+            assert!(max > 100, "the bare kit's path through the bus is not in the desk's alignment ({max})");
+            assert!(alone.iter().any(|v| *v != 0.0), "the kit is silent");
+            let (both, _) = render(1.0);
+            let bus: Vec<f32> = both.iter().zip(&alone).map(|(b, a)| b - a).collect();
+            assert!(bus.iter().any(|v| v.abs() > 1e-4), "nothing of the kit came out of the bus");
+            assert_eq!(peak_at(&bus), peak_at(&alone), "the bare kit's send landed off its own way out's frame");
+        }
+
+        /// The frame a column first carries anything.
+        fn onset(col: &[f32]) -> Option<usize> {
+            col.chunks_exact(2).position(|f| f[0].abs() > 1e-4 || f[1].abs() > 1e-4)
+        }
+
+        /// **The click pays a bus that looks ahead as it pays its own rack:
+        /// uncompensated, and holding the desk back for nothing** (W6's
+        /// leftover, proved and pinned rather than changed). The click is a
+        /// cue: it is summed after the master, at once, so the beat is heard
+        /// when it falls, and nothing it passes through is made up for, its
+        /// own rack's lookahead included. Its send into bus 40 is that rule
+        /// again: what it sends reaches the bus at once, the bus's lookahead
+        /// delays it by exactly the bus's figure, and the desk's alignment
+        /// target stays the channels' (none, on this desk). Giving the click a
+        /// rank would hold its beat back behind the mix it is a cue for.
+        #[test]
+        fn the_click_pays_a_lookahead_bus_uncompensated() {
+            let render = |ahead: bool| -> (Vec<f32>, u32, u32) {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 1.0, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                if ahead {
+                    unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                }
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                let (_, stems) = roll(&mut e, 12);
+                let bays: u32 = (0..INSERTS)
+                    .filter_map(|b| e.shared.seat_cell(SeatKind::Latency, lane_seat(40, CHAIN_OWN) * INSERTS + b))
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .sum();
+                (column(&stems, e.stem_frame_width() / 2, 40), e.shared.max_latency.load(Ordering::Relaxed), bays)
+            };
+            let (plain, _, _) = render(false);
+            let (ahead, max, lat) = render(true);
+            assert!(lat > 100, "fixture: the bus does not look ahead ({lat})");
+            assert_eq!(max, 0, "the click's send held the desk back");
+            let (Some(at), Some(late)) = (onset(&plain), onset(&ahead)) else {
+                panic!("the click never reached the bus");
+            };
+            assert_eq!(late, at + lat as usize, "the click through the bus is not late by exactly the bus's lookahead");
+        }
+
+        /// **A track in a folder that is also routed into a bus is summed by
+        /// both** (W6's leftover, kept on purpose and pinned so a change is
+        /// deliberate): the fold takes every child into its folder whatever
+        /// else it is routed to, and the route takes it into the bus. Track
+        /// 11 in folder 10, routed into bus 40, everything at unity with empty
+        /// racks: the folder's column and the bus's each carry the track
+        /// whole, and the master hears it twice over, in step. Changing either
+        /// rule changes saved projects' sound.
+        #[test]
+        fn a_folded_track_routed_into_a_bus_is_summed_by_both() {
+            let render = |routed: bool| -> [Vec<f32>; 4] {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.lanes[11].parent = Some(Slot(10));
+                if routed {
+                    inputs.routes = vec![route(11, 40, 1.0)];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, 11, 0x1111)]);
+                let (master, stems) = roll(&mut e, 10);
+                let w = e.stem_frame_width() / 2;
+                let tail = |v: Vec<f32>| v[v.len() - BLOCK * 4..].to_vec();
+                [tail(master), tail(column(&stems, w, 10)), tail(column(&stems, w, 40)), tail(column(&stems, w, 11))]
+            };
+            let [alone, _, quiet_bus, _] = render(false);
+            assert!(rms(&alone) > 1e-2, "the folded track is silent");
+            assert!(rms(&quiet_bus) < 1e-6, "the bus sounded with nothing routed to it");
+            let [twice, folder, bus, track] = render(true);
+            let near = |a: f64, b: f64| (a - b).abs() <= 1e-3 * b;
+            assert!(near(rms(&folder), rms(&track)), "the folder no longer carries its child whole");
+            assert!(near(rms(&bus), rms(&track)), "the bus no longer carries the track routed into it whole");
+            assert!(near(rms(&twice), 2.0 * rms(&alone)), "the master does not hear the track twice, in step ({} against {})", rms(&twice), rms(&alone));
+        }
+
+        // ── the mixing leftovers at the width slots (W7-slot-gaps) ──────
+
+        /// The slots item 6 is held at (`gaps`' subjects): lane 1, either
+        /// side of the frozen map's edge, past it and far past it.
+        const WIDE: [usize; 6] = [1, 31, 32, 33, 40, 200];
+
+        /// Wide enough for the lane after 200, and the buses and sources
+        /// (120, 150) the subjects are paired with.
+        const SPAN: usize = 202;
+
+        /// **A lined node's dry stem lands with its wet stem at every width,
+        /// on lane 1's frame** (item 6 at the width slots: the test above
+        /// holds slots 10 and 39 only). The node at each subject in turn,
+        /// sending into lookahead bus 120: a folder over the lane after it,
+        /// and a bus fed by a route from lane 150. Its dry stem peaks on its
+        /// wet stem's frame, and that is the frame lane 1's node's does.
+        #[test]
+        fn a_lined_nodes_dry_stem_lands_with_its_wet_stem_at_every_width() {
+            let render = |node: usize, folder: bool, dry: bool| -> Vec<f32> {
+                let mut e = wide(SPAN);
+                let buses: Vec<usize> = if folder { vec![120] } else { vec![node, 120] };
+                let mut inputs = bus_plan(&e, SPAN, &buses);
+                let source = if folder {
+                    inputs.lanes[node + 1].parent = Some(Slot(node as u32));
+                    node + 1
+                } else {
+                    inputs.routes = vec![route(150, node, 1.0)];
+                    150
+                };
+                inputs.sends = vec![send(node, 120, 1.0, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 120, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_clips_slotted(vec![impulse_at(&e, source, 4_000)]);
+                e.set_stems_dry(dry);
+                let (_, stems) = roll(&mut e, 16);
+                assert!(e.shared.max_latency.load(Ordering::Relaxed) > 100, "node {node}: the bus's lookahead is not in the desk's alignment");
+                column(&stems, e.stem_frame_width() / 2, node)
+            };
+            for folder in [true, false] {
+                let mut reference = None;
+                for node in WIDE {
+                    let (wet, dry) = (render(node, folder, false), render(node, folder, true));
+                    assert!(
+                        wet.iter().any(|v| *v != 0.0) && dry.iter().any(|v| *v != 0.0),
+                        "the node at {node} (folder {folder}): a stem is silent"
+                    );
+                    assert_eq!(peak_at(&dry), peak_at(&wet), "the node at {node} (folder {folder}): its dry stem is off its wet stem's frame");
+                    let lane_1 = *reference.get_or_insert(peak_at(&wet));
+                    assert_eq!(peak_at(&wet), lane_1, "the node at {node} (folder {folder}) lands on another frame than lane 1's");
+                }
+            }
+        }
+
+        /// **The bare drum bus's send into a lookahead bus lands with its own
+        /// way out at every width, on lane 1's frame** (item 6 at the width
+        /// slots: the test above holds bus 40 only). The lookahead bus at
+        /// each subject in turn, the bare kit the only thing sent into it:
+        /// the alignment covers that path, and the bus's share of the master
+        /// peaks on the frame the kit's own way out does, which is the frame
+        /// it does with the bus on lane 1.
+        #[test]
+        fn pdc_aligns_the_bare_drum_bus_send_across_a_lookahead_bus_at_every_width() {
+            let render = |bus: usize, level: f32| -> (Vec<f32>, u32) {
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[bus]);
+                inputs.sends = vec![InSend { from: SendFrom::Drums, to: SendTo::Lane(Slot(bus as u32)), level, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, bus, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                assert!(e.set_pad_kit(0, impulse_kit()), "the kit went nowhere");
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..4 {
+                    e.render_offline(&mut out);
+                }
+                e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                let (master, _) = roll(&mut e, 8);
+                (master, e.shared.max_latency.load(Ordering::Relaxed))
+            };
+            let mut reference = None;
+            for bus in WIDE {
+                let (alone, max) = render(bus, 0.0);
+                assert!(max > 100, "bus {bus}: the bare kit's path through it is not in the desk's alignment ({max})");
+                assert!(alone.iter().any(|v| *v != 0.0), "bus {bus}: the kit is silent");
+                let (both, _) = render(bus, 1.0);
+                let share: Vec<f32> = both.iter().zip(&alone).map(|(b, a)| b - a).collect();
+                assert!(share.iter().any(|v| v.abs() > 1e-4), "nothing of the kit came out of bus {bus}");
+                assert_eq!(peak_at(&share), peak_at(&alone), "the bare kit's send into bus {bus} landed off its own way out's frame");
+                let lane_1 = *reference.get_or_insert(peak_at(&alone));
+                assert_eq!(peak_at(&alone), lane_1, "the kit through bus {bus} lands on another frame than through bus 1");
+            }
+        }
+
+        /// **The click pays a bus that looks ahead uncompensated at every
+        /// width, as with the bus on lane 1** (item 6 at the width slots: the
+        /// pin above holds bus 40 only). The click sent into the lookahead
+        /// bus at each subject in turn: late by exactly the bus's lookahead,
+        /// the desk held back by nothing, on lane 1's frames.
+        #[test]
+        fn the_click_pays_a_lookahead_bus_uncompensated_at_every_width() {
+            let render = |bus: usize, ahead: bool| -> (Vec<f32>, u32, u32) {
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[bus]);
+                inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(bus as u32)), level: 1.0, pre: false }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                if ahead {
+                    unit(&mut e, bus, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                }
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                let (_, stems) = roll(&mut e, 12);
+                let bays: u32 = (0..INSERTS)
+                    .filter_map(|b| e.shared.seat_cell(SeatKind::Latency, lane_seat(bus, CHAIN_OWN) * INSERTS + b))
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .sum();
+                (column(&stems, e.stem_frame_width() / 2, bus), e.shared.max_latency.load(Ordering::Relaxed), bays)
+            };
+            let mut reference = None;
+            for bus in WIDE {
+                let (plain, _, _) = render(bus, false);
+                let (ahead, max, lat) = render(bus, true);
+                assert!(lat > 100, "fixture: bus {bus} does not look ahead ({lat})");
+                assert_eq!(max, 0, "the click's send into bus {bus} held the desk back");
+                let (Some(at), Some(late)) = (onset(&plain), onset(&ahead)) else {
+                    panic!("the click never reached bus {bus}");
+                };
+                assert_eq!(late, at + lat as usize, "the click through bus {bus} is not late by exactly its lookahead");
+                let lane_1 = *reference.get_or_insert((at, late));
+                assert_eq!((at, late), lane_1, "the click through bus {bus} lands on other frames than through bus 1");
+            }
+        }
+
+        /// **A track in a folder that is also routed into a bus is summed by
+        /// both at every width, as on lane 1** (item 6 at the width slots:
+        /// the pin above holds folder 10 only). The folder at each subject
+        /// in turn over the lane after it, that track routed into bus 120:
+        /// the folder's column and the bus's each carry the track whole, the
+        /// master hears it twice over, in step, and as loud as with the
+        /// folder on lane 1.
+        #[test]
+        fn a_folded_track_routed_into_a_bus_is_summed_by_both_at_every_width() {
+            let render = |folder: usize, routed: bool| -> [Vec<f32>; 4] {
+                let track = folder + 1;
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[120]);
+                inputs.lanes[track].parent = Some(Slot(folder as u32));
+                if routed {
+                    inputs.routes = vec![route(track, 120, 1.0)];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, track, 0x1111)]);
+                let (master, stems) = roll(&mut e, 10);
+                let w = e.stem_frame_width() / 2;
+                let tail = |v: Vec<f32>| v[v.len() - BLOCK * 4..].to_vec();
+                [tail(master), tail(column(&stems, w, folder)), tail(column(&stems, w, 120)), tail(column(&stems, w, track))]
+            };
+            let near = |a: f64, b: f64| (a - b).abs() <= 1e-3 * b;
+            let mut reference = None;
+            for folder in WIDE {
+                let [alone, _, quiet_bus, _] = render(folder, false);
+                assert!(rms(&alone) > 1e-2, "the track in folder {folder} is silent");
+                assert!(rms(&quiet_bus) < 1e-6, "the bus sounded with nothing routed to it (folder {folder})");
+                let [twice, held, bus, track] = render(folder, true);
+                assert!(near(rms(&held), rms(&track)), "folder {folder} no longer carries its child whole");
+                assert!(near(rms(&bus), rms(&track)), "the bus no longer carries the track in folder {folder} whole");
+                assert!(near(rms(&twice), 2.0 * rms(&alone)), "the master does not hear the track in folder {folder} twice, in step");
+                let lane_1 = *reference.get_or_insert(rms(&twice));
+                assert!(near(rms(&twice), lane_1), "the master hears folder {folder}'s track at {}, folder 1's at {lane_1}", rms(&twice));
+            }
+        }
+    }
+
+    // ── a lane past slot 31 is every bit a lane (W7-slot-gaps) ──────────
+    mod gaps {
+        //! **Track 33 is no less a track than track 1** (design 13,
+        //! W7-slot-gaps), at the engine's own doors: a drum lane's pad
+        //! effects, a sampler bay's file and a sidechain key behave at slots
+        //! 31, 32, 33, 40 and 200 exactly as at lane 1, and each reaches its
+        //! own lane and no other. One desk two hundred and one wide holds
+        //! every subject at once, so a part that lands on the wrong slot is
+        //! heard on a neighbour. The host's half (the bridge, the sampler
+        //! walk, the export) is `slot_gaps`'.
+        use super::*;
+        use crate::desk_plan::LaneFlags as F;
+
+        /// The reference lane, then the slots the design names: either side
+        /// of the frozen map's edge, past it, and far past it.
+        const SLOTS: [usize; 6] = [1, 31, 32, 33, 40, 200];
+        const WIDTH: usize = 201;
+
+        fn rms(xs: &[f32]) -> f64 {
+            (xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / xs.len().max(1) as f64).sqrt()
+        }
+
+        /// The last `blocks` blocks of `slot`'s column.
+        fn tail(stems: &[f32], width: usize, slot: usize, blocks: usize) -> Vec<f32> {
+            let col = column(stems, width, slot);
+            col[col.len().saturating_sub(BLOCK * 2 * blocks)..].to_vec()
+        }
+
+        fn trim_state(v: f32) -> Vec<u8> {
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("the trim");
+            crate::builtin_fx::state_text(spec, &[v], &[]).into_bytes()
+        }
+
+        /// A kit whose pad 36 holds a steady quarter for a second.
+        fn kit36() -> PadKit {
+            let mut kit = PadKit::default();
+            kit.pads[36] = Some(Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.25; 48_000 * 2],
+                rate: 48_000,
+                source: PathBuf::new(),
+            }));
+            kit
+        }
+
+        /// **Every subject a drum lane holding [`kit36`], pad 36 struck by a
+        /// clip on each, and a Trim at its floor (-24 dB) in pad 36's first
+        /// bay on `cut` alone**: every subject's column, in `SLOTS` order.
+        /// A lane of the frozen map has its bank and its pad racks already;
+        /// one past it is given its bank here, and its pad's rack by the load
+        /// (`Engine::make_pad_rack`).
+        fn pad_desk(cut: Option<usize>) -> Vec<Vec<f32>> {
+            pad_desk_at(cut, false)
+        }
+
+        /// [`pad_desk`], and with `early` the Trim loaded onto `cut`'s pad
+        /// once BEFORE its lane has a bank as well: past the frozen map that
+        /// load builds nothing and seats nothing, and says so.
+        fn pad_desk_at(cut: Option<usize>, early: bool) -> Vec<Vec<f32>> {
+            let mut e = wide(WIDTH);
+            if let (true, Some(slot)) = (early, cut) {
+                let pad = RackAddr { owner: RackOwner::Lane(Slot(slot as u32)), rack: (LANE_RACKS + 36) as u16 };
+                let seated = e
+                    .load_insert_at(pad, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&trim_state(0.0)))
+                    .expect("the ring has room");
+                e.settle_offline();
+                assert!(seated.is_none(), "lane {slot}'s pad took a plugin with no bank to hold its rack");
+                assert!(e.insert_at(pad, 0).is_none(), "lane {slot}'s pad holds a plugin with no bank");
+            }
+            let mut notes = Vec::new();
+            for &slot in &SLOTS {
+                let s = Slot(slot as u32);
+                let gen = e.lane_gen(s).expect("a lane");
+                if slot >= CHANNELS {
+                    e.attach(s, gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the bank goes");
+                }
+                e.attach(s, gen, LanePart::Kit(Box::new(kit36()))).expect("the kit goes");
+                notes.push(SlotPlacedMidi {
+                    slot: s,
+                    gen,
+                    placed: PlacedMidi {
+                        strip: slot,
+                        start: 0,
+                        len: 48_000,
+                        notes: Arc::new(vec![ClipNote { at: 0, dur: 40_000, key: PAD_BASE + 36, vel: 100 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                });
+            }
+            if let Some(slot) = cut {
+                let pad = RackAddr { owner: RackOwner::Lane(Slot(slot as u32)), rack: (LANE_RACKS + 36) as u16 };
+                e.load_insert_at(pad, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&trim_state(0.0)))
+                    .expect("the trim loads")
+                    .expect("and seats on the pad");
+            }
+            let inputs = plan(&e, WIDTH, &|x| if SLOTS.contains(&x) { F::DRUM } else { F::MIDI_OFF });
+            e.publish_plan(&inputs).expect("the plan goes");
+            e.set_midi_slotted(notes);
+            let (_, stems) = roll(&mut e, 12);
+            assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0, "an op was refused");
+            let width = e.stem_frame_width() / 2;
+            SLOTS.iter().map(|&s| tail(&stems, width, s, 4)).collect()
+        }
+
+        /// **A pad effect on a drum lane past slot 31 is heard as on lane 1**
+        /// (the MERGE-ME on `PadBank`: a lane past 31 had no pad racks, so
+        /// its kit summed dry whatever its pads' bays held, live and in every
+        /// export). A Trim at -24 dB on pad 36 of each subject in turn cuts
+        /// that subject's kit by the same 24 dB lane 1's is cut by, and moves
+        /// no other subject's column by a bit.
+        #[test]
+        fn a_pad_effect_past_slot_31_is_heard_as_on_lane_1() {
+            let plain = pad_desk(None);
+            for (col, s) in plain.iter().zip(SLOTS) {
+                assert!(rms(col) > 1e-2, "fixture: the kit on lane {s} is silent");
+            }
+            let mut reference = None;
+            for (i, &a) in SLOTS.iter().enumerate() {
+                let cut = pad_desk(Some(a));
+                let ratio = rms(&cut[i]) / rms(&plain[i]);
+                let want = *reference.get_or_insert(ratio);
+                assert!((ratio - 0.063).abs() < 0.01, "lane {a}'s pad effect cut its kit to {ratio} of itself");
+                assert!((ratio - want).abs() <= 1e-3 * want, "lane {a}'s pad effect is not lane 1's: {ratio} against {want}");
+                for (j, &b) in SLOTS.iter().enumerate() {
+                    if j != i {
+                        assert_eq!(bits(&cut[j]), bits(&plain[j]), "lane {a}'s pad effect reached lane {b}");
+                    }
+                }
+            }
+        }
+
+        /// **A pad's plugin for a lane past slot 31 with no pad bank is
+        /// built for nothing and seated nowhere, and the load says so; once
+        /// the bank is sent the same load seats it, and the pad is cut as
+        /// lane 1's is** (W7-slot-gaps, after review). A lane past the frozen
+        /// map keeps its pad racks in its bank, so a rack made for a lane
+        /// with none went home on arrival with the plugin pushed into it,
+        /// while the load answered that the plugin was seated, and the host
+        /// wrote it down as loaded. Each subject past 31, installed as a
+        /// plain lane, takes the Trim before its bank (`pad_desk_at`'s early
+        /// load: `Ok(None)`, the bay empty), then its bank, its kit and the
+        /// same load, and its kit is cut by lane 1's 24 dB and no other
+        /// subject's moves.
+        #[test]
+        fn a_pad_load_onto_a_lane_with_no_bank_seats_nothing_until_its_bank_comes() {
+            let plain = pad_desk(None);
+            let reference = rms(&pad_desk(Some(SLOTS[0]))[0]) / rms(&plain[0]);
+            assert!((reference - 0.063).abs() < 0.01, "lane 1's pad effect cut its kit to {reference} of itself");
+            for (i, &a) in SLOTS.iter().enumerate().filter(|(_, s)| **s >= CHANNELS) {
+                let cut = pad_desk_at(Some(a), true);
+                let ratio = rms(&cut[i]) / rms(&plain[i]);
+                assert!((ratio - reference).abs() <= 1e-3 * reference, "lane {a}'s pad effect, loaded before its bank, cut its kit to {ratio} of itself, lane 1's to {reference}");
+                for (j, &b) in SLOTS.iter().enumerate() {
+                    if j != i {
+                        assert_eq!(bits(&cut[j]), bits(&plain[j]), "lane {a}'s pad effect reached lane {b}");
+                    }
+                }
+            }
+        }
+
+        /// A sample that is not silence, as the host hands one over.
+        fn tone() -> SamplerSample {
+            SamplerSample {
+                clip: Arc::new(tangent_record::decode::Clip {
+                    samples: vec![0.5; 48_000 * 2],
+                    rate: 48_000,
+                    source: PathBuf::from("tone.wav"),
+                }),
+                name: "tone.wav".to_owned(),
+                source: PathBuf::from("tone.wav"),
+                root_key: SAMPLER_ROOT_KEY,
+            }
+        }
+
+        /// **Every subject a sampler in its first bay and a note at the root
+        /// key, and the file handed to `given` alone**: every subject's column.
+        fn sampler_desk(given: usize) -> Vec<Vec<f32>> {
+            let mut e = wide(WIDTH);
+            let mut notes = Vec::new();
+            for &slot in &SLOTS {
+                let s = Slot(slot as u32);
+                let gen = e.lane_gen(s).expect("a lane");
+                e.load_insert_at(RackAddr { owner: RackOwner::Lane(s), rack: 0 }, 0, Some(Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+                    .expect("the sampler loads")
+                    .expect("and seats");
+                notes.push(SlotPlacedMidi {
+                    slot: s,
+                    gen,
+                    placed: PlacedMidi {
+                        strip: slot,
+                        start: 0,
+                        len: 96_000,
+                        notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: SAMPLER_ROOT_KEY, vel: 110 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                });
+            }
+            assert!(e.set_sampler_sample(Slot(given as u32), Some(tone())), "the engine refused the sample");
+            let inputs = plan(&e, WIDTH, &|_| F::MIDI_OFF);
+            e.publish_plan(&inputs).expect("the plan goes");
+            e.set_midi_slotted(notes);
+            let (_, stems) = roll(&mut e, 10);
+            let width = e.stem_frame_width() / 2;
+            SLOTS.iter().map(|&s| tail(&stems, width, s, 4)).collect()
+        }
+
+        /// **A sampler bay plays its file on a lane past slot 31 as on lane 1**
+        /// (the renderer's file table was thirty-two lanes long, so a file
+        /// handed to lane 40 came straight back and its bay played silence,
+        /// live and in every export). Handed to each subject in turn, the
+        /// file sounds on that subject at lane 1's level and on no other.
+        #[test]
+        fn a_sampler_past_slot_31_plays_its_file_as_on_lane_1() {
+            let mut reference = None;
+            for (i, &a) in SLOTS.iter().enumerate() {
+                let cols = sampler_desk(a);
+                let level = rms(&cols[i]);
+                let want = *reference.get_or_insert(level);
+                assert!(level > 1e-2, "the sampler on lane {a} played its file silent");
+                assert!((level - want).abs() <= 1e-3 * want, "lane {a}'s sampler is not lane 1's: {level} against {want}");
+                for (j, &b) in SLOTS.iter().enumerate() {
+                    if j != i {
+                        assert!(cols[j].iter().all(|v| *v == 0.0), "lane {a}'s file played on lane {b}");
+                    }
+                }
+            }
+        }
+
+        /// A comp that squeezes hard and fast on its key: threshold -30 dB,
+        /// 20:1, the fastest attack and release.
+        fn hard_comp() -> Vec<u8> {
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::COMP_PATH).expect("the comp");
+            let mut v = spec.defaults();
+            v[0] = 0.5;
+            v[1] = 1.0;
+            v[2] = 0.0;
+            v[3] = 0.0;
+            crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
+        }
+
+        /// A flat clip at `level` on `slot`: a key source the comp can see.
+        fn flat_at(e: &Engine, slot: usize, level: f32) -> SlotPlaced {
+            SlotPlaced {
+                slot: Slot(slot as u32),
+                gen: e.lane_gen(Slot(slot as u32)).expect("a lane"),
+                placed: Placed {
+                    clip: Arc::new(tangent_record::decode::Clip { samples: vec![level; 96_000], rate: 48_000, source: PathBuf::from("key.wav") }),
+                    strip: 0,
+                    start: 0,
+                    offset: 0,
+                    len: 48_000,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                },
+            }
+        }
+
+        /// **A comp in the first bay of every one of `comps`, a loud clip on
+        /// `source`, the one key `(keyed, from)` and the `buses` flagged
+        /// buses**: the most each comp squeezed, in dB, over ten blocks.
+        fn key_desk(comps: &[usize], buses: &[usize], source: usize, keyed: usize) -> Vec<f32> {
+            let mut e = wide(WIDTH);
+            let state = hard_comp();
+            for &c in comps {
+                e.load_insert_at(RackAddr { owner: RackOwner::Lane(Slot(c as u32)), rack: 0 }, 0, Some(Path::new(crate::builtin_fx::COMP_PATH)), Some(&state))
+                    .expect("the comp loads")
+                    .expect("and seats");
+            }
+            let mut inputs = plan(&e, WIDTH, &|x| if buses.contains(&x) { F::BUS } else { F::default() });
+            inputs.keys = vec![InKey { seat: lane_seat(keyed, CHAIN_OWN) as u32, bay: 0, from: Slot(source as u32) }];
+            e.publish_plan(&inputs).expect("the plan goes");
+            e.set_clips_slotted(vec![flat_at(&e, source, 0.9)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let mut gr = vec![0.0f32; comps.len()];
+            for _ in 0..10 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                for (g, &c) in gr.iter_mut().zip(comps) {
+                    *g = g.max(e.insert_gr_db_at(RackAddr { owner: RackOwner::Lane(Slot(c as u32)), rack: 0 }, 0));
+                }
+            }
+            assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
+            gr
+        }
+
+        /// **A key reaches a comp past slot 31 as it reaches lane 1's, and no
+        /// other comp** (W7-slot-gaps item 4): the source, a loud clip on lane
+        /// 150 past the old desk and on lane 7 below it, keys the comp of
+        /// each subject in turn; that comp squeezes as lane 1's does and none
+        /// of the other subjects' comps moves.
+        #[test]
+        fn a_key_reaches_a_comp_past_slot_31_as_on_lane_1_and_no_other() {
+            for source in [150usize, 7] {
+                for (i, &a) in SLOTS.iter().enumerate() {
+                    let gr = key_desk(&SLOTS, &[], source, a);
+                    assert!(gr[i] > 6.0, "a key from lane {source} squeezed lane {a}'s comp only {:.2} dB", gr[i]);
+                    for (j, &b) in SLOTS.iter().enumerate() {
+                        if j != i {
+                            assert!(gr[j] < 0.5, "a key from lane {source} for lane {a} squeezed lane {b}'s comp {:.2} dB", gr[j]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// **The design's own case**: a key from lane 40 to a comp on lane 33,
+        /// and from lane 40 to a comp on bus 120, each squeezes its comp, and
+        /// neither reaches the comps on lanes 1, 32 or 41.
+        #[test]
+        fn a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus() {
+            let comps = [1usize, 32, 33, 41, 120];
+            for (keyed, at) in [(33usize, 2usize), (120, 4)] {
+                let gr = key_desk(&comps, &[120], 40, keyed);
+                assert!(gr[at] > 6.0, "a key from lane 40 squeezed the comp on {keyed} only {:.2} dB", gr[at]);
+                for (j, &b) in comps.iter().enumerate() {
+                    if j != at {
+                        assert!(gr[j] < 0.5, "the key for {keyed} squeezed the comp on {b} {:.2} dB", gr[j]);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -43672,7 +44874,7 @@ mod sampler_road {
     #[test]
     fn a_sample_swap_returns_the_displaced_file_on_its_own_lane() {
         let (mut r, _tx, _shared) = tests::renderer_with_midi(2);
-        r.sampler_samples[3] = Some(a_sample("first.wav", 0.5));
+        r.lane_body_mut(3).sample = Some(a_sample("first.wav", 0.5));
         let (mut to, incoming) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
         let (retiring, mut from) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
         r.sampler_incoming = incoming;
@@ -43695,7 +44897,7 @@ mod sampler_road {
         assert_eq!(old.source, PathBuf::from("first.wav"));
         assert_eq!(old.root_key, SAMPLER_ROOT_KEY);
         assert_eq!(
-            r.sampler_samples[3].as_ref().expect("the new one landed").name,
+            r.lane_body(3).sample.as_ref().expect("the new one landed").name,
             "second.wav"
         );
     }
