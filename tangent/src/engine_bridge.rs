@@ -48,9 +48,15 @@ use crate::desktop::{
     keys_patch_of, leaf_of, mirror_sampler_samples,
 };
 use crate::instrument::{
-    Engine, LaneKind, LanePart, LaneSpec, PadBank, PadKit, Placed, PlacedMidi, SlotAutomation, SlotPlaced,
-    SlotPlacedMidi, LEGACY_LANES,
+    Engine, LaneKind, LanePart, LaneSpec, PadBank, PadKit, Placed, PlacedMidi, RackAddr, RackOwner, SlotAutomation,
+    SlotPlaced, SlotPlacedMidi, LEGACY_LANES,
 };
+
+/// **A bay, by the engine's identity for its rack** (`RackAddr`: a lane's by
+/// its slot, a strip's by the strip) and the bay in it: what the host asks
+/// the engine about a plugin by, through that rack's `HostRack` (design 8,
+/// item 8), and what its ledger of loaded bays is keyed by.
+pub type EngineBay = (RackAddr, usize);
 
 /// What an export is asked for: the Export dialog's own spec.
 pub type ExportSpec = tangent_ui::ports::ProjectExportSpec;
@@ -193,14 +199,14 @@ pub fn full_build_with(
         freeze,
         probe: probe.then_some(&ctx.probe),
     };
-    let synced = bridge.sync_shape(app, &mut e, shape, &mut |_, _, _| {});
+    let synced = bridge.sync_shape(app, &mut e, shape, &mut |_, _, _| Forgotten::new());
     e.set_monitor_on(false);
     e.set_drums(app.drums_gain(), app.drums_pan());
     if probe {
         if !ctx.probe.bypass.is_empty() {
             let mut bays = bridge.engine_bypass(app);
             bays.extend(ctx.probe.bypass.iter().filter_map(|sb| bridge.engine_bay(*sb)));
-            e.set_insert_bypass(&bays);
+            e.set_insert_bypass_at(&bays);
         }
         if let Some(ms) = ctx.probe.grain_ms {
             e.set_grain_ms(ms);
@@ -279,7 +285,7 @@ pub fn full_build_with(
             Some(v) => *v,
             None => dx7_voice(app, row),
         };
-        e.set_builtin_voice(slot.0 as usize, v);
+        e.set_builtin_voice(slot, v);
     }
     // ── every configured bay, saved state included ──
     //
@@ -333,7 +339,7 @@ pub fn full_build_with(
         }
         // An offline engine's op ring is empty here, so the attach lands.
         let _ = e.attach(lane.slot, lane.gen, LanePart::Kit(Box::new(kit)));
-        e.set_pad_params(lane.slot.0 as usize, &app.drum_kit_params_of(row));
+        e.set_pad_params(lane.slot, &app.drum_kit_params_of(row));
     }
     // ── the samplers, decoded at the export rate ──
     // Their bays were seated above, file names and all; their audio
@@ -428,35 +434,25 @@ pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
     Some((encode_v32_seat(owner, sb.seat.rack)?, usize::from(sb.bay)))
 }
 
-/// **The engine's own name for a bay of the lane at `slot`**: the frozen
-/// seat map of row `slot`, which is what the engine's seats are for every
-/// lane below [`LEGACY_LANES`]. A track's bays are reached through its
-/// lane's slot and never through its row, so a reorder renames nothing.
-pub fn lane_bay(slot: Slot, rack: Rack, bay: u8) -> Option<(usize, usize)> {
-    let row = u16::try_from(slot.0).ok()?;
-    Some((encode_v32_seat(LegacyOwner::Row(row), rack)?, usize::from(bay)))
+/// **The engine's name for a bay of the lane at `slot`**: the lane's rack
+/// by identity (`RackAddr::of`). A track's bays are reached through its
+/// lane's slot and never through its row, so a reorder renames nothing, and
+/// no seat map is consulted: a lane at any slot names its racks the same way.
+pub fn lane_bay(slot: Slot, rack: Rack, bay: u8) -> Option<EngineBay> {
+    Some((RackAddr::of(RackOwner::Lane(slot), rack)?, usize::from(bay)))
 }
 
-/// **The lane an engine seat belongs to**, by its slot: `None` for a
-/// special's seat. What the host needs to find every bay of a leaving lane.
-pub fn lane_of_engine_seat(seat: usize) -> Option<Slot> {
-    match decode_v32_seat(seat)? {
-        (LegacyOwner::Row(s), _) => Some(Slot(u32::from(s))),
-        _ => None,
-    }
-}
-
-/// The engine seat of a special's rack (the drum bus, the click, the
-/// return, the master), the same in every engine.
-fn special_bay(node: Node, rack: Rack, bay: u8) -> Option<(usize, usize)> {
+/// The engine's name for a bay of a special's rack (the drum bus, the
+/// click, the return, the master), the same in every engine.
+fn special_bay(node: Node, rack: Rack, bay: u8) -> Option<EngineBay> {
     let owner = match node {
-        Node::Drums => LegacyOwner::Drums,
-        Node::Click => LegacyOwner::Click,
-        Node::Fx => LegacyOwner::Fx,
-        Node::Master => LegacyOwner::Master,
+        Node::Drums => RackOwner::Drums,
+        Node::Click => RackOwner::Click,
+        Node::Fx => RackOwner::Fx,
+        Node::Master => RackOwner::Master,
         Node::Track(_) => return None,
     };
-    Some((encode_v32_seat(owner, rack)?, usize::from(bay)))
+    Some((RackAddr::of(owner, rack)?, usize::from(bay)))
 }
 
 /// Whether row `row` has its bit in one of the app's remaining desk words
@@ -523,7 +519,17 @@ pub fn track_racks() -> impl Iterator<Item = Rack> {
 /// **What the host does with a lane whose track has gone**, called by the
 /// bridge while the lane's plugins are alive: the engine, the track and its
 /// lane. The track's bays are named by its identity, so no row is needed.
-pub type Retire<'a> = dyn FnMut(&Engine, TrackId, LaneAt) + 'a;
+/// It answers what it let go of ([`Forgotten`]), which the bridge keeps on
+/// the leaving lane.
+pub type Retire<'a> = dyn FnMut(&Engine, TrackId, LaneAt) -> Forgotten + 'a;
+
+/// **What the host let go of when a lane started home**: its record of the
+/// lane's loaded bays (the ledger's entries, by the engine's names). Kept on
+/// the leaving lane and handed back in [`Synced::reclaimed`] if the track
+/// returns before the lane is sent home, which takes back the same lane with
+/// every plugin still seated in it (design 7.13: "nothing was sent home, so
+/// nothing reloads"). Opaque here: only the host reads it.
+pub type Forgotten = Vec<(EngineBay, String)>;
 
 /// One track's lane in the engine: where it sits, and which lane it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -544,7 +550,7 @@ struct Held {
 /// **A lane on its way home** (design 7.13): first heard fading under a
 /// RETIRING plan, then dropped from the plan and sent home whole. Its track
 /// waits for it if it comes back before it is home.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Leaving {
     id: TrackId,
     at: LaneAt,
@@ -556,6 +562,9 @@ struct Leaving {
     /// The Remove has been sent: the lane is in no plan, and the slot is
     /// the engine's until it comes home.
     sent: bool,
+    /// What the host forgot of the lane's bays as it started home, handed
+    /// back if its track takes it back before it is sent.
+    forgotten: Forgotten,
 }
 
 /// **How a sync builds the plan.** The live engine hears the session's arm
@@ -619,8 +628,8 @@ pub struct Bridge {
     rows: Vec<(TrackId, Option<LaneAt>)>,
     /// The inputs of the last plan the engine took, for the change test.
     published: Option<PlanInputs>,
-    /// The bypass table last stored, in engine seats.
-    bypass: Option<Vec<(usize, usize)>>,
+    /// The bypass table last stored, by the engine's names.
+    bypass: Option<Vec<EngineBay>>,
     /// Where an arrangement record is replacing each row's schedule, in
     /// frames, handed in by the host each frame (it owns the record).
     punches: Vec<Option<u64>>,
@@ -649,6 +658,11 @@ pub struct Synced {
     /// The DX7 rows whose instance was just made, with their lanes: each
     /// wants its strip's own voice.
     pub made_dx7: Vec<(usize, Slot)>,
+    /// **What the host forgot of each lane its track took back this frame**
+    /// ([`Forgotten`]): the lane never left, its plugins are still seated,
+    /// and the host's record of them is owed back, or the reconcile reads
+    /// every bay of it as wanted and not loaded and reloads them in place.
+    pub reclaimed: Vec<Forgotten>,
 }
 
 impl Bridge {
@@ -711,42 +725,43 @@ impl Bridge {
         self.rows.iter().position(|(_, at)| at.is_some_and(|a| a.slot == slot))
     }
 
-    /// **The engine's `(seat, bay)` for a bay, by identity**: a track's
-    /// through its lane, a special's as it always was. `None` for a track
-    /// with no lane (gone, or waiting for one).
-    pub fn engine_bay(&self, sb: SeatBay) -> Option<(usize, usize)> {
+    /// **The engine's name for a bay, by identity**: a track's through its
+    /// lane, a special's as it always was. `None` for a track with no lane
+    /// (gone, or waiting for one).
+    pub fn engine_bay(&self, sb: SeatBay) -> Option<EngineBay> {
         match sb.seat.node {
             Node::Track(id) => lane_bay(self.lanes.get(&id)?.at.slot, sb.seat.rack, sb.bay),
             node => special_bay(node, sb.seat.rack, sb.bay),
         }
     }
 
-    /// **The engine's `(seat, bay)` for the app's `(seat, bay)`**, under the
-    /// app's rows now: the app still keeps its bays by position.
-    pub fn engine_seat(&self, app: &TangentApp, seat: usize, bay: usize) -> Option<(usize, usize)> {
+    /// **The engine's name for the app's `(seat, bay)`**, under the app's
+    /// rows now: the app still keeps its bays by position.
+    pub fn engine_seat(&self, app: &TangentApp, seat: usize, bay: usize) -> Option<EngineBay> {
         self.engine_bay(seat_bay_at(app.track_ids(), seat, bay)?)
     }
 
-    /// **The bay at the engine's `(seat, bay)`, by identity**: the inverse
-    /// of [`Self::engine_bay`], for what the engine reports by seat.
-    pub fn bay_at_engine(&self, seat: usize, bay: usize) -> Option<SeatBay> {
-        let (owner, rack) = decode_v32_seat(seat)?;
-        let node = match owner {
-            LegacyOwner::Row(s) => {
-                let slot = Slot(u32::from(s));
-                Node::Track(self.lanes.iter().find(|(_, h)| h.at.slot == slot).map(|(id, _)| *id)?)
-            }
-            LegacyOwner::Drums => Node::Drums,
-            LegacyOwner::Click => Node::Click,
-            LegacyOwner::Fx => Node::Fx,
-            LegacyOwner::Master => Node::Master,
+    /// **The bay the engine names `at`, by identity**: the inverse of
+    /// [`Self::engine_bay`], for what the engine reports by its racks. A
+    /// lane's rack is its track's wherever the row is; one whose slot no
+    /// track holds (a lane on its way home) is nobody's.
+    pub fn bay_at_engine(&self, at: EngineBay) -> Option<SeatBay> {
+        let (addr, bay) = at;
+        let node = match addr.owner {
+            RackOwner::Lane(slot) => Node::Track(self.lanes.iter().find(|(_, h)| h.at.slot == slot).map(|(id, _)| *id)?),
+            RackOwner::Drums => Node::Drums,
+            RackOwner::Click => Node::Click,
+            RackOwner::Fx => Node::Fx,
+            RackOwner::Master => Node::Master,
         };
-        Some(SeatBay::new(node, rack, u8::try_from(bay).ok()?))
+        let sb = SeatBay::new(node, addr.desk_rack()?, u8::try_from(bay).ok()?);
+        sb.is_valid().then_some(sb)
     }
 
-    /// **The app's `(seat, bay)` for the engine's**, under the app's rows now.
-    pub fn app_seat(&self, app: &TangentApp, seat: usize, bay: usize) -> Option<(usize, usize)> {
-        app_seat_of(app.track_ids(), self.bay_at_engine(seat, bay)?)
+    /// **The app's `(seat, bay)` for the engine's bay**, under the app's rows
+    /// now.
+    pub fn app_seat(&self, app: &TangentApp, at: EngineBay) -> Option<(usize, usize)> {
+        app_seat_of(app.track_ids(), self.bay_at_engine(at)?)
     }
 
     /// Every row whose first bay holds `sentinel`, with its lane: the drum,
@@ -807,9 +822,9 @@ impl Bridge {
         SlotAutomation { curves: tangent_ui::automation::Automation::from_curves(curves), gens, master }
     }
 
-    /// **The bypassed bays, in engine seats**: the desk keeps them by the
-    /// app's position, the engine by its lane's.
-    pub fn engine_bypass(&self, app: &TangentApp) -> Vec<(usize, usize)> {
+    /// **The bypassed bays, by the engine's names**: the desk keeps them by
+    /// the app's position, the engine by its lanes' racks.
+    pub fn engine_bypass(&self, app: &TangentApp) -> Vec<EngineBay> {
         app.insert_bypass()
             .iter()
             .filter_map(|&(seat, bay)| self.engine_seat(app, seat, bay))
@@ -821,7 +836,7 @@ impl Bridge {
     /// lane, which only a host with a shelf has.
     #[cfg_attr(not(test), allow(dead_code, reason = "the host passes its shelf"))]
     pub fn sync(&mut self, app: &TangentApp, e: &mut Engine) -> Synced {
-        self.sync_shape(app, e, Shape::Live, &mut |_, _, _| {})
+        self.sync_shape(app, e, Shape::Live, &mut |_, _, _| Forgotten::new())
     }
 
     /// **Push the desk into the live engine**, once a frame: adopt, install
@@ -847,7 +862,7 @@ impl Bridge {
         let gone: Vec<TrackId> = self.lanes.keys().filter(|id| !wanted.contains(id)).copied().collect();
         for id in gone {
             if let Some(h) = self.lanes.remove(&id) {
-                on_retire(e, id, h.at);
+                let forgotten = on_retire(e, id, h.at);
                 self.leaving.push(Leaving {
                     id,
                     at: h.at,
@@ -855,15 +870,19 @@ impl Bridge {
                     since: Instant::now(),
                     retiring_in: None,
                     sent: false,
+                    forgotten,
                 });
             }
         }
         // **A track back before its lane left takes the lane back**: nothing
-        // was sent home, so nothing reloads. One whose Remove went waits for
+        // was sent home, so nothing reloads, and what the host forgot of its
+        // bays goes back to the host with it. One whose Remove went waits for
         // its lane to be home, then takes a fresh one like any new track.
-        self.leaving.retain(|l| {
+        let reclaimed = &mut synced.reclaimed;
+        self.leaving.retain_mut(|l| {
             if !l.sent && wanted.contains(&l.id) {
                 self.lanes.insert(l.id, Held { at: l.at, pads: l.pads });
+                reclaimed.push(std::mem::take(&mut l.forgotten));
                 return false;
             }
             !(l.sent && e.slot_free(l.at.slot))
@@ -913,12 +932,13 @@ impl Bridge {
         }
         // ── the continuous values, every frame, by slot ──
         self.store_levels(app, e, shape);
-        // **What is bypassed, by engine seat**, stored only when it moved:
-        // `set_insert_bypass` reads before it writes, but the translation
-        // is a walk too, and the table changes when somebody clicks.
+        // **What is bypassed, by the engine's names**, stored only when it
+        // moved: `set_insert_bypass_at` reads before it writes, but the
+        // translation is a walk too, and the table changes when somebody
+        // clicks.
         let bypass = self.engine_bypass(app);
         if self.bypass.as_ref() != Some(&bypass) {
-            e.set_insert_bypass(&bypass);
+            e.set_insert_bypass_at(&bypass);
             self.bypass = Some(bypass);
         }
         // **How far ahead a track's effects are rendered.** One store of a
@@ -973,8 +993,9 @@ impl Bridge {
     /// below [`LEGACY_LANES`], in one Install. A track whose old lane is
     /// still on its way home waits for it; a track with no free slot waits
     /// for one (in this wave every slot past the legacy width lacks the pad
-    /// racks, the automation lane and the instrument bits a lane needs, so
-    /// the bridge never reaches past it). Answers the slots it installed at.
+    /// racks and the automation lane a lane needs, so the bridge never
+    /// reaches past it; its plugin racks and its instruments are already
+    /// reached by identity at any slot). Answers the slots it installed at.
     fn install(&mut self, app: &TangentApp, e: &mut Engine, ids: &[TrackId]) -> Vec<Slot> {
         let mut taken: BTreeSet<Slot> = self.lanes.values().map(|h| h.at.slot).collect();
         taken.extend(self.leaving.iter().map(|l| l.at.slot));
@@ -1204,9 +1225,10 @@ impl Bridge {
             })
             .collect();
         // **The sidechain keys**, by identity: the desk speaks (strip, slot)
-        // so saved edges survive seat renumbering, the engine speaks seats,
-        // and THIS is the one place the translation happens - through
-        // `slot_key`, the display-slot resolver, and the keyed bay's lane.
+        // so saved edges survive seat renumbering, the plan speaks the
+        // engine's seats, and THIS is the one place the translation happens -
+        // through `slot_key`, the display-slot resolver, the keyed bay's
+        // lane, and its rack's `plan_seat`.
         let ids = app.track_ids();
         let keys = app
             .insert_keys()
@@ -1216,8 +1238,8 @@ impl Bridge {
                 let from = self.lane(k.from)?.slot;
                 let node = bind(decode_v32_strip(k.strip)?, ids)?;
                 let sb = tangent_ui::desk_id::slot_key(node, k.slot)?;
-                let (seat, bay) = self.engine_bay(sb)?;
-                Some(InKey { seat: u32::try_from(seat).ok()?, bay: u8::try_from(bay).ok()?, from })
+                let (addr, bay) = self.engine_bay(sb)?;
+                Some(InKey { seat: addr.plan_seat()?, bay: u8::try_from(bay).ok()?, from })
             })
             .collect();
         PlanInputs { lanes, specials, routes, sends: Vec::new(), keys }
@@ -1252,9 +1274,8 @@ impl Bridge {
             if live_rule && app.channel_kind(row) != Some(ChannelKind::Midi) {
                 continue;
             }
-            let ch = at.slot.0 as usize;
-            e.set_keys_patch(ch, keys_patch_of(app.keys_patch_of(row)));
-            e.set_keys_params(ch, &app.keys_params_of(row));
+            e.set_keys_patch(at.slot, keys_patch_of(app.keys_patch_of(row)));
+            e.set_keys_params(at.slot, &app.keys_params_of(row));
         }
     }
 }
@@ -1833,7 +1854,7 @@ mod tests {
         b.sync(app, &mut e);
         for (seat, bay, unit, state) in &c.live {
             let at = b.engine_seat(app, *seat, *bay).expect("the bay's lane");
-            e.load_insert(at.0, at.1, Some(Path::new(unit)), Some(state))
+            e.load_insert_at(at.0, at.1, Some(Path::new(unit)), Some(state))
                 .unwrap_or_else(|err| panic!("{unit} did not load into seat {seat}: {err}"));
         }
         (e, b)
@@ -2169,7 +2190,7 @@ mod tests {
         assert_eq!(body.matches("e.publish_plan(").count(), 0, "a plan goes out past the change test");
         assert_eq!(body.matches("self.publish(e, inputs)").count(), 1, "the shape is not published through the change test");
         let gate = body.find("if self.bypass.as_ref() != Some(&bypass) {").expect("the bypass compare");
-        let store = body.find("e.set_insert_bypass(&bypass);").expect("the bypass store");
+        let store = body.find("e.set_insert_bypass_at(&bypass);").expect("the bypass store");
         assert!(gate < store, "the bypass is stored every frame");
     }
 
@@ -2319,7 +2340,7 @@ mod tests {
     /// **The bays the desk wants, at the engine's address**: the host's
     /// reconcile, without its overlay. Every bay the app holds, at its
     /// track's lane.
-    fn wanted(p: &Bridge, app: &TangentApp) -> BTreeMap<(usize, usize), String> {
+    fn wanted(p: &Bridge, app: &TangentApp) -> BTreeMap<EngineBay, String> {
         desk_bays(app).into_iter().filter_map(|(sb, path)| Some((p.engine_bay(sb)?, path))).collect()
     }
 
@@ -2343,8 +2364,8 @@ mod tests {
         p.sync(&app, &mut e);
         let ledger = wanted(&p, &app);
         assert_eq!(ledger.len(), CHANNELS, "a bay per lane");
-        for ((seat, bay), path) in &ledger {
-            e.load_insert(*seat, *bay, Some(Path::new(path)), None).expect("an EQ loads");
+        for ((rack, bay), path) in &ledger {
+            e.load_insert_at(*rack, *bay, Some(Path::new(path)), None).expect("an EQ loads");
         }
         e.settle_offline();
         let before = p.stats();
@@ -2430,11 +2451,17 @@ mod tests {
         let calls = crate::shelf::fs_calls();
         let mut retired = 0usize;
         app.move_channel(5, 2);
-        p.sync_with(&app, &mut e, &mut |_, _, _| retired += 1);
+        p.sync_with(&app, &mut e, &mut |_, _, _| {
+            retired += 1;
+            Forgotten::new()
+        });
         let moved = desk_bays(&app);
         let rows_moved = app.track_ids()[2..6].to_vec();
         key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
-        p.sync_with(&app, &mut e, &mut |_, _, _| retired += 1);
+        p.sync_with(&app, &mut e, &mut |_, _, _| {
+            retired += 1;
+            Forgotten::new()
+        });
         let undone = desk_bays(&app);
         let rows_undone = app.track_ids()[2..6].to_vec();
         let shelf_calls = crate::shelf::fs_calls() - calls;
@@ -2474,8 +2501,8 @@ mod tests {
         p.sync(&app, &mut e);
         let gone = app.track_ids()[1];
         let at = p.engine_bay(seat_bay_at(app.track_ids(), 1, 0).expect("the bay")).expect("its seat");
-        e.load_insert(at.0, at.1, Some(Path::new(COMP_PATH)), Some(&dial)).expect("the comp loads");
-        let live = e.save_insert_state(at.0, at.1).expect("the comp's state");
+        e.load_insert_at(at.0, at.1, Some(Path::new(COMP_PATH)), Some(&dial)).expect("the comp loads");
+        let live = e.save_insert_state_at(at.0, at.1).expect("the comp's state");
 
         // The shelf the host keeps, by the track's bay.
         let mut shelf: BTreeMap<SeatBay, Vec<u8>> = BTreeMap::new();
@@ -2485,36 +2512,163 @@ mod tests {
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::TrackRemove(1));
         assert!(!app.track_ids().contains(&gone), "the removal kept the track's id");
         let mut retire = |e: &Engine, id: TrackId, lane: LaneAt| {
-            let (seat, bay) = lane_bay(lane.slot, Rack::Chain(0), 0).expect("the lane's first bay");
-            let alive = e.insert(seat, bay).is_some();
-            if let Some(state) = e.save_insert_state(seat, bay) {
+            let (rack, bay) = lane_bay(lane.slot, Rack::Chain(0), 0).expect("the lane's first bay");
+            let alive = e.insert_at(rack, bay).is_some();
+            if let Some(state) = e.save_insert_state_at(rack, bay) {
                 shelf.insert(SeatBay::new(Node::Track(id), Rack::Chain(0), 0), state);
             }
             asked.push((id, lane.slot, alive));
+            Forgotten::new()
         };
         p.sync_with(&app, &mut e, &mut retire);
         assert_eq!(asked, vec![(gone, at_slot(at), true)], "the host was not asked for the lane's states while its plugin lived");
         assert_eq!(shelf.values().next(), Some(&live), "what reached the shelf is not what the comp was playing");
         assert_eq!(p.lane_of(gone), None, "the removed track kept a lane");
-        assert_eq!(e.insert(at.0, at.1), None, "the removed lane's plugin outlived it");
+        assert_eq!(e.insert_at(at.0, at.1), None, "the removed lane's plugin outlived it");
 
         // The undo: the row's track is back, and wants a lane.
         key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
         assert_eq!(app.track_ids().get(1), Some(&gone), "the undo did not bring the track back");
         for _ in 0..3 {
-            p.sync_with(&app, &mut e, &mut |_, _, _| {});
+            p.sync_with(&app, &mut e, &mut |_, _, _| Forgotten::new());
         }
         let back = p.lane_of(gone).expect("the restored track has no lane");
         let sb = seat_bay_at(app.track_ids(), 1, 0).expect("the bay");
         assert_eq!(wanted(&p, &app).get(&p.engine_bay(sb).expect("seat")), Some(&COMP_PATH.to_owned()), "the restored bay is not wanted at its lane");
-        let (seat, bay) = lane_bay(back.slot, Rack::Chain(0), 0).expect("its first bay");
-        e.load_insert(seat, bay, Some(Path::new(COMP_PATH)), shelf.get(&sb).map(Vec::as_slice))
+        let (rack, bay) = lane_bay(back.slot, Rack::Chain(0), 0).expect("its first bay");
+        e.load_insert_at(rack, bay, Some(Path::new(COMP_PATH)), shelf.get(&sb).map(Vec::as_slice))
             .expect("the comp comes back");
-        assert_eq!(e.save_insert_state(seat, bay), Some(live), "the undo brought the comp back without its dial");
+        assert_eq!(e.save_insert_state_at(rack, bay), Some(live), "the undo brought the comp back without its dial");
     }
 
-    fn at_slot((seat, _): (usize, usize)) -> Slot {
-        lane_of_engine_seat(seat).expect("a lane's seat")
+    fn at_slot((rack, _): EngineBay) -> Slot {
+        rack.lane().expect("a lane's rack")
+    }
+
+    /// **A track back before its lane was sent home takes the lane back, and
+    /// nothing reloads** (design 7.13: "an id that reappears waits for its
+    /// old lane"; "nothing was sent home, so nothing reloads"). A comp dialled
+    /// on row 1 and an EQ beside it, the track removed on a running engine:
+    /// the host's hook (`DesktopApp::forget_lane`) writes the lane's states
+    /// down and forgets its bays while the lane fades under its RETIRING plan,
+    /// and before the callback has let it go (no block rendered) the removal
+    /// is undone. The track takes the same lane back, slot and generation,
+    /// and what the hook forgot comes back with it (`Synced::reclaimed`,
+    /// `DesktopApp::reclaim_lanes`): the bays the reconcile wants are exactly
+    /// the bays the ledger holds, so it loads nothing, and the comp is the
+    /// same instance still playing its dial. Forgotten for good, the
+    /// reconcile reloaded every plugin of the lane in place from its file,
+    /// and a bay whose state could not be asked for came back at defaults.
+    #[test]
+    fn a_track_back_before_its_lane_left_takes_it_back_and_reloads_nothing() {
+        use crate::desktop::{DesktopApp, InsertLedger};
+        let mut s = blank();
+        kind(&mut s, &[0, 1, 2], ChannelKind::Audio);
+        bay(&mut s, 1, 0, COMP_PATH);
+        bay(&mut s, 1, 1, EQ_PATH);
+        let mut app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        // Removals by the live road: the Remove waits for the callback to
+        // take the plan that fades the lane, and no block is rendered here.
+        p.stage_removals_for_test();
+        p.sync(&app, &mut e);
+        let gone = app.track_ids()[1];
+        let lane = p.lane_of(gone).expect("a lane");
+        let comp = p.engine_bay(seat_bay_at(app.track_ids(), 1, 0).expect("the comp's bay")).expect("its rack");
+        let dial = dialled(COMP_PATH, &[(0, 0.2), (1, 0.9)]);
+        // The reconcile's loads: every bay the desk wants, and the ledger
+        // that records them.
+        let mut ledger: InsertLedger = wanted(&p, &app);
+        for ((rack, bay), path) in &ledger {
+            let state = (path == COMP_PATH).then_some(dial.as_slice());
+            e.load_insert_at(*rack, *bay, Some(Path::new(path)), state).expect("a bay loads");
+        }
+        let playing = e.save_insert_state_at(comp.0, comp.1).expect("the comp's state");
+        let shelf = scratch("reclaim-shelf");
+        let before = p.stats();
+
+        // A frame first: the app keeps its undo line from the desk it drew.
+        key(&mut app, egui::Key::F24, egui::Modifiers::NONE);
+        app.apply_dialog_action(tangent_ui::dialogs::DialogAction::TrackRemove(1));
+        let mut forget = |e: &Engine, id: TrackId, at: LaneAt| DesktopApp::forget_lane(&mut ledger, &shelf, e, id, at);
+        let left = p.sync_with(&app, &mut e, &mut forget);
+        assert!(left.reclaimed.is_empty(), "a lane was taken back before its track returned");
+        assert!(ledger.keys().all(|(rack, _)| rack.lane() != Some(lane.slot)), "the hook kept the leaving lane's bays");
+        assert_eq!(p.lane_of(gone), None, "the removed track kept its lane");
+
+        // The undo, while the lane is still on its way out.
+        key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(app.track_ids().get(1), Some(&gone), "fixture: the undo did not bring the track back");
+        let mut forget = |e: &Engine, id: TrackId, at: LaneAt| DesktopApp::forget_lane(&mut ledger, &shelf, e, id, at);
+        let back = p.sync_with(&app, &mut e, &mut forget);
+        DesktopApp::reclaim_lanes(&mut ledger, &back);
+
+        let after = p.stats();
+        assert_eq!(back.reclaimed.len(), 1, "the returning track did not take its lane back");
+        assert_eq!(p.lane_of(gone), Some(lane), "the returning track took another lane");
+        assert_eq!(
+            (after.installs, after.removes),
+            (before.installs, before.removes),
+            "the lane was sent home or another installed"
+        );
+        let want = wanted(&p, &app);
+        let reloads: Vec<&EngineBay> =
+            want.keys().chain(ledger.keys()).filter(|at| want.get(*at) != ledger.get(*at)).collect();
+        assert!(reloads.is_empty(), "the reconcile would reload {reloads:?} in place");
+        assert_eq!(
+            e.save_insert_state_at(comp.0, comp.1),
+            Some(playing),
+            "the comp is not the instance that was playing the dial"
+        );
+        let _ = std::fs::remove_dir_all(&shelf);
+    }
+
+    /// **A plugin is reached through its rack's `HostRack`, by identity, at
+    /// any slot** (design 8, item 8; W4-integrate (A) and (C)): the host
+    /// asks the engine by `(RackAddr, bay)`, never by a seat, and the records
+    /// the engine keeps of a bay's tenant live in that rack's one record. A
+    /// lane at slot 40, past the frozen seat map's thirty-two rows: its
+    /// chain, its extra rack and a pedal each seat a comp by identity, each
+    /// answers what it holds and the state it plays, and a lane's pad rack
+    /// past the map's pads is named but not made yet, so it holds nothing.
+    /// When the lane goes home, its racks' records go with it.
+    #[test]
+    fn a_plugin_is_reached_through_its_racks_host_record_at_any_slot() {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let slot = Slot(40);
+        e.install_lanes(vec![(slot, LaneSpec { kind: LaneKind::Audio, drum: false })]).expect("a lane at 40");
+        e.settle_offline();
+        let dial = dialled(COMP_PATH, &[(0, 0.2), (1, 0.9)]);
+        let racks = [Rack::Chain(0), Rack::Chain(1), Rack::Pedal(3)];
+        for rack in racks {
+            let (addr, bay) = lane_bay(slot, rack, 2).expect("a rack of the lane");
+            assert_eq!(addr.lane(), Some(slot), "{rack:?}: the rack is not the lane's");
+            assert_eq!(addr.desk_rack(), Some(rack), "{rack:?}: the desk's name does not round-trip");
+            e.load_insert_at(addr, bay, Some(Path::new(COMP_PATH)), Some(&dial))
+                .expect("the comp loads")
+                .expect("past the map, the rack is still there");
+            assert_eq!(
+                e.insert_at(addr, bay).map(|l| l.bundle.clone()),
+                Some(PathBuf::from(COMP_PATH)),
+                "{rack:?}: the bay does not say what it holds"
+            );
+            assert_eq!(e.save_insert_state_at(addr, bay), Some(dial.clone()), "{rack:?}: the bay lost its dial");
+        }
+        let (pad, bay) = lane_bay(slot, Rack::Pad(5), 0).expect("a pad rack is a rack of the lane");
+        assert_eq!(
+            e.load_insert_at(pad, bay, Some(Path::new(COMP_PATH)), None).expect("no error"),
+            None,
+            "a pad rack past the map's pads seated a plugin"
+        );
+        e.remove_lanes(&[slot]).expect("the lane goes home");
+        let mut out = vec![0.0f32; 256 * 2];
+        e.render_offline(&mut out);
+        e.retire_tick();
+        for rack in racks {
+            let (addr, bay) = lane_bay(slot, rack, 2).expect("a rack of the lane");
+            assert_eq!(e.insert_at(addr, bay), None, "{rack:?}: the host kept a record of a lane that went home");
+        }
     }
 
     /// **On a running engine a leaving lane fades under a plan first**
