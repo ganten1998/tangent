@@ -37380,9 +37380,9 @@ mod arr_identity {
     //! fake interface: `DesktopApp` itself cannot be built in a test.
     use super::*;
     use crate::desk_plan::PickId;
-    use crate::engine_bridge::{input_rows, Bridge, InputStream};
+    use crate::engine_bridge::{input_rows, Bridge, InputRow, InputStream};
     use crate::instrument::Engine;
-    use tangent_record::audio::Picks;
+    use tangent_record::audio::{ChannelPick, Picks};
     use tangent_ui::host::Caps;
     use tangent_ui::recorder::ChannelKind;
     use tangent_ui::settings::Settings;
@@ -37594,5 +37594,130 @@ mod arr_identity {
         assert_eq!(app.track_ids()[row], a, "the take would land on another track");
         assert_eq!(app.channel_input_spec(row), "0", "the row the take lands on is not A's");
         assert!(bridge.pick_of(b).is_some_and(|p| p != pick), "B shares A's pick");
+    }
+
+    /// One block of a record under a binding change: the frame's syncs with
+    /// `rows` (the shape, then every input), the stream's picks set to what
+    /// the bridge answers, as the host sets them (`push_monitor_settings`
+    /// hands the answer to `devices::set_channel_picks`, and
+    /// `reconcile_audio`'s live path changes the picks under the open
+    /// device; an answer of none is the band's own choice, `band`), then the
+    /// device's block, rendered and drained into the take.
+    #[allow(clippy::too_many_arguments, reason = "one block of the rig, every part of it named")]
+    fn record_block(
+        app: &TangentApp,
+        bridge: &mut Bridge,
+        e: &mut Engine,
+        stream: &mut InputStream,
+        band: &Picks,
+        rows: &[InputRow],
+        tx: &mut rtrb::Producer<f32>,
+        block: Vec<f32>,
+        rec: &mut ArrRec,
+    ) {
+        bridge.sync(app, e);
+        let answer = bridge.sync_input_rows(rows, e, stream);
+        stream.picks = if answer.is_empty() { band.clone() } else { Picks::from_slice(&answer) };
+        let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+        let mut out = vec![0.0f32; BLOCK * 2];
+        e.render_offline(&mut out);
+        rec.drain_tee(e);
+    }
+
+    /// **A take on an interface opened whole rides out the desk naming its
+    /// first input, bit for bit** (design A5). On a desk that names no input
+    /// the stream takes the interface whole and the first audio track reads
+    /// the whole device; while it records, another track names input 2,
+    /// which turns the desk explicit and narrows the stream to that input
+    /// (the device stays open, its ring still whole frames). The binding is
+    /// made through the track's row, as the input menu would make it (its
+    /// road, `set_channel_input_spec`, is the app's own): no hold stands on
+    /// input bindings until W6's `desk_shape_held`.
+    ///
+    /// The record's pick was held as the input it named, which for the whole
+    /// device is none: rebuilt reading nothing, the tee skipped it, and the
+    /// take stopped growing at the binding with nothing dropped and nothing
+    /// said.
+    #[test]
+    fn a_whole_device_take_rides_out_the_desk_naming_its_first_input() {
+        const DEV: usize = 4;
+        let (app, mut bridge, mut e, mut tx, mut stream) = rig(desk(&[(1, "", true), (2, "", false)]), DEV);
+        let (a, b) = (app.track_ids()[1], app.track_ids()[2]);
+        assert!(!bridge.pick_table().explicit(), "the desk names an input");
+        let takes = ArrRec::press_takes(&app, &bridge);
+        assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
+        let pick = takes.audio[0].pick;
+        ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut want = Vec::new();
+        for blk in 0..24 {
+            let mut rows = input_rows(&app);
+            if blk >= 8 {
+                if let Some(r) = rows.iter_mut().find(|r| r.id == b) {
+                    r.spec = Some(ChannelPick::Mono(1));
+                }
+            }
+            // The whole device's first pair: a ramp on its left, a level of
+            // its own on its right.
+            let block = ramp_block(DEV, 0, blk * BLOCK, BLOCK);
+            for f in 0..BLOCK {
+                want.extend([block[f * DEV], block[f * DEV + 1]]);
+            }
+            record_block(&app, &mut bridge, &mut e, &mut stream, &Picks::EVERYTHING, &rows, &mut tx, block, &mut rec);
+            assert_eq!(bridge.pick_of(a), Some(pick), "block {blk}: A's pick moved, or A no longer hears its take");
+            assert!(e.is_capturing(pick), "block {blk}: A's capture stopped");
+        }
+        assert!(bridge.pick_table().explicit(), "the binding did not turn the desk explicit");
+        assert_eq!(stream.picks, Picks::from_slice(&[ChannelPick::Mono(1)]), "the stream was not narrowed");
+        assert!(bridge.pick_of(b).is_some_and(|p| p != pick), "B shares A's pick");
+        rec.close_tee(&mut bridge, Some(&mut e));
+        assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        assert_eq!(rec.audio[0].frames.len(), want.len(), "the take stopped growing when the desk named an input");
+        assert!(rec.audio[0].frames == want, "the take is not the whole device's first pair, sample for sample");
+    }
+
+    /// **A take keeps its input when the desk stops naming inputs, bit for
+    /// bit** (design A5). The one track that names an input records input
+    /// 3; mid-take its input is set to none, through its row, which turns
+    /// the desk ordinal, and a desk that names nothing has its stream's
+    /// picks set back to the band's own channel, input 1
+    /// (`devices::audio_selection`; the device stays open). The ordinal walk
+    /// ignored the held pick and had it read the stream's first input: the
+    /// rest of the take was input 1.
+    #[test]
+    fn a_take_keeps_its_input_when_the_desk_stops_naming_inputs() {
+        const DEV: usize = 4;
+        const COL: usize = 2;
+        let (app, mut bridge, mut e, mut tx, mut stream) = rig(desk(&[(1, "2", true), (2, "", false)]), DEV);
+        let a = app.track_ids()[1];
+        let band = Picks::from_slice(&[ChannelPick::Mono(0)]);
+        assert!(bridge.pick_table().explicit(), "the desk names no input");
+        let takes = ArrRec::press_takes(&app, &bridge);
+        assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
+        let pick = takes.audio[0].pick;
+        ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut want = Vec::new();
+        for blk in 0..24 {
+            let mut rows = input_rows(&app);
+            if blk >= 8 {
+                if let Some(r) = rows.iter_mut().find(|r| r.id == a) {
+                    r.spec = None;
+                }
+            }
+            let block = ramp_block(DEV, COL, blk * BLOCK, BLOCK);
+            for f in 0..BLOCK {
+                want.extend([block[f * DEV + COL]; 2]);
+            }
+            record_block(&app, &mut bridge, &mut e, &mut stream, &band, &rows, &mut tx, block, &mut rec);
+            assert_eq!(bridge.pick_of(a), Some(pick), "block {blk}: the record's pick left its track");
+            assert!(e.is_capturing(pick), "block {blk}: A's capture stopped");
+        }
+        assert!(!bridge.pick_table().explicit(), "the desk still names an input");
+        assert_eq!(stream.picks, band, "the stream is not back on the band's channel");
+        rec.close_tee(&mut bridge, Some(&mut e));
+        assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        assert_eq!(rec.audio[0].frames.len(), want.len(), "the take is not as long as the input");
+        assert!(rec.audio[0].frames == want, "the take is not input 3, sample for sample");
     }
 }
