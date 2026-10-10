@@ -307,7 +307,11 @@ pub struct MixerView<'a> {
     /// Every selected channel. Shift takes a range, Cmd or Ctrl takes them one
     /// at a time; all of them wear the rim, because a selection you cannot see
     /// the extent of is not one.
-    pub selected_tracks: &'a [usize],
+    ///
+    /// Owned rows: the app holds the selection by track identity and finds
+    /// each track's row as the view is built, so there is no slice of rows
+    /// on its side to borrow.
+    pub selected_tracks: Vec<usize>,
     /// Whether the OPEN insert menu's bay can take a sidechain key, which is
     /// what earns it the third row. On the view rather than per strip
     /// because at most one menu is up, and the app is the side that can ask
@@ -4501,7 +4505,7 @@ mod tests {
 
     fn a_view() -> MixerView<'static> {
         MixerView {
-            selected_tracks: &[],
+            selected_tracks: Vec::new(),
             routes: &[],
             fx_strip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             input_chip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
@@ -5064,7 +5068,7 @@ mod tests {
         let mut v = a_view();
         v.strips[Column::Track(1)].is_folder = true;
         let picked = [0usize, 1];
-        v.selected_tracks = &picked;
+        v.selected_tracks = picked.to_vec();
         let r = rect();
         let l = Layout::new(r, &v);
         let ctx = egui::Context::default();

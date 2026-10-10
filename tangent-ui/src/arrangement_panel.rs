@@ -666,8 +666,9 @@ pub struct ArrangeView<'a> {
     /// The PRIMARY. Everything selected is in [`Self::selected_tracks`].
     pub selected_channel: Option<usize>,
     /// Every selected channel, all of which wear the rim. See
-    /// `recorder_panel::selection_rim`.
-    pub selected_tracks: &'a [usize],
+    /// `recorder_panel::selection_rim`. Owned rows, found from the tracks
+    /// the app's selection names as the view is built.
+    pub selected_tracks: Vec<usize>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
     /// The strip face — the same theme role the mixer's bays wear, so a
@@ -8737,7 +8738,7 @@ ArrangeView {
             naming: None,
             time_sel: None,
             selected_channel: None,
-            selected_tracks: &[],
+            selected_tracks: Vec::new(),
             lanes: Lanes::dense((0..CHANNELS).map(|i| a_lane(i < 3)).collect()),
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
