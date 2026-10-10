@@ -78,7 +78,7 @@ fn root() -> PathBuf {
 }
 
 /// Every `.rs` file under `dir`, recursively, past any `vendor` directory.
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
