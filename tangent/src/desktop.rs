@@ -6253,6 +6253,27 @@ impl DesktopApp {
         //
         // **By identity**: the copied track's bays to the pasted track's,
         // whichever rows the two stand on now (`take_insert_state_copy_ids`).
+        //
+        // **And a plugin carried between bays** (a pad swap, its undo or
+        // redo) takes its settings to its new bay here too, before the
+        // reconcile rebuilds both: see `engine_bridge::carry_relabels`.
+        let relabels = self.app.take_bay_relabels();
+        if !relabels.is_empty() {
+            let shelf = crate::shelf::global_dir();
+            let written = crate::engine_bridge::carry_relabels(
+                &self.app,
+                &self.bridge,
+                self.recorder.engine.as_ref(),
+                &relabels,
+                &shelf,
+            );
+            for (sb, bundle) in written {
+                self.displaced_states.remove(&(sb, bundle));
+                if let Some(at) = self.bridge.engine_bay(sb) {
+                    self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+                }
+            }
+        }
         if let Some((from, to)) = self.app.take_insert_state_copy_ids() {
             use tangent_ui::desk_id::{slot_key, Node};
             // **All SIX slots, through the display-slot resolver.** A
@@ -19678,13 +19699,7 @@ impl DesktopApp {
             // Out of every bay it sits in, not just the first: the same
             // plugin on two channels would otherwise take the second launch.
             let want = bad.to_string_lossy();
-            let mut pulled = 0usize;
-            for slot in settings.strip_inserts.iter_mut() {
-                if *slot == want {
-                    slot.clear();
-                    pulled += 1;
-                }
-            }
+            let pulled = settings.pull_plugin(&want);
             eprintln!(
                 "tangent: the last launch was killed loading {}; \
                  removed it from {pulled} bay(s) so this one can start",
@@ -21370,11 +21385,16 @@ impl DesktopApp {
             |row| self.app.channel_kind(row) == Some(tangent_ui::recorder::ChannelKind::Audio),
             |row| self.app.folder_of(row),
             |row| {
+                // By identity at both ends: the row's track, and the rows
+                // its destinations stand on.
+                let Some(&id) = self.app.track_ids().get(row) else {
+                    return Vec::new();
+                };
                 routes
-                    .from(row)
+                    .from(tangent_ui::desk_id::Node::Track(id))
                     .into_iter()
                     .filter_map(|(_, r)| match r.target {
-                        tangent_ui::routing::Target::Channel(n) => Some(n),
+                        tangent_ui::routing::Target::Node(n) => self.app.row_of(n.track()?),
                         _ => None,
                     })
                     .collect()
@@ -26136,8 +26156,7 @@ mod tests {
         let scratch = root.join("Untitled");
         app.adopt_template(&template, &scratch);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
-            strip: 0,
-            slot: 0,
+            bay: crate::engine_bridge::seat_bay_at(app.track_ids(), 0, 0).expect("strip 0's first bay"),
             path: library.join("New.wav").to_string_lossy().into_owned(),
         });
         let (_, _, stored) = app.take_sampler_load().expect("the load was not queued");

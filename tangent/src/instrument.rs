@@ -21321,8 +21321,8 @@ impl Engine {
     /// tables and an index to flip between them, which is a different
     /// change from reordering two stores.
     #[cfg(test)]
-    pub fn set_routes(&self, routes: &tangent_ui::routing::Routes) {
-        use tangent_ui::routing::Target;
+    pub fn set_routes(&self, routes: &tangent_ui::routing::LaneRoutes) {
+        use tangent_ui::routing::LaneTarget as Target;
         let n = routes.0.len().min(MAX_ROUTES);
         self.shared.route_count.store(0, Ordering::Release);
         for (i, r) in routes.0.iter().take(n).enumerate() {
@@ -29591,12 +29591,12 @@ mod tests {
         }
         e.set_insert_keys(keys);
         if !dumps.is_empty() {
-            e.set_routes(&tangent_ui::routing::Routes(
+            e.set_routes(&tangent_ui::routing::LaneRoutes(
                 dumps
                     .iter()
-                    .map(|&(from, into)| tangent_ui::routing::Route {
+                    .map(|&(from, into)| tangent_ui::routing::LaneRoute {
                         from,
-                        target: tangent_ui::routing::Target::Channel(into),
+                        target: tangent_ui::routing::LaneTarget::Channel(into),
                         gain: 1.0,
                     })
                     .collect(),

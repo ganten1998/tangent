@@ -361,13 +361,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         icons: s.channel_icons.to_vec(),
         names: s.strip_names.clone(),
         colors: s.strip_colors.to_vec(),
-        inserts: s
-            .strip_inserts
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !p.is_empty())
-            .map(|(n, p)| (n, p.clone()))
-            .collect(),
+        plugins: s.plugins.clone(),
         sends: s.strip_sends.to_vec(),
         muted: s.strip_muted,
         soloed: s.strip_soloed,
@@ -393,7 +387,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         to_theory: Some(s.strip_to_theory.clone()),
         routes: Some(s.routes.clone()),
         insert_keys: Some(s.insert_keys.clone()),
-        bypass: Some(s.insert_bypass.clone()),
+        bypass: Some(s.bypass.clone()),
         instruments: Some(crate::arrangement::Instruments {
             dx7_cartridge: s.strip_dx7_cartridge.clone(),
             dx7_patch: s.strip_dx7_patch.clone(),
@@ -748,7 +742,7 @@ fn the_fixtures_round_trip_and_have_the_promised_shape() {
         assert!(!arr.automation.is_empty() && !arr.markers.is_empty());
         let desk = arr.desk.as_ref().expect("a desk");
         assert_eq!(desk.bay(0), Some(crate::dialogs::DRUMPAD_PATH), "the shipped desk");
-        assert!(desk.inserts.iter().all(|(_, p)| !p.is_empty()), "an empty seat was kept");
+        assert!(desk.plugins.values().all(|p| !p.is_empty()), "an empty seat was kept");
         let text = arr.to_json();
         let back = Arrangement::from_json(&text).to_json();
         if back != text {
@@ -1093,9 +1087,7 @@ fn perf_doc_bytes() {
         arr.add_clip(part);
         let mut s = Settings::default();
         for (bay, path) in bays {
-            if let Some(slot) = s.strip_inserts.get_mut(*bay) {
-                *slot = (*path).to_owned();
-            }
+            s.set_legacy_insert(*bay, path);
         }
         s.strip_names = vec!["drums".into(), "keys".into(), "gtr".into()];
         arr.desk = Some(desk_of(&s));

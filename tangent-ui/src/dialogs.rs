@@ -555,12 +555,15 @@ pub enum Dialog {
         /// silence, and the owner asked for used channels only.
         channels: Vec<(usize, String)>,
         /// What this channel already routes to: the desk-table index, the
-        /// destination's label, and the route's LEVEL. Greys the duplicates
-        /// in the picker AND gives every existing route a row with a level
-        /// and a way OFF - the first pass forgot the way off, and the second
-        /// forgot the level, which left a route that could only ever be made
-        /// at full and never turned down from the view the owner was in.
-        existing: Vec<(usize, String, f32)>,
+        /// destination (a jack, or the row it stands on while this modal
+        /// window is open), its label, and the route's LEVEL. Greys the
+        /// duplicates in the picker by DESTINATION, never by label (two
+        /// tracks may share a name), AND gives every existing route a row
+        /// with a level and a way OFF - the first pass forgot the way off,
+        /// and the second forgot the level, which left a route that could
+        /// only ever be made at full and never turned down from the view the
+        /// owner was in.
+        existing: Vec<(usize, crate::routing::LaneTarget, String, f32)>,
         /// **What has been typed to narrow the channel list.** See
         /// [`picker_rows`]: a list that grows with the desk is found by
         /// typing a name, not by scrolling past every channel. Appended.
@@ -756,20 +759,20 @@ pub enum Dialog {
         had_camera: bool,
     },
     /// A suite unit's face: the kit-drawn panel over one insert bay,
-    /// refreshed by the app each frame with pushed data. `strip`/`slot`
-    /// are DESK terms.
+    /// refreshed by the app each frame with pushed data. The bay by its
+    /// identity, so the face stays on its plugin through any edit of the
+    /// desk under it.
     InsertFace {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         live: Box<crate::faces::FaceLive>,
     },
     /// Pick which channel keys one insert bay's sidechain — the routing
     /// window's sibling, one step instead of two because there is only one
-    /// kind of source. `strip`/`slot` are DESK terms (`Strip::index` and
-    /// the strip's visible slot), like `InsertFace`'s.
+    /// kind of source. The keyed bay by its identity, like `InsertFace`'s;
+    /// the sources by the rows they stand on, which hold still while this
+    /// modal window is open.
     InsertKeySource {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         /// What the bay listens to now, so the picker can grey it and the
         /// "No sidechain" row can say whether it is already the state.
         current: Option<usize>,
@@ -998,7 +1001,7 @@ pub struct IrWizardState {
     /// it, which is where somebody who has just made an impulse wants to be.
     /// Closing the window and finding the bay again is a long way round at
     /// the exact moment enthusiasm is highest.
-    pub origin: Option<(usize, usize)>,
+    pub origin: Option<crate::desk_id::SeatBay>,
     /// **This capture has been written to disk**, so the way back knows
     /// there is a file to load.
     ///
@@ -1332,7 +1335,7 @@ impl IrWizardState {
     /// none: a wizard that kept re-reading would pick up the trail a LATER
     /// panel left, which is a Setup-opened wizard offering to walk back into
     /// somebody else's bay.
-    pub fn adopt_origin(&mut self, from: Option<(usize, usize)>) {
+    pub fn adopt_origin(&mut self, from: Option<crate::desk_id::SeatBay>) {
         if self.origin.is_none() {
             self.origin = from;
         }
@@ -1345,7 +1348,7 @@ impl IrWizardState {
     /// Cancel, which stops the tone and the capture on the way out. A
     /// second door out of a page that has one is two things to read where
     /// there was one.
-    pub fn way_back(&self) -> Option<(usize, usize)> {
+    pub fn way_back(&self) -> Option<crate::desk_id::SeatBay> {
         (self.stage == IrStage::Result).then_some(self.origin).flatten()
     }
 
@@ -1476,11 +1479,10 @@ impl IrWizardState {
     /// to the last file on the shelf — the wrong-file class of fault
     /// [`Self::armed`] was written to make impossible, one door along.
     pub fn back_to_panel(&self) -> Option<(Dialog, Option<DialogAction>)> {
-        let (strip, slot) = self.way_back()?;
-        let home = IrFaceReturn { strip, slot, dir: String::new() };
+        let bay = self.way_back()?;
+        let home = IrFaceReturn { bay, dir: String::new() };
         let ask = self.saved.then(|| DialogAction::SetInsertIr {
-            strip,
-            slot,
+            bay,
             path: IR_LAST_SAVED.to_owned(),
         });
         Some((home.face(self.saved), ask))
@@ -1744,7 +1746,9 @@ pub enum DialogAction {
     /// Make the route. The app owns the no-duplicates rule.
     AddRoute {
         from: usize,
-        target: crate::routing::Target,
+        /// A jack, or a channel by the row it stands on: the window is
+        /// modal, and the app turns the row into its track as it lands.
+        target: crate::routing::LaneTarget,
     },
     /// Take a route off, by its index in the desk's table.
     RemoveRoute(usize),
@@ -1978,28 +1982,26 @@ pub enum DialogAction {
     /// Start a new project and leave the unsaved one where it is.
     NewProjectKeeping,
     // ── the suite faces ─────────────────────────────────────────────────
-    /// One knob on a built-in insert, in DESK terms — the app converts to
-    /// the seat once, on its side of the wall.
-    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// One knob on a built-in insert, its bay by identity — the app names
+    /// it to the host once, on its side of the wall.
+    SetInsertParam { bay: crate::desk_id::SeatBay, id: u32, value: f32 },
     /// A face's reading was typed into: the words, for the host to read
     /// on the unit's own scale. See `faces::FaceAction::Type`.
-    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
+    TypeInsertParam { bay: crate::desk_id::SeatBay, id: u32, text: String },
     /// Save the face's current values under a name; the app reads its own
     /// mirror for the values, so the action stays a wish, not a payload.
-    FaceSavePreset { strip: usize, slot: usize, name: String },
+    FaceSavePreset { bay: crate::desk_id::SeatBay, name: String },
     /// Load a preset file into whatever the open face controls.
     FaceLoadPreset { unit: String, path: String },
     /// Point one bay's sidechain key at a channel, or take it off with
-    /// `None`. DESK terms like the dialog that fires it; the desktop's
-    /// per-frame publish owns the `seat_bay` translation, so the edge
-    /// survives every seat renumbering the desk migrations perform.
-    SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
+    /// `None`: the bay by identity, the source by the row the modal picker
+    /// listed it on, which the app turns into its track as it lands.
+    SetInsertKeySource { bay: crate::desk_id::SeatBay, from: Option<usize> },
     /// The amp face's pedal chip: open the insert picker over pedal
-    /// `pedal` of the channel whose bay the face sits on. `strip`/`slot`
-    /// are the face's own DESK terms; the app resolves the channel through
-    /// `seat_bay` and the pedal through `amp_pedal_seat`, on its side of
-    /// the wall. Appended at the END, per this enum's law.
-    OpenPedalPicker { strip: usize, slot: usize, pedal: usize },
+    /// `pedal` of the board the face's bay wears. `bay` is the face's own;
+    /// the app resolves whose board it is on its side of the wall.
+    /// Appended at the END, per this enum's law.
+    OpenPedalPicker { bay: crate::desk_id::SeatBay, pedal: usize },
     // ── the IR wizard ───────────────────────────────────────────────────
     // Appended at the enum's END, the append-only law. The wizard's five:
     // a door in Setup, and the four asks the app maps onto requests.
@@ -2034,7 +2036,7 @@ pub enum DialogAction {
     /// converts and asks the host to rebind the bay.
     ///
     /// **[`IR_BROWSE`] in `path` means "ask me instead".** See there.
-    SetInsertIr { strip: usize, slot: usize, path: String },
+    SetInsertIr { bay: crate::desk_id::SeatBay, path: String },
     /// **Switch one bay out of circuit, or back in.** Appended at the END,
     /// this enum's law.
     ///
@@ -2042,7 +2044,7 @@ pub enum DialogAction {
     /// already toggles — so this carries the WANTED value rather than a
     /// "toggle", because a face and a menu that both toggled could disagree
     /// about the current state and cancel each other out.
-    SetInsertBypass { strip: usize, slot: usize, on: bool },
+    SetInsertBypass { bay: crate::desk_id::SeatBay, on: bool },
     /// **Open the audio on THIS output**, by name, or `None` for the
     /// system's own default.
     ///
@@ -2079,18 +2081,16 @@ pub enum DialogAction {
     /// at the END, this enum's law — `OpenPedalPicker` above is left exactly
     /// as it was rather than widened, for the same reason.
     ///
-    /// `strip`/`slot` are the amp face's own DESK terms and `pedal` is the
-    /// ordinal; the app resolves the owning channel through `seat_bay` and
-    /// `pedal_owner`, and the seat through `amp_pedal_seat`, on its side of
-    /// the wall. `alt` and `shift` are read from the FACE's own input, not
+    /// `bay` is the amp face's own and `pedal` is the ordinal; the app
+    /// resolves the owning track and the pedal's bay on its side of the
+    /// wall. `alt` and `shift` are read from the FACE's own input, not
     /// from the desk's latched pair: on the desktop a face is a separate OS
     /// window with a keyboard of its own, so a chip that asked the main
     /// window what was held would be answering about a keyboard nobody was
     /// typing on. That is the whole reason they travel in the action rather
     /// than being read where it lands.
     OpenPedalFace {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         pedal: usize,
         alt: bool,
         shift: bool,
@@ -2100,8 +2100,7 @@ pub enum DialogAction {
     /// that needs it — an EQ handle carries a frequency and a gain, and this
     /// road used to make it choose one per frame.
     SetInsertParamPair {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         id_a: u32,
         value_a: f32,
         id_b: u32,
@@ -2110,7 +2109,7 @@ pub enum DialogAction {
     /// **A run of a bay's numbers in one frame.** Appended at the END, this
     /// enum's law. See [`crate::faces::FaceAction::SetMany`] — the EQ's
     /// double-click reset puts a whole band back and that is five of them.
-    SetInsertParamsMany { strip: usize, slot: usize, sets: Vec<(u32, f32)> },
+    SetInsertParamsMany { bay: crate::desk_id::SeatBay, sets: Vec<(u32, f32)> },
     // ── the DX7 bank builder ────────────────────────────────────────────
     // Appended at the END, this enum's law. Six asks from the picker's
     // right pane; the app maps each onto a `RecorderRequest` of the same
@@ -2155,8 +2154,7 @@ pub enum DialogAction {
     /// raises the load on the sampler's own road. A path and nothing else:
     /// the face found where the file is, and never moves a byte of it.
     PickSample {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         path: String,
     },
     /// **Remember this folder as where the media explorers open.**
@@ -4759,11 +4757,11 @@ const DIALOG_ID: &str = "ivory-dialog";
 /// very same match over a second slot, and the only thing it changes is
 /// which surface the window is drawn on. That is the whole architectural
 /// cost of the stack, and it is one string, because everything else a pedal
-/// needs already resolves — `recorder::seat_bay` is the IDENTITY on a pedal
-/// seat, so `Dialog::InsertFace { strip: amp_pedal_seat(ch, p), slot: 0 }`,
-/// `SetInsertParam`, `FaceSavePreset`, `SetInsertIr` and `OpenInsertEditor`
-/// all already mean the right rack. Nobody needs to invent a second
-/// addressing road; there is only a second WINDOW.
+/// needs already resolves — a pedal is a bay by identity like any other, so
+/// `Dialog::InsertFace` on it, `SetInsertParam`, `FaceSavePreset`,
+/// `SetInsertIr` and `OpenInsertEditor` all already mean the right rack.
+/// Nobody needs to invent a second addressing road; there is only a second
+/// WINDOW.
 ///
 /// **Why an id of its own rather than the `becomes` handoff.** `becomes`
 /// (see [`show`]) swaps one window for another in one slot, which is the
@@ -4955,8 +4953,7 @@ const IR_FACE_ID: &str = "dialog-ir-face";
 /// its browser was standing in.
 #[derive(Clone)]
 struct IrFaceReturn {
-    strip: usize,
-    slot: usize,
+    bay: crate::desk_id::SeatBay,
     dir: String,
 }
 
@@ -4983,8 +4980,7 @@ impl IrFaceReturn {
         };
         live.face.path = "@tangent-ir".to_owned();
         Dialog::InsertFace {
-            strip: self.strip,
-            slot: self.slot,
+            bay: self.bay,
             live: Box::new(live),
         }
     }
@@ -4999,11 +4995,11 @@ impl IrFaceReturn {
 /// thing they put there takes this on its own first frame. A wizard opened
 /// from Setup's menu finds nothing here, which is exactly right: there is no
 /// panel behind it to go back to.
-fn remember_ir_face(ctx: &egui::Context, strip: usize, slot: usize, dir: &str) {
+fn remember_ir_face(ctx: &egui::Context, bay: crate::desk_id::SeatBay, dir: &str) {
     ctx.memory_mut(|m| {
         m.data.insert_temp(
             egui::Id::new(IR_FACE_ID),
-            IrFaceReturn { strip, slot, dir: dir.to_owned() },
+            IrFaceReturn { bay, dir: dir.to_owned() },
         );
     });
 }
@@ -7239,7 +7235,7 @@ fn draw_ir_result(
 /// moment somebody is looking at a file browser rather than at their mix. So
 /// the sound is left alone and the consequence is printed in the `kept` line,
 /// which is what that line is for: what survives, and how far.
-fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dialog {
+fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> Dialog {
     let name = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -7274,8 +7270,7 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
         choices: vec![ConfirmChoice::new(
             "Delete",
             DialogAction::SetInsertIr {
-                strip,
-                slot,
+                bay,
                 path: ir_delete_ask(path),
             },
             true,
@@ -7443,7 +7438,7 @@ pub fn picker_rows(channels: &[(usize, String)], filter: &str) -> Vec<(usize, St
     channels
         .iter()
         .filter_map(|(idx, name)| {
-            let number = crate::routing::Target::Channel(*idx).label();
+            let number = format!("Ch {}", idx + 1);
             let shown = if name.trim().is_empty() {
                 number
             } else {
@@ -7763,12 +7758,11 @@ fn show_on(
             )
         }
 
-        Dialog::InsertFace { strip, slot, live } => {
+        Dialog::InsertFace { bay, live } => {
             let p = crate::recorder_panel::surface_of(face);
             let (lcd, lcd_glass) = live_lcd(ctx);
             let st = crate::face::FaceStyle::new(face, lcd, lcd_glass);
-            let strip = *strip;
-            let slot = *slot;
+            let bay = *bay;
             let unit = live.face.path.clone();
             // **The clipboard is pushed, like everything else the face
             // reads.** It lives in this file (see `ir_clip`) rather than on
@@ -7823,23 +7817,20 @@ fn show_on(
                                 action = match act {
                                     crate::faces::FaceAction::SetBypass { on } => {
                                         Some(DialogAction::SetInsertBypass {
-                                            strip,
-                                            slot,
+                                            bay,
                                             on,
                                         })
                                     }
                                     crate::faces::FaceAction::Set { id, value } => {
                                         Some(DialogAction::SetInsertParam {
-                                            strip,
-                                            slot,
+                                            bay,
                                             id,
                                             value,
                                         })
                                     }
                                     crate::faces::FaceAction::Type { id, text } => {
                                         Some(DialogAction::TypeInsertParam {
-                                            strip,
-                                            slot,
+                                            bay,
                                             id,
                                             text,
                                         })
@@ -7850,8 +7841,7 @@ fn show_on(
                                         id_b,
                                         value_b,
                                     } => Some(DialogAction::SetInsertParamPair {
-                                        strip,
-                                        slot,
+                                        bay,
                                         id_a,
                                         value_a,
                                         id_b,
@@ -7859,13 +7849,12 @@ fn show_on(
                                     }),
                                     crate::faces::FaceAction::SetMany { sets } => {
                                         Some(DialogAction::SetInsertParamsMany {
-                                            strip,
-                                            slot,
+                                            bay,
                                             sets,
                                         })
                                     }
                                     crate::faces::FaceAction::SavePreset { name } => {
-                                        Some(DialogAction::FaceSavePreset { strip, slot, name })
+                                        Some(DialogAction::FaceSavePreset { bay, name })
                                     }
                                     crate::faces::FaceAction::LoadPreset { path } => {
                                         Some(DialogAction::FaceLoadPreset {
@@ -7874,15 +7863,14 @@ fn show_on(
                                         })
                                     }
                                     crate::faces::FaceAction::OpenPedal { pedal } => {
-                                        Some(DialogAction::OpenPedalPicker { strip, slot, pedal })
+                                        Some(DialogAction::OpenPedalPicker { bay, pedal })
                                     }
                                     crate::faces::FaceAction::PedalGesture {
                                         pedal,
                                         alt,
                                         shift,
                                     } => Some(DialogAction::OpenPedalFace {
-                                        strip,
-                                        slot,
+                                        bay,
                                         pedal,
                                         alt,
                                         shift,
@@ -7895,16 +7883,16 @@ fn show_on(
                                         // finds nothing and offers no return,
                                         // which is right — there is no panel
                                         // behind it.
-                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
+                                        remember_ir_face(ui.ctx(), bay, &standing);
                                         Some(DialogAction::OpenIrWizard)
                                     }
                                     crate::faces::FaceAction::PickIr { path } => {
-                                        Some(DialogAction::SetInsertIr { strip, slot, path })
+                                        Some(DialogAction::SetInsertIr { bay, path })
                                     }
                                     crate::faces::FaceAction::PickSample { path } => {
-                                        Some(DialogAction::PickSample { strip, slot, path })
+                                        Some(DialogAction::PickSample { bay, path })
                                     }
-                                    // No strip, no slot: one default folder
+                                    // No bay: one default folder
                                     // for the app, shared with the drumpad's
                                     // own DEF chip.
                                     crate::faces::FaceAction::SetMediaDefault { path } => {
@@ -7938,8 +7926,7 @@ fn show_on(
                                         // See `IR_BROWSE`.
                                         result.close = true;
                                         Some(DialogAction::SetInsertIr {
-                                            strip,
-                                            slot,
+                                            bay,
                                             path: IR_BROWSE.to_owned(),
                                         })
                                     }
@@ -7964,8 +7951,7 @@ fn show_on(
                                         let file = ir_clip(ui.ctx());
                                         (!file.is_empty()).then(|| {
                                             DialogAction::SetInsertIr {
-                                                strip,
-                                                slot,
+                                                bay,
                                                 path: ir_paste_ask(&file, &into),
                                             }
                                         })
@@ -7993,10 +7979,8 @@ fn show_on(
                                         // half-lands. A question is its own
                                         // window.
                                         result.close = true;
-                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
-                                        becomes = Some(confirm_ir_delete(
-                                            strip, slot, &path, loaded,
-                                        ));
+                                        remember_ir_face(ui.ctx(), bay, &standing);
+                                        becomes = Some(confirm_ir_delete(bay, &path, loaded));
                                         None
                                     }
                                 };
@@ -12078,7 +12062,7 @@ fn show_on(
                                                 .font(bold(10.0))
                                                 .color(dim),
                                         );
-                                        for (at, label, gain) in existing.iter() {
+                                        for (at, _, label, gain) in existing.iter() {
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(label)
@@ -12217,33 +12201,28 @@ fn show_on(
                                                     // duplicates, and saying
                                                     // so before the click
                                                     // beats refusing after.
+                                                    let dest = crate::routing::LaneTarget::Hardware {
+                                                        first: *first,
+                                                        stereo: *stereo,
+                                                    };
                                                     let free =
-                                                        !existing.iter().any(|(_, l, _)| l == label);
+                                                        !existing.iter().any(|(_, d, _, _)| *d == dest);
                                                     if row(ui, label, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,
-                                                            target: crate::routing::Target::Hardware {
-                                                                first: *first,
-                                                                stereo: *stereo,
-                                                            },
+                                                            target: dest,
                                                         });
                                                     }
                                                 }
                                             } else {
                                                 for (idx, shown) in picker_rows(channels, filter) {
-                                                    let idx = &idx;
-                                                    let label =
-                                                        crate::routing::Target::Channel(*idx)
-                                                            .label();
+                                                    let dest = crate::routing::LaneTarget::Channel(idx);
                                                     let free =
-                                                        !existing.iter().any(|(_, l, _)| *l == label);
+                                                        !existing.iter().any(|(_, d, _, _)| *d == dest);
                                                     if row(ui, &shown, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,
-                                                            target:
-                                                                crate::routing::Target::Channel(
-                                                                    *idx,
-                                                                ),
+                                                            target: dest,
                                                         });
                                                     }
                                                 }
@@ -12272,10 +12251,10 @@ fn show_on(
             )
         }
 
-        Dialog::InsertKeySource { strip, slot, current, channels, filter } => {
+        Dialog::InsertKeySource { bay, current, channels, filter } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
-            let (at, bay, now) = (*strip, *slot, *current);
+            let (bay, now) = (*bay, *current);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -12332,8 +12311,7 @@ fn show_on(
                                     // no-thanks answer.
                                     if row(ui, "No sidechain", now.is_some()) {
                                         action = Some(DialogAction::SetInsertKeySource {
-                                            strip: at,
-                                            slot: bay,
+                                            bay,
                                             from: None,
                                         });
                                     }
@@ -12346,8 +12324,7 @@ fn show_on(
                                         // nothing.
                                         if row(ui, &shown, now != Some(*idx)) {
                                             action = Some(DialogAction::SetInsertKeySource {
-                                                strip: at,
-                                                slot: bay,
+                                                bay,
                                                 from: Some(*idx),
                                             });
                                         }
@@ -12387,7 +12364,7 @@ fn show_on(
             // **And the way back the panel left, taken once.** See
             // `IrWizardState::adopt_origin`: the take is what stops a later
             // Setup-opened wizard from inheriting it.
-            s.adopt_origin(take_ir_face(ctx).map(|o| (o.strip, o.slot)));
+            s.adopt_origin(take_ir_face(ctx).map(|o| o.bay));
             let back_to = s.way_back();
             // The button below only says it was pressed; what that MEANS is
             // `IrWizardState::back_to_panel`, on the state where a test can
@@ -14555,6 +14532,14 @@ fn show_on(
 
 #[cfg(test)]
 mod tests {
+    /// **A test's bay**: displayed slot `slot` on the strip of track `n`.
+    /// These tests used to carry a (strip, slot) pair; the bay those two
+    /// numbers named is what the dialogs carry now, so a test asks for the
+    /// same bay by identity and asserts it came back the same.
+    fn tb(n: u32, slot: usize) -> crate::desk_id::SeatBay {
+        crate::desk_id::slot_key(crate::desk_id::Node::Track(crate::desk_id::TrackId(n)), slot)
+            .expect("a displayed slot")
+    }
 
     /// **A key the in-house bar saw fires ONCE.**
     ///
@@ -18803,8 +18788,7 @@ at: None,
         };
         let face = || {
             Some(Dialog::InsertFace {
-                strip: 0,
-                slot: 0,
+                bay: tb(0, 0),
                 live: Box::default(),
             })
         };
@@ -18970,8 +18954,7 @@ at: None,
         // The face first. Its unit is not in the suite table, so the window
         // it opens is called "Tangent" — and it is sized from the screen.
         let mut face = Some(Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::default(),
         });
         frame(&mut face);
@@ -19042,8 +19025,7 @@ at: None,
         };
 
         let mut dialog = Some(Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::default(),
         });
         frame(&mut dialog, Some(big));
@@ -19501,11 +19483,11 @@ at: None,
 
         // Opened from a panel's wand: the bay comes with it.
         let mut s = IrWizardState::default();
-        s.adopt_origin(Some((4, 1)));
+        s.adopt_origin(Some(tb(4, 1)));
         // Adopted ONCE. A wizard that kept re-reading would pick up the trail
         // a later panel left behind.
-        s.adopt_origin(Some((9, 2)));
-        assert_eq!(s.origin, Some((4, 1)), "the origin was overwritten mid-life");
+        s.adopt_origin(Some(tb(9, 2)));
+        assert_eq!(s.origin, Some(tb(4, 1)), "the origin was overwritten mid-life");
 
         // Not offered before the end: the earlier pages already have the
         // right word for leaving, and it stops the tone on the way out.
@@ -19519,12 +19501,12 @@ at: None,
         // deliberately not saved must not rebind the bay to the last file on
         // the shelf.
         s.stage = IrStage::Result;
-        assert_eq!(s.way_back(), Some((4, 1)));
+        assert_eq!(s.way_back(), Some(tb(4, 1)));
         let (panel, load) = s.back_to_panel().expect("no way back from the result page");
         assert!(load.is_none(), "an unsaved capture bound something anyway");
         match &panel {
-            Dialog::InsertFace { strip, slot, live } => {
-                assert_eq!((*strip, *slot), (4, 1), "it went back to the wrong bay");
+            Dialog::InsertFace { bay, live } => {
+                assert_eq!(*bay, tb(4, 1), "it went back to the wrong bay");
                 assert!(!live.ir_reveal, "nothing was made, so nothing to reveal");
             }
             _ => panic!("the way back is not the panel"),
@@ -19555,8 +19537,8 @@ at: None,
         assert!(s.saved, "a write the host counted was not believed");
         let (panel, load) = s.back_to_panel().expect("no way back after a save");
         match load {
-            Some(DialogAction::SetInsertIr { strip, slot, path }) => {
-                assert_eq!((strip, slot), (4, 1), "the capture went into the wrong bay");
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(4, 1), "the capture went into the wrong bay");
                 // **Not a filename.** `desktop::save_ir` refuses to
                 // overwrite, so a second "Holmes Plate" is written as
                 // "Holmes Plate 2.wav" and only the host knows which name it
@@ -19571,8 +19553,8 @@ at: None,
             ),
         }
         match &panel {
-            Dialog::InsertFace { strip, slot, live } => {
-                assert_eq!((*strip, *slot), (4, 1));
+            Dialog::InsertFace { bay, live } => {
+                assert_eq!(*bay, tb(4, 1));
                 assert_eq!(live.face.path, "@tangent-ir", "it opened as the wrong face");
                 assert!(live.ir_reveal, "the capture would not be scrolled to");
                 // Empty is how the app is asked for its own default folder,
@@ -19633,7 +19615,7 @@ at: None,
         let path = "/m/Tangent Media/IRs/Holmes Plate.wav";
         for loaded in [false, true] {
             let Dialog::Confirm { title, body, kept, choices, warn } =
-                confirm_ir_delete(3, 2, path, loaded)
+                confirm_ir_delete(tb(3, 2), path, loaded)
             else {
                 panic!("deleting an impulse did not raise a confirmation");
             };
@@ -19651,8 +19633,8 @@ at: None,
             // And the button's action is the delete ask, aimed at exactly
             // the file the words name.
             match &choices[0].action {
-                DialogAction::SetInsertIr { strip, slot, path: p } => {
-                    assert_eq!((*strip, *slot), (3, 2));
+                DialogAction::SetInsertIr { bay, path: p } => {
+                    assert_eq!(*bay, tb(3, 2));
                     assert_eq!(ir_ask(p), IrAsk::Delete(path));
                 }
                 _ => panic!("the delete button does not delete"),
@@ -19667,7 +19649,7 @@ at: None,
         // way today and another way tomorrow. The old promise is asserted
         // ABSENT, because a confirmation that says the sound will survive and
         // then stops it is worse than one that says nothing.
-        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, true) else {
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(tb(0, 0), path, true) else {
             unreachable!()
         };
         assert!(kept.contains("emptied"), "{kept:?}");
@@ -19676,7 +19658,7 @@ at: None,
             !kept.contains("does not change"),
             "the box still promises the sound survives the delete: {kept:?}"
         );
-        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, false) else {
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(tb(0, 0), path, false) else {
             unreachable!()
         };
         assert!(!kept.contains("empty"), "an unloaded impulse warned about the bay: {kept:?}");
@@ -19701,14 +19683,14 @@ at: None,
             "a confirmation nobody raised from a panel went somewhere"
         );
 
-        remember_ir_face(&ctx, 5, 3, "/m/Tangent Media/IRs/Cabs");
+        remember_ir_face(&ctx, tb(5, 3), "/m/Tangent Media/IRs/Cabs");
         // A dialog that has not closed goes nowhere, and does not spend the
         // trail on its way past.
         assert!(face_to_return_to(&ctx, false).is_none());
 
         match face_to_return_to(&ctx, true) {
-            Some(Dialog::InsertFace { strip, slot, live }) => {
-                assert_eq!((strip, slot), (5, 3));
+            Some(Dialog::InsertFace { bay, live }) => {
+                assert_eq!(bay, tb(5, 3));
                 assert_eq!(live.face.path, "@tangent-ir");
                 // Back to the folder the right-click happened in, not to the
                 // root: the hand was standing somewhere.
@@ -20621,8 +20603,7 @@ at: None,
             }
         }));
         Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::new(live),
         }
     }
@@ -20659,13 +20640,12 @@ at: None,
             let asked = slot.click("drive");
             match asked {
                 Some(DialogAction::OpenPedalFace {
-                    strip,
-                    slot: bay,
+                    bay,
                     pedal,
                     alt: a,
                     shift: sh,
                 }) => {
-                    assert_eq!((strip, bay, pedal), (0, 0, 2), "the chip named the wrong seat");
+                    assert_eq!((bay, pedal), (tb(0, 0), 2), "the chip named the wrong seat");
                     assert_eq!(
                         (a, sh),
                         (alt, shift),
@@ -20688,8 +20668,7 @@ at: None,
         };
         live.face.path = path.to_owned();
         Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::new(live),
         }
     }
@@ -20744,10 +20723,10 @@ at: None,
                     "{path} switched {was} says nothing about being in circuit"
                 );
                 match slot.click(word) {
-                    Some(DialogAction::SetInsertBypass { strip, slot: bay, on }) => {
+                    Some(DialogAction::SetInsertBypass { bay, on }) => {
                         assert_eq!(
-                            (strip, bay),
-                            (0, 0),
+                            bay,
+                            tb(0, 0),
                             "{path}'s switch named the wrong seat"
                         );
                         assert_eq!(
@@ -20783,7 +20762,7 @@ at: None,
     }
 
     /// An IR panel with one folder of impulses in it, standing at home.
-    fn an_ir_panel(strip: usize, slot: usize, loaded: &str) -> Dialog {
+    fn an_ir_panel(strip: u32, slot: usize, loaded: &str) -> Dialog {
         let mut live = crate::faces::FaceLive {
             ir_dir: "/m/IRs".to_owned(),
             ir_root: "/m/IRs".to_owned(),
@@ -20803,7 +20782,7 @@ at: None,
         };
         live.face.path = "@tangent-ir".to_owned();
         live.face.extra = vec![("ir_path".to_owned(), loaded.to_owned())];
-        Dialog::InsertFace { strip, slot, live: Box::new(live) }
+        Dialog::InsertFace { bay: tb(strip, slot), live: Box::new(live) }
     }
 
 
@@ -21472,8 +21451,7 @@ at: None,
             })
             .collect();
         let mut slot = Slot::new(Dialog::InsertFace {
-            strip: 4,
-            slot: 1,
+            bay: tb(4, 1),
             live: Box::new(crate::faces::FaceLive {
                 face: crate::ports::BuiltinFace {
                     path: "@tangent-tape".to_owned(),
@@ -21485,8 +21463,8 @@ at: None,
         });
         let asked = slot.click("Init").expect("Init raised nothing at all");
         match asked {
-            DialogAction::SetInsertParamsMany { strip, slot: bay, sets } => {
-                assert_eq!((strip, bay), (4, 1), "Init addressed the wrong bay");
+            DialogAction::SetInsertParamsMany { bay, sets } => {
+                assert_eq!(bay, tb(4, 1), "Init addressed the wrong bay");
                 assert_eq!(
                     sets.len(),
                     params.len(),
@@ -21650,12 +21628,12 @@ at: None,
         //
         // The trail is left by the face; here it is left directly, because
         // what is under test is what the CONFIRMATION does with it.
-        let mut slot = Slot::new(confirm_ir_delete(4, 1, "/m/IRs/Holmes Plate.wav", false));
-        remember_ir_face(&slot.ctx, 4, 1, "/m/IRs/Cabs");
+        let mut slot = Slot::new(confirm_ir_delete(tb(4, 1), "/m/IRs/Holmes Plate.wav", false));
+        remember_ir_face(&slot.ctx, tb(4, 1), "/m/IRs/Cabs");
         let asked = slot.click("Delete");
         match asked {
-            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
-                assert_eq!((strip, bay), (4, 1));
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(4, 1));
                 assert_eq!(
                     ir_ask(&path),
                     IrAsk::Delete("/m/IRs/Holmes Plate.wav"),
@@ -21665,8 +21643,8 @@ at: None,
             other => panic!("Delete asked for {:?}", other.is_some()),
         }
         match &slot.dialog {
-            Some(Dialog::InsertFace { strip, slot: bay, live }) => {
-                assert_eq!((*strip, *bay), (4, 1), "it went back to the wrong bay");
+            Some(Dialog::InsertFace { bay, live }) => {
+                assert_eq!(*bay, tb(4, 1), "it went back to the wrong bay");
                 assert_eq!(
                     live.ir_dir, "/m/IRs/Cabs",
                     "it went back to a different folder than the right-click happened in"
@@ -21678,18 +21656,18 @@ at: None,
         // Cancel goes back too, which is the half somebody actually needs:
         // they said "no, not that one" and must not lose the browser they
         // said it in.
-        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", true));
-        remember_ir_face(&slot.ctx, 2, 0, "/m/IRs");
+        let mut slot = Slot::new(confirm_ir_delete(tb(2, 0), "/m/IRs/Plate.wav", true));
+        remember_ir_face(&slot.ctx, tb(2, 0), "/m/IRs");
         assert!(slot.click("Cancel").is_none(), "Cancel asked for something");
         assert!(
-            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 2, slot: 0, .. })),
+            matches!(&slot.dialog, Some(Dialog::InsertFace { bay, .. }) if *bay == tb(2, 0)),
             "Cancel left the desk empty"
         );
 
         // And the trail is a TAKE: a confirmation raised from Setup's menu,
         // with no panel behind it, closes to nothing rather than opening
         // somebody else's bay.
-        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", false));
+        let mut slot = Slot::new(confirm_ir_delete(tb(2, 0), "/m/IRs/Plate.wav", false));
         assert!(slot.click("Cancel").is_none());
         assert!(
             slot.dialog.is_none(),
@@ -21751,7 +21729,7 @@ at: None,
         };
         wiz.name = "Holmes Plate".to_owned();
         let mut slot = Slot::new(Dialog::IrWizard { state: Box::new(wiz) });
-        remember_ir_face(&slot.ctx, 5, 2, "/m/IRs");
+        remember_ir_face(&slot.ctx, tb(5, 2), "/m/IRs");
         // **Save is pressed rather than asserted.** The button only ARMS —
         // see `IrWizardState::save_asked` — so the way back must still refuse
         // until the host's own count moves.
@@ -21779,14 +21757,14 @@ at: None,
         }
         let asked = slot.click("\u{2190} Presets & browser");
         match asked {
-            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
-                assert_eq!((strip, bay), (5, 2));
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(5, 2));
                 assert_eq!(ir_ask(&path), IrAsk::LastSaved);
             }
             other => panic!("the way back asked for {:?}", other.is_some()),
         }
         assert!(
-            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 5, slot: 2, .. })),
+            matches!(&slot.dialog, Some(Dialog::InsertFace { bay, .. }) if *bay == tb(5, 2)),
             "the way back did not put the panel in the slot"
         );
 
@@ -21856,7 +21834,7 @@ at: None,
                         |c| c.to_color32(),
                     );
                 let mut dialog =
-                    Some(confirm_ir_delete(3, 1, "/m/Tangent Media/IRs/Holmes Plate.wav", true));
+                    Some(confirm_ir_delete(tb(3, 1), "/m/Tangent Media/IRs/Holmes Plate.wav", true));
                 let (fills, texts) = painted_dialog(&mut dialog, face);
 
                 // The word, and the smallest thing painted under it — which
@@ -22133,8 +22111,7 @@ at: None,
             (
                 "InsertFace",
                 Dialog::InsertFace {
-                    strip: 0,
-                    slot: 0,
+                    bay: tb(0, 0),
                     live: Box::default(),
                 },
             ),
@@ -22164,8 +22141,7 @@ at: None,
             (
                 "InsertKeySource",
                 Dialog::InsertKeySource {
-                    strip: 0,
-                    slot: 0,
+                    bay: tb(0, 0),
                     current: None,
                     channels: Vec::new(),
                     filter: String::new(),

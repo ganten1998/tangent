@@ -60,7 +60,7 @@ use crate::desk_legacy::{
 use crate::desk_lift::DeskEra;
 use crate::dialogs::{KEYS_PARAMS, KEYS_PATCHES};
 use crate::recorder::MidiInputSel;
-use crate::routing::{KeyEdge, Route, Target};
+use crate::routing::{LaneKey, LaneRoute, LaneTarget};
 
 /// One row's Keys knobs: every patch's eight, `KEYS_PATCHES * KEYS_PARAMS`,
 /// laid out as one channel's slice of `Settings::strip_keys_params`.
@@ -1132,8 +1132,8 @@ impl DeskModel {
         let mut routes = Vec::new();
         for r in &v.routes {
             let to = match r.target {
-                Target::Channel(n) => lane(n).map(RouteTo::Node),
-                Target::Hardware { first, stereo } => Some(RouteTo::Hardware { first, stereo }),
+                LaneTarget::Channel(n) => lane(n).map(RouteTo::Node),
+                LaneTarget::Hardware { first, stereo } => Some(RouteTo::Hardware { first, stereo }),
             };
             match (lane(r.from), to) {
                 (Some(from), Some(to)) => routes.push(RouteEdge { from, to, gain: r.gain }),
@@ -1307,17 +1307,17 @@ impl DeskModel {
         };
         for e in &self.routes {
             let target = match e.to {
-                RouteTo::Node(n) => lane(n).map(Target::Channel),
-                RouteTo::Hardware { first, stereo } => Some(Target::Hardware { first, stereo }),
+                RouteTo::Node(n) => lane(n).map(LaneTarget::Channel),
+                RouteTo::Hardware { first, stereo } => Some(LaneTarget::Hardware { first, stereo }),
             };
             if let (Some(from), Some(target)) = (lane(e.from), target) {
-                v.routes.push(Route { from, target, gain: e.gain });
+                v.routes.push(LaneRoute { from, target, gain: e.gain });
             }
         }
         for k in &self.keys {
             let strip = unbind(k.seat.seat.node, &ids).and_then(encode_v32_strip);
             if let (Some(strip), Some(slot), Some(from)) = (strip, display_slot(k.seat), lane(k.from)) {
-                v.keys.push(KeyEdge { strip, slot, from });
+                v.keys.push(LaneKey { strip, slot, from });
             }
         }
         Some((v, ids))
@@ -1432,8 +1432,8 @@ pub struct V22Desk {
     pub phase: u64,
     pub inserts: BTreeMap<usize, String>,
     pub bypass: BTreeSet<(usize, usize)>,
-    pub routes: Vec<Route>,
-    pub keys: Vec<KeyEdge>,
+    pub routes: Vec<LaneRoute>,
+    pub keys: Vec<LaneKey>,
 }
 
 impl V22Desk {
@@ -1479,9 +1479,10 @@ impl V22Desk {
     /// the shipped rule, as `app::default_armed` does.
     pub fn from_settings(s: &crate::settings::Settings) -> Self {
         let mut v = V22Desk::vacant();
+        let ids = s.desk_ids();
         let armed = s.channel_armed.unwrap_or_else(|| {
             crate::arrangement::armed_by_default(&s.channel_kinds, |n| {
-                s.strip_inserts.get(n * BAYS).map_or("", String::as_str) == crate::dialogs::BUILTIN_PATH
+                s.row_plugin(n, 0) == Some(crate::dialogs::BUILTIN_PATH)
             })
         });
         fill(&mut v.kinds, &s.channel_kinds);
@@ -1507,16 +1508,9 @@ impl V22Desk {
         v.muted = s.strip_muted;
         v.soloed = s.strip_soloed;
         v.phase = s.strip_phase;
-        v.inserts = s
-            .strip_inserts
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| !p.is_empty())
-            .map(|(b, p)| (b, p.clone()))
-            .collect();
-        v.bypass = s.insert_bypass.0.iter().copied().collect();
-        v.routes = s.routes.0.clone();
-        v.keys = s.insert_keys.0.clone();
+        (v.inserts, v.bypass) = dense_bays(&s.plugins, &s.bypass, &ids);
+        v.routes = s.routes.to_lanes(&ids).0;
+        v.keys = s.insert_keys.to_lanes(&ids).0;
         v
     }
 
@@ -1544,7 +1538,8 @@ impl V22Desk {
         v.soloed = d.soloed;
         v.tracks_added = d.tracks_added;
         v.armed = d.armed;
-        v.inserts = d.inserts.iter().filter(|(_, p)| !p.is_empty()).cloned().collect();
+        let ids = d.ids.rows();
+        (v.inserts, _) = dense_bays(&d.plugins, &BTreeSet::new(), &ids);
         if let Some(p) = d.phase {
             v.phase = p;
         }
@@ -1552,13 +1547,13 @@ impl V22Desk {
             fill(&mut v.to_theory, t);
         }
         if let Some(r) = &d.routes {
-            v.routes = r.0.clone();
+            v.routes = r.to_lanes(&ids).0;
         }
         if let Some(k) = &d.insert_keys {
-            v.keys = k.0.clone();
+            v.keys = k.to_lanes(&ids).0;
         }
         if let Some(b) = &d.bypass {
-            v.bypass = b.0.iter().copied().collect();
+            v.bypass = dense_bays(&BTreeMap::new(), b, &ids).1;
         }
         if let Some(i) = &d.instruments {
             fill(&mut v.dx7_cartridge, &i.dx7_cartridge);
@@ -1580,7 +1575,7 @@ impl V22Desk {
     /// The freeze is NOT carried: `frozen_lanes` is the document's, never
     /// the settings file's (see `Settings::frozen_lanes`), so a settings
     /// desk is written with nothing frozen and read without touching it.
-    pub fn into_settings(self, s: &mut crate::settings::Settings) {
+    pub fn into_settings(self, s: &mut crate::settings::Settings, ids: &[TrackId]) {
         let V22Desk {
             kinds,
             icons,
@@ -1632,16 +1627,9 @@ impl V22Desk {
         s.strip_muted = muted;
         s.strip_soloed = soloed;
         s.strip_phase = phase;
-        let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
-        for (bay, path) in inserts {
-            if let Some(slot) = dense.get_mut(bay) {
-                *slot = path;
-            }
-        }
-        s.strip_inserts = dense;
-        s.insert_bypass = crate::settings::BypassBays(bypass.into_iter().collect());
-        s.routes = crate::routing::Routes(routes);
-        s.insert_keys = crate::routing::KeyEdges(keys);
+        (s.plugins, s.bypass) = identity_bays(inserts, bypass, ids);
+        s.routes = crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), ids);
+        s.insert_keys = crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), ids);
     }
 
     /// **This dense desk onto a document snapshot's strip fields**: the
@@ -1683,7 +1671,9 @@ impl V22Desk {
         d.icons = icons;
         d.names = names;
         d.colors = colors;
-        d.inserts = inserts.into_iter().collect();
+        let ids = d.ids.rows().into_owned();
+        let (plugins, bypass) = identity_bays(inserts, bypass, &ids);
+        d.plugins = plugins;
         d.sends = sends;
         d.muted = muted;
         d.soloed = soloed;
@@ -1698,9 +1688,9 @@ impl V22Desk {
         d.armed = armed;
         d.phase = Some(phase);
         d.to_theory = Some(to_theory);
-        d.routes = Some(crate::routing::Routes(routes));
-        d.insert_keys = Some(crate::routing::KeyEdges(keys));
-        d.bypass = Some(crate::settings::BypassBays(bypass.into_iter().collect()));
+        d.routes = Some(crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), &ids));
+        d.insert_keys = Some(crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), &ids));
+        d.bypass = Some(bypass);
         d.instruments = Some(crate::arrangement::Instruments {
             dx7_cartridge,
             dx7_patch,
@@ -1722,6 +1712,44 @@ impl V22Desk {
                 .collect(),
         );
     }
+}
+
+/// **A desk's bays by identity, as the dense shape's flat bays and bypass
+/// seats** under row ids `ids` (`desk_legacy::seat_of`): what the legacy
+/// writers and [`DeskModel::from_v22`] read. A bay whose track no row holds
+/// has no flat bay and is left out; the live desk never holds one (the
+/// writer side of design 6.3, `TangentApp::desk_sentinel`).
+fn dense_bays(
+    plugins: &BTreeMap<SeatBay, String>,
+    bypass: &BTreeSet<SeatBay>,
+    ids: &[TrackId],
+) -> (BTreeMap<usize, String>, BTreeSet<(usize, usize)>) {
+    let inserts = plugins
+        .iter()
+        .filter(|(_, p)| !p.is_empty())
+        .filter_map(|(sb, p)| Some((crate::desk_legacy::flat_of(ids, *sb)?, p.clone())))
+        .collect();
+    let bypass = bypass.iter().filter_map(|sb| crate::desk_legacy::seat_of(ids, *sb)).collect();
+    (inserts, bypass)
+}
+
+/// [`dense_bays`]'s inverse: flat bays and bypass seats back to bays by
+/// identity under `ids` (`desk_legacy::bay_at`).
+fn identity_bays(
+    inserts: BTreeMap<usize, String>,
+    bypass: BTreeSet<(usize, usize)>,
+    ids: &[TrackId],
+) -> (BTreeMap<SeatBay, String>, BTreeSet<SeatBay>) {
+    let plugins = inserts
+        .into_iter()
+        .filter(|(_, p)| !p.is_empty())
+        .filter_map(|(flat, p)| Some((crate::desk_legacy::bay_of_flat(ids, flat)?, p)))
+        .collect();
+    let bypass = bypass
+        .into_iter()
+        .filter_map(|(seat, bay)| crate::desk_legacy::bay_at(ids, seat, bay))
+        .collect();
+    (plugins, bypass)
 }
 
 /// Overwrite the front of a dense array with what a source says, leaving
@@ -1885,6 +1913,7 @@ pub(crate) fn picture(m: &DeskModel) -> String {
 mod tests {
     use super::*;
     use crate::desk_id::{Rack, MAX_CHAIN};
+    use crate::routing::{LaneKey as KeyEdge, LaneRoute as Route, LaneTarget as Target};
     use crate::desk_legacy::identity_ids;
 
     fn t(n: u32) -> TrackId {

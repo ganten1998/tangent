@@ -35,10 +35,7 @@ use std::time::{Duration, Instant};
 use tangent_record::audio::Timebase;
 use tangent_ui::app::TangentApp;
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
-use tangent_ui::desk_legacy::{
-    bind, decode_v32_seat, decode_v32_strip, encode_v32_seat, encode_v32_strip, unbind, LegacyOwner,
-    V32_TOTAL_SEATS,
-};
+use tangent_ui::desk_legacy::{bind, decode_v32_strip, encode_v32_strip, LegacyOwner};
 use tangent_ui::recorder::{ChannelKind, Desk, MidiRoute};
 use tangent_ui::routing::Target;
 
@@ -360,18 +357,14 @@ pub fn full_build_with(
     Ok(Built { engine: e, bridge })
 }
 
-/// **The stems an export writes, and what each file is called**, by ROW:
-/// only the rows with something to SAY - clips, or an instrument in a bay
-/// (the DX7, the drumpad, an SD3 following the transport). A kind with
-/// neither is an armed input that renders silence offline, and a folder of
-/// silent WAVs reads as a bug. `NN-<track name>.wav`, the name made safe for
-/// a file system. The caller binds each row to its lane through the bridge
-/// at the press (design 7.13: stems bind `(slot, gen)` at the press).
 pub fn stem_files(app: &TangentApp) -> Vec<(usize, String)> {
     let clips = &app.arrangement().clips;
     (0..app.track_ids().len())
         .filter(|&row| {
-            clips.iter().any(|c| c.lane == row) || (0..tangent_ui::desk_id::BAYS).any(|b| app.insert(row, b).is_some())
+            clips.iter().any(|c| c.lane == row)
+                || app.track_ids().get(row).is_some_and(|id| {
+                    (0..tangent_ui::desk_id::BAYS).any(|b| track_bay(app, *id, Rack::Chain(0), b as u8).is_some())
+                })
         })
         .map(|row| {
             let name: String = app
@@ -401,37 +394,68 @@ pub fn dx7_voice(app: &TangentApp, strip: usize) -> crate::dx7::Voice {
     cart.voices.get(patch).or_else(|| cart.voices.first()).copied().unwrap_or_default()
 }
 
-/// **Every bay the desk seats, by identity**: the app's flat table (still
-/// the frozen V32 seat map in this wave) read through `decode_v32` and the
-/// row ids, the one road from a position to a bay's identity (design 8:
-/// "decoded from flat seats"). A bay whose row has no id is no bay.
+/// **Every bay the desk seats, by identity**: the app's own map (C11's
+/// `plugins`), read directly. A track's bays are wherever the track is, so
+/// a reorder changes nothing here; a bay whose track no row holds is not in
+/// the map at all (a removal takes its track's bays with it).
 pub fn desk_bays(app: &TangentApp) -> BTreeMap<SeatBay, String> {
-    let ids = app.track_ids();
-    let mut out = BTreeMap::new();
-    for seat in 0..V32_TOTAL_SEATS {
-        for bay in 0..tangent_ui::desk_id::BAYS {
-            let Some(path) = app.insert(seat, bay) else { continue };
-            if let Some(sb) = seat_bay_at(ids, seat, bay) {
-                out.insert(sb, path.to_owned());
-            }
-        }
-    }
-    out
+    app.plugins().iter().filter(|(_, p)| !p.is_empty()).map(|(sb, p)| (*sb, p.clone())).collect()
 }
 
-/// **The bay at the app's `(seat, bay)`, by identity**, under row ids `ids`.
+/// **The bay at the host's `(seat, bay)`, by identity**, under row ids
+/// `ids`: the frozen map's crossing (`desk_legacy::bay_at`), for the host's
+/// roads that still hold a seat.
 pub fn seat_bay_at(ids: &[TrackId], seat: usize, bay: usize) -> Option<SeatBay> {
-    let (owner, rack) = decode_v32_seat(seat)?;
-    let node = bind(owner, ids)?;
-    let sb = SeatBay::new(node, rack, u8::try_from(bay).ok()?);
-    sb.is_valid().then_some(sb)
+    tangent_ui::desk_legacy::bay_at(ids, seat, bay)
 }
 
-/// **Where the app keeps a bay**, `(seat, bay)` in its flat table, under row
-/// ids `ids`: [`seat_bay_at`]'s inverse. `None` for a track no row holds.
+/// **Where the frozen map keeps a bay**, `(seat, bay)`, under row ids
+/// `ids`: [`seat_bay_at`]'s inverse. `None` for a track no row holds.
 pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
-    let owner = unbind(sb.seat.node, ids)?;
-    Some((encode_v32_seat(owner, sb.seat.rack)?, usize::from(sb.bay)))
+    tangent_ui::desk_legacy::seat_of(ids, sb)
+}
+
+/// **Carry a gesture's bay relabels on the host** (C11's
+/// `take_bay_relabels`): each plugin that moved from one bay to another (a
+/// drum pad swap, its undo, its redo) takes its settings with it.
+///
+/// The app has already moved the NAMES: what stood at `from` is wanted at
+/// `to`. The engine still holds the old instances, and the reconcile that
+/// follows rebuilds each moved bay from its own state file, so what this
+/// owes is that every destination's file is the moved plugin's own state
+/// before that rebuild reads it. **Read every source first, then write
+/// every destination**, because a swap's two files are each the other's
+/// source. A source is the instance PLAYING in the engine when it is that
+/// plugin (a unit somebody has been turning has not written its file since
+/// it loaded), else its file on `shelf` (owner-checked).
+///
+/// Answers each destination written and the bundle written there: the
+/// caller lets go of any displaced copy for it (`incoming_state` must not
+/// prefer an older one) and marks the bay to rebuild even when its NAME did
+/// not change (two pads holding the same unit trade settings, not names).
+pub fn carry_relabels(
+    app: &TangentApp,
+    bridge: &Bridge,
+    engine: Option<&Engine>,
+    relabels: &[tangent_ui::desk_id::BayRelabel],
+    shelf: &std::path::Path,
+) -> Vec<(SeatBay, String)> {
+    let moving: Vec<(SeatBay, String, Vec<u8>)> = relabels
+        .iter()
+        .filter_map(|r| {
+            let bundle = app.plugin(r.to)?.to_owned();
+            let live = engine.zip(bridge.engine_bay(r.from)).and_then(|(e, at)| {
+                let playing = e.insert_at(at.0, at.1).and_then(|l| l.bundle.to_str()) == Some(bundle.as_str());
+                playing.then(|| e.save_insert_state_at(at.0, at.1)).flatten()
+            });
+            let state = live.or_else(|| crate::shelf::read_state(shelf, r.from, &bundle))?;
+            Some((r.to, bundle, state))
+        })
+        .collect();
+    moving
+        .into_iter()
+        .filter_map(|(to, bundle, state)| crate::shelf::write_state_in(shelf, to, &bundle, &state).then_some((to, bundle)))
+        .collect()
 }
 
 /// **The engine's name for a bay of the lane at `slot`**: the lane's rack
@@ -470,12 +494,10 @@ pub fn row_armed(app: &TangentApp, row: usize) -> bool {
     row_bit(u64::from(app.armed_mask()), row)
 }
 
-/// **The plugin path in a bay of a track, by identity**: the app's flat
-/// table read at the bay's seat for the row the track stands on, so the
-/// host names a track's bay and never works out a seat.
+/// **The plugin path in a bay of a track, by identity**, read off the app's
+/// map: the host names a track's bay and never works out a seat.
 pub fn track_bay(app: &TangentApp, id: TrackId, rack: Rack, bay: u8) -> Option<&str> {
-    let (seat, b) = app_seat_of(app.track_ids(), SeatBay::new(Node::Track(id), rack, bay))?;
-    app.insert(seat, b)
+    app.plugin(SeatBay::new(Node::Track(id), rack, bay))
 }
 
 /// [`track_bay`] for the track on row `row`'s first bay: what holds its
@@ -499,11 +521,9 @@ pub fn strip_slot(app: &TangentApp, strip: usize, slot: usize) -> Option<SeatBay
     tangent_ui::desk_id::slot_key(strip_node(app, strip)?, slot)
 }
 
-/// **The plugin path in a bay, by identity**: the app's flat table read at
-/// the bay's seat for the rows as they stand.
+/// **The plugin path in a bay, by identity**, off the app's map.
 pub fn bay_path(app: &TangentApp, sb: SeatBay) -> Option<&str> {
-    let (seat, bay) = app_seat_of(app.track_ids(), sb)?;
-    app.insert(seat, bay)
+    app.plugin(sb)
 }
 
 /// **Every rack a track has**: its two chains, its pedal board and its pad
@@ -770,7 +790,7 @@ impl Bridge {
         self.rows
             .iter()
             .enumerate()
-            .filter(|(row, _)| app.insert(*row, 0) == Some(sentinel))
+            .filter(|(_, (id, _))| track_bay(app, *id, Rack::Chain(0), 0) == Some(sentinel))
             .filter_map(|(row, (_, at))| at.map(|a| (row, a)))
             .collect()
     }
@@ -823,12 +843,64 @@ impl Bridge {
     }
 
     /// **The bypassed bays, by the engine's names**: the desk keeps them by
-    /// the app's position, the engine by its lanes' racks.
+    /// identity (C11's `bypass`), the engine by its lanes' racks.
     pub fn engine_bypass(&self, app: &TangentApp) -> Vec<EngineBay> {
-        app.insert_bypass()
+        app.bypass().iter().filter_map(|sb| self.engine_bay(*sb)).collect()
+    }
+
+    /// **A node's lane**, for a route or a key's end: a track's through its
+    /// lane; a special has none (no route or key reaches one before buses
+    /// do).
+    fn node_lane(&self, n: Node) -> Option<LaneAt> {
+        self.lane_of(n.track()?)
+    }
+
+    /// **The desk's wiring, read by identity** (C9's `read_desk`, this
+    /// lane's half of the seam): the routing table and the sidechain keys,
+    /// each end turned into the engine's names through this bridge's lanes.
+    /// No row is read and no seat worked out: a route names its tracks and
+    /// a key its bay and its source by identity, so a reorder hands the
+    /// engine the same wiring, and an end whose track has no lane (gone, or
+    /// waiting for one) wires nothing.
+    ///
+    /// **The routing table is pruned against what the device actually has**:
+    /// an interface swapped for a smaller one leaves routes pointing at
+    /// jacks that are gone, and a fader that moves and does nothing is
+    /// worse than a route that admitted it went away. The pruned copy is
+    /// never written back to the desk, so a route survives an interface
+    /// being unplugged and replugged. **In an EXPORT this drops the
+    /// hardware routes and keeps the sends**, which is exactly right: a
+    /// rendered file has no jacks, but a channel sent through another
+    /// channel's reverb is part of the mix and has to be in the file.
+    pub fn read_desk(&self, app: &TangentApp, outs: usize) -> (Vec<InRoute>, Vec<InKey>) {
+        let mut table = app.routes().clone();
+        table.prune(outs, |n| match n {
+            Node::Track(id) => self.rows.iter().any(|(t, _)| *t == id),
+            _ => true,
+        });
+        let routes = table
+            .0
             .iter()
-            .filter_map(|&(seat, bay)| self.engine_seat(app, seat, bay))
-            .collect()
+            .filter_map(|r| {
+                let from = self.node_lane(r.from)?.slot;
+                let to = match r.target {
+                    Target::Node(n) => RouteEnd::Lane(self.node_lane(n)?.slot),
+                    Target::Hardware { first, stereo } => RouteEnd::Hardware { first: u16::try_from(first).ok()?, stereo },
+                };
+                Some(InRoute { from, to, gain: r.gain })
+            })
+            .collect();
+        let keys = app
+            .insert_keys()
+            .0
+            .iter()
+            .filter_map(|k| {
+                let from = self.node_lane(k.from)?.slot;
+                let (addr, bay) = self.engine_bay(k.seat)?;
+                Some(InKey { seat: addr.plan_seat()?, bay: u8::try_from(bay).ok()?, from })
+            })
+            .collect();
+        (routes, keys)
     }
 
     /// **Push the desk into the live engine**, once a frame. See
@@ -1018,7 +1090,7 @@ impl Bridge {
                 None if app.desk_index().is_folder(row) => LaneKind::Folder,
                 None => LaneKind::Empty,
             };
-            let drum = app.insert(row, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH);
+            let drum = track_bay(app, *id, Rack::Chain(0), 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH);
             batch.push((*id, slot, LaneSpec { kind, drum }));
         }
         if batch.is_empty() {
@@ -1046,9 +1118,9 @@ impl Bridge {
     /// attached behind its Install (design 7.13: "Attach(Pads) then
     /// Attach(Kit). Nothing reloads").
     fn attach_pads(&mut self, app: &TangentApp, e: &mut Engine, ids: &[TrackId]) {
-        for (row, id) in ids.iter().enumerate() {
+        for id in ids {
             let Some(h) = self.lanes.get_mut(id) else { continue };
-            if h.pads || app.insert(row, 0) != Some(tangent_ui::dialogs::DRUMPAD_PATH) {
+            if h.pads || track_bay(app, *id, Rack::Chain(0), 0) != Some(tangent_ui::dialogs::DRUMPAD_PATH) {
                 continue;
             }
             if e.attach(h.at.slot, h.at.gen, LanePart::Pads(Box::new(PadBank::new()))).is_ok() {
@@ -1134,9 +1206,9 @@ impl Bridge {
         };
         let muted = |row: usize| freeze.is_none() && desk.muted.get(row).copied().unwrap_or(false);
         let mut lanes = Vec::with_capacity(n + self.leaving.len());
-        for (row, (_, at)) in self.rows.iter().enumerate() {
+        for (row, (id, at)) in self.rows.iter().enumerate() {
             let Some(at) = at else { continue };
-            let first = app.insert(row, 0);
+            let first = track_bay(app, *id, Rack::Chain(0), 0);
             let is_frozen = frozen.contains(&row);
             let midi_ok = !live_rule || app.channel_kind(row) == Some(ChannelKind::Midi);
             let flags = F::default()
@@ -1201,47 +1273,9 @@ impl Bridge {
             fx: special(LegacyOwner::Fx),
             master: special(LegacyOwner::Master).with(F::SUSPEND, row_bit(suspend, master_lane)),
         };
-        // **The routing table**, pruned against what the device actually has:
-        // an interface swapped for a smaller one leaves routes pointing at
-        // jacks that are gone, and a fader that moves and does nothing is
-        // worse than a route that admitted it went away. The pruned copy is
-        // never written back to the desk, so a route survives an interface
-        // being unplugged and replugged. **In an EXPORT this drops the
-        // hardware routes and keeps the sends**, which is exactly right: a
-        // rendered file has no jacks, but a channel sent through another
-        // channel's reverb is part of the mix and has to be in the file.
-        let mut table = app.routes().clone();
-        table.prune(outs, n);
-        let routes = table
-            .0
-            .iter()
-            .filter_map(|r| {
-                let from = self.lane(r.from)?.slot;
-                let to = match r.target {
-                    Target::Channel(c) => RouteEnd::Lane(self.lane(c)?.slot),
-                    Target::Hardware { first, stereo } => RouteEnd::Hardware { first: u16::try_from(first).ok()?, stereo },
-                };
-                Some(InRoute { from, to, gain: r.gain })
-            })
-            .collect();
-        // **The sidechain keys**, by identity: the desk speaks (strip, slot)
-        // so saved edges survive seat renumbering, the plan speaks the
-        // engine's seats, and THIS is the one place the translation happens -
-        // through `slot_key`, the display-slot resolver, the keyed bay's
-        // lane, and its rack's `plan_seat`.
-        let ids = app.track_ids();
-        let keys = app
-            .insert_keys()
-            .0
-            .iter()
-            .filter_map(|k| {
-                let from = self.lane(k.from)?.slot;
-                let node = bind(decode_v32_strip(k.strip)?, ids)?;
-                let sb = tangent_ui::desk_id::slot_key(node, k.slot)?;
-                let (addr, bay) = self.engine_bay(sb)?;
-                Some(InKey { seat: addr.plan_seat()?, bay: u8::try_from(bay).ok()?, from })
-            })
-            .collect();
+        // **The wiring, by identity** (`read_desk`): the routing table pruned
+        // against the device, and the sidechain keys, in the engine's names.
+        let (routes, keys) = self.read_desk(app, outs);
         PlanInputs { lanes, specials, routes, sends: Vec::new(), keys }
     }
 
@@ -1373,7 +1407,7 @@ mod tests {
     fn blank() -> Settings {
         let mut s = Settings::default();
         s.channel_kinds = [0; CHANNELS];
-        s.strip_inserts.iter_mut().for_each(String::clear);
+        s.plugins.clear();
         s.strip_sends = [0.0; STRIPS];
         s.channel_armed = Some(0);
         s.strip_muted = 0;
@@ -1388,8 +1422,22 @@ mod tests {
         }
     }
 
+    /// Seat `unit` at the legacy desk's flat bay `strip * INSERTS + slot`,
+    /// by the frozen map under the desk's rows: the fixtures' own numbers,
+    /// which the desk now keeps by identity.
     fn bay(s: &mut Settings, strip: usize, slot: usize, unit: &str) {
-        s.strip_inserts[strip * INSERTS + slot] = unit.to_owned();
+        let sb = tangent_ui::desk_legacy::bay_of_flat(&s.desk_ids(), strip * INSERTS + slot).expect("a legacy bay");
+        s.plugins.insert(sb, unit.to_owned());
+    }
+
+    /// The legacy desk's `(seat, bay)`, by identity.
+    fn legacy_sb(s: &Settings, seat: usize, bay: usize) -> SeatBay {
+        tangent_ui::desk_legacy::bay_at(&s.desk_ids(), seat, bay).expect("a legacy bay")
+    }
+
+    /// The track on row `n` of the fixture desk.
+    fn row(s: &Settings, n: usize) -> Node {
+        Node::Track(s.desk_ids()[n])
     }
 
     // ── the desk-structure pushes ───────────────────────────────────────────
@@ -1457,16 +1505,22 @@ mod tests {
         edit(
             "route",
             &|s, _| {
-                s.routes.add(Route::new(3, Target::Channel(4)));
-                s.routes.add(Route::new(6, Target::Hardware { first: 0, stereo: true }));
+                s.routes.add(Route::new(row(&s, 3), Target::Node(row(&s, 4))));
+                s.routes.add(Route::new(row(&s, 6), Target::Hardware { first: 0, stereo: true }));
                 // Past the offline engine's two outputs: pruned at the door.
-                s.routes.add(Route::new(7, Target::Hardware { first: 4, stereo: true }));
+                s.routes.add(Route::new(row(&s, 7), Target::Hardware { first: 4, stereo: true }));
             },
             none.clone(),
         );
         edit("route-gain", &|s, _| s.routes.set_gain(0, 0.5), none.clone());
-        edit("key", &|s, _| s.insert_keys.set(4, 0, Some(3)), none.clone());
-        edit("bypass", &|s, _| s.insert_bypass.0.push((4, 1)), none.clone());
+        edit("key", &|s, _| s.insert_keys.set(legacy_sb(&s, 4, 0), Some(row(&s, 3))), none.clone());
+        edit(
+            "bypass",
+            &|s, _| {
+                s.bypass.insert(legacy_sb(&s, 4, 1));
+            },
+            none.clone(),
+        );
         edit(
             "midi-route",
             &|s, _| {
@@ -1721,7 +1775,7 @@ mod tests {
         bay(&mut s, 1, 0, COMP_PATH);
         bay(&mut s, 1, 1, CHORUS_PATH);
         bay(&mut s, 2, 0, PLATE_PATH);
-        s.insert_bypass.0.push((1, 1));
+        s.bypass.insert(legacy_sb(&s, 1, 1));
         s.strip_phase = 1 << 0;
         let mut doc = Arrangement::default();
         for lane in 0..3 {
@@ -1742,11 +1796,11 @@ mod tests {
         s.strip_is_folder[1] = true;
         s.strip_in_folder[2] = true;
         s.strip_in_folder[3] = true;
-        s.routes.add(Route::new(4, Target::Channel(5)));
-        s.routes.add(Route::new(0, Target::Hardware { first: 0, stereo: true }));
+        s.routes.add(Route::new(row(&s, 4), Target::Node(row(&s, 5))));
+        s.routes.add(Route::new(row(&s, 0), Target::Hardware { first: 0, stereo: true }));
         bay(&mut s, 5, 0, EQ_PATH);
         bay(&mut s, 3, 0, COMP_PATH);
-        s.insert_keys.set(3, 0, Some(2));
+        s.insert_keys.set(legacy_sb(&s, 3, 0), Some(row(&s, 2)));
         s.strip_soloed = 1 << 2 | 1 << 4 | 1 << 5;
         let mut doc = Arrangement::default();
         for lane in 0..5 {
@@ -2161,7 +2215,7 @@ mod tests {
         let mut p = Bridge::new();
         let mut s = blank();
         kind(&mut s, &[0, 1], ChannelKind::Audio);
-        s.routes.add(Route::new(0, Target::Channel(1)));
+        s.routes.add(Route::new(row(&s, 0), Target::Node(row(&s, 1))));
         p.sync(&app_with(s.clone()), &mut e);
         let plans = p.stats().plans;
         p.sync(&app_with(s.clone()), &mut e);
@@ -2304,7 +2358,7 @@ mod tests {
         let mut s = blank();
         kind(&mut s, &(0..CHANNELS).collect::<Vec<_>>(), ChannelKind::Audio);
         for ch in 0..8 {
-            s.routes.add(Route::new(ch, Target::Hardware { first: 0, stereo: true }));
+            s.routes.add(Route::new(row(&s, ch), Target::Hardware { first: 0, stereo: true }));
         }
         let app = app_with(s);
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
@@ -2342,6 +2396,83 @@ mod tests {
     /// track's lane.
     fn wanted(p: &Bridge, app: &TangentApp) -> BTreeMap<EngineBay, String> {
         desk_bays(app).into_iter().filter_map(|(sb, path)| Some((p.engine_bay(sb)?, path))).collect()
+    }
+
+    /// **A pad-FX swap carries both instances and both state files**
+    /// (W5-identity-maps). The app moves the NAMES and hands the host the
+    /// swap as two relabels; `carry_relabels` reads BOTH sources before it
+    /// writes either destination, each from the instance playing in the
+    /// engine where it is that plugin (its knobs have moved since its file
+    /// was written), and each pad's file ends up holding the other pad's
+    /// plugin as it was playing. Two different units, so a carry that wrote
+    /// a file twice, or read a destination it had just written, shows as the
+    /// wrong bytes under the wrong owner. With no engine (the undo's road
+    /// when nothing is playing) the files themselves cross back. Every file
+    /// is on this test's own scratch shelf.
+    #[test]
+    fn a_pad_fx_swap_carries_both_instances_and_both_state_files() {
+        use tangent_ui::desk_id::BayRelabel;
+        let shelf = scratch("padswap").join("state");
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        let drums = row(&s, 1);
+        let (kick, snare) = (SeatBay::new(drums, Rack::Pad(36), 0), SeatBay::new(drums, Rack::Pad(38), 0));
+        s.plugins.insert(kick, COMP_PATH.to_owned());
+        s.plugins.insert(snare, EQ_PATH.to_owned());
+        let before = app_with(s.clone());
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&before, &mut e);
+        let comp_at = p.engine_bay(kick).expect("the kick pad's bay");
+        let eq_at = p.engine_bay(snare).expect("the snare pad's bay");
+        e.load_insert_at(comp_at.0, comp_at.1, Some(Path::new(COMP_PATH)), Some(dialled(COMP_PATH, &[(0, 0.2), (1, 0.9)]).as_slice()))
+            .expect("the comp loads");
+        e.load_insert_at(eq_at.0, eq_at.1, Some(Path::new(EQ_PATH)), Some(dialled(EQ_PATH, &[(0, 0.8)]).as_slice()))
+            .expect("the EQ loads");
+        e.settle_offline();
+        let comp_live = e.save_insert_state_at(comp_at.0, comp_at.1).expect("the comp's live state");
+        let eq_live = e.save_insert_state_at(eq_at.0, eq_at.1).expect("the EQ's live state");
+        // Each pad's file is OLDER than what is playing: the unit's
+        // defaults, as written when it was seated.
+        let (comp_file, eq_file) = (dialled(COMP_PATH, &[]), dialled(EQ_PATH, &[]));
+        assert!(crate::shelf::write_state_in(&shelf, kick, COMP_PATH, &comp_file), "fixture: the kick's file");
+        assert!(crate::shelf::write_state_in(&shelf, snare, EQ_PATH, &eq_file), "fixture: the snare's file");
+        assert_ne!(comp_live, comp_file, "fixture: the comp plays its file");
+        assert_ne!(eq_live, eq_file, "fixture: the EQ plays its file");
+
+        // The swap as the app makes it: the names trade, two relabels.
+        let mut swapped = s.clone();
+        swapped.plugins.insert(kick, EQ_PATH.to_owned());
+        swapped.plugins.insert(snare, COMP_PATH.to_owned());
+        let after = app_with(swapped);
+        let swap = [BayRelabel { from: kick, to: snare }, BayRelabel { from: snare, to: kick }];
+        let mut written = carry_relabels(&after, &p, Some(&e), &swap, &shelf);
+        written.sort();
+        assert_eq!(
+            written,
+            vec![(kick, EQ_PATH.to_owned()), (snare, COMP_PATH.to_owned())],
+            "the swap did not write both destinations, each under its new tenant"
+        );
+        assert_eq!(
+            crate::shelf::read_state(&shelf, snare, COMP_PATH),
+            Some(comp_live.clone()),
+            "the snare's file does not hold the comp as it was playing"
+        );
+        assert_eq!(
+            crate::shelf::read_state(&shelf, kick, EQ_PATH),
+            Some(eq_live.clone()),
+            "the kick's file does not hold the EQ as it was playing"
+        );
+
+        // The undo, with nothing playing: the inverse relabels, read off the
+        // files the swap wrote, and every byte goes home.
+        let back = swap.map(BayRelabel::inverse);
+        let mut written = carry_relabels(&before, &p, None, &back, &shelf);
+        written.sort();
+        assert_eq!(written, vec![(kick, COMP_PATH.to_owned()), (snare, EQ_PATH.to_owned())]);
+        assert_eq!(crate::shelf::read_state(&shelf, kick, COMP_PATH), Some(comp_live), "the undo lost the comp");
+        assert_eq!(crate::shelf::read_state(&shelf, snare, EQ_PATH), Some(eq_live), "the undo lost the EQ");
+        let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
     }
 
     /// **A reorder is ONE plan, and nothing reloads** (W4-integrate,
