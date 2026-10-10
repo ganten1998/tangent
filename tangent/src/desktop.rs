@@ -27368,6 +27368,9 @@ mod tests {
         let doc = doc_in(&song);
         std::fs::write(&doc, text).expect("the legacy document");
         std::fs::write(Arrangement::pre_v8_path(&doc), text).expect("its backup");
+        // And the kit sidecar's, which a first format-2 kit write keeps.
+        let kit_backup = format!("{}{}", tangent_ui::drumpad::FILE_NAME, tangent_ui::arrangement::PRE_V8_SUFFIX);
+        std::fs::write(song.join(&kit_backup), b"{\"lane_kits\": {}}").expect("the kit's backup");
         let legacy = song.join("state").join("insert-state-0-0.bin");
         std::fs::write(&legacy, b"/x/s0.vst3\0as the legacy build saved it").expect("a legacy sidecar");
         let ctx = egui::Context::default();
@@ -27390,16 +27393,98 @@ mod tests {
                 .expect("json");
         let copied_legacy = stage.join("state").join("insert-state-0-0.bin").exists();
         let copied_backup = Arrangement::pre_v8_path(&doc_in(&stage)).exists();
+        let copied_kit_backup = stage.join(&kit_backup).exists();
         let mirrored = crate::shelf::read_state(&stage.join("state"), sb, "/x/s0.vst3");
         let kept = (legacy.is_file(), Arrangement::pre_v8_path(&doc).is_file());
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(!copied_legacy, "the template copied the project's legacy sidecar");
         assert!(!copied_backup, "the template copied the project's .pre-v8 backup");
+        assert!(!copied_kit_backup, "the template copied the kit sidecar's .pre-v8 backup");
         assert_eq!(mirrored.as_deref(), Some(&b"live"[..]), "the template's state/ is not the live shelf");
         assert!(tangent_ui::desk_format::is_format2(&staged["desk"]), "the template's desk is not format 2");
         assert!(staged["desk"].get("legacy_states").is_none(), "the template carries the session's marker");
         assert_eq!(kept, (true, true), "building the template touched the project");
+    }
+
+    /// **A legacy kit sidecar is kept once, beside it, before the first
+    /// format-2 write replaces it** (design 6.7, against 6.8's writer). The
+    /// format-2 `drumpad.json` holds `track_kits` and nothing a release build
+    /// reads (no top-level kit, no `lane_kits`, no `primary_lane`), so the
+    /// first kit write after the switch used to take every drum lane's kit
+    /// away from the project a restored `<doc>.pre-v8` hands back. A kit on
+    /// lane 2, as a release build wrote it: the first format-2 write keeps
+    /// `drumpad.json.pre-v8`, byte for byte, and that file restored opens
+    /// lane 2's kit and the panel's lane again; a second write leaves it as
+    /// it was; a folder whose sidecar is already format 2, or has none,
+    /// keeps nothing; and the sweeps take the backup for Tangent's own file.
+    #[test]
+    fn a_legacy_kit_sidecar_is_kept_once_before_the_first_format_2_write() {
+        use tangent_ui::arrangement::{doc_in, PRE_V8_SUFFIX};
+        use tangent_ui::drumpad::{DrumpadDoc, FILE_NAME};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-kit-pre-v8-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let song = root.join("Song");
+        std::fs::create_dir_all(&song).expect("the project");
+        let doc = doc_in(&song);
+        let sidecar = DrumpadDoc::sidecar(&doc);
+        let backup = song.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}"));
+        // The release build's file: the panel's kit at the top level, every
+        // lane's under `lane_kits`, and `primary_lane`.
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36].path = "media/kick.wav".to_owned();
+        kit.save_beside(&doc);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("the kit")).expect("json");
+        let top = legacy.clone();
+        legacy["primary_lane"] = 2.into();
+        legacy["lane_kits"] = serde_json::json!({ "2": top });
+        let legacy = serde_json::to_vec_pretty(&legacy).expect("json");
+        std::fs::write(&sidecar, &legacy).expect("the legacy sidecar");
+        let (kits, primary) = DrumpadDoc::load_all_beside(&doc, 32, None);
+        assert!(!kits[2].is_empty() && primary == Some(2), "fixture: no kit on lane 2");
+
+        // The first format-2 write: a kit edit, or a save.
+        let ids = tangent_ui::desk_legacy::identity_ids(32);
+        DrumpadDoc::save_all_beside_ids(&kits, &ids, 2, &doc);
+        let now: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar).expect("kit")).expect("json");
+        assert!(now.get("track_kits").is_some() && now.get("lane_kits").is_none(), "fixture: not a format-2 write");
+        assert_eq!(std::fs::read(&backup).ok(), Some(legacy.clone()), "the legacy sidecar was not kept byte for byte");
+        // The way back: the backup restored is the release build's kits.
+        let back = root.join("Restored");
+        std::fs::create_dir_all(&back).expect("a restore");
+        std::fs::write(back.join(FILE_NAME), std::fs::read(&backup).expect("backup")).expect("restored");
+        let (restored, panel) = DrumpadDoc::load_all_beside(&doc_in(&back), 32, None);
+        assert_eq!((restored[2] == kits[2], panel), (true, Some(2)), "the backup does not hand lane 2's kit back");
+
+        // Written once.
+        let mut edited = kits.clone();
+        edited[2].pads[38].path = "media/snare.wav".to_owned();
+        DrumpadDoc::save_all_beside_ids(&edited, &ids, 2, &doc);
+        assert_eq!(std::fs::read(&backup).ok(), Some(legacy), "a second format-2 write touched the backup");
+
+        // Nothing to keep: a sidecar already format 2, and none at all.
+        let fresh = root.join("Fresh");
+        std::fs::create_dir_all(&fresh).expect("fresh");
+        let fresh_doc = doc_in(&fresh);
+        DrumpadDoc::save_all_beside_ids(&kits, &ids, 2, &fresh_doc);
+        DrumpadDoc::save_all_beside_ids(&edited, &ids, 2, &fresh_doc);
+        assert!(!fresh.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}")).exists(), "a format-2 sidecar was kept as legacy");
+
+        // The sweeps: a scratch holding the backup is still only a scratch.
+        let untitled = root.join("Untitled 7");
+        std::fs::create_dir_all(&untitled).expect("a scratch");
+        for name in [tangent_ui::arrangement::DOC_NAME, FILE_NAME] {
+            std::fs::write(untitled.join(name), b"{}").expect("a file");
+        }
+        std::fs::write(untitled.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}")), b"{}").expect("its backup");
+        let disposable = tangent_ui::app::holds_only_scratch(&untitled);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(disposable, "a scratch holding the kit's backup reads as somebody's work");
     }
 
     /// **Save As Template writes the template, never the session.** From a

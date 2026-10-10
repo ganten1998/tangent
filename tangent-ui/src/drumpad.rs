@@ -125,6 +125,30 @@ impl DrumpadDoc {
             .map_or_else(|| std::path::PathBuf::from(FILE_NAME), |d| d.join(FILE_NAME))
     }
 
+    /// **A legacy sidecar's bytes, kept once before the first format-2
+    /// write replaces them** (design 6.7): `drumpad.json.pre-v8` beside it,
+    /// temp and rename, when the file on disk is not format 2 (no
+    /// `track_kits`) and no backup already stands. The format-2 writer
+    /// writes no `lane_kits`, no top-level kit and no `primary_lane`, which
+    /// are all a release build reads, so without this the first kit write
+    /// after the switch took every drum lane's kit away from the project a
+    /// restored `<doc>.pre-v8` hands back. Restoring the two `.pre-v8`
+    /// files hands it back whole.
+    pub(crate) fn keep_pre_v8(path: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let format2 = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|v| v.get(TRACK_KITS).is_some());
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(crate::arrangement::PRE_V8_SUFFIX);
+        let backup = std::path::PathBuf::from(backup);
+        if !format2 && !backup.exists() {
+            crate::settings::write_atomic(&backup, &bytes);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pads.iter().all(|p| p.path.is_empty())
     }
@@ -363,6 +387,7 @@ impl DrumpadDoc {
         }
         let path = Self::sidecar(doc);
         let text = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        Self::keep_pre_v8(&path);
         crate::settings::write_atomic(&path, text.as_bytes());
     }
 
