@@ -47,7 +47,7 @@ use crate::desktop::{
 };
 use crate::instrument::{
     Engine, LaneKind, LanePart, LaneSpec, PadBank, PadKit, Placed, PlacedMidi, RackAddr, RackOwner, SlotAutomation,
-    SlotPlaced, SlotPlacedMidi,
+    SlotPlaced, SlotPlacedMidi, LEGACY_LANES,
 };
 
 /// **A bay, by the engine's identity for its rack** (`RackAddr`: a lane's by
@@ -1089,18 +1089,34 @@ impl Bridge {
         true
     }
 
-    /// **A lane for every track that has none**, at the lowest free slot,
-    /// in one Install: as many as the desk has rows (W6-rows-unlimited; the
-    /// engine grows its spine for them). A track whose old lane is still on
-    /// its way home waits for it. A lane past the legacy thirty-two is
-    /// reached by identity like any other (its plugin racks, its pedal
-    /// board, its instrument, its clips, its kit, its meter); what the
-    /// engine still keeps only for the legacy slots (the pads' own effect
-    /// racks, a curve's playing) is the engine's to grow. Answers the slots
-    /// it installed at.
+    /// **A lane for every track that has none**, in one Install: as many as
+    /// the desk has rows (W6-rows-unlimited; the engine grows its spine for
+    /// them). A track whose old lane is still on its way home waits for it.
+    /// A lane past the legacy thirty-two is reached by identity like any
+    /// other (its plugin racks, its pedal board, its instrument, its clips,
+    /// its curves, its kit, its meter). Answers the slots it installed at.
+    ///
+    /// **The lowest free slot below [`LEGACY_LANES`] first, and one on its
+    /// way home there is waited for** (a frame or two, design 7.13), before
+    /// any slot past them is taken. The engine still keeps some parts only
+    /// for the legacy slots (a drum lane's pad effect racks; routes, sends
+    /// and keys until W6-engine-buses-sends), and an export builds its
+    /// engine fresh with row r at slot r: a track Ctrl/Cmd+T made on a
+    /// shipped desk's hidden row took slot 32 the frame that row's old lane
+    /// started home, so live it lost what its export had. Waiting for the
+    /// lane it replaces gives it the slot the export gives it. A slot past
+    /// them is taken only when none below is free or coming free.
     fn install(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) -> Vec<Slot> {
+        let legacy = u32::try_from(LEGACY_LANES).unwrap_or(u32::MAX);
         let mut taken: BTreeSet<Slot> = self.lanes.values().map(|h| h.at.slot).collect();
         taken.extend(self.leaving.iter().map(|l| l.at.slot));
+        // The legacy slots on their way home that no track of this desk is
+        // waiting to take back: one new track may wait for each.
+        let mut owed = self
+            .leaving
+            .iter()
+            .filter(|l| l.at.slot.0 < legacy && !rows.iter().any(|(_, id)| *id == l.id))
+            .count();
         let mut batch: Vec<(TrackId, Slot, LaneSpec)> = Vec::new();
         for &(row, ref id) in rows {
             if self.lanes.contains_key(id)
@@ -1109,8 +1125,17 @@ impl Bridge {
             {
                 continue;
             }
-            let Some(slot) = (0..=u32::MAX).map(Slot).find(|s| !taken.contains(s) && e.slot_free(*s)) else {
-                break;
+            let free = |s: &Slot| !taken.contains(s) && e.slot_free(*s);
+            let slot = match (0..legacy).map(Slot).find(free) {
+                Some(slot) => slot,
+                None if owed > 0 => {
+                    owed -= 1;
+                    continue;
+                }
+                None => match (legacy..=u32::MAX).map(Slot).find(free) {
+                    Some(slot) => slot,
+                    None => break,
+                },
             };
             taken.insert(slot);
             let kind = match app.channel_kind(row) {
@@ -3539,9 +3564,11 @@ mod tests {
     /// **On a running engine a leaving lane fades under a plan first**
     /// (design 7.13: "a Plan marking the lane RETIRING (a 10 ms ramp), then
     /// a Plan without it, then Remove"), and a new track never takes its
-    /// slot while it fades: it is given another (W6: the slots are as many as
-    /// the rows, where a full fixed desk left it waiting for this one).
-    /// Driven on an offline engine through the live road
+    /// slot while it fades: it WAITS for a legacy slot on its way home, and
+    /// takes one below thirty-two once it is (`Bridge::install`; W6 had it
+    /// take slot 32 at once, where the engine still keeps a drum lane's pad
+    /// racks only for the legacy slots and an export gives the track its
+    /// row's). Driven on an offline engine through the live road
     /// (`stage_removals_for_test`), a block rendered between frames for the
     /// callback that takes each op.
     #[test]
@@ -3574,8 +3601,7 @@ mod tests {
         let retiring = plan.lanes.iter().find(|l| l.slot == slot).expect("the leaving lane left the plan at once");
         assert!(retiring.flags.contains(LaneFlags::RETIRING), "the leaving lane is not RETIRING");
         assert!(e.lane_gen(slot).is_some(), "the lane went home before its fade");
-        let took = p.lane_of(fresh).expect("the new track waited for a slot");
-        assert_ne!(took.slot, slot, "the new track took a slot whose lane is still fading");
+        assert_eq!(p.lane_of(fresh), None, "the new track took a slot while the legacy ones it can have are fading");
         assert_eq!(p.stats().removes, before.removes, "the lane was sent home under the plan that fades it");
         // The row the new track was made on was vacant, and its lane leaves
         // with its old identity (a new track is a new id): it fades beside
@@ -3591,10 +3617,12 @@ mod tests {
         assert!(e.lane_gen(slot).is_none(), "the removed track's lane is still live");
         block(&mut e);
 
-        // Frame three: the slot is free and the new track has a lane.
+        // Frame three: the slot is free and the new track has a lane, one
+        // of the legacy slots that came home.
         p.sync(&app, &mut e);
         p.sync(&app, &mut e);
-        assert!(p.lane_of(fresh).is_some(), "the new track never got a lane");
+        let took = p.lane_of(fresh).expect("the new track never got a lane");
+        assert!((took.slot.0 as usize) < LEGACY_LANES, "the new track took {:?}, past the legacy slots", took.slot);
         assert_eq!(e.plan_refused_for_test(), 0, "the callback refused a plan on the way");
     }
 
