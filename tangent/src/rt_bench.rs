@@ -4007,15 +4007,25 @@ fn resting_desk(grained: bool) -> (Engine, crate::desk_plan::PlanInputs, Vec<cra
 /// compared sample by sample, bit for bit: a resting lane's fader moved, an
 /// audition held on one (an instrument on it) and let go, a plugin seated in
 /// one, a solo and a mute through a new plan and back, a clip list swapped
-/// in that gives one a clip, a locate backwards, a loop that wraps over
-/// lanes that played and went quiet, the loop taken away, and a fader moved
+/// in that gives one a clip, a locate backwards that lands inside a loop set
+/// in the same breath, the loop wrapping four times (two lanes play inside
+/// it, one across its head and one up to its very end, while the lanes with
+/// nothing to play rest beside them), the loop taken away, and a fader moved
 /// again near the end. Then every lane's fader and its park counter are
 /// compared, paid up: a fader is what a lane that is woken late would come
 /// back on wrong, and the counter is the one thing resting defers rather
 /// than skips, so a counter off by any amount would one day park a lane on
-/// one engine and not the other. A plugin seated in a resting lane must
-/// wake it that chunk, which nothing in the sound can show while the lane
-/// has nothing to play, so that is asked of the engine directly.
+/// one engine and not the other.
+///
+/// **Two wakes are asked of the engine directly**, because nothing in the
+/// sound can show them while the lane they wake has nothing to play: a
+/// plugin seated in a resting lane wakes it that chunk, and a loop's wrap
+/// wakes every resting lane on the chunk that consumes it (`fill_active`'s
+/// `flush`). The loop is set WITH the locate, not after it: a playhead that
+/// is already past a loop's end when the loop arrives plays on and never
+/// wraps (`run_transport`), and a loop set that way once left this test
+/// comparing a phase in which nothing wrapped. So the wraps are counted, off
+/// the transport going backwards, and must have happened.
 ///
 /// And it must have rested: an engine that never rested anything would pass
 /// this by comparing two full walks.
@@ -4033,6 +4043,14 @@ fn a_resting_lane_renders_what_the_full_walk_rendered() {
         let mut b = vec![0.0f32; BLOCK * 2];
         let mut most = 0usize;
         let mut woke = 0usize;
+        // The loop's phase: where the transport stood after the last block,
+        // how many times it went backwards (each a wrap, the locate aside),
+        // and the fewest resting lanes any wrap was owed a visit for.
+        let (loop_from, loop_to) = (1_700, 2_600);
+        let mut was_at = 0u64;
+        let mut wraps = 0usize;
+        let mut wrapped = false;
+        let mut fewest_owed = usize::MAX;
         for block in 0..BLOCKS {
             let mut both = |f: &mut dyn FnMut(&mut Engine)| {
                 f(&mut rest);
@@ -4076,21 +4094,48 @@ fn a_resting_lane_renders_what_the_full_walk_rendered() {
                     more.sort_by_key(|c| c.slot.0);
                     e.set_clips_slotted(more);
                 }),
-                1700 => both(&mut |e| e.set_transport(7, rate)),
-                2000 => both(&mut |e| e.set_loop(rate, rate * 3 / 2)),
-                2600 => both(&mut |e| e.set_loop(0, 0)),
+                // One second in, inside [1.0 s, 1.5 s): lane 2's clip
+                // crosses the loop's head, lane 3's ends where the loop
+                // does, and a lap is 187.5 blocks, so it wraps four times
+                // before it is taken away.
+                n if n == loop_from => both(&mut |e| {
+                    e.set_transport(7, rate);
+                    e.set_loop(rate, rate * 3 / 2);
+                }),
+                n if n == loop_to => both(&mut |e| e.set_loop(0, 0)),
                 // Every lane woken (a clip list swapped in, the same one),
                 // so the counters compared below are all paid.
                 n if n == BLOCKS - 2 => both(&mut |e| e.set_clips_slotted(clips.clone())),
                 _ => {}
             }
             let resting_22 = rest.lane_fader(22).is_some_and(|(_, r)| r);
+            // Every lane resting as the chunk after a wrap begins: the
+            // chunk that consumes the wrap's flush must visit each of them.
+            let owed: Option<Vec<usize>> =
+                wrapped.then(|| (0..48).filter(|&s| rest.lane_fader(s).is_some_and(|(_, r)| r)).collect());
             rest.render_offline(&mut a);
             walk.render_offline(&mut b);
             if block == 700 {
                 assert!(resting_22, "grained {grained}: lane 22 was not resting when its plugin arrived");
                 assert_eq!(rest.lane_visited(22), Some(true), "grained {grained}: a plugin arrived and lane 22 slept through it");
             }
+            if let Some(owed) = &owed {
+                for &s in owed {
+                    assert_eq!(
+                        rest.lane_visited(s),
+                        Some(true),
+                        "grained {grained}: block {block}: the loop wrapped and lane {s} slept through it"
+                    );
+                }
+                fewest_owed = fewest_owed.min(owed.len());
+            }
+            let at = rest.transport_position();
+            assert_eq!(at, walk.transport_position(), "grained {grained}: block {block}: the two transports parted");
+            // Backwards inside the loop's phase is a wrap; the locate that
+            // opens the phase is its first block and is not counted.
+            wrapped = block > loop_from && block < loop_to && at < was_at;
+            wraps += usize::from(wrapped);
+            was_at = at;
             let now = rest.resting_lanes();
             if now < most {
                 woke += 1;
@@ -4105,6 +4150,12 @@ fn a_resting_lane_renders_what_the_full_walk_rendered() {
         }
         assert!(most >= 30, "grained {grained}: at most {most} lanes rested, so the test proved little");
         assert!(woke > 0, "grained {grained}: no resting lane ever woke");
+        assert_eq!(wraps, 4, "grained {grained}: the loop wrapped {wraps} times, not the four its laps make");
+        // Four wraps, so four visits owed and this is a real count.
+        assert!(
+            (20..usize::MAX).contains(&fewest_owed),
+            "grained {grained}: a wrap met only {fewest_owed} resting lanes, so its wake was hardly asked"
+        );
         for slot in 0..48 {
             assert_eq!(
                 rest.lane_quiet(slot),
@@ -4120,4 +4171,117 @@ fn a_resting_lane_renders_what_the_full_walk_rendered() {
         let peak = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.001, "grained {grained}: the render was silent, so the test proved nothing");
     }
+}
+
+/// **A lane does not rest while its grain ring still holds what the fold
+/// will read** (`LaneGrains::dead_before`, a term of the rest decided at
+/// the decide walk's idle exit).
+///
+/// The one visit that reaches the idle exit with audio still ahead in the
+/// ring is a grained lane's look-ahead: the ring serves this chunk, the
+/// grain clock asks for the next grain, and the visit finds nothing to feed
+/// it. Here a plate's tail has fallen under the park floor, so the lane is
+/// no longer `loud`, and the clip list is then swapped for an empty one: the
+/// plate lane's next look-ahead visit takes the idle exit with the grain it
+/// is being served from still ahead of the playhead. The plate sits on a
+/// lane of the grain clock's first phase (slot 4 of four phases at 128
+/// frames), which asks for its next grain on the FIRST chunk of the one
+/// being served, so three chunks of that grain are still to come. The full
+/// walk folds them; a lane that rested on that visit would drop them, a tail
+/// under -80 dBFS, which on a desk with nothing else playing is every bit of
+/// the output. (A lane on the last phase asks on the grain's last chunk,
+/// with nothing left to drop: the first draft of this test sat there and
+/// could not fail.)
+///
+/// And the lane must rest once its ring has run dry, or this would pass by
+/// never resting it at all.
+#[test]
+fn a_lane_does_not_rest_while_its_ring_still_holds_a_tail() {
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::instrument::SlotPlaced;
+    const LANES: usize = 32;
+    // `slot % phases == 0`: the first phase (`Renderer::plan_grains`).
+    const PLATE: usize = 4;
+    let rate = u64::from(RATE);
+    let build = || {
+        let mut e = Engine::offline_sized(RATE, Timebase::new(), LANES).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        e.settle_offline();
+        let inputs = PlanInputs {
+            lanes: (0..LANES)
+                .map(|s| InLane {
+                    slot: Slot(s as u32),
+                    gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                    flags: LaneFlags::MIDI_OFF,
+                    parent: None,
+                    punch: None,
+                    midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                    pick: None,
+                })
+                .collect(),
+            ..PlanInputs::default()
+        };
+        e.publish_plan(&inputs).expect("the plan goes");
+        // Half a second of noise into a plate, as the park test plays it.
+        let clip = noise(0.5);
+        let len = clip.frames() as u64;
+        e.set_clips_slotted(vec![SlotPlaced {
+            slot: Slot(PLATE as u32),
+            gen: e.lane_gen(Slot(PLATE as u32)).expect("a lane"),
+            placed: Placed { clip, strip: 0, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 },
+        }]);
+        seat_at(&mut e, PLATE, 0, 0, PLATE_PATH);
+        e.set_grain_ms(-1.0);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    };
+    let (mut rest, mut walk) = (build(), build());
+    rest.set_active_list(true);
+    walk.set_active_list(false);
+    // Five seconds in: the plate is under the floor by about two and a
+    // half (`a_reverb_tail_is_never_cut_off_by_a_lane_going_to_rest`) and
+    // its lane parks only `RACK_PARK_S` after that, so it is still rendering
+    // ahead when its clip goes.
+    let swap = (5 * rate) as usize / BLOCK;
+    let blocks = swap + 400;
+    let mut a = vec![0.0f32; BLOCK * 2];
+    let mut b = vec![0.0f32; BLOCK * 2];
+    let mut before = 0.0f32;
+    let mut after = 0.0f32;
+    for block in 0..blocks {
+        if block == swap {
+            rest.set_clips_slotted(Vec::new());
+            walk.set_clips_slotted(Vec::new());
+        }
+        rest.render_offline(&mut a);
+        walk.render_offline(&mut b);
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits(),
+                "block {block} sample {i}: the resting walk gave {x}, the full walk {y}"
+            );
+        }
+        let peak = b.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        if block + 1 == swap {
+            before = peak;
+        } else if block >= swap {
+            after = after.max(peak);
+        }
+    }
+    // The tail was under the park floor (so the lane was not `loud`) and
+    // still sounding when its clip went, and the full walk folded some of it
+    // after: there was something for a lane resting too early to drop.
+    assert!(
+        before > 0.0 && before < 7.0e-5,
+        "the plate's tail stood at {before} when its clip went, not under the park floor and above silence"
+    );
+    assert!(after > 0.0, "nothing of the tail was folded after the clip went, so the test proved nothing");
+    assert_eq!(
+        rest.lane_fader(PLATE).map(|(_, r)| r),
+        Some(true),
+        "the plate's lane never rested once its ring ran dry"
+    );
 }

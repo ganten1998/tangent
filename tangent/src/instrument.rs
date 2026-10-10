@@ -16693,11 +16693,12 @@ impl Renderer {
     ///
     /// It wakes, and is visited, the chunk anything it reads changes: per
     /// lane in [`Self::still_resting`], and for every resting lane at once
-    /// on a locate or a stop, a start, an op, a plugin, a sample or an
-    /// instrument arriving, a clip list or a MIDI schedule swapped, or a
-    /// change of loop, grain, slew rate, stems, varispeed or probe. A desk
-    /// rendered with resting off (`Engine::set_active_list`) is the same
-    /// bits; `a_resting_lane_renders_what_the_full_walk_rendered` holds it.
+    /// on a locate, a loop's wrap or a stop (`flush`), a start, an op, a
+    /// plugin, a sample or an instrument arriving, a clip list or a MIDI
+    /// schedule swapped, or a change of loop, grain, slew rate, stems,
+    /// varispeed or probe. A desk rendered with resting off
+    /// (`Engine::set_active_list`) is the same bits;
+    /// `a_resting_lane_renders_what_the_full_walk_rendered` holds it.
     ///
     /// The list keeps `order`'s rank order, so the decide walk's visit order
     /// and the fold's sum order are the full walk's with the resting lanes
@@ -16904,10 +16905,14 @@ impl Renderer {
         // the first walk that passes a resting lane by. See `fill_active`.
         self.fill_active(at, frames, rolling, flush);
         // The earliest frame any later chunk can ask a lane's grain ring
-        // for without a locate (which clears every ring): the playhead, or
-        // the loop's head once a loop can bring it back there. A ring holding
-        // nothing at or past it can never be read again, which is one of the
-        // terms of a lane's rest.
+        // for: the playhead. A locate and a loop's wrap each clear every
+        // ring before the next chunk reads one (`run_transport`), so a ring
+        // holding nothing at or past the playhead can never be read again,
+        // which is one of the terms of a lane's rest. While a loop stands
+        // the floor is lowered to the loop's head as well. No read needs
+        // that, since the wrap's clear comes first: it only keeps a lane
+        // that played inside the loop awake until the wrap clears its ring,
+        // a margin no render can tell from its absence.
         let rest_floor = {
             let (a, b) = (
                 self.shared.loop_a.load(Ordering::Relaxed),
