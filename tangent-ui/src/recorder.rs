@@ -369,7 +369,8 @@ pub struct RecorderView<'a> {
 /// and the arrangement view's window when it is open to steer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScrubView {
-    /// `(lane, start_frac, len_frac, colour)` per clip, fractions of the
+    /// `(row, start_frac, len_frac, colour)` per clip, the row as its drawn
+    /// rank (the timeline's own stacking), fractions of the
     /// SPAN — the same axis the seek and the playhead already run on. The
     /// colour indexes `mixer_panel::STRIP_COLORS`; zero is the desk's wood
     /// and draws as the timeline's own green.
@@ -382,6 +383,11 @@ pub struct ScrubView {
     /// longer, so the rectangle is always telling the truth. Zero means
     /// "no document": the wave face falls back to the track's own length.
     pub domain_s: f64,
+    /// **How many rows the overview stacks**: the rows the desk draws,
+    /// handed in. It read the desk's compile-time width, which tied a
+    /// picture of the song to a capacity constant; the desk says how deep it
+    /// is now, and zero (no document) draws one row. Appended.
+    pub rows: usize,
 }
 
 impl RecorderView<'_> {
@@ -459,17 +465,17 @@ impl RecorderView<'_> {
     }
 }
 
-/// The four things with a volume control, as linear gains.
+/// The four things with a volume control that are not tracks, as linear
+/// gains.
 ///
 /// Linear rather than dB because that is what the audio path multiplies by;
 /// the band converts for display and for the fader's travel. A struct rather
 /// than four loose floats so that adding a fifth source is one field and not
-/// five call sites.
+/// five call sites. **A track's fader is its row's** (`TrackRow::gain`, read
+/// through `TangentApp::channel_gain`): an array of them here was as wide as
+/// the fixed desk, and a desk has no width.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gains {
-    /// One per general channel — the fader of each of the eight, whatever
-    /// the channel's kind.
-    pub channels: [f32; CHANNELS],
     /// The click. Applies to what you hear; whether it reaches the FILE is
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
@@ -520,17 +526,53 @@ pub enum Strip {
 
 /// What feeds a general channel, or nothing yet.
 ///
-/// Plain data the settings hold as a number: 0 unused, 1 MIDI, 2 AUDIO. A
-/// channel that is `None` here is a column with a plus in it — drawn, so the
-/// desk never changes shape, but not yet a track.
+/// Plain data the settings hold as a number: 0 unused, 1 MIDI, 2 AUDIO, 3 a
+/// BUS. A channel that is `None` here is a column with a plus in it — drawn,
+/// so the desk never changes shape, but not yet a track.
+///
+/// **A bus is a kind of row, not a track** (docs/design/unlimited-tracks.md,
+/// section 9): nothing feeds it from outside the desk. It has no input chip,
+/// never hears MIDI and holds no clips; what reaches it is what other strips
+/// route or send into it, its rack runs once over that, and it goes on to
+/// the master or wherever it is routed. It is never counted against the
+/// free cap, on any tier. The byte is append-only, like the other two: a
+/// desk that names a bus and a build that never heard of one read it as no
+/// kind, which is the safe direction to fail in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
     Midi,
     Audio,
+    Bus,
 }
 
-/// **Which lanes are shut off from LIVE MIDI**, one bit per channel, set = shut
-/// off. The engine's `midi_off`.
+/// **What a new bus row is FOR**, which is only what it is called.
+///
+/// One kind of row underneath ([`ChannelKind::Bus`]): its rack runs once
+/// over whatever reaches it, by a route (which MOVES a strip into it) or a
+/// send (which COPIES one). A desk calls the first a bus and the second a
+/// return, and a person looking for "the reverb return" should find a strip
+/// that says so, so the word is the one thing the two gestures differ in.
+/// Nothing is stored: a renamed return is simply a bus with another name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusRole {
+    /// A submix that strips are ROUTED into.
+    Bus,
+    /// A return that strips SEND to.
+    Return,
+}
+
+impl BusRole {
+    /// The word its first name starts with: "Bus 2", "Return 1".
+    pub const fn word(self) -> &'static str {
+        match self {
+            BusRole::Bus => "Bus",
+            BusRole::Return => "Return",
+        }
+    }
+}
+
+/// **Which lanes are shut off from LIVE MIDI**, one flag per row, set = shut
+/// off. The engine's `MIDI_OFF` lane flag.
 ///
 /// Three rules, in order:
 ///
@@ -557,41 +599,26 @@ pub enum ChannelKind {
 /// Logic and Cubase both sound the selected instrument track without a record
 /// arm, so this desk is now deliberately stricter than they are.
 ///
-/// It is one mask rather than a gate per rule because the mask's EDGE is what
+/// It is one flag rather than a gate per rule because the flag's EDGE is what
 /// releases the notes a silenced lane was holding. A second gate would have no
 /// edge of its own and would strand them sounding.
 ///
-/// **Only the CHANNEL bits are ever set.** The engine's `Strip` numbering runs
-/// past the channels — drums, click, fx — and those racks read this same mask
-/// for their own bit. They have never been gated by it and must not start
-/// being: a mask built as "everything off, then open the live ones" reaches
-/// them, where the old "nothing off, then close the dead ones" did not, and
-/// the click's own effect would have gone deaf to the keyboard.
-pub fn live_midi_off(
-    kinds: &[Option<ChannelKind>],
-    armed: u32,
-    editor_lane: Option<usize>,
-) -> u32 {
+/// **Only the ROWS are answered.** The drum bus, the click and the effects
+/// return have never been gated by this and must not start being: the
+/// click's own effect would go deaf to the keyboard. Their flags are the
+/// bridge's own, apart from this.
+pub fn live_midi_off(kinds: &[Option<ChannelKind>], armed: &[bool], editor_lane: Option<usize>) -> Vec<bool> {
+    // **One answer per ROW, as long as the desk is**: `off[r]` says row r is
+    // shut off. It was a u32 with a bit per channel, which a desk past
+    // thirty-two rows could not say at all, and `1 << lane.min(31)` folded
+    // an editor open on row 40 onto row 31.
+    let midi = |r: usize| kinds.get(r).copied().flatten() == Some(ChannelKind::Midi);
     // Rule 3 short-circuits, but still answers to rule 1: an editor somehow
     // open on an audio lane silences the desk rather than opening it.
-    // The channels' bits, and no others. See the note above.
-    let all = ((1u64 << CHANNELS.min(32)) - 1) as u32;
     if let Some(lane) = editor_lane {
-        return if kinds.get(lane).copied().flatten() == Some(ChannelKind::Midi) {
-            all & !(1u32 << lane.min(31))
-        } else {
-            all
-        };
+        return (0..kinds.len()).map(|r| !(r == lane && midi(r))).collect();
     }
-    let mut off = all;
-    for ch in 0..CHANNELS.min(32) {
-        let live =
-            kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi) && armed & (1 << ch) != 0;
-        if live {
-            off &= !(1u32 << ch);
-        }
-    }
-    off
+    (0..kinds.len()).map(|r| !(midi(r) && armed.get(r).copied().unwrap_or(false))).collect()
 }
 
 // ── which DEVICES, and which CHANNEL, one track listens to ──────────────────
@@ -829,11 +856,11 @@ impl MidiInputSel {
 ///
 /// The shape is a SPARSE object keyed by channel index, the `strip_inserts`
 /// tail's shape and for its reason: thirty-two rows that nearly all say
-/// "everything" would be a hundred near-empty lines in every settings file
-/// and in every DAW project the plugin saves. Inside a row, `devices` absent
-/// means every device and `channel` absent means every channel — **absent
-/// rather than null**, which is the rule `custom_font_path` set: a key
-/// written as null is a key an older build has to know to ignore.
+/// "everything" would be a hundred near-empty lines in every settings file.
+/// Inside a row, `devices` absent means every device and `channel` absent
+/// means every channel, and **absent rather than null** is the rule
+/// `custom_font_path` set: a key written as null is a key an older build has
+/// to know to ignore.
 pub fn read_midi_inputs(stored: Option<&Value>) -> Vec<MidiInputSel> {
     let mut out: Vec<MidiInputSel> = Vec::new();
     let Some(Value::Object(o)) = stored else {
@@ -841,7 +868,10 @@ pub fn read_midi_inputs(stored: Option<&Value>) -> Vec<MidiInputSel> {
     };
     for (k, v) in o {
         let Ok(ch) = k.parse::<usize>() else { continue };
-        if ch >= CHANNELS {
+        // A hostile file's bound, never a desk's width: the reader grows the
+        // list to the highest row named, so the most a file can ask for is
+        // the most rows any desk may hold.
+        if ch >= crate::desk_id::MAX_ROWS {
             continue;
         }
         let Some(row) = v.as_object() else { continue };
@@ -923,25 +953,35 @@ pub fn write_midi_inputs(sels: &[MidiInputSel]) -> Option<Value> {
 /// anything stored for an audio or unbound channel is meaningless.
 pub fn reconcile_midi_inputs(sels: &mut Vec<MidiInputSel>, legacy: &[String]) {
     for (ch, spec) in legacy.iter().enumerate() {
-        let Some(from_legacy) = MidiInputSel::from_legacy(spec) else {
-            if let Some(slot) = sels.get_mut(ch) {
-                *slot = MidiInputSel::EVERYTHING;
-            }
+        if MidiInputSel::from_legacy(spec).is_none() && sels.get(ch).is_none() {
             continue;
-        };
+        }
         while sels.len() <= ch {
             sels.push(MidiInputSel::EVERYTHING);
         }
-        let held = &mut sels[ch];
-        let contradicts = match from_legacy.devices.first() {
-            None => !held.devices.is_empty(),
-            Some(port) => !held.devices.iter().any(|d| d == port),
-        };
-        if contradicts {
-            held.devices = from_legacy.devices;
-        }
+        reconcile_midi_input(&mut sels[ch], spec);
     }
     trim_midi_inputs(sels);
+}
+
+/// **[`reconcile_midi_inputs`]' rule for ONE track**: its device set against
+/// its own input spec, the string an older build actually wrote winning
+/// where the two contradict, the channel surviving. A spec that is not a
+/// MIDI spec at all leaves the default set: a set stored for an audio or
+/// unbound track is meaningless. What a row of the desk holds both of
+/// (`TrackRow::midi`, `TrackRow::input`), so the rule is applied per row.
+pub fn reconcile_midi_input(sel: &mut MidiInputSel, spec: &str) {
+    let Some(from_legacy) = MidiInputSel::from_legacy(spec) else {
+        *sel = MidiInputSel::EVERYTHING;
+        return;
+    };
+    let contradicts = match from_legacy.devices.first() {
+        None => !sel.devices.is_empty(),
+        Some(port) => !sel.devices.iter().any(|d| d == port),
+    };
+    if contradicts {
+        sel.devices = from_legacy.devices;
+    }
 }
 
 /// Drop trailing defaults, so a desk nobody has narrowed holds an EMPTY
@@ -1012,14 +1052,16 @@ pub fn live_midi_routes(
     sels: &[MidiInputSel],
     kinds: &[Option<ChannelKind>],
     slots: &[String],
-) -> [MidiRoute; CHANNELS] {
-    std::array::from_fn(|ch| {
-        if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
-            return MidiRoute::EVERYTHING;
-        }
-        sels.get(ch)
-            .map_or(MidiRoute::EVERYTHING, |s| s.route(slots))
-    })
+) -> Vec<MidiRoute> {
+    // One per row, as long as the desk is.
+    (0..kinds.len())
+        .map(|ch| {
+            if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
+                return MidiRoute::EVERYTHING;
+            }
+            sels.get(ch).map_or(MidiRoute::EVERYTHING, |s| s.route(slots))
+        })
+        .collect()
 }
 
 /// **Every device any track asks for, deduplicated, in desk order.**
@@ -1033,7 +1075,7 @@ pub fn live_midi_routes(
 /// input and would put a nonsense name in the open set.
 pub fn wanted_midi_devices(sels: &[MidiInputSel], kinds: &[Option<ChannelKind>]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for ch in 0..CHANNELS {
+    for ch in 0..kinds.len() {
         if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
             continue;
         }
@@ -1048,28 +1090,54 @@ pub fn wanted_midi_devices(sels: &[MidiInputSel], kinds: &[Option<ChannelKind>])
 }
 
 impl ChannelKind {
-    /// The settings byte, and back. See `Settings::channel_kinds`.
+    /// The settings byte, and back. See `Settings::channel_kinds`. The
+    /// same bytes as `desk_model::RowKind`, which is the one table.
     pub fn from_u8(n: u8) -> Option<Self> {
-        match n {
-            1 => Some(ChannelKind::Midi),
-            2 => Some(ChannelKind::Audio),
-            _ => None,
-        }
+        crate::desk_model::RowKind::from_byte(n).and_then(Self::of_row)
     }
 
     pub fn as_u8(kind: Option<Self>) -> u8 {
-        match kind {
-            None => 0,
-            Some(ChannelKind::Midi) => 1,
-            Some(ChannelKind::Audio) => 2,
+        crate::desk_model::RowKind::byte(kind.map(Self::row_kind))
+    }
+
+    /// **What a row of this kind is** (`desk_model::RowKind`): the same
+    /// three kinds, by name rather than by byte.
+    pub const fn row_kind(self) -> crate::desk_model::RowKind {
+        match self {
+            ChannelKind::Midi => crate::desk_model::RowKind::Midi,
+            ChannelKind::Audio => crate::desk_model::RowKind::Audio,
+            ChannelKind::Bus => crate::desk_model::RowKind::Bus,
         }
     }
 
-    /// The other one — the icon's click.
+    /// [`Self::row_kind`]'s inverse: one kind for one kind, a bus included,
+    /// so a bus row reads as a bus wherever the app asks a row its kind.
+    /// Never `None` since buses have a kind of their own (W7-buses-ui); an
+    /// `Option` still, so the callers written while a bus read as no kind
+    /// (`kind.and_then(of_row)`) read on unchanged.
+    pub const fn of_row(kind: crate::desk_model::RowKind) -> Option<Self> {
+        Some(match kind {
+            crate::desk_model::RowKind::Midi => ChannelKind::Midi,
+            crate::desk_model::RowKind::Audio => ChannelKind::Audio,
+            crate::desk_model::RowKind::Bus => ChannelKind::Bus,
+        })
+    }
+
+    /// **Whether this is a kind a TRACK has**: MIDI or AUDIO, the two a
+    /// counted row is fed by. A bus is a row of the desk and no track.
+    pub const fn is_track(self) -> bool {
+        matches!(self, ChannelKind::Midi | ChannelKind::Audio)
+    }
+
+    /// The other one — the icon's click. A bus has no other: what feeds
+    /// it is the desk, never an input, so the click does not turn it into a
+    /// track behind somebody's back (that is a counted track made, and it
+    /// asks the creation gate: `TangentApp::set_channel_kind`).
     pub fn cycled(self) -> Self {
         match self {
             ChannelKind::Midi => ChannelKind::Audio,
             ChannelKind::Audio => ChannelKind::Midi,
+            ChannelKind::Bus => ChannelKind::Bus,
         }
     }
 }
@@ -1079,39 +1147,79 @@ impl ChannelKind {
 // THE TAKE IS WHAT WAS PLAYED. One gesture records the moment — audio, MIDI
 // and video together — and keeps it whole; assembling a performance out of
 // the best bars of seven passes is a different program, with an editing
-// timeline this one deliberately does not grow. Play it again instead. Like
-// the fixed desk below, this is a limit you can feel the shape of, not a
-// feature that has not arrived yet.
+// timeline this one deliberately does not grow. Play it again instead. This
+// is a limit you can feel the shape of, not a feature that has not arrived
+// yet; the desk's own size is not such a limit (see the principle below).
 
-/// How many general channels the desk can CARRY — the capacity every
-/// engine table, settings array and seat index is sized to.
+// **The desk has no width** (docs/design/unlimited-tracks.md, section 2):
+//
+// The desk is the list of tracks that exist, plus one place to add the next.
+// It grows by appending and the machine is its only limit: no part of its
+// shape is a compile-time number. A licence decides how many tracks an
+// install may CREATE: thirty-two free, no limit with a supporter key or a
+// certain code. It never hides, silences or truncates a track that exists: a
+// project with more tracks than this install may create opens whole, plays
+// whole and saves whole, and only the next new track is refused. Buses,
+// returns, sends and routes are unlimited on every tier and are not tracks.
+// Every track, bus and plugin seat has an identity that does not depend on
+// where it sits, so adding, removing or reordering tracks renumbers nothing
+// on disk and moves no plugin.
+//
+// So there is no constant here for how many channels the desk carries: it
+// was `CHANNELS`, the capacity every settings array, engine table and seat
+// index was sized to, and it is gone. A desk is `Settings::rows`, as long as
+// it is; the legacy files' frozen width is `desk_lift::V32_CHANNELS`, read
+// only by the readers of those files.
+
+/// **How many tracks a free install may CREATE: thirty-two.**
 ///
-/// **Thirty-two as of 2026-08-31, the owner's word** — the supporter desk
-/// (it was twenty-four for one commit the same evening; the owner went
-/// bigger). It grew from eight (nine columns was the accident of five
-/// slots plus four inputs) to sixteen at 4.82.0, and to thirty-two with
-/// the supporter unlock. What a given INSTALL shows is
-/// [`active_channels`]: sixteen free, the full thirty-two with a key (or
-/// the Konami road).
-/// The engine always runs the full width, so a supporter's session opened
-/// on a free install still SOUNDS whole — a licence must never silence
-/// somebody's music — and the free desk simply cannot start new work past
-/// sixteen. Fixed at each tier, like everything about the desk's shape:
-/// an app whose strips appear and disappear as things load is a desk that
-/// changes shape under your hands, so an unused channel is drawn as a
-/// plus rather than not drawn.
-pub const CHANNELS: usize = 32;
+/// A count of tracks that exist, never a width: a desk that already holds
+/// more (a supporter's project on another machine, a relocked cheater's
+/// session) opens, plays and saves whole, and only the next new track is
+/// refused. What counts is `TangentApp::counted_tracks`; buses, returns and
+/// sends never do. It was sixteen columns of a thirty-two-wide desk until
+/// the owner made the free desk thirty-two.
+pub const FREE_TRACKS: usize = 32;
 
-/// The free desk: the sixteen the app has always shown without a key.
-pub const FREE_CHANNELS: usize = 16;
-
-/// How many channels this install works at. The one place the paywall's
-/// arithmetic lives: LAYOUT iteration and new-track pickers ask this;
-/// engine capacity, persistence and permutation walks stay at
-/// [`CHANNELS`] so nothing ever truncates somebody's data.
-pub fn active_channels(licensed: bool) -> usize {
-    if licensed { CHANNELS } else { FREE_CHANNELS }
+/// **The creation cap for an install of this standing**: `None` for a
+/// supporter (a key that covers this major, or the Konami marker), which
+/// has no track limit, and [`FREE_TRACKS`] otherwise.
+///
+/// Takes the standing as a bool on purpose: the one caller asks
+/// `LicenseStore::is_supporter`, and a function that cannot see the store
+/// cannot ask it the wrong question (`licensed()`, the "may the code
+/// TOGGLE" question, is not this one).
+pub fn track_cap(supporter: bool) -> Option<usize> {
+    if supporter { None } else { Some(FREE_TRACKS) }
 }
+
+/// **How many strips the desk shows by default on a window with room for
+/// them**, the ceiling `default_mixer_visible` hands its ladder.
+///
+/// A geometry number, not a tier: it was `FREE_CHANNELS`, which made the
+/// default zoom move whenever the free desk did. Sixteen is the owner's
+/// "make the default at full screen or max size 16 in one row".
+pub const DEFAULT_MAX_STRIPS: usize = 16;
+
+/// **The most strips or lanes either view lays out at once**, whatever the
+/// zoom asks for: the clamp on the mixer's strip count and the arrangement's
+/// lane count, and the top rung of their zoom ladder.
+///
+/// A geometry number, not a width. It was the channel count, which tied how
+/// many strips a screen can carry to how many tracks the desk holds: a
+/// desk that grows past it now scrolls instead, and a view never builds,
+/// lays out, hit-tests or describes more than this many plus its pinned
+/// strips (docs/design/unlimited-tracks.md, section 10). Sixty-four because
+/// that is a full-width desk on the largest screen the owner uses at the
+/// narrowest strip that still reads (`mixer_panel::MIN_STRIP_W`).
+pub const VISIBLE_MAX: usize = 64;
+
+/// **The palette's period**: how many colours a palette deals before it
+/// repeats. Track `n` wears slot `n % PALETTE_SLOTS`, so tracks 0..31 keep
+/// the colours they always had and track 32 starts the deal again rather
+/// than reading past the table. Thirty-two because every palette in
+/// `mixer_panel::PALETTES` was built thirty-two deep.
+pub const PALETTE_SLOTS: usize = 32;
 
 /// **Where the limiter's threshold ships**, as a knob position.
 ///
@@ -1148,34 +1256,6 @@ pub const LIMITER_SHIPS_AT: f32 = 47.0 / 48.0;
 /// number this app made up.
 pub const INSERTS: usize = 3;
 
-/// How many inputs of one interface the desk has room for.
-///
-/// **Must equal `tangent_record::audio::MAX_PICKS`**, which is the same number
-/// counted where the capture happens. This crate cannot reach that one — see
-/// the firewall — so the host asserts they agree.
-pub const INPUTS: usize = CHANNELS;
-
-/// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 3;
-
-/// The master's own seat in the insert space. Seats `0..STRIPS` are the
-/// channels and the buses; this is the one after them.
-pub const MASTER_SEAT: usize = STRIPS;
-
-/// **The master's SECOND rack.**
-///
-/// A seat of its own, past the pads, holding the master's extra three bays.
-///
-/// **Why a seat and not six bays on one.** `INSERTS` is the stride of the
-/// persisted `strip_inserts` array and of the `insert-state-<seat>-<bay>.bin`
-/// sidecars; raising it to six would change the stride for every strip on
-/// the desk, need a migration for every saved session, and hand the
-/// arrangement's track headers six bays they have no room to draw. An extra
-/// seat is three more entries appended to an array that already grows by
-/// appending, one more rack in the engine, and no other file learns
-/// anything.
-pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
-
 /// **How many bays a strip shows: six on the master and on every CHANNEL.**
 ///
 /// It used to be three on a channel, six on the master, and six on a channel
@@ -1205,137 +1285,6 @@ pub fn bays_on(strip: Option<Strip>) -> usize {
     }
 }
 
-/// **How many bays the strip at a DESK index shows.** [`bays_on`] keyed by
-/// index rather than by `Strip`, for the callers that hold one — the master
-/// is `STRIPS` and is not in `Strip::all()`, which is the convention
-/// [`Column::desk_index`] already writes down.
-pub fn bays_at(desk_index: usize) -> usize {
-    bays_on(Strip::all().get(desk_index).copied())
-}
-
-/// **Which rack seat and which bay a strip's Nth slot really is.**
-///
-/// Everything but the master answers itself. The master's first three slots
-/// are its EXTRA rack and its last three are its original one, and that
-/// order is deliberate: the new bays were added above the old ones on the
-/// strip, a rack runs top to bottom, and a session that already had plugins
-/// in the master must keep hearing them in the same place in the chain.
-///
-/// One function, because the alternative is every call site remembering the
-/// rule — and a call site that forgets it edits somebody else's plugin.
-pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
-    if desk_index == MASTER_SEAT && slot >= INSERTS {
-        (MASTER_SEAT, slot - INSERTS)
-    } else if desk_index == MASTER_SEAT {
-        (MASTER_EXTRA_SEAT, slot)
-    } else if desk_index < CHANNELS && slot >= INSERTS {
-        // A FOLDER's slots 3..5 - and, unlike the master's, in the plain
-        // order: the extra rack goes BELOW the original, so slot and bay
-        // numbering agree with the automation's and no `master_bay` twin
-        // is needed. See `FOLDER_EXTRA_SEATS`.
-        (folder_extra_seat(desk_index), slot - INSERTS)
-    } else if desk_index < STRIPS && slot >= INSERTS {
-        // A BUS's slots 3..5, in the same plain order a channel's take. See
-        // `BUS_EXTRA_SEATS`.
-        (bus_extra_seat(desk_index), slot - INSERTS)
-    } else {
-        (desk_index, slot)
-    }
-}
-
-/// **Which STRIP a rack seat belongs to**, and the exact inverse of
-/// [`seat_bay`] in the only respect anybody asks about: the desk index whose
-/// slots live in that seat.
-///
-/// [`seat_bay`] is a one-way street and was enough while the only question
-/// anybody asked of a bay was where to read it. The question a DRAG asks is
-/// different — "is this the same strip I picked it up from" — and in seat
-/// space the answer was wrong for exactly the bays that live in a second
-/// rack: a channel's slots 0..2 are its own seat and its 3..5 are its
-/// folder-extra one, so carrying a plugin from slot 1 to slot 5 of ONE track
-/// read as a move between two tracks and copied it instead of moving it.
-/// That is the owner's "drag only works between each group of 3".
-///
-/// A seat that is nobody's rack — a drum pad, an amp pedal — answers `None`.
-/// Those are racks a strip OWNS but not racks a strip SHOWS, and a carry
-/// that is not between two shown bays is not a carry this answers for.
-pub fn rack_owner(seat: usize) -> Option<usize> {
-    if seat <= MASTER_SEAT {
-        // The channels, the three buses, and the master's own seat.
-        return Some(seat);
-    }
-    if seat == MASTER_EXTRA_SEAT {
-        return Some(MASTER_SEAT);
-    }
-    if let Some(ch) = folder_extra_of(seat) {
-        return Some(ch);
-    }
-    if let Some(bus) = bus_extra_of(seat) {
-        return Some(bus);
-    }
-    None
-}
-
-/// The BUS whose extra seat this is, if it is one — [`bus_extra_seat`]'s
-/// inverse, and [`folder_extra_of`]'s sibling. See [`rack_owner`], which is
-/// the question both of them exist to answer.
-pub fn bus_extra_of(seat: usize) -> Option<usize> {
-    seat.checked_sub(BUS_EXTRA_SEATS)
-        .filter(|i| *i < BUSES)
-        .map(|i| CHANNELS + i)
-}
-
-/// **Where the pads of drum lanes past the FIRST block begin.**
-///
-/// A drum instrument loads a full instance per channel, so every channel
-/// that carries a drumpad needs its own hundred and twenty-eight pad racks.
-/// They are APPENDED, after everything that already had a seat — the note on
-/// `MASTER_EXTRA_SEAT` says why that is the safe direction: an appended seat
-/// changes no index anybody has already written down, and this array grows
-/// by appending.
-///
-/// Channel 0 keeps the ORIGINAL pad block at `STRIPS + 1`. That is what a
-/// project written before lanes existed used, and `Settings::from_json`
-/// moves it when such a project's drumpad turns out to be on another
-/// channel. See `pad_rack_index`.
-pub const EXTRA_PAD_SEATS: usize = MASTER_EXTRA_SEAT + 1;
-
-/// **Where the FOLDER extra seats begin** - one appended seat per channel,
-/// so a group can wear six bays the way the master does. Appended after
-/// every pad block, for the reason `MASTER_EXTRA_SEAT` records: an appended
-/// seat changes no index anybody has already written down.
-///
-/// Unlike the master's, a folder's extra bays sit BELOW its original three.
-/// There was no legacy strip to keep the look of, so display order,
-/// automation-bay order and chain order all agree here: slots and bays 0..2
-/// are the channel's own seat, 3..5 the extra one.
-pub const FOLDER_EXTRA_SEATS: usize = EXTRA_PAD_SEATS + (CHANNELS - 1) * DRUM_PADS;
-
-/// Channel `ch`'s folder-extra seat. One function, same reason as
-/// `pad_rack_index`: a call site that recomputes this edits somebody
-/// else's plugin.
-pub const fn folder_extra_seat(ch: usize) -> usize {
-    FOLDER_EXTRA_SEATS + ch
-}
-
-/// The inverse: which channel's extra rack a seat is, or `None` for a seat
-/// outside the folder-extra block.
-///
-/// It did not exist while nothing needed to travel BACK. `folder_extra_seat`
-/// is a one-way street — every reader either knew the channel already or was
-/// content to ask about a seat it had just built — and the price of that was
-/// the pedalboard: a folder wears six bays, three of them seated past every
-/// pad block, and the board that arms behind an amp is the CHANNEL's. With no
-/// way home from the seat, the amp face in a folder's slots 3..5 could only
-/// say "on channel strips only", and the engine could only run the board for
-/// a lane whose own rack held the amp. Both were answering a question about
-/// the seat when the question was about the channel. See [`pedal_owner`],
-/// which is the question they should have been asking.
-pub fn folder_extra_of(seat: usize) -> Option<usize> {
-    seat.checked_sub(FOLDER_EXTRA_SEATS)
-        .filter(|ch| *ch < CHANNELS)
-}
-
 /// How many pedal seats each channel owns for the amp's pedalboard.
 ///
 /// Seven, the owner's board: comp, wah, drive, chorus, trem, echo, plate —
@@ -1363,161 +1312,12 @@ pub const AMP_DEFAULT_BOARD: [&str; AMP_PEDALS] = [
     "@tangent-plate",
 ];
 
-/// **Where the amp-pedal seats begin** - seven appended seats per channel,
-/// the pedalboard the amp wears when it sits in a channel bay. Appended
-/// after the folder-extra block, for the reason `MASTER_EXTRA_SEAT`
-/// records: an appended seat changes no index anybody has already written
-/// down, the settings reader re-pads `strip_inserts` to the grown
-/// `INSERT_SPACE`, and the state sidecars are named by seat index going
-/// forward.
-///
-/// A pedal seat is an ordinary rack - VST3s are legal tenants - that the
-/// engine runs IN ORDER over the amp's input, before the amp's own bay.
-/// Only a CHANNEL's amp gets them: an amp on the master, a bus or a
-/// folder's extra rack plays bare in v1.
-pub const AMP_PEDAL_SEATS: usize = FOLDER_EXTRA_SEATS + CHANNELS;
-
-/// Channel `ch`'s pedal `pedal` seat. One function, same reason as
-/// `pad_rack_index`: a call site that recomputes this edits somebody
-/// else's plugin.
-pub const fn amp_pedal_seat(ch: usize, pedal: usize) -> usize {
-    AMP_PEDAL_SEATS + ch * AMP_PEDALS + pedal
-}
-
-/// The inverse: which channel's which pedal a seat is, or `None` for a
-/// seat outside the pedal block. What lets a reorder carry a picker aimed
-/// at a pedal without the call site re-deriving the block's shape.
-pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
-    if seat < AMP_PEDAL_SEATS {
-        return None;
-    }
-    let at = seat - AMP_PEDAL_SEATS;
-    let ch = at / AMP_PEDALS;
-    (ch < CHANNELS).then_some((ch, at % AMP_PEDALS))
-}
-
-/// **Whose pedalboard a rack seat wears** — the one question every part of
-/// the amp's board should be asking, and the one none of them used to.
-///
-/// A channel answers itself. A folder's EXTRA seat answers the channel that
-/// owns it, because a folder is a channel with six bays and a channel has
-/// exactly one board (`AMP_PEDALS` seats, appended once per channel). The
-/// master, the buses, the pads and the pedal seats themselves answer `None`:
-/// there is no board there and never was.
-///
-/// **Why one function rather than the test each caller was making.** Three
-/// places asked `seat < CHANNELS` and meant "does this seat get a board" —
-/// the amp face's chip row, the picker the chips open, and the
-/// default-board seeding — and the engine asked a fourth version of it by
-/// running the board only in the lane pass, which a folder never reaches.
-/// All four agreed, and all four were wrong the same way: an amp dropped
-/// into a folder's second rack drew no board, and an amp in a folder's FIRST
-/// rack drew a board that made no sound. Answering it in one place is the
-/// argument `pad_rack_index` and `amp_pedal_seat` already make on this
-/// module — a call site that recomputes the seat map edits somebody else's
-/// plugin — with the sharper version for this map: a call site that
-/// recomputes it here does not edit the wrong plugin, it silently declines
-/// to run the right one.
-///
-/// A folder's two racks therefore SHARE one board. That is the v1 answer to
-/// "a channel owns one board and a folder wants it twice", and it is written
-/// here rather than left to the caller: the board runs once, at the top of
-/// the fold, over the summed group — see the engine's `run_pedalboard`.
-pub fn pedal_owner(seat: usize) -> Option<usize> {
-    if seat < CHANNELS {
-        return Some(seat);
-    }
-    folder_extra_of(seat)
-}
-
-/// **Where the BUSES' extra bays begin** — one appended seat per bus, so a
-/// bus can wear six the way a channel and the master already do.
-///
-/// The CLICK is the one bus with a column on the desk, and the owner asked
-/// for it to match a track: "make the click have 6 fx slots so it matches the
-/// layout of the other tracks". The other two are mapped anyway rather than
-/// special-cased, because a seat map with a hole in it is a hole somebody
-/// finds by loading a plugin into it.
-///
-/// Appended, for the reason `MASTER_EXTRA_SEAT` records at length: an
-/// appended seat changes no index anybody has already written down, and this
-/// array grows by appending.
-pub const BUS_EXTRA_SEATS: usize = AMP_PEDAL_SEATS + CHANNELS * AMP_PEDALS;
-
-/// The number of buses — every strip past the channels. Three: the drum bus,
-/// the click and the effects return.
-pub const BUSES: usize = STRIPS - CHANNELS;
-
-/// Bus `desk_index`'s extra seat. `desk_index` is a DESK index in
-/// `Strip::index` space, so `CHANNELS..STRIPS`; anything else is not a bus
-/// and gets the first seat, which is the same "answer rather than panic"
-/// `pad_rack_index` and its neighbours make.
-pub const fn bus_extra_seat(desk_index: usize) -> usize {
-    if desk_index < CHANNELS || desk_index >= STRIPS {
-        return BUS_EXTRA_SEATS;
-    }
-    BUS_EXTRA_SEATS + (desk_index - CHANNELS)
-}
-
-/// Every rack seat: strips, master, the first pad block, the master's
-/// extra, a pad block for each channel after the first, a folder-extra
-/// seat per channel, seven pedal seats per channel, and one extra seat per
-/// bus.
-pub const TOTAL_SEATS: usize = BUS_EXTRA_SEATS + BUSES;
-
-/// **The channel permutation lifted onto the WHOLE seat space.** Channel
-/// rows move, each folder-extra seat follows its channel, and every other
-/// seat - buses, master, pads, the master's extra - stays put, per the
-/// reorder rule written on the desktop's permute machinery. `order[new] =
-/// old`, and the same here.
-pub fn seat_order(order: &[usize]) -> Vec<usize> {
-    let mut full: Vec<usize> = (0..TOTAL_SEATS).collect();
-    for (new, old) in order.iter().enumerate() {
-        if new < CHANNELS && *old < CHANNELS {
-            full[new] = *old;
-            full[folder_extra_seat(new)] = folder_extra_seat(*old);
-            // The pedalboard travels with its channel too, exactly as the
-            // folder-extra seat does: a reorder that left the pedals behind
-            // would hand one channel's board to whoever took its row.
-            for pedal in 0..AMP_PEDALS {
-                full[amp_pedal_seat(new, pedal)] = amp_pedal_seat(*old, pedal);
-            }
-        } else if new != *old {
-            // A SEAT-space entry - the drumpad's pad-FX swap permutes pad
-            // seats directly - passes through untouched. Dropping these to
-            // identity silently parted two pads' plugins from their state
-            // files on every swap.
-            if let (Some(slot), true) = (full.get_mut(new), *old < TOTAL_SEATS) {
-                *slot = *old;
-            }
-        }
-    }
-    full
-}
-
-/// **Where channel `ch`'s pad `pad` keeps its bays.**
-///
-/// One function, because the alternative is every call site remembering
-/// that channel 0 is the odd one out — and a call site that forgets edits
-/// somebody else's plugin.
-pub const fn pad_rack_index(ch: usize, pad: usize) -> usize {
-    if ch == 0 {
-        STRIPS + 1 + pad
-    } else {
-        EXTRA_PAD_SEATS + (ch - 1) * DRUM_PADS + pad
-    }
-}
-
-/// How long the whole insert space is: every strip, the master, every pad of
-/// every channel, and the master's second rack.
-pub const INSERT_SPACE: usize = TOTAL_SEATS * INSERTS;
-
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
 /// How many pads the drumpad addresses: EVERY MIDI key. Pad `n` IS note
 /// `n` — the 4×4 window the panel shows is a PAGE over this space, stepped
-/// by the bank band on its left. The engine mirrors this the way it
-/// mirrors [`CHANNELS`].
+/// by the bank band on its left. The engine reads this one number
+/// (`desk_id::PADS`) rather than keeping a copy of its own.
 pub const DRUM_PADS: usize = 128;
 
 /// One visible PAGE of the pads: the 4×4 the hands know.
@@ -1532,12 +1332,6 @@ pub const DRUM_PAGE_ANCHOR: usize = 4;
 
 /// How many pages the band offers: bases 4, 20, …, 116.
 pub const DRUM_PAGES: usize = 8;
-
-/// Where pad `i`'s insert bays live in the strip-indexed insert space:
-/// after every strip and the master. One seat map, mirrored by the engine.
-pub const fn pad_insert_index(pad: usize) -> usize {
-    STRIPS + 1 + pad
-}
 
 /// The MIDI note of pad 0. ZERO now — pad `n` answers note `n`, the whole
 /// keyboard. The classic kit's C1 home (36) is where the default PAGE
@@ -1605,98 +1399,227 @@ impl Default for DrumKitParams {
 /// A mixer COLUMN, which is not a desk index and may never be used as one.
 ///
 /// **This exact aliasing has shipped three times.** Columns and desk indices
-/// agree on every channel that has a column and disagree past the last one —
-/// so a handler that read `Strip::all()`, `strip_names`, `strip_sends` or a
-/// mute mask with a raw column index passed every manual test and was wrong on
-/// exactly the master: the master's fader moved the metronome, its inserts
-/// landed on the click, and its typed name went to a channel with no column to
-/// show it. Each time the fix was one missed call site.
+/// agreed on every channel that had a column and disagreed past the last one
+/// — so a handler that read `Strip::all()`, `strip_names`, `strip_sends` or a
+/// mute mask with a raw column index passed every manual test and was wrong
+/// on exactly the master: the master's fader moved the metronome, its inserts
+/// landed on the click, and its typed name went to a channel with no column
+/// to show it. Each time the fix was one missed call site.
 ///
-/// So the two spaces get two types. A `Column` comes from geometry — a press,
-/// a drawn strip — and the ONLY ways out of it are [`Column::strip`], which
-/// answers what the column is, and [`Column::desk_index`], which answers where
-/// its settings live. Indexing anything desk-shaped with `.0` is greppable,
-/// deliberate, and almost always the bug being reintroduced.
+/// So the two spaces got two types, and the column is an ENUM rather than a
+/// number. It was `Column(usize)`, whose pinned click and master were "one
+/// past the channels" and "two past", so a desk that grew a track moved both
+/// of them and every `.0` that compared against the width was a fourth
+/// shipping of the same bug waiting for the desk to change size (docs/design/
+/// unlimited-tracks.md, section 10). A track column names its ROW; the click
+/// and the master name themselves, and no arithmetic reaches either.
+///
+/// The ways out are [`Column::strip`], which answers what the column is, and
+/// [`Column::strip_ref`], the strip every setting of the column is read and
+/// written by (`Settings::strip_name` and its siblings): there is no desk
+/// index any more, the specials having left strip space (W5).
+///
+/// The derived order is the order the desk draws them in: every track, then
+/// the click, then the master, which is the order `Column(usize)` sorted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Column(pub usize);
+pub enum Column {
+    /// The strip of the track on this ROW of the desk.
+    Track(usize),
+    /// The click's pinned strip, left of the master.
+    Click,
+    /// The master's pinned strip, rightmost.
+    Master,
+}
 
 impl Column {
     /// Which strip this column shows, or `None` for the master.
     ///
-    /// The one place a column becomes a strip. `shown()` and `all()` are not
-    /// the same list — the click and the effects bus are strips with no column
-    /// of their own — and everything that turns a press into a change goes
-    /// through here.
+    /// The one place a column becomes a strip. It used to look itself up in
+    /// a freshly built `Strip::shown()` array on every call, which cost a
+    /// thirty-three-entry array per question; a match is the same answer.
     pub fn strip(self) -> Option<Strip> {
-        Strip::shown().get(self.0).copied()
+        match self {
+            Column::Track(row) => Some(Strip::Channel(row)),
+            Column::Click => Some(Strip::Click),
+            Column::Master => None,
+        }
     }
 
-    /// Where this column's settings live in every desk array.
-    ///
-    /// The master's are last, past every channel — it is not in `shown()` and
-    /// has no `Strip` of its own, so `STRIPS` is its slot by convention and
-    /// this is where that convention is written down.
-    pub fn desk_index(self) -> usize {
-        self.strip().map_or(STRIPS, Strip::index)
+    /// What this column is, as the identity every desk array is read by.
+    pub fn strip_ref(self) -> StripRef {
+        match self {
+            Column::Track(row) => StripRef::Row(row),
+            Column::Click => StripRef::Click,
+            Column::Master => StripRef::Master,
+        }
+    }
+
+    /// The track ROW this column draws, or `None` for the two pinned strips.
+    pub fn row(self) -> Option<usize> {
+        match self {
+            Column::Track(row) => Some(row),
+            Column::Click | Column::Master => None,
+        }
+    }
+
+    /// Whether this column is one of the two pinned at the right, which
+    /// never scroll and never clip.
+    pub fn pinned(self) -> bool {
+        matches!(self, Column::Click | Column::Master)
+    }
+
+    /// Every column of a desk `rows` tracks wide, in drawn order: the tracks,
+    /// then the click, then the master. What a test walks where it walked
+    /// `0..COLUMNS` before the columns had names.
+    pub fn every(rows: usize) -> impl Iterator<Item = Column> {
+        (0..rows).map(Column::Track).chain([Column::Click, Column::Master])
     }
 }
 
+/// Said the way a test message or a log line names it: `Track(3)`, `Click`,
+/// `Master`.
+impl std::fmt::Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
 
-/// How many COLUMNS the desk draws: every strip that has one, then the master.
+/// **A strip of the desk, by what it is**: a track's row, one of the three
+/// buses, or the master.
 ///
-/// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
-/// this crate's panels do not depend on each other, so it is stated here and
-/// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = CHANNELS + 2;
+/// **What every strip setting is read and written by.** The specials have
+/// left strip space (W5): a track's name, colour, send and switches sit in
+/// the row arrays at its row, and the drum bus's, the click's, the effects
+/// return's and the master's in `Settings::specials` (design 4's
+/// `Specials`), keyed by [`StripRef::special`]. `Settings::strip_name`,
+/// `strip_paint`, `strip_send` and `strip_switch` are the doors, and they
+/// take this type, so no code works out where in an array a strip's
+/// settings live, and no array has a slot past the rows for anybody. The
+/// legacy strip space (the rows, then the three buses, then the master) is
+/// `desk_legacy`'s alone, for the files and the shims that still speak it;
+/// a scan (`no_live_code_reads_strip_space`) holds every other file to that,
+/// and `no_view_code_does_strip_index_arithmetic` holds the views to doing
+/// no width sums at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StripRef {
+    /// The track on this row.
+    Row(usize),
+    /// The drum bus, which has a desk slot and no column.
+    Drums,
+    /// The click.
+    Click,
+    /// The effects return, which has a desk slot and no column.
+    Fx,
+    /// The master, past every strip.
+    Master,
+}
+
+impl StripRef {
+    /// The four specials, in the order their settings were always listed:
+    /// the drum bus, the click, the effects return, the master.
+    pub const SPECIALS: [StripRef; 4] = [StripRef::Drums, StripRef::Click, StripRef::Fx, StripRef::Master];
+
+    /// **Which special this is**, as the key `Settings::specials` holds its
+    /// settings by, or `None` for a track's row, whose settings are its
+    /// row's.
+    pub const fn special(self) -> Option<crate::desk_id::Node> {
+        use crate::desk_id::Node;
+        match self {
+            StripRef::Row(_) => None,
+            StripRef::Drums => Some(Node::Drums),
+            StripRef::Click => Some(Node::Click),
+            StripRef::Fx => Some(Node::Fx),
+            StripRef::Master => Some(Node::Master),
+        }
+    }
+
+    /// [`Self::special`]'s inverse: the strip a special node is. `None` for
+    /// a track, which is a row the caller has to look up.
+    pub const fn of_special(node: crate::desk_id::Node) -> Option<StripRef> {
+        use crate::desk_id::Node;
+        match node {
+            Node::Track(_) => None,
+            Node::Drums => Some(StripRef::Drums),
+            Node::Click => Some(StripRef::Click),
+            Node::Fx => Some(StripRef::Fx),
+            Node::Master => Some(StripRef::Master),
+        }
+    }
+
+    /// The `Strip` this is, or `None` for the master, which has none.
+    pub const fn strip(self) -> Option<Strip> {
+        match self {
+            StripRef::Row(row) => Some(Strip::Channel(row)),
+            StripRef::Drums => Some(Strip::Drums),
+            StripRef::Click => Some(Strip::Click),
+            StripRef::Fx => Some(Strip::Fx),
+            StripRef::Master => None,
+        }
+    }
+
+    /// The mixer column it is drawn in, or `None` for the drum bus and the
+    /// effects return, which have none.
+    pub const fn column(self) -> Option<Column> {
+        match self {
+            StripRef::Row(row) => Some(Column::Track(row)),
+            StripRef::Click => Some(Column::Click),
+            StripRef::Master => Some(Column::Master),
+            StripRef::Drums | StripRef::Fx => None,
+        }
+    }
+
+    /// The track row, or `None` for a bus or the master.
+    pub const fn row(self) -> Option<usize> {
+        match self {
+            StripRef::Row(row) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// **Whose curves this strip's are**, in the automation store: a track's
+    /// sit on its row, the master's on [`AutoLane::Master`], by name. Only
+    /// tracks and the master have curves, so a bus has none.
+    ///
+    /// [`AutoLane::Master`]: crate::automation::AutoLane::Master
+    pub const fn auto_lane(self) -> Option<crate::automation::AutoLane> {
+        use crate::automation::AutoLane;
+        match self {
+            StripRef::Row(row) => Some(AutoLane::Row(row)),
+            StripRef::Master => Some(AutoLane::Master),
+            StripRef::Drums | StripRef::Click | StripRef::Fx => None,
+        }
+    }
+
+    /// The strip a stored automation lane belongs to: a track's row, or the
+    /// master.
+    pub const fn from_auto_lane(lane: crate::automation::AutoLane) -> StripRef {
+        use crate::automation::AutoLane;
+        match lane {
+            AutoLane::Row(row) => StripRef::Row(row),
+            AutoLane::Master => StripRef::Master,
+        }
+    }
+}
+
+impl From<Strip> for StripRef {
+    fn from(s: Strip) -> Self {
+        match s {
+            Strip::Channel(row) => StripRef::Row(row),
+            Strip::Drums => StripRef::Drums,
+            Strip::Click => StripRef::Click,
+            Strip::Fx => StripRef::Fx,
+        }
+    }
+}
 
 impl Strip {
-    /// The channels the MIXER draws, in order: the eight, then the CLICK,
-    /// before MASTER.
-    ///
-    /// The click's fader used to live in the band; the band's fader rows are
-    /// gone, so the click is a column like everything else. The effects
-    /// return still has no column: its three knobs are the band's, and a bus
-    /// that could be soloed against its own sources is a desk with a feedback
-    /// question in it. BACKING had a column here and is retired — the
-    /// arrangement's lanes carry audio now.
-    pub fn shown() -> [Strip; CHANNELS + 1] {
-        // **The drum bus strip is retired from the desk** — the drumpad is
-        // a lane's instrument now and answers to that lane's own strip.
-        // `Strip::Drums` keeps its desk index for the arrays and the
-        // engine's fallback; it simply owns no column any more.
-        std::array::from_fn(|i| {
-            if i < CHANNELS {
-                Strip::Channel(i)
-            } else {
-                Strip::Click
-            }
-        })
-    }
-
-    /// Every strip, in desk order.
-    pub fn all() -> [Strip; STRIPS] {
-        std::array::from_fn(|i| {
-            if i < CHANNELS {
-                Strip::Channel(i)
-            } else {
-                [Strip::Drums, Strip::Click, Strip::Fx][i - CHANNELS]
-            }
-        })
-    }
-
-    /// The column this strip is drawn in, or `None` for the click and the
-    /// bus, which have none. The inverse of [`Column::strip`].
+    /// The column this strip is drawn in, or `None` for the drum bus and
+    /// the effects return, which have none. The inverse of [`Column::strip`].
     pub fn column_of(self) -> Option<Column> {
-        Self::shown().iter().position(|s| *s == self).map(Column)
-    }
-
-    /// Its place in `Desk`'s arrays.
-    pub const fn index(self) -> usize {
         match self {
-            Strip::Channel(i) => i,
-            Strip::Drums => CHANNELS,
-            Strip::Click => CHANNELS + 1,
-            Strip::Fx => CHANNELS + 2,
+            Strip::Channel(row) => Some(Column::Track(row)),
+            Strip::Click => Some(Column::Click),
+            Strip::Drums | Strip::Fx => None,
         }
     }
 
@@ -1757,73 +1680,6 @@ pub fn missing_from_take(lost: &[Strip]) -> Option<String> {
     ))
 }
 
-/// The routing half of the desk: what goes to the effects, and what is heard.
-///
-/// **Levels are in [`Gains`] and not here**, because every one of them already
-/// existed and is already pushed: the mixer's faders are the band's faders seen
-/// a second time, which is the whole reason the band can stay exactly as it is.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Desk {
-    /// How much of each strip goes to the effects bus, 0..=1. Indexed by
-    /// [`Strip::index`]; the `Fx` slot is unused and stays zero.
-    pub send: [f32; STRIPS],
-    pub muted: [bool; STRIPS],
-    pub soloed: [bool; STRIPS],
-}
-
-impl Default for Desk {
-    /// **The routing this app had before it had a mixer.** The instrument sends
-    /// everything, nothing else sends anything, nothing is muted and nothing is
-    /// soloed — so a settings file written before any of this existed comes up
-    /// sounding exactly as it did.
-    fn default() -> Self {
-        // **Every instrument sends everything, and nothing else sends
-        // anything.** That is what an insert on the instrument bus was, so a
-        // settings file written before any of this existed comes up sounding
-        // exactly as it did.
-        // **The first channel sends everything, and nothing else sends
-        // anything.** Channel 0 is the desk's default instrument — the DX7 a
-        // fresh install plays — and the send is what an insert on the
-        // instrument bus was, so a new install comes up sounding exactly as
-        // the old one did. Channels ADDED later get their send set to 1.0 at
-        // the gesture instead, so a fresh track gets reverb without an index
-        // here having to guess its kind.
-        let mut send = [0.0; STRIPS];
-        send[0] = 1.0;
-        Self {
-            send,
-            muted: [false; STRIPS],
-            soloed: [false; STRIPS],
-        }
-    }
-}
-
-impl Desk {
-    /// Whether anything is soloed, which is what makes solo exclusive.
-    pub fn any_solo(&self) -> bool {
-        self.soloed.iter().any(|s| *s)
-    }
-
-    /// Whether a strip is heard — which is now also whether it is RECORDED.
-    ///
-    /// The take is the desk (the `record::TakeSource` choice that used to
-    /// stand between them is gone), so this one rule
-    /// answers "is it in the file" as well as "is it in the room". The audio
-    /// thread's `strip_is_heard` is the same rule over the bit masks this same
-    /// `Desk` was pushed as; two answers to that question is the shape of the
-    /// bug that collapsing `TakeSource` removed.
-    ///
-    /// Solo wins, and a soloed strip is heard even if it is also muted —
-    /// pressing solo on a muted channel is a request to hear it, and a solo
-    /// button that sometimes does nothing is worse than one that overrules.
-    pub fn heard(&self, strip: Strip) -> bool {
-        if self.any_solo() {
-            return self.soloed[strip.index()];
-        }
-        !self.muted[strip.index()]
-    }
-}
-
 impl Default for Gains {
     /// Unity for the sources, and the click **under** them.
     ///
@@ -1832,7 +1688,6 @@ impl Default for Gains {
     /// hand within a minute otherwise.
     fn default() -> Self {
         Self {
-            channels: [1.0; CHANNELS],
             metronome: 0.5,
             master: 1.0,
             track: 1.0,
@@ -1849,8 +1704,8 @@ impl Default for Gains {
 /// painter reads. Keeping them separate is what stops the panel from acquiring
 /// a `String` field it would then be tempted to mutate mid-draw.
 ///
-/// Every field is inert in a plugin: `Caps::capture_devices` is false there, the
-/// band takes zero height, and nothing ever writes to this.
+/// Every field is inert where `Caps::capture_devices` is false (a Minimal
+/// build): the band takes zero height, and nothing ever writes to this.
 /// One input of the interface, as the desk needs to draw it.
 ///
 /// **Filled by the host every frame, like the slots.** Which inputs are open
@@ -1886,6 +1741,11 @@ pub struct ArrRecView {
     pub notes: Vec<crate::arrangement::ArrNote>,
 }
 
+/// **The strips that are not rows and have a meter of their own**, in the
+/// order [`RecorderState::special_peaks`] holds them: the drum bus, the click
+/// and the effects return. The master's meter is [`RecorderState::master`].
+pub const SPECIAL_METERS: [StripRef; 3] = [StripRef::Drums, StripRef::Click, StripRef::Fx];
+
 #[derive(Debug, Clone)]
 pub struct RecorderState {
     /// The playhead, in seconds from 0:00 — what the readout and the waveform
@@ -1910,9 +1770,17 @@ pub struct RecorderState {
     pub arr_rec: Option<ArrRecView>,
     pub state: RecordState,
     pub elapsed_s: f64,
-    /// The loudest thing each strip made since the last frame, in
-    /// [`Strip::ALL`] order. Pushed by the host, read by the mixer.
-    pub strip_peaks: [[f32; 2]; STRIPS],
+    /// **The loudest thing each ROW made since the last frame**, by row, as
+    /// long as the desk is: the host reads each track's lane by its slot and
+    /// puts the reading on the row the track stands on. Read by the views
+    /// through `TangentApp::strip_meter`, never by index. It was one array
+    /// in the legacy strip space (thirty-two rows, then the buses), which
+    /// had no place for a thirty-third track's meter.
+    pub row_peaks: Vec<[f32; 2]>,
+    /// The same for the three strips that are not rows: the drum bus, the
+    /// click and the effects return, in that order ([`SPECIAL_METERS`]).
+    /// The master's is [`Self::master`].
+    pub special_peaks: [[f32; 2]; 3],
     pub meters: Meters,
     /// The output's levels and the limiter's reduction. See the same two
     /// fields on [`RecorderView`].
@@ -1922,10 +1790,10 @@ pub struct RecorderState {
     /// times a second. The WINDOW is a setting and is not stored here — see
     /// `TangentApp::recorder_layout_view`, which puts the two together.
     pub loudness: Loudness,
-    /// What each lane's CLIPS are sounding, as a pitch mask. Playback only —
-    /// the live notes are already in the app's own hands, because it is the
-    /// thing that received them.
-    pub lane_sounding: [u128; CHANNELS],
+    /// What each row's CLIPS are sounding, as a pitch mask, by row. Playback
+    /// only — the live notes are already in the app's own hands, because it
+    /// is the thing that received them.
+    pub lane_sounding: Vec<u128>,
     /// The output directory, shortened for display.
     pub dest: String,
     /// The PROJECT and EXPORT folders, likewise. See the same two fields on
@@ -1941,8 +1809,10 @@ pub struct RecorderState {
     pub camera_name: Option<String>,
     /// The camera named in settings is not present right now.
     pub camera_missing: bool,
-    /// The inputs of the interface that are open, one strip each.
-    pub inputs: [InputState; INPUTS],
+    /// The inputs of the interface that are open, one strip each, as many
+    /// as the interface has open: a property of the device, never of the
+    /// desk.
+    pub inputs: Vec<InputState>,
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -1976,9 +1846,7 @@ pub struct RecorderState {
     pub play_pending: bool,
 }
 
-/// Hand-written because `strip_peaks` is a thirty-five-row array and std
-/// only derives `Default` for arrays up to thirty-two — the desk outgrew
-/// the derive the day it went to thirty-two channels plus its three buses.
+/// Hand-written: the record state's own default is not every field's.
 impl Default for RecorderState {
     fn default() -> Self {
         Self {
@@ -1989,12 +1857,13 @@ impl Default for RecorderState {
             arr_rec: None,
             state: RecordState::default(),
             elapsed_s: 0.0,
-            strip_peaks: [[0.0; 2]; STRIPS],
+            row_peaks: Vec::new(),
+            special_peaks: [[0.0; 2]; 3],
             meters: Meters::default(),
             master: Meters::default(),
             gr_db: 0.0,
             loudness: Loudness::default(),
-            lane_sounding: [0; CHANNELS],
+            lane_sounding: Vec::new(),
             dest: String::new(),
             project_dest: String::new(),
             export_dest: String::new(),
@@ -2436,7 +2305,7 @@ impl Default for Knobs {
 ///
 /// The **request pattern**, for the same reason the directory picker uses it:
 /// creating a take directory and opening a device must not happen halfway
-/// through painting a frame. The plugin refuses simply by never draining.
+/// through painting a frame. A host refuses simply by never draining.
 ///
 /// Deliberately short. Everything else a click in the band can do — choosing a
 /// folder, choosing a device, changing the count-in, opening the Export dialog
@@ -2492,11 +2361,16 @@ pub enum RecorderRequest {
     /// header, where there is no bay under the hand to mean. The owner, on
     /// the first version choosing for him every time: "it always takes the
     /// first empty slot -- change this to be per slot freedom."
+    ///
+    /// **By identity** (W7-slot-gaps): the bay copied from, the strip it is
+    /// copied onto, and the bay the hand chose there, if it chose one. They
+    /// were the host's `(seat, bay)`s through the frozen map, which has no
+    /// seat for a track past its thirty-second row, so a drag on track 33
+    /// sent nothing at all.
     CopyInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: Option<usize>,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::Node,
+        to_bay: Option<crate::desk_id::SeatBay>,
     },
     /// Bring these clips up so their loudest point sits just under full
     /// scale.
@@ -2518,8 +2392,8 @@ pub enum RecorderRequest {
     /// track, two or more clips or one that repeats, not on a frozen track)
     /// and sends nothing otherwise; the host keeps only the audio clips among
     /// the ids and re-checks the track. Where `caps.capture_devices` is false
-    /// (a plugin, the Minimal build) `request_recorder` drops it, and nothing
-    /// is said unless the app says it.
+    /// (the Minimal build) `request_recorder` drops it, and nothing is said
+    /// unless the app says it.
     GlueAudio(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///
@@ -2528,14 +2402,15 @@ pub enum RecorderRequest {
     /// only thing the UI can do about it is ask for it to be dropped.
     ResetLoudness,
     /// Open one insert's OWN editor — the plugin's window, with its presets
-    /// and its knobs: `(desk index, bay)`.
+    /// and its knobs: the bay, by identity (it was the host's `(seat, bay)`,
+    /// which no track past the frozen map's rows has).
     ///
     /// A request rather than a dialog, because the window is not ours: the
     /// plugin draws into a native window the host creates after the frame. VST3
     /// requires it on the main thread, and creating an AppKit window with an
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
-    OpenInsertEditor(usize, usize),
+    OpenInsertEditor(crate::desk_id::SeatBay),
     /// The green button: audition from the playhead. Pressed while
     /// auditioning, it PAUSES in place; Stop is what returns to the edit
     /// cursor. The host ignores it while the arrangement records or an export
@@ -2608,15 +2483,14 @@ pub enum RecorderRequest {
     PreviewFile(std::path::PathBuf),
     /// Silence the preview — the explorer closed.
     PreviewStop,
-    /// **Turn one knob on a built-in insert, live.** `strip` is the SEAT and
-    /// `slot` the bay — the same addressing `OpenInsertEditor` carries, so a
-    /// sender converts through `seat_bay` exactly once, on its side. `id` is
-    /// the unit's own stable param id and `value` normalised 0..=1; the host
-    /// forwards to `Engine::set_insert_param`, which writes the durable
-    /// ledger and rides the lock-free ring to the audio thread. The sender
-    /// mirrors optimistically (`TangentApp::set_insert_param`), so a face
-    /// never waits a frame to see its own drag.
-    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// **Turn one knob on a built-in insert, live.** `bay` is the bay by
+    /// identity, as `OpenInsertEditor` carries it. `id` is the unit's own
+    /// stable param id and `value` normalised 0..=1; the host forwards to
+    /// `Engine::set_insert_param_at`, which writes the durable ledger and
+    /// rides the lock-free ring to the audio thread. The sender mirrors
+    /// optimistically (`TangentApp::set_bay_param`), so a face never waits
+    /// a frame to see its own drag.
+    SetInsertParam { bay: crate::desk_id::SeatBay, id: u32, value: f32 },
     /// **Set one knob on a built-in insert from words typed into its
     /// reading.** Same addressing as `SetInsertParam`; `text` is what the
     /// hand typed - "-12", "440", "1.5k", "off". The host reads it on the
@@ -2625,12 +2499,11 @@ pub enum RecorderRequest {
     /// reading shows the number it landed on. Words the unit cannot read
     /// change nothing. The sender does NOT mirror this one: it has no value
     /// to mirror, which is the whole reason the words travel.
-    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
-    /// **Aim the engine's ONE insert tap at a mixer slot, or take it off**
-    /// — the feed behind an EQ face's analyzer and an imager face's
-    /// vectorscope. `strip` and `slot` are DESK terms (`Strip::index` and
-    /// the strip's Nth slot); the host owns the `seat_bay` translation, the
-    /// same way it owns it for `OpenInsertEditor`.
+    TypeInsertParam { bay: crate::desk_id::SeatBay, id: u32, text: String },
+    /// **Aim the engine's ONE insert tap at a bay, or take it off** — the
+    /// feed behind an EQ face's analyzer and an imager face's vectorscope.
+    /// `bay` by identity, as `OpenInsertEditor` carries it: the host aims
+    /// the tap at that bay's lane, wherever its row stands.
     ///
     /// A request because the tap is the engine's: this crate cannot reach
     /// `Engine::set_insert_tap` — the firewall is the whole point — so the
@@ -2647,7 +2520,7 @@ pub enum RecorderRequest {
     /// live and the one below it is holding its last picture, which is the
     /// right answer for a needle nobody is looking at and much better than
     /// the alternative of a second tap nothing in the engine has.
-    SetInsertTap { strip: usize, slot: usize, on: bool },
+    SetInsertTap { bay: crate::desk_id::SeatBay, on: bool },
     // ── presets ─────────────────────────────────────────────────────────
     // The preset road's three requests, at the END because the enum is
     // append-only across parallel lanes. All three are requests for the
@@ -2728,14 +2601,14 @@ pub enum RecorderRequest {
     /// Write the last finished capture into `IRs/<name>.wav` (32-bit float
     /// stereo) and re-push the shelf rows.
     IrSave { name: String },
-    /// Point a loaded Tangent IR bay at another impulse file. `strip` is
-    /// the SEAT (the `SetInsertParam` convention). The host rewrites the
+    /// Point a loaded Tangent IR bay at another impulse file. `bay` by
+    /// identity (the `SetInsertParam` convention). The host rewrites the
     /// bay's state sidecar and reloads the bay, because an IR is applied
     /// to an instance before it crosses to the audio thread - a swap IS a
     /// reload, honestly.
-    SetInsertIr { strip: usize, slot: usize, path: String },
+    SetInsertIr { bay: crate::desk_id::SeatBay, path: String },
     /// **Exchange two loaded insert bays, settings and all.** Appended at
-    /// the END, this enum's law. Both addresses are SEATS, like every other
+    /// the END, this enum's law. Both bays by identity, like every other
     /// bay-shaped request here.
     ///
     /// The owner: "dragging occupied fx slot x to any other occupied slot
@@ -2752,10 +2625,8 @@ pub enum RecorderRequest {
     /// bare paths exchanged in the settings would swap the units and hand
     /// each of them the other's factory defaults.
     SwapInserts {
-        a_strip: usize,
-        a_bay: usize,
-        b_strip: usize,
-        b_bay: usize,
+        a: crate::desk_id::SeatBay,
+        b: crate::desk_id::SeatBay,
     },
     /// **Carry a unit to an EMPTY bay of the SAME STRIP.** The owner: "drag
     /// slot 1 into unoccupied slot two? it moves." A swap needs two units
@@ -2765,19 +2636,15 @@ pub enum RecorderRequest {
     /// to move into. Host-side for `CopyInsert`'s reason: the unit's live
     /// state travels with it.
     ///
-    /// **Two seats, not one**, because a strip's six slots are not one rack:
-    /// a channel's 0..2 are its own seat and its 3..5 its folder-extra one
-    /// (see [`seat_bay`] and [`rack_owner`]). One `strip` field could only
-    /// ever express a move INSIDE a group of three, which is precisely the
-    /// fault the owner reported — "drag only works between each group of 3".
-    /// Whether the two seats are the same STRIP is the caller's question and
-    /// `rack_owner` is where it is answered; this carries whatever the
-    /// caller decided a move.
+    /// **Two bays, not one**, because a strip's six slots are not one rack:
+    /// a channel's 0..2 are its own rack and its 3..5 its second. One rack
+    /// field could only ever express a move INSIDE a group of three, which
+    /// is precisely the fault the owner reported — "drag only works between
+    /// each group of 3". Whether the two bays are the same STRIP is the
+    /// caller's question; this carries whatever the caller decided a move.
     MoveInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: usize,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::SeatBay,
     },
     // ── the DX7 bank builder ────────────────────────────────────────────
     //
@@ -2855,10 +2722,15 @@ pub enum RecorderRequest {
     /// PLAYING at is the thing being pasted, and only the host can ask a
     /// live instance for it. Appended at the END, this enum's law.
     PasteInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: usize,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::SeatBay,
+    },
+    /// **A Tangent Insert bay's routing or ping.** Appended at the END, this
+    /// enum's law. `bay` by identity, the `SetInsertIr` convention; the host
+    /// checks a route against the device before it writes the bay's state.
+    HwInsert {
+        bay: crate::desk_id::SeatBay,
+        ask: crate::faces_hwinsert::HwAsk,
     },
 }
 
@@ -3796,6 +3668,16 @@ pub enum NumField {
     /// word rather than a number — the machinery is the same, and a second
     /// inline-typing system for one field would be the thing to explain.
     MarkerName(usize),
+    /// **The metronome panel's BEATS field**: the top number of the song's
+    /// signature, typed on its own. The owner's ask: "make it so that the
+    /// beats and note fields in the metronome menu are typed fields so they
+    /// can accomodate odd signatures". A plain whole number, 1 to 32 - see
+    /// [`TimeSignature::with_typed_beats`].
+    MetBeats,
+    /// **The metronome panel's NOTE field**: the bottom number, typed on its
+    /// own. 1, 2, 4, 8, 16 or 32 and nothing else - see
+    /// [`TimeSignature::with_typed_unit`].
+    MetUnit,
 }
 
 impl NumField {
@@ -3804,6 +3686,10 @@ impl NumField {
     /// purpose: a new variant is appended at the END (this enum's law) and has
     /// to say where it lives, rather than defaulting to one side and being
     /// cleared, or kept, by accident.
+    ///
+    /// **The metronome's two are not the band's.** Its panel hangs on the
+    /// timeline or the desk, never on the band, so hiding the band must not
+    /// close a field somebody is typing into over the lanes.
     pub fn lives_in_band(self) -> bool {
         match self {
             NumField::Master
@@ -3813,8 +3699,24 @@ impl NumField {
             | NumField::VariMin
             | NumField::VariMax
             | NumField::Varispeed => true,
-            NumField::MeterAt(_) | NumField::MarkerName(_) => false,
+            NumField::MeterAt(_)
+            | NumField::MarkerName(_)
+            | NumField::MetBeats
+            | NumField::MetUnit => false,
         }
+    }
+
+    /// **Whether the field is typed into the METRONOME's panel**, and so
+    /// lives exactly as long as that panel does.
+    pub fn lives_in_metronome(self) -> bool {
+        matches!(self, NumField::MetBeats | NumField::MetUnit)
+    }
+
+    /// **Whether the field is typed into the varispeed's RANGE panel**, and
+    /// so lives exactly as long as that panel does - the rule
+    /// [`NumField::lives_in_metronome`] keeps for the metronome's two.
+    pub fn lives_in_vari_range(self) -> bool {
+        matches!(self, NumField::VariMin | NumField::VariMax)
     }
 }
 
@@ -3978,6 +3880,14 @@ impl NumEdit {
         if matches!(field, NumField::Meter | NumField::MeterAt(_)) {
             let ok = ch.is_ascii_digit() || (ch == '/' && !text.contains('/'));
             return (ok && text.len() < MAX).then_some(MAX);
+        }
+        // **The metronome's halves of a signature are whole numbers and
+        // nothing else**: no slash, because each field IS one side of it, and
+        // no minus or point, which no beat count or note value has. A digit
+        // too many still goes in - 33 is refused when it is committed, never
+        // trimmed to a 3 nobody typed.
+        if field.lives_in_metronome() {
+            return (ch.is_ascii_digit() && text.len() < MAX).then_some(MAX);
         }
         let ok = ch.is_ascii_digit()
             // One dot, and a minus only in front. Neither check is about
@@ -4170,6 +4080,37 @@ impl TimeSignature {
         };
         sig.is_valid().then_some(sig)
     }
+
+    /// This signature with its TOP number typed in: the metronome panel's
+    /// BEATS field.
+    ///
+    /// **Refused, never clamped.** `None` unless the text is a whole number
+    /// [`Self::is_valid`] allows here: 33 is not "as many as there can be",
+    /// it is a number this field cannot take, and the reading the owner was
+    /// looking at is still the one they have - the rule every typed field
+    /// keeps (`commit_number`).
+    pub fn with_typed_beats(self, text: &str) -> Option<Self> {
+        let sig = Self { beats: typed_number(text)?, ..self };
+        sig.is_valid().then_some(sig)
+    }
+
+    /// This signature with its BOTTOM number typed in: the metronome panel's
+    /// NOTE field. A power of two up to 32 or nothing - 3 and 12 are refused,
+    /// not rounded to a note value somebody did not type.
+    pub fn with_typed_unit(self, text: &str) -> Option<Self> {
+        let sig = Self { unit: typed_number(text)?, ..self };
+        sig.is_valid().then_some(sig)
+    }
+}
+
+/// A whole number as somebody types one into a field: digits and nothing
+/// else. Stricter than `str::parse`, which takes a leading `+`.
+fn typed_number(text: &str) -> Option<u8> {
+    let t = text.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
 }
 
 /// One audio device, as the status panel reports it.
@@ -4405,6 +4346,9 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The shipped desk's thirty-two rows, the width these tests were written
+    // against: a legacy number since the desk became the rows that exist.
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     /// **A field opens on its reading, and the first thing typed replaces
     /// it.**
@@ -4530,6 +4474,93 @@ mod tests {
         assert_eq!(typed(NumField::Tempo, "12d0"), "120", "a letter reached a number");
         assert_eq!(typed(NumField::Tempo, "1/20"), "120", "a slash reached a number");
     }
+
+    /// **The metronome's BEATS and NOTE fields take digits and nothing
+    /// else**, and opening one on its reading still lets the first digit
+    /// replace it.
+    ///
+    /// Each is ONE side of a signature, so a slash has no place in it - "7/8"
+    /// typed into BEATS is "78", which the commit then refuses - and neither
+    /// a beat count nor a note value has a sign or a point. Letters are the
+    /// app's single-key shortcuts arriving at a field with focus, and must
+    /// not land. A digit past 32 still goes in: trimming it at the keyboard
+    /// would turn a typed 33 into a 3 nobody asked for.
+    ///
+    /// Revert-checks, both performed: drop the metronome branch from
+    /// `accepts` and the field falls to the numeric filter, which takes the
+    /// `.`; put the two in `lives_in_band` and the place assertion goes red.
+    #[test]
+    fn the_metronome_fields_take_digits_and_nothing_else() {
+        let typed = |field: NumField, s: &str| {
+            let mut e = NumEdit::new(field);
+            for ch in s.chars() {
+                e.push(ch);
+            }
+            e.text
+        };
+        for f in [NumField::MetBeats, NumField::MetUnit] {
+            assert_eq!(typed(f, "7"), "7");
+            assert_eq!(typed(f, "15"), "15");
+            assert_eq!(typed(f, "7/8"), "78", "{f:?} took a slash");
+            assert_eq!(typed(f, "1.5"), "15", "{f:?} took a point");
+            assert_eq!(typed(f, "-3"), "3", "{f:?} took a sign");
+            assert_eq!(typed(f, "1a2b"), "12", "{f:?} took a letter");
+            assert_eq!(typed(f, "333"), "333", "{f:?} trimmed digits at the keyboard");
+            assert!(f.lives_in_metronome() && !f.lives_in_band(), "{f:?} lives somewhere else");
+            // Opened on the reading, the first digit replaces it.
+            let mut e = NumEdit::prefilled(f, "4".to_owned());
+            e.push('x');
+            assert_eq!(e.text, "4", "{f:?}: a refused key cleared the reading");
+            e.push('7');
+            assert_eq!(e.text, "7", "{f:?}: typing appended to the reading");
+        }
+        assert!(!NumField::Meter.lives_in_metronome());
+    }
+
+    /// **A typed half of a signature is refused, never clamped.**
+    ///
+    /// The range is exactly `TimeSignature::is_valid`'s: any beat count from
+    /// 1 to 32 over the signature's own note value, and 1, 2, 4, 8, 16 or 32
+    /// under its own beat count. Everything else is `None` - not the nearest
+    /// legal number - so a slip of the finger keeps the signature somebody
+    /// was looking at rather than inventing one.
+    ///
+    /// Revert-checks, all three performed: clamp the beats into 1..=32 and 0
+    /// comes back as a signature of 1; round the unit up to a power of two
+    /// and 0 comes back as 1; drop the digits-only rule and "+3" parses.
+    #[test]
+    fn a_typed_half_of_a_signature_is_refused_never_clamped() {
+        let sig = TimeSignature { beats: 4, unit: 8 };
+        for beats in 1..=32u8 {
+            assert_eq!(
+                sig.with_typed_beats(&beats.to_string()),
+                Some(TimeSignature { beats, unit: 8 }),
+                "{beats} beats was refused"
+            );
+        }
+        for junk in ["0", "33", "99", "255", "256", "300", "", "  ", "+3", "-1", "7/8", "3.0", "abc"] {
+            assert_eq!(sig.with_typed_beats(junk), None, "{junk:?} beats was accepted");
+        }
+        for unit in [1u8, 2, 4, 8, 16, 32] {
+            assert_eq!(
+                sig.with_typed_unit(&unit.to_string()),
+                Some(TimeSignature { beats: 4, unit }),
+                "a unit of {unit} was refused"
+            );
+        }
+        for junk in ["0", "3", "5", "6", "7", "12", "24", "64", "128", "", "+4", "8/", "x"] {
+            assert_eq!(sig.with_typed_unit(junk), None, "{junk:?} as a unit was accepted");
+        }
+        // Each half leaves the other alone.
+        assert_eq!(
+            TimeSignature { beats: 15, unit: 32 }.with_typed_unit("16"),
+            Some(TimeSignature { beats: 15, unit: 16 })
+        );
+        assert_eq!(
+            TimeSignature { beats: 3, unit: 1 }.with_typed_beats("11"),
+            Some(TimeSignature { beats: 11, unit: 1 })
+        );
+    }
     /// **Every pad of every channel gets its own seat, and no old seat moved.**
     ///
     /// A drum instrument loads a full instance per channel, so the pad racks
@@ -4539,7 +4570,9 @@ mod tests {
     /// pad.
     #[test]
     fn every_channels_pads_have_their_own_seats_and_nothing_moved() {
-        use super::{pad_rack_index, CHANNELS, DRUM_PADS, MASTER_EXTRA_SEAT, STRIPS, TOTAL_SEATS};
+        use super::DRUM_PADS;
+        use crate::desk_legacy::{pad_rack_index, MASTER_EXTRA_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
         // Channel 0 keeps the ORIGINAL block. This is the assertion that
         // stops a saved session's pad plugins from moving.
         for pad in [0usize, 36, 127] {
@@ -4632,20 +4665,23 @@ mod tests {
     #[test]
     fn live_midi_reaches_armed_lanes_and_the_editors_lane_alone() {
         use super::{live_midi_off, ChannelKind};
-        let off = |ch: usize, m: u32| m & (1 << ch) != 0;
+        // One answer per row (W6): `true` is deaf.
+        let off = |ch: usize, m: &[bool]| m[ch];
         let mut kinds = vec![None; CHANNELS];
         kinds[0] = Some(ChannelKind::Midi);
         kinds[1] = Some(ChannelKind::Midi);
         kinds[2] = Some(ChannelKind::Audio);
+        let armed = |rows: &[usize], n: usize| -> Vec<bool> { (0..n).map(|r| rows.contains(&r)).collect() };
+        let width = kinds.len();
 
         // Nothing armed: silence. The editor is the ONE exception below.
-        let m = live_midi_off(&kinds, 0, None);
-        assert!(off(0, m) && off(1, m) && off(2, m));
+        let m = live_midi_off(&kinds, &armed(&[], width), None);
+        assert!(off(0, &m) && off(1, &m) && off(2, &m));
 
         // ARMED sounds, and it is the only thing that does.
-        let m = live_midi_off(&kinds, 1 << 1, None);
-        assert!(!off(1, m), "an armed MIDI lane takes no notes");
-        assert!(off(0, m));
+        let m = live_midi_off(&kinds, &armed(&[1], width), None);
+        assert!(!off(1, &m), "an armed MIDI lane takes no notes");
+        assert!(off(0, &m));
 
         // **An UNARMED lane is silent whatever else is true of it.** This is
         // the owner's 2026-09-07 ruling and the regression guard for it: the
@@ -4654,38 +4690,43 @@ mod tests {
         // heard. There is no selection in this function's arguments any more,
         // which is the strongest form the rule can take — but the case worth
         // naming is lane 0 live while lane 1 is the armed one.
-        let m = live_midi_off(&kinds, 1 << 1, None);
-        assert!(off(0, m), "an unarmed MIDI lane was handed the keyboard");
+        let m = live_midi_off(&kinds, &armed(&[1], width), None);
+        assert!(off(0, &m), "an unarmed MIDI lane was handed the keyboard");
 
         // An armed AUDIO lane is still an audio lane. Rule 1 outranks rule 2.
-        let m = live_midi_off(&kinds, 1 << 2, None);
-        assert!(off(2, m), "an audio lane was handed a note");
+        let m = live_midi_off(&kinds, &armed(&[2], width), None);
+        assert!(off(2, &m), "an audio lane was handed a note");
 
         // **The editor takes the desk.** Both lanes armed, editor open on
         // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, pianoteq
         // on track 2, audition note, it triggers BOTH".
-        let m = live_midi_off(&kinds, 0b11, Some(1));
-        assert!(!off(1, m), "the edited lane went quiet");
-        assert!(off(0, m), "the other armed instrument sounded too");
+        let m = live_midi_off(&kinds, &armed(&[0, 1], width), Some(1));
+        assert!(!off(1, &m), "the edited lane went quiet");
+        assert!(off(0, &m), "the other armed instrument sounded too");
 
         // **And the editor still needs no arm** — the one road to an audition
         // that survived rule 2 losing its selection clause.
-        let m = live_midi_off(&kinds, 0, Some(1));
-        assert!(!off(1, m), "the editor's own lane needs arming now");
+        let m = live_midi_off(&kinds, &armed(&[], width), Some(1));
+        assert!(!off(1, &m), "the editor's own lane needs arming now");
 
         // And an editor somehow open on an audio lane silences every
         // CHANNEL rather than opening the desk up.
-        let all = ((1u64 << CHANNELS) - 1) as u32;
-        assert_eq!(live_midi_off(&kinds, 0b11, Some(2)), all);
+        assert!(live_midi_off(&kinds, &armed(&[0, 1], width), Some(2)).iter().all(|o| *o));
 
-        // **The strips past the channels are never in this mask.** Drums,
-        // click and fx read it for their own bit and have never been gated
-        // by it; a mask built as "everything off, then open the live ones"
-        // reaches them where the old one did not.
-        for (armed, ed) in [(0u32, None), (0b11, Some(1)), (0, Some(1))] {
-            let m = live_midi_off(&kinds, armed, ed);
-            assert_eq!(m & !all, 0, "a strip past the channels was gated: {m:#x}");
+        // **One answer per row, as many as the desk has, and no more.** The
+        // strips past the rows (drums, click, fx) read their own flags and
+        // were never in this answer; it was a word that stopped at row
+        // thirty-one, and it is a list now (W6).
+        for (rows, ed) in [(vec![], None), (vec![0, 1], Some(1)), (vec![], Some(1))] {
+            assert_eq!(live_midi_off(&kinds, &armed(&rows, width), ed).len(), width);
         }
+        // **A row past the old word hears its keys**: an armed MIDI track on
+        // row forty of a desk of forty-one.
+        let mut wide = vec![None; 41];
+        wide[40] = Some(ChannelKind::Midi);
+        let m = live_midi_off(&wide, &armed(&[40], 41), None);
+        assert!(!off(40, &m), "an armed track past row thirty-one took no notes");
+        assert!(m[..40].iter().all(|o| *o));
     }
 
 
@@ -5022,9 +5063,8 @@ mod tests {
     /// else's plugin, silently.
     #[test]
     fn the_masters_six_bays_live_in_two_racks_and_nobody_elses_move() {
-        use super::{
-            bays_on, seat_bay, Strip, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT,
-        };
+        use super::{bays_on, Strip, INSERTS};
+        use crate::desk_legacy::{pad_insert_index, seat_bay, V32_INSERT_SPACE as INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT};
         assert_eq!(bays_on(None), INSERTS * 2, "the master lost its second rack");
         assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS * 2);
 
@@ -5073,11 +5113,9 @@ mod tests {
     /// appended seat is distinct from every seat that already existed.
     #[test]
     fn a_folders_six_slots_have_their_own_appended_seats() {
-        use super::{
-            amp_pedal_of, amp_pedal_seat, bays_on, folder_extra_seat, pad_rack_index, seat_bay,
-            seat_order, Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
-            MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
-        };
+        use super::{bays_on, Strip, AMP_PEDALS, DRUM_PADS, INSERTS};
+        use crate::desk_legacy::{amp_pedal_of, amp_pedal_seat, folder_extra_seat, pad_rack_index, seat_bay, V32_INSERT_SPACE as INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
+        use crate::desk_legacy::V32_STRIPS as STRIPS;
         // The counts: **every channel wears six**, folder or not — the
         // owner's ruling, see `bays_on`. The two buses keep their three; the
         // master keeps its six.
@@ -5144,39 +5182,10 @@ mod tests {
             "the last pedal bay is past the end of the insert space"
         );
 
-        // **seat_order carries the extra seat AND the pedalboard with its
-        // channel** and moves nothing else - two channel rows, two folder
-        // seats and two boards of seven for one swap, identity elsewhere.
-        let mut order: Vec<usize> = (0..CHANNELS).collect();
-        order.swap(2, 5);
-        let full = seat_order(&order);
-        assert_eq!(full.len(), TOTAL_SEATS);
-        assert_eq!(full[2], 5);
-        assert_eq!(full[5], 2);
-        assert_eq!(full[folder_extra_seat(2)], folder_extra_seat(5));
-        assert_eq!(full[folder_extra_seat(5)], folder_extra_seat(2));
-        for pedal in 0..AMP_PEDALS {
-            assert_eq!(full[amp_pedal_seat(2, pedal)], amp_pedal_seat(5, pedal));
-            assert_eq!(full[amp_pedal_seat(5, pedal)], amp_pedal_seat(2, pedal));
-        }
-        assert_eq!(full[MASTER_SEAT], MASTER_SEAT);
-        assert_eq!(full[MASTER_EXTRA_SEAT], MASTER_EXTRA_SEAT);
-        assert_eq!(
-            (0..TOTAL_SEATS).filter(|i| full[*i] != *i).count(),
-            4 + 2 * AMP_PEDALS,
-            "the swap moved more than its own rows"
-        );
-
-        // And a SEAT-space permutation - the pad-FX swap's shape - passes
-        // through instead of collapsing to identity, which silently parted
-        // two pads' plugins from their state files.
-        let (a, b) = (pad_rack_index(0, 3), pad_rack_index(0, 7));
-        let mut pads: Vec<usize> = (0..TOTAL_SEATS.min(b + 1).max(b + 1)).collect();
-        pads[a] = b;
-        pads[b] = a;
-        let lifted = seat_order(&pads);
-        assert_eq!(lifted[a], b, "the pad swap was dropped");
-        assert_eq!(lifted[b], a, "the pad swap was dropped");
+        // `seat_order`, which lifted a channel order onto every seat, is
+        // gone with the seats themselves (W5): a reorder moves no plugin, so
+        // there is no order to lift, and a pad swap is a relabel of two
+        // pads' bays by identity (`TangentApp::swap_pads`).
     }
 
     /// **A folder-extra seat names its own channel, and nothing else does.**
@@ -5199,10 +5208,8 @@ mod tests {
     /// all in a spot check.
     #[test]
     fn a_folder_extra_seat_names_its_own_channel_and_nothing_else() {
-        use super::{
-            amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, AMP_PEDALS,
-            CHANNELS, MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
-        };
+        use super::AMP_PEDALS;
+        use crate::desk_legacy::{amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, MASTER_EXTRA_SEAT, MASTER_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
         for ch in 0..CHANNELS {
             assert_eq!(
                 folder_extra_of(folder_extra_seat(ch)),
@@ -5671,8 +5678,9 @@ mod fader_tests {
     #[test]
     fn the_click_starts_under_the_music_and_out_of_the_file() {
         let k = Knobs::default();
+        // The rows' faders are their own now (W6), not one of the knobs.
         assert!(
-            k.gains.channels.iter().all(|g| k.gains.metronome < *g),
+            crate::settings::Settings::default().rows.iter().all(|r| k.gains.metronome < r.gain as f32),
             "the click starts under EVERY channel, not just the first"
         );
         assert!(!k.metronome_in_take, "a click in the file is a ruined take");
@@ -6370,7 +6378,7 @@ mod missing_tests {
     /// eight is not something anybody can act on.
     #[test]
     fn a_channel_says_which_one() {
-        for i in 0..crate::recorder::CHANNELS {
+        for i in 0..crate::desk_lift::V32_CHANNELS {
             let said = Strip::Channel(i).label();
             assert_eq!(said, format!("channel {}", i + 1));
         }
@@ -6388,4 +6396,381 @@ fn resting_scope() -> &'static crate::scope::Scope {
 fn resting_analyzer() -> &'static crate::analyzer::Analyzer {
     static A: std::sync::OnceLock<crate::analyzer::Analyzer> = std::sync::OnceLock::new();
     A.get_or_init(|| crate::analyzer::Analyzer::new(48_000.0))
+}
+
+/// The column and strip types, and the scan that keeps the views off
+/// strip-index arithmetic (docs/design/unlimited-tracks.md, W2-views-windowed).
+#[cfg(test)]
+mod strip_ref_tests {
+    // The shipped desk's thirty-two rows, a legacy width (W6).
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
+    use super::*;
+
+    /// **A column, its strip and its settings' key agree, by name.** The
+    /// aliasing pin re-pinned on the enum: the click is the click's column
+    /// and its own special, the master the master's, and every track its own
+    /// row. `Column(usize)` called the click's desk index the master's
+    /// column; no number links any of them any more (W5: the specials keep
+    /// their settings by what each is, `StripRef::special`).
+    #[test]
+    fn a_column_a_strip_and_its_settings_key_name_the_same_thing() {
+        for col in Column::every(CHANNELS) {
+            let r = col.strip_ref();
+            assert_eq!(r.column(), Some(col), "{col} does not come back from its StripRef");
+            assert_eq!(col.strip(), r.strip(), "{col} and its StripRef name different strips");
+            match (r, r.special()) {
+                (StripRef::Row(row), None) => assert_eq!(col.row(), Some(row)),
+                (_, Some(node)) => assert_eq!(StripRef::of_special(node), Some(r), "{col}'s special"),
+                (_, None) => panic!("{col} is neither a row nor a special"),
+            }
+            if let Some(s) = col.strip() {
+                assert_eq!(s.column_of(), Some(col));
+                assert_eq!(StripRef::from(s), r);
+            }
+        }
+        assert_eq!(Column::Click.strip(), Some(Strip::Click));
+        assert_eq!(Column::Master.strip(), None);
+        assert_eq!(Column::Click.strip_ref().special(), Some(crate::desk_id::Node::Click));
+        assert_eq!(Column::Master.strip_ref().special(), Some(crate::desk_id::Node::Master));
+        // The two buses with no column have none.
+        assert_eq!(Strip::Drums.column_of(), None);
+        assert_eq!(Strip::Fx.column_of(), None);
+        // A track column past today's desk is still THAT track: the old
+        // `Column(n)` answered "the master" for any n past the click.
+        assert_eq!(Column::Track(40).strip(), Some(Strip::Channel(40)));
+        assert_eq!(Column::Track(40).row(), Some(40));
+        // Drawn order: every track, then the click, then the master.
+        let order: Vec<Column> = Column::every(3).collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+        assert_eq!(
+            order,
+            vec![Column::Track(0), Column::Track(1), Column::Track(2), Column::Click, Column::Master]
+        );
+    }
+
+    /// **Every special is one StripRef and one key, and every legacy strip
+    /// is one StripRef**, and the automation lane space keeps the master
+    /// apart from the drum bus, which shared its number in the strip arrays
+    /// while the specials lived there.
+    #[test]
+    fn every_special_and_legacy_strip_is_one_strip_ref_and_the_auto_lanes_keep_the_master_apart() {
+        let keys: Vec<crate::desk_id::Node> = StripRef::SPECIALS.iter().filter_map(|s| s.special()).collect();
+        assert_eq!(keys, crate::desk_id::Node::SPECIALS.to_vec(), "the specials are not the four nodes in order");
+        for s in StripRef::SPECIALS {
+            assert_eq!(s.special().and_then(StripRef::of_special), Some(s));
+            assert_eq!(s.row(), None, "{s:?} answers a row");
+        }
+        assert_eq!(StripRef::Row(3).special(), None);
+        // The legacy strip space, `desk_legacy`'s alone, is one-to-one.
+        let legacy: Vec<StripRef> = (0..=crate::desk_legacy::V32_STRIPS)
+            .map(|i| crate::desk_legacy::strip_at_v32(i).unwrap_or_else(|| panic!("legacy strip {i} is nobody")))
+            .collect();
+        for (i, r) in legacy.iter().enumerate() {
+            assert_eq!(crate::desk_legacy::v32_strip(*r), Some(i));
+        }
+        // **The master's lane is the master's by name** (W6): no number
+        // past the rows means it, so a row at any width is a row.
+        use crate::automation::AutoLane;
+        assert_eq!(StripRef::Master.auto_lane(), Some(AutoLane::Master));
+        assert_eq!(StripRef::Drums.auto_lane(), None, "the drum bus took the master's lane");
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Master), StripRef::Master);
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Row(3)), StripRef::Row(3));
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Row(CHANNELS)), StripRef::Row(CHANNELS));
+        assert_eq!(StripRef::Row(CHANNELS * 2).auto_lane(), Some(AutoLane::Row(CHANNELS * 2)));
+    }
+
+    /// The code a scan reads: comments dropped, and every top-level
+    /// `#[cfg(test)]` module cut out wherever it stands (the views' tests
+    /// build fixtures and may say whatever they like; `recorder_panel.rs`
+    /// has production code after its first one, so cutting at the first
+    /// would hide it). A top-level module ends at the first `}` in column
+    /// zero, which is rustfmt's shape and saves counting braces through
+    /// strings and comments.
+    fn code_of(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < lines.len() {
+            let next = lines.get(k + 1).copied().unwrap_or("");
+            if lines[k].trim_end() == "#[cfg(test)]"
+                && (next.starts_with("mod ") || next.starts_with("pub(crate) mod "))
+            {
+                k += 2;
+                while k < lines.len() && lines[k].trim_end() != "}" {
+                    k += 1;
+                }
+                k += 1;
+                continue;
+            }
+            out.push(lines[k].split("//").next().unwrap_or(""));
+            k += 1;
+        }
+        out.join("\n")
+    }
+
+    /// One function's body out of a source file, by its signature's start.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone; re-anchor the scan"));
+        let open = at + src[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[at..open + k + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{sig}` never closes")
+    }
+
+    /// What the scan refuses in view code, and the reason for each.
+    fn banned_in(code: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in code.lines().enumerate() {
+            let squashed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            let hits = [
+                // A pinned strip found by adding to the width.
+                squashed.contains("CHANNELS +") || squashed.contains("CHANNELS+"),
+                // The master's slot by the strips' count.
+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| w == "STRIPS" || w == "MASTER_LANE" || w == "MASTER_COLUMN"),
+                // A column or lane tested against the width.
+                ["< CHANNELS", "<= CHANNELS", "> CHANNELS", ">= CHANNELS", "< recorder::CHANNELS",
+                    ">= recorder::CHANNELS", "> recorder::CHANNELS", "<= recorder::CHANNELS",
+                    "< crate::recorder::CHANNELS", ">= crate::recorder::CHANNELS"]
+                    .iter()
+                    .any(|p| squashed.contains(p)),
+            ];
+            if hits.iter().any(|h| *h) {
+                out.push(format!("{}: {}", n + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// The view builders and hit dispatch in `app.rs`: what builds a view,
+    /// and what turns a press on one into a change.
+    const APP_VIEW_FNS: [&str; 16] = [
+        "fn mixer_view(&self)",
+        "pub(crate) fn mixer_view_in(",
+        "fn mixer_view_of(",
+        "fn mixer_view_rows(",
+        "fn arrange_view<'a>(",
+        "fn arr_lane_window(",
+        "fn arr_clip_views(",
+        "fn scrub_view(",
+        "fn arrangement_input(",
+        "fn apply_arrange_key(",
+        "fn apply_mixer_hit(",
+        "fn apply_mixer_hit_spread(",
+        "fn apply_mixer_hit_one(",
+        "fn mixer_value(",
+        "pub fn strip_color(",
+        "fn arr_open_automation_menu(",
+    ];
+
+    /// **No view does strip-index arithmetic.** Not `CHANNELS +` (a pinned
+    /// strip found by adding to the width), not `STRIPS`, `MASTER_LANE` or
+    /// `MASTER_COLUMN` (the master by a count), and not a column tested
+    /// against the width: in the three panels, and in the app's view
+    /// builders and hit dispatch. `StripRef` is where that arithmetic lives
+    /// until the specials leave strip space, so the day the desk stops
+    /// being a fixed width the views are not where it breaks.
+    ///
+    /// Revert-check: put `Hit::BusBay(_, b) => Some((recorder::STRIPS, b))`
+    /// back in `arrangement_input`, or `let click_col = CHANNELS;` back in
+    /// `mixer_panel::Layout::new`, and this names the line.
+    #[test]
+    fn no_view_code_does_strip_index_arithmetic() {
+        let mut bad = Vec::new();
+        for (file, src) in [
+            ("mixer_panel.rs", include_str!("mixer_panel.rs")),
+            ("arrangement_panel.rs", include_str!("arrangement_panel.rs")),
+            ("recorder_panel.rs", include_str!("recorder_panel.rs")),
+        ] {
+            for hit in banned_in(&code_of(src)) {
+                bad.push(format!("{file}:{hit}"));
+            }
+        }
+        let app = include_str!("app.rs");
+        for sig in APP_VIEW_FNS {
+            for hit in banned_in(&code_of(body_of(app, sig))) {
+                bad.push(format!("app.rs {sig}: {hit}"));
+            }
+        }
+        assert!(bad.is_empty(), "strip-index arithmetic in view code:\n  {}", bad.join("\n  "));
+        // And the scan can see what it bans: a planted line of each kind.
+        for planted in [
+            concat!("let click_col = CHANNELS", " + 1;"),
+            "Some((recorder::STRIPS, b))",
+            "if i >= CHANNELS { return; }",
+            "let m = MASTER_LANE;",
+        ] {
+            assert!(!banned_in(planted).is_empty(), "the scan is blind to `{planted}`");
+        }
+    }
+
+    /// **The seat map's names** (`desk_legacy`'s retired half): none may be
+    /// spelled by live code outside the map, because each one is a way to
+    /// work out a seat, and a bay is named by identity now.
+    const RETIRED_SEAT_NAMES: [&str; 21] = [
+        "seat_bay", "rack_owner", "bus_extra_of", "folder_extra_seat", "folder_extra_of", "amp_pedal_seat",
+        "amp_pedal_of", "pedal_owner", "bus_extra_seat", "pad_rack_index", "pad_insert_index", "seat_order",
+        "MASTER_SEAT", "MASTER_EXTRA_SEAT", "EXTRA_PAD_SEATS", "FOLDER_EXTRA_SEATS", "AMP_PEDAL_SEATS",
+        "BUS_EXTRA_SEATS", "TOTAL_SEATS", "INSERT_SPACE", "BUSES",
+    ];
+
+    /// Every line of `code` that spells a retired seat name, as a word.
+    fn seat_names_in(code: &str) -> Vec<String> {
+        code.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| RETIRED_SEAT_NAMES.contains(&w))
+            })
+            .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
+            .collect()
+    }
+
+    /// The modules `lib.rs` compiles only under test: whatever they spell is
+    /// a fixture's business.
+    fn test_only_modules(lib: &str) -> Vec<String> {
+        let lines: Vec<&str> = lib.lines().collect();
+        lines
+            .windows(2)
+            .filter(|w| w[0].trim() == "#[cfg(test)]")
+            .filter_map(|w| {
+                let rest = w[1].trim().strip_prefix("pub(crate) ").unwrap_or(w[1].trim());
+                Some(format!("{}.rs", rest.strip_prefix("mod ")?.trim_end_matches(';').trim()))
+            })
+            .collect()
+    }
+
+    /// **No live code in this crate works out a seat** (W5-identity-maps:
+    /// "no seat arithmetic in tangent-ui outside desk_legacy"). The seat
+    /// map's names are spelled only in `desk_legacy`, which IS the frozen
+    /// map; the re-export this crate kept of them here, for the engine's and
+    /// the host's readers, went in W8 once every reader named `desk_legacy`
+    /// itself, so this file is read whole. Every other file names a bay by identity; a host-facing
+    /// `(seat, bay)` crosses through `desk_legacy::bay_at` and `seat_of`,
+    /// which are the map, not arithmetic on it. Test modules are left to
+    /// their fixtures.
+    ///
+    /// Revert-check: put `let (seat, bay) = desk_legacy::seat_bay(n, bay);`
+    /// back into `apply_arrange_action`'s `HdrBay` arm and this names it.
+    #[test]
+    fn no_live_code_works_out_a_seat() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib = std::fs::read_to_string(dir.join("lib.rs")).expect("lib.rs");
+        let skip = test_only_modules(&lib);
+        assert!(skip.iter().any(|m| m == "era_corpus.rs"), "fixture: the test-only modules were not found: {skip:?}");
+        let mut bad = Vec::new();
+        let mut read = 0;
+        for entry in std::fs::read_dir(&dir).expect("the source dir") {
+            let path = entry.expect("an entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if !name.ends_with(".rs") || name == "desk_legacy.rs" || skip.contains(&name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            read += 1;
+            let code = code_of(&text);
+            for hit in seat_names_in(&code) {
+                bad.push(format!("{name}:{hit}"));
+            }
+        }
+        assert!(read > 40, "the scan read {read} files: it is not reading the crate");
+        assert!(bad.is_empty(), "live code works out a seat:\n  {}", bad.join("\n  "));
+        // And the scan sees what it bans.
+        for planted in [
+            "let (seat, bay) = crate::desk_legacy::seat_bay(n, bay);",
+            "self.set_insert(crate::desk_legacy::MASTER_SEAT, 2, None);",
+            "let seat = crate::desk_legacy::amp_pedal_seat(ch, 2);",
+        ] {
+            assert!(!seat_names_in(planted).is_empty(), "the scan is blind to `{planted}`");
+        }
+    }
+
+    /// Every line of `code` that reads the legacy strip space: the old
+    /// width of it (`STRIPS`), the old index doors (`MASTER_INDEX`,
+    /// `from_desk_index`), the legacy strip order (`Strip::all`), or a
+    /// `Strip`'s legacy place (`Strip::...index()`).
+    fn strip_space_in(code: &str) -> Vec<String> {
+        code.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let words = || line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+                words().any(|w| matches!(w, "STRIPS" | "MASTER_INDEX" | "from_desk_index"))
+                    || line.contains("Strip::all(")
+                    || line.find("Strip::").is_some_and(|at| line[at..].contains(".index()"))
+            })
+            .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
+            .collect()
+    }
+
+    /// **No live code in this crate reads strip space** (W5-identity-maps:
+    /// "the specials leave strip space", and no width sum in tangent-ui
+    /// outside desk_legacy). A strip's name, colour, send and switches are
+    /// read and written by what it is (`Settings::strip_name` and its
+    /// siblings), a row's at its row and a special's in `Settings::specials`,
+    /// so no array has a slot past the rows and nothing finds the click or
+    /// the master by adding to the width. The legacy strip space (rows, then
+    /// the drum bus, the click, the effects return, the master last) is
+    /// `desk_legacy`'s alone, where the legacy files and the shims that still
+    /// speak it cross through `v32_strip` and its siblings. Test modules are
+    /// left to their fixtures.
+    ///
+    /// Revert-check: put `let i = recorder::Strip::Click.index();` into
+    /// `mixer_view_rows`'s strip closure, or the old `STRIPS` constant (the
+    /// channel count and the three buses) back above `bays_on`, and this
+    /// names the line.
+    #[test]
+    fn no_live_code_reads_strip_space() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib = std::fs::read_to_string(dir.join("lib.rs")).expect("lib.rs");
+        let skip = test_only_modules(&lib);
+        let mut bad = Vec::new();
+        let mut read = 0;
+        for entry in std::fs::read_dir(&dir).expect("the source dir") {
+            let path = entry.expect("an entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if !name.ends_with(".rs") || name == "desk_legacy.rs" || skip.contains(&name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            read += 1;
+            for hit in strip_space_in(&code_of(&text)) {
+                bad.push(format!("{name}:{hit}"));
+            }
+        }
+        assert!(read > 40, "the scan read {read} files: it is not reading the crate");
+        assert!(bad.is_empty(), "live code reads strip space:\n  {}", bad.join("\n  "));
+        // And the scan sees what it bans; a strip by what it is passes.
+        for planted in [
+            "let at = recorder::Strip::Drums.index();",
+            "for s in Strip::all() {",
+            "let m = recorder::STRIPS;",
+            "let i = StripRef::from_desk_index(n);",
+        ] {
+            assert!(!strip_space_in(planted).is_empty(), "the scan is blind to `{planted}`");
+        }
+        for fine in [
+            "let n = self.settings.strip_name(StripRef::Click);",
+            "let w = crate::desk_legacy::V32_STRIPS;",
+            "let r = self.desk_index().rank_of(row);",
+        ] {
+            assert!(strip_space_in(fine).is_empty(), "the scan bans `{fine}`");
+        }
+    }
 }

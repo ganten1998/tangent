@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Package Tangent — the STANDALONE, one installer per platform. The VST3
-# plugin is RETIRED (2026-08-24, the owner's ruling): Tangent is a DAW and
-# does not load through another; there is one option and it is the app.
+# Package Tangent, one installer per platform.
 #
 #   scripts/build-installer.sh macos      # dist/Tangent-<ver>-macos.pkg
 #   scripts/build-installer.sh windows    # dist/Tangent-<ver>-windows-setup.exe
@@ -18,12 +16,11 @@
 # notarized by its own script, and rebuilding it here would either duplicate
 # that or quietly ship an unnotarized copy inside a package that looks fine.
 #
-# WHERE THINGS GO. These are the VST3 specification's own locations, which is
-# what makes "my DAW cannot see it" not a support question:
+# WHERE THINGS GO:
 #
-#   macOS    /Library/Audio/Plug-Ins/VST3      app -> /Applications
-#   Windows  %COMMONPROGRAMFILES%\VST3         app -> %PROGRAMFILES%\Tangent
-#   Linux    ~/.vst3  (or <prefix>/lib/vst3)   app -> <prefix>/bin
+#   macOS    /Applications (~/Applications when installed for one user)
+#   Windows  %PROGRAMFILES%\Tangent
+#   Linux    ~/.local/bin (or <prefix>/bin)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,8 +35,8 @@ NAME="Tangent"
 # and writes AppleDouble sidecars instead. `ditto` into a Dropbox directory
 # therefore produces `._Tangent.app`, `._Contents`, `._Info.plist` and one
 # `._` file per binary — and `pkgbuild` packages every one of them, so the
-# installer would put that litter into /Applications and into every user's
-# VST3 folder. (It is also why `target` is a symlink out of Dropbox; see
+# installer would put that litter into /Applications. (It is also why
+# `target` is a symlink out of Dropbox; see
 # docs/HANDOFF.md.) A real APFS directory stores the attributes properly and
 # no sidecar is created at all.
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tangent-installer.XXXXXX")"
@@ -184,9 +181,8 @@ WARN
   echo
   echo "==> $out"
   ls -lh "$out" | sed 's/^/    /'
-  # Prove the choice UI is really there. `productbuild` accepts a distribution
-  # that produces exactly one non-optional choice without complaining, and the
-  # result looks identical until you run it.
+  # What the package offers, read back out of it: one choice, the application
+  # (check-artifacts.sh refuses a package without it).
   echo "    choices offered:"
   installer -showChoicesXML -pkg "$out" -target / 2>/dev/null \
     | grep -A2 'choiceIdentifier' | grep -E 'choice\.|<integer>' \
@@ -284,18 +280,9 @@ build_linux() {
   dir="$(find "$WORK/linux" -maxdepth 1 -mindepth 1 -type d | head -1)"
   [ -n "$dir" ] || { echo "the tarball has no top-level directory" >&2; exit 1; }
 
-  # NOT IDEMPOTENT WITHOUT THIS. The output tarball has the same name as the
-  # input one, so the second run unpacks a tree that already contains
-  # `Tangent.vst3` — and `cp -R src dst` where dst EXISTS copies src INTO it,
-  # producing `Tangent.vst3/Tangent.vst3`. The result installs, loads, and
-  # quietly ships a second complete copy of a 10 MB plugin inside the first.
-  # Found on the third run, by looking at what actually landed on disk.
-  # The scrub stays though the plugin is retired: a re-run over an old
-  # tree must not re-ship last year's bundle.
-  rm -rf "$dir/$NAME.vst3"
   cp installer/linux/install.sh "$dir/install.sh"
   chmod +x "$dir/install.sh"
-  cp LICENSING.md LICENSE-GPL-3.0 "$dir/"
+  cp LICENSING.md "$dir/"
 
   # The bundled encoder, so video needs nothing installed. Cached and
   # checksum-pinned; offline after the first fetch.
@@ -321,8 +308,8 @@ build_linux() {
 
   # Written beside the real name and moved into place only on success.
   #
-  # The input and the output are the SAME FILE — this unpacks the tarball, adds
-  # the plugin and the installer, and repacks it — so a failure anywhere in
+  # The input and the output are the SAME FILE (this unpacks the tarball, adds
+  # the installer and the encoder, and repacks it), so a failure anywhere in
   # between used to destroy the artifact it was given, which took a remote
   # rebuild to get back. `package_linux` in build-cross.sh learned this the
   # same way.
@@ -340,10 +327,8 @@ build_linux() {
   echo "    contents:"
   tar -tzf "$out" | sed 's/^/      /'
   # Same lesson as everywhere else in this repo: an archive that exists proves
-  # nothing. Both payloads and the installer must actually be in it.
-  # The VST3 is RETIRED (owner's ruling, 2026-08-24); requiring it here made
-  # this branch structurally un-runnable — every invocation exited 1 against
-  # an artifact that was correct.
+  # nothing. The binary, the installer and the encoder with its licence must
+  # actually be in it.
   for want in '/tangent$' '/install.sh$' '/tangent-ffmpeg$' \
               'ffmpeg-licenses/GPLv3.txt$'; do
     if [ "$(tar -tzf "$out" | grep -cE "$want")" -eq 0 ]; then
@@ -351,10 +336,9 @@ build_linux() {
       exit 1
     fi
   done
-  # No plugin bundle may sneak back in: the VST3 is retired, and a tarball
-  # carrying one would resurrect copy the fulfil emails no longer promise.
+  # And no Tangent.vst3 may come back in: no download carries one.
   if [ "$(tar -tzf "$out" | grep -c 'Tangent\.vst3')" -ne 0 ]; then
-    echo "FAIL: $out contains a Tangent.vst3 — the plugin is retired" >&2
+    echo "FAIL: $out contains a Tangent.vst3, which no download may carry" >&2
     exit 1
   fi
   # **The installer itself has to RUN, not merely be present.** `sh -n` catches
@@ -378,7 +362,7 @@ build_linux() {
   fi
   rm -rf "$_inst"
 
-  echo "    binary, plugin and installer all present; install.sh --help runs"
+  echo "    binary, installer and encoder all present; install.sh --help runs"
 }
 
 mkdir -p dist

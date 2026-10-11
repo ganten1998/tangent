@@ -1,4 +1,4 @@
-//! Tangent's user interface, shared by the desktop app and the VST3 plugin.
+//! Tangent's user interface, drawn by the desktop app.
 //!
 //! Everything here draws with `egui` and nothing here knows what is hosting it.
 //! See `Cargo.toml` for why the absent dependencies matter more than the
@@ -13,11 +13,30 @@ pub mod automation;
 /// The busy overlay: what covers a mid-session stall, and says what it is.
 pub mod busy;
 pub mod chord_strip;
+/// Identity on the desk: tracks, racks and bays named by what they are, not
+/// by where they sit. Pure; see the module for why positions had to go.
+pub mod desk_id;
+/// The desk's shape worked out once: drawn order, ranks, classes, folders
+/// and clip counts, so every view is O(visible).
+pub mod desk_index;
+/// The frozen 32-channel seat map and its one road to identity.
+pub mod desk_legacy;
+/// The desk as the list of tracks that exist, by identity: rows, the
+/// specials, plugins by bay, routes, keys. Pure until W6 makes it live.
+pub mod desk_model;
+/// Format 2: the one desk reader and writer for settings and documents,
+/// and the one switch every format-2 side effect reads.
+pub mod desk_format;
+/// Which way audio flows between the desk's strips, and the one question a
+/// route or send picker asks of it: would this close a loop.
+pub mod desk_topology;
 pub mod dialogs;
 pub mod face;
 pub mod faces;
 pub mod faces_amp;
 pub mod faces_analog;
+pub mod faces_bitcrush;
+pub mod faces_hwinsert;
 pub mod faces_sampler;
 /// The drumpad's document: the kit, saved beside the arrangement.
 pub mod drumpad;
@@ -55,6 +74,21 @@ pub mod smf_write;
 pub mod arrangement_panel;
 pub mod midi_editor;
 pub mod settings;
+/// Every desk this app ever wrote, lifted onto the frozen 32-wide shape:
+/// the era lifts, their provenance and the legacy global-shelf map.
+pub mod desk_lift;
+/// The era corpus: one literal fixture per desk shape the app has written,
+/// and the scans that keep the lifts off the live constants. Test-only.
+#[cfg(test)]
+mod era_corpus;
+/// The phrase scan over every surface that says what a supporter key does.
+/// Test-only.
+#[cfg(test)]
+mod copy_scan;
+/// The ban scan over every crate's shipped code: no live code names the
+/// fixed desk's width or what grew from it. Test-only.
+#[cfg(test)]
+mod ban_scan;
 /// Musical time: the tempo map, the meter map, and the two conversions
 /// everything else in the app used to do with a multiply.
 pub mod tempo;

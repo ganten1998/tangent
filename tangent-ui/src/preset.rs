@@ -1,8 +1,8 @@
 //! The preset FILE: what a saved unit setting looks like on disk.
 //!
-//! Pure data, deliberately. This crate never reads or writes one of these —
-//! the firewall that keeps a VST3 editor from raising dialogs also keeps it
-//! from wandering Documents — so what lives here is the struct, the JSON
+//! Pure data, deliberately. This crate never reads or writes one of these
+//! (the firewall that keeps it from raising dialogs also keeps it from
+//! wandering Documents), so what lives here is the struct, the JSON
 //! shape and the filename rules, and the HOST does the disk work in
 //! `desktop.rs`. The same bargain [`crate::drumpad::KitPreset`] struck, minus
 //! the embedded audio: a preset is a handful of knob positions, so it is

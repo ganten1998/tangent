@@ -28,7 +28,7 @@
 //! vertically zooms (the app's half — the panel only names the surface).
 
 use crate::mixer_panel::STRIP_COLORS;
-use crate::recorder::{ChannelKind, CHANNELS};
+use crate::recorder::{ChannelKind, Column, VISIBLE_MAX};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One lane's header, as the painter sees it. Lane N IS channel N — name,
@@ -61,13 +61,13 @@ pub struct LaneView<'a> {
     pub stereo: bool,
     /// The three bays' short names — empty for an empty slot.
     /// **Six wide, like the mixer's**: a FOLDER lane fills all six (its
-    /// extra rack, `recorder::folder_extra_seat`), everybody else the first
+    /// extra rack, `Rack::Chain(1)`), everybody else the first
     /// three and blanks.
     pub inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// **Which of those bays are BYPASSED** — kept, loaded, editable, and
     /// not applied, the `AutoView::bypassed` bargain one layer down. Indexed
     /// like `inserts`, so a FOLDER's slots 3..5 answer for its extra rack;
-    /// the app resolves that through `recorder::seat_bay` before it asks.
+    /// the app resolves that through `desk_id::slot_key` before it asks.
     pub bypassed: [bool; crate::recorder::INSERTS * 2],
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
@@ -118,6 +118,10 @@ pub struct LaneView<'a> {
     /// Painted under frost with a snowflake on the header; its clips are
     /// shown and not editable. Appended, the struct's law.
     pub frozen: bool,
+    /// **What an unused lane's plus is**: an empty row's, or the desk's
+    /// trailing add under the last lane, open or locked
+    /// (`mixer_panel::Plus`). Read only on a lane that is not `used`.
+    pub plus: crate::mixer_panel::Plus,
 }
 
 /// One clip on a lane, resolved: `len_s` is real seconds (the host resolved
@@ -199,7 +203,7 @@ pub struct ClipView<'a> {
 /// cannot disagree about what is inside.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoMarquee {
-    pub lane: usize,
+    pub lane: LaneId,
     pub slot: usize,
     pub t0: f64,
     pub t1: f64,
@@ -409,9 +413,158 @@ pub struct MarkerView {
     pub selected: bool,
 }
 
+/// **The lanes a view carries, by row.**
+///
+/// It was `[LaneView; CHANNELS]`: every lane of the desk built every frame,
+/// with its name, its input chip and its six bays, whether it was on screen
+/// or thirty rows under it. The desk stops being a fixed width (docs/design/
+/// unlimited-tracks.md, section 10), so a view now carries the WINDOW the
+/// layout will place: the drawn rows from the scroll down, as many as can
+/// show, each with the row it is. Rows run in order (folders are
+/// positional, and a shut folder only removes rows), so a lookup by row is
+/// a binary search and a walk is O(visible).
+pub struct Lanes<'a> {
+    lanes: Vec<(usize, LaneView<'a>)>,
+    /// The RANK of the first drawn lane carried, among every drawn lane of
+    /// the desk: zero for a whole desk, the scroll's own rank for the
+    /// window the app builds. See [`ArrangeView::lane_scroll`].
+    first: usize,
+}
+
+impl<'a> Lanes<'a> {
+    /// The lanes of these rows, in row order.
+    pub fn new(lanes: Vec<(usize, LaneView<'a>)>) -> Self {
+        debug_assert!(lanes.windows(2).all(|w| w[0].0 < w[1].0), "rows out of order");
+        Self { lanes, first: 0 }
+    }
+
+    /// These lanes begin at drawn rank `first` (the app's window).
+    pub fn starting_at(mut self, first: usize) -> Self {
+        self.first = first;
+        self
+    }
+
+    /// Every lane from row 0, one per row: a whole desk, for a test or a
+    /// picture of the whole song.
+    pub fn dense(lanes: Vec<LaneView<'a>>) -> Self {
+        Self { lanes: lanes.into_iter().enumerate().collect(), first: 0 }
+    }
+
+    fn slot(&self, row: usize) -> Option<usize> {
+        self.lanes.binary_search_by_key(&row, |(r, _)| *r).ok()
+    }
+
+    /// The lane of a row, when this view carries it.
+    pub fn get(&self, row: usize) -> Option<&LaneView<'a>> {
+        self.slot(row).map(|k| &self.lanes[k].1)
+    }
+
+    /// [`Self::get`], to change.
+    pub fn get_mut(&mut self, row: usize) -> Option<&mut LaneView<'a>> {
+        self.slot(row).map(|k| &mut self.lanes[k].1)
+    }
+
+    /// Every lane carried, with its row, top to bottom.
+    pub fn rows(&self) -> impl Iterator<Item = (usize, &LaneView<'a>)> {
+        self.lanes.iter().map(|(r, l)| (*r, l))
+    }
+
+    /// Every lane carried, top to bottom.
+    pub fn iter(&self) -> impl Iterator<Item = &LaneView<'a>> {
+        self.lanes.iter().map(|(_, l)| l)
+    }
+
+    /// Every lane carried, to change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut LaneView<'a>> {
+        self.lanes.iter_mut().map(|(_, l)| l)
+    }
+
+    /// How many lanes were BUILT for this view: what the bounds tests hold
+    /// to the visible count.
+    pub fn len(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Whether the view carries no lane at all.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+}
+
+impl<'a> std::ops::Index<usize> for Lanes<'a> {
+    type Output = LaneView<'a>;
+    /// Panics on a row this view does not carry, as the array did past its
+    /// end. Tests index; the panel itself asks [`Lanes::get`].
+    fn index(&self, row: usize) -> &LaneView<'a> {
+        self.get(row).unwrap_or_else(|| panic!("row {row} is not in this view"))
+    }
+}
+
+impl<'a> std::ops::IndexMut<usize> for Lanes<'a> {
+    fn index_mut(&mut self, row: usize) -> &mut LaneView<'a> {
+        self.get_mut(row).unwrap_or_else(|| panic!("row {row} is not in this view"))
+    }
+}
+
+/// **A lane of the timeline, by what it is**: a track's row, or the master.
+///
+/// It replaces two numbers that meant "the master" by being one and two
+/// past the channels (`MASTER_LANE` and `MASTER_COLUMN`), which moved every
+/// time the desk grew and made every comparison against them a width test
+/// in disguise. A row is a row and the master is the master, and so is a
+/// stored automation lane ([`LaneId::auto_lane`], `automation::AutoLane`).
+/// No number means the master any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LaneId {
+    /// The lane of the track on this row.
+    Row(usize),
+    /// The master's row, above the tracks.
+    Master,
+}
+
+impl LaneId {
+    /// The track row, or `None` for the master.
+    pub fn row(self) -> Option<usize> {
+        match self {
+            LaneId::Row(r) => Some(r),
+            LaneId::Master => None,
+        }
+    }
+
+    /// Whose curves this lane's are in the automation store: a row's, or
+    /// the master's by name (`automation::AutoLane`).
+    pub const fn auto_lane(self) -> crate::automation::AutoLane {
+        match self {
+            LaneId::Row(r) => crate::automation::AutoLane::Row(r),
+            LaneId::Master => crate::automation::AutoLane::Master,
+        }
+    }
+
+    /// The lane a stored automation lane is: the master's own, or a row.
+    pub const fn from_auto_lane(lane: crate::automation::AutoLane) -> LaneId {
+        match lane {
+            crate::automation::AutoLane::Row(r) => LaneId::Row(r),
+            crate::automation::AutoLane::Master => LaneId::Master,
+        }
+    }
+
+    /// Which of the two alternating grounds this lane's automation rows
+    /// stand on. The master's rows took lane thirty-two's, the even one,
+    /// when they were addressed as that lane, and keep it.
+    fn ground(self) -> usize {
+        self.row().map_or(0, |r| r % 2)
+    }
+}
+
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
-    pub lanes: [LaneView<'a>; CHANNELS],
+    /// The lanes the layout will place: see [`Lanes`].
+    pub lanes: Lanes<'a>,
+    /// **How many rows the desk numbers**, the whole desk and not the
+    /// window `lanes` carries: the widest number any header can wear, so the
+    /// number column is cut for it (see [`number_column_w`]) and does not
+    /// jump as a scroll walks from row 99 to row 100.
+    pub desk_rows: usize,
     /// The MASTER's level — linear, as the desk's fader sits.
     pub master_gain: f32,
     /// What it is making right now, for the slim meter beside the knob.
@@ -438,19 +591,25 @@ pub struct ArrangeView<'a> {
     /// The master rack's six short names — empty for an empty bay.
     ///
     /// Six, not three: the master carries two racks. Which of its slots lives
-    /// in which is `recorder::seat_bay`'s business and not this panel's, so
+    /// in which is `desk_id::slot_key`'s business and not this panel's, so
     /// what arrives here is already in strip order, top to bottom.
     pub master_inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// Which of the master's six are bypassed — `LaneView::bypassed` for the
     /// master row, in the same strip order as `master_inserts`.
     pub master_bypassed: [bool; crate::recorder::INSERTS * 2],
     /// The first lane shown — the arrangement has more lanes than fit, so a
-    /// window of them shows and this says which. Clamped by the app.
+    /// window of them shows and this says which — as its RANK among the
+    /// drawn lanes. Clamped by the app.
+    ///
+    /// A rank and not a row: the desk's vacant rows are not drawn, and
+    /// neither are a shut folder's children, so a scroll counted in rows
+    /// spent a wheel notch per hidden row moving nothing, and a legacy
+    /// desk's thirty empty rows let the tracks scroll clean away.
     pub lane_scroll: usize,
     /// How many lanes show at once — Shift+wheel over the headers zooms it.
     pub visible_lanes: usize,
-    /// The paywall's number (`TangentApp::active_channels`): how many lanes
-    /// the field draws and the scroll can reach. Capacity stays CHANNELS.
+    /// How many lanes the field draws, the trailing add's included: what
+    /// the scroll can reach, in ranks. Never a tier.
     pub active: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a
@@ -473,7 +632,7 @@ pub struct ArrangeView<'a> {
     /// master is not one of them — it is a bus, with its own row above them
     /// and its own strip on the desk. Everything else about these rows is a
     /// track's: the same `AutoView`, the same header, the same curve, the
-    /// same gestures. They are addressed as lane [`MASTER_LANE`] so that one
+    /// same gestures. They are addressed as [`LaneId::Master`] so that one
     /// `RowKind::Automation` still covers every automation row in the
     /// timeline and the drawing, hit-testing and editing do not fork.
     pub master_automation: Vec<AutoView<'a>>,
@@ -531,8 +690,9 @@ pub struct ArrangeView<'a> {
     /// The PRIMARY. Everything selected is in [`Self::selected_tracks`].
     pub selected_channel: Option<usize>,
     /// Every selected channel, all of which wear the rim. See
-    /// `recorder_panel::selection_rim`.
-    pub selected_tracks: &'a [usize],
+    /// `recorder_panel::selection_rim`. Owned rows, found from the tracks
+    /// the app's selection names as the view is built.
+    pub selected_tracks: Vec<usize>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
     /// The strip face — the same theme role the mixer's bays wear, so a
@@ -562,13 +722,13 @@ pub enum Hit {
     Solo(usize),
     /// One of the MASTER row's six bays: `(column, slot)`.
     ///
-    /// Its own variant rather than `HdrBay(MASTER_COLUMN, ..)`, because every
-    /// `HdrBay` handler reads its first field as a strip index — and the
-    /// master's column number is a perfectly valid one belonging to somebody
-    /// else, so overloading it would have silently edited another rack's
-    /// plugins. The slot is in STRIP order; `recorder::seat_bay` turns it into
-    /// the rack it actually lives in.
-    BusBay(usize, usize),
+    /// Its own variant rather than an `HdrBay` on the master's number, because
+    /// every `HdrBay` handler reads its first field as a strip index — and the
+    /// master's old column number was a perfectly valid one belonging to
+    /// somebody else, so overloading it would have silently edited another
+    /// rack's plugins. The slot is in STRIP order; `desk_id::slot_key` turns
+    /// it into the rack it actually lives in.
+    BusBay(Column, usize),
     /// The header's gain knob — draggable, vertical, the mixer fader's twin.
     Gain(usize),
     /// A clip's body: select it, and a drag MOVES it along its lane.
@@ -596,7 +756,7 @@ pub enum Hit {
     /// A point on an automation curve, by lane and by index into that
     /// curve's points. Grabbed to drag, or pressed to select.
     /// `(lane, row, point)`.
-    AutoPoint(usize, usize, usize),
+    AutoPoint(LaneId, usize, usize),
     /// **The MASTER row's field**, carrying the time under the pointer.
     ///
     /// It is a bus and has no clips, so its whole width was dead ground —
@@ -607,23 +767,23 @@ pub enum Hit {
     /// Empty room on an automation lane: `(lane, seconds, value)`. A press
     /// here MAKES a point, which is how every DAW draws one.
     /// `(lane, row, seconds, value)`.
-    AutoLane(usize, usize, f64, f64),
+    AutoLane(LaneId, usize, f64, f64),
     /// The sub-lane's own header: which parameter it shows.
     /// One automation ROW's header — `(lane, row)`.
     /// **Ø** — invert this track's polarity.
     Phase(usize),
-    AutoParamPick(usize, usize),
+    AutoParamPick(LaneId, usize),
     /// **×** on an automation row: stop showing this lane.
-    AutoClose(usize, usize),
+    AutoClose(LaneId, usize),
     /// The record dot on an automation row: arm it to write.
-    AutoArm(usize, usize),
+    AutoArm(LaneId, usize),
     /// **B**: bypass this curve without deleting it.
-    AutoBypass(usize, usize),
+    AutoBypass(LaneId, usize),
     /// The dial on an automation row — sets the control itself.
-    AutoDial(usize, usize),
+    AutoDial(LaneId, usize),
     /// The header's fold arrow: show or hide this lane's automation.
     /// The **A** button on a track's header: open the automation menu.
-    AutoMenu(usize),
+    AutoMenu(LaneId),
     /// **T** — send this track's MIDI to the theory view, or stop.
     ToTheory(usize),
     /// A point on the tempo curve, by index. Grabbed to drag.
@@ -662,8 +822,8 @@ pub enum Hit {
     HdrAdd(usize),
     /// A BUS row's level — the master's or the click's. Carries the MIXER
     /// COLUMN, so the drag goes through the desk's own fader hit rather
-    /// than a second road to the same number. See [`Bus::column`].
-    BusGain(usize),
+    /// than a second road to the same number.
+    BusGain(Column),
 }
 
 impl Hit {
@@ -710,11 +870,6 @@ const AUTO_LANE_SHARE: f32 = 0.5;
 /// is no waveform to look at. Every point it does not take is a point the
 /// tracks get back.
 const MASTER_ROW_SHARE: f32 = 0.5;
-
-/// The MIXER COLUMN the master is, so its level goes through the desk's own
-/// fader hit rather than a second road to the same number. See
-/// `recorder::Column::desk_index`, where the convention is written down.
-pub const MASTER_COLUMN: usize = CHANNELS + 1;
 
 /// The ruler's height in points. Short — it is a scale, not a band.
 ///
@@ -831,11 +986,11 @@ pub enum RowKind {
     /// The tempo and meter map, above the tracks. One row, whatever the
     /// song's shape: tempo is a property of the SONG and not of a channel.
     Tempo,
-    /// An automation curve under the track it belongs to.
-    /// An automation curve under the track it belongs to. `usize` is the
-    /// channel; the second is WHICH of its open rows, counting down from the
-    /// track — a lane can show several parameters at once now.
-    Automation(usize, usize),
+    /// An automation curve under the track it belongs to. The first field is
+    /// whose (a track's row, or the master); the second is WHICH of its open
+    /// rows, counting down from the track — a lane can show several
+    /// parameters at once now.
+    Automation(LaneId, usize),
     /// **The MASTER, above the tracks.**
     ///
     /// The desk draws a strip for it and the timeline drew none, so a
@@ -862,39 +1017,58 @@ pub enum RowKind {
 /// the title roughly one character.
 pub const FOLDER_INDENT: f32 = 10.0;
 
-/// **The lane number the MASTER's automation rows answer to.**
+/// **The lane number's type**, in points, before any shrink.
+const NUM_PT: f32 = 10.0;
+/// The number's last resort: below this it is not a number, and a column
+/// too narrow for it at this size draws it clipped rather than as a smudge.
+const NUM_FLOOR_PT: f32 = 6.5;
+/// **The widest digit any bundled face draws at [`NUM_PT`]**: Courier
+/// Prime and JetBrains Mono advance 0.6 of the em, Terminess 0.5.
+/// `every_lane_number_fits_its_column` measures all three against it.
+const NUM_DIGIT_W: f32 = 6.0;
+/// Where the number begins inside its column: the four points off the
+/// plate's edge it has always been drawn at.
+const NUM_LEAD: f32 = 3.0;
+/// The digits the column is never cut narrower than, so a desk under ten
+/// tracks lines up with one over it.
+const NUM_MIN_DIGITS: usize = 2;
+/// The digits it is never cut WIDER than: a five-figure desk shrinks its
+/// type (to [`NUM_FLOOR_PT`]) rather than taking more from the name.
+const NUM_MAX_DIGITS: usize = 4;
+
+/// **The width of the lane number's column, for a desk whose widest number
+/// is `widest`.**
 ///
-/// One past the channels, so it can never collide with one, and so a single
-/// `RowKind::Automation(lane, slot)` still describes every automation row on
-/// the timeline. The alternative was a second row kind, which would have
-/// forked the layout, the paint, the hit test, the selection, the clipboard
-/// and the keyboard — six places to keep in step for one bus.
-pub const MASTER_LANE: usize = CHANNELS;
+/// It was a fixed twelve points, of which nine were left after the lead,
+/// and a two-figure number at ten points is twelve wide: "10" ran three
+/// points out of its column, its second figure ending a point short of the
+/// arm dot, the owner's "gets cut off slightly at the 2nd digit". The column
+/// is cut for the desk's widest number now, two figures at least and four
+/// at most, a point of air after it.
+pub fn number_column_w(widest: usize) -> f32 {
+    let digits = widest.max(1).to_string().len().clamp(NUM_MIN_DIGITS, NUM_MAX_DIGITS);
+    NUM_LEAD + digits as f32 * NUM_DIGIT_W + 1.0
+}
 
 /// The `AutoView` for a row, wherever it lives.
 ///
 /// One lookup, because `lanes` holds the channels and the master's rows sit
 /// beside it — and a caller that reached for `lanes[lane]` directly would
-/// silently find nothing for the master and draw an empty row.
+/// silently find nothing for the master and draw an empty row. The master
+/// is [`LaneId::Master`], one `RowKind::Automation` still describes every
+/// automation row on the timeline, and nothing forks.
 pub fn auto_view_of<'a>(
     view: &'a ArrangeView<'a>,
-    lane: usize,
+    lane: LaneId,
     slot: usize,
 ) -> Option<&'a AutoView<'a>> {
-    if lane == MASTER_LANE {
-        return view.master_automation.get(slot);
+    match lane {
+        LaneId::Master => view.master_automation.get(slot),
+        // The CHANNELS' own table. Deliberately spelled out rather than
+        // routed back through this function — that is infinite recursion,
+        // and was.
+        LaneId::Row(row) => view.lanes.get(row).and_then(|l| l.automation.get(slot)),
     }
-    // The CHANNELS' own table. Deliberately spelled out rather than routed
-    // back through this function — that is infinite recursion, and was.
-    view.lanes.get(lane).and_then(|l| l.automation.get(slot))
-}
-
-/// How many automation rows a lane is showing, master included.
-fn auto_rows_of(view: &ArrangeView<'_>, lane: usize) -> usize {
-    if lane == MASTER_LANE {
-        return view.master_automation.len();
-    }
-    view.lanes.get(lane).map_or(0, |l| l.automation.len())
 }
 
 /// **How much of a folder's row counts as its bottom EDGE** — the strip a
@@ -936,6 +1110,9 @@ pub struct Row {
 
 pub struct Layout {
     pub header: Rect,
+    /// The lane number's column width, one for the whole desk: see
+    /// [`number_column_w`]. The painter sizes the number against it.
+    pub num_w: f32,
     pub ruler: Rect,
     /// The top sliver of the ruler: the time-signature chips and the
     /// MARKER FLAGS, which share it.
@@ -972,10 +1149,62 @@ pub struct Layout {
     /// rather than computed twice, so the two cannot disagree about where a
     /// row is — which is the failure a parallel layout would have.
     pub rows: Vec<Row>,
-    pub lane_rows: [Rect; CHANNELS],
-    pub header_rows: [HeaderRow; CHANNELS],
+    pub lane_rows: ByRow<Rect>,
+    pub header_rows: ByRow<HeaderRow>,
     /// The master's header cells. `NONE` when the row is hidden.
     pub master_row: BusRow,
+    /// **The lane scrollbar** down the lanes' right edge, `LaneBar::NONE`
+    /// when every lane fits. See [`LaneBar`].
+    pub lane_bar: LaneBar,
+}
+
+/// **A thin scrollbar down the lanes: where the window stands among the
+/// tracks, and a handle to move it.**
+///
+/// The wheel over the headers was the only way down a desk taller than the
+/// window, and nothing said how many lanes were below. A desk that grows by
+/// appending needs both (docs/design/unlimited-tracks.md, section 10). The
+/// track is every row of the desk, the thumb the rows on screen; it stands
+/// right of the lanes, where every timeline keeps it, and a press on it is
+/// the bar's (see [`lane_bar_grab`]).
+///
+/// **Beside the lanes, never on them.** It was laid inside the lanes'
+/// right edge, and the press the bar claims first took the last few points
+/// of every lane: a clip running off the window's right edge is clamped
+/// there, so its right trim zone and fade-out corner sat wholly under the
+/// bar, and a press meant to trim scrolled the lanes instead. The bar has
+/// its own gutter now ([`LANE_GUTTER`]), taken out of the lanes area while
+/// the bar shows, so nothing a lane draws or answers lies under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LaneBar {
+    /// Every row of the desk, laid down the lanes' right edge.
+    pub track: Rect,
+    /// The rows on screen, where they stand.
+    pub thumb: Rect,
+    /// The scroll, in rows, that puts the thumb at the bottom.
+    pub max_rows: usize,
+}
+
+impl LaneBar {
+    /// No bar: every lane fits.
+    pub const NONE: Self = Self { track: Rect::NOTHING, thumb: Rect::NOTHING, max_rows: 0 };
+}
+
+/// The bar's width and its shortest thumb.
+const LANE_BAR_W: f32 = 5.0;
+const LANE_BAR_MIN: f32 = 18.0;
+/// **The bar's gutter**: the strip right of the lanes it stands in, one
+/// point clear of the lanes and of the window's edge.
+pub const LANE_GUTTER: f32 = LANE_BAR_W + 2.0;
+
+/// **Whether the lane scrollbar shows**: the desk is taller than the window
+/// of lanes. Kept beside [`lane_window_start`], whose clamps it reads, so
+/// the frame (which reserves the gutter) and the layout (which draws the
+/// bar) cannot disagree.
+pub fn lane_bar_shown(visible_lanes: usize, active: usize) -> bool {
+    let active = active.max(1);
+    let (_, visible) = lane_window_start(0, visible_lanes, active);
+    visible < active
 }
 
 
@@ -1132,6 +1361,88 @@ impl BusRow {
     }
 }
 
+/// **Something per placed row, looked up by row.** Only the rows the layout
+/// placed are in it, so a walk is O(visible); a row it did not place answers
+/// the same "not here" its slot in the old full-width array held (`NOTHING`,
+/// `HeaderRow::NONE`) when indexed, and `None` from [`ByRow::get`].
+#[derive(Debug, Clone)]
+pub struct ByRow<T>(Vec<(usize, T)>);
+
+impl<T> Default for ByRow<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> ByRow<T> {
+    /// What the layout placed for a row.
+    pub fn get(&self, row: usize) -> Option<&T> {
+        self.0
+            .binary_search_by_key(&row, |(r, _)| *r)
+            .ok()
+            .map(|k| &self.0[k].1)
+    }
+
+    /// Every placed row, top to bottom, with what was placed for it.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.0.iter().map(|(r, t)| (*r, t))
+    }
+
+    /// The first placed row, top down, whose entry answers `pred`.
+    pub fn find_row(&self, mut pred: impl FnMut(&T) -> bool) -> Option<usize> {
+        self.0.iter().find(|(_, t)| pred(t)).map(|(r, _)| *r)
+    }
+
+    /// How many rows were placed.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no row was placed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+static NO_RECT: Rect = Rect::NOTHING;
+static NO_HEADER: HeaderRow = HeaderRow::NONE;
+
+impl std::ops::Index<usize> for ByRow<Rect> {
+    type Output = Rect;
+    fn index(&self, row: usize) -> &Rect {
+        self.get(row).unwrap_or(&NO_RECT)
+    }
+}
+
+impl std::ops::Index<usize> for ByRow<HeaderRow> {
+    type Output = HeaderRow;
+    fn index(&self, row: usize) -> &HeaderRow {
+        self.get(row).unwrap_or(&NO_HEADER)
+    }
+}
+
+/// **The rows a timeline scrolled to `lane_scroll` places**: the first row
+/// it lays out, and how many TRACK rows it can show at most.
+///
+/// The layout's own arithmetic, shared with the app so the window of lanes
+/// it builds is the window the layout reads: the scroll is a ROW and is
+/// clamped so the last `visible` rows of the desk can always fill the view.
+/// Rect-free, because the rows that do not fit are dropped by height in the
+/// layout and the window only needs to cover the most that could fit.
+///
+/// **The count is the one asked for, never the lane count** (design section
+/// 10: a lane's height follows the count). A desk shorter than the window
+/// is laid out at the height the count gives each lane, its stack ending
+/// where its lanes do; it used to be clamped to the lanes there were, which
+/// never showed while every desk drew thirty-two of them and, once vacant
+/// rows were hidden, made a fresh desk's two lanes and its add a third of
+/// the timeline each.
+pub fn lane_window_start(lane_scroll: usize, visible_lanes: usize, active: usize) -> (usize, usize) {
+    let active = active.max(1);
+    let visible = visible_lanes.clamp(1, VISIBLE_MAX);
+    (lane_scroll.min(active.saturating_sub(visible)), visible)
+}
+
 impl Layout {
     /// The row a point falls in, if any.
     pub fn row_at(&self, pos: Pos2) -> Option<Row> {
@@ -1260,8 +1571,11 @@ pub struct Frame {
 
 impl Layout {
     /// See [`Frame`]. `header_w` is `ArrangeView::header_w`: a dragged width,
-    /// or `None` for the automatic share.
-    pub fn frame(rect: Rect, header_w: Option<f32>) -> Frame {
+    /// or `None` for the automatic share. `lane_bar` is [`lane_bar_shown`]
+    /// for the view: the bar's gutter comes out of the lanes, the ruler and
+    /// the chip strip with them, so a time read off the ruler and one read
+    /// off a lane are the same span.
+    pub fn frame(rect: Rect, header_w: Option<f32>, lane_bar: bool) -> Frame {
         if !rect.is_positive() {
             return Frame {
                 header: Rect::NOTHING,
@@ -1308,9 +1622,12 @@ impl Layout {
         // the playhead to the start, which keeps the generous
         // back-to-bar-one target the gutter used to provide.
         let field_x = rect.left() + header_w + GRIP_W;
+        // Never left of the field's start: a window too narrow for the
+        // gutter keeps an empty field, not an inverted one.
+        let field_r = if lane_bar { (rect.right() - LANE_GUTTER).max(field_x) } else { rect.right() };
         let ruler = Rect::from_min_max(
             Pos2::new(field_x, rect.top()),
-            Pos2::new(rect.right(), rect.top() + ruler_h),
+            Pos2::new(field_r, rect.top() + ruler_h),
         );
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
@@ -1332,7 +1649,7 @@ impl Layout {
         };
         let lanes_area = Rect::from_min_max(
             Pos2::new(field_x, rect.top() + ruler_h),
-            rect.max,
+            Pos2::new(field_r, rect.bottom()),
         );
         let grip = Rect::from_min_max(
             Pos2::new(rect.left() + header_w, rect.top()),
@@ -1355,21 +1672,34 @@ impl Layout {
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
                 rows: Vec::new(),
-                lane_rows: [Rect::NOTHING; CHANNELS],
-                header_rows: [HeaderRow::NONE; CHANNELS],
+                lane_rows: ByRow::default(),
+                header_rows: ByRow::default(),
                 master_row: BusRow::NONE,
+                lane_bar: LaneBar::NONE,
+                num_w: 0.0,
             };
         }
         // The frame first — see [`Frame`] for why it is its own step.
         let Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h } =
-            Self::frame(rect, view.header_w);
+            Self::frame(rect, view.header_w, lane_bar_shown(view.visible_lanes, view.active));
         // **Eight lanes show; the rest scroll.** The desk grew past what
         // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
         // and `view.lane_scroll` chooses which window shows. A lane outside
         // the window is `NOTHING` — not drawn, not hit, and clips on it
         // resolve to nothing through `clip_rect`'s `is_positive` filter.
-        let active = view.active.clamp(1, CHANNELS);
-        let visible = view.visible_lanes.clamp(1, active);
+        let active = view.active.max(1);
+        let (first, visible) = lane_window_start(view.lane_scroll, view.visible_lanes, active);
+        // The lanes this layout can place: the drawn rows from `first` down,
+        // never past the desk. The view carries a window that starts here
+        // (or a whole desk, for a picture of the song); a lane inside a SHUT
+        // folder is not laid out at all: no row, so nothing is drawn,
+        // nothing is hit, and its clips resolve to nothing through
+        // `clip_rect`'s own `is_positive` filter — the same road a
+        // scrolled-off lane already takes.
+        // By RANK (`ArrangeView::lane_scroll`): the drawn lanes the view
+        // carries, from the one at rank `first`.
+        let skip = first.saturating_sub(view.lanes.first);
+        let placeable = || view.lanes.rows().filter(|(_, l)| !l.hidden).skip(skip);
         // **The bus rows are ADDED to the stack, not taken out of it.**
         //
         // The master and the click are half a track each — one track's
@@ -1378,7 +1708,6 @@ impl Layout {
         // lane showed none at all. `visible` still means TRACKS; the pair
         // costs every track a slice of its height instead, which is the same
         // bargain an open automation row already makes.
-        let first = view.lane_scroll.min(active.saturating_sub(visible));
         // **Automation rows shrink the tracks until they have cost a whole
         // one, and then a track leaves.**
         //
@@ -1407,20 +1736,19 @@ impl Layout {
             } else {
                 0.0
             };
-            ((first..CHANNELS)
-                .filter(|i| !view.lanes.get(*i).is_some_and(|l| l.hidden))
+            (placeable()
                 .take(shown)
-                .map(|i| view.lanes.get(i).map_or(0, |l| l.automation.len()) as f32)
+                .map(|(_, l)| l.automation.len() as f32)
                 .sum::<f32>()
                 + master)
                 * AUTO_LANE_SHARE
         };
         // Settles: evicting a track can only REMOVE automation from the
         // count, which can only let tracks back in, so `shown` walks down
-        // and stops. Bounded by the channel count regardless.
+        // and stops. Bounded by the window regardless.
         let mut shown = visible;
         let mut auto_share = auto_of(shown);
-        for _ in 0..CHANNELS {
+        for _ in 0..=visible {
             let want = visible.saturating_sub(auto_share.floor() as usize).max(1);
             if want >= shown {
                 break;
@@ -1448,7 +1776,7 @@ impl Layout {
         // A row that would hang off the bottom of the area is `NOTHING`, the
         // same as a scrolled-off lane always was — not drawn, not hit, and
         // clips on it resolve to nothing through `clip_rect`'s filter.
-        let mut rows: Vec<Row> = Vec::with_capacity(CHANNELS + 1);
+        let mut rows: Vec<Row> = Vec::with_capacity(2 * visible + 4);
         let mut y = lanes_area.top();
         let push = |kind: RowKind, h: f32, y: &mut f32, rows: &mut Vec<Row>| {
             let bottom = *y + h;
@@ -1503,67 +1831,105 @@ impl Layout {
                 }
             }
             // **Its automation hangs under it**, exactly as a track's does,
-            // and by the same row kind — see `MASTER_LANE`.
+            // and by the same row kind — see `LaneId::Master`.
             for slot in 0..view.master_automation.len() {
                 push(
-                    RowKind::Automation(MASTER_LANE, slot),
+                    RowKind::Automation(LaneId::Master, slot),
                     lane_h * AUTO_LANE_SHARE,
                     &mut y,
                     &mut rows,
                 );
             }
         }
-        for i in first..active {
-            // A track inside a SHUT folder is not laid out at all: no row, so
-            // nothing is drawn, nothing is hit, and its clips resolve to
-            // nothing through `clip_rect`'s own `is_positive` filter — the
-            // same road a scrolled-off lane already takes.
-            if view.lanes.get(i).is_some_and(|l| l.hidden) {
-                continue;
-            }
+        // **Only as many tracks as could ever fit**, plus one: the rows past
+        // the window's height were pushed as `NOTHING` and never drawn, so a
+        // desk of any length lays out in O(visible). `shown` cannot exceed
+        // `visible`, and the one past it is the row that proves the stack
+        // ends flush.
+        let mut lane_rows = Vec::with_capacity(visible + 1);
+        let mut header_rows = Vec::with_capacity(visible + 1);
+        // **One number column for the whole desk**, cut for its widest
+        // number: the desk's own count, or a numbered row in the window past
+        // it if a caller's count fell short. The trailing add wears no
+        // number, so it is not counted.
+        let num_w = number_column_w(
+            view.lanes
+                .rows()
+                .filter(|(_, l)| l.used || l.plus == crate::mixer_panel::Plus::Row)
+                .map(|(r, _)| r + 1)
+                .fold(view.desk_rows, usize::max),
+        );
+        for (i, lane) in placeable().take(visible + 1) {
+            let at = rows.len();
             push(RowKind::Track(i), lane_h, &mut y, &mut rows);
+            // **A rank lookup, not a search**: the row just pushed is this
+            // lane's, so its rectangles are read where they were written
+            // rather than found again by a walk over every row.
+            let row = rows[at];
+            lane_rows.push((i, row.lane));
+            header_rows.push((
+                i,
+                if row.header.is_positive() {
+                    let mut h = Self::header_row(
+                        row.header,
+                        num_w,
+                        lane.used,
+                        if lane.in_folder { FOLDER_INDENT } else { 0.0 },
+                        lane.is_folder,
+                        lane.plus,
+                    );
+                    // **A bus has no input to bind, nothing to arm and no
+                    // MIDI for the theory view** (design 9): the three seats
+                    // stand empty, as a folder's arm and note do.
+                    if lane.kind == Some(ChannelKind::Bus) {
+                        h.input = Rect::NOTHING;
+                        h.arm = Rect::NOTHING;
+                        h.theory = Rect::NOTHING;
+                    }
+                    h
+                } else {
+                    HeaderRow::NONE
+                },
+            ));
             // One row per parameter this lane is showing, in the order the
             // view lists them — which is the order the menu offers them, so
             // the rows and the menu read the same way down.
-            let shown = auto_rows_of(view, i);
-            for slot in 0..shown {
+            for slot in 0..lane.automation.len() {
                 push(
-                    RowKind::Automation(i, slot),
+                    RowKind::Automation(LaneId::Row(i), slot),
                     lane_h * AUTO_LANE_SHARE,
                     &mut y,
                     &mut rows,
                 );
             }
         }
-
-        let lane_of = |want: usize| {
-            rows.iter()
-                .find(|r| r.kind == RowKind::Track(want))
-                .map_or(Rect::NOTHING, |r| r.lane)
-        };
-        let header_of = |want: usize| {
-            rows.iter()
-                .find(|r| r.kind == RowKind::Track(want))
-                .map_or(Rect::NOTHING, |r| r.header)
-        };
         let master_row = rows
             .iter()
             .find(|r| r.kind == RowKind::Master)
             .filter(|r| r.header.is_positive())
             .map_or(BusRow::NONE, |r| BusRow::of(r.header));
-        let lane_rows = std::array::from_fn(lane_of);
-        let header_rows = std::array::from_fn(|i| {
-            let row = header_of(i);
-            let Some(lane) = view.lanes.get(i).filter(|_| row.is_positive()) else {
-                return HeaderRow::NONE;
-            };
-            Self::header_row(
-                row,
-                lane.used,
-                if lane.in_folder { FOLDER_INDENT } else { 0.0 },
-                lane.is_folder,
-            )
-        });
+        let lane_rows = ByRow(lane_rows);
+        let header_rows = ByRow(header_rows);
+        // **The bar, when the desk is taller than the window**: the thumb is
+        // the window's share of the rows, at the scroll's share of its range.
+        let max_rows = active.saturating_sub(visible);
+        let lane_bar = if max_rows > 0 && lanes_area.is_positive() {
+            // In the gutter the frame left for it, one point off the lanes.
+            let track = Rect::from_min_max(
+                Pos2::new(lanes_area.right() + 1.0, lanes_area.top()),
+                Pos2::new(lanes_area.right() + 1.0 + LANE_BAR_W, lanes_area.bottom()),
+            );
+            let h = (track.height() * visible as f32 / active as f32)
+                .clamp(LANE_BAR_MIN.min(track.height()), track.height());
+            let y = track.top() + (track.height() - h) * (first as f32 / max_rows as f32);
+            LaneBar {
+                track,
+                thumb: Rect::from_min_size(Pos2::new(track.left(), y), Vec2::new(LANE_BAR_W, h)),
+                max_rows,
+            }
+        } else {
+            LaneBar::NONE
+        };
         // **The toolbar, in the corner cell** — the room above the track
         // list, before the ruler's first tick. Four small controls: the
         // click, the magnet, the tempo lane's switch, and the grid box the
@@ -1595,12 +1961,25 @@ impl Layout {
         // made a row of buttons that dominated it. The owner: "shrink the
         // scanner/met tempo arm and grid section to be the original height —
         // a half strip (i think) it looks better that way." Twenty IS about
-        // half the corner now, so the two readings agree.
+        // half the corner on a full panel, so the two readings agree there.
+        //
+        // **And twenty is HELD, not half the corner.** The half strip was
+        // first built as a share of the corner's height, which is twenty on
+        // a full panel and less on every shorter one: under 383 points of
+        // arrangement the four shrank with it, to seven points under 157,
+        // and the grid box cut steps that twenty points would have held. The
+        // owner's ruling, "hold buttons at 20pt": twenty whenever the corner
+        // is twenty tall (an arrangement of 209 points and up), and the
+        // corner's own height under that, which is how they were sized
+        // before the ruler grew. The width still wins: on a header too narrow
+        // for four buttons of twenty and the navigator's cell and a half,
+        // the width solve makes all four smaller together. On a full panel
+        // half the corner was already twenty, so it lays out exactly as it
+        // did (`the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty`).
         const TOOL_MAX: f32 = 20.0;
         let side = corner
             .height()
             .min((corner.width() - TOOL_GAP * 4.0) / 5.5)
-            .min(corner.height() * 0.5)
             .clamp(1.0, TOOL_MAX);
         // Centred in the corner's height: the cells are square and the
         // corner is taller than they are, and a row of buttons pinned to the
@@ -1642,12 +2021,21 @@ impl Layout {
             lane_rows,
             header_rows,
             master_row,
+            lane_bar,
+            num_w,
         }
     }
 
     /// The cells across one header, REAPER's row at Tangent's density:
     /// number, arm dot, name, gain knob, slim meter, M/S.
-    fn header_row(row: Rect, used: bool, indent: f32, folder: bool) -> HeaderRow {
+    fn header_row(
+        row: Rect,
+        num_w: f32,
+        used: bool,
+        indent: f32,
+        folder: bool,
+        plus: crate::mixer_panel::Plus,
+    ) -> HeaderRow {
         // **The indent moves the CONTENTS, and `panel` keeps the whole row.**
         //
         // The panel is what a press is tested against and what the plate is
@@ -1673,13 +2061,23 @@ impl Layout {
             // height: at a squeezed row the old full-height centre put the
             // plus on top of the lane's own number.
             let d = (r.height() * 0.44).clamp(16.0, 26.0).min((r.height() - 16.0).max(12.0));
+            // **And right of the number's column**, which is level with the
+            // plus rather than above it: a tenth of the row in put the ring
+            // over the slot's own number on every header narrower than
+            // about three hundred points. The trailing add has no number and
+            // stands in the same place anyway, so the pluses make one column.
             let add = Rect::from_center_size(
                 Pos2::new(
-                    r.left() + r.width() * 0.10,
+                    (r.left() + r.width() * 0.10).max(r.left() + num_w + 2.0 + d * 0.5),
                     r.center().y.max(r.top() + 13.0 + d * 0.5),
                 ),
                 Vec2::splat(d),
             );
+            // **The trailing add is the plus and nothing else**: it is no
+            // row yet, so it has no input to bind and no slot to select.
+            if plus != crate::mixer_panel::Plus::Row {
+                return HeaderRow { panel: row, add, ..HeaderRow::NONE };
+            }
             let ch_h = (r.height() * 0.30).clamp(12.0, 16.0);
             let input = Rect::from_min_size(
                 Pos2::new(add.right() + 6.0, r.center().y - ch_h * 0.5),
@@ -1723,8 +2121,9 @@ impl Layout {
         };
         // The number and the arm keep FIXED seats at the left — the
         // proportional cuts walked the dot into the track title whenever
-        // the header widened.
-        let number = Rect::from_min_max(r.min, Pos2::new(r.left() + 12.0, r.bottom()));
+        // the header widened. Fixed for the DESK, that is: the column is as
+        // wide as the desk's widest number (`number_column_w`).
+        let number = Rect::from_min_max(r.min, Pos2::new(r.left() + num_w, r.bottom()));
         // The arm's GEOMETRY stands even where the arm does not: the
         // theory/automation pair anchors off its right edge, so a folder -
         // which cannot record and returns NOTHING for the field - still
@@ -3248,24 +3647,24 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
     // **The bus rows first**, before the tracks: they sit above them and a
     // press on one must not fall through to the lane beneath.
     if l.master_row.automation.is_positive() && l.master_row.automation.contains(pos) {
-        return Some(Hit::AutoMenu(MASTER_LANE));
+        return Some(Hit::AutoMenu(LaneId::Master));
     }
     if l.master_row.knob.is_positive() && l.master_row.knob.contains(pos) {
-        return Some(Hit::BusGain(MASTER_COLUMN));
+        return Some(Hit::BusGain(Column::Master));
     }
     for (b, cell) in l.master_row.bays.iter().enumerate() {
         if cell.is_positive() && cell.contains(pos) {
-            return Some(Hit::BusBay(MASTER_COLUMN, b));
+            return Some(Hit::BusBay(Column::Master, b));
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
             (row.mute, Hit::Mute(i)),
             (row.phase, Hit::Phase(i)),
             (row.solo, Hit::Solo(i)),
             (row.theory, Hit::ToTheory(i)),
-            (row.automation, Hit::AutoMenu(i)),
+            (row.automation, Hit::AutoMenu(LaneId::Row(i))),
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
@@ -3522,7 +3921,7 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
         }
         return Some(Hit::ClipBody(clip.id));
     }
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         if row.is_positive() && row.contains(pos) {
             return Some(Hit::Lane(i, time_at_in(l, view, pos.x)));
         }
@@ -3537,6 +3936,61 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
     None
 }
 
+
+/// **The lane a hovering file would land on**, where it is drawn, or
+/// `None` when no file hovers or its lane is not on screen.
+///
+/// By ROW: `drop_lane` is the lane the drop lands on, which is what the
+/// layout's rows are keyed by. It was read relative to the scroll
+/// (`drop_lane - lane_scroll` into the rows), so a scrolled timeline lit a
+/// lane `lane_scroll` rows away from the one the file would land on, and
+/// usually lit nothing at all.
+pub fn drop_lane_rect(l: &Layout, view: &ArrangeView<'_>) -> Option<Rect> {
+    view.drop_lane
+        .and_then(|target| l.lane_rows.get(target).copied())
+        .filter(|r| r.is_positive())
+}
+
+/// **A press on the lane scrollbar**: where on the thumb the hand took it,
+/// or `None` when the press is not on the bar. A press on the thumb keeps
+/// its grip; a press beside it centres the thumb under the hand, so the
+/// lanes jump to where it was pressed. The whole gutter and a little past
+/// the window's edge, because five points is a line to look at and not a
+/// target to hit; never a point of the lanes, which belong to the clips,
+/// nodes and points drawn there (see [`LaneBar`]).
+pub fn lane_bar_grab(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<f32> {
+    let l = Layout::new(rect, view);
+    let bar = l.lane_bar;
+    if !bar.track.is_positive() {
+        return None;
+    }
+    let band = Rect::from_min_max(
+        Pos2::new(l.lanes_area.right(), bar.track.top()),
+        Pos2::new(bar.track.right() + 3.0, bar.track.bottom()),
+    );
+    // Strictly right of the lanes: their last point is a lane's.
+    if pos.x <= l.lanes_area.right() || !band.contains(pos) {
+        return None;
+    }
+    Some(if bar.thumb.y_range().contains(pos.y) {
+        pos.y - bar.thumb.top()
+    } else {
+        bar.thumb.height() * 0.5
+    })
+}
+
+/// **The lane scroll with the hand at `pos`**, holding the thumb `grab`
+/// points below its top: the first row shown, clamped to the desk. `None`
+/// when there is no bar.
+pub fn lane_bar_scroll(rect: Rect, view: &ArrangeView<'_>, pos: Pos2, grab: f32) -> Option<usize> {
+    let bar = Layout::new(rect, view).lane_bar;
+    let travel = bar.track.height() - bar.thumb.height();
+    if !bar.track.is_positive() || travel <= 0.0 {
+        return None;
+    }
+    let t = ((pos.y - grab - bar.track.top()) / travel).clamp(0.0, 1.0);
+    Some((t * bar.max_rows as f32).round() as usize)
+}
 
 /// **Every DISCRETE control on the timeline, in reading order.**
 ///
@@ -3576,10 +4030,10 @@ pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     ] {
         push(r, hit);
     }
-    push(l.master_row.automation, Hit::AutoMenu(MASTER_LANE));
-    push(l.master_row.knob, Hit::BusGain(MASTER_COLUMN));
+    push(l.master_row.automation, Hit::AutoMenu(LaneId::Master));
+    push(l.master_row.knob, Hit::BusGain(Column::Master));
     for (b, cell) in l.master_row.bays.iter().enumerate() {
-        push(*cell, Hit::BusBay(MASTER_COLUMN, b));
+        push(*cell, Hit::BusBay(Column::Master, b));
     }
     for row in &l.rows {
         match row.kind {
@@ -3606,7 +4060,7 @@ pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     (hdr.collapse, Hit::HdrCollapse(i)),
                     (hdr.arm, Hit::Arm(i)),
                     (hdr.theory, Hit::ToTheory(i)),
-                    (hdr.automation, Hit::AutoMenu(i)),
+                    (hdr.automation, Hit::AutoMenu(LaneId::Row(i))),
                     (hdr.add, Hit::HdrAdd(i)),
                     (hdr.name, Hit::HdrName(i)),
                     (hdr.input, Hit::HdrInput(i)),
@@ -3700,17 +4154,21 @@ pub fn a11y_nodes_from(
     // The name a person would use for a row, whether or not it is a track
     // yet. Never an empty string — a node labelled "" is a node a reader
     // announces as nothing at all.
-    let who = |i: usize| -> String {
-        // The bus first: `MASTER_LANE` is one PAST the lanes array, so the
-        // lookup below finds nothing there and the fallback would name the
-        // master "Track 17" — which is what a reader heard on every master
-        // automation row. The same word the bus row's own labels use.
-        if i == MASTER_LANE {
-            return "Master".to_owned();
-        }
+    let who_row = |i: usize| -> String {
         match view.lanes.get(i) {
             Some(l) if !l.name.is_empty() => l.name.to_owned(),
             _ => format!("Track {}", i + 1),
+        }
+    };
+    // The bus has a word of its own: when the master was addressed as the
+    // lane one past the channels, the row lookup found nothing there and
+    // the fallback named it "Track 17", which is what a reader heard on
+    // every master automation row. The same word the bus row's own labels
+    // use.
+    let who = |lane: LaneId| -> String {
+        match lane {
+            LaneId::Master => "Master".to_owned(),
+            LaneId::Row(i) => who_row(i),
         }
     };
     // Where a clip sits, in the bars the ruler prints — never in seconds.
@@ -3735,21 +4193,23 @@ pub fn a11y_nodes_from(
             // control that only ever steps one way walks a keyboard down to
             // 1/32 and strands it there. The announced value is the grid the
             // box prints; the travel is the exponent laid onto 0..1.
+            //
+            // **Over the steps the box takes, -6 to 3** (`GRID_BOX_FINEST`
+            // to `GRID_BOX_COARSEST`). It said -5 to 3, a step short of the
+            // settings' own clamp, so at the finest step the value was under
+            // the minimum it declared and the travel was -0.125.
             Hit::ToolGrid => Node::slider(
                 id,
                 r,
                 "Grid",
                 f64::from(view.grid_exp),
-                -5.0,
-                3.0,
+                f64::from(GRID_BOX_FINEST),
+                f64::from(GRID_BOX_COARSEST),
                 {
                     let sg = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
                     grid_spoken(view.grid_exp, sg.beats, sg.unit)
                 },
-                Travel {
-                    norm: (f32::from(view.grid_exp) + 5.0) / 8.0,
-                    up: false,
-                },
+                Travel { norm: grid_box_travel(view.grid_exp), up: false },
             ),
             Hit::ToolNav => Node::readout(
                 id,
@@ -3770,10 +4230,12 @@ pub fn a11y_nodes_from(
                     _ => "Unnamed marker, go to it".to_owned(),
                 },
             ),
+            // By NAME, like every other header control: "Track 3" read a
+            // renamed track by its seat.
             Hit::Phase(i) => Node::toggle(
                 id,
                 r,
-                &format!("Track {} polarity invert", i + 1),
+                &format!("{} polarity invert", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.phase),
             ),
             // `who(i)`, not "track {i+1}": the hardcoded number called the
@@ -3822,39 +4284,49 @@ pub fn a11y_nodes_from(
             Hit::Arm(i) => Node::toggle(
                 id,
                 r,
-                format!("{} record arm", who(i)),
+                format!("{} record arm", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.armed),
             ),
             Hit::Mute(i) => Node::toggle(
                 id,
                 r,
-                format!("{} mute", who(i)),
+                format!("{} mute", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.muted),
             ),
             Hit::Solo(i) => Node::toggle(
                 id,
                 r,
-                format!("{} solo", who(i)),
+                format!("{} solo", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.soloed),
             ),
             Hit::ToTheory(i) => Node::toggle(
                 id,
                 r,
-                format!("{} sends its MIDI to the theory view", who(i)),
+                format!("{} sends its MIDI to the theory view", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.to_theory),
             ),
             Hit::HdrCollapse(i) => Node::toggle(
                 id,
                 r,
-                format!("{} shows its tracks", who(i)),
+                format!("{} shows its tracks", who_row(i)),
                 !view.lanes.get(i).is_some_and(|l| l.folder_shut),
             ),
-            Hit::HdrAdd(i) => Node::button(id, r, format!("Add a track at row {}", i + 1)),
-            Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who(i)), who(i)),
+            Hit::HdrAdd(i) => Node::button(
+                id,
+                r,
+                match view.lanes.get(i).map_or(crate::mixer_panel::Plus::Row, |l| l.plus) {
+                    crate::mixer_panel::Plus::Row => format!("Add a track at row {}", i + 1),
+                    crate::mixer_panel::Plus::Trailing => "Add a track".to_owned(),
+                    crate::mixer_panel::Plus::Locked => {
+                        "Add a track (the free desk is full: a supporter key lifts the limit)".to_owned()
+                    }
+                },
+            ),
+            Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who_row(i)), who_row(i)),
             Hit::HdrInput(i) => Node::readout(
                 id,
                 r,
-                format!("{} input", who(i)),
+                format!("{} input", who_row(i)),
                 match view.lanes.get(i) {
                     Some(l) if !l.input.is_empty() => l.input.clone(),
                     _ => "none".to_owned(),
@@ -3869,7 +4341,7 @@ pub fn a11y_nodes_from(
                 Node::readout(
                     id,
                     r,
-                    format!("{} insert {}", who(i), bay + 1),
+                    format!("{} insert {}", who_row(i), bay + 1),
                     match (what.is_empty(), off) {
                         (true, _) => "empty".to_owned(),
                         (false, true) => format!("{what}, bypassed"),
@@ -3877,7 +4349,7 @@ pub fn a11y_nodes_from(
                     },
                 )
             }
-            Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who(i))),
+            Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who_row(i))),
             // The two rows above the tracks. Their level is the desk's own,
             // so it reads in the desk's own words.
             Hit::BusBay(_, slot) => {
@@ -3917,7 +4389,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} volume", who(i)),
+                    format!("{} volume", who_row(i)),
                     f64::from(g),
                     0.0,
                     1.0,
@@ -3932,7 +4404,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} send", who(i)),
+                    format!("{} send", who_row(i)),
                     f64::from(s),
                     0.0,
                     1.0,
@@ -3945,7 +4417,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} pan", who(i)),
+                    format!("{} pan", who_row(i)),
                     f64::from(p),
                     -1.0,
                     1.0,
@@ -3964,7 +4436,7 @@ pub fn a11y_nodes_from(
                     continue;
                 };
                 let name = if c.name.is_empty() { "Untitled" } else { c.name };
-                let mut says = format!("{}, {}", bars(c.start_s, c.len_s), who(c.lane));
+                let mut says = format!("{}, {}", bars(c.start_s, c.len_s), who_row(c.lane));
                 if c.midi {
                     says.push_str(", MIDI");
                 }
@@ -4180,6 +4652,217 @@ fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink, size: 
     );
 }
 
+/// **The smallest a word that shrinks to its box is drawn: six and a half
+/// points.**
+///
+/// The floor of the other words in this app that shrink rather than cut:
+/// the INPUT chip's ([`input_chip`]) and the analog faces' own
+/// (`faces_analog::fit`, "the smallest legible"). Under it a grid step is a
+/// smudge, and a smudge in a grid box reads as a wrong number rather than a
+/// small one.
+pub const WORD_FLOOR: f32 = 6.5;
+
+/// **The air a word that had to shrink keeps from each side of its room**,
+/// in points.
+///
+/// Fitted with none, a word would fill its room to the last hundredth and
+/// its ink would meet the box's edge. A quarter of a point because the room
+/// is small: the arrange gridbox is twenty points, and a five-character step
+/// (1/128) at the floor is 18.9 to 19.4 of them in Courier Prime and
+/// JetBrains Mono, depending on the display's scale. Half a point a side
+/// would put that step under the floor on a Retina screen and not on a
+/// plain one.
+pub const WORD_AIR: f32 = 0.25;
+
+/// **The size a word is drawn at in `room`: shrunk to the room's width,
+/// never spilled.**
+///
+/// `ceiling` when the word fits the room at that size, so a word its box was
+/// drawn for keeps exactly the size it always had (BAR and 1/2 in the
+/// arrange gridbox, 11 points). Otherwise the largest half point under the
+/// ceiling at which it fits with [`WORD_AIR`] either side, measured in the
+/// face that is installed, and never under [`WORD_FLOOR`]. A word that does
+/// not fit even at the floor is given the floor and left to the clip in
+/// [`paint_fitted_word`]: past that point a smaller word is a smudge, and
+/// which words those are is a question for the box, not for the type.
+///
+/// This is the INPUT chip's rule ([`input_chip`]: the height names the
+/// ceiling and the width decides), except that it never truncates. A grid
+/// step cut to "1/1..." names a different step.
+///
+/// Half points rather than any size: each word gets one size that does not
+/// move from frame to frame, so the glyph atlas is not handed a new fraction
+/// every frame (why `fonts::px` rounds), and on a 2x display half a point is
+/// a whole pixel. Found by walking down rather than by scaling the width
+/// once, because glyphs land on pixels and a word's width is not quite in
+/// proportion to its size.
+///
+/// **A word fits when its advances AND its ink do** ([`ink_placed_inside`]).
+/// A word is laid out and centred by its advances, but its glyphs are drawn
+/// as the atlas holds them, whole pixels rounded outward, at a position the
+/// tessellator snaps to a whole pixel; and a box's edges fall wherever the
+/// layout puts them. So a word laid out inside its box can still have no
+/// whole-pixel position that holds all of its ink. BAR in Courier Prime at
+/// 100%, in the 14-point box of an arrangement under 157 points (fourteen
+/// whole pixels, 54 to 68): by its advances it fits at the box's own 8
+/// points, 13.8 wide, but its ink there is fifteen pixels, and fitted by its
+/// advances alone it would be painted at 8 with a column cut off by the
+/// clip. At 7.5 its ink is fourteen pixels and it is drawn whole. Measured
+/// over every whole-point arrangement height from 100 to 420, every bundled
+/// face and the scales from 100% to 200%: 7,061 (height, word) cases drawn
+/// whole that the advances alone would cut, and not one the other way. It
+/// was 15,377 while the box was half the corner and went down to seven
+/// points.
+pub fn fitted_word_size(
+    painter: &Painter,
+    word: &str,
+    family: &egui::FontFamily,
+    ceiling: f32,
+    room: Rect,
+) -> f32 {
+    let ppp = painter.ctx().pixels_per_point();
+    // Laid out no wider than `width`, and all of its ink placeable inside
+    // the room by whole pixels.
+    let fits = |size: f32, width: f32| {
+        let g = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family.clone()), Color32::WHITE);
+        g.rect.width() <= width && ink_placed_inside(room, &g, ppp).is_some()
+    };
+    if fits(ceiling, room.width()) {
+        return ceiling;
+    }
+    // A ceiling already under the floor is its own floor: shrinking stops
+    // there, and growing is not what this is for.
+    let floor = WORD_FLOOR.min(ceiling);
+    let with_air = room.width() - 2.0 * WORD_AIR;
+    // The first half point under the ceiling (10.5 under 11, 9.5 under the
+    // MIDI chip's 9.9), then down by halves.
+    let mut size = (ceiling * 2.0).ceil() * 0.5 - 0.5;
+    while size > floor && !fits(size, with_air) {
+        size -= 0.5;
+    }
+    size.max(floor)
+}
+
+/// **Where `galley` is drawn in `room` so that all of its ink is inside**:
+/// centred, as `Align2::CENTER_CENTER` centres it, and then, if the ink the
+/// tessellator will draw there crosses an edge, moved in by the whole pixels
+/// it crosses by. `None` when no whole-pixel position holds all of it.
+///
+/// The ink is the galley's mesh, every glyph as the atlas draws it, at the
+/// position the tessellator snaps to a pixel (`round_text_to_pixels`), so it
+/// lands on whole pixels while the room's edges need not. A word that fits by
+/// its advances can still put one column of ink past an edge (BAR in Courier
+/// Prime at 150%, 1/128 in JetBrains Mono at 100%), and the clip would cut
+/// that column off a word that fits: moving it in by a pixel keeps it whole.
+/// Down as well as across: in a seven-point box, the arrange gridbox's size
+/// under 157 points while the corner's buttons were half its height, a
+/// single digit in JetBrains Mono at 100% centres with its ink half a pixel
+/// below the box, and goes up a pixel. No box the arrangement draws now is
+/// that short, so `a_word_whose_ink_falls_under_its_box_is_moved_up_into_it`
+/// holds that one. A thousandth of slack, so float noise is not a pixel.
+fn ink_placed_inside(room: Rect, galley: &egui::Galley, ppp: f32) -> Option<Pos2> {
+    const SLACK: f32 = 1.0e-3;
+    let centred = room.center() - galley.size() * 0.5;
+    let drawn = galley.mesh_bounds;
+    if !drawn.is_positive() {
+        return Some(centred);
+    }
+    // One axis: where the word goes along it, given where centring put it,
+    // its ink's extent from its own origin, and the room's two edges.
+    let along = |at: f32, ink: (f32, f32), edges: (f32, f32)| -> Option<f32> {
+        let snapped = (at * ppp).round() / ppp;
+        let (lo, hi) = (snapped + ink.0, snapped + ink.1);
+        let shift = if hi > edges.1 + SLACK {
+            -((hi - edges.1) * ppp - SLACK).ceil() / ppp
+        } else if lo < edges.0 - SLACK {
+            ((edges.0 - lo) * ppp - SLACK).ceil() / ppp
+        } else {
+            // Inside where centring put it: left there, exactly.
+            return Some(at);
+        };
+        (lo + shift >= edges.0 - SLACK && hi + shift <= edges.1 + SLACK).then_some(snapped + shift)
+    };
+    Some(Pos2::new(
+        along(centred.x, (drawn.min.x, drawn.max.x), (room.left(), room.right()))?,
+        along(centred.y, (drawn.min.y, drawn.max.y), (room.top(), room.bottom()))?,
+    ))
+}
+
+/// **A word painted in its box at [`fitted_word_size`], and never outside
+/// it.**
+///
+/// `room` is where the word may be laid out: the box itself, or the part of
+/// it inside a border. `bx` is the box, and the word is clipped to it,
+/// within whatever clip the painter already has. The clip is the backstop
+/// and not the fit: a word that fits is placed with all of its ink inside
+/// the room ([`ink_placed_inside`]) and the clip cuts nothing from it; a
+/// word that does not fit even at the floor is painted at the floor,
+/// centred, and cut at the box's edge instead of painting over the next
+/// control. Which words those are, at which sizes of the arrange gridbox,
+/// `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// names. That is the class of fault behind the owner's "0.000000": a grid
+/// step six characters wide in the arrange gridbox, spilling onto the tempo
+/// lane's switch, with the navigator painted over its tail.
+pub fn paint_fitted_word(
+    painter: &Painter,
+    bx: Rect,
+    room: Rect,
+    word: &str,
+    family: egui::FontFamily,
+    ceiling: f32,
+    ink: Color32,
+) {
+    if !room.is_positive() || word.is_empty() {
+        return;
+    }
+    let size = fitted_word_size(painter, word, &family, ceiling, room);
+    let galley = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family), ink);
+    let pos = ink_placed_inside(room, &galley, painter.ctx().pixels_per_point())
+        .unwrap_or_else(|| room.center() - galley.size() * 0.5);
+    painter
+        .with_clip_rect(bx.intersect(painter.clip_rect()))
+        .galley(pos, galley, ink);
+}
+
+/// **The size the arrange gridbox prints at**: 0.55 of the box's height,
+/// held to 8 to 11 points. Eleven in the twenty-point box the toolbar draws
+/// whenever the arrangement is tall enough for it. A word wider than the
+/// box shrinks from here ([`grid_box_word`]).
+fn grid_box_type(cell: Rect) -> f32 {
+    (cell.height() * 0.55).clamp(8.0, 11.0)
+}
+
+/// **The arrange gridbox's word, in its box**: [`grid_box_type`] when it
+/// fits, shrunk to the box's width when it does not, and clipped to the box.
+///
+/// The box is a twenty-point square at most, drawn for three characters
+/// (1/2, 1/4, BAR), and at eleven points a fourth is already too many: 1/16
+/// is 25.6 points wide in Courier Prime and JetBrains Mono and 21.5 in
+/// Terminess. The ladder prints five characters too (1/128, at the finest
+/// steps of meters as common as 3/4 and 7/8) and six (1/1024).
+///
+/// **And it is twenty points in an arrangement at least 209 tall**, as are
+/// the three buttons beside it. Under that all four are as tall as the
+/// corner they stand in, down to fourteen points under 157, and the shorter
+/// the arrangement the shorter the steps that no longer fit the box above
+/// the floor: under 181 points, four-character steps such as 1/16 are cut
+/// at some heights in Courier Prime and JetBrains Mono. A step of three
+/// characters or fewer, BAR among them, is never cut.
+/// `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// sweeps every size the layout draws and names, for each face, the height
+/// from which a step of each length is never cut.
+fn grid_box_word(painter: &Painter, cell: Rect, word: &str, ink: Color32) {
+    paint_fitted_word(
+        painter,
+        cell,
+        cell,
+        word,
+        crate::fonts::courier_bold(),
+        grid_box_type(cell),
+        ink,
+    );
+}
+
 /// **The lane field**: the ground every clip in this view sits on.
 ///
 /// In light mode the timecode WELL is lifted toward the strip face so the
@@ -4221,12 +4904,41 @@ pub fn snowflake(painter: &Painter, c: Pos2, r: f32, ink: Color32) {
 }
 
 pub fn lane_field(strip: Color32, well: Color32, dark: bool) -> Color32 {
-    crate::recorder_panel::legible_surface(if dark {
-        shade(well, 1.55)
-    } else {
-        blend(well, strip, 0.46)
-    })
+    // **Dark is the darker of the two, on every theme.** The two derivations
+    // used to be pinned to the switch: dark lifted the well, light blended it
+    // toward the strip face. On a theme whose strip is dark (27 of the 32)
+    // the blend is the DARKER one, so "light" was the darker field there and
+    // D read backwards; and Sandstone's well is pale, so its dark field was
+    // paler than its light one. Somebody who pressed D until the lanes went
+    // dark had engaged LIGHT, and the next pale-faced theme in the cycle
+    // showed it: the owner's "switching theme resets it to light". The flag
+    // never moved; the field it named did. Ranking the two by luminance makes
+    // the switch mean the same thing whatever theme is worn.
+    let lum = crate::recorder_panel::luminance;
+    let lifted = crate::recorder_panel::legible_surface(shade(well, 1.55));
+    let mixed = crate::recorder_panel::legible_surface(blend(well, strip, 0.46));
+    let (darker, lighter) =
+        if lum(lifted) <= lum(mixed) { (lifted, mixed) } else { (mixed, lifted) };
+    if !dark {
+        return lighter;
+    }
+    // **And dark is DARK**, even on a theme whose well is pale (Sandstone):
+    // walked down in its own hue until it sits under the band's dead zone,
+    // where the light ink reads on it.
+    let mut out = darker;
+    for _ in 0..24 {
+        if lum(out) <= DARK_FIELD_MAX {
+            break;
+        }
+        out = shade(out, 0.88);
+    }
+    crate::recorder_panel::legible_surface(out)
 }
+
+/// The palest a dark-mode lane field may be. Below the 0.12 to 0.22 band in
+/// which neither ink clears 4.5:1, so the field is dark by measurement rather
+/// than by name.
+pub const DARK_FIELD_MAX: f32 = 0.10;
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
     // **DERIVED from the theme, in both modes.**
@@ -4576,6 +5288,30 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     v
 }
 
+/// **The ONE-BAR rung's name, on every surface that prints the ladder: BAR,
+/// in every meter.**
+///
+/// Above it the ladder counts bars (2, 4, 8) and below it are note values
+/// (1, 1/2, 1/4 ...), so the bar is the one rung that is neither, and every
+/// spelling it had read as something it is not. In 4/4 it was "1", the name
+/// of a whole note; in 3/4 "1/2·", a dotted half; in a meter whose bar is no
+/// one note it was the time signature (2d292a27; a decimal like "8.000q"
+/// before that). The owner met the last of those in 4/2, whose ladder went
+/// 2, 4/2, 1: "why does the option between 1 and 2 = 4/2 in grid frequency
+/// and why is it even an option?" The rung is there because a grid of one
+/// bar is one every song wants (the magnet on the bar lines). What was wrong
+/// was its name: "4/2" is a fraction, and one that reads as twice the "1"
+/// under it. Of the spellings put to him, the owner chose this one.
+///
+/// A WORD, so it cannot be read as a count of bars or as a note value, and
+/// the same word in every meter, 4/4 included, so nobody has to know the
+/// meter to read it. Three letters, so it is exactly as wide as the
+/// three-character rungs (1/2, 1/4, 1/8) in all three bundled faces, which
+/// are monospaced: the twenty-point arrange box is sized for those, and
+/// `the_bar_rung_is_painted_bar_in_every_meter` measures it on the frame in
+/// each face. Aloud it is "1 bar", as it always was ([`grid_spoken`]).
+pub const GRID_BAR: &str = "BAR";
+
 /// **What the box prints, derived from what the magnet actually does** —
 /// in the spelling that keeps the note glyph at the quarter, which is now
 /// the MIDI EDITOR's chip and nothing else. The arrange gridbox takes
@@ -4624,14 +5360,16 @@ pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
 /// ARRANGE gridbox prints.
 ///
 /// The owner, on that box: "it's easier to spot at a glance for a beginner
-/// and realize that's what that button does." In 4/4 the ladder reads 1,
-/// 1/2, ♪, 1/8, 1/16 — the glyph is the ONE rung not written the way the
-/// rungs on either side of it are, and it sits at the division a beginner is
-/// most likely to be hunting for, because a quarter note is the first thing
-/// anyone is taught to count. `tool_grid` is at most 48 points wide and the
-/// label is drawn between 8 and 11 points, so ♪ arrives as a stem and a blob
-/// that has to be recognised before it can be read; "1/4" arrives as a
-/// fraction the two rungs under it have already taught the eye to parse.
+/// and realize that's what that button does." In 4/4 the glyph spelling
+/// reads BAR, 1/2, ♪, 1/8, 1/16. Under the bar, the glyph is the ONE note
+/// value not written the way the ones on either side of it are, and it sits
+/// at the division a beginner is most likely to be hunting for, because a
+/// quarter note is the first thing anyone is taught to count. `tool_grid`
+/// is a square of at most 20 points (it was 48 wide when this was written)
+/// and the label is drawn between 8 and 11 points, so ♪ arrives as a stem
+/// and a blob that has to be recognised before it can be read; "1/4"
+/// arrives as a fraction the two rungs under it have already taught the eye
+/// to parse.
 ///
 /// This supersedes the earlier ruling quoted on [`grid_label`], and only its
 /// second half: "there should exist a single state of that button that
@@ -4652,15 +5390,23 @@ pub fn grid_label_text(exp: i8, beats: u8, unit: u8) -> String {
 }
 
 /// The one ladder both public labels walk. Kept private and shared so the
-/// bar branch — the half of the label that has nothing to do with note
-/// glyphs — exists once; two copies of `1u32 << exp` is exactly the kind of
+/// bar branches (the multiples of a bar, counted, and the bar itself,
+/// [`GRID_BAR`]: the half of the label that has nothing to do with note
+/// glyphs) exist once; two copies of `1u32 << exp` is exactly the kind of
 /// duplicate that let the label disagree with the magnet in the first place.
 fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String {
     if exp > 0 {
         // Multiples of a BAR, and it says so by counting them.
         return format!("{}", 1u32 << exp.min(6) as u32);
     }
-    note_label(grid_quarters(exp, beats, unit), quarter_glyph)
+    if exp == 0 {
+        // One bar, by name, whatever the meter: see `GRID_BAR`. Not handed
+        // to `note_label`, which can only name the bar's LENGTH, as a note
+        // (4/4's "1", 3/4's "1/2·") or counted in beats (4/2's "4/2"), and
+        // every one of those reads as a note value.
+        return GRID_BAR.to_owned();
+    }
+    note_label(grid_quarters(exp, beats, unit), unit, quarter_glyph)
 }
 
 /// A length in quarter notes, as a note value.
@@ -4669,11 +5415,20 @@ fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String 
 /// is one and a half of the next one up and wears a dot; 6/8's second rung is
 /// a dotted quarter and there is no other honest way to write it.
 ///
+/// **A length no note names is COUNTED, in the meter's own beats**: `n/unit`,
+/// n notes of 1/unit, the way a time signature counts its bar. Every rung
+/// [`grid_quarters`] walks is a whole number of beats or a power-of-two part
+/// of one, and a part of one always has a name, so the count is exact. The
+/// BAR rung never arrives here (it is [`GRID_BAR`], by name, from
+/// [`grid_label_with`]), so what is counted is a rung UNDER the bar that no
+/// note names: 10/8's half bar, five eighths, is 5/8. `unit` is read by this
+/// branch alone; the fallback it replaced is written up in the branch.
+///
 /// **`quarter_glyph` decides one rung and one rung only**: whether q == 1
 /// comes back as `\u{266a}` or falls through into the plain-fraction branch,
 /// which already spells that same rung "1/4" out of the division rather than
-/// out of a second table of its own. Every other string — the whole, the
-/// plain fractions, the dotted values, the unnameable fallback — is identical
+/// out of a second table of its own. Every other string (the whole, the
+/// plain fractions, the dotted values and the counted lengths) is identical
 /// on both paths, so the two panels' labels differ in exactly the one way
 /// they were asked to differ and in no other.
 ///
@@ -4682,7 +5437,7 @@ fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String 
 /// flag reach it and the numeral ladder would carry two things called 1/4
 /// again — plain and dotted, at two different divisions — which is precisely
 /// the fault the derivation above was written to end.
-fn note_label(q: f64, quarter_glyph: bool) -> String {
+fn note_label(q: f64, unit: u8, quarter_glyph: bool) -> String {
     if !q.is_finite() || q <= 0.0 {
         return "1".to_owned();
     }
@@ -4691,38 +5446,121 @@ fn note_label(q: f64, quarter_glyph: bool) -> String {
     if quarter_glyph && (q - 1.0).abs() < 1.0e-9 {
         return "\u{266a}".to_owned();
     }
+    match note_value(q, unit) {
+        NoteValue::Plain(d) if d <= 1 => "1".to_owned(),
+        NoteValue::Plain(d) => format!("1/{d}"),
+        // Dotted: one and a half of a clean value.
+        NoteValue::Dotted(d) if d <= 1 => "1\u{00b7}".to_owned(),
+        NoteValue::Dotted(d) => format!("1/{d}\u{00b7}"),
+        // Nothing nameable: count it, in beats of the meter.
+        //
+        // This used to say the length in quarters, `format!("{q:.3}q")`, and
+        // that is what the owner found: "there's a '0 frequency on the grid
+        // frequency in arrange mode reads as quite a lot of 0.000000s". In
+        // 4/2 the bar rung printed "8.000q", six characters in a box drawn
+        // for three: the 8 spilled onto the tempo-lane switch, where it
+        // barely shows, and the navigator, painted after it, covered the q,
+        // so a row of zeros was what read. Nor was it one rare meter: 5/4,
+        // 7/8 and 9/8, three of the eight in `TIME_SIGNATURES`, reached it at
+        // the same rung. `no_rung_of_any_signature_is_spelled_as_a_decimal`
+        // sweeps them all. The bar rung has since been given a name of its
+        // own, `GRID_BAR`, and no longer comes here; what still does is a
+        // rung under the bar that no note names, like 10/8's five eighths.
+        NoteValue::Counted(n, unit) => format!("{n}/{unit}"),
+    }
+}
+
+/// **What a length in quarters is, as a note**: one note value, one dotted
+/// note value, or a count of the meter's beats.
+///
+/// The one decision [`note_label`] prints and [`grid_spoken`] says aloud, so
+/// the box and the screen reader cannot sort a step differently. The reader
+/// used to sort it a second time, by matching the box's text against a
+/// table of eight spellings, and every step the table did not list fell
+/// through to "of a bar": 428 of the (signature, step) pairs, a whole note
+/// read as "1 of a bar" in 4/2 and a 128th as "1/128 of a bar" in 4/4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteValue {
+    /// One 1/d note: 1 is a whole note, 2 a half, 4 a quarter.
+    Plain(u64),
+    /// A dotted 1/d note, one and a half of it: 6/8's beat is `Dotted(4)`.
+    Dotted(u64),
+    /// n notes of 1/unit, the meter's own beat: 10/8's half bar is
+    /// `Counted(5, 8)`.
+    Counted(u64, u8),
+}
+
+/// Sorts `q` quarter notes into a [`NoteValue`]: a plain note when `4 / q`
+/// is a whole number, a dotted one when two thirds of `q` is, and otherwise
+/// counted in the meter's beats ([`beats_counted`]).
+fn note_value(q: f64, unit: u8) -> NoteValue {
     let denom = 4.0 / q;
     let rounded = denom.round();
     if (denom - rounded).abs() < 1.0e-9 && rounded >= 1.0 {
-        return if rounded <= 1.0 {
-            "1".to_owned()
-        } else {
-            format!("1/{}", rounded as u64)
-        };
+        return NoteValue::Plain(rounded as u64);
     }
-    // Dotted: one and a half of a clean value.
-    let plain = q * 2.0 / 3.0;
-    let d = 4.0 / plain;
+    let d = 4.0 / (q * 2.0 / 3.0);
     let dr = d.round();
     if (d - dr).abs() < 1.0e-9 && dr >= 1.0 {
-        return if dr <= 1.0 {
-            "1\u{00b7}".to_owned()
-        } else {
-            format!("1/{}\u{00b7}", dr as u64)
-        };
+        return NoteValue::Dotted(dr as u64);
     }
-    // Nothing nameable — a meter this build has no word for. Say the length
-    // rather than a wrong note value.
-    format!("{q:.3}q")
+    let (n, unit) = beats_counted(q, unit);
+    NoteValue::Counted(n, unit)
+}
+
+/// **A length in quarters, counted in the meter's beats**: `(n, unit)`, n
+/// notes of 1/unit. What [`note_label`] prints when no single note names the
+/// length, and what [`grid_spoken`] reads back to say it in words, so the
+/// box and the reader cannot count differently.
+///
+/// Rounded because a float's last bit is not a beat, and never below one
+/// because a grid step is never nothing.
+fn beats_counted(q: f64, unit: u8) -> (u64, u8) {
+    let unit = unit.max(1);
+    let n = (q * f64::from(unit) / 4.0).round().max(1.0);
+    (n as u64, unit)
+}
+
+/// **What a 1/d note is called aloud**, for every d the grid can reach: the
+/// note values a signature counts in (whole to thirty-second) and every
+/// halving under them the ladder walks to, down to the 4096th note that the
+/// finest step of 1/32 is.
+///
+/// Said the way a player says them, "hundred twenty-eighth" and not "one
+/// slash one hundred twenty-eight": a reader that has to spell a fraction
+/// out has not named the note.
+fn note_word(d: u64) -> Option<&'static str> {
+    Some(match d {
+        1 => "whole",
+        2 => "half",
+        4 => "quarter",
+        8 => "eighth",
+        16 => "sixteenth",
+        32 => "thirty-second",
+        64 => "sixty-fourth",
+        128 => "hundred twenty-eighth",
+        256 => "two hundred fifty-sixth",
+        512 => "five hundred twelfth",
+        1024 => "thousand twenty-fourth",
+        2048 => "two thousand forty-eighth",
+        4096 => "four thousand ninety-sixth",
+        _ => return None,
+    })
 }
 
 /// The same grid, in the words a person would say it in.
 ///
-/// The box prints "1" and "1/4" because it is a box the width of a thumb.
-/// A screen reader announcing "Grid, 1" has said nothing: the unit is the
+/// The box prints "8" and "1/4" because it is a box the width of a thumb.
+/// A screen reader announcing "Grid, 8" has said nothing: the unit is the
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
-fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
+///
+/// **Every surface a reader reaches the ladder on says it this way**: the
+/// arrange gridbox's slider ([`a11y_nodes`]) and the Quantize window's GRID
+/// chips (`dialogs::quantize_grid_row`), whose own text is the box's
+/// shorthand. The MIDI editor has no reader nodes at all yet, its grid chip
+/// among them.
+pub(crate) fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
     // **Read off the same division the box prints and the magnet uses.**
     //
     // This carried its own third opinion, in BEATS, while the box counted in
@@ -4733,33 +5571,91 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
         return format!("{} bars", 1u32 << exp.min(6) as u32);
     }
     if exp == 0 {
+        // The box prints BAR here (`GRID_BAR`); aloud it is one bar, in
+        // every meter, as it was before the box had a word for it.
         return "1 bar".to_owned();
     }
     let q = grid_quarters(exp, beats, unit);
     // Spoken in words rather than in the box's shorthand: a reader saying
     // "one slash eight" has not said "an eighth note".
     //
-    // **Off the TEXT spelling**, because this is the ARRANGE box's readout
-    // and the arrange box prints numerals now. It is not a free choice:
-    // leave it on `grid_label`'s spelling and the quarter rung arrives as
-    // `\u{266a}`, which no arm below names, so it drops into the catch-all
-    // and a reader is told "♪ of a bar" — a character read aloud instead of
-    // a note named, and wrong arithmetic on top of it, since in 6/8 a
-    // quarter note is a THIRD of the bar. That is the box, the reader and
-    // the magnet disagreeing again, which is what this function was
-    // rewritten to end. `the_grid_box_can_be_stepped_both_ways` is the guard.
-    let label = note_label(q, false);
-    match label.as_str() {
-        "1/4" => "quarter note".to_owned(),
-        "1/2" => "half note".to_owned(),
-        "1/8" => "eighth note".to_owned(),
-        "1/16" => "sixteenth note".to_owned(),
-        "1/32" => "thirty-second note".to_owned(),
-        "1/64" => "sixty-fourth note".to_owned(),
-        "1/4\u{00b7}" => "dotted quarter note".to_owned(),
-        "1/8\u{00b7}" => "dotted eighth note".to_owned(),
-        other => format!("{other} of a bar"),
-    }
+    // **Sorted by `note_value`, the decision the box prints**, rather than
+    // by reading the box's text back. It read the text, against a table of
+    // eight spellings, and everything the table lacked fell through to
+    // "{label} of a bar": in 4/2 the whole note under the bar was "1 of a
+    // bar", right after the bar's "1 bar"; 12/8's dotted half was "1/2· of a
+    // bar", a dot read aloud; and the finest steps were "1/128 of a bar" and
+    // finer, each a fraction of a bar that was not one. 428 (signature,
+    // step) pairs in all, in 182 of the 192 meters. Before that table it
+    // was the quarter: the glyph spelling sent "♪ of a bar".
+    // `every_step_of_every_meter_is_said_as_a_note` sweeps all 192 meters.
+    let counted = |n: u64, u: u8| match note_word(u64::from(u)) {
+        // **A counted step is said as the notes it counts.** The box prints
+        // 10/8's half bar as "5/8"; as "5/8 of a bar" that is a wrong
+        // fraction (it is HALF the bar) said with confidence.
+        Some(word) if n == 1 => format!("1 {word} note"),
+        Some(word) => format!("{n} {word} notes"),
+        // A unit no signature has; the app never builds one.
+        None => format!("{n} beats"),
+    };
+    let named = match note_value(q, unit) {
+        NoteValue::Plain(d) => note_word(d).map(|word| format!("{word} note")),
+        NoteValue::Dotted(d) => note_word(d).map(|word| format!("dotted {word} note")),
+        NoteValue::Counted(n, u) => Some(counted(n, u)),
+    };
+    named.unwrap_or_else(|| {
+        // A note the table has no name for, which no valid meter reaches:
+        // said as a count of the meter's beats rather than as a fraction.
+        let (n, u) = beats_counted(q, unit);
+        counted(n, u)
+    })
+}
+
+/// **The arrange gridbox's finest step**, -6: what the settings clamp
+/// `arr_grid_exp` to at the fine end wherever it is written (the wheel, the
+/// drag, the keys, a settings file) and what its ladder is printed and said
+/// down to.
+pub const GRID_BOX_FINEST: i8 = -6;
+
+/// **The arrange gridbox's coarsest step**, 3: eight bars.
+pub const GRID_BOX_COARSEST: i8 = 3;
+
+/// **Where step `exp` sits on the arrange gridbox's slider**: 0 at
+/// [`GRID_BOX_FINEST`], 1 at [`GRID_BOX_COARSEST`], a ninth of the way a
+/// step. What its reader node declares as its travel ([`a11y_nodes`]), and
+/// what [`grid_box_step_for`] reads a key press back from, so the two
+/// cannot disagree about where a step is.
+pub fn grid_box_travel(exp: i8) -> f32 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    f32::from(exp.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST) - GRID_BOX_FINEST) / span
+}
+
+/// **The step a key on the arrange gridbox asks for**, from the step it is
+/// on and `want`, the slider's travel after the key
+/// (`a11y::Gesture::nudged` of [`grid_box_travel`]).
+///
+/// The nearest step to `want`, so Home and End reach the two ends and Space
+/// or Enter, which leave the travel where it was, leave the step. **And an
+/// arrow always moves one step**, whichever way it pressed: its nudge is a
+/// twentieth of the travel (a hundredth with Shift) and a step is a ninth,
+/// so the nearest step to where an arrow lands is the one it started on.
+/// Read that way, which is how the box was read, the arrows never moved it
+/// at all, and at -6, below the travel's old floor, the down arrow went UP
+/// a step.
+pub fn grid_box_step_for(now: i8, want: f32) -> i8 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    let here = grid_box_travel(now);
+    let want = want.clamp(0.0, 1.0);
+    // Ten steps on the travel, a ninth of it apart.
+    let nearest = (want * span).round() as i8 + GRID_BOX_FINEST;
+    let moved = if nearest != now || (want - here).abs() < 1.0e-6 {
+        nearest
+    } else if want > here {
+        now + 1
+    } else {
+        now - 1
+    };
+    moved.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST)
 }
 
 /// **Where a tempo handle is drawn, and grabbed.**
@@ -4836,8 +5732,8 @@ fn bar_step(view: &ArrangeView<'_>, width: f32) -> u32 {
 /// moves is the contents. One function because THREE callers need the same
 /// rect — the paint, the hit test and the tab order — and a hit test that
 /// disagrees with the paint is a control you can see and cannot press.
-fn auto_cells(view: &ArrangeView<'_>, lane: usize, header: Rect) -> AutoHeader {
-    let indent = if view.lanes.get(lane).is_some_and(|l| l.in_folder) {
+fn auto_cells(view: &ArrangeView<'_>, lane: LaneId, header: Rect) -> AutoHeader {
+    let indent = if lane.row().and_then(|r| view.lanes.get(r)).is_some_and(|l| l.in_folder) {
         FOLDER_INDENT
     } else {
         0.0
@@ -5025,7 +5921,7 @@ fn draw_auto_headers(
 /// moved away from it on purpose. A seam that kept the lane's figure was a
 /// line at 1.01:1 against the surface under it on half the themes: drawn,
 /// and not there.
-fn auto_seam(p: &Ink, lane: usize) -> Color32 {
+fn auto_seam(p: &Ink, lane: LaneId) -> Color32 {
     separate(auto_ground(p, lane), 0.22)
 }
 
@@ -5036,7 +5932,7 @@ fn auto_header_seam(p: &Ink) -> Color32 {
     separate(shade(p.hdr_face, 0.92), 0.22)
 }
 
-fn auto_ground(p: &Ink, lane: usize) -> Color32 {
+fn auto_ground(p: &Ink, lane: LaneId) -> Color32 {
     // Character first, then DISTANCE. The blend gives the row the ruler's
     // hue so it reads as a strip about something other than a track; on the
     // themes whose ruler already sits near the lane that blend alone changed
@@ -5052,7 +5948,7 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     //
     // Two answers per frame, not one per row per loop: the base is the
     // lane's stripe, and there are two stripes. `ink` derives both.
-    p.auto_ground[lane % 2]
+    p.auto_ground[lane.ground()]
 }
 
 /// **The colour a detected attack is marked in.** Amber, and not the
@@ -5239,6 +6135,98 @@ fn wave_band(
     }
 }
 
+/// **The trailing add's ground, run on to the foot of the track area.**
+///
+/// Since rows nobody has made stopped being drawn (design section 10), a
+/// desk shorter than the window ends at its trailing add, and past it the
+/// plain panel showed: the header column's wood under the add's own
+/// `empty_ground`, and the field's wood under its stripe. The owner: "i
+/// want the unlimited track mode to have continuity of the color used for
+/// the background of the track adder button below tracks in the arrange
+/// view ... can we make the draw just infinite?"
+///
+/// So the add's two grounds are painted TALLER, each to the foot of its
+/// own column: `header` is its header panel run down to the bottom of the
+/// header column (it wears `empty_ground` there), `lane` is its lane run
+/// down to the bottom of the lanes (it wears `lane`, the field's own
+/// ground, whatever row the add stands on: see `field_ground`). One rect a
+/// column however much room is left, and each IS the add's own ground, so
+/// the add and the room under it read as one surface: the seam under the
+/// add is not drawn, and its slot box closes round the whole run rather
+/// than across the add's foot.
+///
+/// **Paint, and nothing else.** The add's cells (its `HeaderRow::panel`,
+/// its lane row, its plus) are what a press is tested against and they are
+/// not touched, so a press under the add answers exactly what it did when
+/// the wood showed there, and the scroll range never counts the run.
+/// `None` when the add is not placed, is not the last row placed, or ends
+/// at the foot already (a desk taller than the window): nothing changes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EndlessGround {
+    /// The trailing add's row.
+    pub row: usize,
+    /// Its header panel, run down to the foot of the header column.
+    pub header: Rect,
+    /// Its lane, run down to the foot of the lanes.
+    pub lane: Rect,
+}
+
+/// See [`EndlessGround`].
+pub fn endless_ground(l: &Layout, view: &ArrangeView<'_>) -> Option<EndlessGround> {
+    // The last row the layout placed. The add ranks after every lane and
+    // has no automation rows, so when it is on screen it is this one.
+    let last = l.rows.iter().rev().find(|r| r.lane.is_positive())?;
+    let RowKind::Track(row) = last.kind else {
+        return None;
+    };
+    if !view.lanes.get(row).is_some_and(is_trailing_add) {
+        return None;
+    }
+    let panel = l.header_rows.get(row)?.panel;
+    // Within the half point a row may overhang the area in `Layout::new`: a
+    // stack that ends flush has nothing under it to fill.
+    if !panel.is_positive() || l.lanes_area.bottom() - last.lane.bottom() <= 0.5 {
+        return None;
+    }
+    Some(EndlessGround {
+        row,
+        header: Rect::from_min_max(panel.min, Pos2::new(panel.right(), l.header.bottom())),
+        lane: Rect::from_min_max(
+            last.lane.min,
+            Pos2::new(last.lane.right(), l.lanes_area.bottom()),
+        ),
+    })
+}
+
+/// Whether `lane` is the desk's trailing add, open or locked: no track,
+/// and not a row's own empty plus. What the add wears in the field and
+/// where its ground runs on are both read off this, so the two cannot
+/// disagree about which row is the add.
+fn is_trailing_add(lane: &LaneView<'_>) -> bool {
+    !lane.used && lane.plus != crate::mixer_panel::Plus::Row
+}
+
+/// **The ground row `row` wears in the field.**
+///
+/// A track's row wears one of the two stripes by its row, so eight rows
+/// read as eight. The trailing add wears `lane`, the field's own ground,
+/// whatever row it stands on. It is no row yet (it wears no number
+/// either), and its row is the desk's length, which a removal, a track
+/// opened between two others and a track that grows the desk all change.
+/// Striped by that row, the add took the other stripe whenever the length
+/// changed by an odd count, and since its ground runs on to the foot of
+/// the lanes (`EndlessGround`), the largest surface on the timeline
+/// changed shade with it: the colour the owner asked to carry on held only
+/// until the desk changed length. `lane` is the stripe the add wore on the
+/// shipped desk and on an empty one, so those look as they did.
+fn field_ground(p: &Ink, view: &ArrangeView<'_>, row: usize) -> Color32 {
+    if row % 2 == 0 || view.lanes.get(row).is_some_and(is_trailing_add) {
+        p.lane
+    } else {
+        p.lane_alt
+    }
+}
+
 /// Paint the whole view into `rect`.
 
 pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
@@ -5248,10 +6236,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
     let p = ink(view);
     painter.rect_filled(rect, 0.0, p.wood);
+    // The trailing add's ground where it runs on below the add, read by the
+    // stripes, the seams, the header plates and the slot boxes alike so the
+    // four cannot disagree about where the add ends. See `EndlessGround`.
+    let endless = endless_ground(&l, view);
+    let endless_at = |i: usize| endless.filter(|g| g.row == i);
 
     // ── the lanes' field, striped so eight rows read as eight ─────────────
-    for (i, row) in l.lane_rows.iter().enumerate() {
-        painter.rect_filled(*row, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
+    for (i, row) in l.lane_rows.iter() {
+        // The trailing add's ground runs on to the foot of the lanes, and
+        // is the field's own ground whatever row the add stands on (see
+        // `field_ground`).
+        let ground = endless_at(i).map_or(*row, |g| g.lane);
+        painter.rect_filled(ground, 0.0, field_ground(&p, view, i));
     }
     // **An automation row takes the ground of the track it belongs to**, a
     // shade recessed. Its own stripe colour would read as a ninth track;
@@ -5494,7 +6491,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // ── every channel boundary wears a SEAM — header through field, one
     // line, drawn over the grid so it survives the lines running through
     // it. Empty lanes keep the stronger slot treatment below. ─────────────
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
+        // Not under the trailing add when its ground runs on below it: that
+        // is no boundary, only more of the same surface.
+        if endless_at(i).is_some() {
+            continue;
+        }
         let left = l
             .header_rows
             .get(i)
@@ -5512,20 +6514,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     //
     // Drawn UNDER the clips and over the field, so it reads as the lane
     // lighting up rather than as something laid on top of the music.
-    if let Some(target) = view.drop_lane {
-        if let Some(row) = target
-            .checked_sub(view.lane_scroll)
-            .and_then(|i| l.lane_rows.get(i))
-            .filter(|r| r.is_positive())
-        {
-            painter.rect_filled(*row, 0.0, p.select.gamma_multiply(0.16));
-            painter.rect_stroke(
-                *row,
-                0.0,
-                Stroke::new(1.5_f32, p.select.gamma_multiply(0.85)),
-                egui::StrokeKind::Inside,
-            );
-        }
+    if let Some(row) = drop_lane_rect(&l, view) {
+        painter.rect_filled(row, 0.0, p.select.gamma_multiply(0.16));
+        painter.rect_stroke(
+            row,
+            0.0,
+            Stroke::new(1.5_f32, p.select.gamma_multiply(0.85)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     // ── the automation curves ─────────────────────────────────────────────
@@ -5545,9 +6541,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let Some(auto) = auto_view_of(view, lane, slot) else {
             continue;
         };
-        let (cr, cg, cb) = STRIP_COLORS[view
-            .lanes
-            .get(lane)
+        let (cr, cg, cb) = STRIP_COLORS[lane
+            .row()
+            .and_then(|r| view.lanes.get(r))
             .map_or(0, |v| v.color)
             .min(STRIP_COLORS.len() - 1)];
         // The same surface the row was filled with — one function, so the
@@ -5994,13 +6990,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // out the first time a clip on it is drawn and read back for the rest:
     // the dead-zone guard is a contrast walk of up to fifty steps, and a
     // lane full of clips paid it once per clip.
-    let mut lane_ink: [Option<(Color32, Color32)>; CHANNELS] = [None; CHANNELS];
+    // Keyed by row, and only for the lanes that have a clip on screen, so
+    // a desk of any length pays for what it draws.
+    let mut lane_ink: std::collections::HashMap<usize, (Color32, Color32)> =
+        std::collections::HashMap::new();
     for clip in view.clips {
         let r = clip_rect_in(&l, view, clip);
         if !r.is_positive() {
             continue;
         }
-        let (color, clip_ink) = match lane_ink.get(clip.lane).copied().flatten() {
+        let (color, clip_ink) = match lane_ink.get(&clip.lane).copied() {
             Some(pair) => pair,
             None => {
                 // Through the dead-zone guard, like the strip and the header
@@ -6028,9 +7027,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // staff, wave, fades, handles — takes this ink, so the clip
                 // cannot half-agree with itself.
                 let pair = (color, on_ink(color));
-                if let Some(slot) = lane_ink.get_mut(clip.lane) {
-                    *slot = Some(pair);
-                }
+                lane_ink.insert(clip.lane, pair);
                 pair
             }
         };
@@ -6252,7 +7249,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // mute clearly off reads as a fault, so the lane says it plainly. The
     // FOLDER dims too: it is silent for the same reason and a group half
     // dimmed would look like a bug in the dimming.
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
             continue;
         };
@@ -6261,7 +7258,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_filled(*row, 0.0, Color32::from_black_alpha(96));
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
             continue;
         };
@@ -6283,7 +7280,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         painter.rect_filled(row.lane, 0.0, FROST_TINT);
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         if !view.lanes.get(i).is_some_and(|v| v.frozen) || !row.panel.is_positive() {
             continue;
         }
@@ -6394,7 +7391,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // could be PRESSED and not seen.
     draw_auto_headers(painter, &l, view, &p);
 
-    let num_font = FontId::new(10.0, crate::fonts::courier());
+    let num_font = FontId::new(NUM_PT, crate::fonts::courier());
     // **The MASTER, above the tracks, in the mixer's own colours.**
     //
     // The desk draws a strip for it and the timeline drew none, so a
@@ -6577,7 +7574,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             }
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         let Some(lane) = view.lanes.get(i) else { continue };
         // The strip's own colour as a plate behind the header, the mixer's
         // rule: any colour, and the text still reads. Through the dead-zone
@@ -6620,8 +7617,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         } else {
             // The empty slot's own ground fills the WHOLE panel — the wood
             // margin around a dark plate read as two surfaces, the owner's
-            // "my bad" screenshot.
-            painter.rect_filled(row.panel, 0.0, p.empty_ground);
+            // "my bad" screenshot. The trailing add's runs on to the foot
+            // of the column (see `EndlessGround`).
+            painter.rect_filled(
+                endless_at(i).map_or(row.panel, |g| g.header),
+                0.0,
+                p.empty_ground,
+            );
             // **And an empty slot wears the rim too**, like the mixer's.
             //
             // An empty slot is a destination now — a copied track is pasted
@@ -6650,11 +7652,36 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // the audit computed its own ink instead of calling this. It calls
         // `on_ink` now, and so does the audit.
         let ink_on = on_ink(face);
+        // The trailing add is no row yet, so it wears no number.
+        let numbered = lane.used || lane.plus == crate::mixer_panel::Plus::Row;
+        let num = if numbered { format!("{}", i + 1) } else { String::new() };
+        // **Its column is cut for the desk's widest number** (see
+        // `number_column_w`), so a number fits at full size up to four
+        // figures. Past that the type gives way, down to the floor, rather
+        // than the column taking the name's room.
+        let num_font = {
+            let room = l.num_w - NUM_LEAD - 0.5;
+            let wide = if num.len() > NUM_MAX_DIGITS {
+                painter.layout_no_wrap(num.clone(), num_font.clone(), Color32::WHITE).rect.width()
+            } else {
+                0.0
+            };
+            if wide > room && wide > 0.0 {
+                FontId::new(
+                    ((NUM_PT * room / wide * 2.0).floor() * 0.5).max(NUM_FLOOR_PT),
+                    num_font.family.clone(),
+                )
+            } else {
+                num_font.clone()
+            }
+        };
         painter.text(
-            Pos2::new(plate.left() + 4.0, plate.center().y),
+            // `plate.left() + 4` is the column's left plus its lead: the
+            // plate sits a point outside the row the column is cut from.
+            Pos2::new(plate.left() + 1.0 + NUM_LEAD, plate.center().y),
             Align2::LEFT_CENTER,
-            format!("{}", i + 1),
-            num_font.clone(),
+            num,
+            num_font,
             if lane.used {
                 quiet(ink_on, face, 0.30)
             } else {
@@ -6712,17 +7739,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
                 let w = (radius * 0.12).clamp(1.2, 2.2);
                 painter.circle_stroke(c, radius, Stroke::new(w, ink));
-                let arm = radius * 0.45;
-                painter.line_segment(
-                    [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
-                    Stroke::new(w, ink),
-                );
-                painter.line_segment(
-                    [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
-                    Stroke::new(w, ink),
-                );
+                if lane.plus == crate::mixer_panel::Plus::Locked {
+                    crate::mixer_panel::padlock(painter, c, radius, w, ink);
+                } else {
+                    let arm = radius * 0.45;
+                    painter.line_segment(
+                        [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
+                        Stroke::new(w, ink),
+                    );
+                    painter.line_segment(
+                        [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
+                        Stroke::new(w, ink),
+                    );
+                }
             }
-            chip(painter, row.input, "NO INPUT", false);
+            if lane.plus == crate::mixer_panel::Plus::Row {
+                chip(painter, row.input, "NO INPUT", false);
+            }
             continue;
         }
         // The arm dot: REAPER's record circle, lit when live. A FOLDER has
@@ -7214,14 +8247,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The MIDI editor's chip still calls `grid_label` and still shows
         // the glyph, so pointing this line back at `grid_label` would not
         // undo one decision, it would move two surfaces at once.
-        painter.text(
-            l.tool_grid.center(),
-            Align2::CENTER_CENTER,
-            grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
-            FontId::new(
-                (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
-                crate::fonts::courier_bold(),
-            ),
+        //
+        // **Shrunk to the box and clipped to it** (`grid_box_word`): the
+        // box is drawn for three characters and the ladder prints up to
+        // six. A step wider than the box spilled out of it, and the widest
+        // onto the tempo lane's switch and under the navigator.
+        grid_box_word(
+            painter,
+            l.tool_grid,
+            &grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
             on_ink(p.hdr_face),
         );
     }
@@ -7251,6 +8285,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
     }
 
+    // ── the lane scrollbar, over the lanes' right edge ────────────────────
+    if l.lane_bar.track.is_positive() {
+        painter.rect_filled(l.lane_bar.track, LANE_BAR_W * 0.5, p.face.gamma_multiply(0.18));
+        painter.rect_filled(l.lane_bar.thumb, LANE_BAR_W * 0.5, p.face.gamma_multiply(0.7));
+    }
+
     // ── the EMPTY SLOTS' borders, LAST — nothing may paint over them ──────
     // Third round on these, and the lesson was paint ORDER, not ink: the
     // header section begins by filling its whole column with wood, and the
@@ -7259,12 +8299,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // drawn. Painted here, on top of everything, each unoccupied slot is
     // one channel-shaped box — header through field — in faded face ink
     // that reads on both palettes.
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         if view.lanes.get(i).is_some_and(|lane| lane.used) {
             continue;
         }
         let left = l.header_rows.get(i).map_or(row.left(), |h| h.panel.left());
-        let slot = Rect::from_min_max(Pos2::new(left, row.top()), row.right_bottom());
+        // The trailing add's box closes round its whole run, so the add and
+        // the ground under it are one box rather than a box with a floor.
+        let foot = endless_at(i).map_or(row.bottom(), |g| g.lane.bottom());
+        let slot = Rect::from_min_max(Pos2::new(left, row.top()), Pos2::new(row.right(), foot));
         if slot.is_positive() {
             painter.rect_stroke(
                 slot,
@@ -7526,6 +8569,101 @@ pub(crate) fn cut_to_reference(painter: &Painter, width: f32, text: &str, font: 
     String::new()
 }
 
+/// **Every time signature the app accepts**, `(beats, unit)`, found by
+/// asking `TimeSignature::is_valid` over a range wider than it allows rather
+/// than by writing its rule out again: 1 to 32 beats over 1, 2, 4, 8, 16 or
+/// 32, which is 192. Test support for the sweeps that hold every grid ladder
+/// to something; each of them asserts the 192.
+#[cfg(test)]
+pub(crate) fn valid_signatures() -> Vec<(u8, u8)> {
+    let mut sigs = Vec::new();
+    for beats in 0u8..=64 {
+        for unit in 0u8..=64 {
+            if (crate::recorder::TimeSignature { beats, unit }).is_valid() {
+                sigs.push((beats, unit));
+            }
+        }
+    }
+    sigs
+}
+
+/// **A context dressed in `face`, at `ppp` pixels to the point**, the way
+/// the app's is: test support for measuring words as the screen gets them.
+/// The scale matters to a word's width (glyphs land on whole pixels) and to
+/// where its ink falls, so the fit sweeps run at 100% to 200%.
+#[cfg(test)]
+pub(crate) fn context_at(face: crate::fonts::FontChoice, ppp: f32) -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::fonts::install(&ctx, face, None);
+    crate::fonts::apply_text_styles(&ctx);
+    let mut raw = egui::RawInput::default();
+    raw.viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .native_pixels_per_point = Some(ppp);
+    // Twice: the first pass is what adopts the scale and the fonts.
+    let _ = ctx.run(raw.clone(), |_| {});
+    let _ = ctx.run(raw, |_| {});
+    assert_eq!(ctx.pixels_per_point(), ppp, "the context did not take the scale");
+    ctx
+}
+
+/// **A word as it reaches the screen**: its text and size, where it was laid
+/// out (its advances, from where it was placed), the ink the tessellator
+/// draws for it (every glyph's pixels, unclipped) and the clip it carries.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PaintedWord {
+    pub text: String,
+    pub size: f32,
+    pub laid: Rect,
+    pub ink: Rect,
+    pub clip: Rect,
+}
+
+#[cfg(test)]
+impl PaintedWord {
+    /// Every text `shapes` holds, measured. `ctx` tessellates them, at its
+    /// own scale, for the ink.
+    pub(crate) fn all(ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) -> Vec<Self> {
+        shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    let mut ink = Rect::NOTHING;
+                    for p in ctx.tessellate(vec![s.clone()], ctx.pixels_per_point()) {
+                        if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+                            ink = ink.union(m.calc_bounds());
+                        }
+                    }
+                    Some(Self {
+                        text: t.galley.text().to_owned(),
+                        size: t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                        laid: Rect::from_min_size(t.pos, t.galley.size()),
+                        ink,
+                        clip: s.clip_rect,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What `paint` paints on a layer of its own, keyed by `key`, measured.
+    pub(crate) fn painted_by(
+        ctx: &egui::Context,
+        key: impl std::hash::Hash,
+        paint: impl FnOnce(&Painter),
+    ) -> Vec<Self> {
+        let id = egui::Id::new(("painted word", key));
+        let layer = egui::LayerId::new(egui::Order::Foreground, id);
+        paint(&Painter::new(ctx.clone(), layer, Rect::EVERYTHING));
+        let shapes: Vec<egui::epaint::ClippedShape> =
+            ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().cloned().collect()).unwrap_or_default());
+        Self::all(ctx, &shapes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// **An empty slot can be pointed at.**
@@ -7659,6 +8797,7 @@ mod tests {
         }
     }
     use super::*;
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
@@ -7671,6 +8810,7 @@ LaneView {
     folder_silent: false,
     frozen: false,
             automation: Vec::new(),
+            plus: crate::mixer_panel::Plus::Row,
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS * 2],
@@ -7838,6 +8978,10 @@ LaneView {
             // "shrink the scanner/met tempo arm and grid section to be the
             // original height — a half strip". Both bounds, because "equal
             // sized" is satisfied by four buttons of any one wrong size.
+            // Twenty is about half of this full panel's corner; on a shorter
+            // one it is held, not halved, and
+            // `the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty`
+            // sweeps every height.
             assert!(
                 first.height() <= 20.01,
                 "the buttons are {:.1}pt, past the original twenty, at header {hw}",
@@ -7867,6 +9011,222 @@ LaneView {
                 "the navigator overlaps the grid box at header {hw}"
             );
         }
+    }
+
+    /// **The corner's four buttons hold twenty points wherever the corner
+    /// has twenty, and a full panel lays them out exactly as it did.**
+    ///
+    /// The owner asked for the buttons at "the original height, a half
+    /// strip", and that was built as half the corner's height: twenty on a
+    /// full panel and less on every shorter one, so under 383 points of
+    /// arrangement all four shrank, to seven points under 157, and the grid
+    /// box cut steps a twenty-point box holds. His ruling, "hold buttons at
+    /// 20pt": twenty whenever the corner is at least twenty tall, the
+    /// corner's own height under that, and the width still winning on a
+    /// header too narrow for four buttons and the navigator's cell and a
+    /// half.
+    ///
+    /// Swept over every whole point of arrangement height from 100 to 420,
+    /// at 1300 and 2560 wide, the window's narrowest, and 240 and 180 (too
+    /// narrow for four buttons of twenty: the seam gives those a header of
+    /// half the width), with the header at both ends of the seam, on its own
+    /// share and dragged to 220, and the arrangement at the window's origin
+    /// and below the band. Held at every one:
+    ///
+    /// - the four are one size, square, and three points apart;
+    /// - twenty points wherever the corner is twenty tall and wide enough
+    ///   for four of them and the navigator's thirty, which on every header
+    ///   the seam allows is every arrangement from 209 points up; the
+    ///   corner's own height where it is shorter than twenty; and where the
+    ///   header is too narrow, the side that leaves the navigator exactly a
+    ///   cell and a half;
+    /// - centred in the corner's height and inside it, apart from the
+    ///   navigator, and clear of everything else the layout places: the
+    ///   ruler, its strip, the seam, the headers and the lanes;
+    /// - wherever half the corner was no smaller than the side the width and
+    ///   the cap allow, which is every full panel (383 points and up) at
+    ///   every width, all five rectangles are the half-strip rule's to the
+    ///   bit, worked out here with its own numbers.
+    ///
+    /// And at every height on the 1300-point window, a press at the middle
+    /// and just inside each corner of each lands on it, and the screen
+    /// reader's node for each stands on its rectangle: the press, the paint
+    /// and the reader all read the one `Layout`.
+    ///
+    /// Revert checks, performed: put the half-corner share back and this
+    /// fails at the first height it sweeps, 100 points, the buttons seven
+    /// points in a corner of fourteen; pin the four to the corner's top
+    /// rather than centring them and it fails at 209 points, the first
+    /// corner taller than its buttons, and with the centring assert out as
+    /// well, at 383, where a full panel no longer lays out as it did.
+    #[test]
+    fn the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        let bits = |r: Rect| [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()];
+        // The corner the layout puts the toolbar in: the cell over the
+        // headers and left of the ruler, three points in from its sides and
+        // two from its top and bottom. Its far corner is where the header
+        // starts, to the bit.
+        let corner_of = |r: Rect, l: &Layout| {
+            Rect::from_min_max(r.min, Pos2::new(l.header.right(), l.header.top())).shrink2(Vec2::new(3.0, 2.0))
+        };
+        // The four and the navigator by the rule they had before the hold:
+        // half the corner's height, held to twenty and to the width five and
+        // a half cells need, centred. In its own numbers rather than the
+        // layout's constants, so it stays the rule as it was.
+        let half_strip = |corner: Rect| -> [Rect; 5] {
+            let side = corner
+                .height()
+                .min((corner.width() - 3.0 * 4.0) / 5.5)
+                .min(corner.height() * 0.5)
+                .clamp(1.0, 20.0);
+            let top = corner.top() + ((corner.height() - side) * 0.5).max(0.0);
+            let cell = |k: f32| {
+                Rect::from_min_size(Pos2::new(corner.left() + k * (side + 3.0), top), Vec2::splat(side))
+            };
+            let nav = Rect::from_min_max(Pos2::new(cell(3.0).right() + 3.0, top), Pos2::new(corner.right(), top + side))
+                .intersect(corner);
+            let nav = if nav.width() >= side * 1.5 { nav } else { Rect::NOTHING };
+            [cell(0.0), cell(1.0), cell(2.0), cell(3.0), nav]
+        };
+        let mut swept = 0usize;
+        for origin in [Pos2::ZERO, Pos2::new(0.0, 81.0)] {
+            for w in [1300.0_f32, 2560.0, crate::settings::MIN_WINDOW.x, 240.0, 180.0] {
+                for header_w in [Some(header_floor), None, Some(220.0), Some(w * 0.5)] {
+                    for h in 100u32..=420 {
+                        let r = Rect::from_min_size(origin, Vec2::new(w, h as f32));
+                        let mut v = a_view(&cs);
+                        v.header_w = header_w;
+                        let l = Layout::new(r, &v);
+                        let at = format!("{w}x{h} at {origin:?}, header {header_w:?}");
+                        let corner = corner_of(r, &l);
+                        let four = [l.tool_met, l.tool_snap, l.tool_tempo, l.tool_grid];
+                        let side = four[0].width();
+                        // ── one size, square, in a row ──────────────────────
+                        for (n, b) in four.iter().enumerate() {
+                            assert!(b.is_positive(), "{at}: button {n} is not drawn");
+                            assert!(
+                                (b.width() - side).abs() < 1.0e-3 && (b.height() - side).abs() < 1.0e-3,
+                                "{at}: button {n} is {:.3}x{:.3}, the first {side:.3} square",
+                                b.width(),
+                                b.height()
+                            );
+                        }
+                        for pair in four.windows(2) {
+                            assert!(
+                                (pair[1].left() - pair[0].right() - 3.0).abs() < 1.0e-3
+                                    && (pair[1].top() - pair[0].top()).abs() < 1.0e-3,
+                                "{at}: {:?} and {:?} are not three points apart in a row",
+                                pair[0],
+                                pair[1]
+                            );
+                        }
+                        // ── the size: twenty, the corner, or the width ──────
+                        let twenty_fits = 4.0 * 20.0 + 4.0 * 3.0 + 1.5 * 20.0 <= corner.width();
+                        let corner_fits = 4.0 * corner.height() + 4.0 * 3.0 + 1.5 * corner.height() <= corner.width();
+                        if corner.height() >= 20.0 && twenty_fits {
+                            assert!(
+                                (side - 20.0).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} tall with room for twenty",
+                                corner.height()
+                            );
+                        } else if corner.height() < 20.0 && corner_fits {
+                            assert!(
+                                (side - corner.height()).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} tall",
+                                corner.height()
+                            );
+                        } else {
+                            // The header decides: four cells, four gaps and
+                            // the navigator's cell and a half, and the whole
+                            // corner's width spent on them.
+                            assert!(
+                                side < corner.height().min(20.0)
+                                    && (5.5 * side + 4.0 * 3.0 - corner.width()).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} wide and {:.3} tall",
+                                corner.width(),
+                                corner.height()
+                            );
+                        }
+                        // The threshold the changelog names, on every header
+                        // the seam allows.
+                        if l.header.width() >= header_floor {
+                            if h >= 209 {
+                                assert!((side - 20.0).abs() < 1.0e-3, "{at}: {side:.3} points, not twenty");
+                            } else {
+                                assert!(side < 20.0, "{at}: twenty points in a corner {:.3} tall", corner.height());
+                            }
+                        }
+                        // ── where they stand ───────────────────────────────
+                        assert!(l.tool_nav.is_positive(), "{at}: the navigator was squeezed out");
+                        assert!(
+                            l.tool_nav.left() >= l.tool_grid.right() + 1.0,
+                            "{at}: the navigator {:?} is on the grid box {:?}",
+                            l.tool_nav,
+                            l.tool_grid
+                        );
+                        for b in four.iter().chain([&l.tool_nav]) {
+                            let (above, below) = (b.top() - corner.top(), corner.bottom() - b.bottom());
+                            assert!(
+                                above >= -1.0e-3 && (above - below).abs() < 1.0e-3,
+                                "{at}: {b:?} is not centred in the corner {corner:?}"
+                            );
+                            assert!(
+                                b.left() >= corner.left() - 1.0e-3 && b.right() <= corner.right() + 1.0e-3,
+                                "{at}: {b:?} is outside the corner {corner:?}"
+                            );
+                            for (what, other) in [
+                                ("the ruler", l.ruler),
+                                ("the ruler's strip", l.meter_strip),
+                                ("the seam", l.grip),
+                                ("the headers", l.header),
+                                ("the lanes", l.lanes_area),
+                            ] {
+                                assert!(!b.intersects(other), "{at}: {b:?} is on {what}, {other:?}");
+                            }
+                        }
+                        // ── a full panel, to the bit ───────────────────────
+                        let was = half_strip(corner);
+                        if corner.height() * 0.5 >= ((corner.width() - 12.0) / 5.5).min(20.0) {
+                            let now = [l.tool_met, l.tool_snap, l.tool_tempo, l.tool_grid, l.tool_nav];
+                            for (k, (now, was)) in now.iter().zip(&was).enumerate() {
+                                assert_eq!(
+                                    bits(*now),
+                                    bits(*was),
+                                    "{at}: rectangle {k} is {now:?}, and the half strip put it at {was:?}"
+                                );
+                            }
+                        } else {
+                            assert!(h < 383, "{at}: a full panel's half corner decided its buttons");
+                        }
+                        // ── the press and the reader ───────────────────────
+                        if w == 1300.0 && header_w.is_none() {
+                            let hits = targets(r, &v);
+                            let nodes = a11y_nodes_from(&v, &hits);
+                            for (b, hit, label) in [
+                                (l.tool_met, Hit::ToolMetronome, "Metronome"),
+                                (l.tool_snap, Hit::ToolSnap, "Snap to grid"),
+                                (l.tool_tempo, Hit::ToolTempoLane, "Tempo lane"),
+                                (l.tool_grid, Hit::ToolGrid, "Grid"),
+                                (l.tool_nav, Hit::ToolNav, "Visible span"),
+                            ] {
+                                let inside = b.shrink(0.5);
+                                for p in [b.center(), inside.left_top(), inside.right_top(), inside.left_bottom(), inside.right_bottom()]
+                                {
+                                    assert_eq!(hit_test(r, &v, p), Some(hit), "{at}: a press at {p:?} on {b:?}");
+                                }
+                                assert!(hits.contains(&(b, hit)), "{at}: {hit:?} is not a target at {b:?}");
+                                let node = nodes.iter().find(|n| n.label == label);
+                                assert_eq!(node.map(|n| n.rect), Some(b), "{at}: the reader's {label} is not on {b:?}");
+                            }
+                        }
+                        swept += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(swept, 2 * 5 * 4 * 321, "the sweep skipped a case");
     }
 
     /// Every word painted BELOW the ruler's chip strip, with the ink it was
@@ -8377,6 +9737,161 @@ LaneView {
         );
     }
 
+    /// **No lane number is cut, in any face, at any header width, on a desk
+    /// of any length.**
+    ///
+    /// The owner: "Track count in arrangement view gets cut off slightly at
+    /// the 2nd digit". The column was a fixed twelve points, nine of them
+    /// after the lead, and "10" at ten points is twelve wide, so the second
+    /// figure ran out of the column toward the arm. Desks of 9, 10, 99, 100,
+    /// 999, 1000, 1234 and 12345 rows, the last few rows of each in the
+    /// window (a folder child and an empty numbered slot among them), at the
+    /// width floor, the default, 220 and half the view, on several windows,
+    /// in all three bundled faces: every number is painted whole inside its
+    /// column, clear of every other control on its header, at no less than
+    /// the 6.5 point floor, and four figures keep the full ten points. The
+    /// room is not the name's: every track keeps its input chip and a name
+    /// no narrower than the twenty points the dials already leave it (their
+    /// forty-point column less the note and wrench).
+    ///
+    /// Revert check: make `number_column_w` answer the old twelve and this
+    /// fails on desk 10, "10" running past its column.
+    #[test]
+    fn every_lane_number_fits_its_column() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        let mut bad: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            crate::fonts::apply_text_styles(&ctx);
+            // The widest digit, measured: the constant the column is cut by.
+            let mut digit = 0.0_f32;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for d in 0..10 {
+                        let g = ui.painter().layout_no_wrap(
+                            d.to_string(),
+                            FontId::new(NUM_PT, crate::fonts::courier()),
+                            Color32::WHITE,
+                        );
+                        digit = digit.max(g.size().x);
+                    }
+                });
+            });
+            assert!(
+                digit <= NUM_DIGIT_W + 0.01,
+                "{face:?}: a digit is {digit}pt at {NUM_PT}pt, the column allows {NUM_DIGIT_W}"
+            );
+            for desk in [9usize, 10, 99, 100, 999, 1000, 1234, 12345] {
+                let first = desk.saturating_sub(7);
+                let lanes = || -> Vec<(usize, LaneView<'static>)> {
+                    (first..desk)
+                        .map(|row| {
+                            let k = row - first;
+                            let mut lane = a_lane(k != 2);
+                            lane.in_folder = k == 4;
+                            (row, lane)
+                        })
+                        .collect()
+                };
+                for (w, h) in [(940.0, 420.0), (1300.0, 420.0), (1920.0, 900.0), (2560.0, 1300.0)] {
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+                    for header_w in [Some(header_floor), None, Some(220.0), Some(w * 0.5)] {
+                        let mut v = a_view(&clips);
+                        v.lanes = Lanes::new(lanes());
+                        v.desk_rows = desk;
+                        v.active = 8;
+                        v.header_w = header_w;
+                        let l = Layout::new(r, &v);
+                        let out = ctx.run(
+                            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    ui.set_clip_rect(r);
+                                    draw(ui.painter(), r, &v);
+                                });
+                            },
+                        );
+                        for (i, row) in l.header_rows.iter() {
+                            if !row.panel.is_positive() {
+                                continue;
+                            }
+                            let want = format!("{}", i + 1);
+                            let at = format!("{face:?} desk {desk} {w}x{h} header {header_w:?} row {want}");
+                            let Some((laid, ink, size)) = out.shapes.iter().find_map(|s| match &s.shape {
+                                egui::Shape::Text(t)
+                                    if t.galley.text() == want
+                                        && row.panel.contains(t.visual_bounding_rect().center()) =>
+                                {
+                                    Some((
+                                        Rect::from_min_size(t.pos, t.galley.size()),
+                                        t.visual_bounding_rect(),
+                                        t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                                    ))
+                                }
+                                _ => None,
+                            }) else {
+                                bad.push(format!("{at}: no number painted"));
+                                continue;
+                            };
+                            seen += 1;
+                            // The column: the header's own cell on a track, and
+                            // the same seat on an empty slot, which has none.
+                            let indent = if v.lanes[i].in_folder { FOLDER_INDENT } else { 0.0 };
+                            let col_left = row.panel.left() + 3.0 + indent;
+                            let col_right = if row.number.is_positive() {
+                                assert_eq!(row.number.left(), col_left, "{at}: the column moved");
+                                row.number.right()
+                            } else {
+                                col_left + l.num_w
+                            };
+                            for (what, b) in [("laid out", laid), ("drawn", ink)] {
+                                if b.left() < col_left - 0.01 || b.right() > col_right + 0.5 {
+                                    bad.push(format!(
+                                        "{at}: {what} {:.1}..{:.1}, the column {col_left:.1}..{col_right:.1}",
+                                        b.left(),
+                                        b.right()
+                                    ));
+                                }
+                            }
+                            if size < NUM_FLOOR_PT || (want.len() <= NUM_MAX_DIGITS && size < NUM_PT) {
+                                bad.push(format!("{at}: drawn at {size}pt"));
+                            }
+                            // And the room it took was not the name's: a track
+                            // still has a name and an input chip to press.
+                            if v.lanes[i].used && !(row.name.width() >= 19.5 && row.input.is_positive()) {
+                                bad.push(format!("{at}: name {:?}, input {:?}", row.name, row.input));
+                            }
+                            let mut others = vec![
+                                ("arm", row.arm),
+                                ("note", row.theory),
+                                ("wrench", row.automation),
+                                ("name", row.name),
+                                ("input", row.input),
+                                ("plus", row.add),
+                                ("collapse", row.collapse),
+                                ("folder box", row.folder),
+                                ("pan", row.pan),
+                                ("routing", row.routing),
+                            ];
+                            others.extend(row.bays.iter().map(|b| ("bay", *b)));
+                            for (what, o) in others {
+                                if o.is_positive() && o.intersects(ink) {
+                                    bad.push(format!("{at}: the number {ink:?} runs into the {what} {o:?}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen > 1000, "only {seen} numbers were checked");
+        bad.dedup();
+        assert!(bad.is_empty(), "{} clipped numbers:\n  {}", bad.len(), bad.join("\n  "));
+    }
+
     pub(super) fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             master_gain: 1.0,
@@ -8398,8 +9913,9 @@ ArrangeView {
             naming: None,
             time_sel: None,
             selected_channel: None,
-            selected_tracks: &[],
-            lanes: std::array::from_fn(|i| a_lane(i < 3)),
+            selected_tracks: Vec::new(),
+            lanes: Lanes::dense((0..CHANNELS).map(|i| a_lane(i < 3)).collect()),
+            desk_rows: CHANNELS,
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
             active: CHANNELS,
@@ -9013,7 +10529,7 @@ ArrangeView {
             let row = l
                 .rows
                 .iter()
-                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .find(|x| x.kind == RowKind::Automation(LaneId::Row(0), 0))
                 .expect("no automation row")
                 .lane;
             let out = ctx.run(
@@ -9114,7 +10630,7 @@ ArrangeView {
         // row and pressing it must not move the playhead.
         assert_eq!(
             hit_test(r, &v, l.master_row.knob.center()),
-            Some(Hit::BusGain(MASTER_COLUMN)),
+            Some(Hit::BusGain(Column::Master)),
             "the master fader was swallowed by the field"
         );
 
@@ -9156,7 +10672,7 @@ ArrangeView {
             let row = l
                 .rows
                 .iter()
-                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .find(|x| x.kind == RowKind::Automation(LaneId::Row(0), 0))
                 .unwrap_or_else(|| panic!("no automation row at {hh}"));
             let cells = auto_header(row.header);
             let out = ctx.run(
@@ -9307,10 +10823,12 @@ ArrangeView {
         assert!(knob.is_positive(), "the master's row has no level");
         assert_eq!(
             hit_test(rect(), &v, knob.center()),
-            Some(Hit::BusGain(MASTER_COLUMN)),
+            Some(Hit::BusGain(Column::Master)),
             "the master's level cannot be pressed"
         );
-        assert_eq!(MASTER_COLUMN, CHANNELS + 1);
+        // (It answers the master's COLUMN by name: it was the number two
+        // past the last channel, which moved whenever the desk grew, pinned
+        // here by an equality that is now the type itself.)
 
         // **Hidden, and the tracks take the room back.** Not removed: a
         // session always has an output.
@@ -9565,7 +11083,7 @@ ArrangeView {
     }
 
     /// **The master's automation rows say "Master", not "Track 17".** The
-    /// bus is addressed as lane `MASTER_LANE`, one past the lanes array, so
+    /// bus was addressed as the lane one past the lanes array, so
     /// every label site that indexed `lanes` or printed `i + 1` directly
     /// misnamed it to a reader — and the param row went further, reading a
     /// bound parameter as "none" because the inline lookup found no lane
@@ -9603,7 +11121,9 @@ ArrangeView {
         assert!(has("Hide automation row 1 on Master"), "the close row misnames the bus");
         assert!(has("Automation lane 1 on Master"), "the dial row misnames the bus");
         // And nothing anywhere in the tree calls the bus a track.
-        let ghost = format!("Track {}", MASTER_LANE + 1);
+        // The number a reader heard when the master was the lane one past
+        // the channels: its automation lane, counted from one.
+        let ghost = format!("Track {}", crate::desk_lift::V32_MASTER_LANE + 1);
         assert!(
             !nodes.iter().any(|n| n.label.contains(&ghost)),
             "a node still calls the master {ghost}"
@@ -9629,12 +11149,11 @@ ArrangeView {
     ///
     /// The printed spelling changed under this test — the quarter rung reads
     /// "1/4" rather than `\u{266a}` now — and the SPOKEN assertion below did
-    /// not, deliberately. It is the guard on `grid_spoken` having followed
-    /// the box across: point that function at the glyph spelling while the
-    /// box prints numerals, or leave its match arm on `\u{266a}`, and the
-    /// quarter rung falls through to the "of a bar" catch-all. This line
-    /// then says "1/4 of a bar" and goes red, which is the whole point of
-    /// keeping it worded as a note.
+    /// not, deliberately: the reader names the note, whatever the box draws.
+    /// It used to name it by matching the box's text, so a respelt box could
+    /// drop the quarter into an "of a bar" catch-all; it sorts the division
+    /// itself now (`note_value`), and `every_step_of_every_meter_is_said_as_a_note`
+    /// holds every step of every meter to a note's name.
     #[test]
     fn the_grid_box_can_be_stepped_both_ways() {
         let cs: Vec<ClipView<'_>> = Vec::new();
@@ -9653,10 +11172,80 @@ ArrangeView {
         assert_eq!(grid_label_text(-2, 6, 8), "1/8");
         assert!((grid_quarters(-2, 6, 8) - 0.5).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
-        assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
+        // Four steps up from the finest, -6, of the nine between it and 3.
+        assert!((t.norm - 4.0 / 9.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.
         assert!(crate::a11y::Gesture::Least.nudged(t.norm) <= 0.0);
         assert!(crate::a11y::Gesture::Most.nudged(t.norm) >= 1.0);
+    }
+
+    /// **The grid box's slider spans the steps the box takes, -6 to 3, and
+    /// every key on it lands on the step it means.**
+    ///
+    /// It declared -5 to 3 with the travel `(exp + 5) / 8`, a step short of
+    /// the settings' clamp (`arr_grid_exp` is held to -6..3 wherever it is
+    /// written) and of the ladder this box prints and says. At -6, the finest
+    /// step, the node's value was under its own minimum and its travel was
+    /// -0.125, a position a reader can only take as out of range. Every
+    /// step, then: the value inside the declared range, which is -6 to 3;
+    /// the travel inside 0..1 and rising a ninth a step; and read back
+    /// through `grid_box_step_for`, the road `apply_arrange_key` takes, Space
+    /// (the travel unmoved) stays, Home and End reach the two ends, and an
+    /// arrow, with Shift or without, moves exactly one step its own way.
+    /// `a_key_on_the_grid_box_moves_it_one_step` in `app.rs` drives the same
+    /// presses through egui's focus to the settings.
+    ///
+    /// Revert checks, performed: declare -5 to 3 again, with the travel
+    /// `(exp + 5) / 8`, and this fails on the first step it reads, -6, whose
+    /// range is not the box's; read a key back as the nearest step alone, as
+    /// the road did, and it fails on the first arrow, Up at -6, which stays
+    /// at -6.
+    #[test]
+    fn the_grid_box_slider_spans_every_step_the_box_takes() {
+        use crate::a11y::{Gesture, Kind};
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut last: Option<f32> = None;
+        for exp in GRID_BOX_FINEST..=GRID_BOX_COARSEST {
+            let mut v = a_view(&cs);
+            v.grid_exp = exp;
+            let nodes = a11y_nodes(rect(), &v);
+            let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
+            let Kind::Slider { now, min, max } = g.kind else {
+                panic!("step {exp}: the grid box is not a slider: {:?}", g.kind);
+            };
+            assert_eq!((min, max), (-6.0, 3.0), "step {exp}: the slider's range is not the box's");
+            assert!(
+                (min..=max).contains(&now) && now == f64::from(exp),
+                "step {exp}: the slider reads {now}, outside its range {min}..{max}"
+            );
+            let t = g.travel.expect("the grid box cannot be nudged");
+            assert!((0.0..=1.0).contains(&t.norm), "step {exp}: the travel is {}", t.norm);
+            if let Some(below) = last {
+                assert!(
+                    (t.norm - below - 1.0 / 9.0).abs() < 1.0e-6,
+                    "step {exp}: the travel rose {} from the step under it, not a ninth",
+                    t.norm - below
+                );
+            }
+            last = Some(t.norm);
+            let key = |g: Gesture| grid_box_step_for(exp, g.nudged(t.norm));
+            assert_eq!(key(Gesture::Activate), exp, "step {exp}: Space moved the box");
+            assert_eq!(key(Gesture::Least), GRID_BOX_FINEST, "step {exp}: Home");
+            assert_eq!(key(Gesture::Most), GRID_BOX_COARSEST, "step {exp}: End");
+            for fine in [false, true] {
+                assert_eq!(
+                    key(Gesture::Increase { fine }),
+                    (exp + 1).min(GRID_BOX_COARSEST),
+                    "step {exp}: the up arrow (fine: {fine})"
+                );
+                assert_eq!(
+                    key(Gesture::Decrease { fine }),
+                    (exp - 1).max(GRID_BOX_FINEST),
+                    "step {exp}: the down arrow (fine: {fine})"
+                );
+            }
+        }
+        assert_eq!(last, Some(1.0), "the coarsest step is not the end of the travel");
     }
 
     /// **Every theme, in both modes, measured where the paint actually
@@ -9743,9 +11332,10 @@ ArrangeView {
                 // edge can be SEEN, which is the whole job — a row that
                 // matches its parent stripe is a third stripe in the
                 // alternation rather than a row about something else.
-                for lane in [0usize, 1] {
+                for row in [0usize, 1] {
+                    let lane = LaneId::Row(row);
                     let g = auto_ground(&p, lane);
-                    let parent = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+                    let parent = if row % 2 == 0 { p.lane } else { p.lane_alt };
                     check("automation readout", on_ink(g), g, 4.5);
                     check("automation ground against its lane", g, parent, 1.12);
                     // **The seam between two stacked rows has to be SEEN**,
@@ -10103,6 +11693,466 @@ ArrangeView {
                 if exp >= 0 {
                     assert!(lines > 0, "{len_s} s wide at grid {exp}: no grid at all");
                 }
+            }
+        }
+    }
+
+    // ── the trailing add's ground, run on to the foot ────────────────────
+
+    /// **A desk that ends at its trailing add**: tracks on rows `0..used`
+    /// and the add on row `used`, the way the app builds a desk with fewer
+    /// drawn lanes than the window asks for. `plus` is the add's tier:
+    /// `Trailing`, or `Locked` (the padlock) at the free cap.
+    fn ending_at_the_add<'a>(
+        clips: &'a [ClipView<'a>],
+        used: usize,
+        plus: crate::mixer_panel::Plus,
+    ) -> ArrangeView<'a> {
+        let mut v = a_view(clips);
+        v.lanes = Lanes::dense(
+            (0..=used)
+                .map(|i| if i < used { a_lane(true) } else { LaneView { plus, ..a_lane(false) } })
+                .collect(),
+        );
+        v.active = used + 1;
+        v
+    }
+
+    /// One frame of `v` at `area`, in a context the caller keeps: the
+    /// sweeps below paint hundreds of frames, and fonts are installed once.
+    fn paint_in(ctx: &egui::Context, v: &ArrangeView<'_>, area: Rect) -> Vec<egui::epaint::ClippedShape> {
+        ctx.run(egui::RawInput { screen_rect: Some(area), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_clip_rect(area);
+                draw(ui.painter(), area, v);
+            });
+        })
+        .shapes
+    }
+
+    /// **The ground the eye sees over `region`**: the LAST filled rect
+    /// painted over all of it, and its fill. `None` when a fill painted
+    /// after it covers more of the region than a glyph does (the add's plus
+    /// or padlock can overhang a short row), since that would be the ground
+    /// there instead.
+    fn ground_over(shapes: &[egui::epaint::ClippedShape], region: Rect) -> Option<(Rect, Color32)> {
+        let filled = |cs: &egui::epaint::ClippedShape| match &cs.shape {
+            egui::Shape::Rect(r) if r.fill.a() > 0 => Some((r.rect, r.fill)),
+            _ => None,
+        };
+        let k = shapes.iter().rposition(|cs| filled(cs).is_some_and(|(r, _)| r.contains_rect(region)))?;
+        let covered = shapes[k + 1..]
+            .iter()
+            .filter_map(filled)
+            .map(|(r, _)| r.intersect(region))
+            .any(|i| i.is_positive() && i.area() > 200.0);
+        if covered {
+            None
+        } else {
+            filled(&shapes[k])
+        }
+    }
+
+    /// **Everything [`EndlessGround`] promises, read off one painted frame.**
+    ///
+    /// Under the add, each column's last fill is ONE rect from the add's
+    /// own top to the foot of that column, as wide as the add, in what the
+    /// add wears there: `ink`'s `empty_ground` in the header column, and
+    /// across the field `lane`, the field's own ground, on an odd row as on
+    /// an even one (`field_ground`); and it is the only rect of that colour
+    /// there, so the run costs a rect a column however far it goes.
+    /// Nothing is drawn ACROSS the add's foot, neither the seam a boundary
+    /// between rows wears nor a box edge, and the add's slot box closes
+    /// round the whole run. Returns the two runs under the add: the header
+    /// column's and the field's.
+    fn assert_endless(
+        shapes: &[egui::epaint::ClippedShape],
+        l: &Layout,
+        v: &ArrangeView<'_>,
+        g: EndlessGround,
+        what: &str,
+    ) -> (Rect, Rect) {
+        let p = ink(v);
+        let panel = l.header_rows[g.row].panel;
+        let lane = l.lane_rows[g.row];
+        let foot = lane.bottom();
+        let header_run = Rect::from_min_max(
+            Pos2::new(panel.left(), foot),
+            Pos2::new(panel.right(), l.header.bottom()),
+        );
+        let lane_run = Rect::from_min_max(Pos2::new(lane.left(), foot), l.lanes_area.right_bottom());
+        assert!(
+            header_run.is_positive() && lane_run.is_positive(),
+            "{what}: no room under the add {lane:?} to run on into"
+        );
+        for (column, run, own, want) in
+            [("header column", header_run, panel, p.empty_ground), ("field", lane_run, lane, p.lane)]
+        {
+            let (rect, fill) = ground_over(shapes, run)
+                .unwrap_or_else(|| panic!("{what}: nothing is painted under the add in the {column}"));
+            assert_eq!(fill, want, "{what}: the {column} under the add is not the add's own ground");
+            assert!(
+                rect.top() <= own.top() + 0.01
+                    && rect.bottom() >= run.bottom() - 0.01
+                    && rect.left() <= own.left() + 0.01
+                    && rect.right() >= own.right() - 0.01,
+                "{what}: the {column}'s ground {rect:?} is not one surface from the add {own:?} to the foot at {:.1}",
+                run.bottom()
+            );
+            // And it costs one rect however far it runs: never a rect per
+            // row that is not there.
+            let pieces = shapes
+                .iter()
+                .filter(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) => r.fill == want && r.rect.intersect(run).is_positive(),
+                    _ => false,
+                })
+                .count();
+            assert_eq!(pieces, 1, "{what}: the {column} under the add is painted in {pieces} pieces");
+        }
+        // Nothing across the add's foot: a line or a box edge running the
+        // width there would cut the one surface in two.
+        let across = |y: f32, x0: f32, x1: f32| {
+            (y - foot).abs() <= 1.0 && x1.min(l.lanes_area.right()) - x0.max(panel.left()) > 40.0
+        };
+        for cs in shapes {
+            match &cs.shape {
+                egui::Shape::LineSegment { points: [a, b], stroke }
+                    if stroke.width > 0.0 && stroke.color.a() > 0 =>
+                {
+                    assert!(
+                        !((a.y - b.y).abs() < 0.5 && across(a.y, a.x.min(b.x), a.x.max(b.x))),
+                        "{what}: a line runs across the add's foot at {foot:.1}: {a:?} to {b:?}"
+                    );
+                }
+                egui::Shape::Rect(r) if r.stroke.width > 0.0 && r.stroke.color.a() > 0 => {
+                    for y in [r.rect.top(), r.rect.bottom()] {
+                        assert!(
+                            !across(y, r.rect.left(), r.rect.right()),
+                            "{what}: a box edge runs across the add's foot: {:?}",
+                            r.rect
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        let boxed = shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::Shape::Rect(r)
+                if r.stroke.width > 0.0
+                    && r.fill.a() == 0
+                    && (r.rect.left() - panel.left()).abs() < 0.01
+                    && (r.rect.top() - lane.top()).abs() < 0.01
+                    && (r.rect.right() - lane.right()).abs() < 0.01
+                    && (r.rect.bottom() - l.lanes_area.bottom()).abs() < 0.01)
+        });
+        assert!(boxed, "{what}: the add's slot box does not close round its run");
+        (header_run, lane_run)
+    }
+
+    /// An automation row to open on a lane, for the stacks below.
+    fn an_open_row() -> AutoView<'static> {
+        AutoView {
+            selected: false,
+            label: "volume".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            param: crate::automation::AutoParam::Gain,
+            points: &[],
+            hot: None,
+            chosen: Vec::new(),
+            moving: None,
+        }
+    }
+
+    /// **The trailing add's ground runs on to the foot of the timeline.**
+    ///
+    /// The owner: "i want the unlimited track mode to have continuity of the
+    /// color used for the background of the track adder button below tracks
+    /// in the arrange view ... can we make the draw just infinite?" Held at
+    /// five window sizes, in both tiers (the padlock at the free cap wears
+    /// the same ground), on desks of none to twelve tracks at three zooms,
+    /// with automation rows and a shut folder above the add moving it, at
+    /// every scroll from the top to past the end: wherever the add stands
+    /// with room under it, its run reaches the foot of both columns as one
+    /// surface with it (see `assert_endless`). A desk that fills the window
+    /// ends flush at its add (scrolled to its end) or does not show it, and
+    /// has no run to paint.
+    ///
+    /// Revert-check: paint the add's two grounds over its own row alone
+    /// (the `endless_at` reads in `draw`) and the header column under the
+    /// add is the wood again.
+    #[test]
+    fn the_trailing_adds_ground_runs_on_to_the_foot_of_the_timeline() {
+        use crate::mixer_panel::Plus;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let none: Vec<ClipView<'_>> = Vec::new();
+        let (mut ran, mut flush) = (0usize, 0usize);
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 673.0), (1920.0, 960.0), (640.0, 300.0), (1300.0, 150.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                // (tracks, lanes the window asks for, automation rows open on
+                // the first lane, lanes 1..=k shut away in a folder)
+                for (used, visible, opened, shut) in [
+                    (2usize, 8usize, 0usize, 0usize),
+                    (0, 8, 0, 0),
+                    (5, 8, 0, 0),
+                    (2, 16, 0, 0),
+                    (2, 8, 2, 0),
+                    (5, 8, 1, 0),
+                    (12, 8, 0, 8),
+                    (3, 4, 0, 0),
+                    (12, 8, 0, 0),
+                ] {
+                    for scroll in [0usize, 1, 4, 5, usize::MAX] {
+                        let mut v = ending_at_the_add(&none, used, plus);
+                        v.visible_lanes = visible;
+                        v.lane_scroll = scroll;
+                        if opened > 0 {
+                            v.lanes[0].automation = (0..opened).map(|_| an_open_row()).collect();
+                        }
+                        for k in 1..=shut {
+                            v.lanes[k].hidden = true;
+                        }
+                        v.active = used + 1 - shut;
+                        let what = format!(
+                            "{w}x{h}, {plus:?}, {used} tracks ({shut} shut away) in {visible} lanes, \
+                             {opened} automation rows, scroll {scroll}"
+                        );
+                        let l = Layout::new(r, &v);
+                        let shapes = paint_in(&ctx, &v, r);
+                        match endless_ground(&l, &v) {
+                            Some(g) => {
+                                assert_eq!(g.row, used, "{what}: the run is not the add's");
+                                assert_endless(&shapes, &l, &v, g, &what);
+                                ran += 1;
+                            }
+                            None => {
+                                if let Some(add) = l.lane_rows.get(used).copied().filter(|a| a.is_positive()) {
+                                    assert!(
+                                        l.lanes_area.bottom() - add.bottom() <= 0.5,
+                                        "{what}: the add {add:?} has room under it and no run"
+                                    );
+                                    flush += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ran >= 200 && flush >= 40, "{ran} frames ran the add on, {flush} ended flush at it");
+    }
+
+    /// **On every theme, in both modes, the run wears the add's own
+    /// grounds**, which are the theme's: `empty_ground` in the header column
+    /// (the token every empty row's header wears) and `lane`, the field's
+    /// own ground, in the field, with the add on an even row and on an odd
+    /// one. Read off the painted frame against `ink`, so no colour is
+    /// written down here and a theme that moves its grounds moves the run
+    /// with them.
+    #[test]
+    fn every_theme_runs_the_add_on_in_its_own_grounds() {
+        use crate::mixer_panel::Plus;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let none: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        let mut seen = 0usize;
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
+            let mut st = crate::settings::Settings::default();
+            theme.apply(&mut st);
+            st.dark_mode = dark;
+            for used in [2usize, 3] {
+                let mut v = ending_at_the_add(&none, used, Plus::Trailing);
+                v.dark_mode = dark;
+                let c = st.recorder_bg_color;
+                v.wood = (c.r, c.g, c.b);
+                let c = st.fx_strip_color;
+                v.fx_strip = (c.r, c.g, c.b);
+                let c = st.meter_bg_color;
+                v.meter_bg = (c.r, c.g, c.b);
+                let what = format!("{} {}, the add on row {used}", theme.name, if dark { "dark" } else { "light" });
+                let l = Layout::new(r, &v);
+                let g = endless_ground(&l, &v).unwrap_or_else(|| panic!("{what}: no run under the add"));
+                assert_endless(&paint_in(&ctx, &v, r), &l, &v, g, &what);
+                seen += 1;
+            }
+        }
+        assert!(seen >= 64, "only {seen} theme frames were painted");
+    }
+
+    /// **The add wears one ground in the field however long the desk is.**
+    ///
+    /// The add's row is the desk's length, so removing a track, opening one
+    /// between two others and adding one that grows the desk each stand it
+    /// on a row of the other parity. Striped by that row, the add and the
+    /// run under it (the largest surface on the timeline) swapped between
+    /// the two stripes at every one of those edits, so the colour the owner
+    /// asked to carry on held only until the desk changed length. Held on
+    /// desks of none to nine tracks, so the add stands on even rows and odd
+    /// ones, in both tiers, at three window sizes, with automation rows open
+    /// and a shut folder above it, scrolled to the top and to the end: the
+    /// add's own lane and the run under it, where there is one, are `lane`,
+    /// the field's own ground, and one rect; a desk ending flush at its add
+    /// wears it too; and every track above keeps its stripe by row, so
+    /// nothing but the add changed.
+    ///
+    /// Revert-check: stripe the add by its row again (`field_ground`) and
+    /// every desk whose add stands on an odd row goes red.
+    #[test]
+    fn the_trailing_adds_ground_is_one_colour_however_long_the_desk_is() {
+        use crate::mixer_panel::Plus;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let none: Vec<ClipView<'_>> = Vec::new();
+        // The fill the eye sees at `at`: a speck, so nothing painted beside
+        // it (a scrollbar, a neighbour) is read as its ground.
+        let fill_at = |shapes: &[egui::epaint::ClippedShape], at: Pos2| {
+            ground_over(shapes, Rect::from_center_size(at, Vec2::splat(4.0)))
+        };
+        let (mut odd_run, mut odd_flush, mut striped) = (0usize, 0usize, 0usize);
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 673.0), (640.0, 300.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                // (automation rows open on the first lane, lanes 1..=k shut
+                // away in a folder), each on the desks that have the tracks
+                // to carry it
+                for (opened, shut, least) in [(0usize, 0usize, 0usize), (2, 0, 1), (0, 2, 3)] {
+                    for used in least..=9 {
+                        for scroll in [0usize, usize::MAX] {
+                            let mut v = ending_at_the_add(&none, used, plus);
+                            v.visible_lanes = 6;
+                            v.lane_scroll = scroll;
+                            if opened > 0 {
+                                v.lanes[0].automation = (0..opened).map(|_| an_open_row()).collect();
+                            }
+                            for k in 1..=shut {
+                                v.lanes[k].hidden = true;
+                            }
+                            v.active = used + 1 - shut;
+                            let what = format!(
+                                "{w}x{h}, {plus:?}, the add on row {used} ({shut} shut away, \
+                                 {opened} automation rows), scroll {scroll}"
+                            );
+                            let l = Layout::new(r, &v);
+                            let Some(add) = l.lane_rows.get(used).copied().filter(|a| a.height() > 8.0) else {
+                                continue;
+                            };
+                            let p = ink(&v);
+                            let shapes = paint_in(&ctx, &v, r);
+                            let at = Pos2::new(add.left() + add.width() * 0.3, add.center().y);
+                            let (own, fill) =
+                                fill_at(&shapes, at).unwrap_or_else(|| panic!("{what}: nothing painted on the add"));
+                            assert_eq!(fill, p.lane, "{what}: the add does not wear the field's own ground");
+                            match endless_ground(&l, &v) {
+                                Some(g) => {
+                                    let under = Pos2::new(at.x, (add.bottom() + g.lane.bottom()) * 0.5);
+                                    assert_eq!(
+                                        fill_at(&shapes, under),
+                                        Some((own, p.lane)),
+                                        "{what}: the run under the add is not the add's own ground"
+                                    );
+                                    odd_run += used % 2;
+                                }
+                                None => odd_flush += used % 2,
+                            }
+                            for (i, row) in l.lane_rows.iter().filter(|(i, x)| *i < used && x.height() > 8.0) {
+                                let stripe = if i % 2 == 0 { p.lane } else { p.lane_alt };
+                                let at = Pos2::new(row.left() + row.width() * 0.3, row.center().y);
+                                assert_eq!(
+                                    fill_at(&shapes, at).map(|(_, c)| c),
+                                    Some(stripe),
+                                    "{what}: track row {i} lost its stripe"
+                                );
+                                striped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            odd_run >= 40 && odd_flush >= 8 && striped >= 300,
+            "{odd_run} runs and {odd_flush} flush adds on odd rows, {striped} tracks' stripes read"
+        );
+    }
+
+    /// **The run under the add is paint, and answers nothing.**
+    ///
+    /// A press anywhere in it answers what the bare wood there did: no hit,
+    /// no header panel holding it (a press on bare header ground selects the
+    /// row whose panel holds the point: `app`'s `None` arm) and no lane row.
+    /// No target the panel offers a keyboard or a reader reaches into it.
+    /// And the layout is the one a desk whose last row is an ordinary empty
+    /// row gets, which has no run: the same rows in the same places (the
+    /// add's own among them, ending where it always did) and no lane
+    /// scrollbar, so the run is not content and the scroll range never
+    /// counts it.
+    ///
+    /// Revert-check: with the run unpainted, the first assertion goes red
+    /// here as in every test of the run; the rest hold it to paint.
+    #[test]
+    fn the_run_under_the_add_is_paint_and_answers_nothing() {
+        use crate::mixer_panel::Plus;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let none: Vec<ClipView<'_>> = Vec::new();
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 673.0), (640.0, 300.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                let what = format!("{w}x{h}, {plus:?}");
+                let v = ending_at_the_add(&none, 2, plus);
+                let l = Layout::new(r, &v);
+                let g = endless_ground(&l, &v).unwrap_or_else(|| panic!("{what}: no run under the add"));
+                let (header_run, lane_run) = assert_endless(&paint_in(&ctx, &v, r), &l, &v, g, &what);
+                for run in [header_run, lane_run] {
+                    for fx in [0.02_f32, 0.5, 0.98] {
+                        for fy in [0.02_f32, 0.5, 0.98] {
+                            let at = Pos2::new(run.left() + run.width() * fx, run.top() + run.height() * fy);
+                            assert_eq!(hit_test(r, &v, at), None, "{what}: a press at {at:?} in the run hits");
+                            assert_eq!(
+                                l.header_rows.find_row(|h| h.panel.contains(at)),
+                                None,
+                                "{what}: a header panel holds {at:?} in the run"
+                            );
+                            assert_eq!(
+                                l.lane_rows.find_row(|x| x.contains(at)),
+                                None,
+                                "{what}: a lane holds {at:?} in the run"
+                            );
+                        }
+                    }
+                    for (t, hit) in targets_in(&l, &v) {
+                        assert!(
+                            !t.intersect(run).is_positive(),
+                            "{what}: {hit:?} at {t:?} reaches into the run {run:?}"
+                        );
+                    }
+                }
+                // The same desk ending in an ordinary empty row: no run, and
+                // the same layout to the point.
+                let twin = ending_at_the_add(&none, 2, Plus::Row);
+                let lt = Layout::new(r, &twin);
+                assert_eq!(endless_ground(&lt, &twin), None, "{what}: an ordinary empty row ran on");
+                assert_eq!(l.rows.len(), lt.rows.len(), "{what}: the run changed the rows");
+                for (a, b) in l.rows.iter().zip(&lt.rows) {
+                    assert_eq!(
+                        (a.kind, a.lane, a.header),
+                        (b.kind, b.lane, b.header),
+                        "{what}: the run moved a row"
+                    );
+                }
+                assert_eq!((l.lane_bar, lt.lane_bar), (LaneBar::NONE, LaneBar::NONE), "{what}: a scroll range");
             }
         }
     }
@@ -10616,7 +12666,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
         // **The point under the pointer is the RIGHT one**, four thousand
@@ -10629,7 +12679,7 @@ selected: false,
         );
         assert_eq!(
             hit_test(rect(), &v, at),
-            Some(Hit::AutoPoint(0, 0, want)),
+            Some(Hit::AutoPoint(LaneId::Row(0), 0, want)),
             "the index came back offset by the cull"
         );
     }
@@ -10660,21 +12710,21 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
         assert!(row.is_positive());
 
         // Straight at the first point.
         let at = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.75));
-        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
         // A little off it, still within the handle's reach.
         let near = Pos2::new(at.x + 2.0, at.y - 2.0);
-        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
         // Well away from both: empty room, and it says WHERE.
         let empty = Pos2::new(x_of(rect(), &v, 4.0), row.center().y);
         match hit_test(rect(), &v, empty) {
-            Some(Hit::AutoLane(0, 0, t, val)) => {
+            Some(Hit::AutoLane(LaneId::Row(0), 0, t, val)) => {
                 assert!((t - 4.0).abs() < 0.2, "the press landed at {t}s");
                 assert!((val - 0.5).abs() < 0.1, "the middle of the row read as {val}");
             }
@@ -10682,7 +12732,7 @@ selected: false,
         }
         // The nearer of two points wins, not the first.
         let second = Pos2::new(x_of(rect(), &v, 6.0), auto_y_of(row, 0.25));
-        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 0, 1)));
+        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(LaneId::Row(0), 0, 1)));
     }
 
     /// **A press just above an automation row does not make a point in it.**
@@ -10716,7 +12766,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
 
@@ -10733,13 +12783,13 @@ selected: false,
         // made the lane unusable instead of safe.
         let inside = Pos2::new(x_of(rect(), &v, 20.0), row.center().y);
         assert!(
-            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(0, 0, ..))),
+            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(LaneId::Row(0), 0, ..))),
             "the row stopped accepting presses"
         );
         // A handle overhanging the edge is still grabbable, which is the
         // whole reason the grab area is expanded.
         let handle = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.5));
-        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
     }
 
     /// A closed row is not hit at all, and its clips still are.
@@ -10871,7 +12921,7 @@ selected: false,
         let auto = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row");
         assert!(
             (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,
@@ -10921,7 +12971,7 @@ selected: false,
         assert!(
             l.rows
                 .iter()
-                .any(|r| r.kind == RowKind::Automation(0, 0) && r.lane.is_positive()),
+                .any(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0) && r.lane.is_positive()),
             "the automation row itself fell off"
         );
     }
@@ -11073,7 +13123,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row");
         assert!(row.header.is_positive(), "the row has no header to carve");
 
@@ -11207,7 +13257,7 @@ selected: false,
         let c = clips();
         let v = a_view(&c);
         let l = Layout::new(rect(), &v);
-        for (i, row) in l.header_rows.iter().enumerate() {
+        for (i, row) in l.header_rows.iter() {
             let cells = [
                 row.number,
                 row.arm,
@@ -11263,7 +13313,7 @@ selected: false,
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
         // **The ladder the owner asked for, in the meter he works in.**
-        // Going finer: 1, 1/2, 1/4, 1/8, 1/16 — one 1/4 state, sitting
+        // Going finer: BAR, 1/2, 1/4, 1/8, 1/16, with one 1/4 state, sitting
         // exactly between 1/8 and 1/2, and now written the way the rungs
         // either side of it are written. The middle rung used to assert
         // `\u{266a}`; the owner asked for the fraction back because "it's
@@ -11272,7 +13322,12 @@ selected: false,
         // glyph used to stand in for is asserted on its own terms by
         // `only_one_rung_of_the_arrange_ladder_is_a_quarter`, so nothing was
         // weakened by respelling it here.
-        assert_eq!(grid_label_text(0, 4, 4), "1");
+        //
+        // The top of it asserted "1" until the bar rung was named: "1" is a
+        // whole note, which in 4/4 is the bar's length, and in 4/2 it is the
+        // rung UNDER the bar. The owner ruled the bar reads BAR in every
+        // meter, this one included (see `GRID_BAR`).
+        assert_eq!(grid_label_text(0, 4, 4), "BAR");
         assert_eq!(grid_label_text(3, 4, 4), "8");
         assert_eq!(grid_label_text(-1, 4, 4), "1/2");
         assert_eq!(grid_label_text(-2, 4, 4), "1/4");
@@ -11405,6 +13460,807 @@ selected: false,
         assert!(!(-7i8..=6).any(|e| grid_label_text(e, 6, 8) == "1/4"));
         assert_eq!(grid_label_text(-1, 6, 8), "1/4\u{00b7}");
         assert_eq!(grid_label(-1, 6, 8), "1/4\u{00b7}");
+    }
+
+    /// **No rung of any signature is printed as a decimal**, no ladder says
+    /// one of its rungs twice, and the bar is BAR in every one of them.
+    ///
+    /// Every signature `TimeSignature::is_valid` lets in, all 192 of them,
+    /// over the whole exponent range `grid_quarters` takes, in both
+    /// spellings. 247 of those (signature, rung) pairs used to fall through
+    /// `note_label` into `"{q:.3}q"`: the BAR rung of every meter whose bar
+    /// is not one note or one dotted note (5/4, 7/8, 9/8, 4/2 ...), and the
+    /// halves of a big bar that land on a length no note names (10/8's five
+    /// eighths). The sweep is what catches a fix made for 4/2 alone.
+    ///
+    /// The bar rung then read as its signature, and the owner, in 4/2, asked
+    /// "why does the option between 1 and 2 = 4/2 in grid frequency and why
+    /// is it even an option?" In 4/2 the box steps from 2 bars to one bar to
+    /// a whole note, so the rung "between 1 and 2" is the bar. He ruled it
+    /// reads BAR in every meter, 4/4 included, where it read "1" (see
+    /// `GRID_BAR`). This holds all 192 to that, holds every other rung to
+    /// NOT reading BAR, so the word means one bar and nothing else, and
+    /// holds the reader to saying "1 bar" there.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// at the first signature it sweeps, 1/1, whose bar prints "1".
+    #[test]
+    fn no_rung_of_any_signature_is_spelled_as_a_decimal() {
+        let spellings: [fn(i8, u8, u8) -> String; 2] = [grid_label_text, grid_label];
+        let mut swept = 0;
+        for beats in 0u8..=64 {
+            for unit in 0u8..=64 {
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                if !sig.is_valid() {
+                    continue;
+                }
+                swept += 1;
+                for spell in spellings {
+                    let mut seen: Vec<(i8, String)> = Vec::new();
+                    for e in -7i8..=6 {
+                        let w = spell(e, beats, unit);
+                        assert!(
+                            !w.contains('.') && !w.contains('q'),
+                            "{beats}/{unit} at exp {e} prints {w:?}"
+                        );
+                        if e == 0 {
+                            assert_eq!(w, GRID_BAR, "{beats}/{unit}: the bar rung prints {w:?}");
+                        } else {
+                            assert_ne!(w, GRID_BAR, "{beats}/{unit}: exp {e} is not one bar");
+                        }
+                        if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
+                            panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
+                        }
+                        seen.push((e, w));
+                    }
+                }
+                assert_eq!(grid_spoken(0, beats, unit), "1 bar", "{beats}/{unit}, said aloud");
+            }
+        }
+        assert_eq!(swept, 192, "the sweep no longer covers every valid signature");
+        // The owner's meter, coarse to fine over the arrange box's range: the
+        // rung he asked about is BAR, and the 1 under it is the whole note it
+        // always was.
+        let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 2)).collect();
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1", "1/2", "1/4", "1/8", "1/16", "1/32"]);
+        // And 4/4's, whose bar read "1", the whole note's name.
+        let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 4)).collect();
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64"]);
+        // A rung UNDER the bar that no note names is still counted in the
+        // meter's beats, and a reader hears it as notes, not as a fraction of
+        // the bar: in 10/8 five eighths are HALF the bar, so "5/8 of a bar"
+        // would be a wrong number read aloud.
+        assert_eq!(grid_label_text(-1, 10, 8), "5/8");
+        assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
+        assert_eq!(grid_spoken(0, 4, 2), "1 bar");
+    }
+
+    /// **The bar rung is painted BAR in every meter: as narrow as the
+    /// three-character rungs, and inside its box, in every bundled face.**
+    ///
+    /// The owner met this rung twice. First as "8.000q" in 4/2: "there's a
+    /// '0 frequency on the grid frequency in arrange mode reads as quite a
+    /// lot of 0.000000s", six characters in a box drawn for three, so the 8
+    /// spilled onto the tempo-lane switch and the navigator (painted after
+    /// it) covered the q. Then, once that was counted as the signature, as
+    /// "4/2": "why does the option between 1 and 2 = 4/2 in grid frequency
+    /// and why is it even an option?" It reads BAR now in every meter (see
+    /// `GRID_BAR`), and this reads it off the real frame, for the reason the
+    /// quarter's test above gives: the picture is what was wrong.
+    ///
+    /// The width is held to two things on the same frame: the 1/2 rung, the
+    /// three-character label the box was drawn for, and the box itself,
+    /// which the label has to be laid out inside. It used to be held to the
+    /// 1/16 rung, the widest the 4/4 ladder prints, but at the box's eleven
+    /// points that one is wider than the box (25.6 points of its 20 in
+    /// Courier Prime and JetBrains Mono, 21.5 in Terminess), so the bound let
+    /// a label spill and pass. (It is drawn smaller now, to fit: see
+    /// `every_arrange_grid_step_is_painted_inside_its_box`.) In
+    /// every bundled face, since the box draws in whichever one the settings
+    /// chose and they are not one width: three characters at the box's
+    /// eleven points are 19.6 in Courier Prime and JetBrains Mono and 16.5
+    /// in Terminess. What is held is the laid-out width, not the glyphs'
+    /// quads, which round out to whole pixels and overhang their advance by
+    /// up to a pixel on every rung, 1/4 included.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// on 4/4 painting "1".
+    #[test]
+    fn the_bar_rung_is_painted_bar_in_every_meter() {
+        let r = rect();
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            crate::fonts::apply_text_styles(&ctx);
+            // What the box paints at `exp` in `beats/unit`: the box, and each
+            // text that lands on it, with where it was laid out.
+            let printed = |exp: i8, beats: u8, unit: u8| -> (Rect, Vec<(String, Rect)>) {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                v.meter = crate::tempo::MeterMap::constant(sig);
+                let cell = Layout::new(r, &v).tool_grid;
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => Some((
+                            t.galley.text().to_owned(),
+                            Rect::from_min_size(t.pos, t.galley.size()),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                (cell, texts)
+            };
+            // The three-character rung the box was drawn for, painted in it.
+            let (_, half) = printed(-1, 4, 4);
+            let three = half
+                .iter()
+                .find(|(t, _)| t == "1/2")
+                .map(|(_, laid)| laid.width())
+                .unwrap_or_else(|| panic!("{face:?}: the 4/4 box stopped printing 1/2: {half:?}"));
+            // The stock meters, whose bar read as a note value (4/4 "1", 3/4
+            // and 6/8 "1/2·", 2/4 "1/2", 12/8 "1·"), and odd ones, whose bar
+            // read as their own signature.
+            let meters = [
+                (4u8, 4u8),
+                (3, 4),
+                (6, 8),
+                (2, 4),
+                (12, 8),
+                (4, 2),
+                (5, 4),
+                (7, 8),
+                (9, 8),
+                (10, 8),
+            ];
+            for (beats, unit) in meters {
+                let (cell, got) = printed(0, beats, unit);
+                let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+                assert_eq!(names, [GRID_BAR], "{face:?} {beats}/{unit}: the bar painted {names:?}");
+                let laid = got[0].1;
+                assert!(
+                    laid.width() <= three + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is {}pt wide, the 1/2 rung {three}pt",
+                    laid.width()
+                );
+                assert!(
+                    laid.left() >= cell.left() - 0.01 && laid.right() <= cell.right() + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is laid out at {laid:?}, outside its box {cell:?}"
+                );
+            }
+        }
+    }
+
+    /// **Every step of every arrange ladder is painted inside its box: as it
+    /// always was when it fits, shrunk to the box when it does not, never
+    /// under the floor, and clipped to the box whatever happens.**
+    ///
+    /// The box is drawn for three characters and the ladder prints up to
+    /// six. At the box's eleven points 1/16 is 25.6 points wide in Courier
+    /// Prime and JetBrains Mono and 21.5 in Terminess, in a box of 20, and
+    /// every step of four characters or more spilled out of it; from five
+    /// on (1/128 is 32.6 points) it reached the tempo lane's switch on the
+    /// left and ran under the navigator on the right, the overflow behind
+    /// the owner's "0.000000".
+    ///
+    /// The twenty-point box, the one an arrangement of 209 points or more
+    /// draws; `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+    /// sweeps the smaller ones a shorter arrangement draws, and names what
+    /// they cut. Swept over every word the box can print: all 192
+    /// signatures, every step the box reaches (-6 to 3, the settings'
+    /// clamp), in both spellings. Each is painted by `grid_box_word`, the
+    /// call `draw` makes (`the_arrange_gridbox_paints_its_step_through_the_fit`
+    /// holds `draw` to it), into the real box, in every bundled face and at
+    /// 100% to 200% display scale, and read back as the tessellator draws
+    /// it. Held:
+    ///
+    /// - a word that is laid out inside the box at eleven points is painted
+    ///   at exactly eleven: BAR and 1/2 are, by name, in every face;
+    /// - a word that is not is painted smaller, never under `WORD_FLOOR`,
+    ///   and laid out no wider than the box less `WORD_AIR` either side;
+    /// - every pixel of a word that fits is inside the box, so the clip cuts
+    ///   nothing from it (the pixel snap moves it in when it would);
+    /// - every word is clipped to the box, so nothing is ever painted on a
+    ///   neighbour.
+    ///
+    /// Two words do not fit above the floor, and only in two faces: 1/1024
+    /// and 1/2048 in Courier Prime and JetBrains Mono need 5.5 points or
+    /// less (at 6.5 they are 22.9 to 23.4 points wide). They are pinned here
+    /// by name, so a third cannot join them unnoticed, and so are the 19
+    /// (signature, step) pairs that print them: the signatures 1/16 and 2/32
+    /// at the box's finest step, 1/32 at its two finest, and 3/32, 5/32 and
+    /// every odd count of 32nds up to 31/32 at its finest. They are painted
+    /// at the floor and cut at the box's edges.
+    ///
+    /// Revert checks, all performed: paint at the box's own size again and
+    /// this fails on the first word it sweeps, 1/64 (the finest step of
+    /// 1/1), left at eleven points where it does not fit; take the clip away
+    /// and it fails on that same word, whose clip is then the whole screen;
+    /// take the pixel snap away and it fails on 1/128 in JetBrains Mono at
+    /// 100%, a column of whose ink lands past the box's right edge (BAR in
+    /// Courier Prime at 150% does the same).
+    #[test]
+    fn every_arrange_grid_step_is_painted_inside_its_box() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let mut words: Vec<String> = Vec::new();
+        let mut cut_pairs: std::collections::BTreeSet<(u8, u8, i8)> = Default::default();
+        for &(beats, unit) in &sigs {
+            for e in -6i8..=3 {
+                for spell in [grid_label_text as fn(i8, u8, u8) -> String, grid_label] {
+                    let w = spell(e, beats, unit);
+                    if w == "1/1024" || w == "1/2048" {
+                        cut_pairs.insert((beats, unit, e));
+                    }
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let cell = Layout::new(rect(), &a_view(&cs)).tool_grid;
+        assert!(
+            (cell.width() - 20.0).abs() < 1.0e-3,
+            "the box is not at its full twenty points here: {cell:?}"
+        );
+        // The size the twenty-point box prints at, and has always printed at.
+        let ceiling = 11.0;
+        assert_eq!(grid_box_type(cell), ceiling);
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let mut cut: Vec<&str> = Vec::new();
+                for (k, w) in words.iter().enumerate() {
+                    let at = format!("{face:?} at {ppp}x, {w:?}");
+                    let painted = PaintedWord::painted_by(&ctx, ("arrange", k), |p| {
+                        grid_box_word(p, cell, w, Color32::WHITE);
+                    });
+                    let [word] = painted.as_slice() else {
+                        panic!("{at}: painted {painted:?}, not one word");
+                    };
+                    assert_eq!(&word.text, w, "{at}");
+                    assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                    assert!(
+                        cell.contains_rect(word.clip),
+                        "{at}: clipped to {:?}, not to its box {cell:?}",
+                        word.clip
+                    );
+                    let wide = measure
+                        .layout_no_wrap(w.clone(), FontId::new(ceiling, crate::fonts::courier_bold()), Color32::WHITE)
+                        .rect
+                        .width();
+                    if wide <= cell.width() {
+                        assert_eq!(
+                            word.size, ceiling,
+                            "{at}: fits the box at {ceiling} points ({wide} wide) and was painted at {}",
+                            word.size
+                        );
+                    } else if word.laid.width() > cell.width() - 2.0 * WORD_AIR + 1.0e-3 {
+                        // Too wide even at the floor: the clip holds it.
+                        assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                        cut.push(w.as_str());
+                        continue;
+                    } else {
+                        // Shrunk, with the air either side. Held on its
+                        // width: where it lands is the ink's business, below,
+                        // since the pixel snap may move it by a pixel.
+                        assert!(word.size < ceiling, "{at}: {wide} wide at {ceiling} and not shrunk");
+                        assert!(
+                            word.laid.width() <= cell.width() - 2.0 * WORD_AIR + 1.0e-3,
+                            "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} either side in {}",
+                            word.size,
+                            word.laid.width(),
+                            cell.width()
+                        );
+                    }
+                    assert!(
+                        word.ink.left() >= cell.left() - 1.0e-3
+                            && word.ink.right() <= cell.right() + 1.0e-3
+                            && word.ink.top() >= cell.top() - 1.0e-3
+                            && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                        "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                        word.size,
+                        word.ink
+                    );
+                    if w == GRID_BAR || w == "1/2" {
+                        assert_eq!(word.size, ceiling, "{at}: the box was drawn for this one");
+                    }
+                }
+                let want: &[&str] = match face {
+                    crate::fonts::FontChoice::Terminess => &[],
+                    _ => &["1/1024", "1/2048"],
+                };
+                cut.sort_unstable();
+                assert_eq!(cut, want, "{face:?} at {ppp}x: the words that do not fit above the floor");
+            }
+        }
+        assert_eq!(cut_pairs.len(), 19, "the steps that print 1/1024 and 1/2048: {cut_pairs:?}");
+    }
+
+    /// **The arrange gridbox paints its step through the fit**, read off the
+    /// real frame: the same word, the same size and the same place that
+    /// `grid_box_word` gives it, clipped to the box. The sweeps above and
+    /// below hold `grid_box_word` to every word in every box; this holds
+    /// `draw` to `grid_box_word`, at steps three to six characters wide, in
+    /// every bundled face, in the twenty-point box and in the fourteen-point
+    /// one a 150-point arrangement draws, the smallest there is.
+    ///
+    /// Revert check, performed: hand the box back to `painter.text` at its
+    /// own size and this fails on its first step, BAR, which is no longer
+    /// clipped to its box.
+    #[test]
+    fn the_arrange_gridbox_paints_its_step_through_the_fit() {
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 150.0));
+        let steps = [
+            (4u8, 4u8, 0i8, GRID_BAR),
+            (4, 4, -1, "1/2"),
+            (4, 4, -4, "1/16"),
+            (6, 8, -1, "1/4\u{00b7}"),
+            (3, 4, -6, "1/128"),
+            (22, 16, -1, "11/16"),
+            (1, 16, -6, "1/1024"),
+        ];
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = context_at(face, 1.0);
+            // The word alone is painted on a context of its own: a shape
+            // painted between frames is handed out with the next frame's,
+            // and the next frame is the real one.
+            let apart = context_at(face, 1.0);
+            for (k, (r, (beats, unit, exp, want))) in [rect(), short]
+                .into_iter()
+                .flat_map(|r| steps.into_iter().map(move |s| (r, s)))
+                .enumerate()
+            {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                v.meter = crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
+                let cell = Layout::new(r, &v).tool_grid;
+                if r == short {
+                    assert!(
+                        (cell.width() - 14.0).abs() < 0.01,
+                        "a 150-point arrangement no longer draws a 14-point box: {cell:?}"
+                    );
+                }
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let on_box: Vec<PaintedWord> = PaintedWord::all(&ctx, &out.shapes)
+                    .into_iter()
+                    .filter(|w| cell.intersects(w.laid))
+                    .collect();
+                let at = format!("{face:?} {beats}/{unit} step {exp} in a {}-point box", cell.width());
+                let [drawn] = on_box.as_slice() else {
+                    panic!("{at}: the box painted {on_box:?}");
+                };
+                let alone = PaintedWord::painted_by(&apart, ("arrange draw", k), |p| {
+                    grid_box_word(p, cell, want, Color32::WHITE);
+                });
+                let [alone] = alone.as_slice() else {
+                    panic!("{at}: grid_box_word painted {alone:?}");
+                };
+                assert_eq!(drawn.text, want, "{at}");
+                assert_eq!(drawn.size, alone.size, "{at}: {want} is not painted at its fitted size");
+                assert_eq!(drawn.laid, alone.laid, "{at}: {want} is not where the fit puts it");
+                assert_eq!(drawn.clip, cell, "{at}: {want} is not clipped to its box");
+            }
+        }
+    }
+
+    /// **Every size the arrange gridbox is drawn at, not only its largest: a
+    /// step either fits the box it is in, or it is named here as cut.**
+    ///
+    /// The box is twenty points square only while the arrangement is at
+    /// least 209 points tall. Under that it is the corner the ruler leaves,
+    /// the ruler is 0.115 of the arrangement held to 18..52 points, and the
+    /// corner is the ruler less four; so under 209 the box shrinks with the
+    /// arrangement, to fourteen points under 157. It was half the corner,
+    /// twenty only from 383 and seven under 157, until the owner held the
+    /// corner's buttons at twenty ("hold buttons at 20pt"), and the heights
+    /// in the table below came down with it. Short arrangements are no
+    /// corner case: the window's floor is 320 tall and the band takes 81 of
+    /// it, and the window keeps the shape of the bands showing, so a window
+    /// with few bands is short at any width (the band and the piano alone
+    /// are 340 tall at 1300 wide, which leaves the arrangement 150).
+    /// `every_arrange_grid_step_is_painted_inside_its_box` sweeps the
+    /// twenty-point box alone, at more scales; this sweeps every box.
+    ///
+    /// Driven through `Layout::new` at every whole point of height from 100
+    /// to 420, at the window's narrowest, 1300 and 2560 wide, with the header
+    /// at both ends of the seam and on its own share. The header never
+    /// decides the box (the corner is at least 144 wide, room for boxes of
+    /// 24), which is asserted, so the box is a function of the height. Every
+    /// box that gives, every word the box prints (192 signatures, steps -6
+    /// to 3, in its numerals), every bundled face, at 100% to 200%, painted
+    /// by `grid_box_word` and read off the tessellated paint. A word fits a
+    /// box when it is laid out inside it and its ink, which lands on whole
+    /// pixels, is no more pixels wide or tall than the box holds whole ones;
+    /// that is worked out here from the glyphs, not asked of the code. Held
+    /// for every word in every box: one that fits at the box's own size keeps
+    /// that size; one that fits smaller is shrunk until it is laid out no
+    /// wider than the box less `WORD_AIR` a side, never under `WORD_FLOOR`,
+    /// with every pixel of its ink inside the box; one that does not fit even
+    /// at the floor is painted at the floor and cut at the box's edges; and
+    /// every word is clipped to its box.
+    ///
+    /// **Which are cut is the report the owner asked for**: a step that
+    /// cannot fit above the floor is to be said, not smudged. The faces are
+    /// monospaced, so it is a table of lengths, pinned at the foot: the
+    /// arrangement height from which a step of so many characters is never
+    /// cut, at any of the five scales. Under it, it is cut at some heights
+    /// and not at others, as the box's edges fall on or between pixels: 1/16
+    /// in Courier Prime at 100% is 14.9 points by its advances at the floor
+    /// and sixteen whole pixels of ink; the 16.58-point box of a 179-point
+    /// arrangement holds sixteen whole pixels, and the 16.70-point box of a
+    /// 180-point one, its edges further between pixels, holds fifteen. Every
+    /// step of up to five characters fits wherever the box is twenty points,
+    /// in every face at every scale.
+    ///
+    /// | characters, e.g.        | Courier Prime | JetBrains Mono | Terminess |
+    /// |-------------------------|---------------|----------------|-----------|
+    /// | 1: 1, 2, 8              | never cut     | never cut      | never cut |
+    /// | 2: 1· (a dotted whole)  | never cut     | never cut      | never cut |
+    /// | 3: BAR, 1/2, 5/8        | never cut     | never cut      | never cut |
+    /// | 4: 1/16, 1/4·, 10/8     | from 181      | from 181       | never cut |
+    /// | 5: 1/128, 11/16         | from 208      | from 209       | from 181  |
+    /// | 6: 1/1024, 1/2048       | cut at every height | cut at every height | from 209 |
+    ///
+    /// Revert checks, performed: put the corner's buttons back at half the
+    /// corner and this fails on its smallest box, seven points again, and
+    /// with the box asserts out, on the table, which then reads as it did
+    /// before the hold (three characters from 257, five from 381 and 383);
+    /// fit by the advances alone, as the fit did, and it fails on BAR in
+    /// Courier Prime at 100% in the fourteen-point box, left at 8 points
+    /// where no whole-pixel position holds its ink; give every word the
+    /// box's own size and it fails on the first word it sweeps, 1/64 in the
+    /// fourteen-point box, left at 8 points; take the clip away and it fails
+    /// on that same word, its clip the whole screen; lower `WORD_FLOOR` to 6
+    /// and the table fails, every length that is cut fitting lower (four
+    /// characters from 166 in Courier Prime, five from 196) except the six
+    /// characters Courier Prime and JetBrains Mono cut at every height. Hold
+    /// the ink inside across and not down, and this no longer fails, since
+    /// no box it sweeps puts a word's ink past its top or bottom;
+    /// `a_word_whose_ink_falls_under_its_box_is_moved_up_into_it` fails
+    /// instead.
+    #[test]
+    fn every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut() {
+        use std::collections::BTreeMap;
+        // ── every box the layout draws, by the heights that draw it ──────
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        // (box, the lowest and highest height that draw it)
+        let mut boxes: Vec<(Rect, u32, u32)> = Vec::new();
+        for h in 100u32..=420 {
+            let mut cell: Option<Rect> = None;
+            for w in [crate::settings::MIN_WINDOW.x, 1300.0, 2560.0] {
+                for header_w in [Some(header_floor), None, Some(w * 0.5)] {
+                    let mut v = a_view(&cs);
+                    v.header_w = header_w;
+                    let c = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h as f32)), &v).tool_grid;
+                    assert!(
+                        (c.width() - c.height()).abs() < 1.0e-3,
+                        "{w}x{h}: the box is not square: {c:?}"
+                    );
+                    match cell {
+                        None => cell = Some(c),
+                        Some(was) => assert!(
+                            (was.width() - c.width()).abs() < 1.0e-3,
+                            "{w}x{h} with header {header_w:?}: the header changed the box, {was:?} to {c:?}"
+                        ),
+                    }
+                }
+            }
+            let cell = cell.expect("a box");
+            match boxes.last_mut() {
+                Some((b, _, hi)) if (b.width() - cell.width()).abs() < 1.0e-3 => *hi = h,
+                _ => boxes.push((cell, h, h)),
+            }
+        }
+        let side = |b: &Rect| b.width();
+        assert!((side(&boxes[0].0) - 14.0).abs() < 1.0e-3, "the smallest box is {:?}", boxes[0]);
+        assert_eq!((boxes[0].1, boxes[0].2), (100, 156), "the box no longer stays at fourteen points up to 156");
+        let full = boxes.last().expect("boxes");
+        assert!((side(&full.0) - 20.0).abs() < 1.0e-3, "the largest box is {full:?}");
+        assert_eq!((full.1, full.2), (209, 420), "the box is no longer whole from 209 points");
+        // ── every word the box prints ─────────────────────────────────────
+        // In its own spelling, numerals the whole way down: the glyph
+        // spelling's quarter is the MIDI editor's chip's, which is one size
+        // and swept there (`midi_editor`'s `every_grid_word_is_painted_inside_its_chip`).
+        // The box never prints ♪, which comes off the fallback face (and was
+        // taller than the seven-point box this sweep once reached), so
+        // sweeping it here would hold the box to a word it never prints.
+        let mut words: Vec<String> = Vec::new();
+        for &(beats, unit) in &valid_signatures() {
+            for e in -6i8..=3 {
+                let w = grid_label_text(e, beats, unit);
+                if !words.contains(&w) {
+                    words.push(w);
+                }
+            }
+        }
+        // ── the sweep ─────────────────────────────────────────────────────
+        // (face, characters) -> the tallest arrangement that cut one.
+        let mut tallest_cut: BTreeMap<(String, usize), u32> = BTreeMap::new();
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                // Whether `w` at `size` fits `cell` with `width` for its
+                // advances: laid out no wider, and its ink, which lands on
+                // whole pixels, no more pixels wide or tall than the box
+                // holds whole ones.
+                let fits = |w: &str, size: f32, cell: Rect, width: f32| {
+                    let g = measure.layout_no_wrap(
+                        w.to_owned(),
+                        FontId::new(size, crate::fonts::courier_bold()),
+                        Color32::WHITE,
+                    );
+                    let whole = |a: f32, b: f32| ((b * ppp + 1.0e-3).floor() - (a * ppp - 1.0e-3).ceil()) / ppp;
+                    g.rect.width() <= width
+                        && g.mesh_bounds.width() <= whole(cell.left(), cell.right()) + 1.0e-3
+                        && g.mesh_bounds.height() <= whole(cell.top(), cell.bottom()) + 1.0e-3
+                };
+                for (b, &(cell, lo, hi)) in boxes.iter().enumerate() {
+                    let ceiling = grid_box_type(cell);
+                    let room = cell.width() - 2.0 * WORD_AIR;
+                    let painted: Vec<PaintedWord> = words
+                        .iter()
+                        .enumerate()
+                        .map(|(k, w)| {
+                            let p = PaintedWord::painted_by(&ctx, ("box sizes", b, k), |p| {
+                                grid_box_word(p, cell, w, Color32::WHITE);
+                            });
+                            let [one] = p.as_slice() else {
+                                panic!("{face:?} at {ppp}x, {w:?} in {cell:?}: painted {p:?}");
+                            };
+                            one.clone()
+                        })
+                        .collect();
+                    for (w, word) in words.iter().zip(&painted) {
+                        let at = format!(
+                            "{face:?} at {ppp}x, {w:?} in the {:.2}-point box of a {lo}..{hi}-point arrangement",
+                            cell.width()
+                        );
+                        assert_eq!(&word.text, w, "{at}");
+                        assert_eq!(word.clip, cell, "{at}: not clipped to its box");
+                        assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                        if fits(w, ceiling, cell, cell.width()) {
+                            assert_eq!(word.size, ceiling, "{at}: fits at {ceiling} and was painted at {}", word.size);
+                        } else if !fits(w, WORD_FLOOR, cell, room) {
+                            // Cut: at the floor, and the clip holds it.
+                            assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                            let n = w.chars().count();
+                            let tallest = tallest_cut.entry((format!("{face:?}"), n)).or_insert(0);
+                            *tallest = (*tallest).max(hi);
+                            continue;
+                        } else {
+                            assert!(word.size < ceiling, "{at}: does not fit at {ceiling} and was not shrunk");
+                            assert!(
+                                word.laid.width() <= room + 1.0e-3,
+                                "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} a side",
+                                word.size,
+                                word.laid.width()
+                            );
+                        }
+                        assert!(
+                            word.ink.left() >= cell.left() - 1.0e-3
+                                && word.ink.right() <= cell.right() + 1.0e-3
+                                && word.ink.top() >= cell.top() - 1.0e-3
+                                && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                            "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                            word.size,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
+        // ── the report ────────────────────────────────────────────────────
+        // The arrangement height from which a step of n characters is never
+        // cut, `Some(h)`, or `None` where it never is at all.
+        let report = |face: &str| -> Vec<(usize, Option<u32>)> {
+            (1..=6).map(|n| (n, tallest_cut.get(&(face.to_owned(), n)).map(|h| h + 1))).collect()
+        };
+        let got: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| (format!("{face:?}"), report(&format!("{face:?}"))))
+            .collect();
+        let want: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| {
+                // 421: cut at every height swept, the full box's included.
+                let heights = match face {
+                    crate::fonts::FontChoice::Courier => {
+                        vec![(1, None), (2, None), (3, None), (4, Some(181)), (5, Some(208)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::JetBrains => {
+                        vec![(1, None), (2, None), (3, None), (4, Some(181)), (5, Some(209)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::Terminess => {
+                        vec![(1, None), (2, None), (3, None), (4, None), (5, Some(181)), (6, Some(209))]
+                    }
+                };
+                (format!("{face:?}"), heights)
+            })
+            .collect();
+        assert_eq!(got, want, "the arrangement heights from which steps of 1 to 6 characters are never cut");
+        // **The bar the hold was set to clear**, held in its own words so a
+        // later re-pin of the table cannot lose it: every step of up to five
+        // characters fits wherever the box is twenty points.
+        for ((face, n), tallest) in &tallest_cut {
+            assert!(
+                *n > 5 || *tallest < full.1,
+                "{face}: a step of {n} characters is cut at {tallest} points, where the box is twenty"
+            );
+        }
+    }
+
+    /// **A word whose ink would fall under its box is moved up into it.**
+    ///
+    /// `ink_placed_inside` moves a word down or up as well as across, and no
+    /// size of the arrange gridbox needs the second half any more: the
+    /// smallest is fourteen points and prints at eight. While the corner's
+    /// buttons were half the corner the box was seven points under 157, and
+    /// there a single digit in JetBrains Mono at 100% centred with its ink
+    /// half a pixel under the box. That box is held here, where the layout
+    /// drew it, so the half of the placement the sweeps above no longer
+    /// reach is still held to something.
+    ///
+    /// Revert check, performed: hold the ink inside across and not down, and
+    /// this fails, the 2's ink at 13 in a box whose bottom is 12.5.
+    #[test]
+    fn a_word_whose_ink_falls_under_its_box_is_moved_up_into_it() {
+        // The seven-point box a 100-point arrangement drew while the buttons
+        // were half the corner.
+        let cell = Rect::from_min_max(Pos2::new(33.0, 5.5), Pos2::new(40.0, 12.5));
+        let ctx = context_at(crate::fonts::FontChoice::JetBrains, 1.0);
+        let painted = PaintedWord::painted_by(&ctx, "a digit under its box", |p| {
+            grid_box_word(p, cell, "2", Color32::WHITE);
+        });
+        let [word] = painted.as_slice() else {
+            panic!("painted {painted:?}, not one word");
+        };
+        // The fixture: centred where `CENTER_CENTER` centres it, on the pixel
+        // the tessellator snaps it to, its ink crosses the box's bottom.
+        let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+        let g = measure.layout_no_wrap("2".to_owned(), FontId::new(word.size, crate::fonts::courier_bold()), Color32::WHITE);
+        let centred = (cell.center().y - g.size().y * 0.5).round();
+        assert!(
+            centred + g.mesh_bounds.max.y > cell.bottom() + 1.0e-3,
+            "fixture: centred, the 2's ink ends at {}, inside the box's bottom {}",
+            centred + g.mesh_bounds.max.y,
+            cell.bottom()
+        );
+        assert!(
+            word.ink.top() >= cell.top() - 1.0e-3
+                && word.ink.bottom() <= cell.bottom() + 1.0e-3
+                && word.ink.left() >= cell.left() - 1.0e-3
+                && word.ink.right() <= cell.right() + 1.0e-3,
+            "the 2's ink is at {:?}, outside its box {cell:?}",
+            word.ink
+        );
+    }
+
+    /// **Every step of every meter is said as a note**, the way a player
+    /// would say it, and no ladder says one twice.
+    ///
+    /// The box prints shorthand because it is the width of a thumb; the
+    /// screen reader is the one place the step is said in full, and it used
+    /// to fall through to "{label} of a bar" for 428 (signature, step) pairs:
+    /// in 4/2 the whole note under the bar was "1 of a bar" right after the
+    /// bar's own "1 bar", 12/8's dotted half was "1/2· of a bar", and the
+    /// finest steps were "1/128 of a bar" and finer, none of them a fraction
+    /// of a bar at all. Every valid signature, every step `grid_quarters`
+    /// takes (-7 to 6). Held:
+    ///
+    /// - nothing says "of a bar", a dot or a slash: no fraction is read out;
+    /// - above the bar it counts bars ("2 bars"), the bar is "1 bar", and
+    ///   every step under it is a note: "eighth note", "dotted quarter
+    ///   note", "5 eighth notes";
+    /// - it names what the box prints, so the two cannot disagree: a box's
+    ///   1/d is the 1/d note, its dot is "dotted", its n/u is n notes of
+    ///   1/u;
+    /// - no ladder says one of its steps twice.
+    ///
+    /// Revert check, performed: put back the reader that matched the box's
+    /// text against a table, and this fails on the first signature it
+    /// sweeps, 1/1, whose finest step it said as "1/128 of a bar".
+    #[test]
+    fn every_step_of_every_meter_is_said_as_a_note() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let fractions = ['/', '\u{00b7}', '\u{2044}', '\u{2215}', '\u{00bc}', '\u{00bd}', '\u{00be}'];
+        for &(beats, unit) in &sigs {
+            let mut said: Vec<(i8, String)> = Vec::new();
+            for e in -7i8..=6 {
+                let s = grid_spoken(e, beats, unit);
+                let at = format!("{beats}/{unit} at step {e}");
+                assert!(!s.contains("of a bar"), "{at} is said {s:?}");
+                assert!(
+                    !s.chars().any(|c| fractions.contains(&c) || ('\u{2150}'..='\u{215f}').contains(&c)),
+                    "{at} is said with a fraction: {s:?}"
+                );
+                if e > 0 {
+                    assert_eq!(s, format!("{} bars", 1u32 << e), "{at}");
+                } else if e == 0 {
+                    assert_eq!(s, "1 bar", "{at}");
+                } else {
+                    // What the box prints, said: 1 and 1/d are one note,
+                    // a dot makes it dotted, and n/u counts n notes of 1/u.
+                    let label = grid_label_text(e, beats, unit);
+                    let (body, dotted) = match label.strip_suffix('\u{00b7}') {
+                        Some(body) => (body, true),
+                        None => (label.as_str(), false),
+                    };
+                    let (n, d) = match body.split_once('/') {
+                        Some((n, d)) => (
+                            n.parse::<u64>().expect("a count"),
+                            d.parse::<u64>().expect("a note value"),
+                        ),
+                        None => (1, body.parse::<u64>().expect("a whole note")),
+                    };
+                    let word = note_word(d).unwrap_or_else(|| panic!("{at}: no name for a 1/{d} note"));
+                    let want = match (n, dotted) {
+                        (1, false) => format!("{word} note"),
+                        (1, true) => format!("dotted {word} note"),
+                        (n, false) => format!("{n} {word} notes"),
+                        (_, true) => panic!("{at}: the box prints a dotted count, {label:?}"),
+                    };
+                    assert_eq!(s, want, "{at}, which the box prints {label:?}");
+                }
+                if let Some((prev, _)) = said.iter().find(|(_, w)| *w == s) {
+                    panic!("{beats}/{unit}: steps {prev} and {e} are both said {s:?}");
+                }
+                said.push((e, s));
+            }
+        }
+        // Where the owner and the sweep met them.
+        let ladder: Vec<String> = (-7i8..=3).rev().map(|e| grid_spoken(e, 4, 2)).collect();
+        assert_eq!(
+            ladder,
+            [
+                "8 bars",
+                "4 bars",
+                "2 bars",
+                "1 bar",
+                "whole note",
+                "half note",
+                "quarter note",
+                "eighth note",
+                "sixteenth note",
+                "thirty-second note",
+                "sixty-fourth note",
+            ]
+        );
+        assert_eq!(grid_spoken(-1, 12, 8), "dotted half note");
+        assert_eq!(grid_spoken(-1, 6, 8), "dotted quarter note");
+        assert_eq!(grid_spoken(-7, 4, 4), "hundred twenty-eighth note");
+        assert_eq!(grid_spoken(-7, 3, 4), "two hundred fifty-sixth note");
+        assert_eq!(grid_spoken(-7, 1, 32), "four thousand ninety-sixth note");
+        assert_eq!(grid_spoken(-1, 12, 4), "dotted whole note");
+        assert_eq!(grid_spoken(-1, 6, 32), "dotted sixteenth note");
+        assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
+        assert_eq!(grid_spoken(-1, 4, 1), "2 whole notes");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window
@@ -13099,6 +15955,236 @@ selected: false,
         }
     }
 
+
+    /// The lane a hit is about, for the bounds test: a track's row, the
+    /// master, or nothing (a clip, the toolbar, the ruler).
+    fn lane_of_hit(hit: Hit) -> Option<LaneId> {
+        Some(match hit {
+            Hit::HdrNumber(i)
+            | Hit::HdrCollapse(i)
+            | Hit::HdrBay(i, _)
+            | Hit::HdrRouting(i)
+            | Hit::Arm(i)
+            | Hit::Mute(i)
+            | Hit::Solo(i)
+            | Hit::Gain(i)
+            | Hit::Send(i)
+            | Hit::Pan(i)
+            | Hit::Phase(i)
+            | Hit::ToTheory(i)
+            | Hit::HdrInput(i)
+            | Hit::HdrName(i)
+            | Hit::HdrAdd(i)
+            | Hit::Lane(i, _) => LaneId::Row(i),
+            Hit::AutoPoint(l, ..)
+            | Hit::AutoLane(l, ..)
+            | Hit::AutoParamPick(l, _)
+            | Hit::AutoClose(l, _)
+            | Hit::AutoArm(l, _)
+            | Hit::AutoBypass(l, _)
+            | Hit::AutoDial(l, _)
+            | Hit::AutoMenu(l) => l,
+            Hit::BusBay(..) | Hit::BusGain(_) | Hit::MasterLane(_) => LaneId::Master,
+            _ => return None,
+        })
+    }
+
+    /// **A view the app's way, from an index**: the window
+    /// `lane_window_start` names, built from the drawn order. What
+    /// `TangentApp::arrange_view` does with its own index.
+    fn windowed<'a>(
+        ix: &crate::desk_index::DeskIndex,
+        clips: &'a [ClipView<'a>],
+        visible: usize,
+        lane_scroll: usize,
+    ) -> ArrangeView<'a> {
+        // In RANKS among the drawn rows (`ArrangeView::lane_scroll`), as the
+        // app builds its window.
+        let mut v = a_view(clips);
+        v.active = ix.shown_len();
+        v.visible_lanes = visible;
+        v.lane_scroll = lane_scroll.min(ix.shown_len().saturating_sub(visible));
+        let (first, can) = lane_window_start(v.lane_scroll, visible, v.active);
+        let rows = ix.window(first, can + 1);
+        v.lanes = Lanes::new(rows.iter().map(|r| (*r as usize, a_lane(true))).collect()).starting_at(first);
+        v
+    }
+
+    /// **A timeline of any length builds, lays out, hit-tests and describes
+    /// only its window.** On the XXL and XXXL rungs (128 and 512 rows,
+    /// folders open and shut), at four zooms and three scrolls: the lanes
+    /// BUILT, the track rows LAID OUT, the lanes the hit test answers for
+    /// and the lanes the screen reader is told about are each bounded by
+    /// what shows plus the pinned master plus two. And the window is the
+    /// right one: the first lane on screen is the first drawn row at the
+    /// scroll, and the last row of the desk shows at the end of the rail.
+    ///
+    /// Revert-check: build `windowed` from every drawn row and the first
+    /// assertion names the 512-row desk.
+    #[test]
+    fn a_timeline_of_any_length_builds_and_lays_out_only_its_window() {
+        use crate::perf_fixtures::Wide;
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        for wide in Wide::ALL {
+            for shut in [false, true] {
+                let ix = wide.index(shut);
+                for visible in [1usize, 4, 8, 64] {
+                    for scroll in [0usize, 77, usize::MAX] {
+                        let v = windowed(&ix, &cs, visible, scroll);
+                        let bound = visible + 1 + 2;
+                        let what = format!(
+                            "{} shut={shut} visible={visible} scroll={scroll}",
+                            wide.tag()
+                        );
+                        assert!(v.lanes.len() <= bound, "{what}: built {} lanes", v.lanes.len());
+                        let l = Layout::new(r, &v);
+                        let tracks = l
+                            .rows
+                            .iter()
+                            .filter(|row| matches!(row.kind, RowKind::Track(_)))
+                            .count();
+                        assert!(tracks <= bound, "{what}: laid out {tracks} track rows");
+                        assert!(l.lane_rows.len() <= bound && l.header_rows.len() <= bound);
+                        let hits = targets_in(&l, &v);
+                        let mut lanes: Vec<LaneId> =
+                            hits.iter().filter_map(|(_, h)| lane_of_hit(*h)).collect();
+                        lanes.sort();
+                        lanes.dedup();
+                        assert!(lanes.len() <= bound, "{what}: {} lanes answer presses", lanes.len());
+                        let nodes = a11y_nodes_from(&v, &hits);
+                        assert!(nodes.len() <= hits.len(), "{what}: more nodes than targets");
+                        // The first lane laid out is the drawn row at the
+                        // (clamped) scroll, a rank.
+                        let first_drawn = ix.row_at(v.lane_scroll);
+                        let first_laid = l
+                            .rows
+                            .iter()
+                            .find_map(|row| match row.kind {
+                                RowKind::Track(i) if row.lane.is_positive() => Some(i),
+                                _ => None,
+                            });
+                        assert_eq!(first_laid, first_drawn, "{what}: the window starts elsewhere");
+                        if scroll == usize::MAX && !shut {
+                            assert!(
+                                l.lane_rows[ix.extent() - 1].is_positive(),
+                                "{what}: the end of the rail does not show the last row"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The lane scrollbar says where the window stands, and moves it.**
+    #[test]
+    fn the_lane_scrollbar_shows_the_window_and_carries_the_lanes() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        let mut v = a_view(&cs);
+        v.visible_lanes = CHANNELS;
+        assert_eq!(Layout::new(r, &v).lane_bar, LaneBar::NONE, "a desk that fits drew a bar");
+        let mut v = a_view(&cs);
+        v.visible_lanes = 8;
+        let l = Layout::new(r, &v);
+        let bar = l.lane_bar;
+        assert!(bar.track.is_positive(), "a desk taller than the window drew no bar");
+        // Beside the lanes, inside the panel: it was pinned ON the lanes,
+        // which is where it took the clips' edge presses (see
+        // `the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge`).
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
+        assert_eq!(bar.max_rows, CHANNELS - 8);
+        let share = 8.0 / CHANNELS as f32;
+        assert!((bar.thumb.height() - bar.track.height() * share).abs() < 0.5);
+        assert!((bar.thumb.top() - bar.track.top()).abs() < 0.5, "unscrolled, not at the top");
+        v.lane_scroll = CHANNELS;
+        let end = Layout::new(r, &v).lane_bar;
+        assert!((end.thumb.bottom() - end.track.bottom()).abs() < 0.5, "not at the bottom");
+        // Grab the thumb and drag it past the end: the last window.
+        let v = a_view(&cs);
+        let v = ArrangeView { visible_lanes: 8, ..v };
+        let grab = lane_bar_grab(r, &v, bar.thumb.center()).expect("the thumb took no press");
+        let far = Pos2::new(bar.thumb.center().x, r.bottom() + 100.0);
+        assert_eq!(lane_bar_scroll(r, &v, far, grab), Some(CHANNELS - 8));
+        let near = Pos2::new(bar.thumb.center().x, r.top() - 100.0);
+        assert_eq!(lane_bar_scroll(r, &v, near, grab), Some(0));
+        // A press in the middle of a lane is never the bar's.
+        assert_eq!(lane_bar_grab(r, &v, l.lane_rows[0].center()), None);
+    }
+
+    /// **The bar stands beside the lanes and takes none of their presses.**
+    /// A clip running off the window's right edge is clamped to the lanes'
+    /// right edge, so its right trim zone and its fade-out corner are the
+    /// last few points of the lanes. With the bar laid on the lanes, and
+    /// claimed before any hit, those points were the bar's: a press to trim
+    /// scrolled the lanes instead.
+    ///
+    /// Revert-check: lay the track back inside `lanes_area.right()` with its
+    /// band at `expand2(2, 0)`, and both presses below are the bar's.
+    #[test]
+    fn the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge() {
+        let mut c = clips();
+        // Lane 0, running far past the window's end.
+        c[0].start_s = 30.0;
+        c[0].len_s = 1.0e4;
+        c[0].max_len_s = f64::INFINITY;
+        let r = rect();
+        let v = ArrangeView { visible_lanes: 8, ..a_view(&c) };
+        let l = Layout::new(r, &v);
+        let bar = l.lane_bar;
+        assert!(bar.track.is_positive(), "fixture: a desk taller than the window drew no bar");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        let cr = clip_rect_in(&l, &v, &c[0]);
+        assert!(
+            cr.is_positive() && (cr.right() - l.lanes_area.right()).abs() < 0.5,
+            "fixture: the clip is not clamped at the lanes' edge ({cr:?})"
+        );
+        for (p, want) in [
+            (Pos2::new(cr.right() - 1.0, cr.center().y), Hit::ClipRight(1)),
+            (Pos2::new(cr.right() - 0.5, cr.top() + 2.0), Hit::FadeOut(1)),
+        ] {
+            assert_eq!(lane_bar_grab(r, &v, p), None, "the bar took {want:?}'s press at {p:?}");
+            assert_eq!(hit_test(r, &v, p), Some(want), "at {p:?}");
+        }
+        // The bar still takes a press anywhere in its gutter, on the thumb
+        // or beside it, and a little past the window's edge.
+        assert!(lane_bar_grab(r, &v, bar.thumb.center()).is_some(), "the thumb took no press");
+        let beside = Pos2::new(bar.track.center().x, bar.track.bottom() - 2.0);
+        assert!(!bar.thumb.contains(beside), "fixture: the thumb reaches the bottom");
+        assert!(lane_bar_grab(r, &v, beside).is_some(), "the track beside the thumb took no press");
+        let past = Pos2::new(r.right() + 1.0, bar.thumb.center().y);
+        assert!(lane_bar_grab(r, &v, past).is_some(), "the window's edge took no press");
+        // One span of time: the ruler ends where the lanes do, and the
+        // frame the app reads on its own agrees with the layout.
+        assert_eq!(l.ruler.right(), l.lanes_area.right());
+        let f = Layout::frame(r, v.header_w, lane_bar_shown(v.visible_lanes, v.active));
+        assert_eq!(f.lanes_area, l.lanes_area);
+        // No bar, no gutter: a desk that fits keeps every point.
+        let all = ArrangeView { visible_lanes: v.active, ..a_view(&c) };
+        assert_eq!(Layout::new(r, &all).lanes_area.right(), r.right());
+    }
+
+    /// **A hovering file lights the lane it will land on, scrolled or not.**
+    /// `drop_lane` is a ROW; it was read relative to the scroll, so a
+    /// scrolled timeline lit the wrong lane, or none.
+    #[test]
+    fn a_drop_lights_its_own_lane_on_a_scrolled_timeline() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        let mut v = a_view(&cs);
+        v.visible_lanes = 8;
+        v.lane_scroll = 10;
+        v.drop_lane = Some(12);
+        let l = Layout::new(r, &v);
+        assert!(l.lane_rows[12].is_positive(), "lane 12 is not on screen at scroll 10");
+        assert_eq!(drop_lane_rect(&l, &v), Some(l.lane_rows[12]), "the drop lit another lane");
+        v.drop_lane = Some(2);
+        let l = Layout::new(r, &v);
+        assert_eq!(drop_lane_rect(&l, &v), None, "a lane scrolled away was lit");
+    }
 }
 
 

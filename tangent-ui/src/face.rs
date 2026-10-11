@@ -37,9 +37,8 @@ use crate::recorder_panel::{contrast_ratio, distinct_surface, luminance, surface
 /// Everything a face needs to dress itself: the dialog surface, and the
 /// cluster's glass. Built once per frame by whoever opens the face, from the
 /// same settings colours the timecode reads, and handed down — the kit never
-/// reaches into `Settings` itself, because the plugin build shares these
-/// panels and a widget that reads global state is a widget that cannot be
-/// tested by handing it colours.
+/// reaches into `Settings` itself, because a widget that reads global state
+/// is a widget that cannot be tested by handing it colours.
 #[derive(Clone, Copy)]
 pub struct FaceStyle {
     pub s: Surface,
@@ -287,9 +286,10 @@ pub fn keep<T>(slot: &mut Option<T>, wish: Option<T>) {
 
 /// Remember which control the hand has just clicked, and hand back the one
 /// it clicked before this. Kept in egui's own per-context scratch — never a
-/// static, because the plugin build runs several contexts in one process,
-/// and never `Settings`, because a widget that reads global state is a widget
-/// that cannot be tested.
+/// static, because one process runs several contexts (the compositor's
+/// offscreen one beside the window's, and every test its own), and never
+/// `Settings`, because a widget that reads global state is a widget that
+/// cannot be tested.
 ///
 /// EVERY click a face row takes has to pass through here, whether or not the
 /// row itself cares about the answer, because the answer is "what did the
@@ -1668,6 +1668,8 @@ pub(crate) mod fit {
         ("@tangent-plate", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-wah", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-ir", 2, &[], false, Vec2::new(600.0, 400.0), Vec2::new(1160.0, 620.0)),
+        ("@tangent-bitcrush", 7, &[5, 6], false, Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
+        ("@tangent-insert", 4, &[3], false, Vec2::new(440.0, 480.0), Vec2::new(704.0, 768.0)),
         // The analog's ids are sparse (0..85 with gaps between the blocks),
         // and this harness numbers its parameters densely, so the count is
         // the id ceiling: every dial the panel draws finds a pushed value,

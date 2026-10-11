@@ -508,18 +508,28 @@ mod elsewhere {
 }
 
 
-/// One job for the pool: a lane number and the pointer to the work.
+/// One dispatch for the pool: the work, the list it walks, and how many
+/// hands share the walk.
 ///
-/// The pointer is the whole of the unsafe in this file, and the argument for
-/// it is in [`LanePool::run`].
+/// The two pointers are the whole of the unsafe in this file, and the
+/// argument for them is in [`LanePool::run_list`].
 #[derive(Clone, Copy)]
 struct Job {
-    /// The `&(dyn Fn(usize) + Sync)` the caller handed `run`, as the two
-    /// words a fat pointer is, so that no lifetime rides along with it into
-    /// the pool. Valid only between a dispatch and its barrier.
+    /// The `&(dyn Fn(usize, usize) + Sync)` the caller handed `run_list`, as
+    /// the two words a fat pointer is, so that no lifetime rides along with
+    /// it into the pool. Valid only between a dispatch and its barrier.
     work: (*const (), *const ()),
-    /// The lanes to do, as a bitmask. Bit `ch` set means lane `ch` is owed.
-    lanes: u32,
+    /// The caller's lane list, by its first element. The same window as
+    /// `work`, and never turned into a slice until a claim has proved the
+    /// round is still the caller's.
+    list: *const u32,
+    /// How long `list` is. A `u32` because [`Gate::owed`] carries the
+    /// cursor in thirty-two bits; `run_list` walks a longer list serially
+    /// rather than truncate one.
+    len: u32,
+    /// The hands sharing this round, the caller included. The batch size is
+    /// read from it, see [`guided`].
+    hands: u32,
 }
 
 /// The two halves of a `&dyn Fn` and the way back.
@@ -528,18 +538,23 @@ struct Job {
 /// has no stable way to take it apart otherwise. The sizes are asserted so
 /// that a future representation change is a build error and not a Tuesday.
 const _: () = assert!(
-    size_of::<*const (dyn Fn(usize) + Sync)>() == size_of::<(*const (), *const ())>()
+    size_of::<*const (dyn Fn(usize, usize) + Sync)>() == size_of::<(*const (), *const ())>()
 );
 
-// SAFETY: `Job` is only ever read by a worker between the dispatch that
-// published it and the barrier that ends it, and the caller of
-// [`LanePool::run`] is blocked for the whole of that window. See `run`.
+// SAFETY: `Job` is only ever dereferenced by a worker between the dispatch
+// that published it and the barrier that ends it, and the caller of
+// [`LanePool::run_list`] is blocked for the whole of that window. See there.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
 impl Default for Job {
     fn default() -> Self {
-        Self { work: (std::ptr::null(), std::ptr::null()), lanes: 0 }
+        Self {
+            work: (std::ptr::null(), std::ptr::null()),
+            list: std::ptr::null(),
+            len: 0,
+            hands: 1,
+        }
     }
 }
 
@@ -549,23 +564,30 @@ struct Gate {
     /// wake harmless.
     round: Mutex<u64>,
     wake: Condvar,
-    /// **The round in the high half, the unclaimed lanes in the low half.**
+    /// **The round in the high half, the cursor into the list in the low
+    /// half.** Everything before the cursor has been claimed by some hand.
     ///
-    /// The round is not decoration. A worker reads the work pointer once per
-    /// round and then loops on this word; if it is descheduled between
-    /// finishing its last lane and its next look, the caller can meanwhile
-    /// have completed its barrier, RETURNED, and dispatched the next chunk,
-    /// which stores a fresh set of lanes here. The worker would then wake,
-    /// claim one of those, and call it through the previous round's pointer,
-    /// which is a `mix_channels` stack frame that has gone. One callback is
-    /// several chunks and therefore several rounds back to back, so the two
-    /// are not far apart in time.
+    /// The round is not decoration. A worker reads the job once per round
+    /// and then loops on this word; if it is descheduled between finishing
+    /// its last batch and its next look, the caller can meanwhile have
+    /// completed its barrier, RETURNED, and dispatched the next chunk, which
+    /// stores a fresh cursor here. The worker would then wake, claim a batch
+    /// of that, and call it through the previous round's pointers, which are
+    /// a `mix_channels` stack frame that has gone. One callback is several
+    /// chunks and therefore several rounds back to back, so the two are not
+    /// far apart in time.
     ///
     /// Carrying the round makes that unrepresentable rather than unlikely: a
     /// claim only succeeds for the round the claimant read, and a worker
-    /// holding a stale round finds nothing to do and parks.
+    /// holding a stale round finds nothing to do and parks. That holds for a
+    /// cursor part-way down a list exactly as for one at zero, which is the
+    /// case a mask never had: a stale worker looking at someone else's
+    /// half-claimed list sees the same refusal as at its start.
     owed: AtomicU64,
-    /// Lanes finished. The caller waits for this to equal what it asked for.
+    /// **Lanes finished, as a count.** The caller waits for this to reach the
+    /// list's length. A count rather than a mask because a mask is one bit
+    /// per lane and stops at the word's width, and because a batch is marked
+    /// with one add however many lanes it held. See [`MarkDone`].
     done: AtomicU32,
     /// Set once at teardown; a parked worker wakes, sees it and returns.
     stop: AtomicBool,
@@ -575,6 +597,32 @@ struct Gate {
     /// read by workers after it, so the mutex orders the two.
     job: Mutex<Job>,
 }
+
+/// **The most workers one pool starts**, whatever the machine offers.
+///
+/// Reconsidered for unlimited tracks (W7-scale-and-budgets) and KEPT, on a
+/// measurement and a risk. The number was born beside a thirty-two-bit lane
+/// mask, and nothing here depends on it any more: the claim is a cursor and
+/// `done` a count. What it still decides:
+///
+/// * **No machine it has been measured on reaches it.** The live pool is
+///   the performance cores less one (four on the M5 Pro this was measured
+///   on) and a bounce's is every core less one (fourteen); the tester boxes
+///   the fan-out was swept on are four threads.
+/// * **A bounce would use more on a bigger machine.** 1,024 lanes, each a
+///   plate, export pool of plain threads, 128-frame blocks: serial 6,730
+///   us a block, then 3,761 / 2,706 / 1,925 / 1,499 / 1,286 us at 1, 2, 4,
+///   8 and 14 peers, still 1.17x from eight to fourteen with the last six
+///   on efficiency cores (`docs/PERF-UNLIMITED.md`). A 32-core machine is
+///   capped at half its cores for a bounce, unmeasured.
+/// * **A wider LIVE pool is a bet that can turn the fork off.** The fork
+///   needs every worker real-time and in the device's workgroup
+///   (`ready() >= width()`), and the workgroup names a width of its own
+///   (`os_workgroup_max_parallel_threads`, ten here). Whether a join past
+///   it is refused, which would leave the pool never ready and every block
+///   on one thread, has not been tried. Any raise belongs to bounces
+///   alone, measured on a machine that has the cores.
+const MAX_WORKERS: usize = 16;
 
 /// **A pool of real-time threads that render lanes.**
 ///
@@ -605,7 +653,7 @@ impl LanePool {
     /// fail - which is also why an offline fan-out works on the platforms
     /// where the live one cannot get a real-time grant at all.
     pub fn new(width: usize, wg: Option<Arc<Workgroup>>, plan: Option<RtPlan>) -> Self {
-        let width = width.clamp(1, 16);
+        let width = width.clamp(1, MAX_WORKERS);
         let gate = Arc::new(Gate {
             round: Mutex::new(0),
             wake: Condvar::new(),
@@ -619,12 +667,18 @@ impl LanePool {
         for i in 0..width {
             let gate = Arc::clone(&gate);
             let wg = wg.clone();
-            let hand = std::thread::Builder::new()
+            // **A hand is numbered by the workers that STARTED, not by the
+            // attempt.** The caller is hand 0, so the first worker is 1; a
+            // spawn that fails takes no number, so the hands are always
+            // exactly `0..hands()` and a caller sizing per-hand scratch by
+            // [`Self::hands`] never sees an index past its end.
+            let hand = hands.len() + 1;
+            let spawned = std::thread::Builder::new()
                 .name(format!("tangent-lane-{i}"))
                 .stack_size(512 * 1024)
-                .spawn(move || worker(&gate, wg.as_ref(), plan))
+                .spawn(move || worker(&gate, wg.as_ref(), plan, hand))
                 .ok();
-            if let Some(h) = hand {
+            if let Some(h) = spawned {
                 hands.push(h);
             }
         }
@@ -645,39 +699,70 @@ impl LanePool {
         self.hands.len().min(self.width)
     }
 
-    /// **Run `work(ch)` for every lane in `lanes`, and return when all of
-    /// them have finished.**
+    /// **How many hands a [`Self::run_list`] can call its work with**, the
+    /// caller included: the work only ever sees `hand < hands()`.
     ///
-    /// # Safety of the pointer
+    /// A hand is one thread for the life of the pool, so state indexed by it
+    /// (a lane's scratch buffers, which today are per lane and become per
+    /// hand) is touched by one thread at a time without a lock. The caller
+    /// is always hand 0 and worker `n` is always hand `n + 1`; a worker that
+    /// dies keeps its number unused rather than handing it on.
+    pub fn hands(&self) -> usize {
+        self.hands.len() + 1
+    }
+
+    /// **Run `work(lane, hand)` for every entry of `list`, and return when
+    /// all of them have finished.**
     ///
-    /// `work` crosses to the workers as a raw fat pointer, and the argument
-    /// that this is sound has three parts, all of them enforced here rather
-    /// than promised:
+    /// `lane` is the list's own entry, whatever the caller means by it (a
+    /// slot, a rank); `hand` says which thread is running it, see
+    /// [`Self::hands`]. The list is the caller's and is only read.
     ///
-    /// 1. **It cannot outlive the borrow.** This function does not return
-    ///    until `done == lanes`, and no worker touches the pointer after it
-    ///    has marked its lane done. The caller is blocked for the whole of
-    ///    the window, so the reference it lent is live throughout.
-    /// 2. **No two workers ever get the same lane.** A lane is claimed by one
-    ///    `fetch_and` that clears exactly one bit; the worker that observed
-    ///    the bit set is the only one that can have cleared it.
+    /// # Safety of the pointers
+    ///
+    /// `work` and `list` cross to the workers as raw pointers, and the
+    /// argument that this is sound has three parts, all of them enforced
+    /// here rather than promised:
+    ///
+    /// 1. **They cannot outlive the borrow.** This function does not return,
+    ///    and does not finish unwinding either, until `done` has counted
+    ///    every entry, and no worker touches either pointer after the add
+    ///    that marks its batch. The caller is blocked for the whole of the
+    ///    window, so what it lent is live throughout. See [`Barrier`].
+    /// 2. **No two hands ever get the same index.** An index is claimed by
+    ///    the compare-and-swap that moves the cursor past it; the hand whose
+    ///    swap succeeded is the only one that can have moved it.
     /// 3. **The caller's own work is disjoint from the workers'.** That is
-    ///    the caller's to keep, and in this engine it is kept by seat
-    ///    arithmetic: see `lane_seats` and
-    ///    `the_seats_a_lane_owns_never_meet_another_lanes`.
+    ///    the caller's to keep, and it includes not listing a lane twice:
+    ///    the pool hands out INDICES once each, and two equal entries are two
+    ///    indices. In this engine it is kept by seat arithmetic: see
+    ///    `lane_seats` and `the_seats_a_lane_owns_never_meet_another_lanes`.
     ///
     /// `work` is `Sync` because several threads call it at once.
-    pub fn run(&self, lanes: u32, work: &(dyn Fn(usize) + Sync)) {
-        if lanes == 0 {
-            return;
-        }
-        if self.hands.is_empty() {
-            for ch in lane_iter(lanes) {
-                work(ch);
+    ///
+    /// # Forks only for two
+    ///
+    /// A list of one is run on the caller. Waking a worker and joining it
+    /// measures about 6 us, which is pure loss for one lane: the caller would
+    /// have finished it in the time the worker took to wake.
+    pub fn run_list(&self, list: &[u32], work: &(dyn Fn(usize, usize) + Sync)) {
+        let serial = || {
+            for &lane in list {
+                work(lane as usize, 0);
             }
+        };
+        // A list longer than the cursor can count is not a desk anyone can
+        // build (rows stop at 65,536), but walking it is still right where
+        // truncating it would be silence.
+        let Ok(len) = u32::try_from(list.len()) else {
+            serial();
+            return;
+        };
+        if len < 2 || self.hands.is_empty() {
+            serial();
             return;
         }
-        // **The round is decided here and PUBLISHED LAST.** The lanes are
+        // **The round is decided here and PUBLISHED LAST.** The cursor is
         // stamped with it below, the workers read it back off the condvar,
         // and a claim is refused unless the two agree. The bump itself stays
         // after the job is written, because that is what orders the two: a
@@ -685,14 +770,13 @@ impl LanePool {
         // with it, and there is exactly one caller of this method.
         let round = {
             let Ok(round) = self.gate.round.lock() else {
-                for ch in lane_iter(lanes) {
-                    work(ch);
-                }
+                serial();
                 return;
             };
             round.wrapping_add(1)
         };
-        self.gate.owed.store(owed_word(round, lanes), Ordering::Release);
+        let hands = u32::try_from(self.hands()).unwrap_or(u32::MAX);
+        self.gate.owed.store(owed_word(round, 0), Ordering::Release);
         self.gate.done.store(0, Ordering::Release);
         {
             let mut job = match self.gate.job.lock() {
@@ -700,9 +784,7 @@ impl LanePool {
                 // A poisoned gate means a worker panicked mid-block. Do the
                 // work here rather than hand it to a pool in that state.
                 Err(_) => {
-                    for ch in lane_iter(lanes) {
-                        work(ch);
-                    }
+                    serial();
                     return;
                 }
             };
@@ -715,51 +797,31 @@ impl LanePool {
             // the worker, through the inverse transmute, inside the window
             // this call blocks for.
             job.work = unsafe {
-                transmute::<*const (dyn Fn(usize) + Sync), (*const (), *const ())>(
+                transmute::<*const (dyn Fn(usize, usize) + Sync), (*const (), *const ())>(
                     std::ptr::from_ref(work),
                 )
             };
-            job.lanes = lanes;
+            job.list = list.as_ptr();
+            job.len = len;
+            job.hands = hands;
         }
         if let Ok(mut r) = self.gate.round.lock() {
             *r = round;
         }
         self.gate.wake.notify_all();
+        // Armed before the caller's first lane, so that the wait below runs
+        // on an unwind out of `work` as well as on the way out. See
+        // `Barrier`.
+        let barrier = Barrier { gate: &self.gate, round, len, hands };
         // **The caller works too**, rather than waiting on four threads to do
         // what five could: the real-time thread is one of the cores.
-        while let Some(ch) = claim(&self.gate.owed, round) {
-            let _mark = MarkDone { done: &self.gate.done, bit: 1u32 << ch };
-            work(ch);
-        }
-        // ── the barrier, and why it is not a bare spin ──────────────────
-        //
-        // What is left at this point is a worker finishing a lane it already
-        // holds, which is microseconds, so a few hundred spins is the right
-        // first answer and a condvar would cost more than it saves.
-        //
-        // **But a real-time thread that only spins can starve the very
-        // worker it is waiting for.** That is not hypothetical: the first
-        // version of this loop was a bare `spin_loop`, and under the test
-        // suite - many processes, more real-time threads than cores - it
-        // wedged a whole test binary at 99% of one core for nine minutes,
-        // with its four workers parked at priority 97 and unable to get the
-        // CPU to finish. On a machine with a game or a browser on it, that
-        // is the same shape as a hang.
-        //
-        // So the spin is bounded and then the thread yields. Yielding from
-        // an audio callback is ordinarily forbidden; here it is the
-        // opposite, because everything this thread is waiting for is another
-        // thread in the same workgroup with the same deadline, and giving
-        // one of them the core IS the progress this thread wants.
-        let mut spins = 0u32;
-        while self.gate.done.load(Ordering::Acquire) != lanes {
-            spins = spins.saturating_add(1);
-            if spins < SPINS_BEFORE_YIELD {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+        while let Some(batch) = claim(&self.gate.owed, round, len, hands) {
+            let _mark = MarkDone { done: &self.gate.done, count: batch.end - batch.start };
+            for i in batch {
+                work(list[i as usize] as usize, 0);
             }
         }
+        drop(barrier);
     }
 }
 
@@ -776,28 +838,93 @@ impl Drop for LanePool {
     }
 }
 
-/// **Marks a lane done however the work leaves.**
+/// **The caller's wait for the round, on every path out of `run_list`.**
 ///
-/// The barrier is `while done != lanes`, with no timeout and no exit, and the
-/// thread spinning on it is the audio callback. A worker holds no lock while
-/// it calls the work closure, so a panic in there poisons nothing and is
-/// simply an unwind: it skips the line that marks the lane, and the callback
-/// then spins and yields for ever. That is not a dropout, it is the audio
-/// thread never returning again.
+/// The plain path reaches it with every index claimed and only waits. The
+/// other path is the caller's own lane panicking: before this guard existed
+/// that unwind left `run_list` straight past the barrier, and the frame it tore
+/// down was the very closure and lane list the workers were still running
+/// through. Waiting here, in a destructor, holds the frame until the last
+/// worker has let go of it.
+///
+/// On that path the caller also stops working, so whatever it had not yet
+/// claimed is claimed here and marked done UNRUN rather than left for
+/// workers that may all be gone. A lane whose block is abandoned folds
+/// nothing, which is the same answer a lane that panicked itself gets.
+struct Barrier<'a> {
+    gate: &'a Gate,
+    round: u64,
+    len: u32,
+    hands: u32,
+}
+
+impl Drop for Barrier<'_> {
+    fn drop(&mut self) {
+        // Finds nothing on the plain path: the caller's loop only ends when
+        // the cursor has passed the end.
+        while let Some(batch) = claim(&self.gate.owed, self.round, self.len, self.hands) {
+            self.gate.done.fetch_add(batch.end - batch.start, Ordering::AcqRel);
+        }
+        // ── the wait, and why it is not a bare spin ─────────────────────
+        //
+        // What is left at this point is a worker finishing a batch it
+        // already holds, which is microseconds, so a few hundred spins is
+        // the right first answer and a condvar would cost more than it
+        // saves.
+        //
+        // **But a real-time thread that only spins can starve the very
+        // worker it is waiting for.** That is not hypothetical: the first
+        // version of this loop was a bare `spin_loop`, and under the test
+        // suite - many processes, more real-time threads than cores - it
+        // wedged a whole test binary at 99% of one core for nine minutes,
+        // with its four workers parked at priority 97 and unable to get the
+        // CPU to finish. On a machine with a game or a browser on it, that
+        // is the same shape as a hang.
+        //
+        // So the spin is bounded and then the thread yields. Yielding from
+        // an audio callback is ordinarily forbidden; here it is the
+        // opposite, because everything this thread is waiting for is another
+        // thread in the same workgroup with the same deadline, and giving
+        // one of them the core IS the progress this thread wants.
+        let mut spins = 0u32;
+        while self.gate.done.load(Ordering::Acquire) < self.len {
+            spins = spins.saturating_add(1);
+            if spins < SPINS_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// **Marks a whole batch done however the work leaves.**
+///
+/// The barrier waits for `done` to reach the list's length, with no timeout
+/// and no exit, and the thread waiting is the audio callback. A worker holds
+/// no lock while it calls the work closure, so a panic in there poisons
+/// nothing and is simply an unwind: it skips the line that marks the batch,
+/// and the callback then spins and yields for ever. That is not a dropout, it
+/// is the audio thread never returning again.
 ///
 /// A plugin is the obvious way in, but so is any `unwrap` on the render path,
 /// and this file's own note says a panic crossing the cpal boundary is
 /// undefined behaviour, so the engine must not be relying on there never
-/// being one. Marking the lane from a destructor makes the barrier complete
-/// on every path out, including that one.
+/// being one. Marking from a destructor makes the barrier complete on every
+/// path out, including that one.
+///
+/// **The WHOLE batch**, not the lanes that ran. The lanes after the panicking
+/// one were claimed by this hand and no other hand can ever claim them, so
+/// counting only what ran would leave the barrier one batch short for good.
+/// They do not run: a lane that did not render folds nothing that block.
 struct MarkDone<'a> {
     done: &'a AtomicU32,
-    bit: u32,
+    count: u32,
 }
 
 impl Drop for MarkDone<'_> {
     fn drop(&mut self) {
-        self.done.fetch_or(self.bit, Ordering::AcqRel);
+        self.done.fetch_add(self.count, Ordering::AcqRel);
     }
 }
 
@@ -820,51 +947,69 @@ impl Drop for MarkGone<'_> {
 ///
 /// A few microseconds on this machine, which covers a worker that is nearly
 /// done, and short enough that a worker which has not been scheduled at all
-/// gets the core rather than the spinner. See `LanePool::run`.
+/// gets the core rather than the spinner. See [`Barrier`].
 const SPINS_BEFORE_YIELD: u32 = 2_000;
 
-/// The set bits of `lanes`, low to high.
-fn lane_iter(lanes: u32) -> impl Iterator<Item = usize> {
-    (0..u32::BITS as usize).filter(move |ch| lanes & (1u32 << ch) != 0)
+/// **How many indices one claim takes: half of an even share of what is
+/// left**, and never fewer than one.
+///
+/// One index per claim is one compare-and-swap per lane on a single cache
+/// line that every hand is hammering, which at a thousand lanes is the
+/// fork's whole cost. An even share up front is the opposite mistake: lanes
+/// are not equal (a plate next to an empty lane), and the hand that drew
+/// the heavy share is the block. Guided batches take both: large while the
+/// list is long, so the line is paid once per batch, and single lanes at
+/// the tail, so the last hand to finish is never sitting on a big batch the
+/// others could have shared. The factor two leaves at least half of what is
+/// left for the other hands at every claim.
+fn guided(remaining: u32, hands: u32) -> u32 {
+    (remaining / hands.max(1).saturating_mul(2)).max(1)
 }
 
-/// Take one lane out of `owed`, or `None` when it is empty.
+/// Take the next batch of indices out of `owed`, or `None` when the list is
+/// spent or the round is not the claimant's.
 ///
-/// The `fetch_and` that clears the bit is what makes a lane one worker's:
-/// whoever observed it set and cleared it owns it, and nobody else can
-/// observe the same transition.
-fn claim(owed: &AtomicU64, round: u64) -> Option<usize> {
+/// The compare-and-swap that moves the cursor is what makes a batch one
+/// hand's: whoever's swap moved it from `c` to `c + n` owns `c..c + n`, and
+/// nobody else can observe the same transition.
+fn claim(owed: &AtomicU64, round: u64, len: u32, hands: u32) -> Option<std::ops::Range<u32>> {
     loop {
         let now = owed.load(Ordering::Acquire);
         // **Not my round, not my work.** See the field: this is the whole of
         // what stops a late worker running the previous round's closure.
-        if now >> LANE_BITS != round & ROUND_MASK {
+        if now >> CURSOR_BITS != round & ROUND_MASK {
             return None;
         }
-        let lanes = now as u32;
-        if lanes == 0 {
+        let cursor = now as u32;
+        if cursor >= len {
             return None;
         }
-        let ch = lanes.trailing_zeros() as usize;
-        // Clearing one lane bit leaves the round where it is.
+        let next = cursor + guided(len - cursor, hands);
+        // Moving the cursor leaves the round where it is.
         if owed
-            .compare_exchange_weak(now, now & !(1u64 << ch), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_weak(
+                now,
+                owed_word(round, next),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
-            return Some(ch);
+            return Some(cursor..next);
         }
     }
 }
 
-/// How many low bits of [`Gate::owed`] are the lane mask; the rest is the
-/// round. Thirty-two, because the mask is one bit per channel and there are
-/// thirty-two of those.
-const LANE_BITS: u32 = 32;
-const ROUND_MASK: u64 = u64::MAX >> LANE_BITS;
+/// How many low bits of [`Gate::owed`] are the cursor; the rest is the
+/// round. Thirty-two, which bounds a list at four billion lanes and leaves
+/// the round four billion dispatches before it wraps: weeks of callbacks,
+/// against a stale worker that is microseconds late.
+const CURSOR_BITS: u32 = 32;
+const ROUND_MASK: u64 = u64::MAX >> CURSOR_BITS;
 
-/// The word a dispatch stores: this round's lanes, stamped with this round.
-fn owed_word(round: u64, lanes: u32) -> u64 {
-    ((round & ROUND_MASK) << LANE_BITS) | u64::from(lanes)
+/// The word a dispatch stores: this round, with the cursor at `cursor`.
+fn owed_word(round: u64, cursor: u32) -> u64 {
+    ((round & ROUND_MASK) << CURSOR_BITS) | u64::from(cursor)
 }
 
 /// One worker's whole life: become real-time, join, then park and work.
@@ -873,7 +1018,10 @@ fn owed_word(round: u64, lanes: u32) -> u64 {
 /// because joining a workgroup from a timeshare thread succeeds and buys
 /// nothing. The membership is a local so that it leaves on THIS thread when
 /// the body returns, which is what the API requires.
-fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: Option<RtPlan>) {
+///
+/// `hand` is this worker's number for the life of the pool. See
+/// [`LanePool::hands`].
+fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: Option<RtPlan>, hand: usize) {
     // **No plan is a bounce.** Nothing to ask the kernel for, so nothing
     // that can be refused: the thread is ordinary and it is ready.
     let rt = plan.is_none_or(realtime);
@@ -912,28 +1060,42 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: Option<RtPlan>) {
             break;
         }
         seen = round;
-        // The pointer is read under the same mutex the dispatch wrote it
-        // under, so this worker cannot see a half-published job.
+        // The job is read under the same mutex the dispatch wrote it under,
+        // so this worker cannot see a half-published one. It may be a LATER
+        // round's job than `round`; then every claim below is refused by the
+        // stamp before either pointer is touched.
         let job = {
             let Ok(job) = gate.job.lock() else { break };
             *job
         };
-        if job.lanes == 0 || job.work.0.is_null() {
+        if job.len == 0 || job.work.0.is_null() || job.list.is_null() {
             continue;
         }
-        // SAFETY: the two words the dispatch published, put back together as
-        // the reference they came from. The caller of `LanePool::run` is
-        // blocked on its barrier until every claimed lane below is marked
-        // done, so that reference is live for the whole of this loop. See
-        // `run` for the three parts of the argument.
-        let work: &(dyn Fn(usize) + Sync) = unsafe {
-            &*transmute::<(*const (), *const ()), *const (dyn Fn(usize) + Sync)>(job.work)
-        };
-        while let Some(ch) = claim(&gate.owed, round) {
-            // The lane is marked when this guard drops, which is on every
+        while let Some(batch) = claim(&gate.owed, round, job.len, job.hands) {
+            // The batch is marked when this guard drops, which is on every
             // path out of `work` including an unwind. See `MarkDone`.
-            let _mark = MarkDone { done: &gate.done, bit: 1u32 << ch };
-            work(ch);
+            let _mark = MarkDone { done: &gate.done, count: batch.end - batch.start };
+            // **Made into references only now**, inside a claim that proved
+            // the round is the caller's and that the caller cannot finish
+            // its barrier before `_mark` drops. Built any earlier, they
+            // could name a frame that a stale round has already left.
+            //
+            // SAFETY: the words the dispatch published, put back together as
+            // the reference and the slice they came from. The caller of
+            // `LanePool::run_list` is blocked on its barrier until this
+            // batch is counted, so both are live for the whole of this
+            // body. See `run_list` for the three parts of the argument.
+            let work: &(dyn Fn(usize, usize) + Sync) = unsafe {
+                &*transmute::<(*const (), *const ()), *const (dyn Fn(usize, usize) + Sync)>(
+                    job.work,
+                )
+            };
+            // SAFETY: the same window, and `len` is the length the caller's
+            // slice had when it published this pointer.
+            let list = unsafe { std::slice::from_raw_parts(job.list, job.len as usize) };
+            for i in batch {
+                work(list[i as usize] as usize, hand);
+            }
         }
     }
     // `_gone` decrements the readiness count, and `joined` drops here, on
@@ -949,40 +1111,46 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: Option<RtPlan>) {
 mod tests {
     /// **A worker that is late may not take the next round's work.**
     ///
-    /// The bug this pins shipped. A worker reads the work pointer once per
-    /// round and then loops on the claim word. Between finishing its last
-    /// lane and looking again it can be descheduled, and in that window the
-    /// caller can complete its barrier, RETURN, and dispatch the next chunk,
-    /// which stores a fresh set of lanes. The worker would wake, claim one of
-    /// those, and call it through a pointer to a stack frame that has gone.
-    /// One callback is several chunks, so the two rounds are microseconds
-    /// apart, not milliseconds.
+    /// The bug this pins shipped. A worker reads the job once per round and
+    /// then loops on the claim word. Between finishing its last batch and
+    /// looking again it can be descheduled, and in that window the caller
+    /// can complete its barrier, RETURN, and dispatch the next chunk, which
+    /// stores a fresh cursor. The worker would wake, claim a batch of that,
+    /// and call it through a pointer to a stack frame that has gone. One
+    /// callback is several chunks, so the two rounds are microseconds apart,
+    /// not milliseconds.
     ///
     /// It cannot be caught by running the pool, because it needs one exact
     /// interleaving and nothing in this repo can force one. What CAN be
     /// tested is the word: a claim is refused unless the round matches, so
-    /// the interleaving stops being representable.
+    /// the interleaving stops being representable. And with a cursor rather
+    /// than a mask, the case that matters is a list PART-WAY claimed: the
+    /// stale worker finds work plainly left in the word and still takes
+    /// none of it.
     #[test]
     fn a_stale_worker_claims_nothing() {
-        let owed = AtomicU64::new(owed_word(7, 0b1011));
-        // The round that stored it takes its lanes, lowest first.
-        assert_eq!(claim(&owed, 7), Some(0));
-        assert_eq!(claim(&owed, 7), Some(1));
-        // A worker still in the previous round finds nothing, although there
-        // is plainly work in the word.
-        assert_eq!(owed.load(Ordering::Relaxed) as u32, 0b1000, "lanes are left");
-        assert_eq!(claim(&owed, 6), None, "a stale round claimed the next round's lane");
-        assert_eq!(claim(&owed, 8), None, "a round that has not happened claimed a lane");
-        // And the right round still gets it.
-        assert_eq!(claim(&owed, 7), Some(3));
-        assert_eq!(claim(&owed, 7), None);
+        // Round 7, five of ten indices already taken, two hands: a guided
+        // batch of the five left is one.
+        let owed = AtomicU64::new(owed_word(7, 5));
+        assert_eq!(claim(&owed, 6, 10, 2), None, "a stale round claimed the next round's lanes");
+        assert_eq!(claim(&owed, 8, 10, 2), None, "a round that has not happened claimed a lane");
+        assert_eq!(owed.load(Ordering::Relaxed), owed_word(7, 5), "a refused claim moved the cursor");
+        // And the right round still gets them, from where the cursor stood.
+        assert_eq!(claim(&owed, 7, 10, 2), Some(5..6));
+        assert_eq!(claim(&owed, 7, 10, 2), Some(6..7));
+        assert_eq!(claim(&owed, 6, 10, 2), None, "a stale round claimed mid-list");
+        assert_eq!(claim(&owed, 7, 10, 2), Some(7..8));
+        assert_eq!(claim(&owed, 7, 10, 2), Some(8..9));
+        assert_eq!(claim(&owed, 7, 10, 2), Some(9..10));
+        assert_eq!(claim(&owed, 7, 10, 2), None, "a spent list handed out a lane");
 
         // The round is carried whole, and wraps with the counter rather than
-        // colliding with the lane mask.
-        let wrapped = AtomicU64::new(owed_word(u64::MAX, 1));
-        assert_eq!(claim(&wrapped, u64::MAX), Some(0));
-        let wide = AtomicU64::new(owed_word(3, 1 << 31));
-        assert_eq!(claim(&wide, 3), Some(31), "the top lane was lost to the round");
+        // colliding with the cursor.
+        let wrapped = AtomicU64::new(owed_word(u64::MAX, 0));
+        assert_eq!(claim(&wrapped, u64::MAX, 1, 1), Some(0..1));
+        let deep = AtomicU64::new(owed_word(3, u32::MAX - 1));
+        assert_eq!(claim(&deep, 3, u32::MAX, 1), Some(u32::MAX - 1..u32::MAX), "the top index was lost to the round");
+        assert_eq!(deep.load(Ordering::Relaxed) >> CURSOR_BITS, 3, "the cursor carried into the round");
     }
 
     /// **A panic in one lane must not hang the audio thread for ever.**
@@ -992,22 +1160,23 @@ mod tests {
     /// closure, so an unwind poisons nothing; it used to simply skip the
     /// line that marks the lane, leaving the callback spinning and yielding
     /// with nothing that could ever satisfy it.
+    ///
+    /// The guard now marks a BATCH, and the whole of it: the lanes after the
+    /// one that panicked belong to this hand and no other can claim them.
     #[test]
     fn a_panic_in_one_lane_still_finishes_the_block() {
-        // Asserted on the guard rather than by running a pool: the panic
-        // would land on a worker thread, where the harness turns it into a
-        // dead thread rather than a result this test can read, and the thing
-        // that matters is exactly the guard's contract.
+        // Asserted on the guard here, and through a running pool in
+        // `a_panic_mid_batch_still_releases_the_barrier`.
         let marked = AtomicU32::new(0);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _mark = MarkDone { done: &marked, bit: 1 << 4 };
+            let _mark = MarkDone { done: &marked, count: 5 };
             panic!("inside the work");
         }));
         assert!(unwound.is_err());
         assert_eq!(
             marked.load(Ordering::Relaxed),
-            1 << 4,
-            "a lane that panicked was never marked done, so the callback \
+            5,
+            "a batch that panicked was not counted whole, so the callback \
              would spin on the barrier for ever"
         );
     }
@@ -1063,14 +1232,15 @@ mod tests {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
         let pool = LanePool::new(4, None, Some(plan));
         let counts: Vec<AtomicUsize> = (0..32).map(|_| AtomicUsize::new(0)).collect();
-        let lanes = 0b1010_1111_0000_1111_0101_0101_1111_0000u32;
+        // A scattered half of thirty-two lanes, as the list the engine walks.
+        let lanes: Vec<u32> = [4u32, 5, 6, 7, 8, 10, 12, 14, 16, 17, 18, 19, 24, 25, 26, 27, 29, 31].into();
         for _ in 0..200 {
-            pool.run(lanes, &|ch| {
+            pool.run_list(&lanes, &|ch, _hand| {
                 counts[ch].fetch_add(1, Ordering::Relaxed);
             });
         }
         for ch in 0..32 {
-            let want = if lanes & (1u32 << ch) != 0 { 200 } else { 0 };
+            let want = if lanes.contains(&(ch as u32)) { 200 } else { 0 };
             assert_eq!(
                 counts[ch].load(Ordering::Relaxed),
                 want,
@@ -1086,11 +1256,11 @@ mod tests {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
         let pool = LanePool::new(1, None, Some(plan));
         let seen = AtomicUsize::new(0);
-        pool.run(0, &|_| {
+        pool.run_list(&[], &|_, _| {
             seen.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(seen.load(Ordering::Relaxed), 0, "an empty ask ran something");
-        pool.run(0b101, &|_| {
+        pool.run_list(&[0, 2], &|_, _| {
             seen.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(seen.load(Ordering::Relaxed), 2);
@@ -1116,5 +1286,297 @@ mod tests {
         // worker counts only if it was given a policy.
         assert!(pool.ready() <= pool.width());
         assert!(pool.width() >= 1);
+    }
+
+    /// A list that is not its own indices: a permutation of `0..n`, shifted,
+    /// so a pool that ran the INDEX instead of the entry is caught as surely
+    /// as one that ran an entry twice. 37 is prime to every length used.
+    fn scrambled(n: u32, shift: u32) -> Vec<u32> {
+        (0..n).map(|i| (i * 37) % n + shift).collect()
+    }
+
+    /// Busy for a stretch that differs per lane, so that hands finish out of
+    /// step and race each other for the cursor rather than taking turns.
+    fn uneven(lane: usize) {
+        for i in 0..(lane % 7) * 40 {
+            std::hint::black_box(i);
+        }
+    }
+
+    /// **Every listed lane is claimed exactly once, at widths past what a
+    /// mask could carry, with every hand fighting for the cursor.**
+    ///
+    /// 33 is one lane past the old thirty-two-bit word, 1000 a big desk, and
+    /// 4096 enough lanes that guided batches run many claims deep. Plain
+    /// threads (no plan), so the hands really are concurrent wherever this
+    /// runs instead of being refused a policy and parked.
+    #[test]
+    fn every_listed_lane_is_claimed_exactly_once_under_contention() {
+        let pool = LanePool::new(8, None, None);
+        assert!(pool.hands() >= 2, "no worker started, so nothing contended");
+        for (n, rounds) in [(33u32, 300usize), (1000, 60), (4096, 20)] {
+            let shift = 5;
+            let list = scrambled(n, shift);
+            let counts: Vec<AtomicUsize> = (0..n + shift).map(|_| AtomicUsize::new(0)).collect();
+            let bad_hand = AtomicBool::new(false);
+            let hands = pool.hands();
+            for _ in 0..rounds {
+                pool.run_list(&list, &|lane, hand| {
+                    if hand >= hands {
+                        bad_hand.store(true, Ordering::Relaxed);
+                    }
+                    uneven(lane);
+                    counts[lane].fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            assert!(!bad_hand.load(Ordering::Relaxed), "a hand past hands() at {n} lanes");
+            for (lane, c) in counts.iter().enumerate() {
+                let want = if lane < shift as usize { 0 } else { rounds };
+                assert_eq!(
+                    c.load(Ordering::Relaxed),
+                    want,
+                    "lane {lane} of {n} was done the wrong number of times"
+                );
+            }
+        }
+    }
+
+    /// **Guided: half an even share of what is left, never below one, and
+    /// the batches tile the list with no gap and no overlap.**
+    #[test]
+    fn batches_are_guided_and_tile_the_list() {
+        assert_eq!(guided(100, 4), 12);
+        assert_eq!(guided(7, 4), 1, "a tail smaller than the hands must still move");
+        assert_eq!(guided(1, 17), 1);
+        assert_eq!(guided(10, 0), 5, "no hands is read as one rather than dividing by zero");
+
+        let (len, hands) = (100u32, 4u32);
+        let owed = AtomicU64::new(owed_word(1, 0));
+        let mut next = 0;
+        let mut sizes = Vec::new();
+        while let Some(b) = claim(&owed, 1, len, hands) {
+            assert_eq!(b.start, next, "a gap or an overlap at {next}");
+            assert_eq!(b.end - b.start, guided(len - b.start, hands));
+            sizes.push(b.end - b.start);
+            next = b.end;
+        }
+        assert_eq!(next, len, "the list was not spent");
+        assert_eq!(sizes[0], 12, "the first claim was not a guided batch");
+        assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "batches grew: {sizes:?}");
+        assert_eq!(sizes.last(), Some(&1), "the tail was not single lanes: {sizes:?}");
+        assert!(sizes.len() < len as usize / 2, "one lane per claim is not guided: {sizes:?}");
+    }
+
+    /// **A panic part-way through a batch still releases the barrier**, on a
+    /// running pool, wherever the panic lands: on a worker, whose batch the
+    /// guard counts whole, or on the caller, whose unwind must wait for the
+    /// workers before leaving the frame they are running through.
+    ///
+    /// Run on its own thread with a deadline, so that a regression fails
+    /// this test instead of hanging the suite.
+    #[test]
+    fn a_panic_mid_batch_still_releases_the_barrier() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = LanePool::new(4, None, None);
+            let list = scrambled(64, 0);
+            for attempt in 0..20usize {
+                let inside = AtomicUsize::new(0);
+                let ran: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+                // A different lane each attempt, so the panic lands on the
+                // caller on some attempts and on a worker on others, and
+                // part-way into a batch rather than at its start.
+                let fatal = (attempt * 13 + 3) % 64;
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pool.run_list(&list, &|lane, hand| {
+                        inside.fetch_add(1, Ordering::SeqCst);
+                        uneven(lane + 3);
+                        ran[lane].fetch_add(1, Ordering::Relaxed);
+                        let leave = (lane == fatal || (hand == 0 && attempt % 2 == 1)).then_some(());
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        if leave.is_some() {
+                            panic!("lane {lane} on hand {hand}");
+                        }
+                    });
+                }));
+                // However it left, nobody is still inside the work: the
+                // frame the closure lives in is about to be reused.
+                assert_eq!(
+                    inside.load(Ordering::SeqCst),
+                    0,
+                    "run_list left (unwound: {}) while a worker was still in the work",
+                    unwound.is_err()
+                );
+                for (lane, r) in ran.iter().enumerate() {
+                    assert!(r.load(Ordering::Relaxed) <= 1, "lane {lane} ran twice");
+                }
+            }
+            // **Now with no workers left at all.** Every worker panics until
+            // the pool counts none ready (a plan-less worker is counted until
+            // it dies), so nothing but the caller can claim. Then the caller
+            // itself panics on its first lane: the rest of the list has no
+            // hand to claim it, and only the barrier's own drain finishes
+            // the block.
+            for _ in 0..1_000 {
+                if pool.ready() == 0 {
+                    break;
+                }
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pool.run_list(&list, &|lane, hand| {
+                        uneven(lane + 3);
+                        assert_eq!(hand, 0, "a worker is told to die");
+                    });
+                }));
+                std::thread::yield_now();
+            }
+            let none_left = pool.ready() == 0;
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.run_list(&list, &|_, _| panic!("the caller's first lane"));
+            }));
+            // And the pool still works afterwards, short however many
+            // workers the panics took, because the caller always drains.
+            let all = AtomicUsize::new(0);
+            pool.run_list(&list, &|_, _| {
+                all.fetch_add(1, Ordering::Relaxed);
+            });
+            let _ = tx.send((none_left, first.is_err(), all.load(Ordering::Relaxed)));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok((none_left, unwound, all)) => {
+                assert!(none_left, "the workers would not die, so the drain was never needed");
+                assert!(unwound, "the caller's panic did not reach its caller");
+                assert_eq!(all, 64, "the pool lost lanes after a panic");
+            }
+            Err(_) => panic!("a panic mid-batch left the barrier waiting for ever"),
+        }
+    }
+
+    /// **The caller's own panic waits for the workers before it leaves.**
+    ///
+    /// The closure and the list live in the caller's frame, so an unwind
+    /// that left `run_list` while a worker was still in a lane would hand
+    /// that worker a frame being torn down. The caller here dies only once a
+    /// worker is provably inside a lane that takes milliseconds, which is
+    /// the one moment the drain cannot hide a missing wait.
+    #[test]
+    fn a_callers_panic_waits_for_the_workers_before_it_leaves() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = LanePool::new(4, None, None);
+            let list = scrambled(64, 0);
+            let mut caught_mid = 0usize;
+            let mut left_early = 0usize;
+            for _ in 0..10 {
+                let inside = AtomicUsize::new(0);
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pool.run_list(&list, &|_, hand| {
+                        if hand == 0 {
+                            let t = std::time::Instant::now();
+                            while inside.load(Ordering::SeqCst) == 0
+                                && t.elapsed() < std::time::Duration::from_secs(1)
+                            {
+                                std::hint::spin_loop();
+                            }
+                            panic!("the caller, with a worker mid-lane");
+                        }
+                        inside.fetch_add(1, Ordering::SeqCst);
+                        let t = std::time::Instant::now();
+                        while t.elapsed() < std::time::Duration::from_millis(3) {
+                            std::hint::spin_loop();
+                        }
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }));
+                if unwound.is_err() {
+                    caught_mid += 1;
+                }
+                if inside.load(Ordering::SeqCst) != 0 {
+                    left_early += 1;
+                }
+            }
+            let _ = tx.send((caught_mid, left_early));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok((caught_mid, left_early)) => {
+                assert!(caught_mid > 0, "the caller never died mid-round, so nothing was tested");
+                assert_eq!(left_early, 0, "run_list unwound while a worker was still in the work");
+            }
+            Err(_) => panic!("the caller's panic left the barrier waiting for ever"),
+        }
+    }
+
+    /// **Hand indices are distinct and stable**: one hand is one thread for
+    /// the life of the pool, never two at once, the caller is hand 0, and
+    /// every index is below `hands()`. Per-hand scratch is sound exactly
+    /// when this holds.
+    #[test]
+    fn hand_indices_are_distinct_and_stable() {
+        let pool = LanePool::new(4, None, None);
+        let hands = pool.hands();
+        assert_eq!(hands, pool.width() + 1, "the caller is a hand beside the workers");
+        let busy: Vec<AtomicBool> = (0..hands).map(|_| AtomicBool::new(false)).collect();
+        let owner: Vec<Mutex<Option<std::thread::ThreadId>>> =
+            (0..hands).map(|_| Mutex::new(None)).collect();
+        // Recorded rather than asserted in the work: an assert on a worker
+        // only kills that worker, and the test would never hear of it.
+        let (past, shared, moved, misplaced) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let caller = std::thread::current().id();
+        let list = scrambled(64, 0);
+        for _ in 0..200 {
+            pool.run_list(&list, &|lane, hand| {
+                if hand >= hands {
+                    past.store(true, Ordering::Relaxed);
+                    return;
+                }
+                if busy[hand].swap(true, Ordering::AcqRel) {
+                    shared.store(true, Ordering::Relaxed);
+                }
+                let me = std::thread::current().id();
+                if let Ok(mut o) = owner[hand].lock() {
+                    match *o {
+                        None => *o = Some(me),
+                        Some(t) if t != me => moved.store(true, Ordering::Relaxed),
+                        Some(_) => {}
+                    }
+                }
+                if (hand == 0) != (me == caller) {
+                    misplaced.store(true, Ordering::Relaxed);
+                }
+                uneven(lane);
+                busy[hand].store(false, Ordering::Release);
+            });
+        }
+        assert!(!past.load(Ordering::Relaxed), "a hand at or past hands() {hands}");
+        assert!(!shared.load(Ordering::Relaxed), "two threads ran as one hand at once");
+        assert!(!moved.load(Ordering::Relaxed), "a hand moved to another thread");
+        assert!(!misplaced.load(Ordering::Relaxed), "hand 0 is the caller and only the caller");
+        let seen: Vec<_> = owner.iter().filter_map(|o| *o.lock().expect("owner")).collect();
+        let mut distinct = seen.clone();
+        distinct.sort_by_key(|t| format!("{t:?}"));
+        distinct.dedup();
+        assert_eq!(distinct.len(), seen.len(), "one thread ran under two hand numbers");
+    }
+
+    /// **The pool forks only for two or more lanes**: a list of one runs on
+    /// the caller as hand 0 and does not wake a worker (no round is spent).
+    #[test]
+    fn a_list_of_one_stays_on_the_caller() {
+        let pool = LanePool::new(4, None, None);
+        let before = *pool.gate.round.lock().expect("round");
+        let caller = std::thread::current().id();
+        let seen = Mutex::new(Vec::new());
+        pool.run_list(&[9], &|lane, hand| {
+            seen.lock().expect("seen").push((lane, hand, std::thread::current().id()));
+        });
+        assert_eq!(*seen.lock().expect("seen"), vec![(9, 0, caller)]);
+        assert_eq!(*pool.gate.round.lock().expect("round"), before, "one lane woke the pool");
+        pool.run_list(&[], &|_, _| panic!("an empty list ran something"));
+        pool.run_list(&[1, 2], &|_, _| {});
+        assert_eq!(*pool.gate.round.lock().expect("round"), before + 1, "two lanes did not fork");
     }
 }

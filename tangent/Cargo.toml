@@ -26,11 +26,10 @@ path = "src/main.rs"
 # flag anyone can flip.
 #
 # NOTE the asymmetry that keeps this honest: `#[cfg(feature = ...)]` is allowed
-# HERE and nowhere else. `tangent-ui` has a standing rule against feature cfgs
-# (PLUGIN-PLAN §1) because they are the seed of the two-GUI fork the egui 0.33
-# pin exists to prevent. The GUI compiles the Recorder band in every build and
-# switches it off through `Caps::MINIMAL`, exactly as the plugin already
-# switches off everything it cannot do.
+# HERE and nowhere else. `tangent-ui` has a standing rule against feature cfgs,
+# because they are the seed of two GUIs: the one its tests compile and the one
+# a build ships. The GUI compiles the Recorder band in every build and switches
+# it off through `Caps::MINIMAL`, which a test can build like any other.
 default = ["recorder", "mp3"]
 # MP3 export via static LAME. Off on the Windows cross build — see the
 # dependency note — and the export delivery says so instead of failing.
@@ -50,9 +49,9 @@ recorder = ["dep:tangent-record", "dep:tangent-host", "dep:cpal", "dep:rtrb"]
 # verification stub and the shipped app silently rejects every valid key while
 # every test still passes. `tests/license_feature.rs` guards this.
 tangent-core = { path = "../tangent-core", features = ["learning", "license"] }
-# The shared GUI. Everything the plugin will also link lives here; this crate
-# keeps only what genuinely belongs to a desktop binary — the window, the MIDI
-# device, the single-instance lock, the CLI.
+# The GUI. Everything that draws lives there; this crate keeps only what
+# genuinely belongs to a desktop binary: the window, the MIDI device, the
+# single-instance lock, the CLI.
 tangent-ui = { path = "../tangent-ui" }
 # The recorder and the plugin host. Platform-owning by design, so they live here
 # and NEVER in tangent-ui — see docs/RECORDER-PLAN.md §2.
@@ -102,13 +101,15 @@ eframe = { version = "0.33", default-features = false, features = [
 log = "0.4"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
-# `float_roundtrip` for the same reason tangent-ui turns it on: the plugin
-# build round-trips the settings JSON through DAW project files, and a float
-# that reads back one ULP off is a setting that drifts on every save. Cargo
-# unifies features per crate, so this is also what any binary that links
-# tangent-ui gets; naming it here keeps the intent visible in both places.
+# `float_roundtrip` for the same reason tangent-ui turns it on: undo and "is
+# there anything unsaved?" lean on `to_json(from_json(x)) == x`, and a float
+# that reads back one ULP off is a document that opens dirty. Cargo unifies
+# features per crate, so this is also what any binary that links tangent-ui
+# gets; naming it here keeps the intent visible in both places.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-dirs = "6"
+# No `dirs` among the dependencies that ship: every road to a person's home
+# is `tangent_core::config::home`, which a test build moves to a scratch
+# folder (see the dev-dependencies). `ban_scan` refuses a second road.
 fd-lock = "4"
 # Optional: the LAME C build cannot be CROSS-compiled at all — autoconf tests
 # its toolchain by compiling and RUNNING programs, which a macOS host cannot do
@@ -119,6 +120,20 @@ mp3lame-encoder = { version = "0.2.5", optional = true }
 
 [dev-dependencies]
 ttf-parser = "0.25"
+# **The binary's tests never reach a person's files.** `test-home` puts
+# `tangent_core::config::home`, and every config, media, project and take
+# folder built on it, in a scratch folder per test process. It has to be a
+# feature: `cfg(test)` is per crate, and the tangent-core and tangent-ui
+# these tests link are ordinary builds that resolved the owner's real
+# `~/.config/tangent`, `Documents/Tangent Media` and `Movies/Tangent`.
+# Resolver 2 gives a dev-dependency's features to test builds alone, so
+# `cargo build` and every shipped artifact resolve the real home;
+# `scripts/check-home.sh features` proves it, and `home_tests` in main.rs
+# pins that this test build has it.
+tangent-core = { path = "../tangent-core", features = ["test-home"] }
+# One `#[ignore]` probe measures what the per-frame home lookups cost before
+# they were cached, and that "before" is `dirs::home_dir` itself. Tests only.
+dirs = "6"
 
 # No build-dependencies. `build.rs` shells out to whichever resource compiler
 # is present rather than taking `winres`, because the dependency has to be

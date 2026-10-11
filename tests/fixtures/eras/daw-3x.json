@@ -1,0 +1,12 @@
+{
+"settings_version": 11,
+"plugin_slots": ["/x/Pianoteq 8.vst3",null,"/x/Diva.vst3",null,null],
+"plugin_gains": [0.8,1.0,0.6,1.0,1.0],
+"input_gains": [0.9,0.7,1.0,1.0],
+"record_extra_inputs": ["uid-4"],
+"strip_colors_v2": [3,0,7,0,0,16,21,0,0,23,0,0,5],
+"strip_names": ["Piano","","Lead","","","Mic","Amp","","","","","","Sum"],
+"strip_sends": [1.0,1.0,0.4,1.0,1.0,0.0,0.2,0.0,0.0,0.1,0.0,0.5],
+"strip_muted": 32,
+"strip_inserts": ["/x/Pro-R 2.vst3","","","","","","/x/Pro-C 3.vst3","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","/x/Pro-L 2.vst3","",""]
+}

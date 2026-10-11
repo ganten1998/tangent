@@ -1,5 +1,5 @@
 #!/bin/sh
-# tangent-jack — start a JACK server tuned for this machine, in one command.
+# tangent-jack: start a JACK server tuned for this machine, in one command.
 #
 #   tangent-jack start [-p frames] [-r rate] [-d pcmN]
 #   tangent-jack stop
@@ -18,7 +18,7 @@
 #
 #   1. `hw.usb.uaudio.buffer_ms` must be 1, not its default of 4. Otherwise the
 #      OSS minimum block is 192 frames and jackd REFUSES to start below that.
-#   2. The period must be a MULTIPLE OF THE OSS BLOCK — 48 frames once (1) is
+#   2. The period must be a MULTIPLE OF THE OSS BLOCK: 48 frames once (1) is
 #      set. jackd says so itself, and a period that is not a multiple underruns
 #      badly: 64 frames took nine underruns where 96 took one.
 #   3. The device is /dev/dspN where N is `hw.snd.default_unit`, which changes
@@ -50,7 +50,7 @@ Start a JACK server tuned for low latency on FreeBSD.
   -d  which sound device, as pcmN. Defaults to the system's current one.
 
 Then choose "JACK" in Tangent's Audio Setup panel. Nothing else is needed, and
-nothing about Tangent requires this — it is the low-latency option, not a
+nothing about Tangent requires this; it is the low-latency option, not a
 prerequisite.
 USAGE
 }
@@ -96,7 +96,7 @@ start)
         say ""
         say "          sysctl hw.usb.uaudio.buffer_ms=1"
         say ""
-        say "      then unplug and replug the interface — it applies on attach."
+        say "      then unplug and replug the interface; it applies on attach."
         say ""
     fi
 
@@ -112,7 +112,7 @@ start)
 
     # Realtime scheduling needs mac_priority(4) and membership of the realtime
     # group. Without them jackd runs anyway, just without priority, so this is
-    # a preference and not a requirement — and asking for realtime and not
+    # a preference and not a requirement, and asking for realtime and not
     # getting it is worse than not asking, because the underruns then look
     # like a Tangent bug.
     RT="--no-realtime"

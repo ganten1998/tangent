@@ -265,10 +265,11 @@ impl MidiFastLane {
             };
             let _ = tx.push(event);
             // The pads' mirror. Bounds and channel checks exactly as the UI
-            // drain did them; DRUM_PAD_BASE..+DRUM_PADS is keys 36..52.
+            // drain did them: DRUM_PAD_BASE and the identity grammar's pad
+            // count (`desk_id::PADS`), which no desk width moves.
             let kind = status & 0xF0;
             let base = tangent_ui::recorder::DRUM_PAD_BASE;
-            let top = base + tangent_ui::recorder::DRUM_PADS as u8;
+            let top = base.saturating_add(u8::try_from(tangent_ui::desk_id::PADS).unwrap_or(u8::MAX));
             if self.pads_live.load(Ordering::Relaxed)
                 && (kind == 0x90 || kind == 0x80)
                 && status & 0x0F != 9

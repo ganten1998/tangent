@@ -7,8 +7,8 @@
   and it will happily show a page written for a light background on a dark one.
   The first version set `color: #1a1a1a` on the body and a cream background on
   `code`; in dark mode the body text came out light while the code background
-  stayed light, so every path in this page — the two things it exists to tell
-  you — was light on light and unreadable.
+  stayed light, so every path in this page, which is what it exists to tell
+  you, was light on light and unreadable.
 
   So: inherit the system's text colour, and give inline code a background that
   is a translucent grey. It darkens a light page and lightens a dark one, and
@@ -29,18 +29,9 @@ code {
 </style></head><body>
 <h2>Tangent</h2>
 <p>Tangent watches what you play and names it: the chord, the same notes on a
-guitar neck, and where they sit on the circle of fifths.</p>
-<p>Two things can be installed, and you choose on the next page:</p>
-<ul>
-  <li><b>The application</b> goes to <code>/Applications</code>. It opens its
-      own window and finds a MIDI keyboard by itself.</li>
-  <li><b>The VST3 plugin</b> goes to
-      <code>/Library/Audio/Plug-Ins/VST3</code>, where every DAW looks. It
-      reads the notes on the track it is on and <b>produces no audio</b> &mdash;
-      put it on a MIDI or instrument track, not an effect slot.</li>
-</ul>
-<p>Both can be installed together and neither needs the other.</p>
-<p>The next page also lets you choose <b>for all users</b> (the paths above,
-needs your password) or <b>for me only</b>, which puts the same two things in
-your home folder and needs no password. Your DAW scans both places.</p>
+guitar neck, and where they sit on the circle of fifths. It finds a MIDI
+keyboard by itself.</p>
+<p>You can install it <b>for all users</b>, in <code>/Applications</code>,
+which needs your password, or <b>for me only</b>, in
+<code>~/Applications</code> in your home folder, which needs none.</p>
 </body></html>

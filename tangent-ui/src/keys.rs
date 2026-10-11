@@ -8,10 +8,9 @@
 //! neither happens is to have one source. Adding a binding is one line and the
 //! card updates itself.
 //!
-//! And the card is drawn IN THE CANVAS rather than in a child window. Every
-//! other surface in this app is an OS viewport, which a VST3 editor cannot
-//! create — so this is the first piece of UI that already works in both hosts,
-//! and the shape the rest will move to (docs/PLUGIN-PLAN.md).
+//! And the card is drawn IN THE CANVAS rather than in a child window, so it is
+//! the same card whether the menus and dialogs are OS windows or drawn inline,
+//! and no window manager can move it, hide it or size it into nothing.
 
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
@@ -85,8 +84,8 @@ pub enum KeyAction {
     /// Fill the screen, and come back.
     ///
     /// Gated on [`Gates::window_sizing`] for the same reason every other
-    /// window action is: a plugin editor lives inside somebody's DAW and has no
-    /// business taking their display.
+    /// window action is: only a window that is ours may be made to fill the
+    /// screen.
     ToggleFullscreen,
     /// Menus and dialogs inline, for a screen reader — the same switch as
     /// the menu row, reachable without a mouse.
@@ -97,7 +96,7 @@ pub enum KeyAction {
     ///
     /// Gated on [`Gates::window_sizing`] because the handler follows the
     /// menu row's semantics, and those hand back `child_windows` when the
-    /// mode goes off — a grant a plugin editor must never receive.
+    /// mode goes off, a grant only a host that owns its window may receive.
     ToggleReaderMode,
     TransposeUp,
     TransposeDown,
@@ -135,13 +134,13 @@ pub struct Gates {
     /// This host can record at all — `Caps::capture_devices`.
     ///
     /// Gates the key that OPENS the band, which obviously cannot be gated on
-    /// the band being open. False in a plugin and in a Minimal build, where
-    /// there is no recorder to show and the menu category is absent too.
+    /// the band being open. False in a Minimal build, where there is no
+    /// recorder to show and the menu category is absent too.
     pub recorder_available: bool,
     /// This host owns its window — `Caps::window_sizing`.
     ///
-    /// Gates fullscreen. A plugin editor lives inside somebody's DAW and has
-    /// no business taking their display.
+    /// Gates fullscreen and the reader-mode key: only a window that is ours
+    /// may fill the screen or be handed child windows back.
     pub window_sizing: bool,
     /// This session is being read out loud — `TangentApp::reader_mode()`,
     /// whoever decided so, the saved setting or this session's detection.
@@ -167,8 +166,8 @@ fn available(action: KeyAction, gates: Gates) -> bool {
         KeyAction::ToggleRecorder => gates.recorder_available,
         KeyAction::ToggleFullscreen => gates.window_sizing,
         // The same gate as the menu row it mirrors — critical, because the
-        // handler grants `child_windows` back when the mode turns off, and a
-        // plugin editor must never receive that grant.
+        // handler grants `child_windows` back when the mode turns off, and
+        // only a host that owns its window may receive that grant.
         KeyAction::ToggleReaderMode => gates.window_sizing,
         _ => true,
     }
@@ -576,6 +575,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("C-F", "ctrl+F: group the selection into a folder"),
             ("C-S-F", "ctrl+shift+F: freeze the selected track - again to thaw it"),
             ("C-C/V/X", "copy the track · paste onto an empty slot · cut"),
+            // **C-M here too, now that the chord answers over the desk.** It
+            // opens the panel where a click on the click strip's sound chip
+            // does, not in the middle as on the timeline, and the row says
+            // so, as the arrangement's row says where it opens there.
+            ("C-M", "the metronome panel, at the click strip's sound chip - again to close it"),
             ("FLDR", "the folder glyph: hide or show its tracks"),
             ("NOTE", "the \u{266a} at a track's foot: its MIDI to the theory view"),
             ("S-1", "shift+1: the theory view"),
@@ -654,8 +658,9 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("Q", "the quantize window - grid, strength, window, feel"),
             // **C-M is the metronome now** and the master row took shift
             // with it - the owner's call, and the card is where a moved
-            // shortcut has to be said or it is simply lost.
-            ("C-M", "the metronome panel, in the middle of the view"),
+            // shortcut has to be said or it is simply lost. A second press
+            // puts the panel away, and the row says so now that it does.
+            ("C-M", "the metronome panel, in the middle of the view - again to close it"),
             ("C-S-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
@@ -903,7 +908,7 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
 ///
 /// Centred, sized to its own content, and painted directly rather than through
 /// a `Window` so it cannot be dragged off, cannot be resized into nothing, and
-/// looks identical in a plugin editor where there is no window manager at all.
+/// looks identical inline, where there is no window manager at all.
 ///
 /// `gates` reaches the card for one reason only: a shortcut the app would
 /// ignore must not be advertised. It goes through the same `available` the
@@ -1084,10 +1089,13 @@ mod tests {
         })
     }
 
-    /// The labels every card carries that `fn paint` dispatches for all
-    /// views at once: undo/redo and the shift view keys. They sit outside
-    /// the panel section, so the section boundary must not exempt them.
-    const PAINT_CHORDS: &[&str] = &["C-Z", "C-S-Z", "S-1", "S-2", "S-3"];
+    /// The labels whose key `fn paint` reads for every view that cards them.
+    /// Undo/redo and the shift view keys are on every card and sit outside
+    /// the panel section, so the section boundary must not exempt them. The
+    /// metronome's chord is on the arrangement's card and the mixer's, and
+    /// is read once a frame in `paint` for both surfaces (the timeline's
+    /// pass is handed it), so its row is checked there for both cards.
+    const PAINT_CHORDS: &[&str] = &["C-Z", "C-S-Z", "S-1", "S-2", "S-3", "C-M"];
 
     /// The modifier words a label promises. "chord" is command-or-ctrl,
     /// which is how every handler spells it.
@@ -1577,22 +1585,36 @@ mod tests {
         );
     }
 
-    /// **The metronome chord is described as it behaves.** Cmd/Ctrl+M opens
-    /// the panel in the MIDDLE of the timeline - the owner's call, since a
-    /// panel that opens wherever the hand happens to be has to be found -
-    /// and the card went on saying "at the pointer" after the centring
-    /// shipped.
+    /// **The metronome chord is described as it behaves, on both cards that
+    /// carry it.** Cmd/Ctrl+M opens the panel in the MIDDLE of the timeline -
+    /// the owner's call, since a panel that opens wherever the hand happens
+    /// to be has to be found - and the card went on saying "at the pointer"
+    /// after the centring shipped. Over the desk it opens off the click
+    /// strip's sound chip, where a click on the chip opens it, and the
+    /// desk's card had no row for it while the chord did nothing there. A
+    /// second press closes it on both, which the arrangement's row never said
+    /// while the close never ran.
     #[test]
     fn the_metronome_chord_is_described_as_it_behaves() {
-        let rows = card_rows(Gates::default(), HelpView::Arrange);
-        let (_, said) = rows
-            .iter()
-            .find(|(k, _)| *k == "C-M")
-            .expect("no C-M row on the arrangement's card");
-        assert!(
-            !said.contains("pointer"),
-            "the card says Cmd+M opens at the pointer; it opens in the middle of the timeline: {said}"
-        );
+        for (view, opens) in [(HelpView::Arrange, "middle"), (HelpView::Mixer, "sound chip")] {
+            let rows = card_rows(Gates::default(), view);
+            let (_, said) = rows
+                .iter()
+                .find(|(k, _)| *k == "C-M")
+                .unwrap_or_else(|| panic!("no C-M row on the {view:?} card"));
+            assert!(
+                !said.contains("pointer"),
+                "the {view:?} card says Cmd+M opens at the pointer: {said}"
+            );
+            assert!(
+                said.contains(opens),
+                "the {view:?} card does not say Cmd+M opens the panel at the {opens}: {said}"
+            );
+            assert!(
+                said.contains("again to close"),
+                "the {view:?} card does not say a second Cmd+M closes the panel: {said}"
+            );
+        }
     }
 
     /// **The right button's two clip gestures are on the arrangement's
@@ -1713,7 +1735,7 @@ mod tests {
     /// gesture the person this switch exists for is least able to aim — so
     /// J is the keyboard door. Gated on `window_sizing` because the
     /// handler hands `child_windows` back when the mode turns off, a grant
-    /// a plugin editor must never receive.
+    /// only a host that owns its window may receive.
     #[test]
     fn j_toggles_reader_mode_only_where_the_window_is_ours() {
         let ours = Gates { window_sizing: true, ..Gates::default() };

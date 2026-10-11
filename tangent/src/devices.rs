@@ -948,7 +948,10 @@ pub fn open_inputs(shared: &Shared) -> Vec<(String, String, bool)> {
             }
         }
     }
-    out.truncate(tangent_ui::recorder::INPUTS);
+    // **Every one of them, uncut.** This was truncated to the capture's pick
+    // count, a fixed number that a desk outgrew: an input past it was opened
+    // and recorded and drew no strip. The picks are as many as the desk binds
+    // now (`tangent_record::audio::Picks`), so the names are too.
     out
 }
 
