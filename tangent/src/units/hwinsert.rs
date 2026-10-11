@@ -1650,6 +1650,31 @@ impl HwInsert {
         most
     }
 
+    /// **The bay bypassed** (the owner's ruling): its input, delayed by
+    /// exactly the latency it reports, through the same line the dry path
+    /// uses, so switching bypass in or out mid-play keeps the timing. No
+    /// send goes out and no ping runs: a ping under way, or asked while the
+    /// bay was out, answers that the insert was not running.
+    pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        if let Some(claim) = self.claim.as_ref() {
+            let port = Arc::clone(&claim.port);
+            let c = claim.clocks.out_clock.load(Ordering::Relaxed);
+            if self.last_c != Some(c) {
+                if self.last_c.is_some() && c != self.next_c {
+                    self.dry.fill(0.0);
+                }
+                self.last_c = Some(c);
+                self.next_c = c + frames as u64;
+            }
+            let req = port.ping_req.load(Ordering::Acquire);
+            if req != self.ping_seen || self.ping != Ping::Idle {
+                self.ping_seen = req;
+                self.finish_ping(PingFail::Expired.code());
+            }
+        }
+        self.pass_dry(input, frames, out);
+    }
+
     /// The bay's input, delayed by its latency, as its output: what an
     /// insert with no loop does, in time with everything else.
     fn pass_dry(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
