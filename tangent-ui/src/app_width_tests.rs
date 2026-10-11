@@ -823,6 +823,104 @@ fn a_click_in_the_trailing_adds_run_selects_nothing_and_makes_nothing() {
     }
 }
 
+/// **Ctrl/Cmd+T through real frames**: pressed, then let go.
+fn ctrl_t(ctx: &egui::Context, app: &mut TangentApp) {
+    let key = |pressed: bool| egui::Event::Key {
+        key: egui::Key::T,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    for events in [vec![key(true)], vec![key(false)]] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(WINDOW),
+                modifiers: egui::Modifiers::COMMAND,
+                events,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+}
+
+/// **The ground under the trailing add keeps its colour while the desk
+/// changes length.** The add stands on the row after the desk's last
+/// (`desk_extent`), so Ctrl/Cmd+T under a track that is not the last (a
+/// row opened between two), a removal, and their undo and redo each stand
+/// it on a row of the other parity. The field under it is the largest
+/// surface on the timeline and it wore the stripe of the add's row, so it
+/// swapped shade at every one of those: on the shipped desk, the first
+/// Ctrl+T with the first track selected turned the whole run from one
+/// stripe to the other. Through real frames of the shipped desk, after
+/// each edit the add stands on a row of the other parity, and the ground
+/// the eye sees under it, in the header column and across the field, is
+/// the colour it was.
+#[test]
+fn the_ground_under_the_trailing_add_keeps_its_colour_as_the_desk_changes_length() {
+    let tag = "run-colour";
+    let (ctx, mut app) = app_on(
+        Settings {
+            show_welcome: false,
+            ..Settings::default()
+        },
+        tiers::free(tag),
+    );
+    app.dialog = None;
+    app.mixer_open = false;
+    app.arrangement_open = true;
+    // The add's row, and the fill the eye sees under it in the header
+    // column and across the field.
+    let under_the_add = |app: &mut TangentApp, what: &str| {
+        let shapes = painted(&ctx, app);
+        let rect = app.arrangement_rect.expect("the timeline drew nowhere");
+        let clips = app.arr_clip_views();
+        let v = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &v);
+        let g = crate::arrangement_panel::endless_ground(&l, &v)
+            .unwrap_or_else(|| panic!("{what}: the add has no run under it"));
+        let (panel, lane) = (l.header_rows[g.row].panel, l.lane_rows[g.row]);
+        let fill = |run: Rect| ground_over(&shapes, run).map(|(_, c)| c);
+        (
+            g.row,
+            fill(Rect::from_min_max(panel.left_bottom(), g.header.max)),
+            fill(Rect::from_min_max(lane.left_bottom(), g.lane.max)),
+        )
+    };
+    let (mut was, header, field) = under_the_add(&mut app, "the shipped desk");
+    assert!(header.is_some() && field.is_some(), "nothing is painted under the shipped desk's add");
+    let mut holds = |app: &mut TangentApp, what: &str| {
+        let (row, h, f) = under_the_add(app, what);
+        assert_ne!(row % 2, was % 2, "fixture: {what} left the add on a row of the same parity ({was} to {row})");
+        assert_eq!(
+            (h, f),
+            (header, field),
+            "{what}: the ground under the add changed colour when it moved from row {was} to {row}"
+        );
+        was = row;
+    };
+
+    // Ctrl/Cmd+T with the first track selected opens a row between the two.
+    app.select_track(0, egui::Modifiers::NONE);
+    frame(&ctx, &mut app);
+    let tracks = app.counted_tracks();
+    ctrl_t(&ctx, &mut app);
+    assert_eq!(app.counted_tracks(), tracks + 1, "Ctrl/Cmd+T made no track");
+    holds(&mut app, "Ctrl/Cmd+T under the first track");
+    // Remove Track on the track it made (it is the one selected), then on
+    // the first: a row shorter each time.
+    app.apply_dialog_action(DialogAction::TrackRemove(1));
+    holds(&mut app, "removing the new track");
+    app.apply_dialog_action(DialogAction::TrackRemove(0));
+    holds(&mut app, "removing the first track");
+    app.undo();
+    holds(&mut app, "the undo");
+    app.redo();
+    holds(&mut app, "the redo");
+    let _ = std::fs::remove_dir_all(tiers::dir(tag));
+}
+
 /// **A hidden row holding residue is never taken over** (design section
 /// 4): a pedalboard left on the first hidden row keeps it hidden and
 /// uncounted, and the next track is made on a row of its own past it.
