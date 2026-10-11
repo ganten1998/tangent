@@ -63,6 +63,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **The arrangement opens wider, and each project keeps its own zoom.** An
+  unzoomed timeline shows the first 32 bars at the song's tempo and meter
+  (or the whole song when it is longer), where it used to show 30 seconds.
+  Where you were zoomed and scrolled is saved with the project and comes
+  back when it opens; a new project, and an older one that never saved a
+  zoom, open at the default. Zooming and scrolling never mark the project
+  unsaved and are not undo steps.
 - **A supporter key now takes the track limit away, and the free app holds
   32 tracks.** Without a key the desk holds up to 32 tracks: MIDI and audio
   tracks and folders count. With one there is no limit but the machine's.
