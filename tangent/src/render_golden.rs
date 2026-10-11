@@ -377,6 +377,51 @@ fn sampler(on: bool) -> Engine {
     e
 }
 
+/// **One instrument per lane, effects around each**: the shapes several
+/// instruments on one track must leave exactly as they were (see
+/// `instrument::Layer`). The DX7 at the head with a compressor and a trim
+/// after it; the keyboard with a chorus after it; a compressor AHEAD of the
+/// analog, which the voice replaces, and an EQ after; the sampler in a
+/// track's extra rack behind a trim in its own. Recorded from the engine
+/// before layering existed. With `dry`, the stems are taken dry, which is
+/// where a voice writes its own row.
+fn lone_instruments(dry: bool) -> Engine {
+    let mut e = offline();
+    clips(&mut e, &[9]);
+    e.set_builtin_strips(1 << 2);
+    e.set_keys_strips(1 << 1);
+    e.sync_instrument_lanes(1 << 2, 1 << 1);
+    seat(&mut e, 2, 1, COMP_PATH, None);
+    seat(&mut e, 2, 2, TRIM_PATH, Some(&state(TRIM_PATH, &[(0, 0.3)])));
+    seat(&mut e, 1, 1, CHORUS_PATH, None);
+    seat(&mut e, 4, 0, COMP_PATH, None);
+    seat(&mut e, 4, 1, crate::builtin_fx::ANALOG_PATH, None);
+    seat(&mut e, 4, 2, EQ_PATH, None);
+    seat(&mut e, 5, 0, TRIM_PATH, Some(&state(TRIM_PATH, &[(0, 0.6)])));
+    seat(&mut e, tangent_ui::desk_legacy::folder_extra_seat(5), 0, SAMPLER_PATH, None);
+    assert!(e.set_sampler_sample(
+        crate::desk_plan::Slot(5),
+        Some(SamplerSample {
+            clip: noise(0.5, 0x5a5b),
+            name: "golden.wav".to_owned(),
+            source: PathBuf::from("golden.wav"),
+            root_key: SAMPLER_ROOT_KEY,
+        })
+    ));
+    for lane in [1, 2, 4, 5] {
+        e.set_channel_gain(lane, 0.4);
+    }
+    e.set_midi_clips(
+        [1, 2, 4, 5]
+            .into_iter()
+            .map(|lane| notes(lane, &[(0, 9_000, SAMPLER_ROOT_KEY), (4_000, 12_000, SAMPLER_ROOT_KEY + 7)]))
+            .collect(),
+    );
+    e.set_stems(true);
+    e.set_stems_dry(dry);
+    e
+}
+
 /// One lane of noise and one automation curve on it (or not).
 fn automated(on: bool, lanes: &[usize], auto: fn() -> Curve) -> Engine {
     let mut e = offline();
@@ -617,6 +662,18 @@ pub fn desks() -> Vec<GoldenDesk> {
             stems: true,
         },
         d("sidechain-key", sidechain_key),
+        GoldenDesk {
+            name: "lone-instruments",
+            build: |_| lone_instruments(false),
+            twin: false,
+            stems: true,
+        },
+        GoldenDesk {
+            name: "lone-instruments-dry",
+            build: |_| lone_instruments(true),
+            twin: false,
+            stems: true,
+        },
         // The grain render and the fork are pinned by EQUALITY with the
         // plain insert desk, below, not by difference: neither may change
         // the sound at all (`the_fork_and_the_grain_are_one_sound`). Their
