@@ -12086,9 +12086,36 @@ impl Renderer {
         }
         if report.plans_taken > 0 {
             self.publish_plan_keys();
+            self.snap_left_out();
         }
         if report.applied > 0 {
             self.shared.plan_gen.store(self.plan.gen, Ordering::Relaxed);
+        }
+    }
+
+    /// **A lane LEFT OUT of an export is silent from the plan's first
+    /// frame**, not faded: its fader, its channel gain and its send gates
+    /// are put at zero the block the plan is taken, where a mute slews
+    /// there. An export's plan is its plan from its first block, and a
+    /// slew would leave the head of every left-out track in the file (and
+    /// an exponential tail under the rest of it).
+    fn snap_left_out(&mut self) {
+        use crate::desk_plan::LaneFlags as F;
+        for i in 0..self.plan.lanes.len() {
+            let lane = self.plan.lanes[i];
+            if !lane.flags.contains(F::LEFT_OUT) {
+                continue;
+            }
+            let slot = lane.slot.0 as usize;
+            if let Some(g) = self.spine.ext.lane_gain.get_mut(slot) {
+                *g = 0.0;
+            }
+            if let Some(l) = self.spine.lanes.get_mut(slot).and_then(Option::as_mut) {
+                let b = l.body_mut();
+                b.channel_gain = 0.0;
+                b.pre_gate = 0.0;
+                b.pre_gate_from = 0.0;
+            }
         }
     }
 
@@ -13035,6 +13062,9 @@ impl Renderer {
             // Before the stem push below, deliberately: a folder REPLACES
             // its own slot with its output, so a bounced group stem is the
             // group and not the empty row the folder channel usually is.
+            // A folder's OWN ROW is taken first, while the slot still holds
+            // only what stands on it (`fill_stem_tap_own`).
+            self.fill_stem_tap_own(n);
             if self.plan_drives() {
                 // **The fold phase of the plan's post-fork graph**: every
                 // early folder, level by level, publishing in
@@ -13373,6 +13403,22 @@ impl Renderer {
                 ) {
                     dst.copy_from_slice(src);
                     self.spine.desk.key_prev_frames = n;
+                }
+                // **A lane LEFT OUT of an export keys nothing.** A muted
+                // source still keys by the desk's rule, but a track the
+                // export left out is not in the export at all, so a
+                // left-out kick must not duck the bass it was keying.
+                let stride = self.stride();
+                for lane in self.plan.lanes.iter() {
+                    if !lane.flags.contains(crate::desk_plan::LaneFlags::LEFT_OUT) {
+                        continue;
+                    }
+                    let slot = lane.slot.0 as usize;
+                    for f in 0..n {
+                        if let Some(pair) = self.spine.desk.key_prev.get_mut(f * stride + slot * 2..f * stride + slot * 2 + 2) {
+                            pair.fill(0.0);
+                        }
+                    }
                 }
             }
 
@@ -20626,9 +20672,43 @@ impl Renderer {
         let cols = tap.row.len();
         for (i, slot) in tap.slots.iter().enumerate() {
             let slot = *slot as usize;
-            if self.spine.ext.late_nodes.contains(slot) != late {
+            // A folder's own row was taken before the fold.
+            if tap.own.get(i).copied().unwrap_or(false) || self.spine.ext.late_nodes.contains(slot) != late {
                 continue;
             }
+            for f in 0..n.min(MAX_BLOCK as usize) {
+                let at = f * stride + slot * 2;
+                if let Some(h) = tap.held.get_mut(f * cols + i * 2..f * cols + i * 2 + 2) {
+                    h[0] = from.get(at).copied().unwrap_or(0.0);
+                    h[1] = from.get(at + 1).copied().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+
+    /// **Fill the tap's OWN-ROW columns** (`StemTap::own`): each folder's
+    /// slot as it stands BEFORE the fold replaces it with the group, which
+    /// is its own row alone - the clips and instrument standing on it.
+    /// Called once a chunk, after every source and before the first fold.
+    fn fill_stem_tap_own(&mut self, n: usize) {
+        let stride = self.stride();
+        let Some(tap) = self.stem.as_mut() else {
+            return;
+        };
+        if !tap.own.iter().any(|o| *o) {
+            return;
+        }
+        let from = if self.stems_dry {
+            &self.spine.desk.dry_scratch
+        } else {
+            &self.spine.desk.stem_scratch
+        };
+        let cols = tap.row.len();
+        for (i, slot) in tap.slots.iter().enumerate() {
+            if !tap.own.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let slot = *slot as usize;
             for f in 0..n.min(MAX_BLOCK as usize) {
                 let at = f * stride + slot * 2;
                 if let Some(h) = tap.held.get_mut(f * cols + i * 2..f * cols + i * 2 + 2) {
@@ -20937,7 +21017,18 @@ impl Renderer {
                 // does, and back. At unity, which every desk with no bus
                 // always is, the row is added as it always was.
                 let to = if quiet_row { 0.0 } else { 1.0 };
-                if kind != K::Bus && *row_gate == 1.0 && to == 1.0 {
+                // **Left out of an export** (`LaneFlags::ROW_LEFT_OUT`): gone
+                // from the first frame, not faded, since an export's plan is
+                // its plan from its first block and a fade would leak the
+                // head of the row into the file.
+                let left_out = self
+                    .plan
+                    .lanes
+                    .get(rank)
+                    .is_some_and(|l| l.flags.contains(crate::desk_plan::LaneFlags::ROW_LEFT_OUT));
+                if left_out {
+                    *row_gate = 0.0;
+                } else if kind != K::Bus && *row_gate == 1.0 && to == 1.0 {
                     for (c, dst) in post.iter_mut().enumerate().take(TAP_CHANNELS) {
                         for (f, d) in dst.iter_mut().enumerate().take(frames) {
                             *d += at(slot, f, c);
@@ -22321,15 +22412,22 @@ struct StemTap {
     /// are filled after the route phase, where they run. One push for the
     /// chunk, so the frames leave whole either way.
     held: Box<[f32]>,
+    /// **The columns that take a folder's OWN ROW**, beside `slots`: the
+    /// clips and instrument standing on the folder, taken before the folder
+    /// replaces its slot with the group's sum (`fill_stem_tap_own`). A
+    /// folder's group is never a stem (its children are written on their
+    /// own), but what stands on its row is in no child's.
+    own: Box<[bool]>,
 }
 
 impl StemTap {
-    fn new(tx: Producer<f32>, slots: &[Slot]) -> Self {
+    fn new(tx: Producer<f32>, slots: &[Slot], own: &[Slot]) -> Self {
         Self {
             tx,
             slots: slots.iter().map(|s| s.0).collect(),
             row: vec![0.0; slots.len() * TAP_CHANNELS].into_boxed_slice(),
             held: vec![0.0; MAX_BLOCK as usize * slots.len() * TAP_CHANNELS].into_boxed_slice(),
+            own: slots.iter().map(|s| own.contains(s)).collect(),
         }
     }
 }
@@ -26918,11 +27016,18 @@ impl Engine {
     /// [`Engine::stem_column`] says where a slot's pair is. The ring holds
     /// four seconds of them, built here; there is none until a pass asks.
     pub fn arm_stems(&self, slots: &[Slot]) {
+        self.arm_stems_own(slots, &[]);
+    }
+
+    /// [`Engine::arm_stems`], with the slots in `own` (each one of `slots`)
+    /// taking a folder's OWN ROW rather than the folder's group: what stands
+    /// on the folder, before its children are summed into it.
+    pub fn arm_stems_own(&self, slots: &[Slot], own: &[Slot]) {
         let floats = capture_ring_frames(self.output.sample_rate) * TAP_CHANNELS * slots.len().max(1);
         let (tx, rx) = RingBuffer::<f32>::new(floats);
         *self.stem_rx.borrow_mut() = Some(rx);
         *self.stem_slots.borrow_mut() = slots.to_vec();
-        self.send_stem_tap(Some(StemTap::new(tx, slots)));
+        self.send_stem_tap(Some(StemTap::new(tx, slots, own)));
     }
 
     /// **The stem ring let go: a pass is over and has drained its last.**
@@ -43258,7 +43363,7 @@ mod slot_engine {
         assert_eq!(r.spine.capacity(), 64);
         let (tx, rx) = RingBuffer::<f32>::new(1000);
         let every: Vec<Slot> = (0..64).map(Slot).collect();
-        r.stem = Some(StemTap::new(tx, &every));
+        r.stem = Some(StemTap::new(tx, &every, &[]));
         let mut out = vec![0.0f32; BLOCK * 2];
         r.render(&mut out, 0, 0);
         let width = r.stem.as_ref().map_or(0, |t| t.row.len());

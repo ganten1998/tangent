@@ -130,6 +130,9 @@ mod render_golden;
 /// docs/design/unlimited-tracks.md, C9.
 #[cfg(feature = "recorder")]
 mod engine_bridge;
+/// Canonical composition for the Latin letters, for stem names.
+#[cfg(feature = "recorder")]
+mod nfc_latin;
 /// The Konami and paywall suite past thirty-two rows, end to end through the
 /// bridge: docs/design/unlimited-tracks.md, 11.2 and W6-rows-unlimited.
 #[cfg(all(test, feature = "recorder"))]

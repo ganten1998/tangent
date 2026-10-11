@@ -5378,6 +5378,45 @@ impl TangentApp {
         self.row(ch).is_some_and(|r| r.folder)
     }
 
+    /// **Whether folder `ch` has something of its OWN to play**: clips
+    /// standing on the folder row, or a built-in instrument left in one of
+    /// its bays from before it became a folder. Such a folder is an export
+    /// row of its own ("own clips"): its group is never a stem (that is its
+    /// children twice over), but what stands on its row is in no child's.
+    /// False for anything that is not a folder.
+    pub fn folder_has_own_content(&self, ch: usize) -> bool {
+        self.is_folder(ch)
+            && (self.lane_has_clips(ch)
+                || [dialogs::BUILTIN_PATH, dialogs::KEYS_PATH, dialogs::DRUMPAD_PATH]
+                    .iter()
+                    .any(|p| self.row_holds(ch, p)))
+    }
+
+    /// **Whether row `n` is a stem an export can write**: what has
+    /// something to make one of - clips on it, a bus (a mix of what is sent
+    /// to it), or anything in its own bays - and a folder only for what
+    /// stands on its own row ([`Self::folder_has_own_content`]), never for
+    /// its group, which is its children twice over. The one rule the host's
+    /// stems (`engine_bridge::stem_files`) and the Export window's checklist
+    /// both read.
+    pub fn exports_a_stem(&self, n: usize) -> bool {
+        if self.is_folder(n) {
+            return self.folder_has_own_content(n);
+        }
+        self.lane_has_clips(n)
+            || self.is_bus(n)
+            || self.track_at(n).is_some_and(|id| {
+                (0..crate::desk_id::BAYS as u8).any(|b| {
+                    self.plugin(crate::desk_id::SeatBay::new(
+                        crate::desk_id::Node::Track(id),
+                        crate::desk_id::Rack::Chain(0),
+                        b,
+                    ))
+                    .is_some()
+                })
+            })
+    }
+
     /// Whether this channel sits inside the folder above it.
     ///
     /// **Answered positionally**, so it is false the moment there is no
@@ -36724,9 +36763,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **The Export window's TRACKS and TIME rows as they open.**
     ///
-    /// The checklist is every row of the desk but a folder (a folder's stem
-    /// is its children twice over), in desk order, a member of a folder
-    /// named under it and a bus marked. What comes up checked, first answer
+    /// The checklist is every row of the desk but a folder's group (a
+    /// folder's group stem is its children twice over), in desk order: a
+    /// folder only for what stands on its own row ("own clips"), a member of
+    /// a folder named under it, a bus marked (the window shows buses only
+    /// when stems are written; see `dialogs::ExportTrack::bus`). What comes up checked, first answer
     /// wins: the desk's selection when it holds anything (a selected folder
     /// checks its members); else the tracks the last export of this session
     /// checked, those still standing; else everything. The TIME fields come
@@ -36737,12 +36778,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         spec: &crate::ports::ProjectExportSpec,
         custom: Option<(f64, f64)>,
     ) -> dialogs::ExportPick {
-        let rows: Vec<usize> = (0..self.desk_extent()).filter(|r| !self.is_folder(*r)).collect();
+        // Every row but a folder's group: a folder is a row only for what
+        // stands on its own row ("own clips").
+        let rows: Vec<usize> =
+            (0..self.desk_extent()).filter(|r| !self.is_folder(*r) || self.folder_has_own_content(*r)).collect();
         let selected: std::collections::BTreeSet<usize> = {
             let mut out = std::collections::BTreeSet::new();
             for r in self.selected_rows() {
                 if self.is_folder(r) {
-                    out.extend(rows.iter().copied().filter(|c| self.folder_chain_holds(*c, r)));
+                    // The folder's own row, when it is one, and its members.
+                    out.extend(rows.iter().copied().filter(|c| *c == r || self.folder_chain_holds(*c, r)));
                 } else {
                     out.insert(r);
                 }
@@ -36758,11 +36803,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     "" => format!("Track {}", r + 1),
                     n => n.to_owned(),
                 };
+                let own = self.is_folder(r);
                 let label = match self.folder_of(r) {
                     Some(f) => format!("{} / {name}", self.channel_display_name(f).trim()),
                     None => name,
                 };
-                let label = if self.is_bus(r) { format!("{label} (bus)") } else { label };
+                let label = if own { format!("{label} (own clips)") } else { label };
+                let bus = self.is_bus(r);
                 let on = if !selected.is_empty() {
                     selected.contains(&r)
                 } else if let Some(ids) = remembered.filter(|ids| rows.iter().any(|r| ids.contains(&self.track_id_at(*r)))) {
@@ -36770,7 +36817,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 } else {
                     true
                 };
-                dialogs::ExportTrack { id, label, on }
+                dialogs::ExportTrack {
+                    id,
+                    label,
+                    on,
+                    bus,
+                    stem: self.exports_a_stem(r),
+                    heard: self.strip_heard(recorder::StripRef::Row(r)),
+                }
             })
             .collect();
         let tempo = self.live_tempo_map();
@@ -57265,12 +57319,13 @@ mod tests {
     /// exported into one `Exports/project/` and each `mix.wav` replaced the
     /// last project's. The Export dialog's DIRECTORY row says which folder,
     /// before anything is written.
-    /// **The Export window's TRACKS checklist: no folder in it, a folder's
+    /// **The Export window's TRACKS checklist: no folder's group in it (a
+    /// folder with clips of its own is a row for those alone), a folder's
     /// members named under it, a bus marked, and checked from the desk's
-    /// selection** (a selected folder checks its members), else from what
-    /// the session's last export checked, else everything.
+    /// selection** (a selected folder checks its own row and its members),
+    /// else from what the session's last export checked, else everything.
     #[test]
-    fn the_export_checklist_leaves_out_folders_and_opens_on_the_desks_selection() {
+    fn the_export_checklist_offers_no_folder_group_and_opens_on_the_desks_selection() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         for (ch, name) in [(0usize, "Kick"), (1, "Bass"), (3, "GROUP"), (4, "KID A"), (5, "KID B")] {
             app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
@@ -57291,7 +57346,7 @@ mod tests {
             pick.tracks.iter().find(|t| t.id == ids[r]).cloned().expect("the row")
         };
         assert_eq!(row(&pick, 4).label, "GROUP / KID A", "a member does not say whose it is");
-        assert!(row(&pick, 6).label.ends_with("(bus)"), "the bus is not marked");
+        assert!(row(&pick, 6).bus && !row(&pick, 6).label.contains("(bus)"), "the bus is not marked as one (the window labels it)");
         let on: Vec<usize> = (0..app.desk_extent()).filter(|r| *r != 3 && row(&pick, *r).on).collect();
         assert_eq!(on, vec![0, 4, 5], "the desk's selection (a folder's members for the folder) did not come up checked");
         // Nothing selected: what the last export checked, still standing.
@@ -57303,6 +57358,16 @@ mod tests {
         // Nothing to go on: everything.
         let pick = app.export_pick(&crate::ports::ProjectExportSpec::default(), None);
         assert!(pick.tracks.iter().all(|t| t.on));
+        // A folder with a clip of its OWN is a row of its own, for that
+        // clip alone, and selecting the folder checks it with its members.
+        app.arrangement.clips.push(crate::arrangement::ArrClip { lane: 3, len_s: 1.0, ..Default::default() });
+        app.selected_tracks = vec![ids[3]];
+        let pick = app.export_pick(&crate::ports::ProjectExportSpec::default(), None);
+        assert_eq!(row(&pick, 3).label, "GROUP (own clips)");
+        assert!(row(&pick, 3).stem, "the folder's own clip is nothing to export");
+        let on: Vec<usize> = (0..app.desk_extent()).filter(|r| row(&pick, *r).on).collect();
+        assert_eq!(on, vec![3, 4, 5], "a selected folder did not check its own row and its members");
+        app.selected_tracks.clear();
         // And the dialog opens on it, the spec's tracks the boxes.
         app.export_project_spec.tracks = Some(vec![id(&app, 1)]);
         app.apply_dialog_action(DialogAction::ProjectExportOpen);
@@ -57313,6 +57378,103 @@ mod tests {
             }
             _ => panic!("the Export dialog did not open"),
         }
+    }
+
+    /// **The same, driven the way the host drives it**: a real press on the
+    /// Export button, then the host's own order every frame - the chore
+    /// owed from last frame first (`DesktopApp::run_chore`, which waits for
+    /// two paints of the cover), the app's frame, the request taken and
+    /// announced (`take_project_request`), and the cover painted last and
+    /// mirrored (`paint_busy`). The window must be on screen, carrying the
+    /// cover, on every frame up to and including the one the blocking setup
+    /// runs in, and gone once the cover is down.
+    #[test]
+    fn the_export_window_holds_the_cover_through_the_hosts_own_frame_order() {
+        let (ctx, mut app) = headless(Caps::NONE);
+        app.set_channel_kind(0, Some(recorder::ChannelKind::Audio));
+        app.arrangement.clips.push(crate::arrangement::ArrClip { lane: 0, len_s: 1.0, ..Default::default() });
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        let painted = |out: &egui::FullOutput, want: &str| -> Option<Rect> {
+            out.shapes.iter().find_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == want => Some(Rect::from_min_size(t.pos, t.galley.size())),
+                _ => None,
+            })
+        };
+        // The host's state: the cover it announced, and the chore it owes.
+        let mut cover: Option<crate::busy::Busy> = None;
+        let mut owed = false;
+        let mut frame = |app: &mut TangentApp, events: Vec<egui::Event>, cover: &mut Option<crate::busy::Busy>| {
+            // `run_chore`: the owed block runs once the cover has outlived
+            // the asking frame, and its overlay may then go.
+            let mut ran = false;
+            if owed && cover.as_ref().is_some_and(crate::busy::Busy::outlived_the_asking_frame) {
+                owed = false;
+                ran = true;
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.frame(ctx);
+                    // `take_project_request` and `announce`.
+                    if let Some(crate::ports::ProjectRequest::Export(_)) = app.take_project_request() {
+                        *cover = Some(
+                            crate::busy::Busy::new("Preparing export").with_detail("stems").with_min_visible(Duration::ZERO),
+                        );
+                        owed = true;
+                    }
+                    // `paint_busy`: a finished chore's cover goes, else it
+                    // paints and is mirrored.
+                    if ran {
+                        *cover = None;
+                    }
+                    let up = cover.as_mut().is_some_and(|b| {
+                        let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+                        b.draw(&painter, ctx.content_rect(), egui::Color32::GRAY, 0.0)
+                    });
+                    app.set_surface_cover(if up { cover.clone() } else { None });
+                },
+            );
+            (out, ran)
+        };
+        let (mut out, _) = frame(&mut app, Vec::new(), &mut cover);
+        for _ in 0..2 {
+            out = frame(&mut app, Vec::new(), &mut cover).0;
+        }
+        let at = painted(&out, "Export").expect("the Export button is not on screen").center();
+        for e in [
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ] {
+            out = frame(&mut app, vec![e], &mut cover).0;
+        }
+        assert!(cover.is_some(), "the press asked the host for nothing");
+        // Every frame until the block has run: the window is up and says it.
+        let mut frames = 0;
+        loop {
+            let (o, ran) = frame(&mut app, Vec::new(), &mut cover);
+            frames += 1;
+            if ran {
+                // The frame the setup blocks in shows what the frame before
+                // it presented, and that frame carried the cover.
+                break;
+            }
+            // Said on the window's own foot, in one line: the main window's
+            // cover paints its label and its detail apart.
+            assert!(painted(&o, "Preparing export  stems").is_some(), "the window did not carry the cover on frame {frames}");
+            assert!(matches!(app.dialog, Some(Dialog::ExportProject { .. })), "the window went before the block");
+            assert!(frames < 10, "the block never ran");
+            out = o;
+        }
+        let _ = out;
+        assert!(frames >= 2, "the block ran on the press's own frame");
+        // The block ran and its cover went: the window goes the next frame.
+        let _ = frame(&mut app, Vec::new(), &mut cover);
+        assert!(app.dialog.is_none(), "the window outlived its pass's start");
     }
 
     /// **Once Export is pressed the window carries the host's cover until
