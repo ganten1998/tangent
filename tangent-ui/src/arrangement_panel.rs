@@ -4112,21 +4112,23 @@ pub fn a11y_nodes_from(
             // control that only ever steps one way walks a keyboard down to
             // 1/32 and strands it there. The announced value is the grid the
             // box prints; the travel is the exponent laid onto 0..1.
+            //
+            // **Over the steps the box takes, -6 to 3** (`GRID_BOX_FINEST`
+            // to `GRID_BOX_COARSEST`). It said -5 to 3, a step short of the
+            // settings' own clamp, so at the finest step the value was under
+            // the minimum it declared and the travel was -0.125.
             Hit::ToolGrid => Node::slider(
                 id,
                 r,
                 "Grid",
                 f64::from(view.grid_exp),
-                -5.0,
-                3.0,
+                f64::from(GRID_BOX_FINEST),
+                f64::from(GRID_BOX_COARSEST),
                 {
                     let sg = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
                     grid_spoken(view.grid_exp, sg.beats, sg.unit)
                 },
-                Travel {
-                    norm: (f32::from(view.grid_exp) + 5.0) / 8.0,
-                    up: false,
-                },
+                Travel { norm: grid_box_travel(view.grid_exp), up: false },
             ),
             Hit::ToolNav => Node::readout(
                 id,
@@ -4569,6 +4571,210 @@ fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink, size: 
     );
 }
 
+/// **The smallest a word that shrinks to its box is drawn: six and a half
+/// points.**
+///
+/// The floor of the other words in this app that shrink rather than cut:
+/// the INPUT chip's ([`input_chip`]) and the analog faces' own
+/// (`faces_analog::fit`, "the smallest legible"). Under it a grid step is a
+/// smudge, and a smudge in a grid box reads as a wrong number rather than a
+/// small one.
+pub const WORD_FLOOR: f32 = 6.5;
+
+/// **The air a word that had to shrink keeps from each side of its room**,
+/// in points.
+///
+/// Fitted with none, a word would fill its room to the last hundredth and
+/// its ink would meet the box's edge. A quarter of a point because the room
+/// is small: the arrange gridbox is twenty points, and a five-character step
+/// (1/128) at the floor is 18.9 to 19.4 of them in Courier Prime and
+/// JetBrains Mono, depending on the display's scale. Half a point a side
+/// would put that step under the floor on a Retina screen and not on a
+/// plain one.
+pub const WORD_AIR: f32 = 0.25;
+
+/// **The size a word is drawn at in `room`: shrunk to the room's width,
+/// never spilled.**
+///
+/// `ceiling` when the word fits the room at that size, so a word its box was
+/// drawn for keeps exactly the size it always had (BAR and 1/2 in the
+/// arrange gridbox, 11 points). Otherwise the largest half point under the
+/// ceiling at which it fits with [`WORD_AIR`] either side, measured in the
+/// face that is installed, and never under [`WORD_FLOOR`]. A word that does
+/// not fit even at the floor is given the floor and left to the clip in
+/// [`paint_fitted_word`]: past that point a smaller word is a smudge, and
+/// which words those are is a question for the box, not for the type.
+///
+/// This is the INPUT chip's rule ([`input_chip`]: the height names the
+/// ceiling and the width decides), except that it never truncates. A grid
+/// step cut to "1/1..." names a different step.
+///
+/// Half points rather than any size: each word gets one size that does not
+/// move from frame to frame, so the glyph atlas is not handed a new fraction
+/// every frame (why `fonts::px` rounds), and on a 2x display half a point is
+/// a whole pixel. Found by walking down rather than by scaling the width
+/// once, because glyphs land on pixels and a word's width is not quite in
+/// proportion to its size.
+///
+/// **A word fits when its advances AND its ink do** ([`ink_placed_inside`]).
+/// A word is laid out and centred by its advances, but its glyphs are drawn
+/// as the atlas holds them, whole pixels rounded outward, at a position the
+/// tessellator snaps to a whole pixel; and a box's edges fall wherever the
+/// layout puts them. So a word laid out inside its box can still have no
+/// whole-pixel position that holds all of its ink. BAR in Courier Prime at
+/// 100%, in the 12.95-point box of a 260-point arrangement (twelve whole
+/// pixels, 51 to 63): by its advances it fits at 7 points, 12.2 wide, but
+/// its ink there is thirteen pixels, and fitted by its advances alone it was
+/// painted at 7 with a column cut off by the clip. At 6.5 its ink is twelve
+/// pixels and it is drawn whole. Measured over every whole-point
+/// arrangement height from 100 to 420, every bundled face and the scales
+/// from 100% to 200%: 15,377 (height, word) cases drawn whole that the
+/// advances alone had cut, and not one the other way.
+pub fn fitted_word_size(
+    painter: &Painter,
+    word: &str,
+    family: &egui::FontFamily,
+    ceiling: f32,
+    room: Rect,
+) -> f32 {
+    let ppp = painter.ctx().pixels_per_point();
+    // Laid out no wider than `width`, and all of its ink placeable inside
+    // the room by whole pixels.
+    let fits = |size: f32, width: f32| {
+        let g = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family.clone()), Color32::WHITE);
+        g.rect.width() <= width && ink_placed_inside(room, &g, ppp).is_some()
+    };
+    if fits(ceiling, room.width()) {
+        return ceiling;
+    }
+    // A ceiling already under the floor is its own floor: shrinking stops
+    // there, and growing is not what this is for.
+    let floor = WORD_FLOOR.min(ceiling);
+    let with_air = room.width() - 2.0 * WORD_AIR;
+    // The first half point under the ceiling (10.5 under 11, 9.5 under the
+    // MIDI chip's 9.9), then down by halves.
+    let mut size = (ceiling * 2.0).ceil() * 0.5 - 0.5;
+    while size > floor && !fits(size, with_air) {
+        size -= 0.5;
+    }
+    size.max(floor)
+}
+
+/// **Where `galley` is drawn in `room` so that all of its ink is inside**:
+/// centred, as `Align2::CENTER_CENTER` centres it, and then, if the ink the
+/// tessellator will draw there crosses an edge, moved in by the whole pixels
+/// it crosses by. `None` when no whole-pixel position holds all of it.
+///
+/// The ink is the galley's mesh, every glyph as the atlas draws it, at the
+/// position the tessellator snaps to a pixel (`round_text_to_pixels`), so it
+/// lands on whole pixels while the room's edges need not. A word that fits by
+/// its advances can still put one column of ink past an edge (BAR in Courier
+/// Prime at 150%, 1/128 in JetBrains Mono at 100%), and the clip would cut
+/// that column off a word that fits: moving it in by a pixel keeps it whole.
+/// Down as well as across: in the seven-point box of an arrangement under
+/// 157 points, a single digit in JetBrains Mono at 100% centres with its
+/// ink half a pixel below the box, and goes up a pixel. A thousandth of
+/// slack, so float noise is not a pixel.
+fn ink_placed_inside(room: Rect, galley: &egui::Galley, ppp: f32) -> Option<Pos2> {
+    const SLACK: f32 = 1.0e-3;
+    let centred = room.center() - galley.size() * 0.5;
+    let drawn = galley.mesh_bounds;
+    if !drawn.is_positive() {
+        return Some(centred);
+    }
+    // One axis: where the word goes along it, given where centring put it,
+    // its ink's extent from its own origin, and the room's two edges.
+    let along = |at: f32, ink: (f32, f32), edges: (f32, f32)| -> Option<f32> {
+        let snapped = (at * ppp).round() / ppp;
+        let (lo, hi) = (snapped + ink.0, snapped + ink.1);
+        let shift = if hi > edges.1 + SLACK {
+            -((hi - edges.1) * ppp - SLACK).ceil() / ppp
+        } else if lo < edges.0 - SLACK {
+            ((edges.0 - lo) * ppp - SLACK).ceil() / ppp
+        } else {
+            // Inside where centring put it: left there, exactly.
+            return Some(at);
+        };
+        (lo + shift >= edges.0 - SLACK && hi + shift <= edges.1 + SLACK).then_some(snapped + shift)
+    };
+    Some(Pos2::new(
+        along(centred.x, (drawn.min.x, drawn.max.x), (room.left(), room.right()))?,
+        along(centred.y, (drawn.min.y, drawn.max.y), (room.top(), room.bottom()))?,
+    ))
+}
+
+/// **A word painted in its box at [`fitted_word_size`], and never outside
+/// it.**
+///
+/// `room` is where the word may be laid out: the box itself, or the part of
+/// it inside a border. `bx` is the box, and the word is clipped to it,
+/// within whatever clip the painter already has. The clip is the backstop
+/// and not the fit: a word that fits is placed with all of its ink inside
+/// the room ([`ink_placed_inside`]) and the clip cuts nothing from it; a
+/// word that does not fit even at the floor is painted at the floor,
+/// centred, and cut at the box's edge instead of painting over the next
+/// control. Which words those are, at which sizes of the arrange gridbox,
+/// `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// names. That is the class of fault behind the owner's "0.000000": a grid
+/// step six characters wide in the arrange gridbox, spilling onto the tempo
+/// lane's switch, with the navigator painted over its tail.
+pub fn paint_fitted_word(
+    painter: &Painter,
+    bx: Rect,
+    room: Rect,
+    word: &str,
+    family: egui::FontFamily,
+    ceiling: f32,
+    ink: Color32,
+) {
+    if !room.is_positive() || word.is_empty() {
+        return;
+    }
+    let size = fitted_word_size(painter, word, &family, ceiling, room);
+    let galley = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family), ink);
+    let pos = ink_placed_inside(room, &galley, painter.ctx().pixels_per_point())
+        .unwrap_or_else(|| room.center() - galley.size() * 0.5);
+    painter
+        .with_clip_rect(bx.intersect(painter.clip_rect()))
+        .galley(pos, galley, ink);
+}
+
+/// **The size the arrange gridbox prints at**: 0.55 of the box's height,
+/// held to 8 to 11 points. Eleven in the twenty-point box the toolbar draws
+/// whenever the arrangement is tall enough for it. A word wider than the
+/// box shrinks from here ([`grid_box_word`]).
+fn grid_box_type(cell: Rect) -> f32 {
+    (cell.height() * 0.55).clamp(8.0, 11.0)
+}
+
+/// **The arrange gridbox's word, in its box**: [`grid_box_type`] when it
+/// fits, shrunk to the box's width when it does not, and clipped to the box.
+///
+/// The box is a twenty-point square at most, drawn for three characters
+/// (1/2, 1/4, BAR), and at eleven points a fourth is already too many: 1/16
+/// is 25.6 points wide in Courier Prime and JetBrains Mono and 21.5 in
+/// Terminess. The ladder prints five characters too (1/128, at the finest
+/// steps of meters as common as 3/4 and 7/8) and six (1/1024).
+///
+/// **And it is twenty points only in an arrangement at least 383 tall.**
+/// Under that it follows the ruler down, to seven points under 157, and the
+/// shorter the arrangement the shorter the steps that no longer fit it
+/// above the floor: under 257 points even BAR is cut at some heights in
+/// Courier Prime. `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// sweeps every size the layout draws and names, for each face, the height
+/// from which a step of each length is never cut.
+fn grid_box_word(painter: &Painter, cell: Rect, word: &str, ink: Color32) {
+    paint_fitted_word(
+        painter,
+        cell,
+        cell,
+        word,
+        crate::fonts::courier_bold(),
+        grid_box_type(cell),
+        ink,
+    );
+}
+
 /// **The lane field**: the ground every clip in this view sits on.
 ///
 /// In light mode the timecode WELL is lifted toward the strip face so the
@@ -4965,6 +5171,30 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     v
 }
 
+/// **The ONE-BAR rung's name, on every surface that prints the ladder: BAR,
+/// in every meter.**
+///
+/// Above it the ladder counts bars (2, 4, 8) and below it are note values
+/// (1, 1/2, 1/4 ...), so the bar is the one rung that is neither, and every
+/// spelling it had read as something it is not. In 4/4 it was "1", the name
+/// of a whole note; in 3/4 "1/2·", a dotted half; in a meter whose bar is no
+/// one note it was the time signature (2d292a27; a decimal like "8.000q"
+/// before that). The owner met the last of those in 4/2, whose ladder went
+/// 2, 4/2, 1: "why does the option between 1 and 2 = 4/2 in grid frequency
+/// and why is it even an option?" The rung is there because a grid of one
+/// bar is one every song wants (the magnet on the bar lines). What was wrong
+/// was its name: "4/2" is a fraction, and one that reads as twice the "1"
+/// under it. Of the spellings put to him, the owner chose this one.
+///
+/// A WORD, so it cannot be read as a count of bars or as a note value, and
+/// the same word in every meter, 4/4 included, so nobody has to know the
+/// meter to read it. Three letters, so it is exactly as wide as the
+/// three-character rungs (1/2, 1/4, 1/8) in all three bundled faces, which
+/// are monospaced: the twenty-point arrange box is sized for those, and
+/// `the_bar_rung_is_painted_bar_in_every_meter` measures it on the frame in
+/// each face. Aloud it is "1 bar", as it always was ([`grid_spoken`]).
+pub const GRID_BAR: &str = "BAR";
+
 /// **What the box prints, derived from what the magnet actually does** —
 /// in the spelling that keeps the note glyph at the quarter, which is now
 /// the MIDI EDITOR's chip and nothing else. The arrange gridbox takes
@@ -5013,14 +5243,16 @@ pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
 /// ARRANGE gridbox prints.
 ///
 /// The owner, on that box: "it's easier to spot at a glance for a beginner
-/// and realize that's what that button does." In 4/4 the ladder reads 1,
-/// 1/2, ♪, 1/8, 1/16 — the glyph is the ONE rung not written the way the
-/// rungs on either side of it are, and it sits at the division a beginner is
-/// most likely to be hunting for, because a quarter note is the first thing
-/// anyone is taught to count. `tool_grid` is at most 48 points wide and the
-/// label is drawn between 8 and 11 points, so ♪ arrives as a stem and a blob
-/// that has to be recognised before it can be read; "1/4" arrives as a
-/// fraction the two rungs under it have already taught the eye to parse.
+/// and realize that's what that button does." In 4/4 the glyph spelling
+/// reads BAR, 1/2, ♪, 1/8, 1/16. Under the bar, the glyph is the ONE note
+/// value not written the way the ones on either side of it are, and it sits
+/// at the division a beginner is most likely to be hunting for, because a
+/// quarter note is the first thing anyone is taught to count. `tool_grid`
+/// is a square of at most 20 points (it was 48 wide when this was written)
+/// and the label is drawn between 8 and 11 points, so ♪ arrives as a stem
+/// and a blob that has to be recognised before it can be read; "1/4"
+/// arrives as a fraction the two rungs under it have already taught the eye
+/// to parse.
 ///
 /// This supersedes the earlier ruling quoted on [`grid_label`], and only its
 /// second half: "there should exist a single state of that button that
@@ -5041,13 +5273,21 @@ pub fn grid_label_text(exp: i8, beats: u8, unit: u8) -> String {
 }
 
 /// The one ladder both public labels walk. Kept private and shared so the
-/// bar branch — the half of the label that has nothing to do with note
-/// glyphs — exists once; two copies of `1u32 << exp` is exactly the kind of
+/// bar branches (the multiples of a bar, counted, and the bar itself,
+/// [`GRID_BAR`]: the half of the label that has nothing to do with note
+/// glyphs) exist once; two copies of `1u32 << exp` is exactly the kind of
 /// duplicate that let the label disagree with the magnet in the first place.
 fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String {
     if exp > 0 {
         // Multiples of a BAR, and it says so by counting them.
         return format!("{}", 1u32 << exp.min(6) as u32);
+    }
+    if exp == 0 {
+        // One bar, by name, whatever the meter: see `GRID_BAR`. Not handed
+        // to `note_label`, which can only name the bar's LENGTH, as a note
+        // (4/4's "1", 3/4's "1/2·") or counted in beats (4/2's "4/2"), and
+        // every one of those reads as a note value.
+        return GRID_BAR.to_owned();
     }
     note_label(grid_quarters(exp, beats, unit), unit, quarter_glyph)
 }
@@ -5061,10 +5301,11 @@ fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String 
 /// **A length no note names is COUNTED, in the meter's own beats**: `n/unit`,
 /// n notes of 1/unit, the way a time signature counts its bar. Every rung
 /// [`grid_quarters`] walks is a whole number of beats or a power-of-two part
-/// of one, and a part of one always has a name, so the count is exact. At
-/// the BAR rung n is the top number, so a bar that is not one note reads as
-/// its own signature: 5/4, 7/8, 4/2. `unit` is read by this branch alone;
-/// the fallback it replaced is written up in the branch.
+/// of one, and a part of one always has a name, so the count is exact. The
+/// BAR rung never arrives here (it is [`GRID_BAR`], by name, from
+/// [`grid_label_with`]), so what is counted is a rung UNDER the bar that no
+/// note names: 10/8's half bar, five eighths, is 5/8. `unit` is read by this
+/// branch alone; the fallback it replaced is written up in the branch.
 ///
 /// **`quarter_glyph` decides one rung and one rung only**: whether q == 1
 /// comes back as `\u{266a}` or falls through into the plain-fraction branch,
@@ -5088,39 +5329,66 @@ fn note_label(q: f64, unit: u8, quarter_glyph: bool) -> String {
     if quarter_glyph && (q - 1.0).abs() < 1.0e-9 {
         return "\u{266a}".to_owned();
     }
+    match note_value(q, unit) {
+        NoteValue::Plain(d) if d <= 1 => "1".to_owned(),
+        NoteValue::Plain(d) => format!("1/{d}"),
+        // Dotted: one and a half of a clean value.
+        NoteValue::Dotted(d) if d <= 1 => "1\u{00b7}".to_owned(),
+        NoteValue::Dotted(d) => format!("1/{d}\u{00b7}"),
+        // Nothing nameable: count it, in beats of the meter.
+        //
+        // This used to say the length in quarters, `format!("{q:.3}q")`, and
+        // that is what the owner found: "there's a '0 frequency on the grid
+        // frequency in arrange mode reads as quite a lot of 0.000000s". In
+        // 4/2 the bar rung printed "8.000q", six characters in a box drawn
+        // for three: the 8 spilled onto the tempo-lane switch, where it
+        // barely shows, and the navigator, painted after it, covered the q,
+        // so a row of zeros was what read. Nor was it one rare meter: 5/4,
+        // 7/8 and 9/8, three of the eight in `TIME_SIGNATURES`, reached it at
+        // the same rung. `no_rung_of_any_signature_is_spelled_as_a_decimal`
+        // sweeps them all. The bar rung has since been given a name of its
+        // own, `GRID_BAR`, and no longer comes here; what still does is a
+        // rung under the bar that no note names, like 10/8's five eighths.
+        NoteValue::Counted(n, unit) => format!("{n}/{unit}"),
+    }
+}
+
+/// **What a length in quarters is, as a note**: one note value, one dotted
+/// note value, or a count of the meter's beats.
+///
+/// The one decision [`note_label`] prints and [`grid_spoken`] says aloud, so
+/// the box and the screen reader cannot sort a step differently. The reader
+/// used to sort it a second time, by matching the box's text against a
+/// table of eight spellings, and every step the table did not list fell
+/// through to "of a bar": 428 of the (signature, step) pairs, a whole note
+/// read as "1 of a bar" in 4/2 and a 128th as "1/128 of a bar" in 4/4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteValue {
+    /// One 1/d note: 1 is a whole note, 2 a half, 4 a quarter.
+    Plain(u64),
+    /// A dotted 1/d note, one and a half of it: 6/8's beat is `Dotted(4)`.
+    Dotted(u64),
+    /// n notes of 1/unit, the meter's own beat: 10/8's half bar is
+    /// `Counted(5, 8)`.
+    Counted(u64, u8),
+}
+
+/// Sorts `q` quarter notes into a [`NoteValue`]: a plain note when `4 / q`
+/// is a whole number, a dotted one when two thirds of `q` is, and otherwise
+/// counted in the meter's beats ([`beats_counted`]).
+fn note_value(q: f64, unit: u8) -> NoteValue {
     let denom = 4.0 / q;
     let rounded = denom.round();
     if (denom - rounded).abs() < 1.0e-9 && rounded >= 1.0 {
-        return if rounded <= 1.0 {
-            "1".to_owned()
-        } else {
-            format!("1/{}", rounded as u64)
-        };
+        return NoteValue::Plain(rounded as u64);
     }
-    // Dotted: one and a half of a clean value.
-    let plain = q * 2.0 / 3.0;
-    let d = 4.0 / plain;
+    let d = 4.0 / (q * 2.0 / 3.0);
     let dr = d.round();
     if (d - dr).abs() < 1.0e-9 && dr >= 1.0 {
-        return if dr <= 1.0 {
-            "1\u{00b7}".to_owned()
-        } else {
-            format!("1/{}\u{00b7}", dr as u64)
-        };
+        return NoteValue::Dotted(dr as u64);
     }
-    // Nothing nameable: count it, in beats of the meter.
-    //
-    // This used to say the length in quarters, `format!("{q:.3}q")`, and that
-    // is what the owner found: "there's a '0 frequency on the grid frequency
-    // in arrange mode reads as quite a lot of 0.000000s". In 4/2 the bar rung
-    // printed "8.000q", six characters in a box drawn for three: the 8
-    // spilled onto the tempo-lane switch, where it barely shows, and the
-    // navigator, painted after it, covered the q, so a row of zeros was what
-    // read. Nor was it one rare meter: 5/4, 7/8 and 9/8, three of the eight
-    // in `TIME_SIGNATURES`, reached it at the same rung.
-    // `no_rung_of_any_signature_is_spelled_as_a_decimal` sweeps them all.
     let (n, unit) = beats_counted(q, unit);
-    format!("{n}/{unit}")
+    NoteValue::Counted(n, unit)
 }
 
 /// **A length in quarters, counted in the meter's beats**: `(n, unit)`, n
@@ -5136,26 +5404,46 @@ fn beats_counted(q: f64, unit: u8) -> (u64, u8) {
     (n as u64, unit)
 }
 
-/// What a 1/unit note is called aloud, for the units a signature can have.
-fn note_word(unit: u8) -> Option<&'static str> {
-    Some(match unit {
+/// **What a 1/d note is called aloud**, for every d the grid can reach: the
+/// note values a signature counts in (whole to thirty-second) and every
+/// halving under them the ladder walks to, down to the 4096th note that the
+/// finest step of 1/32 is.
+///
+/// Said the way a player says them, "hundred twenty-eighth" and not "one
+/// slash one hundred twenty-eight": a reader that has to spell a fraction
+/// out has not named the note.
+fn note_word(d: u64) -> Option<&'static str> {
+    Some(match d {
         1 => "whole",
         2 => "half",
         4 => "quarter",
         8 => "eighth",
         16 => "sixteenth",
         32 => "thirty-second",
+        64 => "sixty-fourth",
+        128 => "hundred twenty-eighth",
+        256 => "two hundred fifty-sixth",
+        512 => "five hundred twelfth",
+        1024 => "thousand twenty-fourth",
+        2048 => "two thousand forty-eighth",
+        4096 => "four thousand ninety-sixth",
         _ => return None,
     })
 }
 
 /// The same grid, in the words a person would say it in.
 ///
-/// The box prints "1" and "1/4" because it is a box the width of a thumb.
-/// A screen reader announcing "Grid, 1" has said nothing: the unit is the
+/// The box prints "8" and "1/4" because it is a box the width of a thumb.
+/// A screen reader announcing "Grid, 8" has said nothing: the unit is the
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
-fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
+///
+/// **Every surface a reader reaches the ladder on says it this way**: the
+/// arrange gridbox's slider ([`a11y_nodes`]) and the Quantize window's GRID
+/// chips (`dialogs::quantize_grid_row`), whose own text is the box's
+/// shorthand. The MIDI editor has no reader nodes at all yet, its grid chip
+/// among them.
+pub(crate) fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
     // **Read off the same division the box prints and the magnet uses.**
     //
     // This carried its own third opinion, in BEATS, while the box counted in
@@ -5166,47 +5454,91 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
         return format!("{} bars", 1u32 << exp.min(6) as u32);
     }
     if exp == 0 {
+        // The box prints BAR here (`GRID_BAR`); aloud it is one bar, in
+        // every meter, as it was before the box had a word for it.
         return "1 bar".to_owned();
     }
     let q = grid_quarters(exp, beats, unit);
     // Spoken in words rather than in the box's shorthand: a reader saying
     // "one slash eight" has not said "an eighth note".
     //
-    // **Off the TEXT spelling**, because this is the ARRANGE box's readout
-    // and the arrange box prints numerals now. It is not a free choice:
-    // leave it on `grid_label`'s spelling and the quarter rung arrives as
-    // `\u{266a}`, which no arm below names, so it drops into the catch-all
-    // and a reader is told "♪ of a bar" — a character read aloud instead of
-    // a note named, and wrong arithmetic on top of it, since in 6/8 a
-    // quarter note is a THIRD of the bar. That is the box, the reader and
-    // the magnet disagreeing again, which is what this function was
-    // rewritten to end. `the_grid_box_can_be_stepped_both_ways` is the guard.
-    let label = note_label(q, unit, false);
-    match label.as_str() {
-        "1/4" => "quarter note".to_owned(),
-        "1/2" => "half note".to_owned(),
-        "1/8" => "eighth note".to_owned(),
-        "1/16" => "sixteenth note".to_owned(),
-        "1/32" => "thirty-second note".to_owned(),
-        "1/64" => "sixty-fourth note".to_owned(),
-        "1/4\u{00b7}" => "dotted quarter note".to_owned(),
-        "1/8\u{00b7}" => "dotted eighth note".to_owned(),
-        other => {
-            // **A counted rung is said as the notes it counts.** The box
-            // prints 10/8's half bar as "5/8"; read through the catch-all
-            // that is "5/8 of a bar", a wrong fraction (it is HALF the bar)
-            // said with confidence. Matched against the count itself rather
-            // than parsed out of the text, so only a counted label is read
-            // this way.
-            let (n, u) = beats_counted(q, unit);
-            match note_word(u) {
-                Some(word) if n >= 2 && other == format!("{n}/{u}") => {
-                    format!("{n} {word} notes")
-                }
-                _ => format!("{other} of a bar"),
-            }
-        }
-    }
+    // **Sorted by `note_value`, the decision the box prints**, rather than
+    // by reading the box's text back. It read the text, against a table of
+    // eight spellings, and everything the table lacked fell through to
+    // "{label} of a bar": in 4/2 the whole note under the bar was "1 of a
+    // bar", right after the bar's "1 bar"; 12/8's dotted half was "1/2· of a
+    // bar", a dot read aloud; and the finest steps were "1/128 of a bar" and
+    // finer, each a fraction of a bar that was not one. 428 (signature,
+    // step) pairs in all, in 182 of the 192 meters. Before that table it
+    // was the quarter: the glyph spelling sent "♪ of a bar".
+    // `every_step_of_every_meter_is_said_as_a_note` sweeps all 192 meters.
+    let counted = |n: u64, u: u8| match note_word(u64::from(u)) {
+        // **A counted step is said as the notes it counts.** The box prints
+        // 10/8's half bar as "5/8"; as "5/8 of a bar" that is a wrong
+        // fraction (it is HALF the bar) said with confidence.
+        Some(word) if n == 1 => format!("1 {word} note"),
+        Some(word) => format!("{n} {word} notes"),
+        // A unit no signature has; the app never builds one.
+        None => format!("{n} beats"),
+    };
+    let named = match note_value(q, unit) {
+        NoteValue::Plain(d) => note_word(d).map(|word| format!("{word} note")),
+        NoteValue::Dotted(d) => note_word(d).map(|word| format!("dotted {word} note")),
+        NoteValue::Counted(n, u) => Some(counted(n, u)),
+    };
+    named.unwrap_or_else(|| {
+        // A note the table has no name for, which no valid meter reaches:
+        // said as a count of the meter's beats rather than as a fraction.
+        let (n, u) = beats_counted(q, unit);
+        counted(n, u)
+    })
+}
+
+/// **The arrange gridbox's finest step**, -6: what the settings clamp
+/// `arr_grid_exp` to at the fine end wherever it is written (the wheel, the
+/// drag, the keys, a settings file) and what its ladder is printed and said
+/// down to.
+pub const GRID_BOX_FINEST: i8 = -6;
+
+/// **The arrange gridbox's coarsest step**, 3: eight bars.
+pub const GRID_BOX_COARSEST: i8 = 3;
+
+/// **Where step `exp` sits on the arrange gridbox's slider**: 0 at
+/// [`GRID_BOX_FINEST`], 1 at [`GRID_BOX_COARSEST`], a ninth of the way a
+/// step. What its reader node declares as its travel ([`a11y_nodes`]), and
+/// what [`grid_box_step_for`] reads a key press back from, so the two
+/// cannot disagree about where a step is.
+pub fn grid_box_travel(exp: i8) -> f32 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    f32::from(exp.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST) - GRID_BOX_FINEST) / span
+}
+
+/// **The step a key on the arrange gridbox asks for**, from the step it is
+/// on and `want`, the slider's travel after the key
+/// (`a11y::Gesture::nudged` of [`grid_box_travel`]).
+///
+/// The nearest step to `want`, so Home and End reach the two ends and Space
+/// or Enter, which leave the travel where it was, leave the step. **And an
+/// arrow always moves one step**, whichever way it pressed: its nudge is a
+/// twentieth of the travel (a hundredth with Shift) and a step is a ninth,
+/// so the nearest step to where an arrow lands is the one it started on.
+/// Read that way, which is how the box was read, the arrows never moved it
+/// at all, and at -6, below the travel's old floor, the down arrow went UP
+/// a step.
+pub fn grid_box_step_for(now: i8, want: f32) -> i8 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    let here = grid_box_travel(now);
+    let want = want.clamp(0.0, 1.0);
+    // Ten steps on the travel, a ninth of it apart.
+    let nearest = (want * span).round() as i8 + GRID_BOX_FINEST;
+    let moved = if nearest != now || (want - here).abs() < 1.0e-6 {
+        nearest
+    } else if want > here {
+        now + 1
+    } else {
+        now - 1
+    };
+    moved.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST)
 }
 
 /// **Where a tempo handle is drawn, and grabbed.**
@@ -7775,14 +8107,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The MIDI editor's chip still calls `grid_label` and still shows
         // the glyph, so pointing this line back at `grid_label` would not
         // undo one decision, it would move two surfaces at once.
-        painter.text(
-            l.tool_grid.center(),
-            Align2::CENTER_CENTER,
-            grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
-            FontId::new(
-                (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
-                crate::fonts::courier_bold(),
-            ),
+        //
+        // **Shrunk to the box and clipped to it** (`grid_box_word`): the
+        // box is drawn for three characters and the ladder prints up to
+        // six. A step wider than the box spilled out of it, and the widest
+        // onto the tempo lane's switch and under the navigator.
+        grid_box_word(
+            painter,
+            l.tool_grid,
+            &grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
             on_ink(p.hdr_face),
         );
     }
@@ -8094,6 +8427,101 @@ pub(crate) fn cut_to_reference(painter: &Painter, width: f32, text: &str, font: 
         }
     }
     String::new()
+}
+
+/// **Every time signature the app accepts**, `(beats, unit)`, found by
+/// asking `TimeSignature::is_valid` over a range wider than it allows rather
+/// than by writing its rule out again: 1 to 32 beats over 1, 2, 4, 8, 16 or
+/// 32, which is 192. Test support for the sweeps that hold every grid ladder
+/// to something; each of them asserts the 192.
+#[cfg(test)]
+pub(crate) fn valid_signatures() -> Vec<(u8, u8)> {
+    let mut sigs = Vec::new();
+    for beats in 0u8..=64 {
+        for unit in 0u8..=64 {
+            if (crate::recorder::TimeSignature { beats, unit }).is_valid() {
+                sigs.push((beats, unit));
+            }
+        }
+    }
+    sigs
+}
+
+/// **A context dressed in `face`, at `ppp` pixels to the point**, the way
+/// the app's is: test support for measuring words as the screen gets them.
+/// The scale matters to a word's width (glyphs land on whole pixels) and to
+/// where its ink falls, so the fit sweeps run at 100% to 200%.
+#[cfg(test)]
+pub(crate) fn context_at(face: crate::fonts::FontChoice, ppp: f32) -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::fonts::install(&ctx, face, None);
+    crate::fonts::apply_text_styles(&ctx);
+    let mut raw = egui::RawInput::default();
+    raw.viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .native_pixels_per_point = Some(ppp);
+    // Twice: the first pass is what adopts the scale and the fonts.
+    let _ = ctx.run(raw.clone(), |_| {});
+    let _ = ctx.run(raw, |_| {});
+    assert_eq!(ctx.pixels_per_point(), ppp, "the context did not take the scale");
+    ctx
+}
+
+/// **A word as it reaches the screen**: its text and size, where it was laid
+/// out (its advances, from where it was placed), the ink the tessellator
+/// draws for it (every glyph's pixels, unclipped) and the clip it carries.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PaintedWord {
+    pub text: String,
+    pub size: f32,
+    pub laid: Rect,
+    pub ink: Rect,
+    pub clip: Rect,
+}
+
+#[cfg(test)]
+impl PaintedWord {
+    /// Every text `shapes` holds, measured. `ctx` tessellates them, at its
+    /// own scale, for the ink.
+    pub(crate) fn all(ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) -> Vec<Self> {
+        shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    let mut ink = Rect::NOTHING;
+                    for p in ctx.tessellate(vec![s.clone()], ctx.pixels_per_point()) {
+                        if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+                            ink = ink.union(m.calc_bounds());
+                        }
+                    }
+                    Some(Self {
+                        text: t.galley.text().to_owned(),
+                        size: t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                        laid: Rect::from_min_size(t.pos, t.galley.size()),
+                        ink,
+                        clip: s.clip_rect,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What `paint` paints on a layer of its own, keyed by `key`, measured.
+    pub(crate) fn painted_by(
+        ctx: &egui::Context,
+        key: impl std::hash::Hash,
+        paint: impl FnOnce(&Painter),
+    ) -> Vec<Self> {
+        let id = egui::Id::new(("painted word", key));
+        let layer = egui::LayerId::new(egui::Order::Foreground, id);
+        paint(&Painter::new(ctx.clone(), layer, Rect::EVERYTHING));
+        let shapes: Vec<egui::epaint::ClippedShape> =
+            ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().cloned().collect()).unwrap_or_default());
+        Self::all(ctx, &shapes)
+    }
 }
 
 #[cfg(test)]
@@ -10205,12 +10633,11 @@ ArrangeView {
     ///
     /// The printed spelling changed under this test — the quarter rung reads
     /// "1/4" rather than `\u{266a}` now — and the SPOKEN assertion below did
-    /// not, deliberately. It is the guard on `grid_spoken` having followed
-    /// the box across: point that function at the glyph spelling while the
-    /// box prints numerals, or leave its match arm on `\u{266a}`, and the
-    /// quarter rung falls through to the "of a bar" catch-all. This line
-    /// then says "1/4 of a bar" and goes red, which is the whole point of
-    /// keeping it worded as a note.
+    /// not, deliberately: the reader names the note, whatever the box draws.
+    /// It used to name it by matching the box's text, so a respelt box could
+    /// drop the quarter into an "of a bar" catch-all; it sorts the division
+    /// itself now (`note_value`), and `every_step_of_every_meter_is_said_as_a_note`
+    /// holds every step of every meter to a note's name.
     #[test]
     fn the_grid_box_can_be_stepped_both_ways() {
         let cs: Vec<ClipView<'_>> = Vec::new();
@@ -10229,10 +10656,80 @@ ArrangeView {
         assert_eq!(grid_label_text(-2, 6, 8), "1/8");
         assert!((grid_quarters(-2, 6, 8) - 0.5).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
-        assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
+        // Four steps up from the finest, -6, of the nine between it and 3.
+        assert!((t.norm - 4.0 / 9.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.
         assert!(crate::a11y::Gesture::Least.nudged(t.norm) <= 0.0);
         assert!(crate::a11y::Gesture::Most.nudged(t.norm) >= 1.0);
+    }
+
+    /// **The grid box's slider spans the steps the box takes, -6 to 3, and
+    /// every key on it lands on the step it means.**
+    ///
+    /// It declared -5 to 3 with the travel `(exp + 5) / 8`, a step short of
+    /// the settings' clamp (`arr_grid_exp` is held to -6..3 wherever it is
+    /// written) and of the ladder this box prints and says. At -6, the finest
+    /// step, the node's value was under its own minimum and its travel was
+    /// -0.125, a position a reader can only take as out of range. Every
+    /// step, then: the value inside the declared range, which is -6 to 3;
+    /// the travel inside 0..1 and rising a ninth a step; and read back
+    /// through `grid_box_step_for`, the road `apply_arrange_key` takes, Space
+    /// (the travel unmoved) stays, Home and End reach the two ends, and an
+    /// arrow, with Shift or without, moves exactly one step its own way.
+    /// `a_key_on_the_grid_box_moves_it_one_step` in `app.rs` drives the same
+    /// presses through egui's focus to the settings.
+    ///
+    /// Revert checks, performed: declare -5 to 3 again, with the travel
+    /// `(exp + 5) / 8`, and this fails on the first step it reads, -6, whose
+    /// range is not the box's; read a key back as the nearest step alone, as
+    /// the road did, and it fails on the first arrow, Up at -6, which stays
+    /// at -6.
+    #[test]
+    fn the_grid_box_slider_spans_every_step_the_box_takes() {
+        use crate::a11y::{Gesture, Kind};
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut last: Option<f32> = None;
+        for exp in GRID_BOX_FINEST..=GRID_BOX_COARSEST {
+            let mut v = a_view(&cs);
+            v.grid_exp = exp;
+            let nodes = a11y_nodes(rect(), &v);
+            let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
+            let Kind::Slider { now, min, max } = g.kind else {
+                panic!("step {exp}: the grid box is not a slider: {:?}", g.kind);
+            };
+            assert_eq!((min, max), (-6.0, 3.0), "step {exp}: the slider's range is not the box's");
+            assert!(
+                (min..=max).contains(&now) && now == f64::from(exp),
+                "step {exp}: the slider reads {now}, outside its range {min}..{max}"
+            );
+            let t = g.travel.expect("the grid box cannot be nudged");
+            assert!((0.0..=1.0).contains(&t.norm), "step {exp}: the travel is {}", t.norm);
+            if let Some(below) = last {
+                assert!(
+                    (t.norm - below - 1.0 / 9.0).abs() < 1.0e-6,
+                    "step {exp}: the travel rose {} from the step under it, not a ninth",
+                    t.norm - below
+                );
+            }
+            last = Some(t.norm);
+            let key = |g: Gesture| grid_box_step_for(exp, g.nudged(t.norm));
+            assert_eq!(key(Gesture::Activate), exp, "step {exp}: Space moved the box");
+            assert_eq!(key(Gesture::Least), GRID_BOX_FINEST, "step {exp}: Home");
+            assert_eq!(key(Gesture::Most), GRID_BOX_COARSEST, "step {exp}: End");
+            for fine in [false, true] {
+                assert_eq!(
+                    key(Gesture::Increase { fine }),
+                    (exp + 1).min(GRID_BOX_COARSEST),
+                    "step {exp}: the up arrow (fine: {fine})"
+                );
+                assert_eq!(
+                    key(Gesture::Decrease { fine }),
+                    (exp - 1).max(GRID_BOX_FINEST),
+                    "step {exp}: the down arrow (fine: {fine})"
+                );
+            }
+        }
+        assert_eq!(last, Some(1.0), "the coarsest step is not the end of the travel");
     }
 
     /// **Every theme, in both modes, measured where the paint actually
@@ -12300,7 +12797,7 @@ selected: false,
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
         // **The ladder the owner asked for, in the meter he works in.**
-        // Going finer: 1, 1/2, 1/4, 1/8, 1/16 — one 1/4 state, sitting
+        // Going finer: BAR, 1/2, 1/4, 1/8, 1/16, with one 1/4 state, sitting
         // exactly between 1/8 and 1/2, and now written the way the rungs
         // either side of it are written. The middle rung used to assert
         // `\u{266a}`; the owner asked for the fraction back because "it's
@@ -12309,7 +12806,12 @@ selected: false,
         // glyph used to stand in for is asserted on its own terms by
         // `only_one_rung_of_the_arrange_ladder_is_a_quarter`, so nothing was
         // weakened by respelling it here.
-        assert_eq!(grid_label_text(0, 4, 4), "1");
+        //
+        // The top of it asserted "1" until the bar rung was named: "1" is a
+        // whole note, which in 4/4 is the bar's length, and in 4/2 it is the
+        // rung UNDER the bar. The owner ruled the bar reads BAR in every
+        // meter, this one included (see `GRID_BAR`).
+        assert_eq!(grid_label_text(0, 4, 4), "BAR");
         assert_eq!(grid_label_text(3, 4, 4), "8");
         assert_eq!(grid_label_text(-1, 4, 4), "1/2");
         assert_eq!(grid_label_text(-2, 4, 4), "1/4");
@@ -12444,124 +12946,737 @@ selected: false,
         assert_eq!(grid_label(-1, 6, 8), "1/4\u{00b7}");
     }
 
-    /// **No rung of any signature is printed as a decimal**, and no ladder
-    /// says one of its rungs twice.
+    /// **No rung of any signature is printed as a decimal**, no ladder says
+    /// one of its rungs twice, and the bar is BAR in every one of them.
     ///
-    /// Every signature `TimeSignature::is_valid` lets in, over the whole
-    /// exponent range `grid_quarters` takes. 247 of those (signature, rung)
-    /// pairs used to fall through `note_label` into `"{q:.3}q"`: the BAR rung
-    /// of every meter whose bar is not one note or one dotted note (5/4,
-    /// 7/8, 9/8, 4/2 ...), and the halves of a big bar that land on a length
-    /// no note names (10/8's five eighths). The sweep is what catches a fix
-    /// made for 4/2 alone.
+    /// Every signature `TimeSignature::is_valid` lets in, all 192 of them,
+    /// over the whole exponent range `grid_quarters` takes, in both
+    /// spellings. 247 of those (signature, rung) pairs used to fall through
+    /// `note_label` into `"{q:.3}q"`: the BAR rung of every meter whose bar
+    /// is not one note or one dotted note (5/4, 7/8, 9/8, 4/2 ...), and the
+    /// halves of a big bar that land on a length no note names (10/8's five
+    /// eighths). The sweep is what catches a fix made for 4/2 alone.
     ///
-    /// The spellings are pinned where the owner met them. In 4/2 the box
-    /// steps from 2 bars to one bar to a whole note, so the rung "between 1
-    /// and 2" is the bar, and it now reads 4/2: the bar's own length, in
-    /// the notation every rung under it is written in.
+    /// The bar rung then read as its signature, and the owner, in 4/2, asked
+    /// "why does the option between 1 and 2 = 4/2 in grid frequency and why
+    /// is it even an option?" In 4/2 the box steps from 2 bars to one bar to
+    /// a whole note, so the rung "between 1 and 2" is the bar. He ruled it
+    /// reads BAR in every meter, 4/4 included, where it read "1" (see
+    /// `GRID_BAR`). This holds all 192 to that, holds every other rung to
+    /// NOT reading BAR, so the word means one bar and nothing else, and
+    /// holds the reader to saying "1 bar" there.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// at the first signature it sweeps, 1/1, whose bar prints "1".
     #[test]
     fn no_rung_of_any_signature_is_spelled_as_a_decimal() {
-        for beats in 1u8..=32 {
-            for unit in [1u8, 2, 4, 8, 16, 32] {
-                let mut seen: Vec<(i8, String)> = Vec::new();
-                for e in -7i8..=6 {
-                    let w = grid_label_text(e, beats, unit);
-                    assert!(
-                        !w.contains('.') && !w.contains('q'),
-                        "{beats}/{unit} at exp {e} prints {w:?}"
-                    );
-                    if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
-                        panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
-                    }
-                    seen.push((e, w));
+        let spellings: [fn(i8, u8, u8) -> String; 2] = [grid_label_text, grid_label];
+        let mut swept = 0;
+        for beats in 0u8..=64 {
+            for unit in 0u8..=64 {
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                if !sig.is_valid() {
+                    continue;
                 }
+                swept += 1;
+                for spell in spellings {
+                    let mut seen: Vec<(i8, String)> = Vec::new();
+                    for e in -7i8..=6 {
+                        let w = spell(e, beats, unit);
+                        assert!(
+                            !w.contains('.') && !w.contains('q'),
+                            "{beats}/{unit} at exp {e} prints {w:?}"
+                        );
+                        if e == 0 {
+                            assert_eq!(w, GRID_BAR, "{beats}/{unit}: the bar rung prints {w:?}");
+                        } else {
+                            assert_ne!(w, GRID_BAR, "{beats}/{unit}: exp {e} is not one bar");
+                        }
+                        if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
+                            panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
+                        }
+                        seen.push((e, w));
+                    }
+                }
+                assert_eq!(grid_spoken(0, beats, unit), "1 bar", "{beats}/{unit}, said aloud");
             }
         }
-        // The owner's meter, coarse to fine over the arrange box's range.
+        assert_eq!(swept, 192, "the sweep no longer covers every valid signature");
+        // The owner's meter, coarse to fine over the arrange box's range: the
+        // rung he asked about is BAR, and the 1 under it is the whole note it
+        // always was.
         let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 2)).collect();
-        assert_eq!(ladder, ["8", "4", "2", "4/2", "1", "1/2", "1/4", "1/8", "1/16", "1/32"]);
-        // Three of the eight in `TIME_SIGNATURES`, at their bar rung.
-        assert_eq!(grid_label_text(0, 5, 4), "5/4");
-        assert_eq!(grid_label_text(0, 7, 8), "7/8");
-        assert_eq!(grid_label_text(0, 9, 8), "9/8");
-        // A rung under the bar that no note names is counted the same way,
-        // and a reader hears it as notes, not as a fraction of the bar: in
-        // 10/8 five eighths are HALF the bar, so "5/8 of a bar" would be a
-        // wrong number read aloud.
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1", "1/2", "1/4", "1/8", "1/16", "1/32"]);
+        // And 4/4's, whose bar read "1", the whole note's name.
+        let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 4)).collect();
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64"]);
+        // A rung UNDER the bar that no note names is still counted in the
+        // meter's beats, and a reader hears it as notes, not as a fraction of
+        // the bar: in 10/8 five eighths are HALF the bar, so "5/8 of a bar"
+        // would be a wrong number read aloud.
         assert_eq!(grid_label_text(-1, 10, 8), "5/8");
         assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
         assert_eq!(grid_spoken(0, 4, 2), "1 bar");
     }
 
-    /// **An odd bar is painted as its own time signature, no wider than the
-    /// rungs beside it.**
+    /// **The bar rung is painted BAR in every meter: as narrow as the
+    /// three-character rungs, and inside its box, in every bundled face.**
     ///
-    /// The owner: "there's a '0 frequency on the grid frequency in arrange
-    /// mode reads as quite a lot of 0.000000s", and of where: "it's an option
-    /// between 1 and 2". His settings carried 4/2 with the grid on its 0
-    /// rung, one bar, which in 4/2 sits between 2 (bars) and 1 (a whole
-    /// note, half that bar). It painted "8.000q": six characters in a box
-    /// drawn for three, so the 8 spilled onto the tempo-lane switch, the
-    /// navigator (painted after it) covered the q, and what read was a run of
-    /// zeros. 5/4, 7/8 and 9/8 did the same at the same rung, as "5.000q",
-    /// "3.500q" and "4.500q".
+    /// The owner met this rung twice. First as "8.000q" in 4/2: "there's a
+    /// '0 frequency on the grid frequency in arrange mode reads as quite a
+    /// lot of 0.000000s", six characters in a box drawn for three, so the 8
+    /// spilled onto the tempo-lane switch and the navigator (painted after
+    /// it) covered the q. Then, once that was counted as the signature, as
+    /// "4/2": "why does the option between 1 and 2 = 4/2 in grid frequency
+    /// and why is it even an option?" It reads BAR now in every meter (see
+    /// `GRID_BAR`), and this reads it off the real frame, for the reason the
+    /// quarter's test above gives: the picture is what was wrong.
     ///
-    /// Read off the real frame, for the reason the quarter's test above gives:
-    /// the picture is what was wrong. The width bound is the 1/16 rung, the
-    /// widest the 4/4 ladder already prints at this size.
+    /// The width is held to two things on the same frame: the 1/2 rung, the
+    /// three-character label the box was drawn for, and the box itself,
+    /// which the label has to be laid out inside. It used to be held to the
+    /// 1/16 rung, the widest the 4/4 ladder prints, but at the box's eleven
+    /// points that one is wider than the box (25.6 points of its 20 in
+    /// Courier Prime and JetBrains Mono, 21.5 in Terminess), so the bound let
+    /// a label spill and pass. (It is drawn smaller now, to fit: see
+    /// `every_arrange_grid_step_is_painted_inside_its_box`.) In
+    /// every bundled face, since the box draws in whichever one the settings
+    /// chose and they are not one width: three characters at the box's
+    /// eleven points are 19.6 in Courier Prime and JetBrains Mono and 16.5
+    /// in Terminess. What is held is the laid-out width, not the glyphs'
+    /// quads, which round out to whole pixels and overhang their advance by
+    /// up to a pixel on every rung, 1/4 included.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// on 4/4 painting "1".
     #[test]
-    fn an_odd_bar_is_painted_as_its_own_time_signature() {
-        let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
-        crate::fonts::apply_text_styles(&ctx);
+    fn the_bar_rung_is_painted_bar_in_every_meter() {
         let r = rect();
-        let printed = |exp: i8, beats: u8, unit: u8| -> Vec<(String, f32)> {
-            let cs: Vec<ClipView<'_>> = Vec::new();
-            let mut v = a_view(&cs);
-            v.grid_exp = exp;
-            v.meter =
-                crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
-            let cell = Layout::new(r, &v).tool_grid;
-            let out = ctx.run(
-                egui::RawInput { screen_rect: Some(r), ..Default::default() },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.set_clip_rect(r);
-                        draw(ui.painter(), r, &v);
-                    });
-                },
-            );
-            out.shapes
-                .iter()
-                .filter_map(|s| match &s.shape {
-                    egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => {
-                        Some((t.galley.text().to_owned(), t.galley.size().x))
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let sixteenth = printed(-4, 4, 4);
-        let widest = sixteenth
-            .iter()
-            .find(|(t, _)| t == "1/16")
-            .map(|(_, w)| *w)
-            .unwrap_or_else(|| panic!("the 4/4 box stopped printing 1/16: {sixteenth:?}"));
-        let odd = [(4u8, 2u8, "4/2"), (5, 4, "5/4"), (7, 8, "7/8"), (9, 8, "9/8")];
-        for (beats, unit, want) in odd {
-            let got = printed(0, beats, unit);
-            assert!(
-                !got.iter().any(|(t, _)| t.contains('.') || t.contains('q')),
-                "{beats}/{unit}: the gridbox still paints a decimal: {got:?}"
-            );
-            let Some((_, w)) = got.iter().find(|(t, _)| t == want) else {
-                panic!("{beats}/{unit}: the bar rung painted {got:?}, not {want:?}");
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            crate::fonts::apply_text_styles(&ctx);
+            // What the box paints at `exp` in `beats/unit`: the box, and each
+            // text that lands on it, with where it was laid out.
+            let printed = |exp: i8, beats: u8, unit: u8| -> (Rect, Vec<(String, Rect)>) {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                v.meter = crate::tempo::MeterMap::constant(sig);
+                let cell = Layout::new(r, &v).tool_grid;
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => Some((
+                            t.galley.text().to_owned(),
+                            Rect::from_min_size(t.pos, t.galley.size()),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                (cell, texts)
             };
-            assert!(
-                *w <= widest + 0.01,
-                "{beats}/{unit}: {want:?} is {w}pt wide, wider than the 1/16 rung's {widest}pt"
-            );
+            // The three-character rung the box was drawn for, painted in it.
+            let (_, half) = printed(-1, 4, 4);
+            let three = half
+                .iter()
+                .find(|(t, _)| t == "1/2")
+                .map(|(_, laid)| laid.width())
+                .unwrap_or_else(|| panic!("{face:?}: the 4/4 box stopped printing 1/2: {half:?}"));
+            // The stock meters, whose bar read as a note value (4/4 "1", 3/4
+            // and 6/8 "1/2·", 2/4 "1/2", 12/8 "1·"), and odd ones, whose bar
+            // read as their own signature.
+            let meters = [
+                (4u8, 4u8),
+                (3, 4),
+                (6, 8),
+                (2, 4),
+                (12, 8),
+                (4, 2),
+                (5, 4),
+                (7, 8),
+                (9, 8),
+                (10, 8),
+            ];
+            for (beats, unit) in meters {
+                let (cell, got) = printed(0, beats, unit);
+                let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+                assert_eq!(names, [GRID_BAR], "{face:?} {beats}/{unit}: the bar painted {names:?}");
+                let laid = got[0].1;
+                assert!(
+                    laid.width() <= three + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is {}pt wide, the 1/2 rung {three}pt",
+                    laid.width()
+                );
+                assert!(
+                    laid.left() >= cell.left() - 0.01 && laid.right() <= cell.right() + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is laid out at {laid:?}, outside its box {cell:?}"
+                );
+            }
         }
+    }
+
+    /// **Every step of every arrange ladder is painted inside its box: as it
+    /// always was when it fits, shrunk to the box when it does not, never
+    /// under the floor, and clipped to the box whatever happens.**
+    ///
+    /// The box is drawn for three characters and the ladder prints up to
+    /// six. At the box's eleven points 1/16 is 25.6 points wide in Courier
+    /// Prime and JetBrains Mono and 21.5 in Terminess, in a box of 20, and
+    /// every step of four characters or more spilled out of it; from five
+    /// on (1/128 is 32.6 points) it reached the tempo lane's switch on the
+    /// left and ran under the navigator on the right, the overflow behind
+    /// the owner's "0.000000".
+    ///
+    /// The twenty-point box, the one an arrangement of 383 points or more
+    /// draws; `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+    /// sweeps the smaller ones a shorter arrangement draws, and names what
+    /// they cut. Swept over every word the box can print: all 192
+    /// signatures, every step the box reaches (-6 to 3, the settings'
+    /// clamp), in both spellings. Each is painted by `grid_box_word`, the
+    /// call `draw` makes (`the_arrange_gridbox_paints_its_step_through_the_fit`
+    /// holds `draw` to it), into the real box, in every bundled face and at
+    /// 100% to 200% display scale, and read back as the tessellator draws
+    /// it. Held:
+    ///
+    /// - a word that is laid out inside the box at eleven points is painted
+    ///   at exactly eleven: BAR and 1/2 are, by name, in every face;
+    /// - a word that is not is painted smaller, never under `WORD_FLOOR`,
+    ///   and laid out no wider than the box less `WORD_AIR` either side;
+    /// - every pixel of a word that fits is inside the box, so the clip cuts
+    ///   nothing from it (the pixel snap moves it in when it would);
+    /// - every word is clipped to the box, so nothing is ever painted on a
+    ///   neighbour.
+    ///
+    /// Two words do not fit above the floor, and only in two faces: 1/1024
+    /// and 1/2048 in Courier Prime and JetBrains Mono need 5.5 points or
+    /// less (at 6.5 they are 22.9 to 23.4 points wide). They are pinned here
+    /// by name, so a third cannot join them unnoticed, and so are the 19
+    /// (signature, step) pairs that print them: the signatures 1/16 and 2/32
+    /// at the box's finest step, 1/32 at its two finest, and 3/32, 5/32 and
+    /// every odd count of 32nds up to 31/32 at its finest. They are painted
+    /// at the floor and cut at the box's edges.
+    ///
+    /// Revert checks, all performed: paint at the box's own size again and
+    /// this fails on the first word it sweeps, 1/64 (the finest step of
+    /// 1/1), left at eleven points where it does not fit; take the clip away
+    /// and it fails on that same word, whose clip is then the whole screen;
+    /// take the pixel snap away and it fails on 1/128 in JetBrains Mono at
+    /// 100%, a column of whose ink lands past the box's right edge (BAR in
+    /// Courier Prime at 150% does the same).
+    #[test]
+    fn every_arrange_grid_step_is_painted_inside_its_box() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let mut words: Vec<String> = Vec::new();
+        let mut cut_pairs: std::collections::BTreeSet<(u8, u8, i8)> = Default::default();
+        for &(beats, unit) in &sigs {
+            for e in -6i8..=3 {
+                for spell in [grid_label_text as fn(i8, u8, u8) -> String, grid_label] {
+                    let w = spell(e, beats, unit);
+                    if w == "1/1024" || w == "1/2048" {
+                        cut_pairs.insert((beats, unit, e));
+                    }
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let cell = Layout::new(rect(), &a_view(&cs)).tool_grid;
+        assert!(
+            (cell.width() - 20.0).abs() < 1.0e-3,
+            "the box is not at its full twenty points here: {cell:?}"
+        );
+        // The size the twenty-point box prints at, and has always printed at.
+        let ceiling = 11.0;
+        assert_eq!(grid_box_type(cell), ceiling);
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let mut cut: Vec<&str> = Vec::new();
+                for (k, w) in words.iter().enumerate() {
+                    let at = format!("{face:?} at {ppp}x, {w:?}");
+                    let painted = PaintedWord::painted_by(&ctx, ("arrange", k), |p| {
+                        grid_box_word(p, cell, w, Color32::WHITE);
+                    });
+                    let [word] = painted.as_slice() else {
+                        panic!("{at}: painted {painted:?}, not one word");
+                    };
+                    assert_eq!(&word.text, w, "{at}");
+                    assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                    assert!(
+                        cell.contains_rect(word.clip),
+                        "{at}: clipped to {:?}, not to its box {cell:?}",
+                        word.clip
+                    );
+                    let wide = measure
+                        .layout_no_wrap(w.clone(), FontId::new(ceiling, crate::fonts::courier_bold()), Color32::WHITE)
+                        .rect
+                        .width();
+                    if wide <= cell.width() {
+                        assert_eq!(
+                            word.size, ceiling,
+                            "{at}: fits the box at {ceiling} points ({wide} wide) and was painted at {}",
+                            word.size
+                        );
+                    } else if word.laid.width() > cell.width() - 2.0 * WORD_AIR + 1.0e-3 {
+                        // Too wide even at the floor: the clip holds it.
+                        assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                        cut.push(w.as_str());
+                        continue;
+                    } else {
+                        // Shrunk, with the air either side. Held on its
+                        // width: where it lands is the ink's business, below,
+                        // since the pixel snap may move it by a pixel.
+                        assert!(word.size < ceiling, "{at}: {wide} wide at {ceiling} and not shrunk");
+                        assert!(
+                            word.laid.width() <= cell.width() - 2.0 * WORD_AIR + 1.0e-3,
+                            "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} either side in {}",
+                            word.size,
+                            word.laid.width(),
+                            cell.width()
+                        );
+                    }
+                    assert!(
+                        word.ink.left() >= cell.left() - 1.0e-3
+                            && word.ink.right() <= cell.right() + 1.0e-3
+                            && word.ink.top() >= cell.top() - 1.0e-3
+                            && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                        "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                        word.size,
+                        word.ink
+                    );
+                    if w == GRID_BAR || w == "1/2" {
+                        assert_eq!(word.size, ceiling, "{at}: the box was drawn for this one");
+                    }
+                }
+                let want: &[&str] = match face {
+                    crate::fonts::FontChoice::Terminess => &[],
+                    _ => &["1/1024", "1/2048"],
+                };
+                cut.sort_unstable();
+                assert_eq!(cut, want, "{face:?} at {ppp}x: the words that do not fit above the floor");
+            }
+        }
+        assert_eq!(cut_pairs.len(), 19, "the steps that print 1/1024 and 1/2048: {cut_pairs:?}");
+    }
+
+    /// **The arrange gridbox paints its step through the fit**, read off the
+    /// real frame: the same word, the same size and the same place that
+    /// `grid_box_word` gives it, clipped to the box. The sweeps above and
+    /// below hold `grid_box_word` to every word in every box; this holds
+    /// `draw` to `grid_box_word`, at steps three to six characters wide, in
+    /// every bundled face, in the twenty-point box and in the thirteen-point
+    /// one a 260-point arrangement draws.
+    ///
+    /// Revert check, performed: hand the box back to `painter.text` at its
+    /// own size and this fails on its first step, BAR, which is no longer
+    /// clipped to its box.
+    #[test]
+    fn the_arrange_gridbox_paints_its_step_through_the_fit() {
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 260.0));
+        let steps = [
+            (4u8, 4u8, 0i8, GRID_BAR),
+            (4, 4, -1, "1/2"),
+            (4, 4, -4, "1/16"),
+            (6, 8, -1, "1/4\u{00b7}"),
+            (3, 4, -6, "1/128"),
+            (22, 16, -1, "11/16"),
+            (1, 16, -6, "1/1024"),
+        ];
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = context_at(face, 1.0);
+            // The word alone is painted on a context of its own: a shape
+            // painted between frames is handed out with the next frame's,
+            // and the next frame is the real one.
+            let apart = context_at(face, 1.0);
+            for (k, (r, (beats, unit, exp, want))) in [rect(), short]
+                .into_iter()
+                .flat_map(|r| steps.into_iter().map(move |s| (r, s)))
+                .enumerate()
+            {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                v.meter = crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
+                let cell = Layout::new(r, &v).tool_grid;
+                if r == short {
+                    assert!(
+                        (cell.width() - 12.95).abs() < 0.01,
+                        "a 260-point arrangement no longer draws a 12.95-point box: {cell:?}"
+                    );
+                }
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let on_box: Vec<PaintedWord> = PaintedWord::all(&ctx, &out.shapes)
+                    .into_iter()
+                    .filter(|w| cell.intersects(w.laid))
+                    .collect();
+                let at = format!("{face:?} {beats}/{unit} step {exp} in a {}-point box", cell.width());
+                let [drawn] = on_box.as_slice() else {
+                    panic!("{at}: the box painted {on_box:?}");
+                };
+                let alone = PaintedWord::painted_by(&apart, ("arrange draw", k), |p| {
+                    grid_box_word(p, cell, want, Color32::WHITE);
+                });
+                let [alone] = alone.as_slice() else {
+                    panic!("{at}: grid_box_word painted {alone:?}");
+                };
+                assert_eq!(drawn.text, want, "{at}");
+                assert_eq!(drawn.size, alone.size, "{at}: {want} is not painted at its fitted size");
+                assert_eq!(drawn.laid, alone.laid, "{at}: {want} is not where the fit puts it");
+                assert_eq!(drawn.clip, cell, "{at}: {want} is not clipped to its box");
+            }
+        }
+    }
+
+    /// **Every size the arrange gridbox is drawn at, not only its largest: a
+    /// step either fits the box it is in, or it is named here as cut.**
+    ///
+    /// The box is twenty points square only while the arrangement is at
+    /// least 383 points tall. It is half the corner the ruler leaves, the
+    /// ruler is 0.115 of the arrangement held to 18..52 points, and the
+    /// corner is the ruler less four; so under 383 the box shrinks with the
+    /// arrangement, to seven points under 157. Short arrangements are no
+    /// corner case: the window's floor is 320 tall and the band takes 81 of
+    /// it, and the window keeps the shape of the bands showing, so a window
+    /// with few bands is short at any width (the band and the piano alone
+    /// are 340 tall at 1300 wide, which leaves the arrangement 150).
+    /// `every_arrange_grid_step_is_painted_inside_its_box` sweeps the
+    /// twenty-point box alone, at more scales; this sweeps every box.
+    ///
+    /// Driven through `Layout::new` at every whole point of height from 100
+    /// to 420, at the window's narrowest, 1300 and 2560 wide, with the header
+    /// at both ends of the seam and on its own share. The header never
+    /// decides the box (the corner is at least 144 wide, room for boxes of
+    /// 24), which is asserted, so the box is a function of the height. Every
+    /// box that gives, every word the box prints (192 signatures, steps -6
+    /// to 3, in its numerals), every bundled face, at 100% to 200%, painted
+    /// by `grid_box_word` and read off the tessellated paint. A word fits a
+    /// box when it is laid out inside it and its ink, which lands on whole
+    /// pixels, is no more pixels wide or tall than the box holds whole ones;
+    /// that is worked out here from the glyphs, not asked of the code. Held
+    /// for every word in every box: one that fits at the box's own size keeps
+    /// that size; one that fits smaller is shrunk until it is laid out no
+    /// wider than the box less `WORD_AIR` a side, never under `WORD_FLOOR`,
+    /// with every pixel of its ink inside the box; one that does not fit even
+    /// at the floor is painted at the floor and cut at the box's edges; and
+    /// every word is clipped to its box.
+    ///
+    /// **Which are cut is the report the owner asked for**: a step that
+    /// cannot fit above the floor is to be said, not smudged. The faces are
+    /// monospaced, so it is a table of lengths, pinned at the foot: the
+    /// arrangement height from which a step of so many characters is never
+    /// cut, at any of the five scales. Under it, it is cut at some heights
+    /// and not at others, as the box's edges fall on or between pixels: BAR
+    /// in Courier Prime at 100% is 10.9 points by its advances at the floor
+    /// and twelve whole pixels of ink, and the 12.72-point box of a
+    /// 256-point arrangement, its edges between pixels, holds eleven.
+    ///
+    /// | characters, e.g.        | Courier Prime | JetBrains Mono | Terminess |
+    /// |-------------------------|---------------|----------------|-----------|
+    /// | 1: 1, 2, 8              | never cut     | never cut      | never cut |
+    /// | 2: 1· (a dotted whole)  | from 181      | from 181       | from 159  |
+    /// | 3: BAR, 1/2, 5/8        | from 257      | from 257       | from 222  |
+    /// | 4: 1/16, 1/4·, 10/8     | from 327      | from 327       | from 276  |
+    /// | 5: 1/128, 11/16         | from 381      | from 383       | from 327  |
+    /// | 6: 1/1024, 1/2048       | cut at every height | cut at every height | from 383 |
+    ///
+    /// Revert checks, performed: fit by the advances alone, as the fit did,
+    /// and this fails on 1/8 in Courier Prime at 100% in the 12.72-point box
+    /// of a 256-point arrangement, painted at 7 points where no whole-pixel
+    /// position holds its ink; give every word the box's own size and it
+    /// fails on the first word it sweeps, 1/64 in the seven-point box, left
+    /// at 8 points; take the clip away and it fails on that same word, its
+    /// clip the whole screen; hold the ink inside across and not down, and it
+    /// fails on 2 in JetBrains Mono at 100% in the seven-point box, its ink
+    /// half a pixel under the box; lower `WORD_FLOOR` to 6 and the table
+    /// fails, every length fitting lower.
+    #[test]
+    fn every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut() {
+        use std::collections::BTreeMap;
+        // ── every box the layout draws, by the heights that draw it ──────
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        // (box, the lowest and highest height that draw it)
+        let mut boxes: Vec<(Rect, u32, u32)> = Vec::new();
+        for h in 100u32..=420 {
+            let mut cell: Option<Rect> = None;
+            for w in [crate::settings::MIN_WINDOW.x, 1300.0, 2560.0] {
+                for header_w in [Some(header_floor), None, Some(w * 0.5)] {
+                    let mut v = a_view(&cs);
+                    v.header_w = header_w;
+                    let c = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h as f32)), &v).tool_grid;
+                    assert!(
+                        (c.width() - c.height()).abs() < 1.0e-3,
+                        "{w}x{h}: the box is not square: {c:?}"
+                    );
+                    match cell {
+                        None => cell = Some(c),
+                        Some(was) => assert!(
+                            (was.width() - c.width()).abs() < 1.0e-3,
+                            "{w}x{h} with header {header_w:?}: the header changed the box, {was:?} to {c:?}"
+                        ),
+                    }
+                }
+            }
+            let cell = cell.expect("a box");
+            match boxes.last_mut() {
+                Some((b, _, hi)) if (b.width() - cell.width()).abs() < 1.0e-3 => *hi = h,
+                _ => boxes.push((cell, h, h)),
+            }
+        }
+        let side = |b: &Rect| b.width();
+        assert!((side(&boxes[0].0) - 7.0).abs() < 1.0e-3, "the smallest box is {:?}", boxes[0]);
+        assert_eq!((boxes[0].1, boxes[0].2), (100, 156), "the box no longer stays at seven points up to 156");
+        let full = boxes.last().expect("boxes");
+        assert!((side(&full.0) - 20.0).abs() < 1.0e-3, "the largest box is {full:?}");
+        assert_eq!((full.1, full.2), (383, 420), "the box is no longer whole from 383 points");
+        // ── every word the box prints ─────────────────────────────────────
+        // In its own spelling, numerals the whole way down: the glyph
+        // spelling's quarter is the MIDI editor's chip's, which is one size
+        // and swept there (`midi_editor`'s `every_grid_word_is_painted_inside_its_chip`).
+        // In the seven-point box ♪, which comes off the fallback face, is
+        // taller than the box, so this sweep would be holding the box to a
+        // word it never prints.
+        let mut words: Vec<String> = Vec::new();
+        for &(beats, unit) in &valid_signatures() {
+            for e in -6i8..=3 {
+                let w = grid_label_text(e, beats, unit);
+                if !words.contains(&w) {
+                    words.push(w);
+                }
+            }
+        }
+        // ── the sweep ─────────────────────────────────────────────────────
+        // (face, characters) -> the tallest arrangement that cut one.
+        let mut tallest_cut: BTreeMap<(String, usize), u32> = BTreeMap::new();
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                // Whether `w` at `size` fits `cell` with `width` for its
+                // advances: laid out no wider, and its ink, which lands on
+                // whole pixels, no more pixels wide or tall than the box
+                // holds whole ones.
+                let fits = |w: &str, size: f32, cell: Rect, width: f32| {
+                    let g = measure.layout_no_wrap(
+                        w.to_owned(),
+                        FontId::new(size, crate::fonts::courier_bold()),
+                        Color32::WHITE,
+                    );
+                    let whole = |a: f32, b: f32| ((b * ppp + 1.0e-3).floor() - (a * ppp - 1.0e-3).ceil()) / ppp;
+                    g.rect.width() <= width
+                        && g.mesh_bounds.width() <= whole(cell.left(), cell.right()) + 1.0e-3
+                        && g.mesh_bounds.height() <= whole(cell.top(), cell.bottom()) + 1.0e-3
+                };
+                for (b, &(cell, lo, hi)) in boxes.iter().enumerate() {
+                    let ceiling = grid_box_type(cell);
+                    let room = cell.width() - 2.0 * WORD_AIR;
+                    let painted: Vec<PaintedWord> = words
+                        .iter()
+                        .enumerate()
+                        .map(|(k, w)| {
+                            let p = PaintedWord::painted_by(&ctx, ("box sizes", b, k), |p| {
+                                grid_box_word(p, cell, w, Color32::WHITE);
+                            });
+                            let [one] = p.as_slice() else {
+                                panic!("{face:?} at {ppp}x, {w:?} in {cell:?}: painted {p:?}");
+                            };
+                            one.clone()
+                        })
+                        .collect();
+                    for (w, word) in words.iter().zip(&painted) {
+                        let at = format!(
+                            "{face:?} at {ppp}x, {w:?} in the {:.2}-point box of a {lo}..{hi}-point arrangement",
+                            cell.width()
+                        );
+                        assert_eq!(&word.text, w, "{at}");
+                        assert_eq!(word.clip, cell, "{at}: not clipped to its box");
+                        assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                        if fits(w, ceiling, cell, cell.width()) {
+                            assert_eq!(word.size, ceiling, "{at}: fits at {ceiling} and was painted at {}", word.size);
+                        } else if !fits(w, WORD_FLOOR, cell, room) {
+                            // Cut: at the floor, and the clip holds it.
+                            assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                            let n = w.chars().count();
+                            let tallest = tallest_cut.entry((format!("{face:?}"), n)).or_insert(0);
+                            *tallest = (*tallest).max(hi);
+                            continue;
+                        } else {
+                            assert!(word.size < ceiling, "{at}: does not fit at {ceiling} and was not shrunk");
+                            assert!(
+                                word.laid.width() <= room + 1.0e-3,
+                                "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} a side",
+                                word.size,
+                                word.laid.width()
+                            );
+                        }
+                        assert!(
+                            word.ink.left() >= cell.left() - 1.0e-3
+                                && word.ink.right() <= cell.right() + 1.0e-3
+                                && word.ink.top() >= cell.top() - 1.0e-3
+                                && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                            "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                            word.size,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
+        // ── the report ────────────────────────────────────────────────────
+        // The arrangement height from which a step of n characters is never
+        // cut, `Some(h)`, or `None` where it never is at all.
+        let report = |face: &str| -> Vec<(usize, Option<u32>)> {
+            (1..=6).map(|n| (n, tallest_cut.get(&(face.to_owned(), n)).map(|h| h + 1))).collect()
+        };
+        let got: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| (format!("{face:?}"), report(&format!("{face:?}"))))
+            .collect();
+        let want: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| {
+                // 421: cut at every height swept, the full box's included.
+                let heights = match face {
+                    crate::fonts::FontChoice::Courier => {
+                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(381)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::JetBrains => {
+                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(383)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::Terminess => {
+                        vec![(1, None), (2, Some(159)), (3, Some(222)), (4, Some(276)), (5, Some(327)), (6, Some(383))]
+                    }
+                };
+                (format!("{face:?}"), heights)
+            })
+            .collect();
+        assert_eq!(got, want, "the arrangement heights from which steps of 1 to 6 characters are never cut");
+    }
+
+    /// **Every step of every meter is said as a note**, the way a player
+    /// would say it, and no ladder says one twice.
+    ///
+    /// The box prints shorthand because it is the width of a thumb; the
+    /// screen reader is the one place the step is said in full, and it used
+    /// to fall through to "{label} of a bar" for 428 (signature, step) pairs:
+    /// in 4/2 the whole note under the bar was "1 of a bar" right after the
+    /// bar's own "1 bar", 12/8's dotted half was "1/2· of a bar", and the
+    /// finest steps were "1/128 of a bar" and finer, none of them a fraction
+    /// of a bar at all. Every valid signature, every step `grid_quarters`
+    /// takes (-7 to 6). Held:
+    ///
+    /// - nothing says "of a bar", a dot or a slash: no fraction is read out;
+    /// - above the bar it counts bars ("2 bars"), the bar is "1 bar", and
+    ///   every step under it is a note: "eighth note", "dotted quarter
+    ///   note", "5 eighth notes";
+    /// - it names what the box prints, so the two cannot disagree: a box's
+    ///   1/d is the 1/d note, its dot is "dotted", its n/u is n notes of
+    ///   1/u;
+    /// - no ladder says one of its steps twice.
+    ///
+    /// Revert check, performed: put back the reader that matched the box's
+    /// text against a table, and this fails on the first signature it
+    /// sweeps, 1/1, whose finest step it said as "1/128 of a bar".
+    #[test]
+    fn every_step_of_every_meter_is_said_as_a_note() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let fractions = ['/', '\u{00b7}', '\u{2044}', '\u{2215}', '\u{00bc}', '\u{00bd}', '\u{00be}'];
+        for &(beats, unit) in &sigs {
+            let mut said: Vec<(i8, String)> = Vec::new();
+            for e in -7i8..=6 {
+                let s = grid_spoken(e, beats, unit);
+                let at = format!("{beats}/{unit} at step {e}");
+                assert!(!s.contains("of a bar"), "{at} is said {s:?}");
+                assert!(
+                    !s.chars().any(|c| fractions.contains(&c) || ('\u{2150}'..='\u{215f}').contains(&c)),
+                    "{at} is said with a fraction: {s:?}"
+                );
+                if e > 0 {
+                    assert_eq!(s, format!("{} bars", 1u32 << e), "{at}");
+                } else if e == 0 {
+                    assert_eq!(s, "1 bar", "{at}");
+                } else {
+                    // What the box prints, said: 1 and 1/d are one note,
+                    // a dot makes it dotted, and n/u counts n notes of 1/u.
+                    let label = grid_label_text(e, beats, unit);
+                    let (body, dotted) = match label.strip_suffix('\u{00b7}') {
+                        Some(body) => (body, true),
+                        None => (label.as_str(), false),
+                    };
+                    let (n, d) = match body.split_once('/') {
+                        Some((n, d)) => (
+                            n.parse::<u64>().expect("a count"),
+                            d.parse::<u64>().expect("a note value"),
+                        ),
+                        None => (1, body.parse::<u64>().expect("a whole note")),
+                    };
+                    let word = note_word(d).unwrap_or_else(|| panic!("{at}: no name for a 1/{d} note"));
+                    let want = match (n, dotted) {
+                        (1, false) => format!("{word} note"),
+                        (1, true) => format!("dotted {word} note"),
+                        (n, false) => format!("{n} {word} notes"),
+                        (_, true) => panic!("{at}: the box prints a dotted count, {label:?}"),
+                    };
+                    assert_eq!(s, want, "{at}, which the box prints {label:?}");
+                }
+                if let Some((prev, _)) = said.iter().find(|(_, w)| *w == s) {
+                    panic!("{beats}/{unit}: steps {prev} and {e} are both said {s:?}");
+                }
+                said.push((e, s));
+            }
+        }
+        // Where the owner and the sweep met them.
+        let ladder: Vec<String> = (-7i8..=3).rev().map(|e| grid_spoken(e, 4, 2)).collect();
+        assert_eq!(
+            ladder,
+            [
+                "8 bars",
+                "4 bars",
+                "2 bars",
+                "1 bar",
+                "whole note",
+                "half note",
+                "quarter note",
+                "eighth note",
+                "sixteenth note",
+                "thirty-second note",
+                "sixty-fourth note",
+            ]
+        );
+        assert_eq!(grid_spoken(-1, 12, 8), "dotted half note");
+        assert_eq!(grid_spoken(-1, 6, 8), "dotted quarter note");
+        assert_eq!(grid_spoken(-7, 4, 4), "hundred twenty-eighth note");
+        assert_eq!(grid_spoken(-7, 3, 4), "two hundred fifty-sixth note");
+        assert_eq!(grid_spoken(-7, 1, 32), "four thousand ninety-sixth note");
+        assert_eq!(grid_spoken(-1, 12, 4), "dotted whole note");
+        assert_eq!(grid_spoken(-1, 6, 32), "dotted sixteenth note");
+        assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
+        assert_eq!(grid_spoken(-1, 4, 1), "2 whole notes");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window
