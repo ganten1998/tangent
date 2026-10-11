@@ -214,6 +214,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A stems export shows every stem's wave, and nothing sits on them.** The
+  export window drew one wave whatever the pass wrote; a stems export now
+  draws a row per stem, named for its track and in desk order, each filling
+  in as it renders (with the master's row first when the pass writes one).
+  When there are more than fit, the rows keep a readable height and the list
+  scrolls with the wheel or a drag. The "Writing files" notice that ends a
+  render used to be painted in the middle of the wave; it is now said on the
+  window's top line, clear of every wave. A single-file export looks as it
+  did.
 - **The band's clip lamp no longer lights on a limited master.** With the
   master limiter in circuit at -1 dB, driving into it lit the lamp even
   though nothing left above -1 dBFS, because the lamp also latched on the
