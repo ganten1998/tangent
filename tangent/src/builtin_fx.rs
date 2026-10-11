@@ -89,6 +89,13 @@ pub const SAMPLER_PATH: &str = "@tangent-sampler";
 /// [`crate::units::bitcrush`]. Same naming law as every sentinel above.
 pub const BITCRUSH_PATH: &str = "@tangent-bitcrush";
 
+/// **Tangent Insert**: the bay whose effect is outboard gear, reached
+/// through the interface Tangent is playing on. Its knobs are the two trims,
+/// the mix and the polarity; its jacks and its measured loop are extra state
+/// (`units::hwinsert::EXTRA_SYMBOLS`), because a device channel is not a
+/// number anybody should automate. See `units::hwinsert` for the road.
+pub const HWINSERT_PATH: &str = "@tangent-insert";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -405,6 +412,16 @@ const BITCRUSH_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 5, symbol: "dither", name: "Dither", units: "", default: 0.0, steps: 2 },
 ];
 
+/// The insert's four knobs. Both trims centre on unity over the kernel's
+/// `GAIN_DB`; the mix opens fully wet, because an insert you patched a box
+/// into is one you want to hear the box through.
+const HWINSERT_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "send", name: "Send", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 1, symbol: "return", name: "Return", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+    ParamSpec { id: 3, symbol: "invert", name: "Return Polarity", units: "", default: 0.0, steps: 2 },
+];
+
 fn build_trim(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Trim(Trim::new(sample_rate))
 }
@@ -463,6 +480,10 @@ fn build_ir(sample_rate: f32) -> BuiltinUnit {
 
 fn build_bitcrush(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Bitcrush(BitcrushUnit::new(sample_rate))
+}
+
+fn build_hwinsert(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::HwInsert(crate::units::hwinsert::HwInsert::new(sample_rate))
 }
 
 /// How many parameters the analog publishes: the kernel's own table.
@@ -692,6 +713,15 @@ pub const UNITS: &[UnitSpec] = &[
         build: build_bitcrush,
         voice: false,
     },
+    // The hardware loop. An effect like the rest of the shelf: the bay's
+    // signal goes in and comes back transformed, by a box this time.
+    UnitSpec {
+        path: HWINSERT_PATH,
+        class: "Tangent Insert",
+        params: HWINSERT_FACE_PARAMS,
+        build: build_hwinsert,
+        voice: false,
+    },
     // The one voice. Its class is the preset folder's name, so it stays
     // the plain words even if the picker one day wears a suffix.
     UnitSpec {
@@ -910,6 +940,8 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
                 _ => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
             }
         }
+        (HWINSERT_PATH, 0 | 1) => fmt_db(lerp(crate::units::hwinsert::GAIN_DB)),
+        (HWINSERT_PATH, 3) => (if v >= 0.5 { "inverted" } else { "normal" }).to_owned(),
         // **The three tape dials that have an honest number.** Their
         // `ParamSpec`s promise dB, Hz and dB, and the automation lane prints
         // that promise beside the curve; the face used to fall through to
@@ -1068,6 +1100,7 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // One diode against one, or against two — what the toggle does to
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
+        (HWINSERT_PATH, 3) => vec!["normal".to_owned(), "inverted".to_owned()],
         (ANALOG_PATH, id) => analog_choices(id),
         (SAMPLER_PATH, id) => sampler_choices(id),
         _ => Vec::new(),
@@ -1306,6 +1339,10 @@ pub fn is_extra_symbol(path: &str, symbol: &str) -> bool {
         // down as well as derived, because a library may rename a file and
         // the words the face printed are what somebody chose the preset by.
         SAMPLER_PATH => matches!(symbol, "sample_path" | "sample_name" | "root_key"),
+        // **The insert's jacks and its measured loop**: which device
+        // channels it sends and returns on, and what a ping found (with the
+        // rate and buffers it found it at). See `units::hwinsert::state_lines`.
+        HWINSERT_PATH => crate::units::hwinsert::EXTRA_SYMBOLS.contains(&symbol),
         _ => false,
     }
 }
@@ -1438,6 +1475,8 @@ pub enum BuiltinUnit {
     /// The bitcrusher, an effect. Appended, the enum's law, which is why it
     /// sits after the voices rather than beside the pedals.
     Bitcrush(BitcrushUnit),
+    /// The hardware loop. Appended, the enum's law.
+    HwInsert(crate::units::hwinsert::HwInsert),
 }
 
 impl BuiltinUnit {
@@ -1502,6 +1541,12 @@ impl BuiltinUnit {
             // A hold reads the sample it is holding or one before it, and
             // the quantizer is memoryless: nothing ahead is ever looked at.
             BuiltinUnit::Bitcrush(_) => 0,
+            // **The loop's whole round trip**, measured by a ping or, until
+            // one, the round-trip law's estimate (`units::hwinsert`'s module
+            // notes). Re-read every block like the denoise's, so a ping, a
+            // buffer change or a rate change reaches the compensation graph
+            // on its own.
+            BuiltinUnit::HwInsert(u) => u.latency(),
         }
     }
 
@@ -1531,6 +1576,7 @@ impl BuiltinUnit {
             BuiltinUnit::Analog(u) => u.set_param(id, value),
             BuiltinUnit::Sampler(u) => u.set_param(id, value),
             BuiltinUnit::Bitcrush(u) => u.set_param(id, value),
+            BuiltinUnit::HwInsert(u) => u.set_param(id, value),
         }
     }
 
@@ -1593,6 +1639,14 @@ impl BuiltinUnit {
                     Err(e) => Some(format!("its impulse response did not load: {e}")),
                 }
             }
+            // The jacks and the measured loop. Nothing to fail: a side not
+            // named is a side not chosen, which the face asks for.
+            BuiltinUnit::HwInsert(u) => {
+                let (send, ret, measured) = crate::units::hwinsert::parse_lines(extra);
+                u.set_routes(send, ret);
+                u.set_measured(measured);
+                None
+            }
             _ => None,
         }
     }
@@ -1640,6 +1694,7 @@ impl BuiltinUnit {
             BuiltinUnit::Wah(u) => u.process(input, frames, out),
             BuiltinUnit::Ir(u) => u.process(input, frames, out),
             BuiltinUnit::Bitcrush(u) => u.process(input, frames, out),
+            BuiltinUnit::HwInsert(u) => u.process(input, frames, out),
             // A voice asked to work as an effect has no input to transform
             // and no notes to play: it answers silence rather than passing
             // the input through as if it had done something. `run_rack`
@@ -1765,6 +1820,9 @@ impl BuiltinUnit {
             BuiltinUnit::Sampler(u) => u.kernel.clear(),
             // The holds empty and the knobs settle where they stand.
             BuiltinUnit::Bitcrush(u) => u.kernel.clear(),
+            // The delay line and the alignment go; the jacks, the trims and
+            // the measured loop are knowledge and stay.
+            BuiltinUnit::HwInsert(u) => u.clear(),
         }
     }
 }
