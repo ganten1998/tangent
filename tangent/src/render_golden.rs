@@ -454,7 +454,15 @@ fn pdc(on: bool) -> Engine {
     clips(&mut e, &[0, 1]);
     // The twin keeps a unit in the bay with no latency, so the difference is
     // the compensation and not merely the denoise's own colour on lane 0.
-    seat(&mut e, 0, 0, if on { DENOISE_PATH } else { EQ_PATH }, None);
+    // Spectral Studio by name: the desk pins the compensation of a full
+    // frame, recorded when that was what a fresh denoise opened on, and a
+    // fresh one opens on the Bank since 2026-10-11.
+    if on {
+        let studio = crate::units::denoise::DenoiseKernel::SpectralStudio.dial();
+        seat(&mut e, 0, 0, DENOISE_PATH, Some(&state(DENOISE_PATH, &[(6, studio)])));
+    } else {
+        seat(&mut e, 0, 0, EQ_PATH, None);
+    }
     e
 }
 

@@ -407,12 +407,19 @@ pub const DENOISE_KERNEL_STEPS: i32 = 3;
 
 /// Which of the two engines runs. The dial is appended at the END of the
 /// face's table because ids and symbols are persisted forever, and a
-/// session written before this parameter existed must keep meaning what it
-/// meant — which, since a missing value reads as the spec's default, is
-/// **Spectral Studio**. That is a deliberate change of sound for old
-/// sessions and it is the right one: the bank never delivered the dial it
-/// promised (see [`DenoiseKernel::Bank`]), so "the setting you saved" was
-/// never the reduction you heard.
+/// session written before this parameter existed reads as
+/// **Spectral Studio** ([`DenoiseKernel::UNWRITTEN`]). That was a
+/// deliberate change of sound for those old sessions when the selector
+/// landed, and it stays exactly what it is: the bank never delivered the
+/// dial it promised (see [`DenoiseKernel::Bank`]), so "the setting you
+/// saved" was never the reduction you heard.
+///
+/// A NEW instance opens on the **Bank** (the owner, 2026-10-11: "make the
+/// bank setting the default for the denoise plugin"). The two answers are
+/// kept apart on purpose: what a fresh bay opens on is a choice the owner
+/// can change, and what an old blob plays is a promise, so a blob with no
+/// `kernel=` line does NOT follow the fresh default (see
+/// `builtin_fx::absent_reads_as`).
 ///
 /// The two families are not two flavours of the same thing. They differ in
 /// what a gain change does to PHASE, which is the whole of the owner's
@@ -464,6 +471,13 @@ impl DenoiseKernel {
         DenoiseKernel::SpectralStudio,
         DenoiseKernel::SpectralLive,
     ];
+
+    /// **What a saved state with no `kernel=` line plays**: one written
+    /// before the selector existed. Those have read as Spectral Studio
+    /// since the selector landed, and they keep reading so when the FRESH
+    /// default moves; a saved instance never changes engine because a new
+    /// one would open on another.
+    pub const UNWRITTEN: DenoiseKernel = DenoiseKernel::SpectralStudio;
 
     /// What the panel calls it.
     pub fn label(self) -> &'static str {
@@ -917,8 +931,14 @@ pub struct DenoiseParams {
 /// The shipped sound: nothing learned yet (a wire), 12 dB cap, the
 /// SOFTEST knee, a 10 ms attack and a 100 ms release, 2 dB of treble on
 /// what survives, detector hearing everything, lookahead on — and the
-/// SPECTRAL STUDIO kernel, because it is the one that delivers the dial the
-/// panel is promising. The bank is a deliberate choice, not the default one.
+/// BANK kernel, the owner's call (2026-10-11): "make the bank setting the
+/// default for the denoise plugin". Until then a fresh bay opened on
+/// Spectral Studio. The other dials keep the owner's numbers, so a fresh
+/// bay is exactly what choosing Bank on a fresh bay used to give; the
+/// attack and treble are read by the spectral kernels only and ride along
+/// for the day the selector is moved. A saved state keeps the engine it
+/// was saved with, and one saved before the selector existed keeps
+/// [`DenoiseKernel::UNWRITTEN`].
 ///
 /// The four numbers are the owner's (2026-09-16): "Attack=10ms
 /// Release=100ms Smooth=0 Treble Boost = 2 dB". `release` is 100 ms on the
@@ -933,7 +953,7 @@ impl Default for DenoiseParams {
             release: 0.197,
             sc_hpf: 0.0,
             lookahead: 1.0,
-            kernel: 0.5,
+            kernel: 0.0,
             attack: 0.5,
             treble: 2.0 / DENOISE_TREBLE_DB,
         }
