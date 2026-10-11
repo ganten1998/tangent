@@ -1870,8 +1870,9 @@ pub struct TangentApp {
     export_progress: Option<crate::ports::ExportProgress>,
     /// **The host's busy cover, to be mirrored into any surface the
     /// operating system keeps in front of the main window.** `Some` only
-    /// while the cover is actually showing; the export window paints it
-    /// over itself. See `Busy::paint_over`.
+    /// while the cover is actually showing; the export window SAYS it on
+    /// its top line rather than painting it over its waves. See
+    /// `dialogs::export_line`.
     surface_cover: Option<crate::busy::Busy>,
     /// How many outputs the open device has, pushed by the host. Only the
     /// host knows; the routing picker cannot offer jacks without it.
@@ -45066,8 +45067,11 @@ impl TangentApp {
         // nothing - it reports, while whatever the user had open stays open.
         // It also has to keep painting, so it asks for the next frame itself
         // rather than waiting for a pointer to move.
-        if let Some(p) = self.export_progress.clone() {
-            dialogs::show_export_progress(&ctx, &p, placement, self.surface_cover.as_ref());
+        //
+        // Borrowed, not cloned: a stems pass carries a wave per file, and a
+        // copy of every one of them each frame bought nothing.
+        if let Some(p) = self.export_progress.as_ref() {
+            dialogs::show_export_progress(&ctx, p, placement, self.surface_cover.as_ref());
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -64797,6 +64801,7 @@ mod tests {
             fraction: 0.4,
             label: "Rendering".to_owned(),
             peaks: vec![(0.5, -0.5); 64],
+            rows: Vec::new(),
         }));
         // Two frames: the first draws the window, the second is the one whose
         // pointer test can see the layer the first left behind.
