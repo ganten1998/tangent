@@ -4836,12 +4836,41 @@ pub fn snowflake(painter: &Painter, c: Pos2, r: f32, ink: Color32) {
 }
 
 pub fn lane_field(strip: Color32, well: Color32, dark: bool) -> Color32 {
-    crate::recorder_panel::legible_surface(if dark {
-        shade(well, 1.55)
-    } else {
-        blend(well, strip, 0.46)
-    })
+    // **Dark is the darker of the two, on every theme.** The two derivations
+    // used to be pinned to the switch: dark lifted the well, light blended it
+    // toward the strip face. On a theme whose strip is dark (27 of the 32)
+    // the blend is the DARKER one, so "light" was the darker field there and
+    // D read backwards; and Sandstone's well is pale, so its dark field was
+    // paler than its light one. Somebody who pressed D until the lanes went
+    // dark had engaged LIGHT, and the next pale-faced theme in the cycle
+    // showed it: the owner's "switching theme resets it to light". The flag
+    // never moved; the field it named did. Ranking the two by luminance makes
+    // the switch mean the same thing whatever theme is worn.
+    let lum = crate::recorder_panel::luminance;
+    let lifted = crate::recorder_panel::legible_surface(shade(well, 1.55));
+    let mixed = crate::recorder_panel::legible_surface(blend(well, strip, 0.46));
+    let (darker, lighter) =
+        if lum(lifted) <= lum(mixed) { (lifted, mixed) } else { (mixed, lifted) };
+    if !dark {
+        return lighter;
+    }
+    // **And dark is DARK**, even on a theme whose well is pale (Sandstone):
+    // walked down in its own hue until it sits under the band's dead zone,
+    // where the light ink reads on it.
+    let mut out = darker;
+    for _ in 0..24 {
+        if lum(out) <= DARK_FIELD_MAX {
+            break;
+        }
+        out = shade(out, 0.88);
+    }
+    crate::recorder_panel::legible_surface(out)
 }
+
+/// The palest a dark-mode lane field may be. Below the 0.12 to 0.22 band in
+/// which neither ink clears 4.5:1, so the field is dark by measurement rather
+/// than by name.
+pub const DARK_FIELD_MAX: f32 = 0.10;
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
     // **DERIVED from the theme, in both modes.**
