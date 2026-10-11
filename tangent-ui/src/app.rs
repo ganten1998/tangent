@@ -9499,25 +9499,52 @@ impl TangentApp {
         .unwrap_or(Rect::NOTHING)
     }
 
-    /// A press inside the open varispeed range panel.
+    /// A press inside the open varispeed range panel, or outside it, which
+    /// closes it.
     fn press_in_vari_panel(&mut self, screen: Rect, pos: Pos2) {
+        use recorder_panel::VariHit;
         let anchor = self.vari_anchor();
-        match recorder_panel::vari_hit_test(screen, anchor, pos) {
-            Some(recorder_panel::VariHit::Type(field)) => {
-                self.apply_recorder_hit(recorder_panel::Hit::Type(field));
+        let hit = recorder_panel::vari_hit_test(screen, anchor, pos);
+        // **The band's focus rule, in this panel too** - SIG's
+        // (`commit_number_unless`) and the metronome panel's
+        // (`met_menu_press`). A press on anything but the end being typed
+        // COMMITS it, before the press acts: the other end, RESET, the X,
+        // the panel's chrome, and a press outside it. Each of those threw the
+        // typed number away, so a 70 typed into MIN and clicked away from
+        // left the range as it was. A press back into the end being typed
+        // keeps what was typed, so a typo can be reached without the click
+        // committing it. Escape is the one road that abandons it, in
+        // `edit_number`. A number the field cannot take is refused here as
+        // Enter refuses it: the field closes on the range it opened with.
+        if self
+            .num_edit
+            .as_ref()
+            .is_some_and(|e| hit != Some(VariHit::Type(e.field)))
+        {
+            self.commit_number();
+        }
+        match hit {
+            // Opened looking like its number, as every field is - unless it
+            // is the one being typed, which the press above left alone.
+            Some(VariHit::Type(field)) => {
+                if !self.num_edit.as_ref().is_some_and(|e| e.field == field) {
+                    self.apply_recorder_hit(recorder_panel::Hit::Type(field));
+                }
             }
-            Some(recorder_panel::VariHit::Reset) => {
+            Some(VariHit::Reset) => {
                 // **The RANGE, and not the dial.** Somebody who has widened
                 // the reach and wants it back has not asked for the speed to
                 // change, and `set_min`/`set_max` keep it — see their notes.
                 self.settings.varispeed.set_min(crate::varispeed::DEFAULT_MIN);
                 self.settings.varispeed.set_max(crate::varispeed::DEFAULT_MAX);
-                self.num_edit = None;
                 self.save_settings();
+                // **A press, so a moment** - the range is hashed with the
+                // dial (`DeskSnap::varispeed`), and RESET committed nothing,
+                // so it rode into whatever was done next.
+                self.undo_commit();
             }
-            Some(recorder_panel::VariHit::Close) => {
+            Some(VariHit::Close) => {
                 self.vari_open = false;
-                self.num_edit = None;
                 self.menu_ate_press = true;
             }
             // Panel chrome swallows the press; outside it, the press closes
@@ -9525,7 +9552,6 @@ impl TangentApp {
             None => {
                 if !recorder_panel::vari_popup_rect(screen, anchor).contains(pos) {
                     self.vari_open = false;
-                    self.num_edit = None;
                     self.menu_ate_press = true;
                 }
             }
@@ -18242,10 +18268,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   carry was 120 moments in a 100-moment history).
     ///
     /// Not every gesture keeps the rule yet: a number typed into the band (a
-    /// level, a send, the varispeed or its range), the range panel's RESET,
-    /// a mixer figure finished by a click away, and a keyboard nudge of a
-    /// band knob, a desk fader or a header dial still commit nothing. A
-    /// writer found breaking it is a bug to fix, not a precedent to follow.
+    /// level, a send, the varispeed's dial), a mixer figure finished by a
+    /// click away, and a keyboard nudge of a band knob, a desk fader or a
+    /// header dial still commit nothing. (The varispeed's typed range and
+    /// its panel's RESET keep it now.) A writer found breaking it is a bug
+    /// to fix, not a precedent to follow.
     ///
     /// How each shape must commit:
     ///
@@ -37029,6 +37056,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.settings.varispeed.set_max(n);
                     }
                     self.save_settings();
+                    // **One moment**, as each half of a typed signature is:
+                    // the range is hashed with the dial
+                    // (`DeskSnap::varispeed`) and this committed nothing, so
+                    // a typed end rode into whatever was done next. On every
+                    // road that lands one: Enter, Tab, a press away from it
+                    // (`press_in_vari_panel`) and its panel going (`paint`).
+                    self.undo_commit();
                 }
                 None
             }
@@ -44192,6 +44226,16 @@ impl TangentApp {
         if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_metronome())
             && (self.met_menu.is_none() || self.met_stage().is_none())
         {
+            self.commit_number();
+        }
+        // **And an end of the varispeed's range lives exactly as long as ITS
+        // panel.** A press in the panel or away from it commits the end first
+        // (`press_in_vari_panel`), but the panel also goes by roads that are
+        // no press of its own: a right-click on another knob swaps it for
+        // that effect's panel, and a dial that stops being drawn takes it
+        // down. The end being typed was left open then, drawn nowhere and
+        // holding every key. Committed, by the same rule.
+        if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_vari_range()) && !self.vari_open {
             self.commit_number();
         }
         let typing_before = self.name_focused || self.num_edit.is_some();
@@ -75718,6 +75762,287 @@ mod tests {").expect("the tests module")];
         assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "Cmd+M took the tempo's field away");
         type_keys(&ctx, &mut app, "97");
         assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("97"), "the tempo stopped taking keys");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the varispeed range's typed ends ────────────────────────────────────
+    //
+    // The owner's "yes fix those please": a number typed into the range
+    // panel was thrown away by a click outside it, where SIG and the
+    // metronome panel's BEATS and NOTE keep what was typed.
+
+    /// The varispeed's range panel up, by the dial's own right-click, over
+    /// the timeline or the desk, on a song with a history to count moments
+    /// in. Answers the screen it is pressed on and its anchor.
+    fn vari_panel_up(
+        tag: &str,
+        desk: bool,
+    ) -> (egui::Context, TangentApp, std::path::PathBuf, Rect, Rect) {
+        let root = project_scratch(tag);
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("Projects"));
+        app.arrangement_open = !desk;
+        app.mixer_open = desk;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.arr_save_edits();
+        app.commit_view_change();
+        let dial = knob_cell(&app, recorder_panel::Hit::SetVarispeed(0.5)).center();
+        right_click_at(&ctx, &mut app, dial);
+        assert!(app.vari_open, "the dial's right-click did not open its range");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = app.vari_anchor();
+        assert!(recorder_panel::vari_popup_rect(screen, anchor).is_positive(), "the range panel has no room");
+        assert_eq!(
+            (app.settings.varispeed.min(), app.settings.varispeed.max()),
+            (crate::varispeed::DEFAULT_MIN, crate::varispeed::DEFAULT_MAX),
+            "fixture: the range does not ship at its defaults"
+        );
+        (ctx, app, root, screen, anchor)
+    }
+
+    /// Where `want` is on the range panel, asked of the panel itself: the
+    /// middle of every point that answers it. For `None`, the panel's own
+    /// chrome, it is the first such point the sweep meets.
+    fn vari_point(screen: Rect, anchor: Rect, want: Option<recorder_panel::VariHit>) -> Pos2 {
+        let panel = recorder_panel::vari_popup_rect(screen, anchor);
+        let mut found: Option<Rect> = None;
+        let mut y = panel.top() + 1.0;
+        while y < panel.bottom() - 1.0 {
+            let mut x = panel.left() + 1.0;
+            while x < panel.right() - 1.0 {
+                let p = Pos2::new(x, y);
+                if recorder_panel::vari_hit_test(screen, anchor, p) == want {
+                    if want.is_none() {
+                        return p;
+                    }
+                    let dot = Rect::from_min_max(p, p);
+                    found = Some(found.map_or(dot, |r| r.union(dot)));
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        found.unwrap_or_else(|| panic!("the range panel has no {want:?}")).center()
+    }
+
+    /// **A press away from the varispeed range lands what was typed**, over
+    /// the timeline and over the desk, and is spent on the panel.
+    ///
+    /// MIN typed to 70 and a press outside the panel: the panel goes, the
+    /// range is 70 to 115, and that is one moment, as a typed half of the
+    /// signature is. The press does nothing else: the ruler under it does
+    /// not locate the song, the click's mute under it does not mute, and
+    /// both answer the same press once the panel is gone.
+    ///
+    /// Revert-check, performed: put back the press's old `num_edit = None`
+    /// and the range stays 85 to 115 on both surfaces.
+    #[test]
+    fn a_press_away_from_the_varispeed_range_lands_what_was_typed_on_either_surface() {
+        use recorder::NumField as F;
+        use recorder_panel::VariHit;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, screen, anchor) = vari_panel_up("variaway", desk);
+            let panel = recorder_panel::vari_popup_rect(screen, anchor);
+            // A live control under the panel's scrim and clear of the panel:
+            // the click's mute on the desk, the ruler on the timeline.
+            let away = if desk {
+                let rect = app.mixer_rect.expect("the desk is not laid out");
+                let view = app.mixer_view_in(rect);
+                let col = recorder::Strip::Click.column_of().expect("the click has a column");
+                crate::mixer_panel::Layout::new(rect, &view)
+                    .strips
+                    .get(col)
+                    .expect("the click has a strip")
+                    .mute
+                    .center()
+            } else {
+                let rect = app.arrangement_rect.expect("the timeline is not laid out");
+                let clips = app.arr_clip_views();
+                let view = app.arrange_view(&clips);
+                let ruler = crate::arrangement_panel::Layout::new(rect, &view).ruler;
+                [0.85, 0.15, 0.5]
+                    .into_iter()
+                    .map(|f| Pos2::new(ruler.left() + ruler.width() * f, ruler.center().y))
+                    .find(|p| !panel.contains(*p))
+                    .expect("the panel covers the whole ruler")
+            };
+            assert!(!panel.contains(away), "fixture: {away:?} is on the panel");
+            assert!(!app.strip_heard_muted(recorder::StripRef::Click), "fixture: the click ships muted");
+            app.time_sel = Some((1.0, 2.0));
+
+            click_with(&ctx, &mut app, vari_point(screen, anchor, Some(VariHit::Type(F::VariMin))), egui::Modifiers::NONE);
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+                Some((F::VariMin, "85".to_owned())),
+                "on {on} MIN did not open on its own number"
+            );
+            type_keys(&ctx, &mut app, "70");
+            while app.take_recorder_request().is_some() {}
+            let before = app.hist_at;
+            click_with(&ctx, &mut app, away, egui::Modifiers::NONE);
+            assert!(!app.vari_open, "on {on} the press away did not close the range panel");
+            assert!(app.num_edit.is_none(), "on {on} MIN outlived its panel");
+            assert_eq!(app.settings.varispeed.min(), 70, "on {on} the press away threw the typed 70 away");
+            assert_eq!(app.settings.varispeed.max(), 115, "on {on} MAX moved");
+            assert_eq!(app.hist_at, before + 1, "on {on} the typed MIN is not one moment");
+            // Spent on the panel.
+            assert!(!app.strip_heard_muted(recorder::StripRef::Click), "on {on} the press away muted the click");
+            assert_eq!(app.time_sel, Some((1.0, 2.0)), "on {on} the press away pressed the ruler");
+            assert!(app.take_recorder_request().is_none(), "on {on} the press away located the song");
+            // And the same press, with the panel gone, is the control's.
+            click_with(&ctx, &mut app, away, egui::Modifiers::NONE);
+            if desk {
+                assert!(app.strip_heard_muted(recorder::StripRef::Click), "fixture: {away:?} is not the click's mute");
+            } else {
+                assert_eq!(app.time_sel, None, "fixture: {away:?} is not on the ruler");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **The range panel keeps the band's rule for a typed number**, press
+    /// by press: SIG's, and the metronome panel's.
+    ///
+    /// A press back into MIN keeps what was typed. A press on MAX lands the
+    /// typed MIN first and opens MAX on its own number. RESET lands the
+    /// typed MAX and then puts the range back, a moment each, so one step
+    /// back from RESET is the typed MAX. A press on the panel's chrome lands
+    /// what was typed and leaves the panel up. Escape abandons it, and the
+    /// panel stays. An emptied field is refused as Enter refuses it - the
+    /// range stays and nothing is a moment - and the X lands a number as a
+    /// press away does.
+    ///
+    /// Revert-checks, all performed: drop the commit at the top of
+    /// `press_in_vari_panel` and MAX opens over the typed MIN; let a press
+    /// back into the field re-open it and the typed 7 is lost; take RESET's
+    /// moment out and the count is two; take the moment out of the typed
+    /// range's commit and the typed MIN is no moment at all.
+    #[test]
+    fn the_varispeed_range_keeps_the_bands_rule_for_a_typed_number() {
+        use recorder::NumField as F;
+        use recorder_panel::VariHit;
+        let (ctx, mut app, root, screen, anchor) = vari_panel_up("varirule", false);
+        let min = vari_point(screen, anchor, Some(VariHit::Type(F::VariMin)));
+        let max = vari_point(screen, anchor, Some(VariHit::Type(F::VariMax)));
+        let reset = vari_point(screen, anchor, Some(VariHit::Reset));
+        let close = vari_point(screen, anchor, Some(VariHit::Close));
+        let chrome = vari_point(screen, anchor, None);
+        let range = |app: &TangentApp| (app.settings.varispeed.min(), app.settings.varispeed.max());
+        let typing = |app: &TangentApp| app.num_edit.as_ref().map(|e| (e.field, e.text.clone()));
+        let none = egui::Modifiers::NONE;
+        let before = app.hist_at;
+
+        // Back into MIN: what was typed stays, and nothing lands.
+        click_with(&ctx, &mut app, min, none);
+        type_keys(&ctx, &mut app, "7");
+        click_with(&ctx, &mut app, min, none);
+        assert_eq!(typing(&app), Some((F::VariMin, "7".to_owned())), "a press back into MIN lost what was typed");
+        assert_eq!((range(&app), app.hist_at), ((85, 115), before), "a press back into MIN landed it");
+        type_keys(&ctx, &mut app, "0");
+
+        // MAX: the typed MIN lands first, then MAX opens on its own number.
+        click_with(&ctx, &mut app, max, none);
+        assert_eq!(range(&app), (70, 115), "a press on MAX threw the typed MIN away");
+        assert_eq!(typing(&app), Some((F::VariMax, "115".to_owned())), "MAX did not open on its own number");
+        assert_eq!(app.hist_at, before + 1, "the typed MIN is not one moment");
+
+        // RESET: the typed MAX lands, then the range goes back.
+        type_keys(&ctx, &mut app, "130");
+        click_with(&ctx, &mut app, reset, none);
+        assert!(app.num_edit.is_none() && app.vari_open, "RESET left MAX open or closed the panel");
+        assert_eq!(range(&app), (85, 115), "RESET did not put the range back");
+        assert_eq!(app.hist_at, before + 3, "the typed MAX and RESET are not a moment each");
+        app.undo();
+        assert_eq!(range(&app), (70, 130), "one step back from RESET is not the typed MAX");
+        app.redo();
+        assert_eq!(range(&app), (85, 115));
+
+        // The chrome: lands, and the panel stays up.
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, min, none);
+        type_keys(&ctx, &mut app, "80");
+        click_with(&ctx, &mut app, chrome, none);
+        assert!(app.num_edit.is_none() && app.vari_open, "a press on the chrome left MIN open or closed the panel");
+        assert_eq!((range(&app), app.hist_at), ((80, 115), before + 1), "a press on the chrome threw the typed 80 away");
+
+        // Escape: abandoned, and the panel stays up.
+        click_with(&ctx, &mut app, max, none);
+        type_keys(&ctx, &mut app, "150");
+        key_with(&ctx, &mut app, egui::Key::Escape, none);
+        assert!(app.num_edit.is_none() && app.vari_open, "Escape left MAX open or closed the panel");
+        assert_eq!((range(&app), app.hist_at), ((80, 115), before + 1), "Escape landed the typed 150");
+
+        // Emptied, then the X: refused, and the panel goes.
+        click_with(&ctx, &mut app, max, none);
+        for _ in 0..3 {
+            key_with(&ctx, &mut app, egui::Key::Backspace, none);
+        }
+        assert_eq!(typing(&app), Some((F::VariMax, String::new())), "fixture: MAX was not emptied");
+        click_with(&ctx, &mut app, close, none);
+        assert!(!app.vari_open && app.num_edit.is_none(), "the X left the panel or MAX");
+        assert_eq!((range(&app), app.hist_at), ((80, 115), before + 1), "an emptied MAX was not refused");
+
+        // The X with a number in the field lands it.
+        let dial = knob_cell(&app, recorder_panel::Hit::SetVarispeed(0.5)).center();
+        right_click_at(&ctx, &mut app, dial);
+        assert!(app.vari_open, "fixture: the range did not open again");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        click_with(&ctx, &mut app, min, none);
+        type_keys(&ctx, &mut app, "65");
+        click_with(&ctx, &mut app, close, none);
+        assert!(!app.vari_open && app.num_edit.is_none(), "the X left the panel or MIN");
+        assert_eq!((range(&app), app.hist_at), ((65, 115), before + 2), "the X threw the typed 65 away");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An end of the range lives exactly as long as its panel**, and the
+    /// band's own numbers left open under the panel are kept by it too.
+    ///
+    /// MIN typed and another knob right-clicked: that effect's panel takes
+    /// the range panel's place, and MIN used to stay open, drawn nowhere,
+    /// holding every key. It lands. And a tempo typed into the band, left
+    /// open as the dial was right-clicked, was thrown away by the press that
+    /// closed the range panel; it lands too.
+    ///
+    /// Revert-checks, both performed: drop the guard beside the metronome's
+    /// in `paint` and MIN stays open under the effect panel; put back the
+    /// press's `num_edit = None` and the tempo is lost.
+    #[test]
+    fn a_typed_number_goes_with_the_varispeed_range_and_is_kept() {
+        use recorder::NumField as F;
+        let (ctx, mut app, root, screen, anchor) = vari_panel_up("varigone", false);
+        click_with(
+            &ctx,
+            &mut app,
+            vari_point(screen, anchor, Some(recorder_panel::VariHit::Type(F::VariMin))),
+            egui::Modifiers::NONE,
+        );
+        type_keys(&ctx, &mut app, "75");
+        let reverb = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.5)).center();
+        right_click_at(&ctx, &mut app, reverb);
+        assert_eq!(app.fx_open, Some(recorder_panel::Fx::Reverb), "fixture: the reverb's panel did not open");
+        assert!(!app.vari_open, "fixture: the range panel stayed up beside the reverb's");
+        assert!(app.num_edit.is_none(), "MIN outlived its panel, drawn nowhere");
+        assert_eq!(app.settings.varispeed.min(), 75, "the typed 75 was thrown away");
+
+        // The band's tempo, typed and left open under the range panel.
+        let outside = Pos2::new(6.0, 894.0);
+        click_with(&ctx, &mut app, outside, egui::Modifiers::NONE);
+        assert!(app.fx_open.is_none(), "fixture: the reverb's panel stayed up");
+        let tempo = band_point(&app, recorder_panel::Hit::Type(F::Tempo));
+        click_with(&ctx, &mut app, tempo, egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "97");
+        let dial = knob_cell(&app, recorder_panel::Hit::SetVarispeed(0.5)).center();
+        right_click_at(&ctx, &mut app, dial);
+        assert!(app.vari_open, "fixture: the range did not open");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("97"), "fixture: the tempo closed");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(!recorder_panel::vari_popup_rect(screen, app.vari_anchor()).contains(outside));
+        click_with(&ctx, &mut app, outside, egui::Modifiers::NONE);
+        assert!(!app.vari_open && app.num_edit.is_none(), "the press away left the panel or the tempo");
+        assert!((app.tempo_bpm() - 97.0).abs() < 1e-9, "the press away threw the typed tempo away: {}", app.tempo_bpm());
         let _ = std::fs::remove_dir_all(&root);
     }
 
