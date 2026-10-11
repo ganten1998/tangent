@@ -10,6 +10,7 @@
 //! collide in this file.
 
 pub mod amp;
+pub mod bitcrush;
 /// Wraps DSP that lives in the recorder-gated `effects` module, so the
 /// Minimal build — which has no effects chain to borrow from — skips it.
 #[cfg(feature = "recorder")]
