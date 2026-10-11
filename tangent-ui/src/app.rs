@@ -72986,6 +72986,80 @@ mod tests {").expect("the tests module")];
         assert!(app.dialog_blocks_pointer(&ctx));
     }
 
+    /// **Dark engaged on the arrangement stays dark through every theme.**
+    ///
+    /// The owner: "dark mode is engaged on arrange mode, then switching theme
+    /// resets it to light on the next theme." `arr_dark` itself never moved;
+    /// what moved was the field it named. The lane field's two derivations
+    /// were pinned to the switch, and on a dark-faced theme "light" was the
+    /// DARKER one, so the press that made the lanes go dark had engaged
+    /// light, and a pale-faced theme further round showed it. Sandstone's
+    /// dark field was paler than its light one outright.
+    ///
+    /// Driven by real key events through whole frames: D on the arrangement,
+    /// then T all the way round the factory set, asking at every theme that
+    /// the switch still says dark AND that what is drawn under the pointer
+    /// is the darker of the two fields, and dark by measurement.
+    #[test]
+    fn dark_engaged_on_the_arrangement_survives_cycling_every_theme() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.arrangement_open = true;
+        let press = |ctx: &egui::Context, app: &mut TangentApp, key: egui::Key| {
+            app.dialog = None;
+            let ev = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    focused: true,
+                    events: vec![ev(true), ev(false)],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            pointer_frame(ctx, app, Vec::new());
+        };
+        pointer_frame(&ctx, &mut app, Vec::new());
+        // Engage dark from light, whatever ships: D, through the keymap.
+        app.settings.arr_dark = false;
+        press(&ctx, &mut app, egui::Key::D);
+        assert!(app.settings.arr_dark, "D on the arrangement did not engage its dark mode");
+        let lum = recorder_panel::luminance;
+        for _ in 0..crate::theme::factory().len() {
+            let was = app.settings.theme_name.clone();
+            press(&ctx, &mut app, egui::Key::T);
+            let name = app.settings.theme_name.clone();
+            assert_ne!(name, was, "T on the arrangement did not cycle the theme");
+            assert!(app.settings.arr_dark, "{name}: the theme cycle turned dark off");
+            let at = app.arrangement_rect.expect("the arrangement was not drawn").center();
+            app.last_band = Rect::NOTHING;
+            app.mixer_rect = None;
+            let drawn = app.face_under(at);
+            let light = crate::arrangement_panel::lane_field(
+                app.settings.fx_strip_color.to_color32(),
+                app.settings.meter_bg_color.to_color32(),
+                false,
+            );
+            assert!(
+                lum(drawn) < lum(light),
+                "{name}: dark is engaged and the field drawn ({:.3}) is no darker \
+                 than the light one ({:.3})",
+                lum(drawn),
+                lum(light)
+            );
+            assert!(
+                lum(drawn) <= crate::arrangement_panel::DARK_FIELD_MAX,
+                "{name}: dark is engaged and the field reads light ({:.3})",
+                lum(drawn)
+            );
+        }
+    }
+
     // ── edge-drag auto-scroll ───────────────────────────────────────────────
 
     /// One frame with a CHOSEN frame time and no events at all — which is the
