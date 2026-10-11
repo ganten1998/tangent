@@ -9,6 +9,16 @@ tests/golden/__pycache__/
 # Keygen build output (the tool is a separate workspace under tools/)
 tools/*/target/
 
+# The retired VST3 crate's target outlives the crate. plugin/ is gone, but a
+# checkout that built it keeps plugin/target through the merge that removed
+# it: a SYMLINK out of Dropbox on the Mac, a build directory anywhere else.
+# Unignored, it is an untracked file: `git status` and release.sh call the
+# tree dirty, build-stamp.sh hashes it into the working tree so every build
+# publishes as <HEAD>-dirty, and `git add -A` commits a link to a cache path
+# on one particular Mac. NO trailing slash: `plugin/target/` matches a
+# directory only, never the symlink.
+plugin/target
+
 # Installer staging. Kept out of the repo AND out of Dropbox by
 # scripts/build-installer.sh, which stages in a temp dir; this catches the
 # case where someone points it somewhere else.
