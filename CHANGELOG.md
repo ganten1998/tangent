@@ -12,6 +12,59 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Tangent Bitcrush, a bitcrusher.** In the insert picker with the rest of
+  the house effects. BITS takes the signal down from 24 bits to 1, smoothly,
+  fractions of a bit included; RATE holds each sample for longer, from the
+  session's own rate down to 200 Hz, and by default with no filter in front
+  of it, so the treble folds back down as the metallic overtones a
+  bitcrusher is for.
+  DRIVE sets how hard the signal hits the converter (more drive spends more
+  of the levels; OUTPUT brings it back down), MIX blends in the dry signal,
+  and DITHER, off unless you switch it on, trades the gritty crunch for an
+  even hiss. ANTI-ALIAS, also off unless you switch it on, puts a steep
+  low-pass in front of the hold that follows RATE, so treble above the
+  slower rate is removed instead of folding back down; the stepped edge
+  of the slower rate stays. Every knob glides rather than stepping, so
+  automating any of them does not click, and it adds no latency. It opens on 8 bits at about
+  12 kHz, fully wet: obviously crushed, still musical. With BITS and RATE
+  both turned all the way up and the two levels at noon it passes audio
+  through untouched, bit for bit, with ANTI-ALIAS on or off. Mono tracks are crushed too. The window
+  draws the stair it is making out of a tone above the knobs.
+
+- **Tangent Insert: outboard gear in an insert bay.** Pick it from the
+  plugin shelf like any built-in effect, then choose the outputs it sends
+  on and the inputs it comes back on, each mono or stereo, from the
+  interface Tangent is playing through. The bay's signal goes out of those
+  jacks, through whatever is patched there, and back into the track. A
+  mono send carries the sum of both sides at -6 dB; a mono return feeds
+  both sides. The face has Send and Return trims, a Mix (fully wet to
+  start) and a Return Polarity switch.
+
+  PING fires a click round the loop and measures where it comes back, and
+  the insert reports that round trip to delay compensation so the rest of
+  the session lines up with it. The measurement is saved with the project.
+  Until you ping, the insert assumes the interface's own round trip (input
+  buffer plus twice the output buffer) and the face says it is unmeasured;
+  it also says so again if the rate or the buffer changes. Outputs 1/2
+  carry the main mix and are not offered. If the device changes or the
+  jacks are missing, the insert passes the signal dry, in time, says it is
+  disconnected, and keeps your choice for when the device comes back.
+
+  A hardware loop cannot run faster than real time, so a full-speed export
+  of a project with a Tangent Insert in circuit runs as a realtime export
+  through the device instead, and says so; a freeze of a track that plays
+  through one is refused with a message rather than rendered dry. A
+  bypassed insert is passed over everywhere.
+
+  Bypassed, the insert keeps the loop's delay, so comparing against bypass
+  lines up. The insert refuses a loop it cannot keep in time: an input on a
+  different device from the output (an aggregate device is fine), clocks
+  found drifting, or a round trip longer than delay compensation can absorb
+  (8192 samples). A realtime export starts only when every insert's loop is
+  connected, and says so if one comes apart during the pass. PING is not
+  offered while recording or exporting, and it refuses an answer it cannot
+  trust (a return that was not quiet before the click).
+
 - **Send to Device: the master out on a second output device too.** While
   Tangent plays through your interface, the same mix can also go to a
   virtual cable (VB-Audio's CABLE Input on Windows, BlackHole or Loopback on
@@ -29,7 +82,246 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the window starts it again. The cog's SEND chip shows what the send is
   doing: on, missing, stopped or failed.
 
+- **Buses and returns, as many as a session needs, on every tier.** New Bus
+  and New Return, on a track's right-click, add a row at the end of the
+  desk that is not a track: it takes no clips and no input, hears no
+  MIDI, and never counts toward the free desk's tracks. A bus has a fader,
+  pan, mute, solo, six bays, automation, a colour and a name; it runs its
+  plugins once over whatever arrives, and it can be routed on or be a
+  sidechain source. Any track sends to any number of buses and returns
+  from its Routing window (Send to a Bus or Return, or Send to a New
+  Return), each send at its own level and after the fader unless you flip
+  it to before, and a post-fader send is offered for automation by its bus's
+  name. Soloing a track keeps the returns it feeds audible, and a soloed
+  bus hears what feeds it.
+
+- **Routes have no limit.** The routing table held 64 routes and refused
+  the 65th; it holds as many as the desk makes now. The pickers grey out a
+  destination that would feed a signal back into itself, and a loop saved
+  by an earlier version still opens and sounds as it did.
+
+- **The desk is as long as its tracks.** The mixer and the arrangement draw
+  the tracks that exist and one place to add the next: a plus after the
+  last strip in the mixer, and a row under the last lane in the arrangement.
+  The plus's own background carries on past it, across to the click in the
+  mixer and down to the bottom of the arrangement, and keeps its colour as
+  tracks come and go, so a desk shorter than the window never ends in bare
+  panel.
+  Ctrl/Cmd+T, the header's plus and the mixer's plus add a track after the
+  selection, or at the end with nothing selected, and dropping media below
+  the last lane makes a track for it. Both views scroll, Shift+wheel zooms
+  out as far as 64 strips or lanes at once, and the routing and sidechain
+  pickers filter as you type and name each track. At the free desk's limit
+  the plus is drawn as a padlock and opens the Supporter Key dialog.
+
+### Changed
+
+- **Tangent Denoise opens on the Bank.** A freshly inserted denoiser, and a
+  reset to defaults, now start on the Bank kernel instead of Spectral Studio,
+  with the other dials where they were. Saved projects keep the kernel they
+  were saved with, and a project saved before the Kernel choice existed still
+  opens on Spectral Studio as it did.
+
+- **The arrangement opens wider, and each project keeps its own zoom.** An
+  unzoomed timeline shows the first 32 bars at the song's tempo and meter
+  (or the whole song when it is longer), where it used to show 30 seconds.
+  Where you were zoomed and scrolled is saved with the project and comes
+  back when it opens; a new project, and an older one that never saved a
+  zoom, open at the default. Zooming and scrolling never mark the project
+  unsaved and are not undo steps.
+
+- **A supporter key now takes the track limit away, and the free app holds
+  32 tracks.** Without a key the desk holds up to 32 tracks: MIDI and audio
+  tracks and folders count. With one there is no limit but the machine's.
+  Every key already sold does the same, since keys have no expiry and cover
+  every version. Buses, returns, sends and routes have no limit for anyone
+  and are never counted. The limit only ever stops a new track: a project
+  with more than 32 tracks opens, plays, edits, exports and saves whole
+  without a key, and adding a track to it asks for one. Ctrl/Cmd+T at the
+  limit says so; it used to do nothing. The About card names the desk an
+  install has, and the Supporter Key dialog, the README and the store page
+  say what a key does; they said it unlocked nothing.
+
+- **Remove Track takes the row away.** It used to clear the track and
+  leave an empty slot where it stood; the row goes now and the tracks below
+  close up. Its plugins' settings are put by first, so Undo brings the track
+  back whole, and an amp's pedalboard leaves with its track.
+
+- **Reordering tracks moves no plugin.** Every plugin, route, send,
+  sidechain key and automation row belongs to its track now rather than to
+  a position on the desk, so dragging a track to a new place is one change
+  and nothing reloads. It used to hand each moved plugin back and forth
+  with the audio engine, which on a desk full of plugins could take seconds.
+
+- **Settings and projects are saved in a new format, and the old files are
+  kept.** The first time this version saves over a settings file, a project
+  or a template written by an earlier one, it keeps the original beside it,
+  once: `settings.pre-v23.json`, `<project>.pre-v8`, and the drum kits'
+  `drumpad.json.pre-v8`. Plugin settings are copied to new file names that
+  follow their track, and the old files are never renamed or deleted.
+  Earlier versions of Tangent cannot open the new files; putting the kept
+  originals back gives an earlier version its project as it was.
+
+- **While the arrangement records or a realtime export runs, a new track
+  goes at the end.** Inserting, removing or reordering tracks, or changing
+  a track's kind or input, waits until it is over, with a line saying why:
+  the recording captures each track by its row, and the export writes each
+  one by its row.
+
+- **The installers go straight to installing Tangent.** The macOS installer
+  no longer opens on a list of components with only Tangent in it, and the
+  Windows installer no longer has a components page. Their pages, and the
+  Linux `install.sh --help`, describe Tangent alone.
+
+- **The metronome panel's BEATS and NOTE are typed fields.** Press the
+  number between the minus and the plus and type any beat count from 1 to
+  32, over a note value of 1, 2, 4, 8, 16 or 32, so 7/8, 11/16, 15/32 and
+  3/1 are a few keys away. Enter or Tab sets it and Escape leaves it as it
+  was; pressing anywhere else sets what was typed. A number a signature
+  cannot have, like 33 beats or a note of 3, is turned down and the
+  signature stays as it was. NOTE's four buttons became a minus, the field
+  and a plus, like BEATS above it, and its steps reach all six note values.
+  Each change is one step of undo, and the timeline's bars, the click and
+  the count-in follow it, while the song plays too.
+
+- **The grid's one-bar step is called BAR, in every meter.** The step
+  between 2 bars and the note values read 1 in 4/4, which is also a whole
+  note's name, and 1/2· in 3/4 and 6/8; in 5/4, 7/8 and 9/8 it printed a
+  decimal too wide for its box (5.000q, 3.500q, 4.500q). It reads BAR now
+  in the grid boxes of the arrangement and the MIDI editor (BAR T with
+  triplets on) and in the Quantize window's GRID row. Steps above it still
+  count bars (2, 4, 8) and steps below it are note values (1, 1/2, 1/4 and
+  finer); one that no single note names is counted in the meter's own
+  beats, so half a bar of 10/8 reads 5/8.
+
+  A step too wide for its box is printed smaller now, until it fits, in
+  the arrangement's grid box (1/16, 1/4·, 1/128) and the MIDI editor's
+  grid chip (1/16 sw, 1/1024T), never under 6.5 points. Nothing is drawn
+  outside a grid box any more, so a long step no longer runs onto the
+  tempo lane's switch or under the navigator, and steps that already fit
+  keep their size. A step still too wide at 6.5 points is cut at the box's
+  edges. The arrangement's grid box, like the metronome, magnet and tempo
+  buttons beside it, is 20 points square whenever the arrangement is at
+  least 209 points tall; a shorter arrangement draws all four as tall as
+  the corner they sit in, down to 14 points, so what is cut depends on the
+  arrangement's height and the font:
+
+  - Courier Prime and JetBrains Mono: 1/1024 and 1/2048 (the finest steps
+    of 1/16, 1/32, 2/32 and odd counts of 32nds) at every height. In an
+    arrangement shorter than 208 points (209 in JetBrains Mono),
+    five-character steps such as 1/128 and 11/16 as well; shorter than
+    181, four-character ones such as 1/16 and 10/8.
+  - Terminess: shorter than 209 points, 1/1024 and 1/2048; shorter than
+    181, five characters.
+
+  Steps of three characters or fewer, BAR and 1/2 among them, are never
+  cut. Just under each of those heights the cut comes and goes from one
+  point of height to the next, as the box's edges land on whole pixels or
+  between them.
+
+  A screen reader names every step as a note, in the arrangement's grid
+  box and in the Quantize window's GRID row: whole note, dotted half note,
+  hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar" for the
+  whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted half and
+  "1/128 of a bar" and finer for the finest steps, and it read the
+  Quantize chips as their printed shorthand ("1/2·", "1/128") without
+  saying which one was chosen; it says which now. With the reader on, the
+  arrow keys move the arrangement's grid box a step each way, which they
+  never did, and Home and End reach both of its ends, the finest step
+  (1/64 in 4/4) included. The MIDI editor is not read by a screen reader
+  yet, its grid chip included.
+
 ### Fixed
+
+- **A stems export shows every stem's wave, and nothing sits on them.** The
+  export window drew one wave whatever the pass wrote; a stems export now
+  draws a row per stem, named for its track and in desk order, each filling
+  in as it renders (with the master's row first when the pass writes one).
+  When there are more than fit, the rows keep a readable height and the list
+  scrolls with the wheel or a drag. The "Writing files" notice that ends a
+  render used to be painted in the middle of the wave; it is now said on the
+  window's top line, clear of every wave. A single-file export looks as it
+  did.
+- **The band's clip lamp no longer lights on a limited master.** With the
+  master limiter in circuit at -1 dB, driving into it lit the lamp even
+  though nothing left above -1 dBFS, because the lamp also latched on the
+  signal going into the limiter. It now answers only for what leaves: after
+  the limiter and the master fader, at full scale. How hard the limiter is
+  working is still shown by its gain-reduction readout. The limiter's
+  ceiling also settles exactly at its dial now; at -1 dB it had held
+  -0.996 dBFS.
+
+- **Dark mode on the arrangement stays dark whichever theme you cycle to.**
+  The switch was never reset, but on most themes its "light" field was the
+  darker of the two, so D read backwards and a pale theme further round
+  looked like dark had been turned off; Sandstone's dark field was paler
+  than its light one. Dark is now the darker field on every theme, and dark
+  by measurement. The arrangement now starts light until you press D; a
+  choice you have saved is kept.
+
+- **Track numbers in the arrangement are no longer cut off.** The second
+  figure of a lane number (10, 11, ...) ran out of its column toward the arm
+  button. The column is now as wide as the desk's longest number, so two,
+  three and four figures fit at full size in every typeface, and the plus on
+  an empty numbered slot no longer sits on top of its number.
+
+- **Two or more instruments on one track all play.** A track's insert rack
+  can hold several instruments (the DX7, Keys, Analog, Sampler, the drum
+  pads, hosted VST3 and LV2 instruments), and every one of them now hears
+  the same MIDI, live while the track is armed and from its clips on
+  playback, in exports and in freezes, and they sum on the track's channel.
+  Before, a later instrument replaced everything ahead of it, and the DX7,
+  Keys and the drum pads only played from the track's first bay. The rule
+  for a chain: an effect processes what reaches its bay, so an effect
+  between two instruments processes only the first, and one after both
+  processes their sum; delay compensation keeps the layered instruments
+  together, dry stems included. A drum kit layered with other instruments
+  enters at the head of its track's chain and goes through it once with
+  them. A track with one instrument sounds exactly as it did.
+
+- **The IR wizard measured the wrong input when inputs were picked.** With
+  the desk's inputs picked (say In 3 alone), a wizard return on In 3 read
+  input 1. It reads the input it names now.
+
+- **Routes follow their tracks.** Moving a track left every route to and
+  from it on the row it came from, so after a reorder a track could be
+  routed into somebody else's audio, and removing a track left routes aimed
+  at its row. Routes, sends and sidechain keys name their tracks now, so a
+  reorder, an insert or a removal carries them, and a removed track takes
+  its routes with it.
+
+- **A drum track's pad effects move with it.** Reordering a drum track left
+  the effect plugins on its pads behind on the row it came from.
+
+- **Old settings files keep the drum bus's and the master's polarity.** A
+  file from the 16-channel builds that had the drum bus or the master
+  phase-inverted opened with them upright, and the inversion moved onto
+  tracks that never asked for it.
+
+- **Files from the 24-channel builds open with their buses and master
+  where they belong.** The builds of 31 August that had a 24-channel desk
+  had no step to lift their files onto the wider one, so the buses' and
+  the master's settings landed on tracks.
+
+- **Old projects reopen the plugins on their buses, master and drum pads
+  as they were saved.** A project from the 8- or 16-channel builds reopened
+  those plugins at their default settings, because its plugin state files
+  were named for a desk that had since grown; they are read by the desk
+  they were written for now.
+
+- **Save As writes the desk you see.** It wrote the desk as it stood at
+  the last save, so a track added since then was missing from the copy
+  while the copy's kit file had it.
+
+- **Removing a drum track no longer deletes its kit before you save.** The
+  kit file was rewritten at once, so Don't Save after a removal reopened
+  the project without the kit. It is written with the project on the next
+  save now, and Undo before then brings it back.
+
+- **A crash part-way through a save no longer leaves plugins at their
+  defaults.** The plugin settings a save owes a project are recorded before
+  the project file is written and paid at the next launch, on every road
+  that saves: Save, Save As, New, switching projects and Quit.
 
 - **The launch clean-up no longer deletes a folder that holds anything
   Tangent did not put there.** It removed any folder in the projects folder
@@ -224,6 +516,33 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   release; it made one per BPM it passed. A tempo typed or dragged on an
   empty song is now its own undo step too.
 
+- **A click on the metronome panel over the mixer presses once.** Every
+  row of it was pressed twice, so the beats and the count-in moved two at
+  a time and the count-in's "carries on" switch flipped and flipped back.
+  The panel over the arrangement was not affected.
+
+- **A second Cmd/Ctrl+M closes the metronome panel, and the chord works
+  over the mixer.** In the arrangement the chord opened the panel and
+  pressing it again did nothing, so the panel could only be closed with
+  the mouse; over the mixer it did neither. Over the mixer it now opens the
+  panel where clicking the CLICK strip's sound chip opens it. A beat count
+  or note value being typed into the panel is set as it closes.
+
+- **The varispeed range keeps what you type into it.** Clicking outside
+  the range panel, on its X, on RESET or on the other end threw away a
+  number being typed into MIN or MAX. It is set first now, as the
+  signature's fields set theirs, and clicking back into the field keeps
+  typing; Escape still leaves the range as it was. Right-clicking another
+  knob while typing no longer leaves an invisible field holding the
+  keyboard. Each change to the range, typed or by RESET, is one step of
+  undo.
+
+- **Hiding the recorder band keeps the number you were typing into it.**
+  Choosing Hide Recorder Band from the band's right-click menu while
+  typing a tempo, a level, an effect's amount, the varispeed or an end of
+  its range threw the number away. It is set as the band goes now, as a
+  click anywhere else sets it.
+
 - **An Analog track's dry stem lines up with the others.** In a dry stems
   export it came out 68 samples (1.4 ms at 48 kHz) behind every other stem
   and the mix, by the delay the Analog reports for its own sound. It now
@@ -333,6 +652,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   is told the song started or stopped in the buffer where it did, not a
   buffer before or after.
 
+- **Play sounds the note it starts on.** A MIDI note at the spot Play
+  started from, or a few milliseconds after it, never played: a note at
+  the very start of a part, played from the very start, stayed silent
+  while the notes after it sounded. It happened on every instrument but the
+  drum pads, from a spot just clicked to, from the start of a loop, after a
+  count-in and, now and then, at the head of a realtime export; the first
+  moment of an audio clip starting at that spot was silent too.
+
 - **Starting and stopping no longer, now and then, play a moment from the
   wrong place.** Stopping could play a moment from the start point and
   leave the playhead a little past it, and playing from a new place could
@@ -381,9 +708,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   clip was measured over parts of its file it never plays, so a take could
   come up by almost nothing, or past the -1 dBFS normalize aims for.
 
-- **One key press with a pedal window open over an amp acts once.** In the
-  plugin, or with child windows off, T skipped a theme and Space sent the
-  transport two commands.
+- **One key press with a pedal window open over an amp acts once.** With
+  child windows off, T skipped a theme and Space sent the transport two
+  commands.
 
 - **The export and glue no longer stretch a clip past the length playback
   allows.** A clip whose stretch would make it longer than 20 minutes
@@ -534,8 +861,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   press.
 
 - **Normalising says why where it cannot.** In a build without the audio
-  engine, and in the plugin, Cmd/Ctrl+Shift+N on an audio clip did nothing
-  and said nothing.
+  engine, Cmd/Ctrl+Shift+N on an audio clip did nothing and said nothing.
 
 - **The quantize message counts the clip's own attacks.** "Quantized N of M
   attacks" counted every attack in the take's whole file, so a split or
@@ -634,8 +960,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   realtime export, and the cassette while an export writes its files also
   say why they did nothing.
 
-- **About tells the truth about the build it is in.** It gives the
-  mixer's real channel count, 32, where it said 16; it names the plugin
+- **About tells the truth about the build it is in.** It names the desk the
+  install has, a 32-track desk or unlimited tracks with a supporter key,
+  where it gave a channel count of 16; it names the plugin
   formats the build hosts, VST3 on macOS and Windows and LV2 and VST3 on
   Linux and FreeBSD, where it said LV2/VST3 everywhere; and a build without
   the recorder no longer claims to record or host plugins.
@@ -659,11 +986,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   spirit-duplicator handout). Five of them keep their ground dark, as
   Amber and Phosphor do. The existing themes and their slots are
   unchanged, so a saved desk opens exactly as it was, and every new theme
-  carries its own 32-channel palette.
+  carries its own palette of 32 track colours.
 
 - **The Themes menu fits a short window.** A hover menu taller than the
   screen now shrinks its rows to fit, as the main menu already did,
-  instead of running off the bottom of a small plugin editor.
+  instead of running off the bottom.
 
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
   small one.** A new row in the audio setup panel, beside the buffer size,
@@ -1087,10 +1414,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   window's size back to 100% in the settings and left the window as it was
   until the next launch. It resizes it at once now, and undoing the reset
   puts the window back.
-
-- **In the plugin, Reset Everything no longer turns on a recorder band.**
-  The plugin has no recorder to fill one, and nothing in its menus could
-  turn the band off again.
 
 - **The settings panel behaves.** DONE no longer also places the playhead
   in the song under it, a signature typed into SIG is kept when you click
@@ -1887,8 +2210,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 ### Added
 
 - **A session carries its rack, its levels and its feel.** The eight knobs
-  across the recorder's band — reverb, delay, chorus, phaser, the two filters,
-  the output gain and the limiter — and every parameter row behind them lived
+  across the recorder's band (reverb, delay, chorus, phaser, the two filters,
+  the output gain and the limiter) and every parameter row behind them lived
   in the settings file alone, which made each of them a property of the
   MACHINE rather than of the song: opening any project wore whatever reverb
   the last one was using, and there was no way to leave a mix set up and come
@@ -1904,7 +2227,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   file. Everything should be session dependent."
 
   A document that does not carry a key keeps the LIVE value, which is the
-  rule the desk's earlier late arrivals already answer to — nothing an old
+  rule the desk's earlier late arrivals already answer to: nothing an old
   project sounds like changes because a field was added, and a project opened
   from before this wears no asterisk it did not earn.
 
@@ -1912,9 +2235,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   invisible: `selected` is sorted by contract because the roll asks a binary
   search whether each note it draws is picked, and the walk APPENDED rather
   than inserting in order. The moment the note taken in had a lower index than
-  one already held — which in a chord is most of the time, since notes are
+  one already held (which in a chord is most of the time, since notes are
   indexed in the order they were written and the one above is as often older
-  as newer — the search could no longer find it and the note drew unselected.
+  as newer), the search could no longer find it and the note drew unselected.
   It appeared later, all at once, whenever some other operation rebuilt the
   selection in order. The owner: "it just doesn't show a visual indicator as
   notes are added in a stacked note/chordal situation. it only shows after an
@@ -1922,16 +2245,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **An arrow's audition is held long enough to be a pitch.** A cursor step
   sounded its note and set no deadline, and a preview with no deadline is read
-  as one a hand is holding — so with no button down it was released on the
+  as one a hand is holding, so with no button down it was released on the
   very next frame. A click rather than a note, and the key it lit blinked. It
   is held for four tenths of a second now, and the step after it releases it
   first, so walking the keyboard cannot leave a chord ringing behind. The
   owner: "make the arrow audition a bit longer unless interrupted by another
   audition."
 
-- **A sounding key is visible.** The editor auditions on three roads — a
+- **A sounding key is visible.** The editor auditions on three roads (a
   press on the piano column, an arrow that moves the pitch cursor, a note
-  written or grabbed — and not one of them drew anything: the sound came out
+  written or grabbed) and not one of them drew anything: the sound came out
   and the picture said nothing, so a player walking up the keyboard on the
   arrows had to count rows, and a press that produced no sound looked exactly
   like one that had not registered. A key that is sounding now lights amber in
@@ -1942,14 +2265,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The MIDI editor's grid chip reads "1/4" rather than the note glyph**, the
   same numerals the arrange toolbar has used since the owner asked for them
-  there. The two spellings had been kept apart on purpose — he asked about
+  there. The two spellings had been kept apart on purpose (he asked about
   ARRANGE, and a shared helper would have moved this chip in the same edit
-  without anyone deciding to — with a test pinning the editor's glyph in both
+  without anyone deciding to), with a test pinning the editor's glyph in both
   directions until he said otherwise. He has: "Replace the note glyph with 1/4
   in midi editor."
 
 - **Right-click a note for its own menu**, and two keys beside it. Copy,
-  Cut, Paste, Delete, Mute, Join and Split — the owner's list. Right-click
+  Cut, Paste, Delete, Mute, Join and Split: the owner's list. Right-click
   used to erase the note on the spot; Delete is one of the rows now, one
   press further in and named. **M mutes the selection** from the keyboard, the
   menu's row on a key. A right-click on a note outside the selection
@@ -1961,7 +2284,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   **A muted note is written but not played.** It keeps its place, its length,
   its pitch and its velocity, is still there to be dragged and selected, and
-  is skipped by every walk that turns a clip into sound — so it is not the
+  is skipped by every walk that turns a clip into sound, so it is not the
   same as deleting and undoing. It draws hollow rather than dimmed, because
   this roll already paints velocity as colour and a washed-out note means
   something else here. A flag rather than velocity zero, so unmuting gives
@@ -1976,13 +2299,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   edit midi clips intuitively, and from the beginning to the end."
 
   **Enter writes a note** at the playhead on the pitch cursor, and walks the
-  playhead past it — so Enter pressed four times writes four notes in a row
+  playhead past it, so Enter pressed four times writes four notes in a row
   rather than four in a stack, and a melody is a run of Enter with the odd Up
   or Down in it. The roll has a playhead for the time axis and now a cursor
   for the pitch axis, which the mouse never needed because a hand carries
   both at once.
 
-  **The bare arrows do one of two jobs and the selection decides which** —
+  **The bare arrows do one of two jobs and the selection decides which**,
   the grammar the rest of the app already uses. With a note in hand they
   edit it: a step along, a semitone up, and the pitch cursor comes with it so
   the next note starts where the hand left off. With nothing in hand they
@@ -1991,21 +2314,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   **Shift splits by axis.** Left and right are the note's length; up and down
   take the note above or below into the selection, which is how a chord is
-  built a note at a time — a candidate has to overlap the selection in time,
+  built a note at a time: a candidate has to overlap the selection in time,
   so it climbs the chord rather than reaching across the bar. **Ctrl/Cmd+Alt
   with up and down** moves the selection an octave. **Escape lets go** of the
-  selection, and closes the editor on the second press — which is the order
+  selection, and closes the editor on the second press, which is the order
   somebody in trouble presses it in anyway, and it is what puts the bare
   arrows back on the playhead without reaching for the mouse.
 
 - **Shift+H humanizes the selection in the MIDI editor.** The chord hangs a
-  small menu under the pointer with two amounts — TIMING, a percentage of one grid
-  step, and VELOCITY, a percentage of the velocity each note already has —
+  small menu under the pointer with two amounts (TIMING, a percentage of one grid
+  step, and VELOCITY, a percentage of the velocity each note already has)
   and HUMANIZE (or Enter) applies them to the selected notes. Two
   independent amounts because the two are not the same wish: a drum part
   often wants its velocities moved and its timing left where it is, and a
   held pad the reverse. Velocity moves by a proportion rather than a fixed
-  number so the part keeps its shape — a ghost note shifts by a few and an
+  number so the part keeps its shape: a ghost note shifts by a few and an
   accent by a dozen, and nothing is ever pushed to silence. The amounts are
   remembered, so the second part costs one press. Notes stay wholly
   inside their clip.
@@ -2015,15 +2338,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   surface whose card is hardest to do without. Cmd+H was the obvious sidestep
   and is not available: winit installs the standard macOS application menu,
   whose Hide item carries Cmd+H (and Cmd+Shift+H for Hide Others), and AppKit
-  eats both before the app sees a key — so bound there, Humanize would have
+  eats both before the app sees a key, so bound there, Humanize would have
   hidden Tangent.
 
 - **Insert Track, on a channel's right-click.** A new empty track opens
   directly under the one clicked and the rows beneath shift down a place.
-  The desk is thirty-two fixed lanes, so this spends an unused one from
-  BELOW the insertion point — a lane taken from above would shift tracks
-  the gesture never mentioned, in the opposite direction to the one asked
-  for. A row opened inside a folder joins that folder, or the group would be
+  A row opened inside a folder joins that folder, or the group would be
   split in two by a track that is not in it. The owner: "Need a rightclick
   option for channels to insert track."
 
@@ -2045,19 +2365,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   This was a lie the app had been telling. Each track's chip already named a
   MIDI port, and the app opened exactly ONE device app-wide, chosen from a
-  global menu row nothing on the desk mentioned — so two tracks could not have
+  global menu row nothing on the desk mentioned, so two tracks could not have
   separate keyboards and every chip said they could. The owner found it while
   setting up two tracks with two inputs.
 
   The chip says what is true now, in a grammar that names the axis it is
   talking about: `MIDI: ALL DEVICES`, `MIDI: Keystation 88 +1 CH 3`. A device a
-  track remembers and which is not plugged in right now is kept, not dropped —
-  unplugging a keyboard and plugging it back in costs nothing — and it is
+  track remembers and which is not plugged in right now is kept, not dropped
+  (unplugging a keyboard and plugging it back in costs nothing), and it is
   marked, on the chip with a `!` and in the dialog with "not connected".
 
   Two tracks may ask for the same device and channel, and both hear it. That is
-  what this desk already does everywhere else — two armed instruments both
-  sound — and layering a piano and a pad from one keyboard is the ordinary
+  what this desk already does everywhere else (two armed instruments both
+  sound), and layering a piano and a pad from one keyboard is the ordinary
   reason to want it.
 
   Recording follows the same rule, so a take of two players lands each
@@ -2070,7 +2390,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The MIDI editor has a pedal lane.** The chip marked PED, at the pencil's
   shoulder, swaps the lane along the foot of the editor between velocity and
-  the sustain pedal. The pedal is drawn as a step — a shelf where it is held
+  the sustain pedal. The pedal is drawn as a step: a shelf where it is held
   and a riser where it moves, never a slope, because a controller holds its
   value and a line sloping between two edges would be a picture of an
   interpolation nothing performs. The shelf is filled down to the floor, so
@@ -2079,7 +2399,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   from a full one.
 
   Drag in the lane to paint. The height of the hand is the value, which is what
-  lets one gesture do both jobs — along the top it paints the damper down,
+  lets one gesture do both jobs: along the top it paints the damper down,
   along the floor it paints it up, because zero is a pedal nobody is pressing.
   There is no separate erase to go and find. A press that does not travel
   writes a single edge, "from here, this much". Strokes are bounded: what stood
@@ -2089,8 +2409,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   One lane and not a new row: the editor is already a tool strip, a ruler, the
   roll and a lane, and every row added to that stack is height the roll loses.
-  Sostenuto and soft ride above the damper as thin rails — a part that uses
-  them should not look like a part that does not — and they survive an edit
+  Sostenuto and soft ride above the damper as thin rails (a part that uses
+  them should not look like a part that does not), and they survive an edit
   untouched.
 
 - **A looping clip shows where every pass ends, audio and MIDI alike.** The
@@ -2098,7 +2418,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   bottom edge at each turn of the loop, so a one-bar part dragged over four
   bars reads as four bars of one part instead of as one green box, and a
   four-bar drum take pulled over sixteen shows its four passes through the
-  waveform. Nothing is drawn ON the clip — the material is taken AWAY — so it
+  waveform. Nothing is drawn ON the clip (the material is taken AWAY), so it
   says the same thing on a near-black theme and on a bone one with no colour to
   choose. The bite is a tenth of the lane deep, which is the band the waveform
   and the note miniature are both kept clear of, and it is dropped when a pass
@@ -2109,7 +2429,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Glue flattens a clip that repeats, on its own.** Gluing used to need two
   clips; one is enough now if it loops, and it welds that clip's own repeats
   into it. A one-bar part playing C D E F, stretched until it shows C D E F /
-  C D, becomes a clip holding those six notes as one pass with no seam — what
+  C D, becomes a clip holding those six notes as one pass with no seam: what
   was on screen is now what is in the document. Nothing sounds different by a
   sample, and the next pull of its right edge repeats the whole six-note phrase
   and puts a divot after the second D.
@@ -2130,7 +2450,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   stops at the clip instead of stretching it"). It follows the SNAP
   chip like everything else in the editor, so a loop lands on the grid the
   notes in it landed on, and it will not be pulled shorter than one grid line.
-  A note that ends on the turn keeps its own edge — notes win on the roll, and
+  A note that ends on the turn keeps its own edge: notes win on the roll, and
   the tab on the ruler is the half of the handle that nothing can cover.
 
 - **Press and hold a DX7 patch name to hear it.** The instrument's picker
@@ -2161,8 +2481,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   stops at the clip's own edges, the same wall the edge-scroll stops at, and
   never zooms narrower than the wheel's quarter second; a window the wheel
   has pushed past the clip stretches the box to hold it rather than falling
-  off. The whole thing takes no height from the roll — it lives in room the
-  strip was not using — and steps aside on an editor too narrow to hold both
+  off. The whole thing takes no height from the roll (it lives in room the
+  strip was not using), and steps aside on an editor too narrow to hold both
   it and the name. It is drawn whether or not the clip already fits the roll:
   at the fit the window fills the box, and its two handles are the way in.
 
@@ -2200,7 +2520,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   aarch64" covers eleven releases, and one report cost a day to the difference
   between Sonoma and Tahoe; the header carries the product version now. And
   there was no `audio in:` line at all, on a build whose Recorder band cannot be
-  hidden — so the input stream is always open and the log never once said so.
+  hidden, so the input stream is always open and the log never once said so.
 
 - **`TANGENT_ACTIVITY=1` asks macOS to treat the process as latency-critical.**
   Opt-in and off by default, so behaviour on every macOS version is unchanged
@@ -2215,7 +2535,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   at every strip: a dry stem is that
   strip's own bays taken out and nothing else's, so a group's dry stem is the
   group before its bus compressor with its children exactly as they reach the
-  mix. The two write to different folders — `stems/` and `stems-dry/` — so a
+  mix. The two write to different folders (`stems/` and `stems-dry/`), so a
   second export cannot overwrite the first with different-sounding files under
   identical names. Choosing dry does not move one sample of the master.
 
@@ -2224,22 +2544,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   MIDI editor's roll in all four directions, the arrangement's lanes sideways
   along the song and downward through the track stack, and the mixer's desk
   across its channels. Things can be moved beyond what is currently on screen
-  without resizing or zooming out first — a note to a pitch off the top, a
+  without resizing or zooming out first: a note to a pitch off the top, a
   clip to the ninth track, a channel past the eighth column. One rate law
   serves all three, measured in points per SECOND rather than per frame, so
   the same hold covers the same ground whether the window is painting at 240
   frames a second or ticking over at twenty; it ramps from a slow floor at the
   zone's inner lip to a ceiling at the rail and holds that ceiling however far
   past the edge the hand goes. The gesture asks for its own frames, so it
-  keeps moving while the hand is perfectly still. View gestures — the alt-drag
-  pan, the navigator — are exempt: a view that auto-scrolled while being panned
+  keeps moving while the hand is perfectly still. View gestures (the alt-drag
+  pan, the navigator) are exempt: a view that auto-scrolled while being panned
   would accelerate away from the hand steering it.
 
 - **Nothing waits in silence any more.** Every operation that used to freeze
   the window with no explanation now says what it is doing. A survey traced
-  seventy-six of them. The ones that can be counted show a real meter —
-  loading a project counts its plugins, a pasted track counts its bays, an
-  export counts its racks — and the ones that cannot name what they are
+  seventy-six of them. The ones that can be counted show a real meter
+  (loading a project counts its plugins, a pasted track counts its bays, an
+  export counts its racks), and the ones that cannot name what they are
   waiting on instead, by the plugin's own name where there is one. The overlay
   obeys the rule the frozen frame forces on it: it is painted on the frame
   BEFORE the blocking call, because a call that blocks produces no frames to
@@ -2249,8 +2569,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   than owning the screen forever.
 - **Messages moved to the top-left corner and stopped interrupting.** A themed
   notification that lasts three to five seconds and can be clicked away.
-  Messages that are *conditions* — a missing MIDI port, a device that
-  disappeared — stand until the condition clears rather than expiring, and a
+  Messages that are *conditions* (a missing MIDI port, a device that
+  disappeared) stand until the condition clears rather than expiring, and a
   dismissal sticks without silencing the next genuine occurrence.
 - **Silverface**, the nineteenth theme: the faceplate of the Dual Showman
   Reverb, with the red jewel pilot lamp as the master.
@@ -2339,13 +2659,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   open it to live notes as well, on the reasoning that trying an instrument out
   should not begin by arming a track. What that cost in the room was arm
   reading as a lie: an armed track sitting silent while an unarmed one sounded
-  and metered, because selection is quiet and sticky — every click on a header
+  and metered, because selection is quiet and sticky: every click on a header
   sets it, and nothing on the strip says it also opens a MIDI gate. The lane
   answering the keyboard was not the lane wearing the R. Arm is now the whole
   of it, and the price is paid knowingly: auditioning an instrument means
   arming its track first.
 
-  The MIDI editor is untouched and is still the road that needs no arm — while
+  The MIDI editor is untouched and is still the road that needs no arm: while
   it is open, its clip's lane is the only lane that hears, armed or not.
 
 - **Every clip is a loop from the moment it is made, audio as well as MIDI.**
@@ -2354,8 +2674,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   audio clip in the app were not, so the same right-edge drag laid down another
   pass on one and stopped at the end of the file on the next. It now lays down
   another pass on all of them. A loop as long as the clip it sits on is one
-  pass and sounds like nothing at all — no repeat, no seam, no change to any
-  session — so what this actually buys is that pulling any clip's right edge
+  pass and sounds like nothing at all (no repeat, no seam, no change to any
+  session), so what this actually buys is that pulling any clip's right edge
   repeats it, which is the reason anybody records four bars of a groove. The
   loop can be turned off per clip from the clip's own right-click menu.
 
@@ -2365,13 +2685,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a project saved before this, worth stating plainly: an audio clip still
   carrying the whole-file length gains a loop the first time it is opened here,
   and nothing about it sounds different, but its right edge now pulls out into
-  repeats. A clip whose loop has been turned off keeps it off — that door only
+  repeats. A clip whose loop has been turned off keeps it off: that door only
   opens once.
 
 - **Right-click a clip and untick Loop to stop it repeating.** The clip menu
   has a Loop row with a checkmark beside it when the clip repeats: press it and
   the loop goes, press it again and it comes back over the clip's whole length.
-  Turning it off leaves the clip exactly where and as long as it was — a clip
+  Turning it off leaves the clip exactly where and as long as it was: a clip
   pulled out to four passes and then unlooped stays four bars on the timeline
   and plays its material once, because the length is the timeline's business
   and this row has no say in it. Like every other row in that menu it acts on
@@ -2380,8 +2700,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   bar; this row is only the on and the off.
 
 - **Glue makes one clip that loops over the whole of what was glued.** It used
-  to be the escape hatch from the loop — the way to turn several repeating
-  items into one long pass — and it is now the same rule as everything else:
+  to be the escape hatch from the loop (the way to turn several repeating
+  items into one long pass), and it is now the same rule as everything else:
   the weld is a clip, and every clip is a loop over its own length. Nothing
   about the result sounds different, because the sources' repeats are written
   out into real notes as they always were and a loop as long as its clip is a
@@ -2393,7 +2713,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   selection" on a clip's body and "stretch" from a clip's edge, both of them a
   few points from the empty ground this gesture starts on, and a modifier that
   means three things depending on what is under it is a modifier nobody can
-  learn. Cmd is the platform's command finger — Ctrl off macOS — and it is
+  learn. Cmd is the platform's command finger (Ctrl off macOS), and it is
   already what the editor's rubber band uses. The item is still born pinned at
   the length it was drawn and looping from that moment, notes or no notes, so
   the first pull of its right edge lays down a second pass.
@@ -2402,7 +2722,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   build a set.** The one-lane gesture was on shift, which is the multi-select
   key everywhere else on this desk and therefore meant the opposite of what the
   rest of the app teaches. Alt takes it over, and it ignores the strip selection
-  the way no other control does — spreading it would arm the very tracks the
+  the way no other control does: spreading it would arm the very tracks the
   gesture exists to stand down. Shift touches only the lane under it, leaving
   the strip selection out of it, and flips it (see "Both arm modifiers can
   undo themselves"); a plain click toggles the lane and carries the selected
@@ -2428,8 +2748,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Nine dialogs that asked nothing stopped stopping you.** The take report,
   the MIDI errors, the startup notices, the no-free-channel refusal and the
   "Tangent" notice window are notifications now. Everything that asks a real
-  question — save before closing, flatten the tempo, the three destructive
-  confirmations — is untouched, as are the file and folder pickers and the
+  question (save before closing, flatten the tempo, the three destructive
+  confirmations) is untouched, as are the file and folder pickers and the
   three native boxes that fire when there is no window left to draw into.
 - **The render is the biggest thing on screen while it runs**, sized from the
   monitor rather than a fixed 520 by 210, and nothing that merely *announces*
@@ -2492,7 +2812,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Soloing a track inside a folder no longer mutes the whole desk.** The
   rule that decides what a solo leaves audible walked only UP the folder
   tree: a channel is heard if it, or a group it sits in, is the thing
-  soloed. Nothing asked whether a group had a soloed track INSIDE it — so
+  soloed. Nothing asked whether a group had a soloed track INSIDE it, so
   the folder itself fell through as not-heard, its fold took a gain of zero,
   and because a foldered lane reaches the master through its group and
   nowhere else, the soloed track silenced itself along with everything. A
@@ -2502,18 +2822,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **A drum kit inside a folder answers to the group.** The pad pass asked
   the flat question, which knows nothing about folders, so a kit on a lane
-  inside a group went silent whenever anything else was soloed — including
-  when its own group was the thing soloed — and a mute on the group never
+  inside a group went silent whenever anything else was soloed (including
+  when its own group was the thing soloed), and a mute on the group never
   reached it. Same rule as every other lane now. Found by the test for the
   solo above rather than by anybody playing it.
 
-- **The four-input cap is gone: every channel can take an input.** The desk
-  opened at most four capture inputs, handed out to audio channels in index
-  order, so a fifth audio track could be bound, armed, metered and could
-  never receive a sample — it simply read its input's name and stayed
+- **The four-input cap is gone: every audio track can take an input.** The
+  desk opened at most four capture inputs, handed out to audio channels in
+  index order, so a fifth audio track could be bound, armed, metered and
+  could never receive a sample: it simply read its input's name and stayed
   silent. The cap was a leftover from a band with four input strips; every
-  channel has had its own input chip for a long time. It is the channel
-  count now, thirty-two. It costs nothing: the capture rings already carry
+  channel has had its own input chip for a long time. There is no cap now,
+  not even the desk's width: as many inputs open as there are audio tracks
+  bound to one. It costs nothing: the capture rings already carry
   whole device frames, so a pick is a map from the stream's columns to a
   strip rather than a thing that sizes a buffer. The owner, on his fifth
   audio track: "I do not think the input cap is a good thing at all and it
@@ -2521,7 +2842,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **A removed track takes its input with it.** Deleting a track cleared its
   kind, its name, its colour, its clips and its bays and left the interface
-  channel it listened to sitting in `channel_inputs` — a state the desk's
+  channel it listened to sitting in `channel_inputs`: a state the desk's
   own model ("the input IS the kind") says cannot exist, and one nothing
   could repair by hand. The slot then drew as an empty plus; pressing it
   made a track that wore switches, whose R toggled and which could never
@@ -2533,7 +2854,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **Paste Track no longer destroys the track you aim it at.** The row was
   Paste Track (overwrite) and it took the lane it landed on, clips, bays and
-  all — it said so on the label, which is the least a row like that can do,
+  all. It said so on the label, which is the least a row like that can do,
   but a paste that costs a track is a paste people check twice before using.
   It is now Paste Track Below: the copy arrives on a row opened under the one
   clicked and everything beneath shifts down. The owner: "make paste track
@@ -2542,18 +2863,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   The mixer's Cmd+V went the same way, and it had never had the guard the
   arrangement's has: aimed at a live track it overwrote silently, with no
-  label anywhere to warn. Both surfaces now go through one decision — an
+  label anywhere to warn. Both surfaces now go through one decision: an
   empty slot receives the copy, a live track keeps its life and the copy
   lands under it.
 
 - **The "That is a MIDI part, not a sample" message is gone.** It answered a
-  question nobody asked, on a DRAG — as often a slip of the hand as an
-  intention — and a drag that publishes nothing has already said so by not
+  question nobody asked, on a DRAG (as often a slip of the hand as an
+  intention), and a drag that publishes nothing has already said so by not
   moving anything. The refusal stands; the sentence does not. The owner: "I'm
   not [sure] that message is actually useful in any way."
 
-- **An explanatory message ages out on its own.** The app's helper answers —
-  the ones a press asks for and nothing re-checks — borrowed the machinery
+- **An explanatory message ages out on its own.** The app's helper answers
+  (the ones a press asks for and nothing re-checks) borrowed the machinery
   built for CONDITIONS, which have no clock because they end when they stop
   being true. Nothing was ever going to lower "No MIDI track on the desk", so
   it sat in the corner until it was clicked, which is one more thing to do in
@@ -2581,7 +2902,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **A parked desk stops running its effect chains, so an idle project is
   silent.** Every loaded plugin ran every block, whatever the transport was
-  doing — deliberately, so that a reverb tail is not cut in half at every gap
+  doing, deliberately, so that a reverb tail is not cut in half at every gap
   or chopped the instant somebody presses stop. The cost of that was reckoned
   as "plugins process silence", which is free only for a plugin that is
   transparent on silence. An amp simulation is not: fed digital silence it
@@ -2594,21 +2915,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   A lane's chain now stops after eight seconds of stopped transport, which is
   past the tail of any reverb anybody mixes with, and wakes instantly on play,
   on arm, on a note, on an audition. **A lane carrying an instrument never
-  parks at all** — an effect fed nothing has nothing of its own to lose, but a
+  parks at all**: an effect fed nothing has nothing of its own to lose, but a
   voice may be holding a note, so the rule asks each plugin's own box whether
   it generates and stands down for the whole lane if any of them does. It also
   gives the CPU back: an idle desk of twenty plugins was running all of them.
 
 - **A preset reaches the instrument, not its first sixteen values.** The
   queue a knob crosses to the audio thread held sixteen points a bay, and
-  loading a preset is one point per knob all at once — so Tangent Analog,
+  loading a preset is one point per knob all at once, so Tangent Analog,
   which publishes sixty-one, had sixteen of them applied and forty-five left
   standing at the patch before, and Tangent EQ lost nine of its twenty-five.
   Nothing showed it: the face, the host's ledger and a saved project all
   carry the full preset, because those are written on the host side and never
   cross that queue. Only the SOUND was a mongrel of two patches, which on a
   synth can drone. The owner found it as "presets require manual updates of
-  values to register" — nudging a knob afterwards sends a single point, and a
+  values to register": nudging a knob afterwards sends a single point, and a
   single point always fitted.
 
   The cap was sized for automation curves, where a point that does not fit is
@@ -2618,8 +2939,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   for more parameters than the unit in it has.
 
 - **A trimmed MIDI loop fills its tail.** Every unroll counted passes as the
-  clip's length over its loop, while placing each note at `at_s - offset_s`
-  — so a clip trimmed from its front starts mid-loop and the walk ran out
+  clip's length over its loop, while placing each note at `at_s - offset_s`,
+  so a clip trimmed from its front starts mid-loop and the walk ran out
   exactly the offset before the clip's end. Trim half a loop off the front
   and precisely the last half held no notes, in the sound, in the export and
   in the drawing. The offset is part of the span to cover. Audio loops were
@@ -2630,8 +2951,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **A trimmed clip is notched where its loop actually turns over.** The
   divots along a looping clip's edges were laid a whole loop apart from the
   clip's LEFT EDGE, which is right only for a clip that begins on a
-  boundary. Trim a quarter of a bar off the front — the same trim behind the
-  empty tail above, and the same cause — and every notch sat a quarter of a
+  boundary. Trim a quarter of a bar off the front (the same trim behind the
+  empty tail above, and the same cause) and every notch sat a quarter of a
   bar late, over the middle of a pass, on the one mark whose whole job is to
   say where the loop restarts. The first pass of a trimmed clip is short by
   however far into the loop it starts; the rest follow a loop apart from
@@ -2645,8 +2966,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   however far it has been trimmed. The seams read the clip's kind now.
 
 - **Phosphor's and Nocturne's light mode is a light mode.** Those two are the
-  only themes whose light ground is a near-black — it is what makes them what
-  they are — so the piano has to derive a pale key for them and then put the
+  only themes whose light ground is a near-black (it is what makes them what
+  they are), so the piano has to derive a pale key for them and then put the
   keyboard the right way up out of it, which it has done since the last
   release. The page did not follow. It went on reading the near-black the theme
   declares, so light mode gave a bone keyboard butted against a black theory
@@ -2739,8 +3060,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The sustain pedal is recorded into the clip and played back.** A part
   performed with the damper down came back dry: the take kept only the instants
   the KEYS came up, the clip had nowhere to say the pedal was still down, and
-  playback dutifully cut every note at its key-up. All three pedals — sustain,
-  sostenuto and soft — are now written into the clip as they were played, at
+  playback dutifully cut every note at its key-up. All three pedals (sustain,
+  sostenuto and soft) are now written into the clip as they were played, at
   their own values rather than as a switch, so half-pedalling survives; a pedal
   already down when the red button is pressed is restated at the take's start,
   so it is not released later by an event with no cause; and the clip's pedal
@@ -2752,7 +3073,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   half-pedalling, and it destroys the difference between a chord rolled under
   the pedal and a chord held, which is a difference a pianist can hear.
 
-  The pedal travels with the clip everywhere the notes do — split (the tail
+  The pedal travels with the clip everywhere the notes do: split (the tail
   inherits the level it was cut under), glue, the loop (every pass opens with
   the pedal it inherits), and the `.mid` export. A `.mid` dragged in carries
   its pedal too, which it never did.
@@ -2767,8 +3088,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   anywhere, which is a description of the panel rather than a reason.
 
 - **A strike's cost is asserted where the number means something.** The budget
-  behind it is a release budget — eight notes at a tenth of a millisecond is a
-  third of a 2.7 ms block — but `cargo test` builds unoptimised, so the figure
+  behind it is a release budget (eight notes at a tenth of a millisecond is a
+  third of a 2.7 ms block), but `cargo test` builds unoptimised, so the figure
   being checked was a debug one. Measured: 10.3 µs in release against 104–110 in
   debug, a factor of ten, with nothing in the instrument changed. It passed for
   months only because debug happened to sit under a bar it was never measuring
@@ -2781,19 +3102,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   only the rows that had not been lifted out. Drag a folder from row 4 past row
   7 and it arrived three rows above where it was let go. The block's head is
   what lands on the drop row now, its children follow it down, and the rows it
-  passed close up behind it — which is what a single track has always done and
+  passed close up behind it, which is what a single track has always done and
   what the arithmetic was written to match.
 
 - **Phosphor's and Nocturne's keyboards were upside down.** Every other theme
   paints pale naturals and dark sharps in light mode, and inverts in dark mode.
-  Those two did the opposite in each — light mode gave them a black keyboard and
-  dark mode a pale one — because a theme's naturals are pinned to its light
+  Those two did the opposite in each (light mode gave them a black keyboard and
+  dark mode a pale one) because a theme's naturals are pinned to its light
   ground, and being dark-designed is exactly what those two are. Measured across
   the set, the sixteen others put their light-mode naturals between 0.61 and
   0.97 luminance; those two sat at 0.011 and 0.004. The polarity is decided by
   the piano now rather than inherited from the ground: the naturals are the pale
   key in light mode and the dark key in dark mode, on every theme. The two
-  colours themselves are untouched — only which key wears which.
+  colours themselves are untouched; only which key wears which.
 
 - **A held DX7 patch rings for the whole press.** The note stopped as soon as
   the pointer moved six points, which a hand holding a button still does, so it
@@ -2802,8 +3123,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   way, which is the patch being chosen.
 
 - **A recorded MIDI take now repeats when you pull its right edge, like a drawn
-  one.** A MIDI item drawn on a lane has been a loop from birth — drag its edge
-  and it lays down another pass — but a recorded take was born with no loop, so
+  one.** A MIDI item drawn on a lane has been a loop from birth (drag its edge
+  and it lays down another pass), but a recorded take was born with no loop, so
   the same drag on the same kind of item revealed empty time instead. The two
   ways of getting a part onto a lane behaved differently at the one gesture
   everybody uses on a part they like. The take's own length is its loop now.
@@ -2812,8 +3133,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **A folder dragged past its own children turned into one of them.** A folder
   carries its rows, so dropping it below them names a target that is already
-  inside the block being carried. The move itself is then a no-op — the block
-  comes out and goes back where it was — but the membership decision that runs
+  inside the block being carried. The move itself is then a no-op (the block
+  comes out and goes back where it was), but the membership decision that runs
   first is not: it asks which folder the target row belongs to, gets the dragged
   folder back, and writes that onto the folder itself. It stopped being a folder,
   became a child of itself, the group flattened around it, and the row that had
@@ -2822,7 +3143,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **Phosphor's and Nocturne's pale piano keys stopped glaring.** The lift that
   makes those two themes' keyboards visible walked the pale key away from the
-  naturals until the two were far enough apart — and toward pure white, which on
+  naturals until the two were far enough apart, and toward pure white, which on
   exactly those themes it always reached, because their dark naturals sit at
   about 0.095 luminance and nothing can get far enough from that. So the walk
   spent every step, arrived at the screen's limit, and still fell short of the
@@ -2833,8 +3154,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The arrangement's little menus ignored the theme.** The clip menu, the FX
   menu, the input menu and the bay drag chip all painted a hardcoded cream with
-  hardcoded near-black ink — the shipped theme's own colours, written out as
-  literals — so on the other fifteen themes they were a pale card on a dark desk,
+  hardcoded near-black ink (the shipped theme's own colours, written out as
+  literals), so on the other fifteen themes they were a pale card on a dark desk,
   and on the dark ones they glared. They derive their surface now, the way every
   other painted panel here does: the paper comes from the theme's face, moves
   itself when that face sits where neither ink would read, and the ink is a
@@ -2842,7 +3163,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **Both arm modifiers can undo themselves.** Shift could add a lane to the
   armed set and not take one back out, and alt could make a lane the only armed
-  one and not stand it down — so either gesture had to be abandoned mid-thought
+  one and not stand it down, so either gesture had to be abandoned mid-thought
   to be reversed. Shift now flips whatever it crosses and alt on the lane that is
   already alone disarms everything. A modified arm also touches one lane rather
   than the whole strip selection, which is what both modifiers are for; a plain
@@ -2853,7 +3174,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   offered nothing, because the right-click matched the channel headers' bays
   alone and never the bus row's. A plugin could go into the master there and
   only come out by going to the mixer for it. Both of the master's racks answer
-  now — its first three slots and its last three are seated far apart, so the
+  now: its first three slots and its last three are seated far apart, so the
   menu resolves the seat the same way the left-click always has and cannot open
   pointed at a neighbour's plugin.
 
@@ -2861,7 +3182,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a key in mono or unison falls back onto a key still held and, with
   multi-trigger on, re-attacks the whole voice stack. That road was the one
   place a voice was made to sound without being woken first, and waking is where
-  a voice takes its filter lane — so any voice past the stack's old width, after
+  a voice takes its filter lane, so any voice past the stack's old width, after
   the Voices dial had been turned mid-phrase, sounded with no lane at all. The
   render then asked for group 31 of three and panicked inside the CoreAudio
   callback, which ends the process and whatever was unsaved with it. Those
@@ -2873,7 +3194,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The Project dialog's Done button fell off the bottom edge.** It has done
   this twice. The stack was laid out straight down with Done as its last item
   and the window sized by hand to fit, so the first time a row was added the
-  button went past the bottom and the fix was to grow the window — which is not
+  button went past the bottom and the fix was to grow the window, which is not
   a rule, and the next row put it back off the edge, leaving a dialog whose only
   way out was Esc. The button is reserved at the foot now and the body scrolls
   above it, the same shape the Export dialog already uses, so a row added later
@@ -2883,14 +3204,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The metronome's sound row said the same thing twice, and a chosen click
   could go missing.** With nothing chosen the two controls read "built-in" and
-  "default" — one naming the click you were on, one naming the click you would
+  "default": one naming the click you were on, one naming the click you would
   go back to, which are the same click, so neither said what pressing it would
   do. They are **Default** and **Custom** now, in that order, and Custom wears
   the chosen file's own name once there is one. And the file is now KEPT rather
   than pointed at: choosing a click copies it into Tangent's own folder and the
   setting names the copy, so renaming a folder or emptying a Downloads
   directory no longer drops the metronome silently back to the shipped click.
-  One slot, replaced each time — this is a preference, not a library.
+  One slot, replaced each time: this is a preference, not a library.
 
 - **The DX7 picker opens lit on the patch the strip is playing.** It had been
   lighting the row for exactly one frame: the host's answer to the open, the
@@ -2899,13 +3220,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   now the row the strip's setting names, in both cases.
 
 - **An audio system that opens and then plays nothing is set aside instead of
-  being tried for ever.** A driver that refuses to open is easy — the open
+  being tried for ever.** A driver that refuses to open is easy: the open
   fails, Tangent falls back, and the band says why. The expensive case is a
   driver that says yes and does nothing: the stream is "running", the watchdog
   declares it dead two seconds later, the rebuild opens the same driver, it says
   yes again, and the app oscillates between silence and rebuilding for as long
   as anybody leaves it there. Nothing in that loop is an error, so nothing in it
-  ever fell back. Windows has a stock example — Realtek ships a generic ASIO
+  ever fell back. Windows has a stock example: Realtek ships a generic ASIO
   wrapper, so a machine with no interface still presents "an ASIO device", and a
   tester's log has Tangent announcing it was back on ASIO and playing silence.
   An engine torn down having served zero callbacks never worked at all; two of
@@ -2917,13 +3238,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The ASIO fallback was a one-shot, so the second time it was needed the app
   went silent for the session.** With `audio_system` set to ASIO and no
   interface plugged in, Tangent opens the platform default instead and says so.
-  It marks what it is standing in for — the mark keeps the reprobe watching for
-  the interface and carries the "back on ASIO" line when it returns — and it was
+  It marks what it is standing in for (the mark keeps the reprobe watching for
+  the interface and carries the "back on ASIO" line when it returns), and it was
   also, wrongly, being asked whether a fallback was allowed at all. It cannot
   answer that: the mark is cleared in one place, and only once the chosen system
   is back, which the stand-in itself rules out. So it stayed set. Drop the
-  engine for any reason — an output that went quiet, a band closed and reopened
-  — and the rebuild restored ASIO, failed on it, found the mark still set,
+  engine for any reason (an output that went quiet, a band closed and reopened)
+  and the rebuild restored ASIO, failed on it, found the mark still set,
   refused to fall back a second time, and spent its retries on hardware that was
   not there. Permanent silence, on a machine where choosing WASAPI by hand
   worked perfectly. The decision to fall back no longer consults the mark; the
@@ -2933,12 +3254,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   recorded through.** There is one insert rack per channel and it is clocked
   once a block, so when the control room is monitoring an input it claims that
   channel's rack and the timeline's own pass stands aside. The claim was made
-  for *any* armed channel, monitoring or not — and monitoring ships off, so the
+  for *any* armed channel, monitoring or not, and monitoring ships off, so the
   ordinary state of an armed channel was a rack claimed by a room that was not
   listening, whose entire output was then removed from the speakers again by
   the monitor gate. The lane stood aside for nothing and its audio went to the
   bus dry: record a part, leave the lane armed, press play, and the compressor
-  or amp you recorded through is not on it. Nothing platform-specific — every
+  or amp you recorded through is not on it. Nothing platform-specific: every
   desk did it. The rack now goes to whichever path can use it. If the room is
   listening it keeps it and takes the lane's own audio through it as well, so
   one run serves both. If the room is not listening and the lane holds audio,
@@ -2949,8 +3270,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The rate follower was building two AudioUnits a second, forever.** cpal's
   macOS `default_output_config` instantiates an AUHAL just to read a device's
   buffer range, and the poll that watches for a sample-rate change called it
-  twice a second for the life of the process — 21 ms median, 32 ms at the 95th
-  percentile, measured, on a thread that exists to notice one number changing.
+  twice a second for the life of the process (21 ms median, 32 ms at the 95th
+  percentile, measured) on a thread that exists to notice one number changing.
   It reads that number directly now. `TANGENT_RATE_POLL=auhal` puts the old road
   back for an A/B, and a test pins the two to the same answer.
 
@@ -2963,24 +3284,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   byte-identical.
 
 - **A note entered by double-click rang for ever on Analog.** Every preview in
-  the MIDI editor is gated by a hand — a press sounds it, the release quiets it
-  — except this one. A double-click writes its note on the second *release*, so
+  the MIDI editor is gated by a hand (a press sounds it, the release quiets it)
+  except this one. A double-click writes its note on the second *release*, so
   the note-on happens with the gesture already over and the release handler
   that would have closed the gate already returned past. The note-off was never
   sent at all: the note stood open until the next click anywhere in the roll.
-  That is inaudible on every instrument that decays, which is how it survived —
+  That is inaudible on every instrument that decays, which is how it survived:
   a piano, a Rhodes, a kit and most DX7 patches all fall silent on their own.
   Analog does not: its envelope ships sustaining at 0.8 and holds for exactly as
   long as the gate is open, so what was a silent leak everywhere else was an
-  endless note there. The written note is given a length now — its own, so what
-  you hear is what you drew — and underneath that, anything the editor is
+  endless note there. The written note is given a length now (its own, so what
+  you hear is what you drew), and underneath that, anything the editor is
   sounding with no deadline and no hand on it is let go of the next frame,
   which covers every early return in that file rather than only the one that
   was found.
 
 - **A take's video was short by exactly the number of frames it repeated.** The
   pump has two clocks and until now it used both. `Compositor::frame` is
-  pipelined one deep — it submits tick *n* and hands back tick *n − 1* — so a
+  pipelined one deep (it submits tick *n* and hands back tick *n − 1*), so a
   composited frame arrived carrying a timestamp one tick behind the pump's own
   counter, while a repeated frame, which composites nothing, carried the
   counter itself. Interleave the two and time runs backwards over every repeat:
@@ -2990,13 +3311,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   showed: a 10-second window take asked for 306 frames, repeated 43, and its
   file held 263. The file's clock is the encoder's own count now, which cannot
   run backwards by construction, and a frame the encoder will not take is
-  counted as a frame the encoder dropped — so this class of fault can never be
+  counted as a frame the encoder dropped, so this class of fault can never be
   silent again.
 
 - **A window take of a quiet moment ended on a red warning about a video with
   nothing wrong with it.** A screen capture delivers only when the screen
   changes, so a still window sends nothing and the take repeats the frame it
-  already has — the picture is exactly right and no machine was late. Those
+  already has: the picture is exactly right and no machine was late. Those
   repeats were counted beside the ones a machine that cannot composite in time
   makes, and every take that held still asked the owner to "lower the video
   size in Export", which could not have helped. They are counted apart now
@@ -3005,7 +3326,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The cursor wore a ring in every window take.** `capturesMouseClicks` is a
   different thing from capturing the pointer: it paints macOS's own click
   decoration, a hard ring that swells around the cursor on every press, into
-  the frame — several times a bar over somebody playing, and burnt in with no
+  the frame, several times a bar over somebody playing, and burnt in with no
   way to take it out afterwards. The pointer is still in the picture; the
   decoration is not.
 
@@ -3028,14 +3349,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   itself now and spends each pair, so the next two make another.
 
 - **A note would not go in near the playhead, on either side of it.** Two faults
-  meeting. A note's edges are spread wide so a hand can catch them and pull —
-  seven points inside the note and four outside — and that band answered for
+  meeting. A note's edges are spread wide so a hand can catch them and pull
+  (seven points inside the note and four outside), and that band answered for
   double-clicks too, which have no meaning on a resize handle: eleven points
   around every note border where a double-click did nothing at all. And the
   band lands on the playhead, because a click with the pen up locates, snapped,
   and the double-click that follows writes its note from the same snapped grid
   line: the new note's border and the playhead are the same pixel. A click
-  reads past the resize zones now — on the note it is the note, past it is the
+  reads past the resize zones now: on the note it is the note, past it is the
   empty roll it looks like. The arrangement's clips had the same fault at their
   resize ends and fade corners, where a double-click would not open a MIDI item.
 
@@ -3043,23 +3364,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   scale.** Two faults on the same readout, and each one hid the other. The
   host published the wizard's live picture only while the IR road was "doing
   something", and it decided that partly by reading the very meter the picture
-  carries — a return at −200 dBFS made the host conclude nothing was happening
+  carries: a return at −200 dBFS made the host conclude nothing was happening
   and stop pushing. The stage-2 tone runs with an empty capture buffer, so
   during the whole of the level page that return level was the *only* thing
   that could keep the picture flowing: a loop bringing nothing back froze the
   wizard on whatever it last held, for the rest of the session. The case that
   went dark is exactly the case the page exists for. A dead loop is the one
   fault still fixable with the cable in your hand at the interface, the page
-  has a sentence ready for it — "Nothing is coming back — check the loop's
-  cables and the unit's bypass" — and that sentence is chosen by a number the
+  has a sentence ready for it ("Nothing is coming back - check the loop's
+  cables and the unit's bypass"), and that sentence is chosen by a number the
   host had decided not to send. Underneath it, the resting picture itself was
   wrong: `IrLive` derived its default, so four dBFS fields whose own
   documentation says −200 for silence rested at 0.0, and on a dBFS scale 0.0 is
   not "nothing", it is FULL SCALE. Every wizard is built from that default and
   then handed it, so a freshly opened level page drew its bar hard right and
   warned about clipping over a loop nobody had measured yet. The picture now
-  follows the PANEL rather than the signal — an open wizard is pushed to every
-  frame whatever the numbers say — silence rests at silence, and a road with no
+  follows the PANEL rather than the signal (an open wizard is pushed to every
+  frame whatever the numbers say), silence rests at silence, and a road with no
   engine behind it publishes silence rather than going on showing levels off a
   device that is no longer open. The level page also carries the road's own
   phase line now, the way the sweep and result pages always have, so a tone
@@ -3068,17 +3389,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **A full-speed export rendered every plugin at its last-saved knobs, not the
   ones the desk is playing.** An export builds a second engine and furnishes it
-  by hand, and it filled every rack from the sidecar files on disk — which are
+  by hand, and it filled every rack from the sidecar files on disk, which are
   written when a project is saved, when a plugin's own window is closed, when a
   session is replaced and at quit, and by nothing else. No knob writes them,
   and the suite's own units have no window whose closing writes them either. So
   a compressor dialled in on a track and exported before the next save was
-  rendered by a mirror still wearing whatever that bay wore at the last save —
+  rendered by a mirror still wearing whatever that bay wore at the last save:
   its shipped defaults, if the bay had never been saved at all. On the master
   that reads as "the export sounds wrong". On stems it reads as something
   worse, and is how it was reported: the settings a unit sits at before
-  somebody dials it in are precisely the ones that do nothing — a flat EQ, zero
-  drive, a compressor still at 1:1 — so a **Processed** stems export came out
+  somebody dials it in are precisely the ones that do nothing (a flat EQ, zero
+  drive, a compressor still at 1:1), so a **Processed** stems export came out
   indistinguishable from the dry one, with every part of the dry/processed
   switch working correctly on audio that had been through a rack with nothing
   in it. An export now takes each bay's knobs off the desk, and falls back to
@@ -3088,17 +3409,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   painted in the same egui band as the dialogs and one band below the export
   render window, so a "Preparing export" or "Writing files" cover could sit
   behind the very window whose work it was reporting. There is one rule now,
-  stated once and used by both covers — this one and the launch splash: a cover
+  stated once and used by both covers (this one and the launch splash): a cover
   paints above every band any surface of this app can ask for, because a cover
   is the last thing on screen before the app stops answering. And on the
   desktop, where a dialog is a window of its own that no paint order can reach
   over, an announced block now waits one frame longer: for a frame that no
   longer carries the window that asked for the work. A window is destroyed by
   not being drawn, and the pass that would not draw it was the pass that
-  blocked — so pressing Export used to freeze the Export dialog on top of the
+  blocked, so pressing Export used to freeze the Export dialog on top of the
   progress cover for the whole length of the render.
 
-- **A plugin on an audio track did nothing at all.** Not "processed silence" —
+- **A plugin on an audio track did nothing at all.** Not "processed silence":
   it did not run. An audio clip passed through its lane's fader, pan, mute,
   solo and send, and then went straight to the master having entered no insert
   rack anywhere in the engine; the lane's rack was reached only by MIDI notes
@@ -3108,14 +3429,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   fixture with a constant clip thirty decibels over a 20:1 compressor's
   threshold, on that compressor's own lane: the master peaked at 0.8999999
   with the plugin loaded and 0.8999999 without it, bit for bit. It now peaks
-  at 0.0285 — thirty decibels of gain reduction that had been going nowhere.
+  at 0.0285: thirty decibels of gain reduction that had been going nowhere.
 
   **This changes the mix of existing projects.** Any project with a plugin in
   an audio track's bay has been rendering as if that bay were empty, and will
   now render through it: the master, the stems and every bounce. An export
   made before this release is not reproducible after it. Nothing needs
-  converting — the desk always showed the plugin, and the audio has finally
-  caught up with what it said — but a mix balanced against a bay that was
+  converting (the desk always showed the plugin, and the audio has finally
+  caught up with what it said), but a mix balanced against a bay that was
   doing nothing will want another listen.
 
   The clips' separate delay compensation went with it. They used to hold
@@ -3126,7 +3447,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The window title was costing a sixth of every frame.** It asked whether the
   project was dirty once per frame, and asking meant serialising the entire
-  document to JSON — 2.6 ms on a modest session. It is a structural fingerprint
+  document to JSON, 2.6 ms on a modest session. It is a structural fingerprint
   now, about thirty times cheaper, with the exact comparison kept everywhere a
   wrong answer could lose work.
 - **The piano roll drew two circles per note in its velocity lane**, seventeen
@@ -3136,7 +3457,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Opening a project made twenty-six thousand filesystem calls, twice**, walking
   every one of 4,389 seats when two of them held anything.
 - **Consecutive strikes popped on every MIDI instrument**, worst under the
-  pedal, because a re-struck key reused its voice and then reset it — clearing
+  pedal, because a re-struck key reused its voice and then reset it, clearing
   a ringing waveguide mid-cycle, reseeding modal banks, overwriting a DX7 slot.
   A hammer adds energy to a string rather than silencing it, and restrikes now
   superpose. Underneath it was a slot leak: a percussive DX7 patch held by the
@@ -3151,18 +3472,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Tangent Keys: a piano and an electric piano, computed rather than
   recorded.** A third built-in instrument beside the DX7 and the drumpad, on
   the sentinel `@tangent-keys`, containing no samples at all. **Piano 1** is a
-  jazz grand voiced for solo playing, built as a digital waveguide — a delay
+  jazz grand voiced for solo playing, built as a digital waveguide: a delay
   line whose length is the pitch, a frequency-dependent loss filter for the
   decay, and an all-pass cascade for the stiffness that stretches a piano's
   partials sharp. **EP Mk.1** is a tine electric piano taken dry, and it is
   built a completely different way on purpose: a tine is a stiff bar, not a
   flexible string, so its modes are nowhere near harmonic and a waveguide
-  cannot make them. It is modal instead — a bank of decaying sinusoids, each
+  cannot make them. It is modal instead: a bank of decaying sinusoids, each
   sitting where the metal actually puts it. Its velocity response is three
   mechanisms rather than a volume curve: a contact time that shortens with
   force and therefore feeds the high modes, a neoprene tip that stiffens as it
   compresses, and an electromagnetic pickup whose output goes as the inverse
-  square of its gap. The last one is why hitting it hard *barks* — the transfer
+  square of its gap. The last one is why hitting it hard *barks*: the transfer
   is lopsided only when the tine is swinging wide, so the distortion arrives
   with force and is simply absent when the note is quiet, which is something a
   waveshaper on the output could never do without dirtying the soft notes too.
@@ -3170,7 +3491,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the fundamental to 18 dB under it, and waveform asymmetry from 0.017 to
   0.382, both monotonically. The whole module is pure `std` and adds no
   dependency, the same as the DX7's, so it compiles standalone on a bench that
-  renders a scripted performance to a WAV in under a second — which is how all
+  renders a scripted performance to a WAV in under a second, which is how all
   of the above was tuned and how three defects invisible in the source were
   found. `docs/KEYS.md` has the design notes and the measurement method.
 
@@ -3495,29 +3816,29 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   came back at double speed against its own video with up to half its frames
   counted as dropped. The graph hands the `pipewire` PCM one quantum per
   cycle; a `Fixed(256)` request under a 512-frame `clock.min-quantum` gave the
-  ring 256 of every 512 frames and *discarded the rest below every counter* —
+  ring 256 of every 512 frames and *discarded the rest below every counter*:
   no xrun, no error, honest timestamps, a clean-looking stream at exactly half
   rate. The take's timeline is indexed by device frames, so a fifteen-second
-  performance was written as a "7.5-second" take, and the desk's tap ring —
-  drained at the halved pace — overflowed from the eighth second on, which is
+  performance was written as a "7.5-second" take, and the desk's tap ring
+  (drained at the halved pace) overflowed from the eighth second on, which is
   where the huge `frames_dropped` numbers actually came from. The input now
   sizes its ring to cover twice the graph's floor (the request still decides
-  the period, so nobody's graph gets dragged coarser), and `takeprobe` — a new
+  the period, so nobody's graph gets dragged coarser), and `takeprobe` (a new
   headless instrument that runs the app's own capture drain against a real
-  device — measured the same stream at full rate with the fix and half rate
+  device) measured the same stream at full rate with the fix and half rate
   without it. JACK takes were never affected: a JACK client's buffers are the
   graph's own cycle, so there is no ring to mismatch.
 
 - **A take whose measured rate is far from its nominal one now says so out
-  loud.** The rate fit measured the halving above perfectly — `epsilon_ppm:
-  -499993` sat in every damaged manifest — and nothing read the number. A
+  loud.** The rate fit measured the halving above perfectly (`epsilon_ppm:
+  -499993` sat in every damaged manifest), and nothing read the number. A
   device-fed take with a fitted clock more than 10,000 ppm off nominal now
   raises a problem naming both rates: crystals lie by parts per million,
   delivery faults lie by factors, and there is nothing between.
 
 ### Added
 
-- **JACK on Linux**, beside ALSA, in the Audio Setup panel's SYSTEM row — the
+- **JACK on Linux**, beside ALSA, in the Audio Setup panel's SYSTEM row, the
   row that has been a readout on every Linux build until now. Choosing it makes
   Tangent an ordinary client of the graph, named `Tangent`, so its ports appear
   in qjackctl, Carla or Patchance and can be patched into a DAW. It works
@@ -3525,8 +3846,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   nearly every desktop Linux is running.
 
   **It is offered for the routing, not for the latency.** The expectation was
-  the opposite — a JACK client skips pipewire-alsa and the four-period ring
-  `BUFFER_PERIODS` had to add for it — and the measurement did not support it:
+  the opposite (a JACK client skips pipewire-alsa and the four-period ring
+  `BUFFER_PERIODS` had to add for it), and the measurement did not support it:
   capture to playback through the monitor ring came out at 23.4 ms against
   ALSA's 5.6 ms on the dev box. `docs/LINUX-JACK-FINDINGS.md` has the runs and
   shows why neither figure means what it looks like, the short version being
@@ -3539,14 +3860,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   What it does fix outright is **which interface you record.** Through ALSA on
   a PipeWire machine there is one openable device, called `pipewire`, and it
-  follows whatever the desktop's default source happens to be — the fault that
+  follows whatever the desktop's default source happens to be: the fault that
   once recorded a laptop microphone with an interface plugged in. Through JACK
   the ports carry the interface's real name.
 
   **It costs the artifact nothing.** libjack is `dlopen`ed on demand rather than
   linked, so `readelf -d` on the Linux binary gains no entry and a desktop with
   no pro-audio stack installed runs exactly what it ran before. No new crate
-  enters the dependency graph either — `jack` was already there for the FreeBSD
+  enters the dependency graph either: `jack` was already there for the FreeBSD
   build. Choosing JACK on a machine where no server answers falls back to ALSA
   rather than leaving the app silent.
 
@@ -3554,14 +3875,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The Audio Status line no longer names a ring that does not exist.** The
   period and the ring were derived from `BUFFER_PERIODS`, a per-PLATFORM
-  constant, where they are really a property of the HOST in use — so a Linux
+  constant, where they are really a property of the HOST in use, so a Linux
   build had one number for two driver stacks. Under JACK that would have
   reported a 128-frame period for a 512-frame callback, next to a 2048-frame
   ring belonging to nobody. `BufferRule` now carries the distinction from the
   open, where the real host is known.
 - **Under JACK the input picker no longer offers devices it cannot open.** The
   PipeWire node list is a workaround for cpal's ALSA host, and it REPLACES
-  cpal's own list rather than joining it — so through JACK, where there is no
+  cpal's own list rather than joining it, so through JACK, where there is no
   `pipewire` PCM to aim, every row in the picker would have failed to open and
   the one that works would have been hidden behind them. A saved `pw:` choice
   from an earlier ALSA session falls back to the host's default instead of

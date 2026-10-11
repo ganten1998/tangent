@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, Column, Strip, CHANNELS, INSERTS};
+use crate::recorder::{gain_text, gain_to_fader, Column, Strip, INSERTS, VISIBLE_MAX};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -31,8 +31,8 @@ pub struct StripView<'a> {
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
     /// **Six, because the master has two racks.** A channel fills the first
-    /// three and leaves the rest empty. See `recorder::seat_bay`, which is
-    /// the one place that knows a slot's real seat.
+    /// three and leaves the rest empty. See `desk_id::slot_key`, which is
+    /// the one place that knows a slot's real bay.
     pub inserts: [&'a str; INSERTS * 2],
     /// How many routes leave this channel, for the strips under the button.
     /// The routes THEMSELVES live on the view, not the strip: one borrow for
@@ -88,24 +88,20 @@ pub struct StripView<'a> {
     /// This channel's MIDI goes to the theory view — the **T** switch.
     pub to_theory: bool,
     /// This channel IS a folder — a group head, wearing six bays like the
-    /// master. See `recorder::folder_extra_seat`.
+    /// master: slots 3..5 are its second rack (`desk_id::slot_key`).
     pub is_folder: bool,
     /// This channel lives inside a folder above it. Drawn a step LOWER —
     /// the mixer's vertical answer to the arrangement's indent.
     pub in_folder: bool,
     /// The folder is shut. Said by the folder glyph's arrow.
     pub folder_shut: bool,
-    /// A child of a SHUT folder: the strip collapses out of the row, the
-    /// same disappearance the arrangement performs - the owner unified the
-    /// two views' folding.
-    pub hidden: bool,
     /// Which bays wear a sidechain key, for the dot in the chip's corner.
     /// Same indexing as `inserts`: the strip's visible slots.
     pub keyed: [bool; INSERTS * 2],
     /// **Which bays are BYPASSED** — kept, loaded, editable, and not
     /// applied. Same indexing as `inserts` and `keyed`: the strip's visible
     /// slots, which for the master and a folder span two racks. The caller
-    /// resolves that through `recorder::seat_bay` before asking, exactly as
+    /// resolves that through `desk_id::slot_key` before asking, exactly as
     /// it does for the names.
     ///
     /// Appended after `keyed` and not woven in beside it, for the reason
@@ -114,6 +110,51 @@ pub struct StripView<'a> {
     pub bypassed: [bool; INSERTS * 2],
     /// **Frozen** - see `arrangement_panel::LaneView::frozen`. Appended.
     pub frozen: bool,
+    /// **What an empty strip's plus is**: an empty row's, or the desk's one
+    /// trailing add, open or locked. Read only on an `empty` strip.
+    pub plus: Plus,
+    /// **This strip's sends to buses and returns**, in the order they were
+    /// made: what its send rows draw (the knob is its send into the effects
+    /// return and is not here). Empty on a strip that sends nowhere.
+    /// Appended.
+    pub sends: Vec<SendRow>,
+    /// **The track's identity**, `None` for the click and the master: what
+    /// its controls' accessibility ids are keyed by ([`a11y_key`]), so a
+    /// reorder or an insert above never hands a reader's focus to the track
+    /// that moved into this one's row. Appended.
+    pub id: Option<crate::desk_id::TrackId>,
+}
+
+/// **One send as a strip's row draws it**: the bus's name, the level, and
+/// whether it is taken before the fader.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendRow {
+    pub label: String,
+    /// 0..=1.
+    pub level: f32,
+    pub pre: bool,
+}
+
+/// **What the plus on an empty strip or lane is** (docs/design/
+/// unlimited-tracks.md, section 10). Both views draw it and both ask it.
+///
+/// The desk is the list of rows that exist, so the slots it drew past its
+/// tracks (thirty-two of them, most of them plus signs) are gone, and one
+/// plus after the last track is where a new one comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Plus {
+    /// A drawn row with no track on it yet (the indented plus inside a
+    /// folder, a row holding a plugin and nothing else): its number, and a
+    /// plus that makes the track ON it.
+    #[default]
+    Row,
+    /// **The trailing add**: left of the pinned click and master on the
+    /// desk, a row under the last lane on the timeline. No number, since it
+    /// is no row yet; its plus is Add (`TangentApp::add_track`).
+    Trailing,
+    /// The trailing add at the free cap: a padlock where the plus was, and
+    /// its press opens the Supporter Key dialog rather than refusing.
+    Locked,
 }
 
 impl StripView<'_> {
@@ -123,9 +164,133 @@ impl StripView<'_> {
         self.strip.is_some_and(Strip::sends) && !self.empty
     }
 
+    /// **Whether this strip is a bus** (or a return): a row of its own kind,
+    /// with no input to choose and nothing to arm (design 9).
+    pub fn is_bus(&self) -> bool {
+        self.kind == Some(crate::recorder::ChannelKind::Bus)
+    }
+
+    /// **Whether it wears the send rows**: a track's strip (a folder's and a
+    /// bus's included) that is there. The click sends nowhere and the
+    /// master has nothing past it to send to.
+    fn send_rows(&self) -> bool {
+        matches!(self.strip, Some(Strip::Channel(_))) && !self.empty
+    }
+
     /// Whether it has controls at all. An empty slot has one: the plus.
     fn live(&self) -> bool {
         self.strip.is_some() && !self.empty
+    }
+
+    /// The column this strip is drawn in. Every strip a view carries has
+    /// one: a track's row, the click, or the master.
+    pub fn column(&self) -> Column {
+        match self.strip {
+            Some(Strip::Channel(row)) => Column::Track(row),
+            Some(Strip::Click) => Column::Click,
+            // The drum bus and the effects return have no column and are
+            // never in a view; the master is `None`.
+            Some(Strip::Drums | Strip::Fx) | None => Column::Master,
+        }
+    }
+}
+
+/// **The strips a view carries: a WINDOW of the tracks, and the two pinned
+/// strips.**
+///
+/// It was `[StripView; COLUMNS]`, every column of the desk built every frame
+/// whether it was on screen or forty strips off it, and the array's last
+/// two entries were the click and the master by position. The desk has no
+/// fixed width (docs/design/unlimited-tracks.md, sections 2 and 10), so a
+/// view carries the tracks the layout will place, in RANK order (the
+/// drawn order, which a shut folder's children have left), plus the click
+/// and the master by NAME, plus the totals the scroll range needs.
+///
+/// `first` is the rank of `tracks[0]` among every drawn track; `shown` is
+/// how many are drawn on the whole desk. A dense view (every drawn track) is
+/// `first: 0` with `tracks.len() == shown`; a windowed one is what
+/// [`track_window`] said the layout will place.
+pub struct DeskStrips<'a> {
+    /// The tracks this view carries, in rank order, rows ascending.
+    pub tracks: Vec<StripView<'a>>,
+    /// The rank of `tracks[0]`.
+    pub first: usize,
+    /// How many tracks are drawn on the whole desk: the scroll range.
+    pub shown: usize,
+    /// The click's pinned strip.
+    pub click: StripView<'a>,
+    /// The master's pinned strip.
+    pub master: StripView<'a>,
+}
+
+impl<'a> DeskStrips<'a> {
+    /// Where a track's strip sits in `tracks`, by its row. The tracks run in
+    /// row order (folders are positional, and a shut folder only removes
+    /// rows), so this is a binary search.
+    fn slot(&self, row: usize) -> Option<usize> {
+        self.tracks
+            .binary_search_by_key(&row, |v| match v.strip {
+                Some(Strip::Channel(r)) => r,
+                _ => usize::MAX,
+            })
+            .ok()
+    }
+
+    /// The strip a column shows, when this view carries it.
+    pub fn get(&self, col: Column) -> Option<&StripView<'a>> {
+        match col {
+            Column::Track(row) => self.slot(row).map(|k| &self.tracks[k]),
+            Column::Click => Some(&self.click),
+            Column::Master => Some(&self.master),
+        }
+    }
+
+    /// [`Self::get`], to change.
+    pub fn get_mut(&mut self, col: Column) -> Option<&mut StripView<'a>> {
+        match col {
+            Column::Track(row) => self.slot(row).map(|k| &mut self.tracks[k]),
+            Column::Click => Some(&mut self.click),
+            Column::Master => Some(&mut self.master),
+        }
+    }
+
+    /// A track's rank among every drawn track, when this view carries it.
+    pub fn rank_of(&self, row: usize) -> Option<usize> {
+        self.slot(row).map(|k| self.first + k)
+    }
+
+    /// Every strip carried, in drawn order: the tracks, the click, the master.
+    pub fn iter(&self) -> impl Iterator<Item = (Column, &StripView<'a>)> {
+        self.tracks
+            .iter()
+            .map(|v| (v.column(), v))
+            .chain([(Column::Click, &self.click), (Column::Master, &self.master)])
+    }
+
+    /// How many strips were BUILT for this view, the pinned two included:
+    /// what the bounds tests hold to the visible count.
+    pub fn len(&self) -> usize {
+        self.tracks.len() + 2
+    }
+
+    /// Never empty: the click and the master are always carried.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl<'a> std::ops::Index<Column> for DeskStrips<'a> {
+    type Output = StripView<'a>;
+    /// Panics on a track this view does not carry, as an array did past its
+    /// end. Tests index; the views themselves ask [`DeskStrips::get`].
+    fn index(&self, col: Column) -> &StripView<'a> {
+        self.get(col).unwrap_or_else(|| panic!("{col:?} is not in this view"))
+    }
+}
+
+impl<'a> std::ops::IndexMut<Column> for DeskStrips<'a> {
+    fn index_mut(&mut self, col: Column) -> &mut StripView<'a> {
+        self.get_mut(col).unwrap_or_else(|| panic!("{col:?} is not in this view"))
     }
 }
 
@@ -145,10 +310,9 @@ pub fn shade_face(c: Color32, k: f32) -> Color32 {
 }
 
 pub struct MixerView<'a> {
-    /// Every channel, then the master last. Fixed, because the desk is fixed:
-    /// an app whose strips appear and disappear as things are loaded is a desk
-    /// that changes shape under your hands.
-    pub strips: [StripView<'a>; COLUMNS],
+    /// The tracks the layout will place, then the click and the master.
+    /// See [`DeskStrips`] for why it is a window and not the whole desk.
+    pub strips: DeskStrips<'a>,
     /// **What the click is playing**, as a word: the chosen file's name, or
     /// the bundled click's. Drawn on the click's own button, which opens the
     /// metronome panel.
@@ -167,11 +331,6 @@ pub struct MixerView<'a> {
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
-    /// How many channels this install works at — the paywall's number
-    /// (`TangentApp::active_channels`). Capacity stays [`CHANNELS`]; this
-    /// bounds what the desk DRAWS and how far it scrolls, so a free
-    /// install neither shows nor reaches the supporter lanes.
-    pub active: usize,
     pub dark_mode: bool,
     /// Every route on the desk: source channel, label, fader. Each strip
     /// draws the ones that leave it, in order.
@@ -206,7 +365,11 @@ pub struct MixerView<'a> {
     /// Every selected channel. Shift takes a range, Cmd or Ctrl takes them one
     /// at a time; all of them wear the rim, because a selection you cannot see
     /// the extent of is not one.
-    pub selected_tracks: &'a [usize],
+    ///
+    /// Owned rows: the app holds the selection by track identity and finds
+    /// each track's row as the view is built, so there is no slice of rows
+    /// on its side to borrow.
+    pub selected_tracks: Vec<usize>,
     /// Whether the OPEN insert menu's bay can take a sidechain key, which is
     /// what earns it the third row. On the view rather than per strip
     /// because at most one menu is up, and the app is the side that can ask
@@ -228,14 +391,16 @@ pub struct MixerView<'a> {
 
 impl MixerView<'_> {
     /// Whether a strip is heard right now, which is what dims it.
-    pub fn heard(&self, at: usize) -> bool {
+    pub fn heard(&self, at: Column) -> bool {
         let Some(s) = self.strips.get(at) else {
             return true;
         };
         if !s.live() {
             return true;
         }
-        if self.any_solo {
+        // **A bus is solo-safe** (design 9, owner call 4): another strip's
+        // solo never silences it, so it is not drawn as silenced by one.
+        if self.any_solo && !s.is_bus() {
             return s.soloed;
         }
         !s.muted
@@ -277,6 +442,16 @@ pub enum Hit {
     /// from the top of THIS channel's list — not an index into the desk's
     /// table, which the panel has no business knowing.
     RouteGain(Column, usize),
+    /// **One send row's level**, dragged sideways like a route's. The
+    /// second field is which send, counting from the top of THIS strip's
+    /// list of sends to buses (`StripView::sends`).
+    SendLevel(Column, usize),
+    /// **The send rows' plus**: open the routing window on its list of
+    /// buses and returns to send to.
+    SendAdd(Column),
+    /// **The +N chip** on a strip with more sends than rows: open the
+    /// routing window, where every one of them is.
+    SendMore(Column),
     /// The decibel readout: type a number into it.
     Db(Column),
     /// The channel's name: type a new one.
@@ -429,10 +604,16 @@ impl Hit {
             | Hit::FxMenu(i, ..)
             | Hit::InputChip(i)
             | Hit::Routing(i)
-            | Hit::RouteGain(i, _) => i,
+            | Hit::RouteGain(i, _)
+            | Hit::SendLevel(i, _)
+            | Hit::SendAdd(i)
+            | Hit::SendMore(i) => i,
             // The click's sound button is on the click's column, which is
-            // where it is drawn.
-            Hit::MetFile => Column(Strip::Click.index()),
+            // where it is drawn. It answered `Column(Strip::Click.index())`,
+            // the click's DESK index read as a column, which was the master's
+            // column: the aliasing the column type exists to stop, in the
+            // one arm nobody pressed through a column-keyed handler.
+            Hit::MetFile => Column::Click,
         }
     }
 
@@ -450,11 +631,15 @@ impl Hit {
             // down, and a control that fills to the right has to be swept to
             // the right or the picture and the hand disagree.
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
+            // A send row lies down too: the same picture, the same sweep.
+            Hit::SendLevel(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
             | Hit::MetFile
-            | Hit::Routing(_) => None,
+            | Hit::Routing(_)
+            | Hit::SendAdd(_)
+            | Hit::SendMore(_) => None,
         }
     }
 
@@ -465,11 +650,14 @@ impl Hit {
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
+            Hit::SendLevel(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
             | Hit::MetFile
-            | Hit::Routing(_) => None,
+            | Hit::Routing(_)
+            | Hit::SendAdd(_)
+            | Hit::SendMore(_) => None,
         }
     }
 }
@@ -1177,8 +1365,14 @@ impl Palette {
     /// original run; 17..24 in the palette's extension block. PALETTE_RUN
     /// and not CHANNELS: the run length is table HISTORY, and history does
     /// not grow when the desk does.
+    ///
+    /// **Folded by [`crate::recorder::PALETTE_SLOTS`], not by the desk's
+    /// width**: the palette is thirty-two colours deep whatever the desk
+    /// holds, so track 32 starts the deal again at track 0's colour rather
+    /// than the period moving (and every track's colour with it) the day the
+    /// desk stops being thirty-two wide.
     pub fn slot(&self, i: usize) -> usize {
-        let i = i % CHANNELS;
+        let i = i % crate::recorder::PALETTE_SLOTS;
         if i < PALETTE_RUN {
             self.base + i
         } else if i < PALETTE_RUN + 8 {
@@ -1339,20 +1533,6 @@ const FADER_TRAVEL: f32 = 420.0;
 /// the same room a fader does.
 const SEND_TRAVEL: f32 = 420.0;
 
-/// Where everything on one strip is, and where the strips are.
-///
-/// Fractions of the rect rather than points, so the same layout holds at every
-/// window size the app offers — and so the hit test and the painter cannot
-/// drift, because they read the same struct.
-/// The drawn channels, plus the master.
-///
-/// Every instrument slot, every input of the interface, the backing track and
-/// the master. The click and the effects return keep their place on the desk
-/// and are not drawn — their controls are the band's.
-// Eight general channels, the click, and the master. BACKING had a column
-// here and is retired: the arrangement's lanes carry audio now.
-pub const COLUMNS: usize = CHANNELS + 2;
-
 /// How many route strips a mixer channel shows before it stops growing.
 ///
 /// **Three, because they come out of the fader's travel.** Every strip is
@@ -1363,14 +1543,83 @@ pub const COLUMNS: usize = CHANNELS + 2;
 /// and the routing window remains where they are managed.
 pub const STRIP_ROUTES: usize = 3;
 
+/// **How many send rows a strip shows**; past them, the last row is a +N
+/// chip that opens the routing window, where every send is.
+///
+/// **A band every strip that can send wears, whatever it sends**: the route
+/// strips' pattern, minus the thing the owner struck out of it. Those grew
+/// one strip per route and took each out of the fader's travel, "so a column
+/// changed shape as you routed it"; these rows are always there (an empty
+/// one is the plus that makes the first send), so making a send or ten
+/// moves nothing on the strip. Two, because a dry track, a reverb return and
+/// a delay return is what most strips send to, and the knob above them is
+/// already the send into the effects. The room comes out of that knob band,
+/// which had the most to spare: the fader keeps every point of its travel.
+pub const STRIP_SENDS: usize = 2;
+
+/// **What one of a strip's send rows holds this frame.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendCell {
+    /// Nothing: a row past the plus.
+    Empty,
+    /// The strip's k-th send to a bus, a level lying down.
+    Level(usize),
+    /// The plus that sends the strip to a bus or a return.
+    Add,
+    /// "+n": this many sends past the rows above, behind one chip.
+    More(usize),
+}
+
+/// Where everything on one strip is, and where the strips are.
+///
+/// Fractions of the rect rather than points, so the same layout holds at every
+/// window size the app offers — and so the hit test and the painter cannot
+/// drift, because they read the same struct.
 pub struct Layout {
-    pub strips: [StripStrip; COLUMNS],
+    /// The strips PLACED this frame: the tracks in the scrolled window (and
+    /// the half strip at its edge), then the click, then the master.
+    pub strips: LaidStrips,
     /// The scrolling channel region — everything left of the pinned click.
     /// Channel strips CLIP to it (a half-scrolled strip stops at its edge
     /// rather than bleeding under the click), and a hit outside it belongs
     /// to nobody however far a partial strip's rectangle reaches.
     pub region: Rect,
+    /// **The scrollbar under the run**, `ScrollBar::NONE` when every track
+    /// fits. See [`ScrollBar`].
+    pub bar: ScrollBar,
 }
+
+/// **A thin scrollbar: where the desk is, and a handle to move it.**
+///
+/// The wheel was the only way along a desk wider than the window, and
+/// nothing said how much more there was or where the window stood in it. A
+/// desk that grows by appending needs both (docs/design/unlimited-tracks.md,
+/// section 10), so the run carries a bar in the margin under it: the track
+/// is the whole desk, the thumb is the part on screen, and a press on it
+/// moves the desk to the press (see [`scrollbar_grab`]).
+///
+/// It sits in the bottom margin, which no strip draws into and no control
+/// answers in, so it takes no press from anything that had one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollBar {
+    /// The whole desk's width, laid along the run.
+    pub track: Rect,
+    /// The window's share of it, where the window stands.
+    pub thumb: Rect,
+    /// The scroll, in pixels, that puts the thumb at the track's far end.
+    pub max_px: f32,
+}
+
+impl ScrollBar {
+    /// No bar: everything fits.
+    pub const NONE: Self = Self { track: Rect::NOTHING, thumb: Rect::NOTHING, max_px: 0.0 };
+}
+
+/// The bar's thickness, and its gap below the strips, both inside `PAD`.
+const BAR_H: f32 = 4.0;
+const BAR_GAP: f32 = 3.0;
+/// The shortest a thumb gets, so a very long desk still has a handle.
+const BAR_MIN: f32 = 18.0;
 
 /// One strip's rectangles.
 #[derive(Debug, Clone, Copy)]
@@ -1433,17 +1682,148 @@ pub struct StripStrip {
     /// A user effect plugin across this strip. Only the bus has one today.
     /// **Six, because the master has two racks.** A channel uses the first
     /// three and leaves the rest `NOTHING`; `recorder::bays_on` says how
-    /// many a strip actually draws. See `recorder::MASTER_EXTRA_SEAT`.
+    /// many a strip actually draws, and `desk_id::slot_key` which rack each
+    /// slot is (the master's show extra-first).
     pub inserts: [Rect; INSERTS * 2],
     /// The Routing button, under the insert bays — the owner's placement.
     pub routing: Rect,
     /// One small strip per route: a label and its own fader. `NOTHING` past
     /// what this channel actually routes. See [`STRIP_ROUTES`].
     pub routes: [Rect; STRIP_ROUTES],
+    /// **The send rows**, under the knobs. See [`STRIP_SENDS`]: the band is
+    /// laid on every strip that can send, and what each row is this frame
+    /// is [`Self::send_cells`]; a row holding nothing is `NOTHING`.
+    pub sends: [Rect; STRIP_SENDS],
+    pub send_cells: [SendCell; STRIP_SENDS],
+    /// **A BUS says so**, in the band a track names its input in: a readout
+    /// like the folder's chip, not a door. A bus has no input to choose
+    /// (design 9), and an empty chip there would read as one that failed to
+    /// draw.
+    pub bus_chip: Rect,
     /// The plus on an empty slot.
     pub add: Rect,
     /// The × at the top right of a removable channel. `NOTHING` on the rest.
     pub close: Rect,
+}
+
+/// **The placed strips, by column.** Only what the layout placed is in it,
+/// so walking it is O(visible); asking for a column it did not place
+/// answers [`StripStrip::NONE`], the "not here" every array slot past the
+/// window used to hold.
+#[derive(Debug, Clone, Default)]
+pub struct LaidStrips(Vec<(Column, StripStrip)>);
+
+/// The answer for a column the layout did not place.
+static NO_STRIP: StripStrip = StripStrip::NONE;
+
+impl LaidStrips {
+    /// A placed column's rectangles.
+    pub fn get(&self, col: Column) -> Option<&StripStrip> {
+        self.0.iter().find(|(c, _)| *c == col).map(|(_, s)| s)
+    }
+
+    /// Every placed strip in drawn order: the tracks, the click, the master.
+    pub fn iter(&self) -> impl Iterator<Item = (Column, &StripStrip)> {
+        self.0.iter().map(|(c, s)| (*c, s))
+    }
+
+    /// How many strips were placed.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether nothing was placed (a rect too small to hold a strip).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::ops::Index<Column> for LaidStrips {
+    type Output = StripStrip;
+    fn index(&self, col: Column) -> &StripStrip {
+        self.get(col).unwrap_or(&NO_STRIP)
+    }
+}
+
+/// **Where the scrolling run of tracks stands at a rect**: the pitch, the
+/// first rank on screen and the rank past the last, and how far the first
+/// hangs off the left edge.
+///
+/// One derivation, read by [`Layout::new`] to place strips and by
+/// [`track_window`] to tell the app which strips to build, so the window a
+/// view is built for and the window it is laid out in cannot disagree.
+struct Run {
+    inner: Rect,
+    unit: f32,
+    pitch: f32,
+    first: usize,
+    last: usize,
+    frac: f32,
+    /// The clamped scroll and its ceiling, for the bar.
+    px: f32,
+    max_px: f32,
+    /// How many tracks show across, and how many are drawn on the desk.
+    visible: usize,
+    shown: usize,
+}
+
+fn run(rect: Rect, visible: usize, shown: usize, scroll_px: f32) -> Option<Run> {
+    let inner = Rect::from_min_max(
+        Pos2::new(rect.min.x + PAD, rect.min.y + PAD),
+        Pos2::new(rect.max.x - PAD, rect.max.y - PAD),
+    );
+    if !inner.is_positive() {
+        return None;
+    }
+    // **Never more columns than the width can carry.** See `MIN_STRIP_W`.
+    // Two seats are always spoken for — the click and the master are
+    // pinned at the right and are not part of the scrolling run — which
+    // is the `+ 2` `metrics` also applies.
+    let fits_across = {
+        let inner_w = (rect.width() - 2.0 * PAD).max(1.0);
+        let slots = ((inner_w + GAP) / (MIN_STRIP_W + GAP)).floor() as usize;
+        slots.saturating_sub(2).max(1)
+    };
+    // **A shut folder's children do not occupy columns.** Position runs on
+    // RANK among the drawn tracks, so collapsing a folder closes the gap
+    // instead of leaving invisible pillars; `shown` is how many there are.
+    let shown = shown.max(1);
+    // **Sized by the count asked for, never by the track count** (design
+    // section 10). A desk shorter than the count shows its strips at the
+    // width the count gives them and leaves the rest of the run empty; it
+    // used to divide the run among the tracks there were, which never
+    // showed while every desk drew thirty-two columns and, once vacant rows
+    // were hidden, stretched a fresh desk's two strips and its add across
+    // the whole window.
+    let asked = visible.clamp(1, VISIBLE_MAX).min(fits_across);
+    let visible = asked.min(shown);
+    let (unit, pitch) = Layout::metrics(rect, asked);
+    // **Pixels, then a window with a remainder.** The scroll lands wherever
+    // the wheel left it; the first fully-or-partly visible column and how
+    // much of it hangs off the left edge both fall out of one division. One
+    // extra column draws on the right when the remainder exposes it — that
+    // half strip is the whole point.
+    let max_px = (shown.saturating_sub(visible)) as f32 * pitch;
+    let px = scroll_px.clamp(0.0, max_px.max(0.0));
+    let first = ((px / pitch).floor() as usize).min(shown.saturating_sub(1));
+    let frac = px - first as f32 * pitch;
+    let last = (first + visible + usize::from(frac > 0.5)).min(shown);
+    Some(Run { inner, unit, pitch, first, last, frac, px, max_px, visible, shown })
+}
+
+/// **The ranks of the tracks a layout at `rect` will place**: what the app
+/// builds strips for, so a view is O(visible) and never the whole desk.
+///
+/// `shown` is the number of drawn tracks (a shut folder's children are not
+/// drawn), `visible` the zoom and `scroll_px` the scroll, exactly as the
+/// view will carry them. Empty for a rect too small to hold a strip.
+pub fn track_window(
+    rect: Rect,
+    visible: usize,
+    shown: usize,
+    scroll_px: f32,
+) -> std::ops::Range<usize> {
+    run(rect, visible, shown, scroll_px).map_or(0..0, |r| r.first..r.last)
 }
 
 impl StripStrip {
@@ -1475,6 +1855,9 @@ impl StripStrip {
         inserts: [Rect::NOTHING; INSERTS * 2],
         routing: Rect::NOTHING,
         routes: [Rect::NOTHING; STRIP_ROUTES],
+        sends: [Rect::NOTHING; STRIP_SENDS],
+        send_cells: [SendCell::Empty; STRIP_SENDS],
+        bus_chip: Rect::NOTHING,
         add: Rect::NOTHING,
         close: Rect::NOTHING,
     };
@@ -1521,34 +1904,23 @@ impl Layout {
     /// clamp — two copies of this arithmetic is a scroll that overshoots.
     pub fn metrics(rect: Rect, visible: usize) -> (f32, f32) {
         let inner_w = (rect.width() - 2.0 * PAD).max(1.0);
-        let slots = (visible.clamp(1, CHANNELS) + 2) as f32;
+        let slots = (visible.clamp(1, VISIBLE_MAX) + 2) as f32;
         let unit = ((inner_w - GAP * (slots - 1.0)) / slots).max(1.0);
         (unit, unit + GAP)
     }
 
     /// The furthest `scroll_px` can legally stand at `rect`: the desk's
     /// off-screen width. Zero when everything fits.
-    /// `active` here is the SHOWN channel count - a shut folder's children
+    /// `shown` here is the SHOWN channel count - a shut folder's children
     /// are not columns and must not add scroll range; the app counts them
     /// out before asking (see `mixer_shown_channels`).
-    pub fn max_scroll_px(rect: Rect, visible: usize, active: usize) -> f32 {
-        let active = active.clamp(1, CHANNELS);
-        let visible = visible.clamp(1, active);
-        let (_, pitch) = Self::metrics(rect, visible);
-        (active.saturating_sub(visible)) as f32 * pitch
+    pub fn max_scroll_px(rect: Rect, visible: usize, shown: usize) -> f32 {
+        // The run's own arithmetic, so the wheel's rail and the layout's are
+        // one number (`run` sizes by the count asked for).
+        run(rect, visible, shown, 0.0).map_or(0.0, |r| r.max_px)
     }
 
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
-        let inner = Rect::from_min_max(
-            Pos2::new(rect.min.x + PAD, rect.min.y + PAD),
-            Pos2::new(rect.max.x - PAD, rect.max.y - PAD),
-        );
-        if !inner.is_positive() {
-            return Self {
-                strips: [StripStrip::NONE; COLUMNS],
-                region: Rect::NOTHING,
-            };
-        }
         // **Eight channels show; the CLICK and the MASTER are pinned right.**
         // The desk grew past what fits, so the channel columns scroll (see
         // `MixerView::scroll_px`) while the two utility strips stay put at
@@ -1556,21 +1928,8 @@ impl Layout {
         // click beside it. Every column is one unit wide: a desk where one
         // strip is a different size is a desk with two kinds of strip.
         //
-        // Layout: [ 8 scrolling channels | GAP | click | GAP | master ].
-        let click_col = CHANNELS; // column index of the click
-        let master_col = COLUMNS - 1;
-        let active = view.active.clamp(1, CHANNELS);
-        let visible = view.visible.clamp(1, active);
-        // **Never more columns than the width can carry.** See `MIN_STRIP_W`.
-        // Two seats are always spoken for — the click and the master are
-        // pinned at the right and are not part of the scrolling run — which
-        // is the `+ 2` `metrics` also applies.
-        let fits_across = {
-            let inner_w = (rect.width() - 2.0 * PAD).max(1.0);
-            let slots = ((inner_w + GAP) / (MIN_STRIP_W + GAP)).floor() as usize;
-            slots.saturating_sub(2).max(1)
-        };
-        let visible = visible.min(fits_across);
+        // Layout: [ the scrolling run | GAP | click | GAP | master ].
+        //
         // **There is no folded desk any more.** Sixteen over sixteen was a
         // way to get every channel on screen at a usable width when the
         // window was tall, and it cost every strip half its height to do it
@@ -1579,23 +1938,15 @@ impl Layout {
         // always, at whatever width the desk can carry. What it was FOR is
         // answered instead by `app::default_mixer_visible`, which now opens
         // a large window with all sixteen across.
-        // **A shut folder's children do not occupy columns.** Every strip
-        // keeps its CHANNEL index in `strips` - identity is baked as
-        // column==channel all over the desk - but position runs on RANK
-        // among the shown, so collapsing a folder closes the gap instead
-        // of leaving invisible pillars.
-        let mut rank = [0usize; COLUMNS];
-        let mut shown = 0usize;
-        for i in 0..active {
-            rank[i] = shown;
-            if !view.strips.get(i).is_some_and(|v| v.hidden) {
-                shown += 1;
-            }
-        }
-        let shown = shown.max(1);
-        let visible = visible.min(shown);
-        let cols_across = visible;
-        let (unit, pitch) = Self::metrics(rect, cols_across);
+        let Some(Run { inner, unit, pitch, first, last, frac, px, max_px, visible, shown }) =
+            run(rect, view.visible, view.strips.shown, view.scroll_px)
+        else {
+            return Self {
+                strips: LaidStrips::default(),
+                region: Rect::NOTHING,
+                bar: ScrollBar::NONE,
+            };
+        };
         // The two pinned columns, from the right edge inward.
         let master_x = inner.right() - unit;
         let click_x = master_x - pitch;
@@ -1605,44 +1956,8 @@ impl Layout {
             Pos2::new(region_left, inner.top()),
             Pos2::new(click_x - GAP, inner.bottom()),
         );
-        // **Pixels, then a window with a remainder.** The scroll lands
-        // wherever the wheel left it; the first fully-or-partly visible
-        // column and how much of it hangs off the left edge both fall out
-        // of one division. One extra column draws on the right when the
-        // remainder exposes it — that half strip is the whole point.
-        let max_px = (shown.saturating_sub(visible)) as f32 * pitch;
-        let px = view.scroll_px.clamp(0.0, max_px.max(0.0));
-        let first = ((px / pitch).floor() as usize).min(shown.saturating_sub(1));
-        let frac = px - first as f32 * pitch;
-        let last_shown = (first + visible + usize::from(frac > 0.5)).min(shown);
-        let _row_h = inner.height();
-        let strips = std::array::from_fn(|i| {
-            let Some(v) = view.strips.get(i) else {
-                return StripStrip::NONE;
-            };
-            let (x, y, h) = if i == master_col {
-                (master_x, inner.top(), inner.height())
-            } else if i == click_col {
-                (click_x, inner.top(), inner.height())
-            } else if i >= active || v.hidden {
-                // Past the active desk (the paywall's lanes), or a
-                // collapsed child: no column at all.
-                return StripStrip::NONE;
-            } else {
-                // A channel column: only the visible window (plus the
-                // partial at the edge) is laid out, in RANK space so a shut
-                // folder's children leave no gap. Everything else is
-                // off-desk.
-                let r = rank[i];
-                if r < first || r >= last_shown {
-                    return StripStrip::NONE;
-                }
-                (
-                    region_left + (r - first) as f32 * pitch - frac,
-                    inner.top(),
-                    inner.height(),
-                )
-            };
+        let place = |x: f32, v: &StripView<'_>| {
+            let (y, h) = (inner.top(), inner.height());
             // **A child's strip starts where the folder's chop ends** -
             // the whole panel steps down by the chop's height, which is
             // the visual indent the desk was missing.
@@ -1653,8 +1968,42 @@ impl Layout {
             };
             let panel = Rect::from_min_size(Pos2::new(x, y), Vec2::new(unit, h));
             Self::one(panel, Some(v))
-        });
-        Self { strips, region }
+        };
+        // A channel column: only the visible window (plus the partial at the
+        // edge) is laid out, in RANK space so a shut folder's children leave
+        // no gap. A strip the view carries outside the window (a dense view)
+        // is off-desk and gets no entry at all.
+        let mut strips = Vec::with_capacity(last.saturating_sub(first) + 2);
+        for (k, v) in view.strips.tracks.iter().enumerate() {
+            let r = view.strips.first + k;
+            if r < first || r >= last {
+                continue;
+            }
+            let x = region_left + (r - first) as f32 * pitch - frac;
+            strips.push((v.column(), place(x, v)));
+        }
+        strips.push((Column::Click, place(click_x, &view.strips.click)));
+        strips.push((Column::Master, place(master_x, &view.strips.master)));
+        // **The bar, when the desk is wider than the window.** In the bottom
+        // margin under the run, the run's width: the thumb is the window's
+        // share of the drawn tracks, at the scroll's share of its range.
+        let bar = if max_px > 0.0 && region.width() > 0.0 {
+            let track = Rect::from_min_max(
+                Pos2::new(region.left(), inner.bottom() + BAR_GAP),
+                Pos2::new(region.right(), inner.bottom() + BAR_GAP + BAR_H),
+            );
+            let w = (track.width() * visible as f32 / shown as f32)
+                .clamp(BAR_MIN.min(track.width()), track.width());
+            let x = track.left() + (track.width() - w) * (px / max_px).clamp(0.0, 1.0);
+            ScrollBar {
+                track,
+                thumb: Rect::from_min_size(Pos2::new(x, track.top()), Vec2::new(w, BAR_H)),
+                max_px,
+            }
+        } else {
+            ScrollBar::NONE
+        };
+        Self { strips: LaidStrips(strips), region, bar }
     }
 
     /// The rows inside one strip, top to bottom.
@@ -1714,8 +2063,12 @@ impl Layout {
         // The knob band: a channel splits it — send LEFT, pan RIGHT, the
         // owner's rule that every channel has a pan knob. The click and the
         // bus keep the whole band for their send.
+        // A strip that wears the send rows gives them the foot of this band
+        // (`STRIP_SENDS`): the knobs are a little shorter, and nothing under
+        // them moves.
+        let send_rows = view.send_rows();
         let (send, pan) = if sends {
-            let band = cut(0.41, 0.53);
+            let band = if send_rows { cut(0.41, 0.494) } else { cut(0.41, 0.53) };
             if matches!(view.strip, Some(Strip::Channel(_) | Strip::Drums)) {
                 (
                     Rect::from_min_max(
@@ -1859,7 +2212,9 @@ impl Layout {
         // on the folder's own glyph now, and the theory send is the note
         // button at the strip's foot. A FOLDER is not a track and cannot
         // record, so it keeps only M and S.
-        let has_arm = has_arm && !view.is_folder;
+        // Nor can a BUS: it has no input to record and hears no MIDI, so it
+        // keeps the pair too (design 9).
+        let has_arm = has_arm && !view.is_folder && !view.is_bus();
         let (mute, solo, arm) = if switchable && has_arm {
             let gap = 3.0;
             let w = ((switches.width() - gap * 2.0) / 3.0).max(1.0);
@@ -1940,6 +2295,36 @@ impl Layout {
             Rect::NOTHING
         };
         let routes: [Rect; STRIP_ROUTES] = [Rect::NOTHING; STRIP_ROUTES];
+        // **The send rows**: the band is there on every strip that can send,
+        // and what fills each row is the strip's list. Up to the rows' count
+        // each send is a row and the next row is the plus; past it the last
+        // row is a +N chip for the rest (the routing window lists them all).
+        let send_band = if send_rows { cut(0.498, 0.546) } else { Rect::NOTHING };
+        let held = view.sends.len();
+        let send_cells: [SendCell; STRIP_SENDS] = std::array::from_fn(|k| {
+            if !send_band.is_positive() {
+                SendCell::Empty
+            } else if held > STRIP_SENDS {
+                if k + 1 < STRIP_SENDS { SendCell::Level(k) } else { SendCell::More(held - k) }
+            } else if k < held {
+                SendCell::Level(k)
+            } else if k == held {
+                SendCell::Add
+            } else {
+                SendCell::Empty
+            }
+        });
+        let send_rects: [Rect; STRIP_SENDS] = std::array::from_fn(|k| {
+            if send_cells[k] == SendCell::Empty {
+                return Rect::NOTHING;
+            }
+            let h = send_band.height() / STRIP_SENDS as f32;
+            let y = send_band.top() + h * k as f32;
+            Rect::from_min_max(
+                Pos2::new(send_band.left() + 2.0, y + 0.5),
+                Pos2::new(send_band.right() - 2.0, y + h - 0.5),
+            )
+        });
         let travel = cut(if sends { 0.55 } else { 0.42 }, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
@@ -2027,6 +2412,9 @@ impl Layout {
             panel,
             routing,
             routes,
+            sends: send_rects,
+            send_cells,
+            bus_chip: if view.is_bus() && has_icon { cut(0.152, 0.19) } else { Rect::NOTHING },
             icon,
             icon_room,
             // **Loosely fitting the text, not a band of face.** These were a
@@ -2046,8 +2434,9 @@ impl Layout {
                     full
                 }
             },
-            detail: if view.is_folder {
-                // The folder's extra bays live here now — see `rack`.
+            detail: if view.is_folder || view.is_bus() {
+                // The folder's extra bays live here now — see `rack`. A bus
+                // says what it is in its chip, in the same band.
                 Rect::NOTHING
             } else if has_icon {
                 cut(0.152, 0.19)
@@ -2059,6 +2448,7 @@ impl Layout {
             input_chip: if matches!(view.strip, Some(Strip::Channel(_)))
                 && !view.empty
                 && !view.is_folder
+                && !view.is_bus()
             {
                 cut(0.152, 0.19)
             } else {
@@ -2131,9 +2521,8 @@ impl Layout {
     /// from the same rects, so a control that moved cannot become a control
     /// you can see and not press.
     pub fn targets(&self) -> Vec<(Rect, Hit)> {
-        let mut out = Vec::with_capacity(6 * 4);
-        for (i, s) in self.strips.iter().enumerate() {
-            let i = Column(i);
+        let mut out = Vec::with_capacity(self.strips.len() * 24);
+        for (i, s) in self.strips.iter() {
             for (r, hit) in [
                 // Polarity BEFORE the fader: on short strips the enlarged
                 // switch can graze the fader's band by a pixel, and the
@@ -2174,6 +2563,18 @@ impl Layout {
                     out.push((r, hit));
                 }
             }
+            // The send rows, each what its cell says it is this frame.
+            for (r, cell) in s.sends.iter().zip(s.send_cells) {
+                let hit = match cell {
+                    SendCell::Level(k) => Hit::SendLevel(i, k),
+                    SendCell::Add => Hit::SendAdd(i),
+                    SendCell::More(_) => Hit::SendMore(i),
+                    SendCell::Empty => continue,
+                };
+                if r.is_positive() {
+                    out.push((*r, hit));
+                }
+            }
         }
         out
     }
@@ -2212,18 +2613,27 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
     let mut out = Vec::with_capacity(hits.len());
     for &(r, hit) in hits {
         let Some(col) = hit_column(hit) else { continue };
-        let Some(s) = view.strips.get(col.0) else { continue };
+        let Some(s) = view.strips.get(col) else { continue };
         // An empty slot is a plus sign and nothing else; the eight controls
         // that would be on a channel are not there to be reached.
         if s.empty && !matches!(hit, Hit::Add(_)) {
             continue;
         }
-        let who = if s.name.is_empty() {
-            format!("Channel {}", col.0 + 1)
-        } else {
-            s.name.to_owned()
+        // **Named by what the strip is called, numbered only when it has no
+        // name**, and the number is its row's, never a column count: the
+        // click and the master have names of their own and no number.
+        let who = match (s.name.is_empty(), col) {
+            (false, _) => s.name.to_owned(),
+            (true, Column::Track(row)) => format!("Channel {}", row + 1),
+            (true, Column::Click) => "Click".to_owned(),
+            (true, Column::Master) => "Master".to_owned(),
         };
-        let id = egui::Id::new(("desk", col.0, format!("{hit:?}")));
+        // **The id is the strip's IDENTITY and the control**, never the
+        // column's place on screen: a scroll or a zoom moves every strip and
+        // must not hand a reader's focus to whatever slid under it. A track
+        // is its TrackId (`StripView::id`, the row's own since W3), and the
+        // two pinned strips are themselves.
+        let id = egui::Id::new(("desk", a11y_key(col, s.id), format!("{hit:?}")));
         let travel = |norm: f32, axis: DragAxis| Travel {
             norm: norm.clamp(0.0, 1.0),
             up: matches!(axis, DragAxis::Vertical),
@@ -2281,7 +2691,15 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                 format!("{who} shows its tracks"),
                 !s.folder_shut,
             ),
-            Hit::Add(_) => Node::button(id, r, format!("Add a channel at slot {}", col.0 + 1)),
+            Hit::Add(_) => Node::button(
+                id,
+                r,
+                match s.plus {
+                    Plus::Row => format!("Add a channel at slot {}", col.row().map_or(0, |row| row + 1)),
+                    Plus::Trailing => "Add a track".to_owned(),
+                    Plus::Locked => "Add a track (the free desk is full: a supporter key lifts the limit)".to_owned(),
+                },
+            ),
             Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
             Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
             Hit::InputChip(_) => Node::readout(
@@ -2335,6 +2753,22 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                     travel(level, DragAxis::Horizontal),
                 )
             }
+            Hit::SendLevel(_, k) => {
+                let (to, level, pre) =
+                    s.sends.get(k).map_or(("a bus", 0.0, false), |x| (x.label.as_str(), x.level, x.pre));
+                Node::slider(
+                    id,
+                    r,
+                    format!("{who} send to {to}{}", if pre { ", before the fader" } else { "" }),
+                    f64::from(level),
+                    0.0,
+                    1.0,
+                    format!("{:.0}%", level * 100.0),
+                    travel(level, DragAxis::Horizontal),
+                )
+            }
+            Hit::SendAdd(_) => Node::button(id, r, format!("{who}: send to a bus or a return")),
+            Hit::SendMore(_) => Node::button(id, r, format!("{who}: every send, in the routing window")),
             // The insert menu is modal over the whole desk while it is up;
             // its two rows are not part of the desk's tab order.
             Hit::FxMenu(..) => continue,
@@ -2342,6 +2776,20 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
         out.push(node);
     }
     out
+}
+
+/// The identity an accessibility id is keyed by: a track's `TrackId`, or
+/// the pinned strip itself. See `a11y_nodes_from`. It read `TrackId(row)`,
+/// the identity rule's answer for a legacy desk, which is the ROW again
+/// under another name: a track dragged above this one left its controls'
+/// ids to whichever track landed on its row. A track strip with no id
+/// (none is built without one) keeps a key no identity can share.
+fn a11y_key(col: Column, id: Option<crate::desk_id::TrackId>) -> (u8, u32) {
+    match col {
+        Column::Track(row) => id.map_or((3, row as u32), |t| (0, t.0)),
+        Column::Click => (1, 0),
+        Column::Master => (2, 0),
+    }
 }
 
 /// Which column a hit belongs to. Every variant carries one.
@@ -2362,9 +2810,11 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Db(i)
         | Hit::Name(i)
         | Hit::Folder(i)
-        | Hit::Remove(i) => i,
-        Hit::MetFile => Column(Strip::Click.index()),
-        Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::FxMenu(i, _, _) => i,
+        | Hit::Remove(i)
+        | Hit::SendAdd(i)
+        | Hit::SendMore(i) => i,
+        Hit::MetFile => Column::Click,
+        Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::SendLevel(i, _) | Hit::FxMenu(i, _, _) => i,
     })
 }
 
@@ -2404,7 +2854,7 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // two rows is a dismissal and nothing else, because the mis-click this
     // exists to prevent is exactly a press that lands somewhere it should not.
     if let Some((at, bay)) = view.fx_menu {
-        if let Some(s) = l.strips.get(at.0) {
+        if let Some(s) = l.strips.get(at) {
             // The rows the menu is offering, from the one list the painter
             // draws from: the actions are POSITIONAL and a conditional row
             // must not re-point the rows above it. See `fx_menu_actions`.
@@ -2427,11 +2877,49 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // strip's rectangles reach past the region it is clipped to; the part a
     // person cannot see must not answer. The pinned click and master live
     // to the region's right and keep answering everywhere they draw.
-    let in_bounds = |i: usize| i >= CHANNELS || l.region.contains(pos);
+    let in_bounds = |col: Column| col.pinned() || l.region.contains(pos);
     l.targets()
         .into_iter()
-        .find(|(r, h)| r.contains(pos) && in_bounds(h.column().0))
+        .find(|(r, h)| r.contains(pos) && in_bounds(h.column()))
         .map(|(_, h)| h)
+}
+
+/// **A press on the scrollbar**: where on the thumb the hand took it, or
+/// `None` when the press is not on the bar. A press on the thumb keeps its
+/// grip; a press on the track beside it centres the thumb under the hand,
+/// so the desk jumps to where it was pressed. The bar's band is taller than
+/// the bar itself (the whole bottom margin) because four points is a line
+/// to look at and not a target to hit.
+pub fn scrollbar_grab(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<f32> {
+    let bar = Layout::new(rect, view).bar;
+    if !bar.track.is_positive() {
+        return None;
+    }
+    let band = Rect::from_min_max(
+        Pos2::new(bar.track.left(), bar.track.top() - BAR_GAP),
+        Pos2::new(bar.track.right(), rect.bottom()),
+    );
+    if !band.contains(pos) {
+        return None;
+    }
+    Some(if bar.thumb.x_range().contains(pos.x) {
+        pos.x - bar.thumb.left()
+    } else {
+        bar.thumb.width() * 0.5
+    })
+}
+
+/// **Where the desk scrolls to with the hand at `pos`**, holding the thumb
+/// `grab` points from its left edge: the scroll in pixels, clamped to the
+/// desk. `None` when there is no bar.
+pub fn scrollbar_scroll(rect: Rect, view: &MixerView<'_>, pos: Pos2, grab: f32) -> Option<f32> {
+    let bar = Layout::new(rect, view).bar;
+    let travel = bar.track.width() - bar.thumb.width();
+    if !bar.track.is_positive() || travel <= 0.0 {
+        return None;
+    }
+    let t = ((pos.x - grab - bar.track.left()) / travel).clamp(0.0, 1.0);
+    Some(t * bar.max_px)
 }
 
 /// Which column a point is on, for a right-click. `None` off the rack.
@@ -2439,8 +2927,8 @@ pub fn strip_at(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Column> {
     Layout::new(rect, view)
         .strips
         .iter()
-        .position(|s| s.panel.contains(pos))
-        .map(Column)
+        .find(|(_, s)| s.panel.contains(pos))
+        .map(|(col, _)| col)
 }
 
 /// How far a control travels, for the caller that is dragging it.
@@ -2545,26 +3033,59 @@ fn ink(view: &MixerView<'_>) -> Ink {
     }
 }
 
+/// **The trailing add's ground, run on to the end of the run.**
+///
+/// Since strips nobody has made stopped being drawn (design section 10), a
+/// desk shorter than the run ends at its trailing add, and the wood showed
+/// from there to the pinned click. The owner asked for the colour of the
+/// add's ground to carry on beside the tracks, "just infinite". So that
+/// ground is painted WIDER: from the add's own left edge to the right edge
+/// of the run (`Layout::region`, a gap short of the click, where every
+/// strip in the run stops), at the add's own height, which is the full
+/// strip height. One rounded panel and one rim, both the add's own, so the
+/// add and the run after it are one surface with no rim or gap between.
+///
+/// Paint only, as the arrangement's
+/// [`crate::arrangement_panel::EndlessGround`] is: the add's cells are not
+/// touched, so a press beside the add answers what it did when the wood
+/// showed there, and the scroll range never counts the run. `None` when the
+/// add is not placed, is not the last track placed, or already reaches the
+/// end of the run (a desk wider than the window, scrolled to its end).
+pub fn endless_ground(l: &Layout, view: &MixerView<'_>) -> Option<(Column, Rect)> {
+    let (col, s) = l.strips.iter().filter(|(c, _)| !c.pinned()).last()?;
+    let v = view.strips.get(col)?;
+    let end = l.region.right();
+    if !v.empty || v.plus == Plus::Row || !s.panel.is_positive() || end - s.panel.right() <= 0.5 {
+        return None;
+    }
+    Some((col, Rect::from_min_max(s.panel.min, Pos2::new(end, s.panel.bottom()))))
+}
+
 /// Paint the whole rack into `rect`.
 pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     let l = Layout::new(rect, view);
     let p = ink(view);
     painter.rect_filled(rect, 0.0, p.wood);
+    // The trailing add's ground, where it runs on past the add.
+    let endless = endless_ground(&l, view);
 
     // Channel strips clip to the scrolling region: a half-scrolled strip
     // ends at the region's edge instead of bleeding under the pinned click.
     // The pinned columns keep the raw painter — they never overhang.
     let clipped = painter.with_clip_rect(l.region);
-    for (i, s) in l.strips.iter().enumerate() {
+    for (i, s) in l.strips.iter() {
         let Some(v) = view.strips.get(i) else { continue };
         if !s.panel.is_positive() {
             continue;
         }
-        let painter = if i < CHANNELS { &clipped } else { painter };
+        let painter = if i.pinned() { painter } else { &clipped };
         let heard = view.heard(i);
-        let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
-        let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
-        strip(painter, s, v, &p, view.routes, heard, typed, naming);
+        let typed = view.typing.filter(|(at, _)| *at == i).map(|(_, b)| b);
+        let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
+        // Every strip's ground is its panel, but the trailing add's when it
+        // runs on to the end of the run: see `endless_ground`.
+        let ground = endless.filter(|(at, _)| *at == i).map_or(s.panel, |(_, g)| g);
+        strip(painter, s, v, &p, view.routes, heard, typed, naming, ground);
         // The selected channels' faint rim — the owner's slight light.
         if view
             .selected_tracks
@@ -2617,8 +3138,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             );
         }
     };
+    // The scrollbar, in the margin under the run: a faint track and a
+    // thumb in the strips' own face, which is what already stands out from
+    // the wood on every theme; quiet enough to read as furniture.
+    if l.bar.track.is_positive() {
+        painter.rect_filled(l.bar.track, BAR_H * 0.5, p.face.gamma_multiply(0.22));
+        painter.rect_filled(l.bar.thumb, BAR_H * 0.5, p.face.gamma_multiply(0.85));
+    }
     if let Some((at, bay)) = view.fx_menu {
-        if let Some(s) = l.strips.get(at.0) {
+        if let Some(s) = l.strips.get(at) {
             // Row order is the hit test's: the two lists must stay twins,
             // which is why neither of them writes one down.
             let actions = fx_menu_actions(
@@ -2669,6 +3197,30 @@ pub(crate) fn auto_icon(strip: Option<Strip>, is_folder: bool) -> Option<crate::
     }
 }
 
+/// **The bus's badge**: three lines coming in from the left and running
+/// together into one going out to the right, in `ink`, inside `r`. Square
+/// in its rect, like every badge, and thick enough to read at a strip's
+/// smallest.
+pub(crate) fn bus_glyph(painter: &Painter, r: Rect, ink: Color32) {
+    if !r.is_positive() {
+        return;
+    }
+    let side = r.width().min(r.height());
+    let b = Rect::from_center_size(r.center(), Vec2::splat(side * 0.86));
+    let w = (side * 0.075).clamp(1.2, 3.0);
+    let stroke = Stroke::new(w, ink);
+    let join = Pos2::new(b.left() + b.width() * 0.58, b.center().y);
+    for k in 0..3 {
+        let y = b.top() + b.height() * (0.18 + 0.32 * k as f32);
+        let start = Pos2::new(b.left(), y);
+        let bend = Pos2::new(b.left() + b.width() * 0.28, y);
+        painter.line_segment([start, bend], stroke);
+        painter.line_segment([bend, join], stroke);
+    }
+    painter.line_segment([join, Pos2::new(b.right(), join.y)], stroke);
+    painter.circle_filled(join, w * 1.3, ink);
+}
+
 fn strip(
     painter: &Painter,
     l: &StripStrip,
@@ -2678,16 +3230,20 @@ fn strip(
     heard: bool,
     typed: Option<&str>,
     naming: Option<&str>,
+    // What an EMPTY slot paints its ground over: its panel, or the trailing
+    // add's panel run on to the end of the run (`endless_ground`). A
+    // strip with something on it ignores it.
+    ground: Rect,
 ) {
     if v.empty {
         // The slot's own NUMBER, so an empty desk still says which column is
         // which — the mixer had none at all, and the arrange view's have been
-        // there all along.
-        let number = match v.strip {
-            Some(Strip::Channel(n)) => Some(n + 1),
+        // there all along. The trailing add is no row yet and has none.
+        let number = match (v.plus, v.strip) {
+            (Plus::Row, Some(Strip::Channel(n))) => Some(n + 1),
             _ => None,
         };
-        empty_slot(painter, l, p, number);
+        empty_slot(painter, l, p, number, v.plus == Plus::Locked, ground);
         return;
     }
     // **A painted channel keeps its own face for the labels.** The whole panel
@@ -2863,6 +3419,13 @@ fn strip(
         && crate::recorder_panel::draw_badge(painter, l.icon, ink, face, v.icon);
     let named = if badge {
         true
+    } else if v.is_bus() {
+        // **A bus wears its own drawing**: strips running together into one
+        // line, which is what a bus is. Drawn, not taken from the artwork:
+        // the set has no bus in it, and a borrowed instrument would say the
+        // strip plays one.
+        bus_glyph(painter, l.icon, ink);
+        true
     } else {
         match auto_icon(v.strip, v.is_folder) {
             Some(icon) => {
@@ -2954,6 +3517,25 @@ fn strip(
             p.engrave.gamma_multiply(0.85),
         );
     }
+    // **A BUS's chip**, the folder chip's twin: a readout of what the strip
+    // is, in the band a track names its input in, registered in no target
+    // list because a bus has no input to pick.
+    if l.bus_chip.is_positive() {
+        painter.rect_filled(l.bus_chip, 2.0, p.chip);
+        painter.rect_stroke(
+            l.bus_chip,
+            2.0,
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        centred(
+            painter,
+            l.bus_chip,
+            "BUS",
+            plain((h * 0.024).clamp(7.0, 11.0)),
+            p.engrave.gamma_multiply(0.85),
+        );
+    }
     // **The CLICK's own sound**, in the band a channel spends on its input
     // chip and wearing the same panel — it is the same kind of control,
     // "what is feeding this strip", and it opens the metronome panel. The
@@ -3039,6 +3621,49 @@ fn strip(
                 FontId::new(size, crate::fonts::courier_bold()),
                 p.face,
             );
+        }
+    }
+
+    // ── The send rows: a level lying down per send, the plus, the +N ─────
+    //
+    // The route strips' picture, because a send is the same kind of thing
+    // to look at: a tap off this strip at a level of its own. The name over
+    // the fill is the BUS's, and a send taken before the fader says so at
+    // the row's right end.
+    for (r, cell) in l.sends.iter().zip(l.send_cells) {
+        if !r.is_positive() {
+            continue;
+        }
+        let size = (r.height() * 0.62).clamp(5.0, 9.0);
+        let font = FontId::new(size, crate::fonts::courier_bold());
+        match cell {
+            SendCell::Level(k) => {
+                let Some(x) = v.sends.get(k) else { continue };
+                painter.rect_filled(*r, 1.0, p.slot);
+                let filled = Rect::from_min_max(
+                    r.min,
+                    Pos2::new(r.left() + r.width() * x.level.clamp(0.0, 1.0), r.bottom()),
+                );
+                if filled.width() > 0.5 {
+                    painter.rect_filled(filled, 1.0, p.lit.gamma_multiply(0.55));
+                }
+                painter.text(Pos2::new(r.left() + 3.0, r.center().y), egui::Align2::LEFT_CENTER, &x.label, font.clone(), p.face);
+                if x.pre {
+                    painter.text(Pos2::new(r.right() - 3.0, r.center().y), egui::Align2::RIGHT_CENTER, "PRE", font, p.face);
+                }
+            }
+            // A door, drawn as the routing button is: a quiet plate with its
+            // word on it.
+            SendCell::Add | SendCell::More(_) => {
+                painter.rect_filled(*r, 2.0, shade_face(p.face, 0.94));
+                painter.rect_stroke(*r, 2.0, Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+                let word = match cell {
+                    SendCell::More(n) => format!("+{n} SENDS"),
+                    _ => "+ SEND".to_owned(),
+                };
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, word, font, p.engrave.gamma_multiply(0.8));
+            }
+            SendCell::Empty => {}
         }
     }
 
@@ -3507,16 +4132,26 @@ fn empty_slot_ink(p: &Ink) -> Color32 {
     empty_slot_ink_for(p.face, p.empty_ground)
 }
 
-fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>) {
+fn empty_slot(
+    painter: &Painter,
+    l: &StripStrip,
+    p: &Ink,
+    number: Option<usize>,
+    locked: bool,
+    ground: Rect,
+) {
     // The empty slot's own ground, cut out of this theme's wood — under the
-    // circled plus and the quiet space around it.
-    painter.rect_filled(l.panel, 3.0, p.empty_ground);
+    // circled plus and the quiet space around it. Over `ground`, which is
+    // the panel, or for the trailing add the panel run on to the end of the
+    // run: one rounded surface and one rim either way, so nothing is drawn
+    // between the add and the ground beside it.
+    painter.rect_filled(ground, 3.0, p.empty_ground);
     // **And its rim is measured against the ground it rims.** It was the
     // strip FACE at 22% alpha, which is a colour belonging to the panels
     // either side of this hole rather than to the hole; on a dark theme it
     // fell to within a point of the wood and the slot had no edge at all.
     painter.rect_stroke(
-        l.panel,
+        ground,
         3.0,
         Stroke::new(1.0_f32, p.empty_edge),
         egui::StrokeKind::Inside,
@@ -3553,6 +4188,10 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>)
     let radius = r.width().min(r.height()) * 0.5 - 1.0;
     let w = (radius * 0.11).clamp(1.2, 2.5);
     painter.circle_stroke(c, radius, Stroke::new(w, ink));
+    if locked {
+        padlock(painter, c, radius, w, ink);
+        return;
+    }
     let arm = radius * 0.45;
     painter.line_segment(
         [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
@@ -3562,6 +4201,28 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>)
         [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
         Stroke::new(w, ink),
     );
+}
+
+/// **A padlock inside the trailing add's ring** ([`Plus::Locked`]): the
+/// free desk is full, and the ring still says the press does something (it
+/// opens the Supporter Key dialog). Drawn, not a glyph, so it needs no font
+/// that has one. Both views draw it.
+pub(crate) fn padlock(painter: &Painter, c: Pos2, radius: f32, w: f32, ink: Color32) {
+    let body = Rect::from_center_size(
+        Pos2::new(c.x, c.y + radius * 0.18),
+        Vec2::new(radius * 0.92, radius * 0.66),
+    );
+    painter.rect_filled(body, radius * 0.08, ink);
+    // The shackle: a half ring standing on the body's top edge.
+    let r = radius * 0.30;
+    let top = body.top();
+    let pts: Vec<Pos2> = (0..=12)
+        .map(|k| {
+            let a = std::f32::consts::PI * (k as f32 / 12.0);
+            Pos2::new(c.x - r * a.cos(), top - r * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(w, ink)));
 }
 
 /// A vertical bar, filling from the bottom.
@@ -4013,6 +4674,7 @@ fn print_on(bg: Color32, p: &Ink) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     /// **The T switch is legible on every theme, lit and at rest.**
     ///
@@ -4107,7 +4769,6 @@ mod tests {
             is_folder: false,
             in_folder: false,
             folder_shut: false,
-            hidden: false,
             route_count: 0,
             icon: 0,
             strip,
@@ -4135,6 +4796,13 @@ mod tests {
             keyed: [false; INSERTS * 2],
             bypassed: [false; INSERTS * 2],
             frozen: false,
+            plus: Plus::Row,
+            sends: Vec::new(),
+            // The identity rule's ids, row r is track r, as a legacy desk's.
+            id: match strip {
+                Some(Strip::Channel(r)) => Some(crate::desk_id::TrackId(r as u32)),
+                _ => None,
+            },
         }
     }
 
@@ -4168,9 +4836,9 @@ mod tests {
         };
         let (w, hgt) = (num("IVORY_SHOT_W", 900.0), num("IVORY_SHOT_H", 700.0));
         let mut v = a_view();
-        v.strips[1].is_folder = true;
+        v.strips[Column::Track(1)].is_folder = true;
         for i in 0..3 {
-            v.strips[i].inserts = ["COMP", "EQ", "VERB", "TAPE", "", ""];
+            v.strips[Column::Track(i)].inserts = ["COMP", "EQ", "VERB", "TAPE", "", ""];
         }
         let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
         let surface = crate::recorder_panel::surface_of(Color32::from_rgb(0x61, 0x37, 0x3A));
@@ -4202,20 +4870,28 @@ mod tests {
         println!("wrote {out} ({pw}x{ph})");
     }
 
+    /// A whole desk of `rows` tracks, every one drawn: the dense view the
+    /// app builds for a picture of the desk.
+    fn dense(rows: usize, empty: impl Fn(usize) -> bool) -> DeskStrips<'static> {
+        DeskStrips {
+            tracks: (0..rows).map(|i| a_strip(Some(Strip::Channel(i)), empty(i))).collect(),
+            first: 0,
+            shown: rows,
+            click: a_strip(Some(Strip::Click), false),
+            master: a_strip(None, false),
+        }
+    }
+
     fn a_view() -> MixerView<'static> {
-        let channels = Strip::shown();
         MixerView {
-            selected_tracks: &[],
+            selected_tracks: Vec::new(),
             routes: &[],
             fx_strip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             input_chip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
-            strips: std::array::from_fn(|i| {
-                a_strip(channels.get(i).copied(), false)
-            }),
+            strips: dense(CHANNELS, |_| false),
             click_sound: "CLICK",
             any_solo: false,
             scroll_px: 0.0,
-            active: CHANNELS,
             visible: VISIBLE_CHANNELS,
             selected: None,
             typing: None,
@@ -4230,11 +4906,10 @@ mod tests {
         }
     }
 
-    /// The index of the last channel before the master.
-    const MASTER: usize = COLUMNS - 1;
-    /// The effects return, which is the channel before that.
-    /// The click's column, which is the one before the master.
-    const CLICK: usize = COLUMNS - 2;
+    /// The master's column.
+    const MASTER: Column = Column::Master;
+    /// The click's column, the one before the master.
+    const CLICK: Column = Column::Click;
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
@@ -4329,11 +5004,11 @@ mod tests {
             // Did the desk actually fold here? Read off the layout rather
             // than re-deriving the rule: a second row is a channel strip
             // whose panel starts below the middle of the window.
-            if l.strips.iter().enumerate().any(|(i, s)| {
+            if l.strips.iter().any(|(i, s)| {
                 i != MASTER && i != CLICK && s.panel.is_positive() && s.panel.top() > h * 0.4
             }) {
             }
-            for (i, s) in l.strips.iter().enumerate() {
+            for (i, s) in l.strips.iter() {
                 if !s.icon.is_positive() {
                     continue;
                 }
@@ -4471,12 +5146,56 @@ mod tests {
         assert_eq!(before, ids.len(), "two desk controls share an id");
     }
 
+    /// **A control's accessibility id is its track's, not its row's.** The
+    /// same desk twice, the second with the first two rows' tracks swapped
+    /// (a drag of track 1 below track 2): every control on a row whose track
+    /// stayed keeps its id, so a reader's focus survives, and every control
+    /// on the two rows whose tracks changed gets a new one, so focus is
+    /// never handed to the track that moved into a row. The id used to be
+    /// keyed by `TrackId(row)`, the row under another name, and both rows
+    /// kept their ids across the swap.
+    #[test]
+    fn a_controls_accessibility_id_belongs_to_its_track_not_its_row() {
+        use crate::desk_id::TrackId;
+        let r = rect();
+        let mut first = a_view();
+        let mut swapped = a_view();
+        for (row, (a, b)) in [(0usize, (40u32, 41u32)), (1, (41, 40))] {
+            first.strips.tracks[row].id = Some(TrackId(a));
+            swapped.strips.tracks[row].id = Some(TrackId(b));
+        }
+        let (before, after) = (a11y_nodes(r, &first), a11y_nodes(r, &swapped));
+        assert_eq!(before.len(), after.len(), "the swap changed the controls");
+        let targets = Layout::new(r, &first).targets();
+        let row_of = |rect: Rect| {
+            targets.iter().find(|(rr, _)| *rr == rect).and_then(|&(_, hit)| match hit_column(hit) {
+                Some(Column::Track(row)) => Some(row),
+                _ => None,
+            })
+        };
+        let (mut kept, mut renewed) = (0, 0);
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(b.rect, a.rect, "the two desks laid out differently");
+            match row_of(b.rect) {
+                Some(0 | 1) => {
+                    assert_ne!(b.id, a.id, "{}: a swapped row's control kept its id", b.label);
+                    renewed += 1;
+                }
+                _ => {
+                    assert_eq!(b.id, a.id, "{}: a control whose track stayed lost its id", b.label);
+                    kept += 1;
+                }
+            }
+        }
+        assert!(renewed >= 10 && kept >= 40, "too few controls compared: {renewed} renewed, {kept} kept");
+    }
+
     /// A fader reads in decibels and a pan in sides, never in 0..1.
     #[test]
     fn the_desk_speaks_in_the_numbers_printed_on_it() {
         let mut view = a_view();
-        view.strips[0].gain = 0.5;
-        view.strips[0].pan = -0.64;
+        view.strips[Column::Track(0)].gain = 0.5;
+        view.strips[Column::Track(0)].pan = -0.64;
         let nodes = a11y_nodes(rect(), &view);
         let said = |needle: &str| {
             nodes
@@ -4499,7 +5218,7 @@ mod tests {
         // a toggle that only says its name is one nobody can read the state
         // of without pressing it.
         let mut on = a_view();
-        on.strips[0].muted = true;
+        on.strips[Column::Track(0)].muted = true;
         let muted = a11y_nodes(rect(), &on);
         let m = muted
             .iter()
@@ -4514,9 +5233,8 @@ mod tests {
     /// tab stops onto nothing.
     #[test]
     fn an_empty_slot_is_one_tab_stop_and_not_nine() {
-        let channels = Strip::shown();
         let view = MixerView {
-            strips: std::array::from_fn(|i| a_strip(channels.get(i).copied(), i == 2)),
+            strips: dense(CHANNELS, |i| i == 2),
             ..a_view()
         };
         let nodes = a11y_nodes(rect(), &view);
@@ -4647,12 +5365,12 @@ mod tests {
     #[test]
     fn routing_is_a_button_and_the_fader_never_gives_up_travel_for_it() {
         let mut none = a_view();
-        none.strips[1].route_count = 0;
-        let unrouted = Layout::new(rect(), &none).strips[1];
+        none.strips[Column::Track(1)].route_count = 0;
+        let unrouted = Layout::new(rect(), &none).strips[Column::Track(1)];
 
         let mut v = a_view();
-        v.strips[1].route_count = 3;
-        let s = Layout::new(rect(), &v).strips[1];
+        v.strips[Column::Track(1)].route_count = 3;
+        let s = Layout::new(rect(), &v).strips[Column::Track(1)];
 
         assert!(s.routing.is_positive(), "no ROUTING button rect");
         for n in 0..STRIP_ROUTES {
@@ -4670,9 +5388,98 @@ mod tests {
         // And a routed channel is still a pressable button.
         assert_eq!(
             hit_test(rect(), &v, s.routing.center()),
-            Some(Hit::Routing(Column(1))),
+            Some(Hit::Routing(Column::Track(1))),
             "the routing button cannot be pressed"
         );
+    }
+
+    /// **A strip's send rows are one band whatever it sends, and the fader
+    /// gives up nothing for them** (`STRIP_SENDS`): the owner struck the
+    /// route strips out because "a column changed shape as you routed it",
+    /// so the send rows are the same band on a strip that sends to none and
+    /// to forty, and only what fills them changes: the plus after the last
+    /// send, a +N chip for the sends past the rows. Each row answers its own
+    /// press, and a level row drags sideways.
+    #[test]
+    fn a_strips_send_rows_are_one_band_whatever_it_sends() {
+        let laid = |n: usize| {
+            let mut v = a_view();
+            v.strips[Column::Track(1)].sends =
+                (0..n).map(|k| SendRow { label: format!("B{k}"), level: 0.5, pre: k % 2 == 1 }).collect();
+            let l = Layout::new(rect(), &v).strips[Column::Track(1)];
+            let hits: Vec<Hit> = (0..STRIP_SENDS)
+                .filter(|k| l.sends[*k].is_positive())
+                .filter_map(|k| hit_test(rect(), &v, l.sends[k].center()))
+                .collect();
+            (l, hits)
+        };
+        let (none, hits) = laid(0);
+        assert_eq!(none.send_cells, [SendCell::Add, SendCell::Empty], "a strip with no send is not offered one");
+        assert_eq!(hits, vec![Hit::SendAdd(Column::Track(1))]);
+        let (one, hits) = laid(1);
+        assert_eq!(one.send_cells, [SendCell::Level(0), SendCell::Add]);
+        assert_eq!(hits, vec![Hit::SendLevel(Column::Track(1), 0), Hit::SendAdd(Column::Track(1))]);
+        let (two, _) = laid(2);
+        assert_eq!(two.send_cells, [SendCell::Level(0), SendCell::Level(1)], "two sends do not both show");
+        let (many, hits) = laid(5);
+        assert_eq!(many.send_cells, [SendCell::Level(0), SendCell::More(4)], "the chip does not count the rest");
+        assert_eq!(hits, vec![Hit::SendLevel(Column::Track(1), 0), Hit::SendMore(Column::Track(1))]);
+        for n in [1, 2, 5, 40] {
+            let (l, _) = laid(n);
+            assert_eq!(l.fader, none.fader, "{n} sends moved the fader");
+            assert_eq!(l.send, none.send, "{n} sends moved the knob");
+            for k in 0..STRIP_SENDS {
+                if l.sends[k].is_positive() && none.sends[0].is_positive() {
+                    assert!((l.sends[k].height() - none.sends[0].height()).abs() < 0.01, "{n} sends: row {k} changed size");
+                }
+            }
+        }
+        // The band sits under the knobs and over the fader, clear of both.
+        assert!(none.sends[0].top() >= none.send.bottom() && none.sends[0].bottom() <= none.fader.top());
+        // A level row lies down, and its travel is a send's.
+        assert_eq!(Hit::SendLevel(Column::Track(1), 0).axis(), Some(DragAxis::Horizontal));
+        assert_eq!(Hit::SendLevel(Column::Track(1), 0).travel(), Some(SEND_TRAVEL));
+        assert_eq!(Hit::SendAdd(Column::Track(1)).axis(), None, "the plus is a door, not a level");
+        // The click sends nowhere and nothing is past the master.
+        let l = Layout::new(rect(), &a_view());
+        for col in [CLICK, MASTER] {
+            assert!(l.strips[col].sends.iter().all(|r| !r.is_positive()), "{col:?} wears send rows");
+        }
+    }
+
+    /// **A bus says so, has no input to choose and nothing to arm**
+    /// (design 9): its chip reads BUS and is no door, there is no input chip
+    /// and no R, and it keeps its mute, solo, send rows and rack.
+    #[test]
+    fn a_bus_strip_says_bus_and_offers_no_input_and_no_arm() {
+        let mut v = a_view();
+        v.strips[Column::Track(2)].kind = Some(crate::recorder::ChannelKind::Bus);
+        let l = Layout::new(rect(), &v);
+        let (bus, track) = (&l.strips[Column::Track(2)], &l.strips[Column::Track(1)]);
+        assert!(bus.bus_chip.is_positive(), "a bus does not say so");
+        assert!(!bus.input_chip.is_positive(), "a bus offers an input");
+        assert!(!bus.arm.is_positive() && !bus.theory.is_positive(), "a bus can be armed");
+        assert!(bus.mute.is_positive() && bus.solo.is_positive());
+        assert!(bus.sends[0].is_positive() && bus.inserts[0].is_positive());
+        assert_eq!(
+            (bus.bus_chip.top(), bus.bus_chip.bottom(), bus.bus_chip.width()),
+            (track.input_chip.top(), track.input_chip.bottom(), track.input_chip.width()),
+            "the bus chip is not in the band an input chip is"
+        );
+        assert!(!track.bus_chip.is_positive(), "a track says it is a bus");
+        // Not a door: nothing answers a press on it but the strip.
+        assert!(
+            !l.targets().iter().any(|(r, h)| r.contains(bus.bus_chip.center()) && h.column() == Column::Track(2)),
+            "the bus chip answers a press"
+        );
+        // **Solo-safe**: another strip's solo does not draw it silenced, as
+        // it does every other strip that is not soloed; its own mute does.
+        v.any_solo = true;
+        v.strips[Column::Track(0)].soloed = true;
+        assert!(v.heard(Column::Track(2)), "another strip's solo drew the bus silenced");
+        assert!(!v.heard(Column::Track(1)), "fixture: a track not soloed is drawn silenced");
+        v.strips[Column::Track(2)].muted = true;
+        assert!(!v.heard(Column::Track(2)), "a muted bus is drawn heard");
     }
 
     /// **Every control can be pressed, and presses where it is drawn.**
@@ -4715,11 +5522,11 @@ mod tests {
     #[test]
     fn a_folder_wears_a_chip_reading_folder() {
         let mut v = a_view();
-        v.strips[1].is_folder = true;
+        v.strips[Column::Track(1)].is_folder = true;
         let r = rect();
         let l = Layout::new(r, &v);
-        let chip = l.strips[1].folder_chip;
-        let track = l.strips[0].input_chip;
+        let chip = l.strips[Column::Track(1)].folder_chip;
+        let track = l.strips[Column::Track(0)].input_chip;
         assert!(chip.is_positive(), "the folder's band is still a hole");
         assert!(track.is_positive(), "the reference track has no input chip");
         assert!(
@@ -4728,7 +5535,7 @@ mod tests {
             "the folder's chip is not on the input chip's own row"
         );
         assert!(
-            !l.strips[1].input_chip.is_positive(),
+            !l.strips[Column::Track(1)].input_chip.is_positive(),
             "a folder grew an input chip it could bind nothing with"
         );
         // Nothing to press: it is not in the target list at all.
@@ -4771,9 +5578,9 @@ mod tests {
     #[test]
     fn a_selected_folder_is_rimmed_in_the_shape_of_a_folder() {
         let mut v = a_view();
-        v.strips[1].is_folder = true;
+        v.strips[Column::Track(1)].is_folder = true;
         let picked = [0usize, 1];
-        v.selected_tracks = &picked;
+        v.selected_tracks = picked.to_vec();
         let r = rect();
         let l = Layout::new(r, &v);
         let ctx = egui::Context::default();
@@ -4790,7 +5597,7 @@ mod tests {
         );
         // The FOLDER's rim is a path, and it keeps out of the chop: no point
         // on it stands in the notch the strip cuts out of its own corner.
-        let panel = l.strips[1].panel;
+        let panel = l.strips[Column::Track(1)].panel;
         let notch = Rect::from_min_max(
             Pos2::new(panel.right() - panel.width() * NOTCH_W + 1.0, panel.top()),
             Pos2::new(panel.right(), panel.top() + CHILD_INDENT - 1.0),
@@ -4819,7 +5626,7 @@ mod tests {
             "the rim does not come back out to the strip's edge under the chop"
         );
         // A plain track keeps the rectangle, at the same weight.
-        let track = l.strips[0].panel;
+        let track = l.strips[Column::Track(0)].panel;
         let rect_rim = out.shapes.iter().any(|s| match &s.shape {
             egui::Shape::Rect(rr) => {
                 (rr.stroke.width - RIM_W).abs() < 0.01
@@ -4829,6 +5636,271 @@ mod tests {
             _ => false,
         });
         assert!(rect_rim, "a selected track lost its rectangular rim");
+    }
+
+    // ── the trailing add's ground, run on to the end of the run ──────────
+
+    /// **A desk that ends at its trailing add**: tracks on rows `0..used`
+    /// and the add after them, the way the app builds a desk shorter than
+    /// the run. `plus` is the add's tier: `Trailing`, or `Locked` (the
+    /// padlock) at the free cap.
+    fn ending_at_the_add(used: usize, plus: Plus) -> MixerView<'static> {
+        let mut v = a_view();
+        v.strips = dense(used + 1, |i| i == used);
+        v.strips.tracks[used].plus = plus;
+        v
+    }
+
+    /// One frame of `v` at `area`, in a context the caller keeps: the
+    /// sweeps below paint hundreds of frames, and fonts are installed once.
+    fn paint_in(ctx: &egui::Context, v: &MixerView<'_>, area: Rect) -> Vec<egui::epaint::ClippedShape> {
+        ctx.run(egui::RawInput { screen_rect: Some(area), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_clip_rect(area);
+                draw(ui.painter(), area, v);
+            });
+        })
+        .shapes
+    }
+
+    /// **The ground the eye sees over `region`**: the LAST filled rect
+    /// painted over all of it, and its fill. `None` when a fill painted
+    /// after it covers more of the region than a glyph does, since that
+    /// would be the ground there instead.
+    fn ground_over(shapes: &[egui::epaint::ClippedShape], region: Rect) -> Option<(Rect, Color32)> {
+        let filled = |cs: &egui::epaint::ClippedShape| match &cs.shape {
+            egui::Shape::Rect(r) if r.fill.a() > 0 => Some((r.rect, r.fill)),
+            _ => None,
+        };
+        let k = shapes.iter().rposition(|cs| filled(cs).is_some_and(|(r, _)| r.contains_rect(region)))?;
+        let covered = shapes[k + 1..]
+            .iter()
+            .filter_map(filled)
+            .map(|(r, _)| r.intersect(region))
+            .any(|i| i.is_positive() && i.area() > 200.0);
+        if covered {
+            None
+        } else {
+            filled(&shapes[k])
+        }
+    }
+
+    /// **Everything `endless_ground` promises, read off one painted frame.**
+    ///
+    /// Beside the add, to the end of the run, the last fill is ONE rect
+    /// from the add's own left edge to the run's right edge at the add's
+    /// full height, in `ink`'s `empty_ground`, and the only rect of that
+    /// colour there, so the run costs one rect however far it goes; and the
+    /// one rim round the add is round that same rect, so there is no rim
+    /// edge, gap or wood between the add and its run. Returns the run
+    /// beside the add.
+    fn assert_endless(
+        shapes: &[egui::epaint::ClippedShape],
+        l: &Layout,
+        v: &MixerView<'_>,
+        col: Column,
+        what: &str,
+    ) -> Rect {
+        let p = ink(v);
+        let add = l.strips[col].panel;
+        let beside = Rect::from_min_max(
+            Pos2::new(add.right(), add.top()),
+            Pos2::new(l.region.right(), add.bottom()),
+        );
+        assert!(beside.is_positive(), "{what}: no room beside the add {add:?} to run on into");
+        let (rect, fill) = ground_over(shapes, beside)
+            .unwrap_or_else(|| panic!("{what}: nothing is painted beside the add"));
+        assert_eq!(fill, p.empty_ground, "{what}: the run beside the add is not the add's own ground");
+        assert!(
+            (rect.left() - add.left()).abs() < 0.01
+                && (rect.right() - l.region.right()).abs() < 0.01
+                && (rect.top() - add.top()).abs() < 0.01
+                && (rect.bottom() - add.bottom()).abs() < 0.01,
+            "{what}: the ground {rect:?} is not one surface from the add {add:?} to the end of the run at {:.1}",
+            l.region.right()
+        );
+        // And it costs one rect however far it runs: never a rect per strip
+        // that is not there.
+        let pieces = shapes
+            .iter()
+            .filter(|cs| match &cs.shape {
+                egui::Shape::Rect(r) => r.fill == p.empty_ground && r.rect.intersect(beside).is_positive(),
+                _ => false,
+            })
+            .count();
+        assert_eq!(pieces, 1, "{what}: the run beside the add is painted in {pieces} pieces");
+        let rims: Vec<Rect> = shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r)
+                    if r.stroke.width > 0.0 && r.fill.a() == 0 && r.rect.intersect(add).is_positive() =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rims, vec![rect], "{what}: the add is rimmed apart from its run");
+        // And nothing drawn down the add's right edge, between the two.
+        for cs in shapes {
+            if let egui::Shape::LineSegment { points: [a, b], stroke } = &cs.shape {
+                let down = (a.x - b.x).abs() < 0.5 && (a.x - add.right()).abs() <= 1.0;
+                let long = a.y.max(b.y).min(add.bottom()) - a.y.min(b.y).max(add.top()) > 40.0;
+                assert!(
+                    !(stroke.width > 0.0 && stroke.color.a() > 0 && down && long),
+                    "{what}: a line runs down between the add and its run: {a:?} to {b:?}"
+                );
+            }
+        }
+        beside
+    }
+
+    /// **The trailing add's ground runs on to the end of the run.**
+    ///
+    /// The owner asked for the colour behind the add to carry on "beside
+    /// them in mixer view", and for the draw to be "just infinite". Held at
+    /// five window sizes, in both tiers (the padlock at the free cap wears
+    /// the same ground), on desks of none to twelve tracks at three zooms,
+    /// at every scroll from the start to past the end: wherever the add
+    /// stands with room after it, its ground reaches the end of the run as
+    /// one surface with it (see `assert_endless`). A desk longer than the
+    /// run stops flush at its add when scrolled to its end, and does not
+    /// show the add at all anywhere else; neither has a run to paint.
+    ///
+    /// Revert-check: paint the add's ground over its own panel again (pass
+    /// `s.panel` for `ground` in `draw`) and the run beside it is the wood.
+    #[test]
+    fn the_trailing_adds_ground_runs_on_to_the_end_of_the_run() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let (mut ran, mut flush) = (0usize, 0usize);
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 700.0), (1920.0, 500.0), (640.0, 300.0), (420.0, 420.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                for (used, visible) in [(2usize, 8usize), (0, 8), (5, 8), (2, 16), (3, 4), (12, 8)] {
+                    let mut v = ending_at_the_add(used, plus);
+                    v.visible = visible;
+                    let end = Layout::max_scroll_px(r, visible, used + 1);
+                    for scroll in [0.0_f32, 37.5, end * 0.5, end - 0.25, end, 1.0e6] {
+                        v.scroll_px = scroll;
+                        let what = format!("{w}x{h}, {plus:?}, {used} tracks in {visible} strips, scroll {scroll}");
+                        let l = Layout::new(r, &v);
+                        let shapes = paint_in(&ctx, &v, r);
+                        let add = Column::Track(used);
+                        match endless_ground(&l, &v) {
+                            Some((col, ground)) => {
+                                assert_eq!(col, add, "{what}: the run is not the add's");
+                                assert_eq!(ground.right(), l.region.right(), "{what}: the run stops short");
+                                assert_endless(&shapes, &l, &v, col, &what);
+                                ran += 1;
+                            }
+                            None => {
+                                if let Some(s) = l.strips.get(add).filter(|s| s.panel.is_positive()) {
+                                    assert!(
+                                        l.region.right() - s.panel.right() <= 0.5,
+                                        "{what}: the add {:?} has room after it and no run",
+                                        s.panel
+                                    );
+                                    flush += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ran >= 150 && flush >= 40, "{ran} frames ran the add on, {flush} ended flush at it");
+    }
+
+    /// **On every theme the run wears the add's own ground**: `ink`'s
+    /// `empty_ground`, the token every empty slot on the desk wears, read
+    /// off the painted frame in both modes so no colour is written down
+    /// here and a theme that moves its slots moves the run with them.
+    #[test]
+    fn every_theme_runs_the_desks_add_on_in_its_own_ground() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let mut seen = 0usize;
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
+            let mut set = crate::settings::Settings::default();
+            theme.apply(&mut set);
+            let mut v = ending_at_the_add(2, Plus::Trailing);
+            v.dark_mode = dark;
+            v.wood = {
+                let c = set.recorder_bg_color;
+                (c.r, c.g, c.b)
+            };
+            v.fx_strip = set.fx_strip_color.to_color32();
+            v.input_chip = set.input_chip_color.to_color32();
+            let what = format!("{} {}", theme.name, if dark { "dark" } else { "light" });
+            let l = Layout::new(r, &v);
+            let (col, _) = endless_ground(&l, &v).unwrap_or_else(|| panic!("{what}: no run beside the add"));
+            assert_endless(&paint_in(&ctx, &v, r), &l, &v, col, &what);
+            seen += 1;
+        }
+        assert!(seen >= 32, "only {seen} theme frames were painted");
+    }
+
+    /// **The run beside the add is paint, and answers nothing.**
+    ///
+    /// A press anywhere in it answers what the bare wood there did: no hit,
+    /// and no strip under it (a press on a strip's panel SELECTS that
+    /// channel, and a right-click asks `strip_at` which column it is on), so
+    /// the run cannot select the add or make a track. No target the desk
+    /// offers a keyboard or a reader reaches into it. And the layout is the
+    /// one a desk whose last strip is an ordinary empty slot gets, which has
+    /// no run: the same strips in the same places, and no scrollbar or
+    /// scroll range, so the run is not content.
+    ///
+    /// Revert-check: with the run unpainted, the first assertion goes red
+    /// here as in every test of the run; the rest hold it to paint.
+    #[test]
+    fn the_run_beside_the_add_is_paint_and_answers_nothing() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 700.0), (420.0, 420.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                let what = format!("{w}x{h}, {plus:?}");
+                let v = ending_at_the_add(2, plus);
+                let l = Layout::new(r, &v);
+                let (col, _) = endless_ground(&l, &v).unwrap_or_else(|| panic!("{what}: no run beside the add"));
+                let beside = assert_endless(&paint_in(&ctx, &v, r), &l, &v, col, &what);
+                for fx in [0.02_f32, 0.5, 0.98] {
+                    for fy in [0.02_f32, 0.5, 0.98] {
+                        let at = Pos2::new(beside.left() + beside.width() * fx, beside.top() + beside.height() * fy);
+                        assert_eq!(hit_test(r, &v, at), None, "{what}: a press at {at:?} in the run hits");
+                        assert_eq!(strip_at(r, &v, at), None, "{what}: {at:?} in the run is on a strip");
+                    }
+                }
+                for (t, hit) in l.targets() {
+                    assert!(
+                        !t.intersect(beside).is_positive(),
+                        "{what}: {hit:?} at {t:?} reaches into the run {beside:?}"
+                    );
+                }
+                // The same desk ending in an ordinary empty slot: no run,
+                // and the same layout to the point.
+                let twin = ending_at_the_add(2, Plus::Row);
+                let lt = Layout::new(r, &twin);
+                assert_eq!(endless_ground(&lt, &twin), None, "{what}: an ordinary empty slot ran on");
+                let panels = |l: &Layout| l.strips.iter().map(|(c, s)| (c, s.panel, s.add)).collect::<Vec<_>>();
+                assert_eq!(panels(&l), panels(&lt), "{what}: the run moved a strip");
+                assert_eq!((l.region, l.bar), (lt.region, ScrollBar::NONE), "{what}: the run is content");
+                assert_eq!(
+                    Layout::max_scroll_px(r, v.visible, v.strips.shown),
+                    0.0,
+                    "{what}: the run gave the desk a scroll range"
+                );
+            }
+        }
     }
 
     /// **Every rack on the desk is at the same height, and holds six.**
@@ -4841,16 +5913,16 @@ mod tests {
     /// view to be the same as the current tracks'".
     ///
     /// The CLICK is in the sweep because it grew a second rack to be here
-    /// with: six slots seated in `recorder::BUS_EXTRA_SEATS`, and the engine
+    /// with: six slots on its two racks (`Node::Click`, chains 0 and 1), and the engine
     /// runs them.
     #[test]
     fn every_rack_on_the_desk_is_at_one_height() {
         let mut v = a_view();
-        v.strips[1].is_folder = true;
+        v.strips[Column::Track(1)].is_folder = true;
         let l = Layout::new(rect(), &v);
-        let track = l.strips[0].inserts[0];
+        let track = l.strips[Column::Track(0)].inserts[0];
         assert!(track.is_positive(), "the reference track has no rack");
-        for (what, col) in [("folder", 1), ("click", CLICK), ("master", MASTER)] {
+        for (what, col) in [("folder", Column::Track(1)), ("click", CLICK), ("master", MASTER)] {
             let bays = &l.strips[col].inserts;
             assert!(bays[0].is_positive(), "{what}: no rack at all");
             assert!(
@@ -4862,13 +5934,13 @@ mod tests {
             // Six, and the last one ends where a track's last one ends.
             assert!(bays[5].is_positive(), "{what}: only three bays");
             assert!(
-                (bays[5].bottom() - l.strips[0].inserts[5].bottom()).abs() < 0.5,
+                (bays[5].bottom() - l.strips[Column::Track(0)].inserts[5].bottom()).abs() < 0.5,
                 "{what}'s rack ends somewhere else"
             );
         }
         // **And a folder's ICON is clear of it**, which is the fault that
         // started this: the rack used to be drawn over the badge.
-        let folder = &l.strips[1];
+        let folder = &l.strips[Column::Track(1)];
         assert!(folder.icon.is_positive(), "the folder has no icon seat");
         assert!(
             folder.icon.bottom() <= folder.inserts[0].top() + 0.5,
@@ -4896,7 +5968,7 @@ mod tests {
         assert!(!click.input_chip.is_positive(), "the click grew an input chip");
         // In the band a channel spends on its input, so the two columns line
         // up row for row.
-        let track = &l.strips[0];
+        let track = &l.strips[Column::Track(0)];
         assert!(
             (click.met.top() - track.input_chip.top()).abs() < 0.5
                 && (click.met.bottom() - track.input_chip.bottom()).abs() < 0.5,
@@ -4909,7 +5981,7 @@ mod tests {
             "the click's sound button cannot be pressed"
         );
         // Every other column keeps its own; nobody else grew one.
-        for (i, s) in l.strips.iter().enumerate() {
+        for (i, s) in l.strips.iter() {
             assert!(
                 i == CLICK || !s.met.is_positive(),
                 "column {i} grew a metronome button"
@@ -4976,7 +6048,7 @@ mod tests {
         // And an ordinary channel has both a send and its switches. Channel
         // 0, not the one just left of the click: only eight channels show at
         // once now, and the click and master are pinned past them.
-        let track = &l.strips[0];
+        let track = &l.strips[Column::Track(0)];
         assert!(track.send.is_positive() && track.mute.is_positive());
     }
 
@@ -4992,17 +6064,17 @@ mod tests {
         v.scroll_px = 0.0;
         let l = Layout::new(r, &v);
         for n in 0..VISIBLE_CHANNELS {
-            assert!(l.strips[n].panel.is_positive(), "channel {n} should show");
+            assert!(l.strips[Column::Track(n)].panel.is_positive(), "channel {n} should show");
         }
         for n in VISIBLE_CHANNELS..CHANNELS {
-            assert!(!l.strips[n].panel.is_positive(), "channel {n} should be scrolled off");
+            assert!(!l.strips[Column::Track(n)].panel.is_positive(), "channel {n} should be scrolled off");
         }
         // The click and the master are always laid out...
         assert!(l.strips[CLICK].panel.is_positive(), "the click vanished");
         assert!(l.strips[MASTER].panel.is_positive(), "the master vanished");
         // ...and the master is the rightmost thing on the desk.
         let master_x = l.strips[MASTER].panel.left();
-        for s in &l.strips {
+        for (_, s) in l.strips.iter() {
             if s.panel.is_positive() {
                 assert!(
                     s.panel.left() <= master_x + 0.5,
@@ -5014,8 +6086,8 @@ mod tests {
         let mut v = a_view();
         v.scroll_px = (CHANNELS - VISIBLE_CHANNELS) as f32 * Layout::metrics(r, VISIBLE_CHANNELS).1;
         let l = Layout::new(r, &v);
-        assert!(l.strips[CHANNELS - 1].panel.is_positive(), "the last channel never shows");
-        assert!(!l.strips[0].panel.is_positive(), "channel 0 should be scrolled off");
+        assert!(l.strips[Column::Track(CHANNELS - 1)].panel.is_positive(), "the last channel never shows");
+        assert!(!l.strips[Column::Track(0)].panel.is_positive(), "channel 0 should be scrolled off");
         assert!(
             (l.strips[MASTER].panel.left() - master_x).abs() < 0.5,
             "the master moved when the channels scrolled"
@@ -5034,37 +6106,37 @@ mod tests {
         v.scroll_px = pitch * 0.5;
         let l = Layout::new(r, &v);
         // Channel 0 is half off: its panel starts left of the region.
-        assert!(l.strips[0].panel.is_positive(), "the partial column vanished");
+        assert!(l.strips[Column::Track(0)].panel.is_positive(), "the partial column vanished");
         assert!(
-            l.strips[0].panel.left() < l.region.left() - 0.5,
+            l.strips[Column::Track(0)].panel.left() < l.region.left() - 0.5,
             "channel 0 does not overhang, so nothing scrolled by pixels"
         );
         // The extra column on the right is exposed.
         assert!(
-            l.strips[VISIBLE_CHANNELS].panel.is_positive(),
+            l.strips[Column::Track(VISIBLE_CHANNELS)].panel.is_positive(),
             "the half position exposed no extra column"
         );
         // A press on the overhanging, clipped part of channel 0 lands on
         // nothing; the same control pressed inside the region still answers.
         let hidden = Pos2::new(
-            (l.strips[0].panel.left() + l.region.left()) / 2.0 - 0.1,
-            l.strips[0].mute.center().y,
+            (l.strips[Column::Track(0)].panel.left() + l.region.left()) / 2.0 - 0.1,
+            l.strips[Column::Track(0)].mute.center().y,
         );
         assert!(
             hit_test(r, &v, hidden).is_none(),
             "the clipped part of a strip answered a press"
         );
-        let seen = Pos2::new(l.region.left() + 2.0, l.strips[0].mute.center().y);
-        if l.strips[0].mute.contains(seen) {
-            assert_eq!(hit_test(r, &v, seen), Some(Hit::Mute(Column(0))));
+        let seen = Pos2::new(l.region.left() + 2.0, l.strips[Column::Track(0)].mute.center().y);
+        if l.strips[Column::Track(0)].mute.contains(seen) {
+            assert_eq!(hit_test(r, &v, seen), Some(Hit::Mute(Column::Track(0))));
         }
         // And the clamp holds: past the end lands at the end, not beyond.
         let mut v = a_view();
         v.scroll_px = 1.0e9;
         let l = Layout::new(r, &v);
-        assert!(l.strips[CHANNELS - 1].panel.is_positive());
+        assert!(l.strips[Column::Track(CHANNELS - 1)].panel.is_positive());
         assert!(
-            l.strips[CHANNELS - 1].panel.right() <= l.region.right() + 0.5,
+            l.strips[Column::Track(CHANNELS - 1)].panel.right() <= l.region.right() + 0.5,
             "the clamp let the last channel drift past the region"
         );
     }
@@ -5089,7 +6161,7 @@ mod tests {
         let drawn: Vec<f32> = l
             .strips
             .iter()
-            .map(|s| s.panel.width())
+            .map(|(_, s)| s.panel.width())
             .filter(|w| *w > 0.0)
             .collect();
         assert!(!drawn.is_empty(), "the desk drew nothing at all");
@@ -5103,7 +6175,7 @@ mod tests {
         // ever takes away what would not have fitted.
         let wide = Rect::from_min_size(Pos2::ZERO, Vec2::new(2400.0, 320.0));
         let l = Layout::new(wide, &v);
-        let shown = l.strips.iter().filter(|s| s.panel.width() > 0.0).count();
+        let shown = l.strips.iter().filter(|(_, s)| s.panel.width() > 0.0).count();
         assert!(
             shown >= CHANNELS,
             "a wide desk showed only {shown} of {CHANNELS}"
@@ -5132,8 +6204,8 @@ mod tests {
             let tops: std::collections::BTreeSet<i64> = l
                 .strips
                 .iter()
-                .filter(|s| s.panel.is_positive())
-                .map(|s| s.panel.top().round() as i64)
+                .filter(|(_, s)| s.panel.is_positive())
+                .map(|(_, s)| s.panel.top().round() as i64)
                 .collect();
             assert_eq!(
                 tops.len(),
@@ -5145,47 +6217,69 @@ mod tests {
             // the fold was spending.
             let full = l.strips[MASTER].panel.height();
             for n in 0..CHANNELS {
-                if l.strips[n].panel.is_positive() {
+                if l.strips[Column::Track(n)].panel.is_positive() {
                     assert!(
-                        (l.strips[n].panel.height() - full).abs() < 0.6,
+                        (l.strips[Column::Track(n)].panel.height() - full).abs() < 0.6,
                         "channel {n} is {} tall against the master's {full}",
-                        l.strips[n].panel.height()
+                        l.strips[Column::Track(n)].panel.height()
                     );
                 }
             }
         }
     }
 
-    /// **The free desk ends at sixteen, everywhere the layout reaches.**
-    /// The paywall's geometry: with `active` at the free count, the
-    /// supporter lanes are never laid out, the scroll cannot reach them,
-    /// and the fold never fires however big the screen - one scrolling
-    /// row is the free mixer's whole shape, by the owner's word.
+    /// **The free desk is all thirty-two, in one scrolling row.**
+    ///
+    /// It used to end at sixteen: `active` was the paywall's geometry, and
+    /// the supporter lanes were never laid out on a free install. The free
+    /// tier is a CREATION cap now (`recorder::track_cap`), never a width, so
+    /// a free desk lays out every lane the scroll can reach, and the layout's
+    /// own rule - nothing past `active` is laid out, the rail stops at its
+    /// edge - is pinned below at a literal sixteen, which is a view's
+    /// argument rather than anybody's tier.
     #[test]
-    fn a_free_desk_never_shows_or_reaches_the_supporter_lanes() {
+    fn a_free_desk_lays_out_and_reaches_every_lane() {
         let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 800.0));
+        let free = crate::recorder::FREE_TRACKS;
+        assert_eq!(free, 32, "the owner's free desk is thirty-two tracks");
         let mut v = a_view();
-        v.active = crate::recorder::FREE_CHANNELS;
+        v.strips = dense(free, |_| false);
         v.visible = CHANNELS; // asks for everything; the clamp answers
         v.scroll_px = 1.0e9; // and so does the scroll's rail
         let l = Layout::new(tall, &v);
-        for n in crate::recorder::FREE_CHANNELS..CHANNELS {
-            assert!(
-                !l.strips[n].panel.is_positive(),
-                "supporter lane {n} was laid out on a free desk"
-            );
-        }
+        assert!(
+            l.strips[Column::Track(free - 1)].panel.is_positive(),
+            "the free desk's last lane was not laid out at the end of the rail"
+        );
         // No fold: every visible channel shares one row.
-        let tops: std::collections::BTreeSet<i64> = (0..crate::recorder::FREE_CHANNELS)
-            .filter(|n| l.strips[*n].panel.is_positive())
-            .map(|n| l.strips[n].panel.top().round() as i64)
+        let tops: std::collections::BTreeSet<i64> = (0..free)
+            .filter(|n| l.strips[Column::Track(*n)].panel.is_positive())
+            .map(|n| l.strips[Column::Track(n)].panel.top().round() as i64)
             .collect();
         assert_eq!(tops.len(), 1, "the free desk folded");
-        // And the scroll's ceiling respects the same edge.
+        // And the scroll's ceiling reaches the free desk's last lane.
         assert_eq!(
-            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, crate::recorder::FREE_CHANNELS),
-            (crate::recorder::FREE_CHANNELS - VISIBLE_CHANNELS) as f32
-                * Layout::metrics(tall, VISIBLE_CHANNELS).1,
+            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, free),
+            (free - VISIBLE_CHANNELS) as f32 * Layout::metrics(tall, VISIBLE_CHANNELS).1,
+        );
+
+        // **The layout still stops at the desk's last drawn track**, whatever
+        // asked for more: a view of sixteen tracks lays out sixteen.
+        let edge = 16;
+        let mut v = a_view();
+        v.strips = dense(edge, |_| false);
+        v.visible = CHANNELS;
+        v.scroll_px = 1.0e9;
+        let l = Layout::new(tall, &v);
+        for n in edge..CHANNELS {
+            assert!(
+                !l.strips[Column::Track(n)].panel.is_positive(),
+                "lane {n} was laid out past the desk's end"
+            );
+        }
+        assert_eq!(
+            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, edge),
+            (edge - VISIBLE_CHANNELS) as f32 * Layout::metrics(tall, VISIBLE_CHANNELS).1,
         );
     }
 
@@ -5199,7 +6293,7 @@ mod tests {
             v.visible = want;
             v.scroll_px = 0.0;
             let l = Layout::new(r, &v);
-            let shown = (0..CHANNELS).filter(|n| l.strips[*n].panel.is_positive()).count();
+            let shown = (0..CHANNELS).filter(|n| l.strips[Column::Track(*n)].panel.is_positive()).count();
             assert_eq!(shown, want.min(CHANNELS), "asked for {want}, showed {shown}");
             assert!(l.strips[MASTER].panel.is_positive(), "the master must always show");
         }
@@ -5212,7 +6306,7 @@ mod tests {
         let v = a_view();
         let l = Layout::new(rect(), &v);
         assert!(
-            l.strips[MASTER].meter.height() > l.strips[0].meter.height(),
+            l.strips[MASTER].meter.height() > l.strips[Column::Track(0)].meter.height(),
             "the master left a hole where a send would have been"
         );
     }
@@ -5221,10 +6315,10 @@ mod tests {
     #[test]
     fn soloing_one_strip_silences_the_rest() {
         let mut v = a_view();
-        v.strips[2].soloed = true;
+        v.strips[Column::Track(2)].soloed = true;
         v.any_solo = true;
-        assert!(v.heard(2), "the soloed strip was silent");
-        assert!(!v.heard(0), "an unsoloed strip was still heard");
+        assert!(v.heard(Column::Track(2)), "the soloed strip was silent");
+        assert!(!v.heard(Column::Track(0)), "an unsoloed strip was still heard");
         // And the master is never taken out by a solo, or soloing anything
         // would mute the app.
         assert!(v.heard(MASTER), "solo silenced the master");
@@ -5237,9 +6331,9 @@ mod tests {
     #[test]
     fn an_empty_slot_is_a_plus_and_nothing_else() {
         let mut v = a_view();
-        v.strips[0].empty = true;
+        v.strips[Column::Track(0)].empty = true;
         let l = Layout::new(rect(), &v);
-        let s = &l.strips[0];
+        let s = &l.strips[Column::Track(0)];
         assert!(s.add.is_positive(), "there is no way to fill the slot");
         for (r, what) in [
             (s.fader, "fader"),
@@ -5252,7 +6346,7 @@ mod tests {
         }
         assert_eq!(
             hit_test(rect(), &v, s.add.center()),
-            Some(Hit::Add(Column(0))),
+            Some(Hit::Add(Column::Track(0))),
             "the plus does not open anything"
         );
         // And a filled one has no plus in the MIDDLE of it, where the fader
@@ -5260,18 +6354,18 @@ mod tests {
         // change what is on a channel, filled or not — so what is checked is
         // that the two are not in two places: `add` is the icon exactly.
         let filled = Layout::new(rect(), &a_view());
-        assert!(filled.strips[0].icon.is_positive(), "a filled slot has no icon");
+        assert!(filled.strips[Column::Track(0)].icon.is_positive(), "a filled slot has no icon");
         assert_eq!(
-            filled.strips[0].add, filled.strips[0].icon,
+            filled.strips[Column::Track(0)].add, filled.strips[Column::Track(0)].icon,
             "the picker is somewhere other than the icon that opens it"
         );
         assert!(
-            !filled.strips[0].add.contains(filled.strips[0].fader.center()),
+            !filled.strips[Column::Track(0)].add.contains(filled.strips[Column::Track(0)].fader.center()),
             "the picker is over the fader"
         );
         assert_eq!(
-            hit_test(rect(), &a_view(), filled.strips[0].icon.center()),
-            Some(Hit::Add(Column(0))),
+            hit_test(rect(), &a_view(), filled.strips[Column::Track(0)].icon.center()),
+            Some(Hit::Add(Column::Track(0))),
             "the icon does not open the picker"
         );
     }
@@ -5283,14 +6377,14 @@ mod tests {
     #[test]
     fn an_empty_channels_circle_adds_and_the_rest_is_quiet_ground() {
         let mut v = a_view();
-        v.strips[0].empty = true;
+        v.strips[Column::Track(0)].empty = true;
         let r = rect();
         let l = Layout::new(r, &v);
-        let panel = l.strips[0].panel;
+        let panel = l.strips[Column::Track(0)].panel;
         // The circle answers with ADD…
         assert_eq!(
-            hit_test(r, &v, l.strips[0].add.center()),
-            Some(Hit::Add(Column(0))),
+            hit_test(r, &v, l.strips[Column::Track(0)].add.center()),
+            Some(Hit::Add(Column::Track(0))),
             "the circled plus cannot be pressed"
         );
         // …and the rest of the panel is quiet ground — where the
@@ -5317,15 +6411,15 @@ mod tests {
     fn every_label_is_at_the_same_height_as_the_masters() {
         let v = a_view();
         let l = Layout::new(rect(), &v);
-        let master = l.strips[COLUMNS - 1].name;
+        let master = l.strips[MASTER].name;
         assert!(master.is_positive(), "the master has no name plate");
-        for (i, s) in l.strips.iter().enumerate() {
+        for (i, s) in l.strips.iter() {
             if !s.name.is_positive() {
                 continue;
             }
             assert!(
                 (s.name.top() - master.top()).abs() < 0.5,
-                "column {i}'s label is at {} where the master's is at {}",
+                "column {i:?}'s label is at {} where the master's is at {}",
                 s.name.top(),
                 master.top()
             );
@@ -5429,32 +6523,39 @@ mod tests {
     /// Every instrument slot is a channel, filled or not.
     #[test]
     fn the_desk_has_a_strip_for_every_slot() {
-        let channels = Strip::shown();
-        for n in 0..CHANNELS {
-            assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
-        }
-        // **Drawn: the eight and the click.** BACKING retired with v13;
-        // the drum bus column retired when the drumpad became a lane's
-        // instrument — the kit answers to its lane's strip now, and the
-        // bus row survives only as hidden desk plumbing. Only the effects
-        // return keeps its off-desk life: its three knobs are the band's,
-        // and a soloable bus is a feedback question.
+        // **Drawn: the tracks and the click, then the master.** BACKING
+        // retired with v13; the drum bus column retired when the drumpad
+        // became a lane's instrument — the kit answers to its lane's strip
+        // now, and the bus row survives only as hidden desk plumbing. Only
+        // the effects return keeps its off-desk life: its three knobs are the
+        // band's, and a soloable bus is a feedback question.
+        let view = a_view();
         assert_eq!(
-            COLUMNS,
-            CHANNELS + 2,
-            "a drawn channel went missing"
+            Column::every(CHANNELS).collect::<Vec<_>>(),
+            view.strips.iter().map(|(c, _)| c).collect::<Vec<_>>(),
+            "the desk's columns are not every track, the click and the master"
         );
-        assert_eq!(channels.len(), CHANNELS + 1);
-        assert!(!channels.contains(&Strip::Drums), "the retired drum bus came back");
-        assert!(channels.contains(&Strip::Click), "the click lost its column");
-        assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
-        // Every strip owns a distinct place in the arrays, or two of them
-        // would share a send and mute together.
-        let mut seen: Vec<usize> = Strip::all().iter().map(|s| s.index()).collect();
-        let n = seen.len();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), n, "two channels share an index");
+        let drawn: Vec<Strip> = view.strips.iter().filter_map(|(c, _)| c.strip()).collect();
+        for n in 0..CHANNELS {
+            assert_eq!(drawn[n], Strip::Channel(n), "channel {n} has no column");
+        }
+        assert_eq!(drawn.last(), Some(&Strip::Click), "the click lost its column");
+        assert!(!drawn.contains(&Strip::Drums), "the retired drum bus came back");
+        assert!(!drawn.contains(&Strip::Fx), "the bus is drawn twice");
+        // Every strip keeps settings of its own, or two of them would share
+        // a send and mute together: a row's at its row, a special's among
+        // the specials (W5), each read back as written.
+        let mut s = crate::settings::Settings::default();
+        let every: Vec<crate::recorder::StripRef> = (0..CHANNELS)
+            .map(crate::recorder::StripRef::Row)
+            .chain([crate::recorder::StripRef::Drums, crate::recorder::StripRef::Click, crate::recorder::StripRef::Fx])
+            .collect();
+        for (k, strip) in every.iter().enumerate() {
+            s.set_strip_send(*strip, (k + 1) as f64 / 64.0);
+        }
+        for (k, strip) in every.iter().enumerate() {
+            assert_eq!(s.strip_send(*strip), (k + 1) as f64 / 64.0, "{strip:?} shares its send");
+        }
     }
 
     /// **Three inserts on every channel, and all three can be pressed.**
@@ -5467,7 +6568,7 @@ mod tests {
         let v = a_view();
         let r = rect();
         let l = Layout::new(r, &v);
-        for (i, s) in l.strips.iter().enumerate() {
+        for (i, s) in l.strips.iter() {
             if !s.panel.is_positive() || v.strips[i].empty {
                 continue;
             }
@@ -5478,7 +6579,7 @@ mod tests {
                 );
                 assert_eq!(
                     hit_test(r, &v, s.inserts[n].center()),
-                    Some(Hit::Insert(Column(i), n)),
+                    Some(Hit::Insert(i, n)),
                     "channel {i}'s insert {n} cannot be pressed"
                 );
             }
@@ -5509,9 +6610,9 @@ mod tests {
         // effect chips on a channel with no instrument in it would be three
         // controls for something that is not there.
         let mut empty = a_view();
-        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
+        empty.strips[Column::Track(0)] = a_strip(Some(Strip::Channel(0)), true);
         let l = Layout::new(r, &empty);
-        assert!(!l.strips[0].inserts[0].is_positive());
+        assert!(!l.strips[Column::Track(0)].inserts[0].is_positive());
     }
 
     /// **A channel's name is a field, and a long one is cut.**
@@ -5526,14 +6627,14 @@ mod tests {
         let v = a_view();
         let r = rect();
         let l = Layout::new(r, &v);
-        for (i, s) in l.strips.iter().enumerate() {
+        for (i, s) in l.strips.iter() {
             if !s.panel.is_positive() {
                 continue;
             }
             assert!(s.name.is_positive(), "channel {i} has nowhere to put a name");
             assert_eq!(
                 hit_test(r, &v, s.name.center()),
-                Some(Hit::Name(Column(i))),
+                Some(Hit::Name(i)),
                 "channel {i}'s name cannot be pressed"
             );
         }
@@ -5541,10 +6642,10 @@ mod tests {
         // and a name field on it would be a control for a channel that is not
         // there yet.
         let mut empty = a_view();
-        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
+        empty.strips[Column::Track(0)] = a_strip(Some(Strip::Channel(0)), true);
         let l = Layout::new(r, &empty);
-        assert!(!l.strips[0].name.is_positive(), "an empty slot got a name field");
-        assert_eq!(hit_test(r, &empty, l.strips[0].panel.center()), Some(Hit::Add(Column(0))));
+        assert!(!l.strips[Column::Track(0)].name.is_positive(), "an empty slot got a name field");
+        assert_eq!(hit_test(r, &empty, l.strips[Column::Track(0)].panel.center()), Some(Hit::Add(Column::Track(0))));
     }
 
     /// **Every mark has to land on the scale it is drawn against.**
@@ -5594,8 +6695,8 @@ mod tests {
         let r = rect();
         let l = Layout::new(r, &v);
         assert_eq!(
-            hit_test(r, &v, l.strips[0].db.center()),
-            Some(Hit::Db(Column(0))),
+            hit_test(r, &v, l.strips[Column::Track(0)].db.center()),
+            Some(Hit::Db(Column::Track(0))),
             "the number could not be clicked"
         );
         // The swatch grid moved into the TRACK dialog; the master's default
@@ -5834,7 +6935,7 @@ mod tests {
     #[test]
     fn the_insert_menu_offers_bypass_delete_and_replace_and_nothing_else() {
         let mut v = a_view();
-        v.fx_menu = Some((Column(0), 1));
+        v.fx_menu = Some((Column::Track(0), 1));
         let r = rect();
         let l = Layout::new(r, &v);
         let actions = fx_menu_actions(
@@ -5843,35 +6944,35 @@ mod tests {
             v.fx_menu_paste,
             v.fx_menu_bypassed,
         );
-        let rows = fx_menu_rows(&l.strips[0], 1, actions.len());
+        let rows = fx_menu_rows(&l.strips[Column::Track(0)], 1, actions.len());
         for (i, row) in rows.iter().enumerate() {
             assert!(row.is_positive(), "row {i} has no area");
             assert!(
-                l.strips[0].panel.contains(row.min) && l.strips[0].panel.contains(row.max),
+                l.strips[Column::Track(0)].panel.contains(row.min) && l.strips[Column::Track(0)].panel.contains(row.max),
                 "row {i} hangs outside its own strip"
             );
         }
         assert_eq!(
             hit_test(r, &v, rows[0].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Bypass))
+            Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass))
         );
         assert_eq!(
             hit_test(r, &v, rows[1].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+            Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Delete))
         );
         assert_eq!(
             hit_test(r, &v, rows[2].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Replace))
+            Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Replace))
         );
         // A press on ANOTHER strip's fader is a dismissal, not a fader.
         assert_eq!(
-            hit_test(r, &v, l.strips[3].fader.center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Dismiss))
+            hit_test(r, &v, l.strips[Column::Track(3)].fader.center()),
+            Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Dismiss))
         );
         // And with no menu open the same point is the fader again.
         assert_eq!(
-            hit_test(r, &a_view(), l.strips[3].fader.center()),
-            Some(Hit::Fader(Column(3)))
+            hit_test(r, &a_view(), l.strips[Column::Track(3)].fader.center()),
+            Some(Hit::Fader(Column::Track(3)))
         );
     }
 
@@ -5887,7 +6988,7 @@ mod tests {
     #[test]
     fn the_sidechain_row_appears_only_where_a_key_can_go() {
         let mut v = a_view();
-        v.fx_menu = Some((Column(0), 1));
+        v.fx_menu = Some((Column::Track(0), 1));
         v.fx_menu_key = true;
         let r = rect();
         let l = Layout::new(r, &v);
@@ -5901,18 +7002,18 @@ mod tests {
             actions.contains(&FxAction::Sidechain),
             "a key-capable bay was offered no sidechain row"
         );
-        let rows = fx_menu_rows(&l.strips[0], 1, actions.len());
+        let rows = fx_menu_rows(&l.strips[Column::Track(0)], 1, actions.len());
         for (i, row) in rows.iter().enumerate() {
             assert!(row.is_positive(), "row {i} has no area");
             assert!(
-                l.strips[0].panel.contains(row.min) && l.strips[0].panel.contains(row.max),
+                l.strips[Column::Track(0)].panel.contains(row.min) && l.strips[Column::Track(0)].panel.contains(row.max),
                 "row {i} hangs outside its own strip"
             );
         }
         for (row, action) in rows.iter().zip(&actions) {
             assert_eq!(
                 hit_test(r, &v, row.center()),
-                Some(Hit::FxMenu(Column(0), 1, *action)),
+                Some(Hit::FxMenu(Column::Track(0), 1, *action)),
                 "the rows and the actions have come apart"
             );
         }
@@ -5926,17 +7027,17 @@ mod tests {
             v.fx_menu_bypassed,
         );
         assert!(!plain.contains(&FxAction::Sidechain));
-        let short = fx_menu_rows(&l.strips[0], 1, plain.len());
+        let short = fx_menu_rows(&l.strips[Column::Track(0)], 1, plain.len());
         assert_eq!(
             hit_test(r, &v, short[0].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Bypass))
+            Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass))
         );
         let last = short[short.len() - 1];
         let below = Pos2::new(last.center().x, last.bottom() + last.height());
         if !short.iter().any(|r| r.contains(below)) {
             assert_eq!(
                 hit_test(r, &v, below),
-                Some(Hit::FxMenu(Column(0), 1, FxAction::Dismiss)),
+                Some(Hit::FxMenu(Column::Track(0), 1, FxAction::Dismiss)),
                 "a plain bay's menu answered a row it does not have"
             );
         }
@@ -6019,9 +7120,9 @@ mod tests {
         // where a destructive act has a named row. No strip lays one out
         // and no press can find one.
         let mut v = a_view();
-        v.strips[1].removable = true;
+        v.strips[Column::Track(1)].removable = true;
         let l = Layout::new(rect(), &v);
-        for (i, s) in l.strips.iter().enumerate() {
+        for (i, s) in l.strips.iter() {
             assert!(!s.close.is_positive(), "column {i} still wears an ×");
         }
     }
@@ -6040,15 +7141,15 @@ mod tests {
             v.scroll_px = n.min(CHANNELS - VISIBLE_CHANNELS) as f32
                 * Layout::metrics(r, VISIBLE_CHANNELS).1;
             let l = Layout::new(r, &v);
-            let s = &l.strips[n];
+            let s = &l.strips[Column::Track(n)];
             assert!(s.arm.is_positive(), "channel {n} has no R switch");
             assert_eq!(
                 hit_test(r, &v, s.arm.center()),
-                Some(Hit::Arm(Column(n))),
+                Some(Hit::Arm(Column::Track(n))),
                 "channel {n}'s R cannot be pressed"
             );
-            assert_eq!(hit_test(r, &v, s.mute.center()), Some(Hit::Mute(Column(n))));
-            assert_eq!(hit_test(r, &v, s.solo.center()), Some(Hit::Solo(Column(n))));
+            assert_eq!(hit_test(r, &v, s.mute.center()), Some(Hit::Mute(Column::Track(n))));
+            assert_eq!(hit_test(r, &v, s.solo.center()), Some(Hit::Solo(Column::Track(n))));
         }
         let v = a_view();
         let l = Layout::new(r, &v);
@@ -6063,14 +7164,14 @@ mod tests {
         );
         // An empty slot has no switches at all — its one control is the plus.
         let mut empty = a_view();
-        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
-        assert!(!Layout::new(r, &empty).strips[0].arm.is_positive());
+        empty.strips[Column::Track(0)] = a_strip(Some(Strip::Channel(0)), true);
+        assert!(!Layout::new(r, &empty).strips[Column::Track(0)].arm.is_positive());
     }
 
     /// Everything that travels does so vertically, and knows how far.
     #[test]
     fn every_travelling_control_has_an_axis_and_a_distance() {
-        for hit in [Hit::Fader(Column(0)), Hit::Send(Column(1))] {
+        for hit in [Hit::Fader(Column::Track(0)), Hit::Send(Column::Track(1))] {
             // Faders, sends and pans stand up; a route strip lies down.
             let want = if matches!(hit, Hit::RouteGain(..)) {
                 DragAxis::Horizontal
@@ -6080,7 +7181,7 @@ mod tests {
             assert_eq!(hit.axis(), Some(want), "{hit:?}");
             assert!(hit.travel().is_some_and(|t| t > 0.0), "{hit:?}");
         }
-        for hit in [Hit::Mute(Column(0)), Hit::Solo(Column(0))] {
+        for hit in [Hit::Mute(Column::Track(0)), Hit::Solo(Column::Track(0))] {
             assert_eq!(hit.axis(), None, "{hit:?} is not a thing you drag");
             assert_eq!(hit.travel(), None, "{hit:?}");
         }
@@ -6108,5 +7209,173 @@ mod tests {
             }
         }
     }
-}
 
+    /// **A view the app's way, from an index**: the window `track_window`
+    /// names at `rect`, built from the drawn order, plus the pinned two.
+    /// What `TangentApp::mixer_view_in` does with its own index.
+    fn windowed(
+        ix: &crate::desk_index::DeskIndex,
+        rect: Rect,
+        visible: usize,
+        scroll_px: f32,
+    ) -> MixerView<'static> {
+        let ranks = track_window(rect, visible, ix.shown_len(), scroll_px);
+        let rows = ix.window(ranks.start, ranks.len());
+        MixerView {
+            strips: DeskStrips {
+                tracks: rows
+                    .iter()
+                    .map(|r| a_strip(Some(Strip::Channel(*r as usize)), false))
+                    .collect(),
+                first: ranks.start,
+                shown: ix.shown_len(),
+                click: a_strip(Some(Strip::Click), false),
+                master: a_strip(None, false),
+            },
+            visible,
+            scroll_px,
+            ..a_view()
+        }
+    }
+
+    /// **A desk of any length builds, lays out, hit-tests and describes only
+    /// its window.** On the XXL and XXXL rungs (128 and 512 rows, folders
+    /// open and shut), at four zooms and three scrolls: the strips BUILT,
+    /// the strips LAID OUT, the strips the hit test can answer for and the
+    /// strips the screen reader is told about are each bounded by what
+    /// shows plus the pinned two plus two (the half strip at the edge, and
+    /// one of slack). And the window is the right one: what is laid out is
+    /// exactly the run of drawn tracks the scroll stands on, the last one
+    /// included at the end of the rail.
+    ///
+    /// Revert-check: build `windowed` from every drawn row (`ix.shown()`
+    /// whole) and the first assertion names the 512-row desk.
+    #[test]
+    fn a_desk_of_any_length_builds_and_lays_out_only_its_window() {
+        use crate::perf_fixtures::Wide;
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0));
+        for wide in Wide::ALL {
+            for shut in [false, true] {
+                let ix = wide.index(shut);
+                for visible in [1usize, 8, 16, 64] {
+                    let end = ix.shown_len() as f32 * 1.0e6;
+                    for scroll in [0.0_f32, 4_321.0, end] {
+                        let v = windowed(&ix, r, visible, scroll);
+                        let bound = visible + 2 + 2;
+                        let what = format!(
+                            "{} shut={shut} visible={visible} scroll={scroll}",
+                            wide.tag()
+                        );
+                        assert!(v.strips.len() <= bound, "{what}: built {} strips", v.strips.len());
+                        let l = Layout::new(r, &v);
+                        assert!(l.strips.len() <= bound, "{what}: laid out {}", l.strips.len());
+                        let hits = l.targets();
+                        let mut cols: Vec<Column> = hits.iter().map(|(_, h)| h.column()).collect();
+                        cols.sort();
+                        cols.dedup();
+                        assert!(cols.len() <= bound, "{what}: {} strips answer presses", cols.len());
+                        let nodes = a11y_nodes_from(&v, &hits);
+                        assert!(nodes.len() <= hits.len(), "{what}: more nodes than targets");
+                        // Every track the layout placed is one the window
+                        // carried, in drawn order.
+                        let placed: Vec<usize> = l
+                            .strips
+                            .iter()
+                            .filter_map(|(c, s)| c.row().filter(|_| s.panel.is_positive()))
+                            .collect();
+                        let want: Vec<usize> =
+                            v.strips.tracks.iter().filter_map(|t| t.column().row()).collect();
+                        assert_eq!(placed, want, "{what}: placed is not the window");
+                        if scroll == end {
+                            assert_eq!(
+                                placed.last().copied(),
+                                ix.row_at(ix.shown_len() - 1),
+                                "{what}: the end of the rail does not show the last track"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The scrollbar says where the desk stands, and moves it.** None when
+    /// every track fits; a thumb that is the window's share of the desk,
+    /// at the start and at the end of the rail; and a drag of the thumb to
+    /// the far end of the track lands the scroll on the far end of the desk.
+    #[test]
+    fn the_scrollbar_shows_the_window_and_carries_the_desk() {
+        let r = rect();
+        let mut v = a_view();
+        v.visible = CHANNELS;
+        let all = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(4000.0, 420.0)), &v);
+        assert_eq!(all.bar, ScrollBar::NONE, "a desk that fits drew a bar");
+
+        let mut v = a_view();
+        v.visible = VISIBLE_CHANNELS;
+        let l = Layout::new(r, &v);
+        assert!(l.bar.track.is_positive(), "a desk wider than the window drew no bar");
+        // Under the strips, in the margin: nothing a strip draws is there.
+        let bottom = l.strips.iter().map(|(_, s)| s.panel.bottom()).fold(0.0_f32, f32::max);
+        assert!(l.bar.track.top() >= bottom, "the bar overlaps the strips");
+        assert!(l.bar.track.bottom() <= r.bottom(), "the bar hangs off the panel");
+        let share = VISIBLE_CHANNELS as f32 / CHANNELS as f32;
+        assert!(
+            (l.bar.thumb.width() - l.bar.track.width() * share).abs() < 0.5,
+            "the thumb is not the window's share of the desk"
+        );
+        assert!(
+            (l.bar.thumb.left() - l.bar.track.left()).abs() < 0.5,
+            "unscrolled, the thumb is not at the start"
+        );
+        // At the end of the rail, the thumb is at the end of the track.
+        v.scroll_px = 1.0e9;
+        let end = Layout::new(r, &v);
+        assert!((end.bar.thumb.right() - end.bar.track.right()).abs() < 0.5);
+        // A press on the thumb keeps its grip; dragged to the far end, the
+        // desk goes to the far end.
+        let v = a_view();
+        let grab = scrollbar_grab(r, &v, l.bar.thumb.center()).expect("the thumb took no press");
+        assert!((grab - l.bar.thumb.width() * 0.5).abs() < 0.5);
+        let far = Pos2::new(r.right() + 50.0, l.bar.thumb.center().y);
+        let px = scrollbar_scroll(r, &v, far, grab).expect("no scroll");
+        assert!((px - l.bar.max_px).abs() < 0.5, "a thumb dragged to the end left the desk at {px}");
+        // A press on a strip is never the bar's.
+        let fader = l.strips[Column::Track(0)].fader.center();
+        assert_eq!(scrollbar_grab(r, &v, fader), None, "the bar took a fader press");
+    }
+
+    /// **What the windowed desk costs per frame**, per rung: a windowed
+    /// build, its layout, a hit test and a screen-reader pass. Measured,
+    /// never asserted.
+    ///
+    ///     cargo test --release -p tangent-ui --lib perf_wide_desk -- --ignored --nocapture
+    #[test]
+    #[ignore = "a measurement, printed for a person"]
+    fn perf_wide_desk() {
+        use crate::perf_fixtures::{per_call, say, Wide};
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 600.0));
+        for wide in Wide::ALL {
+            let ix = wide.index(false);
+            let scroll = 10_000.0;
+            let d = per_call(200, || {
+                std::hint::black_box(windowed(&ix, r, 16, scroll));
+            });
+            say("mixer", wide.tag(), "windowed view", d, true);
+            let v = windowed(&ix, r, 16, scroll);
+            let d = per_call(200, || {
+                std::hint::black_box(Layout::new(r, &v));
+            });
+            say("mixer", wide.tag(), "layout", d, true);
+            let p = Pos2::new(r.center().x, r.top() + 300.0);
+            let d = per_call(200, || {
+                std::hint::black_box(hit_test(r, &v, p));
+            });
+            say("mixer", wide.tag(), "hit test", d, true);
+            let d = per_call(200, || {
+                std::hint::black_box(a11y_nodes(r, &v));
+            });
+            say("mixer", wide.tag(), "a11y nodes", d, true);
+        }
+    }
+}

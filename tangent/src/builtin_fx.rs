@@ -83,6 +83,19 @@ pub const ANALOG_PATH: &str = "@tangent-analog";
 /// does — see `instrument::SamplerSample`.
 pub const SAMPLER_PATH: &str = "@tangent-sampler";
 
+/// **The bitcrusher**, asked for by name ("I'd also like a bitcrusher plugin
+/// Tangent Bitcrush") and registered after the shelf was full: an effect,
+/// seated like the drive and the trem, with its kernel in
+/// [`crate::units::bitcrush`]. Same naming law as every sentinel above.
+pub const BITCRUSH_PATH: &str = "@tangent-bitcrush";
+
+/// **Tangent Insert**: the bay whose effect is outboard gear, reached
+/// through the interface Tangent is playing on. Its knobs are the two trims,
+/// the mix and the polarity; its jacks and its measured loop are extra state
+/// (`units::hwinsert::EXTRA_SYMBOLS`), because a device channel is not a
+/// number anybody should automate. See `units::hwinsert` for the road.
+pub const HWINSERT_PATH: &str = "@tangent-insert";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -256,8 +269,11 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
 /// forever and a value must never move one knob to the left because a
 /// parameter was added, so a new one takes a new number at the end of the
 /// road — which is also why a session written before a parameter existed
-/// reads it as the spec's default (Spectral Studio; 10 ms; 2 dB) and not
-/// as position zero.
+/// reads it as the spec's default (10 ms; 2 dB) and not as position zero.
+/// The KERNEL is the one exception: a fresh bay opens on the Bank (the
+/// owner, 2026-10-11), while a blob with no `kernel=` line keeps reading
+/// as Spectral Studio, what it has read as since the selector landed. See
+/// [`absent_reads_as`].
 ///
 /// The defaults for `smooth` and `release` moved on 2026-09-16 (the
 /// softest knee, 100 ms) with the owner's new numbers; a bay saved before
@@ -269,7 +285,7 @@ const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.197, steps: 0 },
     ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
-    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.5, steps: DENOISE_KERNEL_STEPS },
+    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.0, steps: DENOISE_KERNEL_STEPS },
     ParamSpec { id: 7, symbol: "attack", name: "Attack", units: "ms", default: 0.5, steps: 0 },
     ParamSpec { id: 8, symbol: "treble", name: "Treble Boost", units: "dB", default: 1.0 / 3.0, steps: 0 },
 ];
@@ -368,6 +384,48 @@ const IR_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 1, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
 ];
 
+/// One knob per `units::bitcrush::BitcrushParams` field, ids in declaration
+/// order. Defaults are `BitcrushParams::default()` verbatim (eight bits at
+/// about 12 kHz, fully wet, unity levels, no dither) and a test holds the
+/// two tables together. BITS and RATE both reach the wire at the top of
+/// their travel; DRIVE and OUTPUT are unity at noon.
+const BITCRUSH_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        id: 0,
+        symbol: "bits",
+        name: "Bits",
+        units: "bit",
+        default: crate::units::bitcrush::BITS_DEFAULT,
+        steps: 0,
+    },
+    ParamSpec {
+        id: 1,
+        symbol: "rate",
+        name: "Rate",
+        units: "Hz",
+        default: crate::units::bitcrush::RATE_DEFAULT,
+        steps: 0,
+    },
+    ParamSpec { id: 2, symbol: "drive", name: "Drive", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+    ParamSpec { id: 4, symbol: "output", name: "Output", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 5, symbol: "dither", name: "Dither", units: "", default: 0.0, steps: 2 },
+    // Appended on the owner's ruling (2026-10-11). Off, so a blob saved
+    // before it existed (no `aa=` line) reads as the classic folding it
+    // was saved with, and a fresh unit opens on it too.
+    ParamSpec { id: 6, symbol: "aa", name: "Anti-alias", units: "", default: 0.0, steps: 2 },
+];
+
+/// The insert's four knobs. Both trims centre on unity over the kernel's
+/// `GAIN_DB`; the mix opens fully wet, because an insert you patched a box
+/// into is one you want to hear the box through.
+const HWINSERT_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "send", name: "Send", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 1, symbol: "return", name: "Return", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+    ParamSpec { id: 3, symbol: "invert", name: "Return Polarity", units: "", default: 0.0, steps: 2 },
+];
+
 fn build_trim(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Trim(Trim::new(sample_rate))
 }
@@ -422,6 +480,14 @@ fn build_wah(sample_rate: f32) -> BuiltinUnit {
 
 fn build_ir(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Ir(IrUnit::new(sample_rate))
+}
+
+fn build_bitcrush(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Bitcrush(BitcrushUnit::new(sample_rate))
+}
+
+fn build_hwinsert(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::HwInsert(crate::units::hwinsert::HwInsert::new(sample_rate))
 }
 
 /// How many parameters the analog publishes: the kernel's own table.
@@ -644,6 +710,22 @@ pub const UNITS: &[UnitSpec] = &[
         build: build_ir,
         voice: false,
     },
+    UnitSpec {
+        path: BITCRUSH_PATH,
+        class: "Tangent Bitcrush",
+        params: BITCRUSH_FACE_PARAMS,
+        build: build_bitcrush,
+        voice: false,
+    },
+    // The hardware loop. An effect like the rest of the shelf: the bay's
+    // signal goes in and comes back transformed, by a box this time.
+    UnitSpec {
+        path: HWINSERT_PATH,
+        class: "Tangent Insert",
+        params: HWINSERT_FACE_PARAMS,
+        build: build_hwinsert,
+        voice: false,
+    },
     // The one voice. Its class is the preset folder's name, so it stays
     // the plain words even if the picker one day wears a suffix.
     UnitSpec {
@@ -847,6 +929,23 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         (PLATE_PATH, 1) => fmt_ms(lerp(crate::effects::PLATE_PREDELAY_MS)),
         (WAH_PATH, 1) => fmt_hz(sweep(crate::units::wah::WAH_BASE_HZ)),
         (IR_PATH, 1) => fmt_db(lerp(crate::units::convolver::CONV_TRIM_DB)),
+        // The bitcrusher reads through the kernel's own maps. BITS prints a
+        // tenth of a bit because the depth is continuous and 7.5 bits is a
+        // real step size; RATE's top is the host's own rate, which has no
+        // number this function could know, so it says so in a word.
+        (BITCRUSH_PATH, id) => {
+            use crate::units::bitcrush::*;
+            match id {
+                0 => format!("{:.1} bit", bits_at(v)),
+                1 => rate_at(v).map_or_else(|| "full".to_owned(), fmt_hz),
+                2 => fmt_db(lerp(DRIVE_DB)),
+                3 => fmt_pct(v),
+                4 => fmt_db(lerp(OUTPUT_DB)),
+                _ => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
+            }
+        }
+        (HWINSERT_PATH, 0 | 1) => fmt_db(lerp(crate::units::hwinsert::GAIN_DB)),
+        (HWINSERT_PATH, 3) => (if v >= 0.5 { "inverted" } else { "normal" }).to_owned(),
         // **The three tape dials that have an honest number.** Their
         // `ParamSpec`s promise dB, Hz and dB, and the automation lane prints
         // that promise beside the curve; the face used to fall through to
@@ -999,12 +1098,13 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
             .iter()
             .map(|k| k.label().to_owned())
             .collect(),
-        (DENOISE_PATH, 5) | (AMP_PATH, 0) => {
+        (DENOISE_PATH, 5) | (AMP_PATH, 0) | (BITCRUSH_PATH, 5 | 6) => {
             vec!["off".to_owned(), "on".to_owned()]
         }
         // One diode against one, or against two — what the toggle does to
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
+        (HWINSERT_PATH, 3) => vec!["normal".to_owned(), "inverted".to_owned()],
         (ANALOG_PATH, id) => analog_choices(id),
         (SAMPLER_PATH, id) => sampler_choices(id),
         _ => Vec::new(),
@@ -1243,6 +1343,10 @@ pub fn is_extra_symbol(path: &str, symbol: &str) -> bool {
         // down as well as derived, because a library may rename a file and
         // the words the face printed are what somebody chose the preset by.
         SAMPLER_PATH => matches!(symbol, "sample_path" | "sample_name" | "root_key"),
+        // **The insert's jacks and its measured loop**: which device
+        // channels it sends and returns on, and what a ping found (with the
+        // rate and buffers it found it at). See `units::hwinsert::state_lines`.
+        HWINSERT_PATH => crate::units::hwinsert::EXTRA_SYMBOLS.contains(&symbol),
         _ => false,
     }
 }
@@ -1291,12 +1395,34 @@ pub fn extra_from_state(spec: &UnitSpec, bytes: &[u8]) -> Vec<(String, String)> 
         .collect()
 }
 
+/// **What a symbol a saved blob LACKS reads as, when that is no longer the
+/// spec's default.**
+///
+/// A missing line normally reads as the spec's default, which is right
+/// while the default has never moved: the blob was written before the
+/// knob existed, and the default is what that knob gave the day it
+/// arrived. Once a default moves, the two part company. A fresh bay should
+/// open on the new one; a saved one must go on playing what it played.
+/// Each entry here is a default that moved after blobs without its line
+/// were already in the world, pinned to what those blobs have always read.
+///
+/// The denoise's kernel: a fresh bay opens on the Bank since 2026-10-11,
+/// and a blob from before the selector stays on
+/// [`crate::units::denoise::DenoiseKernel::UNWRITTEN`] (Spectral Studio).
+fn absent_reads_as(path: &str, symbol: &str) -> Option<f32> {
+    match (path, symbol) {
+        (DENOISE_PATH, "kernel") => Some(crate::units::denoise::DenoiseKernel::UNWRITTEN.dial()),
+        _ => None,
+    }
+}
+
 /// Read a state blob back into a full value table.
 ///
 /// Forgiving about lines and strict about the container, on the LV2 model: a
 /// symbol this build does not know is skipped (a newer build's parameter), a
-/// symbol the blob lacks reads as its default (an older build's file), a value
-/// that does not parse or is not finite reads as its default — but a blob that
+/// symbol the blob lacks reads as its default (an older build's file; see
+/// [`absent_reads_as`] for a default that moved since), a value that does
+/// not parse or is not finite reads as that same value; but a blob that
 /// is not this format at all is an `Err`, because it is another plugin's state
 /// or a damaged file, and the user should hear that their settings did not
 /// come back rather than get defaults dressed as a restore.
@@ -1306,7 +1432,11 @@ pub fn values_from_state(spec: &UnitSpec, bytes: &[u8]) -> Result<Vec<f32>, Stri
     if lines.next() != Some("tangentfx 1") {
         return Err("the stored block is not a built-in effect's state".to_owned());
     }
-    let mut values = spec.defaults();
+    let mut values: Vec<f32> = spec
+        .params
+        .iter()
+        .map(|p| absent_reads_as(spec.path, p.symbol).unwrap_or(p.default))
+        .collect();
     for line in lines {
         let Some((symbol, value)) = line.split_once('=') else {
             continue;
@@ -1346,6 +1476,11 @@ pub enum BuiltinUnit {
     Analog(AnalogUnit),
     /// The second voice. Appended for the same reason.
     Sampler(SamplerUnit),
+    /// The bitcrusher, an effect. Appended, the enum's law, which is why it
+    /// sits after the voices rather than beside the pedals.
+    Bitcrush(BitcrushUnit),
+    /// The hardware loop. Appended, the enum's law.
+    HwInsert(crate::units::hwinsert::HwInsert),
 }
 
 impl BuiltinUnit {
@@ -1407,6 +1542,15 @@ impl BuiltinUnit {
             // billed frames it does not use would push the whole channel
             // late for arithmetic that happens between two of them.
             BuiltinUnit::Sampler(_) => 0,
+            // A hold reads the sample it is holding or one before it, and
+            // the quantizer is memoryless: nothing ahead is ever looked at.
+            BuiltinUnit::Bitcrush(_) => 0,
+            // **The loop's whole round trip**, measured by a ping or, until
+            // one, the round-trip law's estimate (`units::hwinsert`'s module
+            // notes). Re-read every block like the denoise's, so a ping, a
+            // buffer change or a rate change reaches the compensation graph
+            // on its own.
+            BuiltinUnit::HwInsert(u) => u.latency(),
         }
     }
 
@@ -1435,6 +1579,8 @@ impl BuiltinUnit {
             BuiltinUnit::Ir(u) => u.set_param(id, value),
             BuiltinUnit::Analog(u) => u.set_param(id, value),
             BuiltinUnit::Sampler(u) => u.set_param(id, value),
+            BuiltinUnit::Bitcrush(u) => u.set_param(id, value),
+            BuiltinUnit::HwInsert(u) => u.set_param(id, value),
         }
     }
 
@@ -1494,8 +1640,16 @@ impl BuiltinUnit {
                     .map(|(_, v)| v.as_str())?;
                 match crate::wavread::read(std::path::Path::new(path)) {
                     Ok(wav) => u.load_ir(&wav),
-                    Err(e) => Some(format!("its impulse response did not load — {e}")),
+                    Err(e) => Some(format!("its impulse response did not load: {e}")),
                 }
+            }
+            // The jacks and the measured loop. Nothing to fail: a side not
+            // named is a side not chosen, which the face asks for.
+            BuiltinUnit::HwInsert(u) => {
+                let (send, ret, measured) = crate::units::hwinsert::parse_lines(extra);
+                u.set_routes(send, ret);
+                u.set_measured(measured);
+                None
             }
             _ => None,
         }
@@ -1543,6 +1697,8 @@ impl BuiltinUnit {
             BuiltinUnit::Plate(u) => u.process(input, frames, out),
             BuiltinUnit::Wah(u) => u.process(input, frames, out),
             BuiltinUnit::Ir(u) => u.process(input, frames, out),
+            BuiltinUnit::Bitcrush(u) => u.process(input, frames, out),
+            BuiltinUnit::HwInsert(u) => u.process(input, frames, out),
             // A voice asked to work as an effect has no input to transform
             // and no notes to play: it answers silence rather than passing
             // the input through as if it had done something. `run_rack`
@@ -1666,6 +1822,11 @@ impl BuiltinUnit {
             // "tails go, the loaded filter stays"; a sampler borrows its
             // audio for the length of a block and has no such split.
             BuiltinUnit::Sampler(u) => u.kernel.clear(),
+            // The holds empty and the knobs settle where they stand.
+            BuiltinUnit::Bitcrush(u) => u.kernel.clear(),
+            // The delay line and the alignment go; the jacks, the trims and
+            // the measured loop are knowledge and stay.
+            BuiltinUnit::HwInsert(u) => u.clear(),
         }
     }
 }
@@ -2191,6 +2352,57 @@ impl TremUnit {
     }
 }
 
+// ── Tangent Bitcrush, seated ────────────────────────────────────────────────
+
+/// The bitcrusher behind its panel table. The one difference from the
+/// pedals around it is the road in: it crushes PLANAR, in `out`, rather than
+/// through `run_planar`'s interleaving scratch, because that adapter hands a
+/// mono channel back untouched and a bitcrusher on a mono lane should crush
+/// it. The kernel is per-channel arithmetic on one shared clock, so planar
+/// costs it nothing and saves the two copies.
+pub struct BitcrushUnit {
+    kernel: crate::units::bitcrush::Bitcrush,
+    params: crate::units::bitcrush::BitcrushParams,
+}
+
+impl BitcrushUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::bitcrush::Bitcrush::new(sample_rate),
+            params: crate::units::bitcrush::BitcrushParams::default(),
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = BITCRUSH_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.bits = v,
+            1 => self.params.rate = v,
+            2 => self.params.drive = v,
+            3 => self.params.mix = v,
+            4 => self.params.output = v,
+            5 => self.params.dither = v,
+            _ => self.params.aa = v,
+        }
+    }
+
+    /// The input copied into `out`, then crushed there in place: one channel
+    /// as mono, two as stereo, any past the second passed through as the
+    /// copy left them.
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let n = input.len().min(out.len());
+        for (src, dst) in input.iter().zip(out.iter_mut()) {
+            let m = frames.min(src.len()).min(dst.len());
+            dst[..m].copy_from_slice(&src[..m]);
+        }
+        let crushed = n.min(crate::units::bitcrush::CRUSH_CHANNELS);
+        self.kernel.process_planar(&mut out[..crushed], frames, &self.params);
+    }
+}
+
 // ── Tangent Chorus, seated ──────────────────────────────────────────────────
 
 pub struct ChorusUnit {
@@ -2402,7 +2614,7 @@ impl IrUnit {
         if wav.rate != engine {
             return Some(format!(
                 "its impulse response was captured at {} Hz and this session runs at \
-                 {engine} Hz — loaded as-is, so it plays shifted",
+                 {engine} Hz; loaded as-is, so it plays shifted",
                 wav.rate
             ));
         }
@@ -3168,7 +3380,8 @@ mod tests {
         }
         // The kernel menu steps across exactly the kernel's enum, ends
         // inclusive, and its default position is the one the enum calls
-        // Spectral Studio — a literal in the table, pinned to its source.
+        // Bank (the owner, 2026-10-11): a literal in the table, pinned to
+        // its source.
         use crate::units::denoise::DenoiseKernel;
         assert_eq!(
             DENOISE_KERNEL_STEPS as usize,
@@ -3177,8 +3390,8 @@ mod tests {
         );
         assert_eq!(
             DenoiseKernel::from_dial(d.kernel),
-            DenoiseKernel::SpectralStudio,
-            "the shipped denoise no longer opens on Spectral Studio"
+            DenoiseKernel::Bank,
+            "the shipped denoise no longer opens on the Bank"
         );
         // The amp's table is nine knobs to the kernel's eight: VIB is a
         // panel SWITCH the wrapper folds into vib_depth (off = depth 0),
@@ -3218,6 +3431,13 @@ mod tests {
         let ir = crate::units::convolver::ConvolverParams::default();
         for (spec, want) in IR_FACE_PARAMS.iter().zip([ir.mix, ir.trim]) {
             assert_eq!(spec.default, want, "{} drifted from ConvolverParams::default", spec.symbol);
+        }
+        let bc = crate::units::bitcrush::BitcrushParams::default();
+        for (spec, want) in BITCRUSH_FACE_PARAMS
+            .iter()
+            .zip([bc.bits, bc.rate, bc.drive, bc.mix, bc.output, bc.dither, bc.aa])
+        {
+            assert_eq!(spec.default, want, "{} drifted from BitcrushParams::default", spec.symbol);
         }
     }
 
@@ -3610,6 +3830,79 @@ mod tests {
         );
     }
 
+    /// **A fresh denoise opens on the Bank; a saved one plays the engine it
+    /// was saved with.**
+    ///
+    /// The owner, 2026-10-11: "make the bank setting the default for the
+    /// denoise plugin". A new bay is `spec.defaults()` through
+    /// `UnitSpec::create` (the loader's `None` state), and a reset-to-default
+    /// reads the face's `default`, which is the same spec row. A saved bay is
+    /// `values_from_state` over its blob, and that must not follow: a blob
+    /// that names its kernel keeps it, and a blob written before the selector
+    /// existed keeps reading as Spectral Studio, every value of it exactly
+    /// what it decoded to before the default moved.
+    ///
+    /// Revert-check: put `values_from_state` back on `spec.defaults()` and
+    /// the pre-selector blob opens on the Bank, which this names.
+    #[test]
+    fn a_fresh_denoise_opens_on_the_bank_and_a_saved_one_keeps_its_engine() {
+        use crate::units::denoise::{DenoiseKernel, DenoiseParams, DENOISE_LOOKAHEAD_MS};
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let at = spec.params.iter().position(|p| p.symbol == "kernel").expect("a kernel knob");
+        let la = (48_000.0 * DENOISE_LOOKAHEAD_MS / 1_000.0).round() as u32;
+
+        // Fresh: the spec row, the kernel's own default and the face agree,
+        // and the latency is the bank's (its lookahead, which ships on).
+        let fresh = spec.defaults();
+        assert_eq!(DenoiseKernel::from_dial(fresh[at]), DenoiseKernel::Bank);
+        assert_eq!(fresh[at], DenoiseParams::default().kernel);
+        assert_eq!(describe(DENOISE_PATH, 6, fresh[at], &fresh), "Bank");
+        assert_eq!(
+            spec.create(48_000.0, &fresh).latency(),
+            la,
+            "a fresh denoise does not report the bank's lookahead"
+        );
+        // The owner's other dials did not move with the engine (the softest
+        // knee, 100 ms): a fresh bay is what choosing Bank on a fresh bay
+        // gave before, with nothing else touched.
+        assert_eq!((fresh[2], fresh[3]), (0.0, 0.197), "a fresh bay's smooth/release moved with the engine");
+
+        // Saved, naming its kernel: every engine comes back as itself.
+        for k in DenoiseKernel::ALL {
+            let mut v = spec.defaults();
+            v[at] = k.dial();
+            let back = values_from_state(spec, state_text(spec, &v, &[]).as_bytes()).expect("reads");
+            assert_eq!(DenoiseKernel::from_dial(back[at]), k, "a saved {} reopened as another engine", k.label());
+            assert_eq!(back, v, "a saved {} bay did not come back value for value", k.label());
+        }
+
+        // Saved before the selector: exactly the table it decoded to before
+        // the fresh default moved, written out rather than derived, so a
+        // second default moving underneath it is caught too.
+        let old_blob = b"tangentfx 1\nlearn=0\nreduce=0.3\nsmooth=0.5\nrelease=0.5\nsc_hpf=0\nlookahead=0\n";
+        let back = values_from_state(spec, old_blob).expect("a pre-kernel blob still reads");
+        assert_eq!(
+            back,
+            vec![0.0, 0.3, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0 / 3.0],
+            "a blob written before the Kernel parameter no longer decodes as it did"
+        );
+        assert_eq!(
+            DenoiseKernel::from_dial(back[at]),
+            DenoiseKernel::SpectralStudio,
+            "a blob written before the Kernel parameter followed the fresh default onto the Bank"
+        );
+        // And a kernel line that does not parse reads as the same promise,
+        // as it did before (it read as the spec default, then Studio).
+        let garbled = b"tangentfx 1\nkernel=bank\n";
+        let back = values_from_state(spec, garbled).expect("reads");
+        assert_eq!(DenoiseKernel::from_dial(back[at]), DenoiseKernel::SpectralStudio);
+        // No other unit's missing lines changed meaning.
+        for other in UNITS.iter().filter(|u| u.path != DENOISE_PATH) {
+            let back = values_from_state(other, b"tangentfx 1\n").expect("an empty blob reads");
+            assert_eq!(back, other.defaults(), "{}'s empty blob no longer reads as its defaults", other.class);
+        }
+    }
+
     /// **Learn, freeze, persist, restore: the denoise's whole threshold
     /// story at the unit level.** The dial up is listening, the falling edge
     /// freezes, the snapshot is offered for exactly the freeze block, and a
@@ -3617,7 +3910,12 @@ mod tests {
     #[test]
     fn the_denoise_learns_on_the_falling_edge_and_the_extra_state_restores_it() {
         let spec = spec_for(DENOISE_PATH).unwrap();
-        let mut unit = spec.create(48_000.0, &spec.defaults());
+        // On Spectral Studio by name: this test is about a SPECTRAL print
+        // and the bank's knees taken beside it, and the unit opens on the
+        // Bank since 2026-10-11.
+        let mut studio = spec.defaults();
+        studio[6] = crate::units::denoise::DenoiseKernel::SpectralStudio.dial();
+        let mut unit = spec.create(48_000.0, &studio);
         assert!(
             unit.learn_snapshot().is_none(),
             "an idle denoise offered a snapshot"
@@ -3646,7 +3944,7 @@ mod tests {
             thr.iter().any(|t| *t > 0.05),
             "a broadband learn froze an all-off bank: {thr:?}"
         );
-        // The unit ships on Spectral Studio, so this print is the spectral
+        // The unit runs Spectral Studio here, so this print is the spectral
         // kernel's own reading and the knees beside it are the BANK's
         // measurement of the same noise, taken by `learn_feed` during the
         // same pass - see `Band::knee_db`. Real knees, then: every band
@@ -3675,7 +3973,7 @@ mod tests {
             .map(|(k, t)| (format!("t{k}"), t.to_string()))
             .chain(knees.iter().enumerate().map(|(k, t)| (format!("k{k}"), t.to_string())))
             .collect();
-        let mut restored = spec.create(48_000.0, &spec.defaults());
+        let mut restored = spec.create(48_000.0, &studio);
         assert!(restored.apply_extra_state(&extra).is_none());
         let BuiltinUnit::Denoise(r) = &restored else {
             panic!("the denoise path built something else");
@@ -3895,8 +4193,8 @@ mod tests {
     ///
     /// `Denoise::process` sends every kernel but the Bank to
     /// `process_spectral` and returns; `params.smooth` and `params.release`
-    /// are read below that line. So on Spectral Studio — the unit's SHIPPED
-    /// kernel — those two dials are inert, and the face used to print a
+    /// are read below that line. So on Spectral Studio (the unit's SHIPPED
+    /// kernel until 2026-10-11) those two dials are inert, and the face used to print a
     /// confident "2.8:1" and "219 ms" under both of them. Measured, not
     /// inferred: the same take rendered at smooth 0.0 and 1.0 and at release
     /// 0.0 and 1.0 comes back byte for byte identical, all four hashes equal
@@ -4381,5 +4679,114 @@ mod tests {
                 "frame {i} differs: {a} in one pass, {b} in four"
             );
         }
+    }
+
+    /// **Tangent Bitcrush reads in its own units and offers its switch's
+    /// words**: eight bits and about 12 kHz at rest, the wire's words at the
+    /// tops of BITS and RATE, unity at noon on both levels, and DITHER a
+    /// two-position row whose reading is one of its positions.
+    #[test]
+    fn the_bitcrusher_reads_in_bits_hertz_and_decibels() {
+        let spec = spec_for(BITCRUSH_PATH).expect("the bitcrusher is registered");
+        assert_eq!(spec.class, "Tangent Bitcrush");
+        assert!(!spec.voice);
+        let rest = spec.defaults();
+        assert_eq!(describe(BITCRUSH_PATH, 0, rest[0], &rest), "8.0 bit");
+        assert_eq!(describe(BITCRUSH_PATH, 0, 1.0, &rest), "24.0 bit");
+        assert_eq!(describe(BITCRUSH_PATH, 0, 0.0, &rest), "1.0 bit");
+        assert_eq!(describe(BITCRUSH_PATH, 1, rest[1], &rest), "12.2 kHz");
+        assert_eq!(describe(BITCRUSH_PATH, 1, 0.0, &rest), "200 Hz");
+        assert_eq!(describe(BITCRUSH_PATH, 1, 1.0, &rest), "full");
+        assert_eq!(describe(BITCRUSH_PATH, 2, 0.5, &rest), "+0.0 dB");
+        assert_eq!(describe(BITCRUSH_PATH, 2, 1.0, &rest), "+24.0 dB");
+        assert_eq!(describe(BITCRUSH_PATH, 4, 0.0, &rest), "-24.0 dB");
+        assert_eq!(describe(BITCRUSH_PATH, 3, 1.0, &rest), tangent_ui::face::fmt_pct(1.0));
+        assert_eq!(choices(BITCRUSH_PATH, 5), vec!["off", "on"]);
+        assert_eq!(describe(BITCRUSH_PATH, 5, 0.0, &rest), "off");
+        assert_eq!(describe(BITCRUSH_PATH, 5, 1.0, &rest), "on");
+        assert_eq!(choices(BITCRUSH_PATH, 6), vec!["off", "on"]);
+        assert_eq!(describe(BITCRUSH_PATH, 6, rest[6], &rest), "off");
+        for id in 0..5 {
+            assert!(choices(BITCRUSH_PATH, id).is_empty(), "dial {id} grew steps");
+        }
+        // Typed words land where the reading says them: "full" is the top,
+        // and a typed depth finds its own position.
+        assert_eq!(value_for_reading(BITCRUSH_PATH, 1, "full", &rest), Some(1.0));
+        let v = value_for_reading(BITCRUSH_PATH, 0, "12", &rest).expect("a depth");
+        assert_eq!(describe(BITCRUSH_PATH, 0, v, &rest), "12.0 bit");
+    }
+
+    /// **The face's picture and the kernel are one map.** `faces_bitcrush`
+    /// restates the sweeps because the UI crate cannot see this one; a stair
+    /// drawn on a different map would be a picture of a sound the unit does
+    /// not make. The sentinel is pinned the same way.
+    #[test]
+    fn the_bitcrushers_face_draws_the_kernels_own_maps() {
+        use crate::units::bitcrush as k;
+        use tangent_ui::faces_bitcrush as f;
+        assert_eq!(f::BITCRUSH_PATH, BITCRUSH_PATH);
+        assert_eq!(f::BITS_RANGE, k::BITS_RANGE);
+        assert_eq!(f::RATE_HZ, k::RATE_HZ);
+        assert_eq!(f::DRIVE_DB, k::DRIVE_DB);
+        assert_eq!(f::AA_CUTOFF, k::AA_CUTOFF);
+        // The stair at the shipped rest, held against the kernel crushing
+        // the same tone at the same rate.
+        let (clean, stair) = f::staircase(k::BITS_DEFAULT, k::RATE_DEFAULT, 0.5, false);
+        let mut kernel = k::Bitcrush::new(48_000.0);
+        let mut buf = clean.clone();
+        let n = buf.len();
+        kernel.process(&mut buf, n, 1, &k::BitcrushParams::default());
+        for (i, (a, b)) in stair.iter().zip(&buf).enumerate() {
+            assert!((a - b).abs() < 1.0e-6, "sample {i}: the face draws {a}, the kernel plays {b}");
+        }
+    }
+
+    /// **Seated, the bitcrusher's wire is still a wire and a mono lane is
+    /// still crushed.** Through the planar road at 24 bits, full rate and
+    /// unity, the awkward values come back to the bit; at its shipped rest
+    /// a ONE-channel block comes back changed, because a bitcrusher on a
+    /// mono lane that passed it untouched would be a knob that does
+    /// nothing; and a state blob round-trips every knob it was given.
+    #[test]
+    fn the_seated_bitcrusher_is_a_wire_at_the_top_and_crushes_mono() {
+        let spec = spec_for(BITCRUSH_PATH).unwrap();
+        let frames = 2_048;
+        let input = tricky_planar(frames);
+        // The anti-alias switch ON: at "full" it is out of circuit.
+        let wire = [1.0, 1.0, 0.5, 1.0, 0.5, 0.0, 1.0];
+        let mut unit = spec.create(48_000.0, &wire);
+        let out = run(&mut unit, &input, frames);
+        for (c, (a, b)) in input.iter().zip(&out).enumerate() {
+            for (f, (x, y)) in a.iter().zip(b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "channel {c} frame {f}: {x:e} came out {y:e}");
+            }
+        }
+        let mono = vec![(0..frames).map(|i| (i as f32 * 0.03).sin() * 0.5).collect::<Vec<f32>>()];
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        let out = run(&mut unit, &mono, frames);
+        assert_ne!(out[0], mono[0], "a mono block went through the crusher untouched");
+        assert!(out[0].iter().all(|s| s.is_finite()));
+        // Every knob off its rest, through the blob and back.
+        let moved = [0.6, 0.2, 0.7, 0.4, 0.3, 1.0, 1.0];
+        let text = state_text(spec, &moved, &[]);
+        assert_eq!(values_from_state(spec, text.as_bytes()).unwrap(), moved.to_vec());
+        // A blob saved before the anti-alias switch existed has no `aa=`
+        // line, and reads with it OFF: the folding it was saved with.
+        let old = "tangentfx 1\nbits=0.6\nrate=0.2\ndrive=0.7\nmix=0.4\noutput=0.3\ndither=1\n";
+        assert_eq!(
+            values_from_state(spec, old.as_bytes()).unwrap(),
+            vec![0.6, 0.2, 0.7, 0.4, 0.3, 1.0, 0.0]
+        );
+        // An automation point lands on the knob it names, and a stale id
+        // moves nothing.
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        unit.apply(&[tangent_host::ParamPoint { id: 3, offset: 0, value: 0.0 }]);
+        unit.apply(&[tangent_host::ParamPoint { id: 99, offset: 0, value: 0.0 }]);
+        // A second of it: the glide is 20 ms and lands exactly.
+        let long = tricky_planar(48_000);
+        let out = run(&mut unit, &long, 48_000);
+        // MIX automated to zero is the dry signal, once the glide lands.
+        let tail = 48_000 - 64;
+        assert_eq!(out[0][tail..], long[0][tail..], "a MIX lane at zero did not reach the dry");
     }
 }

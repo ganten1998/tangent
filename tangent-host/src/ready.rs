@@ -1717,7 +1717,7 @@ mod tests {
     ///
     /// ```text
     /// TANGENT_PROBE_BUNDLE="/Library/Audio/Plug-Ins/VST3/Grand 9.vst3" \
-    /// TANGENT_PROBE_STATE=".../state/insert-state-3-0.bin" \
+    /// TANGENT_PROBE_STATE=".../state/pstate-t3-c0-b0.bin" \
     /// cargo test -p tangent-host --lib --release -- --ignored how_loud_the_test_note --nocapture
     /// ```
     ///
@@ -1821,7 +1821,7 @@ mod tests {
     ///
     /// ```text
     /// TANGENT_PROBE_BUNDLE="/Library/Audio/Plug-Ins/VST3/Rhodes Anthology.vst3" \
-    /// TANGENT_PROBE_STATE=".../state/insert-state-0-0.bin" \
+    /// TANGENT_PROBE_STATE=".../state/pstate-t0-c0-b0.bin" \
     /// TANGENT_PROBE_N=7 \
     /// cargo test -p tangent-host --lib --release -- --ignored what_a_deskful --nocapture
     /// ```
@@ -1843,8 +1843,9 @@ mod tests {
         else {
             panic!("set TANGENT_PROBE_BUNDLE to a VST3 bundle; this probe measures a real one");
         };
-        // A sidecar on disk is `<bundle path>\0<container>`; the app's
-        // `saved_insert_state` splits it at the NUL and checks the owner
+        // A state file on disk (`pstate-<seatbay>.bin`, or a legacy
+        // `insert-state-S-B.bin`) is `<bundle path>\0<container>`; the app's
+        // `shelf::saved_state` splits it at the NUL and checks the owner
         // before handing the rest to the plugin. Handing the whole file over
         // instead is a blob the container rejects in a microsecond, which
         // measures a plugin at its DEFAULT preset — a different instrument

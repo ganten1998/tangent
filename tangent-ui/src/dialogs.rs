@@ -3,8 +3,9 @@
 //! custom tuning editor for the guitar view (D-UI-15), and the recorder's
 //! Export dialog (RECORDER-PLAN §5).
 //! Each dialog is its own immediate viewport, like Qt's top-level dialogs
-//! (the fixed-size main window is too small to host them) — or, in a plugin,
-//! a layer in the canvas. `show_dialog_viewport` is the funnel that makes
+//! (the fixed-size main window is too small to host them) or, with child
+//! windows off (screen-reader mode, fullscreen), a layer in the canvas.
+//! `show_dialog_viewport` is the funnel that makes
 //! that the same code, and nothing here may open a window by itself. A
 //! QUESTION wears the OS's chrome and freezes the desk; a PLUGIN window (a
 //! face, the Keys panel, the pickers they open) wears the in-house bar from
@@ -30,6 +31,12 @@ use egui::{
 use tangent_core::fretboard::{self, Tuning, TuningError, MAX_STRINGS};
 use tangent_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
 use tangent_core::OverrideInfo;
+
+/// **The lane a Track menu carries for a strip that is no row** (the
+/// click's): every row-only part of the menu is offered only on a real row.
+/// It was "past the channels", a width test against a desk that no longer
+/// has a width.
+pub const NOT_A_ROW: usize = usize::MAX;
 
 pub enum Dialog {
     /// **The Konami dialog.** Its words and its one button are the owner's
@@ -64,6 +71,8 @@ pub enum Dialog {
     /// anybody adjusts about a metronome, and three of them lived in
     /// different corners of the app while the fourth did not exist.
      Track {
+        /// The track's row, or [`NOT_A_ROW`] for a strip that is none (the
+        /// click): the menu's row-only parts are offered on a row alone.
         lane: usize,
         removable: bool,
         /// The lane's current badge, 0..=3 — the picker's lit slot.
@@ -103,6 +112,13 @@ pub enum Dialog {
         /// frozen one to thaw). Appended, the struct's law.
         frozen: bool,
         can_freeze: bool,
+        /// **The strip the menu is open on, by what it is**: a track's row,
+        /// or the click, whose menu is the colour rows alone. What the paint
+        /// lands on (`DialogAction::TrackColor`), now that the click's colour
+        /// is no slot of a strip-space array but its own (W5). `lane` is the
+        /// row the row-only parts act on, past the channels for the click.
+        /// Appended, the struct's law.
+        strip: crate::recorder::StripRef,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -380,7 +396,8 @@ pub enum Dialog {
     /// control that could only show one made that a thing you toggled
     /// between rather than saw.
     Automation {
-        lane: usize,
+        /// Whose rows: a track's, or the master's.
+        lane: crate::automation::AutoLane,
         /// What the track is called, for the title.
         who: String,
         groups: Vec<AutoGroup>,
@@ -405,7 +422,16 @@ pub enum Dialog {
         /// The project's own name, so the question names the thing at risk.
         name: String,
     },
-    About,
+    /// **The About card**, which knows the install's standing.
+    ///
+    /// `supporter` is `LicenseStore::is_supporter()` read when the card was
+    /// opened (`MenuAction::ShowAbout`): a key covering this major, or the
+    /// Konami marker. Carried rather than asked at paint time because this
+    /// module cannot see the store, and a card that describes the desk has
+    /// to describe THIS install's desk (`about_lines`).
+    About {
+        supporter: bool,
+    },
     /// **Setup.** What the audio path is doing, and everything that changes it.
     ///
     /// It began as a read-only status card, because every number in it was
@@ -529,29 +555,50 @@ pub enum Dialog {
     Welcome {
         dont_show_again: bool,
     },
-    /// Where a channel goes besides the master. Two steps in one window: the
-    /// kind first (a send or a pair of jacks), then the destination.
+    /// Where a channel goes besides the master, and what it sends. Two steps
+    /// in one window: what is there and the ways to add to it first, then
+    /// the destination (a pair of jacks, a strip to route into, a bus or a
+    /// return to send to).
     Routing {
         /// The channel this is about.
         channel: usize,
-        /// `None` while the two kinds are showing; `Some(true)` listing
-        /// hardware outputs, `Some(false)` listing channels to send to.
-        picking: Option<bool>,
+        /// Which list is showing. See [`RoutingPage`].
+        page: RoutingPage,
         /// Hardware destinations the OPEN DEVICE offers: label, first
         /// channel, stereo. Built by the app, because only the host knows
         /// what the interface has.
         hardware: Vec<(String, usize, bool)>,
-        /// Channels worth sending to: index and name. Empty slots are left
-        /// out — sending into a channel with nothing on it is a route to
-        /// silence, and the owner asked for used channels only.
+        /// Strips worth routing to: index and name, the buses and returns
+        /// first (a route into a bus is what a bus is for). Empty slots are
+        /// left out — sending into a channel with nothing on it is a route
+        /// to silence, and the owner asked for used channels only.
         channels: Vec<(usize, String)>,
+        /// **The rows a new route or send from this channel would close a
+        /// loop through** (`desk_topology::would_cycle`): offered, so the
+        /// list is the whole desk, and greyed with the reason, so nobody
+        /// makes a howl to find out. Appended.
+        looped: Vec<usize>,
+        /// **What this channel sends to buses**: the bus's row (it holds
+        /// still while this modal window is open), its name, the send's
+        /// level and whether it is pre-fader. Appended.
+        sends: Vec<(usize, String, f32, bool)>,
+        /// **The buses and returns a send may go to**: row and name, in desk
+        /// order, this channel itself left out. Appended.
+        buses: Vec<(usize, String)>,
         /// What this channel already routes to: the desk-table index, the
-        /// destination's label, and the route's LEVEL. Greys the duplicates
-        /// in the picker AND gives every existing route a row with a level
-        /// and a way OFF - the first pass forgot the way off, and the second
-        /// forgot the level, which left a route that could only ever be made
-        /// at full and never turned down from the view the owner was in.
-        existing: Vec<(usize, String, f32)>,
+        /// destination (a jack, or the row it stands on while this modal
+        /// window is open), its label, and the route's LEVEL. Greys the
+        /// duplicates in the picker by DESTINATION, never by label (two
+        /// tracks may share a name), AND gives every existing route a row
+        /// with a level and a way OFF - the first pass forgot the way off,
+        /// and the second forgot the level, which left a route that could
+        /// only ever be made at full and never turned down from the view the
+        /// owner was in.
+        existing: Vec<(usize, crate::routing::LaneTarget, String, f32)>,
+        /// **What has been typed to narrow the channel list.** See
+        /// [`picker_rows`]: a list that grows with the desk is found by
+        /// typing a name, not by scrolling past every channel. Appended.
+        filter: String,
     },
     /// **The quantize window**: every knob the feature has, in one place.
     ///
@@ -743,29 +790,35 @@ pub enum Dialog {
         had_camera: bool,
     },
     /// A suite unit's face: the kit-drawn panel over one insert bay,
-    /// refreshed by the app each frame with pushed data. `strip`/`slot`
-    /// are DESK terms.
+    /// refreshed by the app each frame with pushed data. The bay by its
+    /// identity, so the face stays on its plugin through any edit of the
+    /// desk under it.
     InsertFace {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         live: Box<crate::faces::FaceLive>,
     },
     /// Pick which channel keys one insert bay's sidechain — the routing
     /// window's sibling, one step instead of two because there is only one
-    /// kind of source. `strip`/`slot` are DESK terms (`Strip::index` and
-    /// the strip's visible slot), like `InsertFace`'s.
+    /// kind of source. The keyed bay and every source by identity: this is
+    /// a plugin window (`is_modal`), so the desk stays live under it, and a
+    /// source named by its row would be whatever track a drag left there.
+    /// The app redraws the list whenever the desk changes shape
+    /// (`on_desk_shape_change`), so the rows it shows are the rows as they
+    /// stand.
     InsertKeySource {
-        strip: usize,
-        slot: usize,
-        /// What the bay listens to now, so the picker can grey it and the
-        /// "No sidechain" row can say whether it is already the state.
-        current: Option<usize>,
-        /// Channels worth keying from: index and name. Used channels only —
-        /// an empty channel is a key that never ducks — and never the
-        /// destination itself. Folders ARE offered, unlike the routing
-        /// picker's list: a group's stem holds the group's whole mix, and
-        /// ducking to the drum bus is the classic ask.
-        channels: Vec<(usize, String)>,
+        bay: crate::desk_id::SeatBay,
+        /// The track the bay listens to now, so the picker can grey it and
+        /// the "No sidechain" row can say whether it is already the state.
+        current: Option<crate::desk_id::Node>,
+        /// Channels worth keying from: the track, the row it stands on and
+        /// its name. Used channels only — an empty channel is a key that
+        /// never ducks — and never the destination itself. Folders ARE
+        /// offered, unlike the routing picker's list: a group's stem holds
+        /// the group's whole mix, and ducking to the drum bus is the classic
+        /// ask.
+        channels: Vec<(crate::desk_id::Node, usize, String)>,
+        /// What has been typed to narrow the list. See [`picker_rows`].
+        filter: String,
     },
     /// **The IR wizard**: capture a hardware unit's impulse response through
     /// a physical loop — interface outs into the box, box outs back into the
@@ -873,7 +926,7 @@ impl Dialog {
             | Dialog::Confirm { .. }
             | Dialog::Automation { .. }
             | Dialog::SaveChanges { .. }
-            | Dialog::About
+            | Dialog::About { .. }
             | Dialog::AudioSetup { .. }
             | Dialog::InputChannels { .. }
             | Dialog::Welcome { .. }
@@ -892,6 +945,20 @@ impl Dialog {
             | Dialog::Export { .. } => true,
         }
     }
+}
+
+/// **Which list the routing window is showing.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPage {
+    /// What the channel routes and sends to now, each with its level and a
+    /// way off, and the ways to add one.
+    Main,
+    /// The open device's jacks, for a route out of the box.
+    Hardware,
+    /// The strips a route may MOVE the channel into, buses first.
+    Channel,
+    /// The buses and returns a send may COPY the channel into.
+    Send,
 }
 
 /// Which page of the IR wizard is showing.
@@ -983,7 +1050,7 @@ pub struct IrWizardState {
     /// it, which is where somebody who has just made an impulse wants to be.
     /// Closing the window and finding the bay again is a long way round at
     /// the exact moment enthusiasm is highest.
-    pub origin: Option<(usize, usize)>,
+    pub origin: Option<crate::desk_id::SeatBay>,
     /// **This capture has been written to disk**, so the way back knows
     /// there is a file to load.
     ///
@@ -1317,7 +1384,7 @@ impl IrWizardState {
     /// none: a wizard that kept re-reading would pick up the trail a LATER
     /// panel left, which is a Setup-opened wizard offering to walk back into
     /// somebody else's bay.
-    pub fn adopt_origin(&mut self, from: Option<(usize, usize)>) {
+    pub fn adopt_origin(&mut self, from: Option<crate::desk_id::SeatBay>) {
         if self.origin.is_none() {
             self.origin = from;
         }
@@ -1330,7 +1397,7 @@ impl IrWizardState {
     /// Cancel, which stops the tone and the capture on the way out. A
     /// second door out of a page that has one is two things to read where
     /// there was one.
-    pub fn way_back(&self) -> Option<(usize, usize)> {
+    pub fn way_back(&self) -> Option<crate::desk_id::SeatBay> {
         (self.stage == IrStage::Result).then_some(self.origin).flatten()
     }
 
@@ -1461,11 +1528,10 @@ impl IrWizardState {
     /// to the last file on the shelf — the wrong-file class of fault
     /// [`Self::armed`] was written to make impossible, one door along.
     pub fn back_to_panel(&self) -> Option<(Dialog, Option<DialogAction>)> {
-        let (strip, slot) = self.way_back()?;
-        let home = IrFaceReturn { strip, slot, dir: String::new() };
+        let bay = self.way_back()?;
+        let home = IrFaceReturn { bay, dir: String::new() };
         let ask = self.saved.then(|| DialogAction::SetInsertIr {
-            strip,
-            slot,
+            bay,
             path: IR_LAST_SAVED.to_owned(),
         });
         Some((home.face(self.saved), ask))
@@ -1581,6 +1647,17 @@ fn track_insert_row_h(removable: bool) -> f32 {
 /// somebody the slot can receive a track. A live track's menu is about the
 /// track; a permanently dead paste row on every one of them would be a row
 /// that teaches people to stop reading this menu.
+/// What the New Bus / New Return row costs a row's menu: one row, on
+/// every menu that is a row's (an empty slot's included), since making a bus
+/// does not depend on what the row holds.
+fn track_bus_row_h(lane: usize) -> f32 {
+    if lane != NOT_A_ROW {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
 fn track_paste_row_h(removable: bool, can_paste: bool) -> f32 {
     if removable && can_paste {
         TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
@@ -1667,7 +1744,7 @@ pub enum DialogAction {
     SaveChangesDiscard,
     SaveChangesCancel,
     /// Show or hide one automation lane. The `String` is `AutoParam::key()`.
-    AutomationToggle(usize, String),
+    AutomationToggle(crate::automation::AutoLane, String),
     /// Expand or collapse one heading in the automation menu.
     AutomationGroup(String),
     /// New session from the `default` template.
@@ -1696,8 +1773,9 @@ pub enum DialogAction {
     TrackFreeze(usize),
     /// Put the held track on this EMPTY slot.
     TrackPaste(usize),
-    /// Paint one channel by hand — index into `STRIP_COLORS`.
-    TrackColor(usize, i64),
+    /// Paint one strip by hand — index into `STRIP_COLORS`. By what the
+    /// strip is: a track (which paints its selection with it) or the click.
+    TrackColor(crate::recorder::StripRef, i64),
     /// The lane's badge: 0 auto, 1 drum, 2 guitar, 3 bass.
     TrackIcon(usize, u8),
     /// Choose the auto-palette every unpainted slot wears.
@@ -1724,12 +1802,34 @@ pub enum DialogAction {
     SetShowWelcome(bool),
     /// Open the routing window for a channel.
     OpenRouting(usize),
-    /// Step into one of the two lists: `true` for hardware outputs.
-    RoutingPick { channel: usize, hardware: bool },
+    /// Step into one of the lists. See [`RoutingPage`].
+    RoutingPick { channel: usize, page: RoutingPage },
+    /// **Send this channel to the bus on row `to`**: a new post-fader send
+    /// at unity (`TangentApp::add_send`). Both by row: the window is modal.
+    AddSend { from: usize, to: usize },
+    /// **One send's level**, 0..=1, from the window's own slider. `done` is
+    /// the end of the gesture (the hand let go, or a one-step change), where
+    /// the app takes the send's one moment; only the window can know it.
+    SetSendLevel { from: usize, to: usize, pre: bool, level: f32, done: bool },
+    /// **Move one send to the other side of the fader.** `pre` is the side
+    /// it is on now.
+    FlipSendPre { from: usize, to: usize, pre: bool },
+    /// Take one send off.
+    RemoveSend { from: usize, to: usize, pre: bool },
+    /// **A new return, with this channel already sent to it**: the send
+    /// list's own way to a return that is not there yet.
+    SendToNewReturn(usize),
+    /// **A new bus, with this channel already routed into it.**
+    RouteToNewBus(usize),
+    /// **A new bus or return, at the end of the desk**: the track menu's
+    /// rows. Never asks the track cap.
+    NewBus(crate::recorder::BusRole),
     /// Make the route. The app owns the no-duplicates rule.
     AddRoute {
         from: usize,
-        target: crate::routing::Target,
+        /// A jack, or a channel by the row it stands on: the window is
+        /// modal, and the app turns the row into its track as it lands.
+        target: crate::routing::LaneTarget,
     },
     /// Take a route off, by its index in the desk's table.
     RemoveRoute(usize),
@@ -1963,28 +2063,26 @@ pub enum DialogAction {
     /// Start a new project and leave the unsaved one where it is.
     NewProjectKeeping,
     // ── the suite faces ─────────────────────────────────────────────────
-    /// One knob on a built-in insert, in DESK terms — the app converts to
-    /// the seat once, on its side of the wall.
-    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// One knob on a built-in insert, its bay by identity — the app names
+    /// it to the host once, on its side of the wall.
+    SetInsertParam { bay: crate::desk_id::SeatBay, id: u32, value: f32 },
     /// A face's reading was typed into: the words, for the host to read
     /// on the unit's own scale. See `faces::FaceAction::Type`.
-    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
+    TypeInsertParam { bay: crate::desk_id::SeatBay, id: u32, text: String },
     /// Save the face's current values under a name; the app reads its own
     /// mirror for the values, so the action stays a wish, not a payload.
-    FaceSavePreset { strip: usize, slot: usize, name: String },
+    FaceSavePreset { bay: crate::desk_id::SeatBay, name: String },
     /// Load a preset file into whatever the open face controls.
     FaceLoadPreset { unit: String, path: String },
-    /// Point one bay's sidechain key at a channel, or take it off with
-    /// `None`. DESK terms like the dialog that fires it; the desktop's
-    /// per-frame publish owns the `seat_bay` translation, so the edge
-    /// survives every seat renumbering the desk migrations perform.
-    SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
+    /// Point one bay's sidechain key at a track, or take it off with
+    /// `None`: both ends by identity, so a drag under the open picker
+    /// cannot turn the choice into another track.
+    SetInsertKeySource { bay: crate::desk_id::SeatBay, from: Option<crate::desk_id::Node> },
     /// The amp face's pedal chip: open the insert picker over pedal
-    /// `pedal` of the channel whose bay the face sits on. `strip`/`slot`
-    /// are the face's own DESK terms; the app resolves the channel through
-    /// `seat_bay` and the pedal through `amp_pedal_seat`, on its side of
-    /// the wall. Appended at the END, per this enum's law.
-    OpenPedalPicker { strip: usize, slot: usize, pedal: usize },
+    /// `pedal` of the board the face's bay wears. `bay` is the face's own;
+    /// the app resolves whose board it is on its side of the wall.
+    /// Appended at the END, per this enum's law.
+    OpenPedalPicker { bay: crate::desk_id::SeatBay, pedal: usize },
     // ── the IR wizard ───────────────────────────────────────────────────
     // Appended at the enum's END, the append-only law. The wizard's five:
     // a door in Setup, and the four asks the app maps onto requests.
@@ -2019,7 +2117,7 @@ pub enum DialogAction {
     /// converts and asks the host to rebind the bay.
     ///
     /// **[`IR_BROWSE`] in `path` means "ask me instead".** See there.
-    SetInsertIr { strip: usize, slot: usize, path: String },
+    SetInsertIr { bay: crate::desk_id::SeatBay, path: String },
     /// **Switch one bay out of circuit, or back in.** Appended at the END,
     /// this enum's law.
     ///
@@ -2027,7 +2125,7 @@ pub enum DialogAction {
     /// already toggles — so this carries the WANTED value rather than a
     /// "toggle", because a face and a menu that both toggled could disagree
     /// about the current state and cancel each other out.
-    SetInsertBypass { strip: usize, slot: usize, on: bool },
+    SetInsertBypass { bay: crate::desk_id::SeatBay, on: bool },
     /// **Open the audio on THIS output**, by name, or `None` for the
     /// system's own default.
     ///
@@ -2064,18 +2162,16 @@ pub enum DialogAction {
     /// at the END, this enum's law — `OpenPedalPicker` above is left exactly
     /// as it was rather than widened, for the same reason.
     ///
-    /// `strip`/`slot` are the amp face's own DESK terms and `pedal` is the
-    /// ordinal; the app resolves the owning channel through `seat_bay` and
-    /// `pedal_owner`, and the seat through `amp_pedal_seat`, on its side of
-    /// the wall. `alt` and `shift` are read from the FACE's own input, not
+    /// `bay` is the amp face's own and `pedal` is the ordinal; the app
+    /// resolves the owning track and the pedal's bay on its side of the
+    /// wall. `alt` and `shift` are read from the FACE's own input, not
     /// from the desk's latched pair: on the desktop a face is a separate OS
     /// window with a keyboard of its own, so a chip that asked the main
     /// window what was held would be answering about a keyboard nobody was
     /// typing on. That is the whole reason they travel in the action rather
     /// than being read where it lands.
     OpenPedalFace {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         pedal: usize,
         alt: bool,
         shift: bool,
@@ -2085,8 +2181,7 @@ pub enum DialogAction {
     /// that needs it — an EQ handle carries a frequency and a gain, and this
     /// road used to make it choose one per frame.
     SetInsertParamPair {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         id_a: u32,
         value_a: f32,
         id_b: u32,
@@ -2095,7 +2190,7 @@ pub enum DialogAction {
     /// **A run of a bay's numbers in one frame.** Appended at the END, this
     /// enum's law. See [`crate::faces::FaceAction::SetMany`] — the EQ's
     /// double-click reset puts a whole band back and that is five of them.
-    SetInsertParamsMany { strip: usize, slot: usize, sets: Vec<(u32, f32)> },
+    SetInsertParamsMany { bay: crate::desk_id::SeatBay, sets: Vec<(u32, f32)> },
     // ── the DX7 bank builder ────────────────────────────────────────────
     // Appended at the END, this enum's law. Six asks from the picker's
     // right pane; the app maps each onto a `RecorderRequest` of the same
@@ -2140,8 +2235,7 @@ pub enum DialogAction {
     /// raises the load on the sampler's own road. A path and nothing else:
     /// the face found where the file is, and never moves a byte of it.
     PickSample {
-        strip: usize,
-        slot: usize,
+        bay: crate::desk_id::SeatBay,
         path: String,
     },
     /// **Remember this folder as where the media explorers open.**
@@ -2176,6 +2270,12 @@ pub enum DialogAction {
     /// longer overwrites a live one, so the two variants are now "into" and
     /// "below" rather than "destroy" and "refuse".
     TrackPasteBelow(usize),
+    /// **A Tangent Insert face's ask**, for the bay it was opened over.
+    /// Appended at the END, this enum's law.
+    HwInsert {
+        bay: crate::desk_id::SeatBay,
+        ask: crate::faces_hwinsert::HwAsk,
+    },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -2848,7 +2948,7 @@ fn midi_inputs_body(
         RichText::new(if devices.iter().any(|d| d.on) {
             "ticked devices only"
         } else {
-            "none ticked \u{2014} every device, including ones plugged in later"
+            "none ticked: every device, including ones plugged in later"
         })
         .font(plain(10.0))
         .color(dim),
@@ -2896,7 +2996,7 @@ fn midi_inputs_body(
                 let label = if row.present {
                     row.name.clone()
                 } else {
-                    format!("{}  \u{2014} not connected", row.name)
+                    format!("{} (not connected)", row.name)
                 };
                 let text = RichText::new(label)
                     .font(plain(11.0))
@@ -3934,19 +4034,6 @@ impl PluginEntry {
     /// whose path has no stem at all — a trailing `..`, a caller's mistake —
     /// falls back to the whole path rather than an unclickable-looking blank
     /// row.
-    /// **This app's OWN VST3, which is not an instrument.**
-    ///
-    /// Tangent ships a plugin that draws the same display inside a DAW. It has
-    /// no audio by design — `AUDIO_IO_LAYOUTS` is empty — so loading it here
-    /// fails, correctly, with "no audio output channels". A Linux tester met it
-    /// as a row called "Tangent" sitting under "Tangent DX7", chose the
-    /// familiar name, and read the failure as the app being broken.
-    ///
-    /// Matched by bundle stem, which is what the picker has: the list is a
-    /// directory listing and opening every module to ask its name is the one
-    /// thing this dialog will not do.
-    pub const OWN_PLUGIN_STEM: &'static str = "Tangent";
-
     pub fn from_bundle(path: &Path) -> PluginEntry {
         Self::from_bundle_with_vendor(path, None, None)
     }
@@ -3970,18 +4057,10 @@ impl PluginEntry {
             .filter(|d| !d.is_empty())
             .or(stem)
             .unwrap_or_else(|| full.clone());
-        // Said in the row rather than hidden from it. The file IS on the disk,
-        // and somebody who has just built it should see it where they put it —
-        // what they should not do is choose it and be told the app is broken.
-        let vendor = if name == Self::OWN_PLUGIN_STEM {
-            "this app's own display plugin - for a DAW, not for here".to_owned()
-        } else {
-            vendor.unwrap_or("").to_owned()
-        };
         PluginEntry {
             name,
             path: full,
-            vendor,
+            vendor: vendor.unwrap_or("").to_owned(),
         }
     }
 }
@@ -4183,17 +4262,30 @@ fn vst3_locations() -> &'static str {
 ///
 /// * **Whether this build records and hosts plugins at all.** Both arrive
 ///   with the recorder, so `Caps::capture_devices` answers for both: the
-///   same gate the menu's plugin-folder rows use. It is false in a plugin
-///   editor and in a Minimal build, which link neither the recorder nor the
-///   plugin host, and have no audio engine either; what they are is the
-///   chord display.
+///   same gate the menu's plugin-folder rows use. It is false in a Minimal
+///   build, which links neither the recorder nor the plugin host, and has
+///   no audio engine either; what it is is the chord display.
 /// * **Which plugin formats**, by TARGET platform. LV2 is compiled only on
 ///   Linux and FreeBSD (`tangent-host`'s Cargo.toml gates `livi`, `lilv` and
 ///   `lv2-sys` there; `about_lists_lv2_exactly_where_the_host_compiles_it`
 ///   holds the two together) and VST3 everywhere. This line said "LV2/VST3"
 ///   on every platform. `cfg!` and not a probe, as [`encoder_note`] does it:
 ///   a Windows build cross-compiled on a Mac still answers for Windows.
-fn about_lines(caps: crate::host::Caps) -> (&'static str, String) {
+///
+/// `supporter` is the install's standing (see `Dialog::About`). It reaches
+/// here so the line can say what THIS install's desk is: a free desk of
+/// thirty-two tracks, or one with no track limit.
+///
+/// **The desk's size is the creation cap's, asked the cap's own way.** The
+/// line said "32-channel mixer" for everybody, from the desk's width
+/// constant, and the desk stopped having a width: what a licence decides is
+/// how many tracks an install may CREATE (`recorder::track_cap`), so the card
+/// asks `track_cap` and prints its answer. A free install reads "32-track
+/// desk" from the same `FREE_TRACKS` the gate refuses at, so the two cannot
+/// disagree; a supporter reads "unlimited tracks". A build with no recorder
+/// has no desk to describe, so its line is the chord display's whatever the
+/// standing.
+fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, String) {
     if !caps.capture_devices {
         return (
             "A piano display with chord intelligence",
@@ -4205,15 +4297,31 @@ fn about_lines(caps: crate::host::Caps) -> (&'static str, String) {
     } else {
         "VST3"
     };
+    let desk = match crate::recorder::track_cap(supporter) {
+        Some(cap) => format!("{cap}-track desk"),
+        None => "unlimited tracks".to_owned(),
+    };
     (
         "A recording DAW with chord intelligence",
-        // The channel count comes from the desk's own constant, so it cannot
-        // fall behind the desk again: it read 16 here while the desk had 32.
-        format!(
-            "Recorder, {}-channel mixer, arrangement, MIDI editor, drum machine, {formats}",
-            crate::recorder::CHANNELS
-        ),
+        format!("Recorder, {desk}, arrangement, MIDI editor, drum machine, {formats}"),
     )
+}
+
+/// The Supporter Key dialog's three lines for an install with no key yet.
+///
+/// A function, and not literals in the arm, so the wording that names the
+/// free desk's size takes it from `recorder::FREE_TRACKS`: the dialog that
+/// sells the key and the gate that refuses the 33rd track read one number.
+fn key_dialog_lines() -> [String; 3] {
+    [
+        format!(
+            "Tangent is free, with up to {} tracks.",
+            crate::recorder::FREE_TRACKS
+        ),
+        "A supporter key (or a certain code) takes the track limit away and lights the heart."
+            .to_owned(),
+        "Buses, returns, sends and routes have no limit for anyone.".to_owned(),
+    ]
 }
 
 impl Dialog {
@@ -4714,11 +4822,11 @@ const DIALOG_ID: &str = "ivory-dialog";
 /// very same match over a second slot, and the only thing it changes is
 /// which surface the window is drawn on. That is the whole architectural
 /// cost of the stack, and it is one string, because everything else a pedal
-/// needs already resolves — `recorder::seat_bay` is the IDENTITY on a pedal
-/// seat, so `Dialog::InsertFace { strip: amp_pedal_seat(ch, p), slot: 0 }`,
-/// `SetInsertParam`, `FaceSavePreset`, `SetInsertIr` and `OpenInsertEditor`
-/// all already mean the right rack. Nobody needs to invent a second
-/// addressing road; there is only a second WINDOW.
+/// needs already resolves — a pedal is a bay by identity like any other, so
+/// `Dialog::InsertFace` on it, `SetInsertParam`, `FaceSavePreset`,
+/// `SetInsertIr` and `OpenInsertEditor` all already mean the right rack.
+/// Nobody needs to invent a second addressing road; there is only a second
+/// WINDOW.
 ///
 /// **Why an id of its own rather than the `becomes` handoff.** `becomes`
 /// (see [`show`]) swaps one window for another in one slot, which is the
@@ -4910,8 +5018,7 @@ const IR_FACE_ID: &str = "dialog-ir-face";
 /// its browser was standing in.
 #[derive(Clone)]
 struct IrFaceReturn {
-    strip: usize,
-    slot: usize,
+    bay: crate::desk_id::SeatBay,
     dir: String,
 }
 
@@ -4938,8 +5045,7 @@ impl IrFaceReturn {
         };
         live.face.path = "@tangent-ir".to_owned();
         Dialog::InsertFace {
-            strip: self.strip,
-            slot: self.slot,
+            bay: self.bay,
             live: Box::new(live),
         }
     }
@@ -4954,11 +5060,11 @@ impl IrFaceReturn {
 /// thing they put there takes this on its own first frame. A wizard opened
 /// from Setup's menu finds nothing here, which is exactly right: there is no
 /// panel behind it to go back to.
-fn remember_ir_face(ctx: &egui::Context, strip: usize, slot: usize, dir: &str) {
+fn remember_ir_face(ctx: &egui::Context, bay: crate::desk_id::SeatBay, dir: &str) {
     ctx.memory_mut(|m| {
         m.data.insert_temp(
             egui::Id::new(IR_FACE_ID),
-            IrFaceReturn { strip, slot, dir: dir.to_owned() },
+            IrFaceReturn { bay, dir: dir.to_owned() },
         );
     });
 }
@@ -5753,9 +5859,9 @@ const EXPORT_MAX: Vec2 = Vec2::new(1200.0, 620.0);
 
 /// The export window's size on this display — see [`EXPORT_SHARE`].
 ///
-/// `monitor` is whatever [`Placement`] was handed: the screen on the
-/// desktop, the plugin editor's own canvas inline, and the same share is
-/// the right answer to both.
+/// `monitor` is whatever [`Placement`] was handed: the screen with child
+/// windows, the app's own canvas inline, and the same share is the right
+/// answer to both.
 ///
 /// The rule itself is [`crate::shell::share_of_screen`] and lives there
 /// rather than here: a share of the display with a floor, a ceiling and a
@@ -5822,6 +5928,18 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
+    // The comp's shape and for the comp's reason: a picture on top of the
+    // knob rows, here the stair over six rows where the comp has a needle
+    // over seven.
+    ("@tangent-bitcrush", Vec2::new(0.344, 0.582), Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
+    // The insert: the glass, two routing rows, four knobs and the ping row
+    // stacked over the footer. Taller than the knob panels by those rows.
+    (
+        crate::faces_hwinsert::HWINSERT_PATH,
+        Vec2::new(0.38, 0.64),
+        Vec2::new(440.0, 480.0),
+        Vec2::new(704.0, 768.0),
+    ),
 ];
 
 /// Every other face: the shape the knob rows were laid out in.
@@ -5857,8 +5975,8 @@ const FACE_IR: (Vec2, Vec2, Vec2) = (
 
 /// The face window for `unit` on this display. See [`FACE_SIZES`].
 ///
-/// `monitor` is whatever [`Placement`] was handed — the screen on the
-/// desktop, the plugin editor's own canvas inline — and `None` on the frames
+/// `monitor` is whatever [`Placement`] was handed (the screen with child
+/// windows, the app's own canvas inline) and `None` on the frames
 /// before anything has been measured, where `share_of_screen` answers with
 /// the floor, which is the size these faces opened at for their whole life so
 /// far.
@@ -5972,6 +6090,181 @@ pub fn export_layout(rect: Rect) -> ExportLayout {
         Vec2::new(w, bar_h),
     );
     ExportLayout { label, wave, bar }
+}
+
+/// A stem row's name line, the floor under its well, and the air below it.
+///
+/// The floor is what keeps a row READABLE when there are many: a wave
+/// squeezed to a few points is a line, not a picture of a stem, so past
+/// this the rows stop shrinking and the list scrolls instead.
+pub const EXPORT_ROW_NAME_H: f32 = 16.0;
+pub const EXPORT_ROW_MIN_WELL: f32 = 36.0;
+pub const EXPORT_ROW_GAP: f32 = 6.0;
+
+/// **How tall one stem row is**, name and air included, in a wave area
+/// `area_h` tall that has `rows` of them to show.
+///
+/// An even share of the area while the share clears the floor, so a pass
+/// of three stems fills the window the way one wave does; the floor once it
+/// does not, and the rows past the bottom are reached by scrolling.
+pub fn export_row_pitch(area_h: f32, rows: usize) -> f32 {
+    let floor = EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP;
+    if rows == 0 {
+        return floor;
+    }
+    (area_h.max(0.0) / rows as f32).max(floor)
+}
+
+/// A row's two parts: the line its name is written on, and the well its
+/// wave is drawn in, BELOW the name and never under it. The air at the
+/// foot is the row's own, so two wells never touch.
+pub fn export_row_parts(row: Rect) -> (Rect, Rect) {
+    let name = Rect::from_min_size(row.min, Vec2::new(row.width(), EXPORT_ROW_NAME_H));
+    let well = Rect::from_min_max(
+        Pos2::new(row.left(), name.bottom()),
+        Pos2::new(row.right(), (row.bottom() - EXPORT_ROW_GAP).max(name.bottom())),
+    );
+    (name, well)
+}
+
+/// The words on the export window's top line.
+///
+/// **The host's cover is SAID here, not painted over the wave.** It used
+/// to be mirrored into this window whole, scrim and card, centred on the
+/// window - which is the middle of the wave. A stems pass ends on the
+/// longest "Writing files" block in the app (one file per stem through the
+/// format pass), so the picture the owner was left looking at when the
+/// render finished was the announcement sitting in the waveform: "the
+/// initial helper message is shown behind the waveform draw". The line
+/// above the wave is where this window already says what it is doing, and
+/// a cover is one more thing it is doing.
+fn export_line(p: &crate::ports::ExportProgress, cover: Option<&crate::busy::Busy>) -> String {
+    match cover.filter(|b| b.is_visible()) {
+        Some(b) => match b.detail.as_deref() {
+            Some(d) if !d.is_empty() => format!("{}  {d}", b.label),
+            _ => b.label.clone(),
+        },
+        None => format!("{}  {:.0}%", p.label, p.fraction * 100.0),
+    }
+}
+
+/// **One wave, into its well**: the ground, the hairline, the zero line,
+/// the columns heard so far, and the playhead at `x`. The single export's
+/// one well and every stem's are drawn by this, so a row can never look
+/// different from the window it replaced.
+fn paint_export_wave(
+    painter: &egui::Painter,
+    well: Rect,
+    peaks: &[(f32, f32)],
+    x: f32,
+    t: &DialogTheme,
+) {
+    let wave = painter.with_clip_rect(well);
+    wave.rect_filled(well, 2.0, t.field_bg);
+    // **A hairline round the well**, because on three of the seventy-six
+    // dressings the well and the window's ground are within 1.1:1 of
+    // each other (Porcelain light, Phosphor dark and Silverface dark,
+    // each on the strip face) and the waveform was floating in a
+    // rectangle with no findable edge. Another twelve sit under 1.15:1,
+    // so this is not one theme being awkward. The
+    // surface cannot move (it is the ground the wave is measured
+    // against), so the box gets a line instead, in the theme's own edge
+    // shade. See `every_theme_dresses_the_export_window`.
+    wave.rect_stroke(
+        well,
+        2.0,
+        Stroke::new(1.0_f32, t.button_border),
+        egui::StrokeKind::Inside,
+    );
+    let mid = well.center().y;
+    // The zero line, so a silent passage still reads as rendered rather
+    // than as nothing drawn yet.
+    wave.line_segment(
+        [Pos2::new(well.left(), mid), Pos2::new(well.right(), mid)],
+        Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
+    );
+    let cols = peaks.len().max(1);
+    let half = (well.height() * 0.5 - 2.0).max(0.5);
+    // **A column is as wide as its share of the wave**, not one point.
+    // The feed is a fixed 480 columns (`ports::EXPORT_PEAKS`), which was
+    // about one point each in the 496-point wave this window used to
+    // have; across a wave three times that wide, one-point strokes draw
+    // a comb with two points of ground showing between every pair of
+    // samples. Floored at a point so a narrow window still draws
+    // something rather than hairlines with gaps.
+    let col_w = (well.width() / cols as f32).max(1.0);
+    for (i, (lo, hi)) in peaks.iter().enumerate() {
+        if *lo == 0.0 && *hi == 0.0 {
+            continue;
+        }
+        let cx = well.left() + well.width() * (i as f32 + 0.5) / cols as f32;
+        let top = mid - hi.clamp(-1.0, 1.0) * half;
+        let bot = mid - lo.clamp(-1.0, 1.0) * half;
+        wave.line_segment(
+            [Pos2::new(cx, top), Pos2::new(cx, bot.max(top + 1.0))],
+            Stroke::new(col_w, t.text),
+        );
+    }
+    // The playhead: where the render has got to.
+    wave.line_segment(
+        [Pos2::new(x, well.top()), Pos2::new(x, well.bottom())],
+        Stroke::new(1.0_f32, playhead_ink(t.field_bg)),
+    );
+}
+
+/// The id the stem list's scroll offset is kept under.
+fn export_rows_scroll_id() -> egui::Id {
+    egui::Id::new((EXPORT_ID, "rows"))
+}
+
+/// **Every stem's wave, one named row each, scrolling when they outgrow
+/// the area.** Only the rows in view are painted (`show_rows`), so a pass
+/// of a hundred stems costs what the dozen on screen cost.
+///
+/// Wheel and drag both scroll it, as every list in this app does, and the
+/// bar is hidden like theirs. A new export opens at the top: egui keeps a
+/// scroll offset for the life of the process, and a render that opened
+/// halfway down the last one's list would hide its first stems.
+fn show_export_rows(
+    ui: &mut egui::Ui,
+    l: &ExportLayout,
+    rows: &[crate::ports::ExportRow],
+    fraction: f32,
+    fresh: bool,
+    t: &DialogTheme,
+) {
+    let pitch = export_row_pitch(l.wave.height(), rows.len());
+    let x = l.playhead(fraction);
+    let name_font = FontId::new(11.0, fonts::courier_bold());
+    ui.scope_builder(egui::UiBuilder::new().max_rect(l.wave), |ui| {
+        ui.set_clip_rect(l.wave.intersect(ui.clip_rect()));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt(export_rows_scroll_id())
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .auto_shrink([false, false])
+            .max_height(l.wave.height());
+        if fresh {
+            area = area.vertical_scroll_offset(0.0);
+        }
+        area.show_rows(ui, pitch, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(l.wave.width(), pitch),
+                    egui::Sense::hover(),
+                );
+                let (name, well) = export_row_parts(r);
+                ui.painter().with_clip_rect(name).text(
+                    name.left_center(),
+                    Align2::LEFT_CENTER,
+                    &row.name,
+                    name_font.clone(),
+                    t.text,
+                );
+                paint_export_wave(ui.painter(), well, &row.peaks, x, t);
+            }
+        });
+    });
 }
 
 /// **The playhead's red, kept findable on the well it is drawn on.**
@@ -6093,21 +6386,21 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 ///    click going nowhere.
 /// 6. **Close Setup.** The export window is back in front of everything
 ///    within a frame or two, still drawing.
-/// 7. **The plugin path.** Open the suite plugin in a host, start an export
-///    from it, and check the same things in the canvas: the window is drawn
-///    over the piano and the recorder band, the canvas behind it is NOT
-///    dimmed (it is reporting, not asking), a click on the window's face
-///    does not operate a control underneath it, a message raised mid-render
-///    appears in the corner column rather than as a second window, and a
-///    dialog opened from the menu paints OVER it and can be used — including
-///    its dropdowns and its hover text, which is what keeps a question in the
-///    band its own popups are drawn in.
+/// 7. **The inline path.** Turn screen-reader mode on (Window > Menus Inside
+///    the Window, or J), start an export, and check the same things in the
+///    canvas: the window is drawn over the piano and the recorder band, the
+///    canvas behind it is NOT dimmed (it is reporting, not asking), a click
+///    on the window's face does not operate a control underneath it, a
+///    message raised mid-render appears in the corner column rather than as
+///    a second window, and a dialog opened from the menu paints OVER it and
+///    can be used, its dropdowns and its hover text included, which is
+///    what keeps a question in the band its own popups are drawn in.
 /// 7a. **The raw-pointer hole, now closed.** Inline, `shell` swallows what
 ///    lands on a surface at egui's hit test, which covers every widget and
 ///    the main background's own response. The handlers that read `i.pointer`
 ///    directly — the piano's note press, the recorder band's hit test — are
 ///    gated by `App::dialog_blocks_pointer`, which used to answer only about
-///    a `Dialog`, so a click on the waveform sounded a note in the plugin.
+///    a `Dialog`, so a click on the waveform sounded a note inline.
 ///    That function now asks [`pointer_over_export`] first. Press the middle
 ///    of the window and listen: nothing.
 /// 8. **A native file panel beats everything.** Start an export, then open
@@ -6143,9 +6436,9 @@ pub fn show_export_progress(
         // **Not modal.** It blocks nothing and dims nothing: the desk stays
         // live under a render, which is the whole reason this is not a
         // `Dialog`. It went through `show_dialog_viewport` before, which
-        // decides modality from `chrome` and therefore made it modal inline
-        // — a plugin canvas greyed out behind a window that was reporting,
-        // not asking.
+        // decides modality from `chrome` and therefore made it modal inline:
+        // a canvas greyed out behind a window that was reporting, not
+        // asking.
         //
         // Not modal is not the same as transparent to a press: `shell`
         // swallows what lands on any inline surface whether or not it dims,
@@ -6170,87 +6463,44 @@ pub fn show_export_progress(
     // still running with nothing on screen saying so is exactly what this
     // window exists to prevent. That was its contract before and it is its
     // contract now.
+    // **A new export opens its stem list at the top.** The window is drawn
+    // on every pass while a render runs, so a gap of more than one pass is a
+    // window that went away and has come back.
+    let seen = egui::Id::new((EXPORT_ID, "rows-seen"));
+    let pass = ctx.cumulative_pass_nr();
+    let fresh = ctx
+        .memory(|m| m.data.get_temp::<u64>(seen))
+        .is_none_or(|last| pass.saturating_sub(last) > 1);
+    ctx.memory_mut(|m| m.data.insert_temp(seen, pass));
     let _ = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, _want_close| {
         apply_theme(ui.style_mut(), &t);
-        // **The host's cover, over THIS window too.** This window is
-        // `Uncovered` and AlwaysOnTop, so the cover painted in the main
-        // viewport sat behind it and the user saw a render window over an
-        // app that seemed frozen. On the cover's own layer, which is above
-        // everything drawn below whatever order the calls come in.
-        if let Some(b) = cover {
-            let vc = ui.ctx().clone();
-            let painter = vc.layer_painter(crate::busy::cover_layer("tangent-busy-export"));
-            b.paint_over(&painter, vc.content_rect(), live_face(&vc), vc.input(|i| i.time));
-        }
         let rect = ui.max_rect();
         let painter = ui.painter_at(rect);
         // Rounded inline, where there is no window edge to tell the surface
         // apart from the app behind it; square in a window of its own.
         painter.rect_filled(rect, if inline { 4.0 } else { 0.0 }, t.bg);
         let l = export_layout(rect);
-        painter.text(
+        // **The host's cover is said on this line, never painted over the
+        // waves.** This window is `Uncovered` and AlwaysOnTop, so the cover
+        // painted in the main viewport sits behind it, and a window that
+        // said nothing of it looked like a render over a frozen app. It
+        // was mirrored in here whole once, scrim and card, and the card
+        // landed in the middle of the wave. See `export_line`.
+        painter.with_clip_rect(l.label).text(
             l.label.left_center(),
             Align2::LEFT_CENTER,
-            format!("{}  {:.0}%", p.label, p.fraction * 100.0),
+            export_line(p, cover),
             bold(13.0),
             t.text,
         );
-        // ── the wave ──────────────────────────────────────────────────────
-        let wave = painter.with_clip_rect(l.wave);
-        wave.rect_filled(l.wave, 2.0, t.field_bg);
-        // **A hairline round the well**, because on three of the seventy-six
-        // dressings the well and the window's ground are within 1.1:1 of
-        // each other (Porcelain light, Phosphor dark and Silverface dark,
-        // each on the strip face) and the waveform was floating in a
-        // rectangle with no findable edge. Another twelve sit under 1.15:1,
-        // so this is not one theme being awkward. The
-        // surface cannot move — it is the ground the wave is measured
-        // against — so the box gets a line instead, in the theme's own edge
-        // shade. See `every_theme_dresses_the_export_window`.
-        wave.rect_stroke(
-            l.wave,
-            2.0,
-            Stroke::new(1.0_f32, t.button_border),
-            egui::StrokeKind::Inside,
-        );
-        let mid = l.wave.center().y;
-        // The zero line, so a silent passage still reads as rendered rather
-        // than as nothing drawn yet.
-        wave.line_segment(
-            [
-                Pos2::new(l.wave.left(), mid),
-                Pos2::new(l.wave.right(), mid),
-            ],
-            Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
-        );
-        let cols = p.peaks.len().max(1);
-        let half = l.wave.height() * 0.5 - 2.0;
-        // **A column is as wide as its share of the wave**, not one point.
-        // The feed is a fixed 480 columns (`ports::EXPORT_PEAKS`), which was
-        // about one point each in the 496-point wave this window used to
-        // have; across a wave three times that wide, one-point strokes draw
-        // a comb with two points of ground showing between every pair of
-        // samples. Floored at a point so a narrow window still draws
-        // something rather than hairlines with gaps.
-        let col_w = (l.wave.width() / cols as f32).max(1.0);
-        for (i, (lo, hi)) in p.peaks.iter().enumerate() {
-            if *lo == 0.0 && *hi == 0.0 {
-                continue;
-            }
-            let x = l.wave.left() + l.wave.width() * (i as f32 + 0.5) / cols as f32;
-            let top = mid - hi.clamp(-1.0, 1.0) * half;
-            let bot = mid - lo.clamp(-1.0, 1.0) * half;
-            wave.line_segment(
-                [Pos2::new(x, top), Pos2::new(x, bot.max(top + 1.0))],
-                Stroke::new(col_w, t.text),
-            );
+        // ── the waves ─────────────────────────────────────────────────────
+        // One, unnamed, for a single file - the window as it always was -
+        // or one named row per file a stems pass writes.
+        if p.rows.is_empty() {
+            paint_export_wave(&painter, l.wave, &p.peaks, l.playhead(p.fraction), &t);
+        } else {
+            show_export_rows(ui, &l, &p.rows, p.fraction, fresh, &t);
         }
-        // The playhead: where the render has got to.
-        let x = l.playhead(p.fraction);
-        wave.line_segment(
-            [Pos2::new(x, l.wave.top()), Pos2::new(x, l.wave.bottom())],
-            Stroke::new(1.0_f32, playhead_ink(t.field_bg)),
-        );
         // ── the bar ───────────────────────────────────────────────────────
         // Filled to the SAME x the playhead stands at — the bar and the wave
         // share a left edge and a width, so the two read as one measurement
@@ -6890,7 +7140,7 @@ fn draw_ir_result(
     // nothing. See `ports::IrReferenceUse`.
     let ref_note = match r.reference {
         crate::ports::IrReferenceUse::Borrowed => Some((
-            "one return jack brought the loop back — it was used for both channels",
+            "one return jack brought the loop back, and it was used for both channels",
             false,
         )),
         crate::ports::IrReferenceUse::Dropped => Some((
@@ -7030,7 +7280,7 @@ fn draw_ir_result(
     // what left "why is my plate 0.6 seconds" unanswerable.
     ui.label(
         RichText::new(format!(
-            "captured at {:.1} dBFS peak over a {:.0} dBFS floor \u{2014} \
+            "captured at {:.1} dBFS peak over a {:.0} dBFS floor: \
              {:.0} dB of usable range",
             r.capture_peak_db, r.noise_floor_db, r.tail_range_db
         ))
@@ -7065,7 +7315,7 @@ fn draw_ir_result(
         ui.label(
             RichText::new(
                 "This capture folded. The tail slides steadily downward, \
-                 which a decay cannot do — it is the sweep coming back off a \
+                 which a decay cannot do: it is the sweep coming back off a \
                  device that samples lower than this interface, not the \
                  unit's reverb. Go back, set TOP one step LOWER than you \
                  used, and record another - keep stepping down until this \
@@ -7194,7 +7444,7 @@ fn draw_ir_result(
 /// moment somebody is looking at a file browser rather than at their mix. So
 /// the sound is left alone and the consequence is printed in the `kept` line,
 /// which is what that line is for: what survives, and how far.
-fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dialog {
+fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> Dialog {
     let name = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -7218,7 +7468,7 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
             // sounds one way today and another way tomorrow. See
             // `desktop::clear_insert_ir`.
             "This is the impulse this bay is playing, and the bay is emptied \
-             with it \u{2014} the sound stops now, not next time this project is \
+             with it: the sound stops now, not next time this project is \
              opened. Any other bay playing the same file is emptied too."
                 .to_owned()
         } else {
@@ -7229,8 +7479,7 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
         choices: vec![ConfirmChoice::new(
             "Delete",
             DialogAction::SetInsertIr {
-                strip,
-                slot,
+                bay,
                 path: ir_delete_ask(path),
             },
             true,
@@ -7361,6 +7610,46 @@ pub fn set_export_stem_mode(spec: &mut crate::ports::ProjectExportSpec, chip: us
 }
 
 
+/// **The Quantize window's GRID row**: one chip per step, BAR (step 0) down
+/// to the finest the window offers (step -7), each named in the song's
+/// `meter` by the same ladder the gridboxes print, and a press sets
+/// `grid_exp`. Returns the chips, coarse to fine.
+///
+/// Its own function so the row can be drawn alone: each chip sizes itself
+/// to its word (a selectable label), which is why this row needed no fit
+/// when the gridboxes did, and `every_quantize_grid_chip_holds_its_word`
+/// holds it to that for every word in every meter and face.
+///
+/// **Each chip is SAID as the note it is** (`arrangement_panel::grid_spoken`),
+/// and as chosen or not. egui names a selectable label by its text and
+/// leaves its state out, so a screen reader heard the box's shorthand,
+/// "1/2·" for 12/8's dotted half with the dot read aloud and "1/128" for
+/// 4/4's finest, and never which chip was the grid. The name a reader is
+/// given is the last one handed to the chip, so this one, given after the
+/// label's own, is the one it keeps.
+/// `every_quantize_grid_chip_is_said_as_a_note` holds every chip of every
+/// meter to it.
+fn quantize_grid_row(ui: &mut egui::Ui, grid_exp: &mut i8, meter: (u8, u8)) -> Vec<egui::Response> {
+    ui.horizontal_wrapped(|ui| {
+        let mut chips = Vec::new();
+        for e in (-7_i8..=0).rev() {
+            let label = crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
+            let chosen = *grid_exp == e;
+            let chip = ui.selectable_label(chosen, label);
+            let said = crate::arrangement_panel::grid_spoken(e, meter.0, meter.1);
+            chip.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, chip.enabled(), chosen, &said)
+            });
+            if chip.clicked() {
+                *grid_exp = e;
+            }
+            chips.push(chip);
+        }
+        chips
+    })
+    .inner
+}
+
 /// **The desk's own dialog window**, in the one slot the app has always had.
 ///
 /// A thin wrapper since the amp grew a stacked pedal window: `show_on` below
@@ -7377,6 +7666,71 @@ pub fn show(
     placement: Placement,
 ) -> Option<DialogAction> {
     show_on(ctx, dialog_opt, face, placement)
+}
+
+/// **One picker row per channel: the NAME first, then the number, narrowed
+/// to what has been typed.**
+///
+/// The route and key pickers listed "Ch 3 - Bass": a number first, which is
+/// the one thing about a channel nobody looks for, on a list that grows by
+/// one row for every track the desk has. A person reaching for the bass
+/// types "ba"; the list answers with the bass and keeps its number beside
+/// the name, so two tracks both called "Vox" can still be told apart. A
+/// channel with no name is its number alone. The match is case-blind and
+/// against the whole row, so "3" still finds channel three (and anything
+/// else with a 3 in it, which is what typing a digit asks).
+///
+/// `channels` is the app's list of `(index, name)`; the answer is
+/// `(index, row text)`, in the list's order.
+pub fn picker_rows(channels: &[(usize, String)], filter: &str) -> Vec<(usize, String)> {
+    let want = filter.trim().to_lowercase();
+    channels
+        .iter()
+        .filter_map(|(idx, name)| {
+            let number = format!("Ch {}", idx + 1);
+            let shown = if name.trim().is_empty() {
+                number
+            } else {
+                format!("{} ({number})", name.trim())
+            };
+            (want.is_empty() || shown.to_lowercase().contains(&want)).then_some((*idx, shown))
+        })
+        .collect()
+}
+
+/// **What a routing or send destination that would close a loop says**
+/// under its greyed row (`desk_topology::would_cycle`): the first sign of a
+/// loop on a desk is a howl, so the picker says it instead.
+pub const LOOP_HINT: &str = "greyed: it already feeds this channel, so this would loop";
+
+/// [`picker_rows`] for the key picker, whose sources are tracks by
+/// identity: each shown by the row it stands on and its name, as every
+/// picker shows a channel, and answered by the track.
+pub fn key_source_rows(
+    channels: &[(crate::desk_id::Node, usize, String)],
+    filter: &str,
+) -> Vec<(crate::desk_id::Node, String)> {
+    let rows: Vec<(usize, String)> = channels.iter().map(|(_, at, name)| (*at, name.clone())).collect();
+    picker_rows(&rows, filter)
+        .into_iter()
+        .filter_map(|(at, shown)| Some((channels.iter().find(|(_, row, _)| *row == at)?.0, shown)))
+        .collect()
+}
+
+/// The field a picker's list is narrowed with, focused when the list first
+/// shows so the hand that opened it can start typing at once.
+fn picker_filter(ui: &mut egui::Ui, filter: &mut String, font: FontId, text: Color32) {
+    let resp = ui.add(
+        egui::TextEdit::singleline(filter)
+            .hint_text("type a name to filter")
+            .font(font)
+            .text_color(text)
+            .desired_width(ui.available_width()),
+    );
+    if ui.memory(|m| m.focused().is_none()) {
+        resp.request_focus();
+    }
+    ui.add_space(6.0);
 }
 
 /// **The same window machinery, drawn on the STACKED surface** — one pedal's
@@ -7672,12 +8026,11 @@ fn show_on(
             )
         }
 
-        Dialog::InsertFace { strip, slot, live } => {
+        Dialog::InsertFace { bay, live } => {
             let p = crate::recorder_panel::surface_of(face);
             let (lcd, lcd_glass) = live_lcd(ctx);
             let st = crate::face::FaceStyle::new(face, lcd, lcd_glass);
-            let strip = *strip;
-            let slot = *slot;
+            let bay = *bay;
             let unit = live.face.path.clone();
             // **The clipboard is pushed, like everything else the face
             // reads.** It lives in this file (see `ir_clip`) rather than on
@@ -7732,23 +8085,20 @@ fn show_on(
                                 action = match act {
                                     crate::faces::FaceAction::SetBypass { on } => {
                                         Some(DialogAction::SetInsertBypass {
-                                            strip,
-                                            slot,
+                                            bay,
                                             on,
                                         })
                                     }
                                     crate::faces::FaceAction::Set { id, value } => {
                                         Some(DialogAction::SetInsertParam {
-                                            strip,
-                                            slot,
+                                            bay,
                                             id,
                                             value,
                                         })
                                     }
                                     crate::faces::FaceAction::Type { id, text } => {
                                         Some(DialogAction::TypeInsertParam {
-                                            strip,
-                                            slot,
+                                            bay,
                                             id,
                                             text,
                                         })
@@ -7759,8 +8109,7 @@ fn show_on(
                                         id_b,
                                         value_b,
                                     } => Some(DialogAction::SetInsertParamPair {
-                                        strip,
-                                        slot,
+                                        bay,
                                         id_a,
                                         value_a,
                                         id_b,
@@ -7768,13 +8117,12 @@ fn show_on(
                                     }),
                                     crate::faces::FaceAction::SetMany { sets } => {
                                         Some(DialogAction::SetInsertParamsMany {
-                                            strip,
-                                            slot,
+                                            bay,
                                             sets,
                                         })
                                     }
                                     crate::faces::FaceAction::SavePreset { name } => {
-                                        Some(DialogAction::FaceSavePreset { strip, slot, name })
+                                        Some(DialogAction::FaceSavePreset { bay, name })
                                     }
                                     crate::faces::FaceAction::LoadPreset { path } => {
                                         Some(DialogAction::FaceLoadPreset {
@@ -7783,15 +8131,14 @@ fn show_on(
                                         })
                                     }
                                     crate::faces::FaceAction::OpenPedal { pedal } => {
-                                        Some(DialogAction::OpenPedalPicker { strip, slot, pedal })
+                                        Some(DialogAction::OpenPedalPicker { bay, pedal })
                                     }
                                     crate::faces::FaceAction::PedalGesture {
                                         pedal,
                                         alt,
                                         shift,
                                     } => Some(DialogAction::OpenPedalFace {
-                                        strip,
-                                        slot,
+                                        bay,
                                         pedal,
                                         alt,
                                         shift,
@@ -7804,16 +8151,19 @@ fn show_on(
                                         // finds nothing and offers no return,
                                         // which is right — there is no panel
                                         // behind it.
-                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
+                                        remember_ir_face(ui.ctx(), bay, &standing);
                                         Some(DialogAction::OpenIrWizard)
                                     }
                                     crate::faces::FaceAction::PickIr { path } => {
-                                        Some(DialogAction::SetInsertIr { strip, slot, path })
+                                        Some(DialogAction::SetInsertIr { bay, path })
                                     }
                                     crate::faces::FaceAction::PickSample { path } => {
-                                        Some(DialogAction::PickSample { strip, slot, path })
+                                        Some(DialogAction::PickSample { bay, path })
                                     }
-                                    // No strip, no slot: one default folder
+                                    crate::faces::FaceAction::HwInsert(ask) => {
+                                        Some(DialogAction::HwInsert { bay, ask })
+                                    }
+                                    // No bay: one default folder
                                     // for the app, shared with the drumpad's
                                     // own DEF chip.
                                     crate::faces::FaceAction::SetMediaDefault { path } => {
@@ -7847,8 +8197,7 @@ fn show_on(
                                         // See `IR_BROWSE`.
                                         result.close = true;
                                         Some(DialogAction::SetInsertIr {
-                                            strip,
-                                            slot,
+                                            bay,
                                             path: IR_BROWSE.to_owned(),
                                         })
                                     }
@@ -7873,8 +8222,7 @@ fn show_on(
                                         let file = ir_clip(ui.ctx());
                                         (!file.is_empty()).then(|| {
                                             DialogAction::SetInsertIr {
-                                                strip,
-                                                slot,
+                                                bay,
                                                 path: ir_paste_ask(&file, &into),
                                             }
                                         })
@@ -7902,10 +8250,8 @@ fn show_on(
                                         // half-lands. A question is its own
                                         // window.
                                         result.close = true;
-                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
-                                        becomes = Some(confirm_ir_delete(
-                                            strip, slot, &path, loaded,
-                                        ));
+                                        remember_ir_face(ui.ctx(), bay, &standing);
+                                        becomes = Some(confirm_ir_delete(bay, &path, loaded));
                                         None
                                     }
                                 };
@@ -9477,7 +9823,7 @@ fn show_on(
             show_dialog_viewport(
                 ctx,
                 placement,
-                &format!("{who} \u{2014} MIDI Inputs"),
+                &format!("{who} - MIDI Inputs"),
                 Vec2::new(MIDI_INPUTS_W, h),
                 Vec2::new(MIDI_INPUTS_W - 80.0, 220.0),
                 |ui, result| {
@@ -11137,9 +11483,11 @@ fn show_on(
             midi_clips,
             frozen,
             can_freeze,
+            strip,
         } => {
             let t = theme(face);
             let lane = *lane;
+            let strip = *strip;
             let removable = *removable;
             let midi_clips = *midi_clips;
             let (frozen, can_freeze) = (*frozen, *can_freeze);
@@ -11184,7 +11532,8 @@ fn show_on(
                         + track_export_row_h(midi_clips)
                         + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
-                        + track_insert_row_h(removable),
+                        + track_insert_row_h(removable)
+                        + track_bus_row_h(lane),
                 ),
                 Vec2::new(
                     520.0,
@@ -11192,7 +11541,8 @@ fn show_on(
                         + track_export_row_h(midi_clips)
                         + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
-                        + track_insert_row_h(removable),
+                        + track_insert_row_h(removable)
+                        + track_bus_row_h(lane),
                 ),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
@@ -11381,7 +11731,7 @@ fn show_on(
                             // slot's menu always says what it is for; a row
                             // that appears only sometimes is a row nobody
                             // learns is there.
-                            if empty && lane < crate::recorder::CHANNELS {
+                            if empty && lane != NOT_A_ROW {
                                 let label = if can_paste {
                                     "Paste Track"
                                 } else {
@@ -11401,7 +11751,31 @@ fn show_on(
                                 }
                                 ui.add_space(6.0);
                             }
-                            if lane < crate::recorder::CHANNELS {
+                            // **A bus or a return, at the end of the desk**:
+                            // never a track, so never the cap's, on any tier
+                            // (design 9). Two halves of one row, because they
+                            // are one gesture with two names.
+                            if lane != NOT_A_ROW {
+                                ui.horizontal(|ui| {
+                                    let w = ((ui.available_width() - 6.0) * 0.5).max(1.0);
+                                    for (label, role) in [
+                                        ("New Bus", crate::recorder::BusRole::Bus),
+                                        ("New Return", crate::recorder::BusRole::Return),
+                                    ] {
+                                        if ui
+                                            .add_sized(
+                                                Vec2::new(w, TRACK_EXPORT_ROW_H),
+                                                Button::new(RichText::new(label).font(plain(11.0)).color(t.text)),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(DialogAction::NewBus(role));
+                                        }
+                                    }
+                                });
+                                ui.add_space(TRACK_EXPORT_ROW_GAP);
+                            }
+                            if lane != NOT_A_ROW {
                                 if ui
                                     .add_sized(
                                         Vec2::new(ui.available_width(), 26.0),
@@ -11425,7 +11799,7 @@ fn show_on(
                                 );
                                 ui.add_space(8.0);
                             }
-                            if lane < crate::recorder::CHANNELS {
+                            if lane != NOT_A_ROW {
                                 ui.label(
                                     RichText::new("ICON").font(bold(10.0)).color(dim),
                                 );
@@ -11563,7 +11937,7 @@ fn show_on(
                                         }
                                         if resp.clicked() {
                                             action = Some(DialogAction::TrackColor(
-                                                lane, idx as i64,
+                                                strip, idx as i64,
                                             ));
                                         }
                                     }
@@ -11571,7 +11945,7 @@ fn show_on(
                             }
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new("AUTO-PALETTE — every unpainted slot")
+                                RichText::new("AUTO-PALETTE: every unpainted slot")
                                     .font(bold(10.0))
                                     .color(dim),
                             );
@@ -11680,7 +12054,7 @@ fn show_on(
                                     // channels and the two that are not.
                                     let sw = cells_across(
                                         ui.available_width() - 6.0,
-                                        crate::recorder::CHANNELS + 2,
+                                        crate::recorder::PALETTE_SLOTS + 2,
                                         1.0,
                                     )
                                     .clamp(3.0, 12.0);
@@ -11697,7 +12071,9 @@ fn show_on(
                                             Color32::from_rgb(cr, cg, cb),
                                         );
                                     };
-                                    for c in 0..crate::recorder::CHANNELS {
+                                    // The palette's whole deal, which is its
+                                    // own period and not the desk's width.
+                                    for c in 0..crate::recorder::PALETTE_SLOTS {
                                         swatch(ui, pal.slot(c));
                                     }
                                     ui.add_space(6.0);
@@ -11721,9 +12097,9 @@ fn show_on(
                 },
             )
         }
-        Dialog::About => {
+        Dialog::About { supporter } => {
             let t = theme(face);
-            let (tagline, what) = about_lines(placement.caps);
+            let (tagline, what) = about_lines(placement.caps, *supporter);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -11916,21 +12292,25 @@ fn show_on(
 
         Dialog::Routing {
             channel,
-            picking,
+            page,
             hardware,
             channels,
+            looped,
             existing,
+            sends,
+            buses,
+            filter,
         } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
             let ch = *channel;
-            let step = *picking;
+            let step = *page;
             show_dialog_viewport(
                 ctx,
                 placement,
                 &format!("Routing - Channel {}", ch + 1),
-                Vec2::new(420.0, 420.0),
-                Vec2::new(360.0, 300.0),
+                Vec2::new(440.0, 500.0),
+                Vec2::new(360.0, 320.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.field_bg;
@@ -11955,9 +12335,37 @@ fn show_on(
                                 ui.add_space(4.0);
                                 clicked
                             };
+                            // **A level and nothing else**, the route's and the
+                            // send's alike: the slider, its figure, and a
+                            // double-click home to unity (the keys knobs'
+                            // exemplar). Answers the new level when it moved,
+                            // and whether the gesture is over: the hand let go,
+                            // or a one-step change (a key) that has no release.
+                            let level = |ui: &mut egui::Ui, now: f32| -> Option<(f32, bool)> {
+                                let mut g = now;
+                                let resp = ui
+                                    .add(egui::Slider::new(&mut g, 0.0..=1.0).show_value(false))
+                                    .on_hover_text("double-click to reset");
+                                ui.label(
+                                    RichText::new(format!("{:>3.0}%", g.clamp(0.0, 1.0) * 100.0))
+                                        .font(bold(10.0))
+                                        .color(dim),
+                                );
+                                if resp.double_clicked() {
+                                    return Some((1.0, true));
+                                }
+                                let done = resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                                (resp.changed() || done).then_some((g, done))
+                            };
                             match step {
-                                // ── which kind ────────────────────────────
-                                None => {
+                                // ── what is there, and the ways to add ────
+                                RoutingPage::Main => {
+                                    egui::ScrollArea::vertical()
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        )
+                                        .max_height((ui.available_height() - 36.0).max(60.0))
+                                        .show(ui, |ui| {
                                     ui.label(
                                         RichText::new("Send this channel somewhere else.")
                                             .font(bold(11.0))
@@ -11965,9 +12373,10 @@ fn show_on(
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Routing to a channel MOVES it there, through \
-                                             whatever is loaded on it. For a copy - a reverb \
-                                             feed - use the SEND knob instead.",
+                                            "Routing to a channel or a bus MOVES it there, through \
+                                             whatever is loaded on it. A SEND is a copy: the SND \
+                                             knob into the effects, or a send to a bus or a return \
+                                             below.",
                                         )
                                         .font(bold(9.0))
                                         .color(dim),
@@ -11984,7 +12393,7 @@ fn show_on(
                                                 .font(bold(10.0))
                                                 .color(dim),
                                         );
-                                        for (at, label, gain) in existing.iter() {
+                                        for (at, _, label, gain) in existing.iter() {
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(label)
@@ -11998,37 +12407,9 @@ fn show_on(
                                                 // for the fader, so a person
                                                 // working in that view had no
                                                 // way to turn a route down.
-                                                let mut g = *gain;
-                                                let resp = ui.add(
-                                                    egui::Slider::new(&mut g, 0.0..=1.0)
-                                                        .show_value(false),
-                                                );
-                                                // Double-click puts it back to
-                                                // unity — the keys knobs'
-                                                // exemplar, on the one slider
-                                                // that had no way home.
-                                                if resp.double_clicked() {
-                                                    g = 1.0;
-                                                    action = Some(
-                                                        DialogAction::SetRouteGain(*at, g),
-                                                    );
-                                                } else if resp.changed() {
-                                                    action = Some(
-                                                        DialogAction::SetRouteGain(*at, g),
-                                                    );
+                                                if let Some((g, _)) = level(ui, *gain) {
+                                                    action = Some(DialogAction::SetRouteGain(*at, g));
                                                 }
-                                                let resp = resp.on_hover_text(
-                                                    "double-click to reset",
-                                                );
-                                                let _ = resp;
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{:>3.0}%",
-                                                        g.clamp(0.0, 1.0) * 100.0
-                                                    ))
-                                                    .font(bold(10.0))
-                                                    .color(dim),
-                                                );
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
                                                     |ui| {
@@ -12054,26 +12435,26 @@ fn show_on(
                                         ui,
                                         // Not "Sends" — a send is a COPY, and
                                         // this moves the channel. The SND
-                                        // knob is the copy, into the effects
-                                        // bus, and calling both the same
+                                        // knob and the sends below are the
+                                        // copies, and calling both the same
                                         // thing is how you end up expecting
                                         // to hear the track twice.
-                                        "Another Channel",
+                                        "A Bus or Another Channel",
                                         "moves it there, through whatever is loaded on it",
                                         !channels.is_empty(),
                                     ) {
                                         action = Some(DialogAction::RoutingPick {
                                             channel: ch,
-                                            hardware: false,
+                                            page: RoutingPage::Channel,
                                         });
                                     }
-                                    if channels.is_empty() {
-                                        ui.label(
-                                            RichText::new("(no other channel is in use yet)")
-                                                .font(bold(9.0))
-                                                .color(dim),
-                                        );
-                                        ui.add_space(4.0);
+                                    if row(
+                                        ui,
+                                        "A New Bus",
+                                        "makes a bus at the end of the desk and routes this channel into it",
+                                        true,
+                                    ) {
+                                        action = Some(DialogAction::RouteToNewBus(ch));
                                     }
                                     if row(
                                         ui,
@@ -12083,7 +12464,7 @@ fn show_on(
                                     ) {
                                         action = Some(DialogAction::RoutingPick {
                                             channel: ch,
-                                            hardware: true,
+                                            page: RoutingPage::Hardware,
                                         });
                                     }
                                     if hardware.is_empty() {
@@ -12095,63 +12476,167 @@ fn show_on(
                                             .color(dim),
                                         );
                                     }
+                                    // ── the sends: copies into buses ──────
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.label(
+                                        RichText::new(if sends.is_empty() {
+                                            "No sends to buses yet."
+                                        } else {
+                                            "Now sending to:"
+                                        })
+                                        .font(bold(10.0))
+                                        .color(dim),
+                                    );
+                                    for (to, label, now, pre) in sends.iter() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(label)
+                                                    .font(bold(11.0))
+                                                    .color(t.text),
+                                            );
+                                            if let Some((g, done)) = level(ui, *now) {
+                                                action = Some(DialogAction::SetSendLevel {
+                                                    from: ch,
+                                                    to: *to,
+                                                    pre: *pre,
+                                                    level: g,
+                                                    done,
+                                                });
+                                            }
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(Button::new(
+                                                            RichText::new("Remove")
+                                                                .font(bold(10.0))
+                                                                .color(t.text),
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        action = Some(DialogAction::RemoveSend {
+                                                            from: ch,
+                                                            to: *to,
+                                                            pre: *pre,
+                                                        });
+                                                    }
+                                                    // Which side of the fader,
+                                                    // said as the word for the
+                                                    // side it is ON: a press
+                                                    // moves it to the other.
+                                                    if ui
+                                                        .add(Button::new(
+                                                            RichText::new(if *pre { "PRE" } else { "POST" })
+                                                                .font(bold(10.0))
+                                                                .color(t.text),
+                                                        ))
+                                                        .on_hover_text(
+                                                            "post-fader follows this channel's fader; \
+                                                             pre-fader does not",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        action = Some(DialogAction::FlipSendPre {
+                                                            from: ch,
+                                                            to: *to,
+                                                            pre: *pre,
+                                                        });
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                    ui.add_space(6.0);
+                                    if row(
+                                        ui,
+                                        "Send to a Bus or Return",
+                                        "a copy, at its own level; the channel still reaches the master",
+                                        !buses.is_empty(),
+                                    ) {
+                                        action = Some(DialogAction::RoutingPick {
+                                            channel: ch,
+                                            page: RoutingPage::Send,
+                                        });
+                                    }
+                                    if row(
+                                        ui,
+                                        "Send to a New Return",
+                                        "makes a return at the end of the desk and sends this channel to it",
+                                        true,
+                                    ) {
+                                        action = Some(DialogAction::SendToNewReturn(ch));
+                                    }
+                                        });
                                 }
                                 // ── which destination ─────────────────────
-                                Some(is_hw) => {
+                                pick => {
                                     ui.label(
-                                        RichText::new(if is_hw {
-                                            "Pick an output:"
-                                        } else {
-                                            "Pick a channel to send to:"
+                                        RichText::new(match pick {
+                                            RoutingPage::Hardware => "Pick an output:",
+                                            RoutingPage::Send => "Pick a bus or a return to send to:",
+                                            _ => "Pick a bus or a channel to route to:",
                                         })
                                         .font(bold(11.0))
                                         .color(t.text),
                                     );
                                     ui.add_space(6.0);
+                                    if pick != RoutingPage::Hardware {
+                                        picker_filter(ui, filter, bold(12.0), t.text);
+                                    }
                                     egui::ScrollArea::vertical()
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .max_height(ui.available_height() - 40.0)
                                         .show(ui, |ui| {
-                                            if is_hw {
-                                                for (label, first, stereo) in hardware.iter() {
-                                                    // A destination already
-                                                    // routed from here is
-                                                    // greyed: the rule is no
-                                                    // duplicates, and saying
-                                                    // so before the click
-                                                    // beats refusing after.
-                                                    let free =
-                                                        !existing.iter().any(|(_, l, _)| l == label);
-                                                    if row(ui, label, "", free) {
-                                                        action = Some(DialogAction::AddRoute {
-                                                            from: ch,
-                                                            target: crate::routing::Target::Hardware {
-                                                                first: *first,
-                                                                stereo: *stereo,
-                                                            },
-                                                        });
+                                            match pick {
+                                                RoutingPage::Hardware => {
+                                                    for (label, first, stereo) in hardware.iter() {
+                                                        // A destination already
+                                                        // routed from here is
+                                                        // greyed: the rule is no
+                                                        // duplicates, and saying
+                                                        // so before the click
+                                                        // beats refusing after.
+                                                        let dest = crate::routing::LaneTarget::Hardware {
+                                                            first: *first,
+                                                            stereo: *stereo,
+                                                        };
+                                                        let free =
+                                                            !existing.iter().any(|(_, d, _, _)| *d == dest);
+                                                        if row(ui, label, "", free) {
+                                                            action = Some(DialogAction::AddRoute {
+                                                                from: ch,
+                                                                target: dest,
+                                                            });
+                                                        }
                                                     }
                                                 }
-                                            } else {
-                                                for (idx, name) in channels.iter() {
-                                                    let label =
-                                                        crate::routing::Target::Channel(*idx)
-                                                            .label();
-                                                    let shown = if name.is_empty() {
-                                                        label.clone()
-                                                    } else {
-                                                        format!("{label} - {name}")
-                                                    };
-                                                    let free =
-                                                        !existing.iter().any(|(_, l, _)| *l == label);
-                                                    if row(ui, &shown, "", free) {
-                                                        action = Some(DialogAction::AddRoute {
-                                                            from: ch,
-                                                            target:
-                                                                crate::routing::Target::Channel(
-                                                                    *idx,
-                                                                ),
-                                                        });
+                                                RoutingPage::Send => {
+                                                    for (idx, shown) in picker_rows(buses, filter) {
+                                                        // Greyed when it already
+                                                        // takes this channel, and
+                                                        // when it would close a
+                                                        // loop, which says why.
+                                                        let sent = sends.iter().any(|(to, ..)| *to == idx);
+                                                        let lp = looped.contains(&idx);
+                                                        let hint = if lp { LOOP_HINT } else { "" };
+                                                        if row(ui, &shown, hint, !sent && !lp) {
+                                                            action = Some(DialogAction::AddSend { from: ch, to: idx });
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    for (idx, shown) in picker_rows(channels, filter) {
+                                                        let dest = crate::routing::LaneTarget::Channel(idx);
+                                                        let taken = existing.iter().any(|(_, d, _, _)| *d == dest);
+                                                        let lp = looped.contains(&idx);
+                                                        let hint = if lp { LOOP_HINT } else { "" };
+                                                        if row(ui, &shown, hint, !taken && !lp) {
+                                                            action = Some(DialogAction::AddRoute {
+                                                                from: ch,
+                                                                target: dest,
+                                                            });
+                                                        }
                                                     }
                                                 }
                                             }
@@ -12166,7 +12651,7 @@ fn show_on(
                                 {
                                     result.close = true;
                                 }
-                                if step.is_some()
+                                if step != RoutingPage::Main
                                     && ui
                                         .add(Button::new(RichText::new("Back").color(t.text)))
                                         .clicked()
@@ -12179,10 +12664,10 @@ fn show_on(
             )
         }
 
-        Dialog::InsertKeySource { strip, slot, current, channels } => {
+        Dialog::InsertKeySource { bay, current, channels, filter } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
-            let (at, bay, now) = (*strip, *slot, *current);
+            let (bay, now) = (*bay, *current);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -12226,6 +12711,7 @@ fn show_on(
                                 .color(dim),
                             );
                             ui.add_space(8.0);
+                            picker_filter(ui, filter, bold(12.0), t.text);
                             egui::ScrollArea::vertical()
                                 .scroll_bar_visibility(
                                     egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
@@ -12238,29 +12724,20 @@ fn show_on(
                                     // no-thanks answer.
                                     if row(ui, "No sidechain", now.is_some()) {
                                         action = Some(DialogAction::SetInsertKeySource {
-                                            strip: at,
-                                            slot: bay,
+                                            bay,
                                             from: None,
                                         });
                                     }
-                                    for (idx, name) in channels.iter() {
-                                        let label =
-                                            crate::routing::Target::Channel(*idx).label();
-                                        let shown = if name.is_empty() {
-                                            label
-                                        } else {
-                                            format!("{label} - {name}")
-                                        };
+                                    for (source, shown) in key_source_rows(channels, filter) {
                                         // The current source is greyed, the
                                         // routing picker's no-duplicates
                                         // grammar: saying "already this" before
                                         // the click beats a click that does
                                         // nothing.
-                                        if row(ui, &shown, now != Some(*idx)) {
+                                        if row(ui, &shown, now != Some(source)) {
                                             action = Some(DialogAction::SetInsertKeySource {
-                                                strip: at,
-                                                slot: bay,
-                                                from: Some(*idx),
+                                                bay,
+                                                from: Some(source),
                                             });
                                         }
                                     }
@@ -12299,7 +12776,7 @@ fn show_on(
             // **And the way back the panel left, taken once.** See
             // `IrWizardState::adopt_origin`: the take is what stops a later
             // Setup-opened wizard from inheriting it.
-            s.adopt_origin(take_ir_face(ctx).map(|o| (o.strip, o.slot)));
+            s.adopt_origin(take_ir_face(ctx).map(|o| o.bay));
             let back_to = s.way_back();
             // The button below only says it was pressed; what that MEANS is
             // `IrWizardState::back_to_panel`, on the state where a test can
@@ -12436,7 +12913,7 @@ fn show_on(
                                             ))
                                             .on_hover_text(
                                                 "back to the sweep with this loop and \
-                                                 these levels — capture, save, repeat",
+                                                 these levels: capture, save, repeat",
                                             )
                                             .clicked()
                                         {
@@ -12484,7 +12961,7 @@ fn show_on(
                                                     .color(t.text),
                                                 ))
                                                 .on_hover_text(
-                                                    "back to the IR panel \u{2014} its \
+                                                    "back to the IR panel: its \
                                                      presets and its impulse browser, \
                                                      with this capture loaded and \
                                                      scrolled to",
@@ -12630,7 +13107,7 @@ fn show_on(
             show_dialog_viewport(
                 ctx,
                 placement,
-                &format!("{who} \u{2014} Automation"),
+                &format!("{who} - Automation"),
                 Vec2::new(430.0, 460.0),
                 Vec2::new(360.0, 260.0),
                 |ui, result| {
@@ -12819,15 +13296,7 @@ fn show_on(
 
                             // ── the grid ──────────────────────────────────
                             head(ui, "GRID");
-                            ui.horizontal_wrapped(|ui| {
-                                for e in (-7_i8..=0).rev() {
-                                    let label =
-                                        crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
-                                    if ui.selectable_label(*grid_exp == e, label).clicked() {
-                                        *grid_exp = e;
-                                    }
-                                }
-                            });
+                            quantize_grid_row(ui, grid_exp, *meter);
                             ui.horizontal(|ui| {
                                 ui.checkbox(triplet, RichText::new("triplet").color(t.text));
                                 ui.add_space(10.0);
@@ -12841,7 +13310,7 @@ fn show_on(
                             });
                             if *triplet && *swing_pct > 50.0 {
                                 ui.label(
-                                    RichText::new("triplet wins — a swung triplet is two answers to one question")
+                                    RichText::new("triplet wins: a swung triplet is two answers to one question")
                                         .font(bold(9.0))
                                         .color(dim),
                                 );
@@ -12870,7 +13339,7 @@ fn show_on(
                             );
                             ui.label(
                                 RichText::new(if *window_ms <= 0.0 {
-                                    "off — everything moves, ornaments included".to_owned()
+                                    "off: everything moves, ornaments included".to_owned()
                                 } else {
                                     format!(
                                         "anything more than {window_ms:.0} ms from a line is left alone"
@@ -13139,8 +13608,11 @@ fn show_on(
                 ctx,
                 placement,
                 "Supporter Key",
-                Vec2::new(460.0, 310.0),
-                Vec2::new(400.0, 270.0),
+                // Forty points taller than the two-line card it was: the
+                // three lines above the paste box wrap to four or five rows,
+                // and the failure message under the box still needs its room.
+                Vec2::new(460.0, 350.0),
+                Vec2::new(400.0, 310.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.bg;
@@ -13156,16 +13628,22 @@ fn show_on(
                                         .color(t.text),
                                 );
                             } else {
-                                ui.label(
-                                    RichText::new("Tangent is free, and it stays free.")
-                                        .font(bold(12.0))
-                                        .color(t.text),
-                                );
-                                ui.label(
-                                    RichText::new("A key is a thank-you, nothing more.")
-                                        .font(bold(12.0))
-                                        .color(t.text),
-                                );
+                                // **What a key does, said truthfully.** This
+                                // read "a thank-you, nothing more" while a
+                                // key was about to lift the free desk's track
+                                // limit, which is a promise broken in the one
+                                // place a buyer reads before paying. Three
+                                // facts, each its own line so none is buried:
+                                // the free desk's size (the gate's own
+                                // `FREE_TRACKS`, so the two cannot drift),
+                                // what a key or the Konami code changes (owner
+                                // call 9: "a certain code", in the app and
+                                // nowhere else), and what never had a limit.
+                                for line in key_dialog_lines() {
+                                    ui.label(
+                                        RichText::new(line).font(bold(12.0)).color(t.text),
+                                    );
+                                }
                                 // The store, said out loud. This dialog asks
                                 // for a key and never used to say where one
                                 // comes from — the only purchase link lived
@@ -14458,6 +14936,14 @@ fn show_on(
 
 #[cfg(test)]
 mod tests {
+    /// **A test's bay**: displayed slot `slot` on the strip of track `n`.
+    /// These tests used to carry a (strip, slot) pair; the bay those two
+    /// numbers named is what the dialogs carry now, so a test asks for the
+    /// same bay by identity and asserts it came back the same.
+    fn tb(n: u32, slot: usize) -> crate::desk_id::SeatBay {
+        crate::desk_id::slot_key(crate::desk_id::Node::Track(crate::desk_id::TrackId(n)), slot)
+            .expect("a displayed slot")
+    }
 
     /// **A key the in-house bar saw fires ONCE.**
     ///
@@ -15567,14 +16053,14 @@ mod tests {
         );
     }
 
-    /// The editor has to draw where there is no window manager at all: in a
-    /// plugin it is an `Area` in the DAW's canvas, and `show` is the only
-    /// funnel that knows the difference. This runs a whole frame of it inline —
-    /// text fields, a wrapped row of preset buttons, a scroll area and twelve
-    /// spinners sharing one `Area` id — and asserts the editor does nothing on
+    /// The editor has to draw where there is no window manager at all: inline
+    /// it is an `Area` in the app's own canvas, and `show` is the only funnel
+    /// that knows the difference. This runs a whole frame of it inline (text
+    /// fields, a wrapped row of preset buttons, a scroll area and twelve
+    /// spinners sharing one `Area` id) and asserts the editor does nothing on
     /// its own until it is confirmed.
     #[test]
-    fn the_editor_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+    fn the_editor_draws_inline_and_says_nothing_until_it_is_confirmed() {
         let ctx = egui::Context::default();
         // The dialogs name Courier Prime explicitly and epaint PANICS on a
         // font family that is not bound, so the fonts have to be installed
@@ -15589,7 +16075,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -16832,13 +17318,13 @@ at: None,
     }
 
     /// Like the tuning editor, this dialog has to draw where there is no window
-    /// manager at all — in a plugin it is an `Area` in the DAW's canvas, and
+    /// manager at all: inline it is an `Area` in the app's own canvas, and
     /// `show` is the only funnel that knows the difference. This runs a whole
     /// frame of it inline (a text field, four radio groups, eleven checkboxes
     /// and a scroll area sharing one `Area` id) and asserts it does nothing on
     /// its own until it is confirmed.
     #[test]
-    fn the_export_dialog_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+    fn the_export_dialog_draws_inline_and_says_nothing_until_it_is_confirmed() {
         let ctx = egui::Context::default();
         // The dialogs name Courier Prime explicitly and epaint PANICS on a
         // font family that is not bound.
@@ -16853,7 +17339,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -16978,8 +17464,8 @@ at: None,
     /// went in below the floor and could not be clicked at all, which is why
     /// the size argument at the arm is written the way it is.
     ///
-    /// So the frame is run for real, inline (the plugin path, where the
-    /// dialog is an `Area` in a canvas), and the question put to it is the
+    /// So the frame is run for real, inline (where the dialog is an `Area` in
+    /// a canvas), and the question put to it is the
     /// user's own: **is the word "Export" on the screen, inside the window,
     /// where it can be clicked?** The button's own painted glyphs are found
     /// among the frame's shapes and their rectangle is compared with the
@@ -17032,7 +17518,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -17097,54 +17583,373 @@ at: None,
 
     // ── the busy cover, and what it has to be over ──────────────────────────
 
-    /// The placement the two cover guards below draw against: the PLUGIN
-    /// caps, where every surface is an `Area` in one canvas and the paint
+    /// The placement the two cover guards below draw against: `Caps::NONE`,
+    /// where every surface is an `Area` in one canvas and the paint
     /// order is the whole of the z-order. On the desktop each of these is an
     /// OS window and the ladder is `shell::SurfaceTier`'s, which
     /// `a_cover_is_painted_above_every_surface_this_app_can_open` reads from
     /// the other end.
-    /// **The export window paints the cover it is handed.** The cover is
-    /// painted in the main viewport, and this window is a child window the
-    /// operating system keeps in front of it, so a decode or a write that
+    /// **The export window SAYS the cover it is handed, on its top line,
+    /// and paints nothing over its waves.**
+    ///
+    /// The cover is painted in the main viewport, and this window is a child
+    /// window the operating system keeps in front of it, so a write that
     /// started under a render showed the render over an app that seemed
-    /// frozen — "the loading splash loads behind the export menu". Handed
-    /// the host's cover, the window paints it over itself; handed none, it
-    /// paints what it always did.
+    /// frozen: "the loading splash loads behind the export menu". The first
+    /// fix mirrored the cover in here whole, scrim and card, and the card sat
+    /// in the middle of the wave: when a stems pass finished, its long
+    /// "Writing files" block was the announcement painted in the waveform,
+    /// the owner's "the initial helper message is shown behind the waveform
+    /// draw". So the words go on the line the window already speaks on.
+    ///
+    /// Revert-check: paint `b.paint_over(..)` over the window again (as the
+    /// closure did before) and the card's "Writing files" lands on the waves
+    /// and the scrim spills past the window - both asserts below go red.
     #[test]
-    fn the_export_window_paints_the_cover_it_is_handed() {
-        let ctx = egui::Context::default();
-        fonts::install(&ctx, fonts::FontChoice::default(), None);
-        let progress = crate::ports::ExportProgress {
-            fraction: 0.4,
-            label: "Rendering".into(),
-            peaks: vec![(0.0, 0.0); crate::ports::EXPORT_PEAKS],
-        };
-        let input = || egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
-            ..Default::default()
-        };
-        let mut busy = crate::busy::Busy::new("Loading audio");
+    fn the_export_window_says_the_cover_on_its_line_and_paints_nothing_over_its_waves() {
+        let ctx = export_ctx();
+        let p = stems_progress(1.0, "Writing files", &["Kick", "Snare", "Bass"], true);
+        let mut busy = crate::busy::Busy::new("Writing files").with_detail("wav");
         busy.delay = std::time::Duration::ZERO;
         // Shown once, so the mirror has something to mirror.
-        let _ = ctx.run(input(), |ctx| {
-            let p = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
-            busy.draw(&p, ctx.content_rect(), FALLBACK_FACE, 0.0);
+        let _ = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+            busy.draw(&painter, ctx.content_rect(), FALLBACK_FACE, 0.0);
         });
         assert!(busy.is_visible(), "the cover never became visible; the test proves nothing");
-        let count = |cover: Option<&crate::busy::Busy>| {
-            let mut n = 0;
-            // Two passes: an `Area` places itself from what it measured last time.
-            for _ in 0..2 {
-                n = ctx
-                    .run(input(), |ctx| show_export_progress(ctx, &progress, cover_placement(), cover))
-                    .shapes
-                    .len();
+        let shapes = export_frame(&ctx, &p, Some(&busy), Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let wells = export_wells(&l, p.rows.len(), 0.0);
+        let texts = painted_texts(&shapes);
+        let said = texts
+            .iter()
+            .find(|(s, _)| s == "Writing files  wav")
+            .unwrap_or_else(|| panic!("the cover's words are not on the window's line: {texts:?}"));
+        assert!(
+            l.label.expand(1.0).contains_rect(said.1),
+            "the cover's words were painted at {:?}, off the line at {:?}",
+            said.1,
+            l.label
+        );
+        for (text, at) in &texts {
+            for well in &wells {
+                assert!(
+                    !well.intersects(*at),
+                    "{text:?} is painted at {at:?}, over the wave in {well:?}"
+                );
             }
-            n
+        }
+        // And nothing else of the cover's: no scrim, no card, nothing past
+        // the window's own edge.
+        for s in &shapes {
+            let r = s.shape.visual_bounding_rect();
+            assert!(
+                !r.is_positive() || window.expand(1.5).contains_rect(r),
+                "a shape at {r:?} spills past the window at {window:?} - the cover's scrim"
+            );
+        }
+    }
+
+    /// **Every stem gets its own named wave, in desk order.** The owner:
+    /// "we need to show all waveforms being drawn, not just the one". Each
+    /// name sits on its own line ABOVE its well, so no word is ever under a
+    /// wave, and each row draws what its own peaks say.
+    ///
+    /// Revert-check: draw `p.peaks` alone whatever `p.rows` holds (the old
+    /// window) and no name is painted at all.
+    #[test]
+    fn a_stems_export_draws_one_named_wave_per_stem_in_desk_order() {
+        let ctx = export_ctx();
+        let names = ["Master", "Kick", "Snare", "Bass"];
+        let p = stems_progress(0.5, "Rendering", &names, false);
+        let shapes = export_frame(&ctx, &p, None, Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let wells = export_wells(&l, names.len(), 0.0);
+        let texts = painted_texts(&shapes);
+        let mut last_y = f32::NEG_INFINITY;
+        for (i, name) in names.iter().enumerate() {
+            let hits: Vec<_> = texts.iter().filter(|(s, _)| s == name).collect();
+            assert_eq!(hits.len(), 1, "{name:?} was painted {} times: {texts:?}", hits.len());
+            let at = hits[0].1;
+            assert!(at.top() > last_y, "{name:?} is out of desk order");
+            last_y = at.top();
+            assert!(
+                at.bottom() <= wells[i].top() + 0.5 && at.top() >= l.wave.top() - 0.5,
+                "{name:?} at {at:?} is not on the line above its well {:?}",
+                wells[i]
+            );
+            assert!(wells[i].height() >= EXPORT_ROW_MIN_WELL - 0.5, "row {i}'s well is a sliver");
+        }
+        // Every well painted: its ground, exactly where the rows put it.
+        let grounds = painted_rects(&shapes);
+        for (i, well) in wells.iter().enumerate() {
+            assert!(
+                grounds.iter().any(|r| (r.min - well.min).length() < 0.5 && (r.max - well.max).length() < 0.5),
+                "row {i}'s well {well:?} was never painted: {grounds:?}"
+            );
+        }
+        // And each row its OWN wave: the stems' peaks differ, so their
+        // strokes do too (row i's columns reach i-dependent heights).
+        let strokes = wave_strokes(&shapes);
+        for (i, well) in wells.iter().enumerate() {
+            assert!(
+                strokes.iter().any(|seg| well.contains(seg[0]) && well.contains(seg[1]) && (seg[1].y - seg[0].y).abs() > 2.0),
+                "row {i} drew no wave of its own"
+            );
+        }
+    }
+
+    /// **A single-file export looks as it always did**: one unnamed wave
+    /// filling the area between the line and the bar.
+    #[test]
+    fn a_single_file_export_still_draws_one_unnamed_wave() {
+        let ctx = export_ctx();
+        let p = crate::ports::ExportProgress {
+            fraction: 0.5,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.5, 0.5); crate::ports::EXPORT_PEAKS],
+            rows: Vec::new(),
         };
-        let bare = count(None);
-        let with = count(Some(&busy));
-        assert!(with > bare, "the cover added nothing to the export window ({bare} -> {with} shapes)");
+        let shapes = export_frame(&ctx, &p, None, Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let texts = painted_texts(&shapes);
+        assert_eq!(
+            texts.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["Rendering  50%"],
+            "a single file names no rows"
+        );
+        let grounds = painted_rects(&shapes);
+        assert!(grounds.contains(&l.wave), "the one well is not the whole wave area: {grounds:?}");
+    }
+
+    /// **More stems than fit scroll, and every one is reachable by wheel
+    /// and by drag.** Rows keep a readable floor rather than shrinking to
+    /// lines; only the rows in view are painted.
+    ///
+    /// Revert-check: lay the rows out as plain allocations with no
+    /// `ScrollArea` round them and the last stems are never painted.
+    #[test]
+    fn more_stems_than_fit_scroll_and_every_row_is_reachable() {
+        let names: Vec<String> = (1..=20).map(|i| format!("Stem {i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let p = stems_progress(0.3, "Rendering", &refs, false);
+        for by_drag in [false, true] {
+            let ctx = export_ctx();
+            let first = export_frame(&ctx, &p, None, Vec::new());
+            let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+            let l = export_layout(window);
+            let pitch = export_row_pitch(l.wave.height(), names.len());
+            assert!(
+                pitch * names.len() as f32 > l.wave.height() + 1.0,
+                "twenty rows fit a {}pt area; the test proves nothing",
+                l.wave.height()
+            );
+            assert!(
+                pitch >= EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP - 0.01,
+                "rows shrank under their floor instead of scrolling"
+            );
+            let seen_first: Vec<String> = painted_texts(&first).into_iter().map(|(s, _)| s).collect();
+            assert!(seen_first.contains(&names[0]), "the first stem is not in view at the start");
+            assert!(!seen_first.contains(&names[19]), "the last stem is painted though it cannot be in view");
+            let mut seen = std::collections::BTreeSet::new();
+            let at = l.wave.center();
+            let mut t = 0.0;
+            for frame in 0..400 {
+                let events = if by_drag {
+                    // Press, pull up a row's height, let go: one flick a frame-group.
+                    match frame % 4 {
+                        0 => vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        }],
+                        1 => vec![egui::Event::PointerMoved(at - Vec2::new(0.0, 30.0))],
+                        2 => vec![egui::Event::PointerMoved(at - Vec2::new(0.0, 60.0))],
+                        _ => vec![egui::Event::PointerButton {
+                            pos: at - Vec2::new(0.0, 60.0),
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                    }
+                } else {
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, -20.0),
+                            modifiers: Default::default(),
+                        },
+                    ]
+                };
+                t += 1.0 / 30.0;
+                let shapes = export_frame_at(&ctx, &p, events, t);
+                for (s, r) in painted_texts(&shapes) {
+                    if s.starts_with("Stem ") && l.wave.intersects(r) {
+                        seen.insert(s);
+                    }
+                }
+                if seen.len() == names.len() {
+                    break;
+                }
+            }
+            let how = if by_drag { "drag" } else { "wheel" };
+            let missing: Vec<_> = names.iter().filter(|n| !seen.contains(*n)).collect();
+            assert!(missing.is_empty(), "by {how}, these rows were never reached: {missing:?}");
+        }
+    }
+
+    /// The rows' pitch: an even share while it clears the floor, the floor
+    /// once it does not.
+    #[test]
+    fn a_row_takes_its_share_of_the_area_down_to_a_readable_floor() {
+        let floor = EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP;
+        assert_eq!(export_row_pitch(400.0, 2), 200.0);
+        assert_eq!(export_row_pitch(400.0, 40), floor);
+        let (name, well) = export_row_parts(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 100.0)));
+        assert!(name.bottom() <= well.top(), "the name line runs into its well");
+        assert_eq!(well.height(), 100.0 - EXPORT_ROW_NAME_H - EXPORT_ROW_GAP);
+    }
+
+    fn export_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        ctx
+    }
+
+    /// A stems pass's progress: `names` in order, each with a wave whose
+    /// height depends on its row so the rows can be told apart.
+    fn stems_progress(fraction: f32, label: &str, names: &[&str], silent: bool) -> crate::ports::ExportProgress {
+        crate::ports::ExportProgress {
+            fraction,
+            label: label.to_owned(),
+            peaks: Vec::new(),
+            rows: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let a = if silent { 0.6 } else { 0.2 + 0.15 * (i % 5) as f32 };
+                    crate::ports::ExportRow {
+                        name: (*n).to_owned(),
+                        peaks: vec![(-a, a); crate::ports::EXPORT_PEAKS],
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Settle the window (an `Area` places itself from what it measured last
+    /// time) and hand back the last frame's shapes.
+    fn export_frame(
+        ctx: &egui::Context,
+        p: &crate::ports::ExportProgress,
+        cover: Option<&crate::busy::Busy>,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(Vec::new()), |ctx| show_export_progress(ctx, p, cover_placement(), cover));
+        ctx.run(input(events), |ctx| show_export_progress(ctx, p, cover_placement(), cover)).shapes
+    }
+
+    /// One frame at time `t`, for the tests that move the pointer.
+    fn export_frame_at(
+        ctx: &egui::Context,
+        p: &crate::ports::ExportProgress,
+        events: Vec<egui::Event>,
+        t: f64,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            events,
+            time: Some(t),
+            predicted_dt: 1.0 / 30.0,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| show_export_progress(ctx, p, cover_placement(), None)).shapes
+    }
+
+    /// Where the rows' wells are, scrolled `offset` points down.
+    fn export_wells(l: &ExportLayout, rows: usize, offset: f32) -> Vec<Rect> {
+        let pitch = export_row_pitch(l.wave.height(), rows);
+        (0..rows)
+            .map(|i| {
+                let top = l.wave.top() + i as f32 * pitch - offset;
+                export_row_parts(Rect::from_min_size(
+                    Pos2::new(l.wave.left(), top),
+                    Vec2::new(l.wave.width(), pitch),
+                ))
+                .1
+            })
+            .collect()
+    }
+
+    fn flat_shapes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::epaint::Shape> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+            match shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Every string painted, with where it landed - clipped to what was
+    /// visible, so a row scrolled out of view does not count as shown.
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        for c in shapes {
+            let mut flat = Vec::new();
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+                match shape {
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    s => out.push(s.clone()),
+                }
+            }
+            walk(&c.shape, &mut flat);
+            for s in flat {
+                if let egui::epaint::Shape::Text(t) = &s {
+                    let r = t.visual_bounding_rect().intersect(c.clip_rect);
+                    if r.is_positive() {
+                        out.push((t.galley.job.text.clone(), r));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every filled rectangle, by where it is. Matched by geometry and not
+    /// by colour: the window fades in, so its fills carry the fade's alpha.
+    fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<Rect> {
+        flat_shapes(shapes)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::Rect(r) if r.fill.a() > 0 => Some(r.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wave_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<[Pos2; 2]> {
+        flat_shapes(shapes)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::LineSegment { points, .. } => Some(points),
+                _ => None,
+            })
+            .collect()
     }
 
     fn cover_placement() -> Placement {
@@ -17154,7 +17959,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         }
@@ -17298,6 +18103,7 @@ at: None,
             fraction: 1.0,
             label: "Rendering".to_owned(),
             peaks: vec![(0.0, 0.0); 8],
+            rows: Vec::new(),
         };
         let (bare, with) = frame_with_and_without_cover("Writing files", |ctx| {
             show_export_progress(ctx, &progress, cover_placement(), None);
@@ -17365,8 +18171,8 @@ at: None,
         out
     }
 
-    /// The picker drawn inline, the way a plugin editor draws it: what ended up
-    /// on the screen, and anything it asked the app to do.
+    /// The picker drawn inline, the way reader mode draws it: what ended up on
+    /// the screen, and anything it asked the app to do.
     ///
     /// Three frames, not one. An `egui::Area` whose size is not known yet runs a
     /// SIZING PASS — it lays the whole dialog out and paints none of it
@@ -17375,10 +18181,10 @@ at: None,
     /// shapes would find a blank screen and conclude the dialog draws nothing,
     /// which is the wrong answer to the right question.
     fn run_picker(dialog: &mut Option<Dialog>) -> (String, Option<DialogAction>) {
-        run_picker_with(dialog, crate::host::Caps::PLUGIN)
+        run_picker_with(dialog, crate::host::Caps::NONE)
     }
 
-    /// [`run_picker`] for a host other than the plugin's. `caps` must keep
+    /// [`run_picker`] for a host other than `Caps::NONE`. `caps` must keep
     /// `child_windows` off, which is what draws the dialog in the canvas
     /// where the test can read it.
     fn run_picker_with(
@@ -17600,7 +18406,7 @@ at: None,
     /// I playing through" by reading 112 rows. The loaded bundle is preselected
     /// and marked, and — because it may be ninety rows down — the mark is only
     /// worth anything if the list opens on it, which is what the `focus` flag
-    /// also does. This runs the frame inline, the way a plugin editor draws it.
+    /// also does. This runs the frame inline, the way reader mode draws it.
     /// **A folded capture SAYS SO on the page that offers to save it.**
     ///
     /// The fault it announces: a device sampling lower than the interface
@@ -17710,6 +18516,8 @@ at: None,
                         "Tangent Plate",
                         "Tangent Wah",
                         "Tangent IR (Experimental)",
+                        "Tangent Bitcrush",
+                        "Tangent Insert",
                         "analog lab v",
                         "the modelled piano",
                         "Vital"
@@ -17726,12 +18534,12 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Nineteen, not one: the house shelf took the first
-                // eighteen rows — the five instruments and the thirteen-unit
-                // suite — and the number is derived from those two lists so
+                // Twenty-one, not one: the house shelf took the first
+                // twenty rows (the five instruments and the fifteen-unit
+                // suite) and the number is derived from those two lists so
                 // the next instrument moves it rather than breaking it.
                 let shelf = INSTRUMENT_ROWS.len() + crate::faces::SUITE_UNITS.len();
-                assert_eq!(shelf, 18);
+                assert_eq!(shelf, 20);
                 assert_eq!(*selected, Some(shelf + 1), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
@@ -17787,7 +18595,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -17923,7 +18731,7 @@ at: None,
             child_windows: false,
             ..crate::host::Caps::DESKTOP
         };
-        let mut dialog = Some(Dialog::About);
+        let mut dialog = Some(Dialog::About { supporter: false });
         let (painted, action) = run_picker_with(&mut dialog, desktop);
         assert!(action.is_none(), "About asked the app to do something");
         assert!(
@@ -17938,9 +18746,11 @@ at: None,
             !painted.contains("Simple MIDI Keyboard Monitor"),
             "the 1.x tagline is back: {painted}"
         );
-        // The desk's real size, from the same constant the desk is built
-        // from. The line said "16-channel mixer" over a 32-channel desk.
-        let desk = format!("{}-channel mixer", crate::recorder::CHANNELS);
+        // The FREE desk's size, from the constant the gate refuses at. The
+        // line said "16-channel mixer" over a 32-channel desk, and then a
+        // width for everybody once a key lifted the limit;
+        // `about_names_the_desk_this_standing_gets` holds both tiers.
+        let desk = format!("{}-track desk", crate::recorder::FREE_TRACKS);
         assert!(painted.contains(&desk), "About does not say {desk:?}: {painted}");
         // **The formats THIS platform's build hosts**, which it said were
         // "LV2/VST3" everywhere. LV2 is compiled only on Linux and FreeBSD;
@@ -17960,27 +18770,66 @@ at: None,
         );
     }
 
+    /// **The card says what THIS install's desk is.** A free install has a
+    /// desk of `FREE_TRACKS` tracks and a supporter (a key covering this
+    /// major, or the Konami marker) has no track limit, so the one line
+    /// that names the desk names it per standing: the free card must not
+    /// promise unlimited tracks, and a supporter's must not print the cap
+    /// they paid to lift. Both read as painted, through the desktop's card.
+    #[test]
+    fn about_names_the_desk_this_standing_gets() {
+        let desktop = crate::host::Caps {
+            child_windows: false,
+            ..crate::host::Caps::DESKTOP
+        };
+        let free_desk = format!("{}-track desk", crate::recorder::FREE_TRACKS);
+        let mut dialog = Some(Dialog::About { supporter: false });
+        let (free, _) = run_picker_with(&mut dialog, desktop);
+        assert!(free.contains(&free_desk), "the free card lost its desk size: {free}");
+        assert!(!free.contains("unlimited"), "the free card promises no limit: {free}");
+
+        let mut dialog = Some(Dialog::About { supporter: true });
+        let (paid, _) = run_picker_with(&mut dialog, desktop);
+        assert!(paid.contains("unlimited tracks"), "a supporter's card keeps a limit: {paid}");
+        assert!(
+            !paid.contains(&free_desk),
+            "a supporter's card prints the cap they lifted: {paid}"
+        );
+        // Everything else on the line is the same for both: the desk is the
+        // one thing the standing changes.
+        let (_, free_line) = about_lines(crate::host::Caps::DESKTOP, false);
+        let (_, paid_line) = about_lines(crate::host::Caps::DESKTOP, true);
+        assert_eq!(free_line.replace(&free_desk, "unlimited tracks"), paid_line);
+    }
+
     /// **A build with no recorder claims neither recording nor hosting.** A
-    /// plugin editor and a Minimal build link neither the recorder nor the
-    /// plugin host and have no audio engine, so their card describes the
-    /// chord display. It said "Recorder ... LV2/VST3" in both.
+    /// Minimal build links neither the recorder nor the plugin host and has
+    /// no audio engine, so its card describes the chord display. It said
+    /// "Recorder ... LV2/VST3".
     #[test]
     fn about_in_a_build_without_the_recorder_claims_neither_recording_nor_hosting() {
-        let mut dialog = Some(Dialog::About);
+        let mut dialog = Some(Dialog::About { supporter: false });
         let (painted, _) = run_picker(&mut dialog);
         assert!(
             painted.contains("A piano display with chord intelligence"),
             "{painted}"
         );
         for claim in ["recording DAW", "Recorder", "VST3", "LV2"] {
-            assert!(!painted.contains(claim), "the plugin's card says {claim:?}: {painted}");
+            assert!(!painted.contains(claim), "the card without a recorder says {claim:?}: {painted}");
         }
         assert!(painted.contains("tangentdaw@gmail.com"), "{painted}");
-        // Minimal gives up the same two capabilities, so it gets the same card.
+        // The card above was painted at `Caps::NONE`; Minimal gives up the
+        // same two capabilities that decide it, so it gets the same card.
         assert_eq!(
-            about_lines(crate::host::Caps::MINIMAL),
-            about_lines(crate::host::Caps::PLUGIN)
+            about_lines(crate::host::Caps::MINIMAL, false),
+            about_lines(crate::host::Caps::NONE, false)
         );
+        // **And the standing changes neither.** A chord display has no desk,
+        // so a supporter's Minimal card keeps the chord-display line rather
+        // than claiming tracks it cannot record.
+        for caps in [crate::host::Caps::MINIMAL, crate::host::Caps::NONE] {
+            assert_eq!(about_lines(caps, true), about_lines(caps, false));
+        }
     }
 
     /// **The card's LV2 rule is the host's own.** tangent-ui cannot depend on
@@ -18016,7 +18865,7 @@ at: None,
             "[dependencies]",
             "VST3 is no longer hosted everywhere: About says it is"
         );
-        let (_, desktop) = about_lines(crate::host::Caps::DESKTOP);
+        let (_, desktop) = about_lines(crate::host::Caps::DESKTOP, false);
         assert_eq!(
             desktop.contains("LV2"),
             cfg!(any(target_os = "linux", target_os = "freebsd")),
@@ -18042,6 +18891,17 @@ at: None,
             painted.contains("ganten.gumroad.com/l/ivory"),
             "no way to buy a key from the dialog that asks for one: {painted}"
         );
+        // **What the key does, all three facts.** The free desk's size from
+        // the gate's own constant, what a key (or the code) changes, and what
+        // has no limit for anyone. It said the key changed nothing.
+        let free = format!("Tangent is free, with up to {} tracks.", crate::recorder::FREE_TRACKS);
+        for fact in [
+            free.as_str(),
+            "A supporter key (or a certain code) takes the track limit away",
+            "Buses, returns, sends and routes have no limit for anyone.",
+        ] {
+            assert!(painted.contains(fact), "the key dialog no longer says {fact:?}: {painted}");
+        }
 
         let mut dialog = Some(Dialog::SupporterKey {
             input: String::new(),
@@ -18188,11 +19048,11 @@ at: None,
             "the floor never engages"
         );
 
-        // And a canvas too small even for the floor — a plugin editor, where
-        // `monitor` is the editor's own pane. The window comes down to fit,
-        // and the minimum it may be dragged to comes down with it, because a
-        // minimum larger than the size just asked for is a window that
-        // cannot be placed.
+        // And a canvas too small even for the floor: a short window drawing
+        // inline, where `monitor` is the app's own pane. The window comes
+        // down to fit, and the minimum it may be dragged to comes down with
+        // it, because a minimum larger than the size just asked for is a
+        // window that cannot be placed.
         let tiny = Vec2::new(400.0, 300.0);
         let size = export_window_size(Some(tiny));
         assert!(size.x < EXPORT_MIN.x && size.y < EXPORT_MIN.y, "{size:?}");
@@ -18283,8 +19143,8 @@ at: None,
             assert!((l.playhead(9.0) - l.wave.right()).abs() < 0.01);
         }
 
-        // Squeezed under its own minimum — which the inline shell can do on a
-        // very short plugin editor. Nothing inverts and nothing escapes.
+        // Squeezed under its own minimum, which the inline shell can do in a
+        // very short window. Nothing inverts and nothing escapes.
         for h in [90.0_f32, 40.0, 10.0, 0.0] {
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, h));
             let l = export_layout(rect);
@@ -18485,7 +19345,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -18493,6 +19353,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.4, 0.4); 16],
+            rows: Vec::new(),
         };
         // Three frames for the same reason `run_picker` runs three: the
         // sizing pass paints nothing.
@@ -18655,8 +19516,7 @@ at: None,
         };
         let face = || {
             Some(Dialog::InsertFace {
-                strip: 0,
-                slot: 0,
+                bay: tb(0, 0),
                 live: Box::default(),
             })
         };
@@ -18822,8 +19682,7 @@ at: None,
         // The face first. Its unit is not in the suite table, so the window
         // it opens is called "Tangent" — and it is sized from the screen.
         let mut face = Some(Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::default(),
         });
         frame(&mut face);
@@ -18894,8 +19753,7 @@ at: None,
         };
 
         let mut dialog = Some(Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::default(),
         });
         frame(&mut dialog, Some(big));
@@ -18971,6 +19829,7 @@ at: None,
             ("@tangent-imager", Vec2::new(340.0, 480.0)),
             ("@tangent-comp", Vec2::new(400.0, 430.0)),
             ("@tangent-tape", Vec2::new(400.0, 360.0)),
+            ("@tangent-bitcrush", Vec2::new(400.0, 440.0)),
         ];
         for (unit, floor) in was {
             // No monitor is no guess: the floor, which is today's size.
@@ -19100,6 +19959,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.5, 0.5); 32],
+            rows: Vec::new(),
         };
         let level = |id: &str| {
             ctx.memory(|m| {
@@ -19187,7 +20047,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: Some(screen.size()),
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -19195,6 +20055,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.4, 0.4); 16],
+            rows: Vec::new(),
         };
         let mut over_middle = false;
         let mut over_corner = false;
@@ -19353,11 +20214,11 @@ at: None,
 
         // Opened from a panel's wand: the bay comes with it.
         let mut s = IrWizardState::default();
-        s.adopt_origin(Some((4, 1)));
+        s.adopt_origin(Some(tb(4, 1)));
         // Adopted ONCE. A wizard that kept re-reading would pick up the trail
         // a later panel left behind.
-        s.adopt_origin(Some((9, 2)));
-        assert_eq!(s.origin, Some((4, 1)), "the origin was overwritten mid-life");
+        s.adopt_origin(Some(tb(9, 2)));
+        assert_eq!(s.origin, Some(tb(4, 1)), "the origin was overwritten mid-life");
 
         // Not offered before the end: the earlier pages already have the
         // right word for leaving, and it stops the tone on the way out.
@@ -19371,12 +20232,12 @@ at: None,
         // deliberately not saved must not rebind the bay to the last file on
         // the shelf.
         s.stage = IrStage::Result;
-        assert_eq!(s.way_back(), Some((4, 1)));
+        assert_eq!(s.way_back(), Some(tb(4, 1)));
         let (panel, load) = s.back_to_panel().expect("no way back from the result page");
         assert!(load.is_none(), "an unsaved capture bound something anyway");
         match &panel {
-            Dialog::InsertFace { strip, slot, live } => {
-                assert_eq!((*strip, *slot), (4, 1), "it went back to the wrong bay");
+            Dialog::InsertFace { bay, live } => {
+                assert_eq!(*bay, tb(4, 1), "it went back to the wrong bay");
                 assert!(!live.ir_reveal, "nothing was made, so nothing to reveal");
             }
             _ => panic!("the way back is not the panel"),
@@ -19407,8 +20268,8 @@ at: None,
         assert!(s.saved, "a write the host counted was not believed");
         let (panel, load) = s.back_to_panel().expect("no way back after a save");
         match load {
-            Some(DialogAction::SetInsertIr { strip, slot, path }) => {
-                assert_eq!((strip, slot), (4, 1), "the capture went into the wrong bay");
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(4, 1), "the capture went into the wrong bay");
                 // **Not a filename.** `desktop::save_ir` refuses to
                 // overwrite, so a second "Holmes Plate" is written as
                 // "Holmes Plate 2.wav" and only the host knows which name it
@@ -19423,8 +20284,8 @@ at: None,
             ),
         }
         match &panel {
-            Dialog::InsertFace { strip, slot, live } => {
-                assert_eq!((*strip, *slot), (4, 1));
+            Dialog::InsertFace { bay, live } => {
+                assert_eq!(*bay, tb(4, 1));
                 assert_eq!(live.face.path, "@tangent-ir", "it opened as the wrong face");
                 assert!(live.ir_reveal, "the capture would not be scrolled to");
                 // Empty is how the app is asked for its own default folder,
@@ -19485,7 +20346,7 @@ at: None,
         let path = "/m/Tangent Media/IRs/Holmes Plate.wav";
         for loaded in [false, true] {
             let Dialog::Confirm { title, body, kept, choices, warn } =
-                confirm_ir_delete(3, 2, path, loaded)
+                confirm_ir_delete(tb(3, 2), path, loaded)
             else {
                 panic!("deleting an impulse did not raise a confirmation");
             };
@@ -19503,8 +20364,8 @@ at: None,
             // And the button's action is the delete ask, aimed at exactly
             // the file the words name.
             match &choices[0].action {
-                DialogAction::SetInsertIr { strip, slot, path: p } => {
-                    assert_eq!((*strip, *slot), (3, 2));
+                DialogAction::SetInsertIr { bay, path: p } => {
+                    assert_eq!(*bay, tb(3, 2));
                     assert_eq!(ir_ask(p), IrAsk::Delete(path));
                 }
                 _ => panic!("the delete button does not delete"),
@@ -19519,7 +20380,7 @@ at: None,
         // way today and another way tomorrow. The old promise is asserted
         // ABSENT, because a confirmation that says the sound will survive and
         // then stops it is worse than one that says nothing.
-        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, true) else {
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(tb(0, 0), path, true) else {
             unreachable!()
         };
         assert!(kept.contains("emptied"), "{kept:?}");
@@ -19528,7 +20389,7 @@ at: None,
             !kept.contains("does not change"),
             "the box still promises the sound survives the delete: {kept:?}"
         );
-        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, false) else {
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(tb(0, 0), path, false) else {
             unreachable!()
         };
         assert!(!kept.contains("empty"), "an unloaded impulse warned about the bay: {kept:?}");
@@ -19553,14 +20414,14 @@ at: None,
             "a confirmation nobody raised from a panel went somewhere"
         );
 
-        remember_ir_face(&ctx, 5, 3, "/m/Tangent Media/IRs/Cabs");
+        remember_ir_face(&ctx, tb(5, 3), "/m/Tangent Media/IRs/Cabs");
         // A dialog that has not closed goes nowhere, and does not spend the
         // trail on its way past.
         assert!(face_to_return_to(&ctx, false).is_none());
 
         match face_to_return_to(&ctx, true) {
-            Some(Dialog::InsertFace { strip, slot, live }) => {
-                assert_eq!((strip, slot), (5, 3));
+            Some(Dialog::InsertFace { bay, live }) => {
+                assert_eq!(bay, tb(5, 3));
                 assert_eq!(live.face.path, "@tangent-ir");
                 // Back to the folder the right-click happened in, not to the
                 // root: the hand was standing somewhere.
@@ -19625,8 +20486,8 @@ at: None,
     /// as (rect, colour) and (rect, colour, words).
     ///
     /// `painted_text` above reads the words; this reads the picture. Three
-    /// frames for the reason that one spells out — an `egui::Area` whose size
-    /// is not known yet runs an invisible sizing pass — and `Caps::PLUGIN` so
+    /// frames for the reason that one spells out (an `egui::Area` whose size
+    /// is not known yet runs an invisible sizing pass), and `Caps::NONE` so
     /// the dialog is drawn INLINE rather than into a viewport a headless
     /// context never presents.
     #[allow(clippy::type_complexity)]
@@ -19643,7 +20504,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -19749,7 +20610,7 @@ at: None,
                 monitor: None,
                 // Inline rather than into a viewport, which a headless
                 // context never presents.
-                caps: crate::host::Caps::PLUGIN,
+                caps: crate::host::Caps::NONE,
                 chrome: None,
                 surface: None,
             }
@@ -20473,8 +21334,7 @@ at: None,
             }
         }));
         Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::new(live),
         }
     }
@@ -20511,13 +21371,12 @@ at: None,
             let asked = slot.click("drive");
             match asked {
                 Some(DialogAction::OpenPedalFace {
-                    strip,
-                    slot: bay,
+                    bay,
                     pedal,
                     alt: a,
                     shift: sh,
                 }) => {
-                    assert_eq!((strip, bay, pedal), (0, 0, 2), "the chip named the wrong seat");
+                    assert_eq!((bay, pedal), (tb(0, 0), 2), "the chip named the wrong seat");
                     assert_eq!(
                         (a, sh),
                         (alt, shift),
@@ -20530,6 +21389,58 @@ at: None,
     }
 
 
+    /// **The Tangent Insert's face asks for its jacks and its ping**, by the
+    /// words on its buttons, over the bay it was opened on; and it says when
+    /// the loop is down.
+    #[test]
+    fn the_insert_face_asks_for_jacks_and_a_ping() {
+        use crate::faces_hwinsert::{HwAsk, HwLive, HWINSERT_PATH};
+        let face = |connected: bool| {
+            let mut live = crate::faces::FaceLive::default();
+            live.face.path = HWINSERT_PATH.to_owned();
+            live.face.extra = HwLive {
+                connected,
+                status: if connected { "Connected." } else { "Disconnected: choose the outputs to send on." }
+                    .to_owned(),
+                latency: 384,
+                rate: 48_000,
+                out_channels: 8,
+                in_channels: 8,
+                ..Default::default()
+            }
+            .to_lines();
+            if connected {
+                live.face.extra.extend([
+                    ("send_first".to_owned(), "2".to_owned()),
+                    ("send_width".to_owned(), "2".to_owned()),
+                    ("ret_first".to_owned(), "4".to_owned()),
+                    ("ret_width".to_owned(), "1".to_owned()),
+                ]);
+            }
+            Dialog::InsertFace { bay: tb(0, 0), live: Box::new(live) }
+        };
+        let mut slot = Slot::new(face(true));
+        assert!(slot.says("CONNECTED"));
+        assert!(slot.says("Out 3/4") && slot.says("In 5"));
+        let asked = |a: Option<DialogAction>| match a {
+            Some(DialogAction::HwInsert { bay, ask }) => {
+                assert_eq!(bay, tb(0, 0), "the ask named another bay");
+                ask
+            }
+            _ => panic!("the face asked the host for nothing"),
+        };
+        assert_eq!(asked(slot.click("PING")), HwAsk::Ping);
+        assert_eq!(asked(slot.click("OUT >")), HwAsk::Route { send: true, jacks: Some((4, true)) });
+        assert_eq!(asked(slot.click("< OUT")), HwAsk::Route { send: true, jacks: None });
+        assert_eq!(asked(slot.click("SEND STEREO")), HwAsk::Route { send: true, jacks: Some((2, false)) });
+        assert_eq!(asked(slot.click("RETURN MONO")), HwAsk::Route { send: false, jacks: Some((4, true)) });
+        assert_eq!(asked(slot.click("IN >")), HwAsk::Route { send: false, jacks: Some((5, false)) });
+        // Down: it says so, and the ping is not offered.
+        let mut down = Slot::new(face(false));
+        assert!(down.says("DISCONNECTED - PASSING DRY"));
+        assert!(down.click("PING").is_none(), "a ping was asked of a loop that is not up");
+    }
+
     /// One suite unit's face over channel 0's first bay, switched in or out
     /// of circuit — a pedal's own stacked window, as the amp's chip opens
     /// it.
@@ -20540,8 +21451,7 @@ at: None,
         };
         live.face.path = path.to_owned();
         Dialog::InsertFace {
-            strip: 0,
-            slot: 0,
+            bay: tb(0, 0),
             live: Box::new(live),
         }
     }
@@ -20577,6 +21487,7 @@ at: None,
         // Every unit the amp's board can be seeded with, plus the two the
         // sweep is really about at either end of the exemption.
         for path in [
+            "@tangent-insert",
             "@tangent-comp",
             "@tangent-wah",
             "@tangent-drive",
@@ -20588,6 +21499,7 @@ at: None,
             "@tangent-imager",
             "@tangent-tape",
             "@tangent-ir",
+            "@tangent-bitcrush",
         ] {
             for (was, word) in [(false, "BYPASS"), (true, "BYPASSED")] {
                 let mut slot = Slot::new(a_unit_face(path, was));
@@ -20596,10 +21508,10 @@ at: None,
                     "{path} switched {was} says nothing about being in circuit"
                 );
                 match slot.click(word) {
-                    Some(DialogAction::SetInsertBypass { strip, slot: bay, on }) => {
+                    Some(DialogAction::SetInsertBypass { bay, on }) => {
                         assert_eq!(
-                            (strip, bay),
-                            (0, 0),
+                            bay,
+                            tb(0, 0),
                             "{path}'s switch named the wrong seat"
                         );
                         assert_eq!(
@@ -20635,7 +21547,7 @@ at: None,
     }
 
     /// An IR panel with one folder of impulses in it, standing at home.
-    fn an_ir_panel(strip: usize, slot: usize, loaded: &str) -> Dialog {
+    fn an_ir_panel(strip: u32, slot: usize, loaded: &str) -> Dialog {
         let mut live = crate::faces::FaceLive {
             ir_dir: "/m/IRs".to_owned(),
             ir_root: "/m/IRs".to_owned(),
@@ -20655,7 +21567,7 @@ at: None,
         };
         live.face.path = "@tangent-ir".to_owned();
         live.face.extra = vec![("ir_path".to_owned(), loaded.to_owned())];
-        Dialog::InsertFace { strip, slot, live: Box::new(live) }
+        Dialog::InsertFace { bay: tb(strip, slot), live: Box::new(live) }
     }
 
 
@@ -20789,7 +21701,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -21324,8 +22236,7 @@ at: None,
             })
             .collect();
         let mut slot = Slot::new(Dialog::InsertFace {
-            strip: 4,
-            slot: 1,
+            bay: tb(4, 1),
             live: Box::new(crate::faces::FaceLive {
                 face: crate::ports::BuiltinFace {
                     path: "@tangent-tape".to_owned(),
@@ -21337,8 +22248,8 @@ at: None,
         });
         let asked = slot.click("Init").expect("Init raised nothing at all");
         match asked {
-            DialogAction::SetInsertParamsMany { strip, slot: bay, sets } => {
-                assert_eq!((strip, bay), (4, 1), "Init addressed the wrong bay");
+            DialogAction::SetInsertParamsMany { bay, sets } => {
+                assert_eq!(bay, tb(4, 1), "Init addressed the wrong bay");
                 assert_eq!(
                     sets.len(),
                     params.len(),
@@ -21502,12 +22413,12 @@ at: None,
         //
         // The trail is left by the face; here it is left directly, because
         // what is under test is what the CONFIRMATION does with it.
-        let mut slot = Slot::new(confirm_ir_delete(4, 1, "/m/IRs/Holmes Plate.wav", false));
-        remember_ir_face(&slot.ctx, 4, 1, "/m/IRs/Cabs");
+        let mut slot = Slot::new(confirm_ir_delete(tb(4, 1), "/m/IRs/Holmes Plate.wav", false));
+        remember_ir_face(&slot.ctx, tb(4, 1), "/m/IRs/Cabs");
         let asked = slot.click("Delete");
         match asked {
-            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
-                assert_eq!((strip, bay), (4, 1));
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(4, 1));
                 assert_eq!(
                     ir_ask(&path),
                     IrAsk::Delete("/m/IRs/Holmes Plate.wav"),
@@ -21517,8 +22428,8 @@ at: None,
             other => panic!("Delete asked for {:?}", other.is_some()),
         }
         match &slot.dialog {
-            Some(Dialog::InsertFace { strip, slot: bay, live }) => {
-                assert_eq!((*strip, *bay), (4, 1), "it went back to the wrong bay");
+            Some(Dialog::InsertFace { bay, live }) => {
+                assert_eq!(*bay, tb(4, 1), "it went back to the wrong bay");
                 assert_eq!(
                     live.ir_dir, "/m/IRs/Cabs",
                     "it went back to a different folder than the right-click happened in"
@@ -21530,18 +22441,18 @@ at: None,
         // Cancel goes back too, which is the half somebody actually needs:
         // they said "no, not that one" and must not lose the browser they
         // said it in.
-        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", true));
-        remember_ir_face(&slot.ctx, 2, 0, "/m/IRs");
+        let mut slot = Slot::new(confirm_ir_delete(tb(2, 0), "/m/IRs/Plate.wav", true));
+        remember_ir_face(&slot.ctx, tb(2, 0), "/m/IRs");
         assert!(slot.click("Cancel").is_none(), "Cancel asked for something");
         assert!(
-            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 2, slot: 0, .. })),
+            matches!(&slot.dialog, Some(Dialog::InsertFace { bay, .. }) if *bay == tb(2, 0)),
             "Cancel left the desk empty"
         );
 
         // And the trail is a TAKE: a confirmation raised from Setup's menu,
         // with no panel behind it, closes to nothing rather than opening
         // somebody else's bay.
-        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", false));
+        let mut slot = Slot::new(confirm_ir_delete(tb(2, 0), "/m/IRs/Plate.wav", false));
         assert!(slot.click("Cancel").is_none());
         assert!(
             slot.dialog.is_none(),
@@ -21603,7 +22514,7 @@ at: None,
         };
         wiz.name = "Holmes Plate".to_owned();
         let mut slot = Slot::new(Dialog::IrWizard { state: Box::new(wiz) });
-        remember_ir_face(&slot.ctx, 5, 2, "/m/IRs");
+        remember_ir_face(&slot.ctx, tb(5, 2), "/m/IRs");
         // **Save is pressed rather than asserted.** The button only ARMS —
         // see `IrWizardState::save_asked` — so the way back must still refuse
         // until the host's own count moves.
@@ -21631,14 +22542,14 @@ at: None,
         }
         let asked = slot.click("\u{2190} Presets & browser");
         match asked {
-            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
-                assert_eq!((strip, bay), (5, 2));
+            Some(DialogAction::SetInsertIr { bay, path }) => {
+                assert_eq!(bay, tb(5, 2));
                 assert_eq!(ir_ask(&path), IrAsk::LastSaved);
             }
             other => panic!("the way back asked for {:?}", other.is_some()),
         }
         assert!(
-            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 5, slot: 2, .. })),
+            matches!(&slot.dialog, Some(Dialog::InsertFace { bay, .. }) if *bay == tb(5, 2)),
             "the way back did not put the panel in the slot"
         );
 
@@ -21708,7 +22619,7 @@ at: None,
                         |c| c.to_color32(),
                     );
                 let mut dialog =
-                    Some(confirm_ir_delete(3, 1, "/m/Tangent Media/IRs/Holmes Plate.wav", true));
+                    Some(confirm_ir_delete(tb(3, 1), "/m/Tangent Media/IRs/Holmes Plate.wav", true));
                 let (fills, texts) = painted_dialog(&mut dialog, face);
 
                 // The word, and the smallest thing painted under it — which
@@ -21985,8 +22896,7 @@ at: None,
             (
                 "InsertFace",
                 Dialog::InsertFace {
-                    strip: 0,
-                    slot: 0,
+                    bay: tb(0, 0),
                     live: Box::default(),
                 },
             ),
@@ -22016,10 +22926,10 @@ at: None,
             (
                 "InsertKeySource",
                 Dialog::InsertKeySource {
-                    strip: 0,
-                    slot: 0,
+                    bay: tb(0, 0),
                     current: None,
                     channels: Vec::new(),
+                    filter: String::new(),
                 },
             ),
             (
@@ -22033,7 +22943,7 @@ at: None,
             assert!(!d.is_modal(), "{name} is a plugin window and must not freeze the desk");
         }
         let questions: Vec<(&str, Dialog)> = vec![
-            ("About", Dialog::About),
+            ("About", Dialog::About { supporter: false }),
             ("Cheated", Dialog::Cheated),
             ("CheatFun", Dialog::CheatFun),
             (
@@ -22122,7 +23032,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22236,7 +23146,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22339,7 +23249,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22395,6 +23305,152 @@ at: None,
                 let _ = show(ctx, &mut dialog, face, placement);
             },
         );
+    }
+
+    /// **Every Quantize GRID chip holds its word, in every meter and face.**
+    ///
+    /// The gridboxes had to be taught to shrink a word to their box
+    /// (`arrangement_panel::grid_box_word`, `midi_editor::chip_word`): their
+    /// steps of four characters and more spilled out of it. This row did not
+    /// need it: each chip is a selectable label and sizes itself to its
+    /// word. Held here all the same, so that a chip of fixed width would be
+    /// caught the day one is drawn: the eight chips of every one of the 192
+    /// signatures, painted by `quantize_grid_row` in the window's own style,
+    /// in every bundled face at 100% and 200%, and each word laid out inside
+    /// its own chip, every pixel of its ink too.
+    ///
+    /// There is no fix on this row to revert, so this has no revert check:
+    /// it passes on the code from before the gridboxes' fit as well.
+    #[test]
+    fn every_quantize_grid_chip_holds_its_word() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let t = theme(Color32::from_rgb(0x4A, 0x3B, 0x2C));
+        for ppp in [1.0f32, 2.0] {
+            for face in fonts::FontChoice::ALL {
+                let ctx = crate::arrangement_panel::context_at(face, ppp);
+                for &(beats, unit) in &sigs {
+                    let mut raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0))),
+                        ..Default::default()
+                    };
+                    raw.viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .native_pixels_per_point = Some(ppp);
+                    let mut chips: Vec<egui::Response> = Vec::new();
+                    let out = ctx.run(raw, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            apply_theme(ui.style_mut(), &t);
+                            let mut grid_exp = -3;
+                            chips = quantize_grid_row(ui, &mut grid_exp, (beats, unit));
+                        });
+                    });
+                    let words = crate::arrangement_panel::PaintedWord::all(&ctx, &out.shapes);
+                    let at = format!("{face:?} at {ppp}x in {beats}/{unit}");
+                    assert_eq!(chips.len(), 8, "{at}: the row is not steps 0 down to -7");
+                    assert_eq!(words.len(), 8, "{at}: the row painted {words:?}");
+                    for (k, (chip, word)) in chips.iter().zip(&words).enumerate() {
+                        let e = -i8::try_from(k).expect("eight chips");
+                        assert_eq!(word.text, crate::arrangement_panel::grid_label_text(e, beats, unit), "{at}");
+                        let r = chip.rect;
+                        assert!(
+                            r.contains_rect(word.laid),
+                            "{at}: {:?} is laid out at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.laid
+                        );
+                        assert!(
+                            word.ink.left() >= r.left() - 1.0e-3
+                                && word.ink.right() <= r.right() + 1.0e-3
+                                && word.ink.top() >= r.top() - 1.0e-3
+                                && word.ink.bottom() <= r.bottom() + 1.0e-3,
+                            "{at}: {:?} has ink at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Every Quantize GRID chip is said as the note it is, and as chosen
+    /// or not.**
+    ///
+    /// The chips print the gridboxes' shorthand, and a selectable label is
+    /// named by its text, so a screen reader was given the shorthand: 12/8's
+    /// dotted half as "1/2·", the dot read aloud, 6/8's dotted quarter as
+    /// "1/4·", 4/4's finest chip as "1/128", "one slash one hundred
+    /// twenty-eight". And egui leaves a selectable label's state out of its
+    /// name, so nothing said which chip was the grid. This is the one other
+    /// surface a reader reaches the ladder on, after the arrange gridbox, and
+    /// it says the steps the way that one does (`grid_spoken`).
+    ///
+    /// Read where a reader gets it: what each chip hands egui when the focus
+    /// lands on it, every chip of every one of the 192 signatures, with a
+    /// different chip chosen as the meters go by. A chip is handed its
+    /// label's own name first and then this one, and a reader keeps the
+    /// last; so the last is what is held. Held: it is `grid_spoken` of the
+    /// chip's step, which says no fraction (no slash, no dot); it is a
+    /// selectable label; and it is chosen exactly when its step is the grid.
+    ///
+    /// Revert check, performed: take the chip's own `widget_info` away and
+    /// this fails on the first chip it reads, 1/1's BAR, said "BAR" where
+    /// "1 bar" was due.
+    #[test]
+    fn every_quantize_grid_chip_is_said_as_a_note() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0));
+        // One frame of the row: its chips, and the names they handed egui
+        // as the focus landed. The focus is moved inside the frame, before
+        // the row, which is what makes this the frame a chip GAINS it in (a
+        // request between frames is already the focus the frame begins
+        // with, and nothing is said).
+        let frame = |meter: (u8, u8), chosen: i8, focus: Option<egui::Id>| {
+            let mut chips: Vec<egui::Response> = Vec::new();
+            let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                if let Some(id) = focus {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut grid_exp = chosen;
+                    chips = quantize_grid_row(ui, &mut grid_exp, meter);
+                });
+            });
+            let named: Vec<egui::WidgetInfo> = out
+                .platform_output
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::output::OutputEvent::FocusGained(info) => Some(info.clone()),
+                    _ => None,
+                })
+                .collect();
+            (chips, named)
+        };
+        for (i, &(beats, unit)) in sigs.iter().enumerate() {
+            let chosen = -i8::try_from(i % 8).expect("eight chips");
+            let (chips, _) = frame((beats, unit), chosen, None);
+            assert_eq!(chips.len(), 8, "{beats}/{unit}: the row is not steps 0 down to -7");
+            for (k, id) in chips.iter().map(|c| c.id).enumerate() {
+                let e = -i8::try_from(k).expect("eight chips");
+                let printed = crate::arrangement_panel::grid_label_text(e, beats, unit);
+                let at = format!("{beats}/{unit}, step {e} (printed {printed:?})");
+                let (_, named) = frame((beats, unit), chosen, Some(id));
+                let kept = named.last().unwrap_or_else(|| panic!("{at}: the chip named nothing as it took the focus"));
+                let want = crate::arrangement_panel::grid_spoken(e, beats, unit);
+                assert_eq!(kept.label.as_deref(), Some(want.as_str()), "{at}: a reader is told this");
+                assert!(
+                    !want.contains('/') && !want.contains('\u{00b7}'),
+                    "{at} is said with a fraction, {want:?}"
+                );
+                assert_eq!(kept.typ, egui::WidgetType::SelectableLabel, "{at}");
+                assert_eq!(kept.selected, Some(e == chosen), "{at}: chosen is {chosen}");
+            }
+        }
     }
 }
 
@@ -22694,7 +23750,7 @@ mod shot {
                 MIDI_INPUTS_W,
                 (212.0 + devices.len() as f32 * 24.0).min(MIDI_INPUTS_MAX_H),
             ),
-            "Rhodes \u{2014} MIDI Inputs",
+            "Rhodes - MIDI Inputs",
             &surface,
             &mut |ui| {
                 apply_theme(ui.style_mut(), &t);
@@ -22716,5 +23772,48 @@ mod shot {
             "wrote {out} ({w}x{h}, {} mode)",
             if set.dark_mode { "dark" } else { "light" }
         );
+    }
+}
+
+/// The route and key pickers' rows: name first, narrowed by typing.
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    fn desk() -> Vec<(usize, String)> {
+        vec![
+            (0, "Bass".to_owned()),
+            (1, String::new()),
+            (2, "Vox".to_owned()),
+            (12, "Backing vox".to_owned()),
+            (39, "Room".to_owned()),
+        ]
+    }
+
+    /// **The name leads and the number follows**; a channel with no name is
+    /// its number alone. It was "Ch 3 - Vox": the number first, which is the
+    /// one thing about a channel nobody goes looking for.
+    #[test]
+    fn a_picker_row_leads_with_the_name() {
+        let rows = picker_rows(&desk(), "");
+        let shown: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(shown, vec!["Bass (Ch 1)", "Ch 2", "Vox (Ch 3)", "Backing vox (Ch 13)", "Room (Ch 40)"]);
+        // The index rides along untouched, whatever the row says.
+        assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2, 12, 39]);
+    }
+
+    /// **Typing narrows the list, by name or by number, case-blind**, and an
+    /// empty or blank field narrows nothing.
+    #[test]
+    fn typing_narrows_the_picker_by_name_or_number() {
+        let pick = |f: &str| picker_rows(&desk(), f).into_iter().map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(pick("VOX"), vec![2, 12], "a name did not narrow, or not case-blind");
+        assert_eq!(pick("  ba "), vec![0, 12], "the typed text was not trimmed");
+        assert_eq!(pick("ch 40"), vec![39], "the number did not find its channel");
+        assert_eq!(pick("zzz"), Vec::<usize>::new());
+        assert_eq!(pick("   ").len(), 5);
+        // And a picker that has been typed into still sends its INDEX: the
+        // row text is for the eye, never parsed back.
+        assert_eq!(picker_rows(&desk(), "room"), vec![(39, "Room (Ch 40)".to_owned())]);
     }
 }

@@ -38,8 +38,8 @@
 //! the amp is never put away to show a pedal, and both windows stay
 //! turnable wherever they are not covered.
 //!
-//! **Whose board this is comes from `recorder::pedal_owner`, not from the
-//! seat.** A group wears six bays across two seats, and an amp in the second
+//! **Whose board this is comes from the bay's TRACK (`pedal_board_of` in
+//! the app), not from its rack.** A group wears six bays across two seats, and an amp in the second
 //! of them wears the same board as one in the first — one board per channel,
 //! run once over the summed group.
 

@@ -102,7 +102,7 @@ repeating uncritically. See §8.1, finding B6: "nothing saves itself" is false a
 | 2 | Linux tarball missing `install.sh` and ffmpeg | **CLOSED**, but it landed *in the audit commit itself*, not in the 170 commits since. |
 | 3 | `Tangent-macos.pkg` built by no script in the release path | **OPEN.** The pkg builder exists and is good; nothing calls it. The supporter email hardcodes that link. |
 | 4 | Windows `setup.exe` never Authenticode-signed | **OPEN.** The signing function exists and signs the *inner* binary; the file a buyer double-clicks is signed by nothing. |
-| 5 | Installer UI, emails and store copy still sell the retired VST3 plugin | **OPEN.** The *mechanism* was retired before the audit was written; the **words** were never touched. Nine files still sell it, including both installers' first screens and the one email a buyer keeps. |
+| 5 | Installer UI, emails and store copy still sell the retired VST3 plugin | **CLOSED** 2026-10-10, by the owner's ruling "remove those mentions of the vst plugin -- that's what it means to be dead". The installers' pages, scripts and components, the Linux `install.sh`, the store copy, `LICENSING.md` and the app's own strings no longer offer, describe or license one; what stays is the cleanup that removes an old install's `Tangent.vst3`. The `plugin/` crate went too, on the owner's second ruling the same day ("yes, delete the plugin crate too"): the crate, `scripts/build-plugin.sh`, `scripts/verify-plugin.c`, `LICENSE-GPL-3.0` and every gate leg that built or checked it were removed on `lane/ul-w8-plugin-gone`. |
 | 6 | `release.sh` cannot catch #2 | **CLOSED**, also in the audit commit. |
 
 Two of the six were therefore already fixed when the audit was written, and **none of the remaining

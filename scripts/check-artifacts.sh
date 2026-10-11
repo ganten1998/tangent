@@ -110,10 +110,10 @@ check_freebsd_bundle() {
 }
 
 for a in "$@"; do
-  # ── Installers, which carry BOTH payloads and are checked for both ────────
-  # An installer that quietly ships only the app is the same class of failure
-  # as the empty Linux tarball: it installs, it looks right, and the thing the
-  # user came for is not there.
+  # ── Installers: the application must be in each, and nothing retired ──────
+  # An installer without the app in it is the same class of failure as the
+  # empty Linux tarball: it installs, it looks right, and the thing the user
+  # came for is not there.
   case "$a" in
     *-freebsd-*.pkg)
       check_freebsd_pkg "$a"

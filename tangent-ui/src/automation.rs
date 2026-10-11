@@ -27,6 +27,78 @@
 //! default for the same reason: a curve drawn against a performance belongs
 //! where it was drawn.
 
+/// **The persisted name of the master's curves in a format-2 document**:
+/// `{"target": "master"}` in place of a `lane`.
+///
+/// A lane number for the master was the channel count, so it moved every
+/// time the desk grew (16, then 24, then 32), and every older document's
+/// master curves needed `desk_lift::master_auto_lane` to find them again. A
+/// name does not move. Rows keep `{"lane": row}`: a row's lane is its
+/// position, which the structural edits carry with the curve.
+pub const MASTER_TARGET: &str = "master";
+
+/// **Where a persisted curve says it lives**, read off its object: a row's
+/// `lane`, or the master by `target`. `None` for a curve that says neither
+/// (or names a target this build does not have), which the reader drops
+/// rather than guesses at.
+pub fn persisted_lane(o: &serde_json::Map<String, serde_json::Value>) -> Option<AutoLane> {
+    match o.get("target") {
+        Some(t) => (t.as_str()? == MASTER_TARGET).then_some(AutoLane::Master),
+        None => usize::try_from(o.get("lane")?.as_u64()?).ok().map(AutoLane::Row),
+    }
+}
+
+/// **Whose curve it is**: the track on a row, or the master.
+///
+/// **A name for the master, never a number.** Its curves used to be filed
+/// under the lane one past the rows (the channel count), which was a safe
+/// number only while the rows stopped at a fixed count. A desk that grows by
+/// appending reaches that number with its next track, and a curve drawn on
+/// the thirty-third track would then have played on the master's fader, or
+/// the master's on the new track's. No row can reach a name. Rows still go
+/// by their position, because a row's curves are a positional unit that the
+/// structural edits carry with it (design section 0).
+///
+/// Ordered rows first, then the master: the order a document has always
+/// listed its curves in, when the master's number sat past every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AutoLane {
+    /// The track on this row.
+    Row(usize),
+    /// The master's own fader, pan, mute and bays.
+    Master,
+}
+
+impl AutoLane {
+    /// The row, or `None` for the master.
+    pub const fn row(self) -> Option<usize> {
+        match self {
+            AutoLane::Row(r) => Some(r),
+            AutoLane::Master => None,
+        }
+    }
+
+    /// **This lane as a number in a list that names the master by
+    /// `master`**: the engine's lane space, where the bridge has already
+    /// put each row's curves on its track's slot and says which number the
+    /// master's curves are filed under (`SlotAutomation::master`). A row is
+    /// its own number.
+    pub const fn index_or(self, master: usize) -> usize {
+        match self {
+            AutoLane::Row(r) => r,
+            AutoLane::Master => master,
+        }
+    }
+}
+
+/// A bare number is a row: the shape every caller that names a track's
+/// lane, and the engine's slot space, already speak.
+impl From<usize> for AutoLane {
+    fn from(row: usize) -> Self {
+        AutoLane::Row(row)
+    }
+}
+
 /// Which control a curve moves.
 ///
 /// **An index space that is persisted**, so it is append-only like every
@@ -55,6 +127,28 @@ pub enum AutoParam {
     /// SAME plugin apart: their parameter ids are identical, and a curve that
     /// named only the id would move both.
     Plugin { bay: u8, id: u32 },
+    /// **The strip's post-fader send to one bus or return row**, by the
+    /// bus's identity (design section 9). Appended: the variants above are
+    /// in files people have.
+    ///
+    /// A track, never the effects return: the send to Return 0 is [`Send`]
+    /// and keeps that one spelling, so one control has one curve. By
+    /// `TrackId` and not by the bus's row, for the reason a route names its
+    /// ends by identity: a curve on the bass that sends to "Verb" must
+    /// still send to Verb after Verb is dragged three rows up. The bus's
+    /// own row is the curve's lane only when the curve is ON the bus.
+    ///
+    /// Only a post-fader send has a curve. A pre-fader send is a cue mix,
+    /// set once and listened to on headphones; the desk the curves are
+    /// drawn on is the one that goes through the fader. Played live and in
+    /// an export on that send alone: the host hands it to the engine as the
+    /// post-fader send between the strip's lane and the bus's
+    /// (`engine_bridge::send_bus_of`, `instrument::SendCurve`), so a file's
+    /// strip that also sends to the bus before its fader keeps that cue
+    /// where it was set.
+    ///
+    /// [`Send`]: AutoParam::Send
+    SendTo { to: crate::desk_id::TrackId },
 }
 
 impl AutoParam {
@@ -81,6 +175,10 @@ impl AutoParam {
             // written in decimal because that is what a plugin's own
             // documentation prints.
             Self::Plugin { bay, id } => format!("fx:{bay}:{id}"),
+            // **`send:t<id>`**: the bus in the desk's one text grammar
+            // (Appendix C), behind a prefix none of the names above can
+            // wear. `send` alone stays the effects return's.
+            Self::SendTo { to } => format!("send:{}", crate::desk_id::Node::Track(to)),
         }
     }
 
@@ -91,6 +189,14 @@ impl AutoParam {
                 bay: bay.parse().ok()?,
                 id: id.parse().ok()?,
             });
+        }
+        // Strict, the grammar's own rule: `send:t007` and `send:fx` are not
+        // keys, so nothing reads a curve onto a send it was not written for.
+        if let Some(rest) = k.strip_prefix("send:") {
+            return match rest.parse::<crate::desk_id::Node>().ok()? {
+                crate::desk_id::Node::Track(to) => Some(Self::SendTo { to }),
+                _ => None,
+            };
         }
         Self::ALL.into_iter().find(|p| p.key() == k)
     }
@@ -109,7 +215,9 @@ impl AutoParam {
     /// A plugin parameter has no name of its own here: the NAME lives with
     /// the plugin and reaches the app through `ports::FxParams`, so this
     /// answers with the address and the caller that has the list puts the
-    /// word in. See `TangentApp::auto_param_label`.
+    /// word in. See `TangentApp::auto_param_label`. A send to a bus is the
+    /// same bargain: the bus's name is the desk's, so this says which
+    /// track and the app says what it is called.
     pub fn label(self) -> String {
         match self {
             Self::Gain => "volume".to_owned(),
@@ -117,6 +225,16 @@ impl AutoParam {
             Self::Send => "send".to_owned(),
             Self::Mute => "mute".to_owned(),
             Self::Plugin { bay, id } => format!("bay {} parameter {id}", bay + 1),
+            Self::SendTo { to } => format!("send to {}", crate::desk_id::Node::Track(to)),
+        }
+    }
+
+    /// **The bus a send curve feeds**, for the one parameter that names
+    /// another row.
+    pub fn send_to(self) -> Option<crate::desk_id::TrackId> {
+        match self {
+            Self::SendTo { to } => Some(to),
+            _ => None,
         }
     }
 }
@@ -248,7 +366,7 @@ pub struct Point {
 /// One control's automation over the whole song.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Curve {
-    pub lane: usize,
+    pub lane: AutoLane,
     pub param: AutoParam,
     /// Sorted by time, never empty once [`Curve::sanitised`] has been. A
     /// curve with no points is not written down at all — see
@@ -277,7 +395,8 @@ impl Curve {
     /// The same bargain [`crate::tempo::TempoMap::sanitised`] makes, and for
     /// the same reason — a document is a file somebody can edit by hand, so
     /// "the file said so" guarantees nothing.
-    pub fn sanitised(lane: usize, param: AutoParam, mut points: Vec<Point>) -> Self {
+    pub fn sanitised(lane: impl Into<AutoLane>, param: AutoParam, mut points: Vec<Point>) -> Self {
+        let lane = lane.into();
         points.retain(|p| p.at_s.is_finite() && p.value.is_finite() && p.at_s >= 0.0);
         for p in &mut points {
             p.value = p.value.clamp(0.0, 1.0);
@@ -506,22 +625,25 @@ impl Automation {
     }
 
     /// Move every curve on `from` to `to` — the era lift's tool. The master
-    /// lane IS the channel count, so when the desk grew from sixteen to
-    /// twenty-four every pre-6 document's master curves sat at 16, which is
-    /// an ordinary channel now.
-    pub fn remap_lane(&mut self, from: usize, to: usize) {
+    /// lane WAS the channel count, so every older document's master curves
+    /// sit at the number its era's desk ended at (16, 24 or 32), an ordinary
+    /// row's number now, and are moved onto [`AutoLane::Master`] by name.
+    pub fn remap_lane(&mut self, from: impl Into<AutoLane>, to: impl Into<AutoLane>) {
+        let (from, to) = (from.into(), to.into());
         for c in &mut self.curves {
             if c.lane == from {
                 c.lane = to;
             }
         }
+        self.curves.sort_by_key(|c| (c.lane, c.param));
     }
 
     pub fn is_empty(&self) -> bool {
         self.curves.is_empty()
     }
 
-    pub fn get(&self, lane: usize, param: AutoParam) -> Option<&Curve> {
+    pub fn get(&self, lane: impl Into<AutoLane>, param: AutoParam) -> Option<&Curve> {
+        let lane = lane.into();
         self.curves.iter().find(|c| c.lane == lane && c.param == param)
     }
 
@@ -535,7 +657,7 @@ impl Automation {
     /// starts at or after `t`. A plugin parameter is read at the chunk's
     /// position too, and a lane carrying one is not rendered ahead, so it
     /// hears its curve on that same chunk - see the engine's `grain_ok`.
-    pub fn value_at(&self, lane: usize, param: AutoParam, seconds: f64) -> Option<f64> {
+    pub fn value_at(&self, lane: impl Into<AutoLane>, param: AutoParam, seconds: f64) -> Option<f64> {
         self.get(lane, param)?.value_at(seconds)
     }
 
@@ -552,7 +674,8 @@ impl Automation {
     }
 
     /// The curve for a control, made if it is not there yet.
-    pub fn entry(&mut self, lane: usize, param: AutoParam) -> &mut Curve {
+    pub fn entry(&mut self, lane: impl Into<AutoLane>, param: AutoParam) -> &mut Curve {
+        let lane = lane.into();
         if self.get(lane, param).is_none() {
             self.curves.push(Curve::sanitised(lane, param, Vec::new()));
             self.curves.sort_by_key(|c| (c.lane, c.param));
@@ -856,6 +979,20 @@ mod tests {
             assert_eq!(AutoParam::from_key(&p.key()), Some(p), "{p:?} does not round trip");
         }
         assert_eq!(AutoParam::from_key("nonesuch"), None);
+        // **A send to a bus**, appended: `send:t<id>` in the desk's own
+        // grammar, round-tripping, and never a second spelling of the
+        // effects return's `send` or of anything the grammar refuses.
+        let bus = AutoParam::SendTo { to: crate::desk_id::TrackId(40) };
+        assert_eq!(bus.key(), "send:t40");
+        assert_eq!(AutoParam::from_key("send:t40"), Some(bus));
+        assert_eq!(AutoParam::from_key("send:t0"), Some(AutoParam::SendTo { to: crate::desk_id::TrackId(0) }));
+        for refused in ["send:fx", "send:master", "send:drums", "send:t040", "send:T4", "send:", "send:t-1", "send:t4294967296"] {
+            assert_eq!(AutoParam::from_key(refused), None, "{refused} read as a parameter");
+        }
+        assert_eq!(AutoParam::from_key("send"), Some(AutoParam::Send), "the return's own spelling moved");
+        assert_eq!(bus.bay(), None);
+        assert_eq!(bus.send_to(), Some(crate::desk_id::TrackId(40)));
+        assert_eq!(AutoParam::Send.send_to(), None);
         assert_eq!(Shape::from_key(Shape::Hold.key()), Shape::Hold);
         assert_eq!(Shape::from_key(Shape::Linear.key()), Shape::Linear);
         // An unknown shape from a newer build reads as the ordinary one

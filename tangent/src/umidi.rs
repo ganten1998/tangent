@@ -426,7 +426,7 @@ fn open_nonblocking(path: &Path) -> Result<libc::c_int, Error> {
         // failures nobody can predict.
         if e.raw_os_error() == Some(libc::EBUSY) {
             return Err(Error(format!(
-                "{} is open in another program — MIDI ports allow one at a \
+                "{} is open in another program. MIDI ports allow one at a \
                  time, so close whatever else is using it and reconnect",
                 path.display()
             )));

@@ -87,12 +87,12 @@ fi
 # installed bundle and break its signature.
 if [ -d "$DEST" ]; then
   OLD=$(app_version "$DEST")
-  # The retired plugin, wherever an old dev-install or pkg left it. The
+  # A Tangent.vst3 an older dev install or package left behind. The
   # user-level copy goes quietly; a root-owned /Library copy is named so the
   # owner can remove it with sudo.
   rm -rf "$HOME/Library/Audio/Plug-Ins/VST3/Tangent.vst3" 2>/dev/null || true
   if [ -d "/Library/Audio/Plug-Ins/VST3/Tangent.vst3" ] && [ ! -w "/Library/Audio/Plug-Ins/VST3/Tangent.vst3" ]; then
-    echo "NOTE: retired plugin at /Library/Audio/Plug-Ins/VST3/Tangent.vst3 (root-owned)"
+    echo "NOTE: an older install left /Library/Audio/Plug-Ins/VST3/Tangent.vst3 (root-owned)"
     echo "      remove it with:  sudo rm -rf /Library/Audio/Plug-Ins/VST3/Tangent.vst3"
   fi
   echo "==> Replacing $OLD with $VERSION"

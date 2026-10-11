@@ -1,31 +1,22 @@
 # Licensing
 
-Tangent ships two binaries under two licences. This file exists so that split
-is written down once, precisely, rather than reconstructed from memory later.
+Tangent ships one program, under the MIT licence, and some downloads carry a
+third-party program and libraries beside it under their own terms. This file
+exists so all of that is written down once, precisely, rather than
+reconstructed from memory later.
 
 | Artifact | Licence | Why |
 |---|---|---|
-| `Tangent.app` / `tangent` / `tangent.exe` (standalone) | **MIT** | Links no GPL. The LGPL LAME static link (macOS/FreeBSD) adds duties, not a licence change; see below. |
-| `tangent-core`, `ivory` and every other crate in this repo | **MIT** | Source, not binaries. |
-| `Tangent.vst3` (the plugin) | **GPL-3.0-or-later** | Links NIH-plug's VST3 bindings. |
+| `Tangent.app` / `tangent` / `tangent.exe` | **MIT** | Links no GPL. The LGPL LAME static link (macOS/FreeBSD) adds duties, not a licence change; see below. |
+| `tangent-core` and every other crate the app is built from | **MIT** | Source, not binaries. |
+| `tangent-ffmpeg` / `tangent-ffmpeg.exe` (Linux and Windows downloads) | **GPL**, ffmpeg's own | A separate program that Tangent starts, not part of Tangent; see below. |
 
-## Why the plugin is GPLv3 and the app is not
+## Hosting VST3 plugins
 
-The copyleft comes from the **Rust bindings crate**, not from Steinberg.
-
-`plugin/` reaches `vst3-sys` (RustAudio) transitively through the pinned
-`nih_plug` revision, and that crate declares `license = "GPL-3.0"` in its own
-`Cargo.toml`. NIH-plug's documentation is explicit about the consequence: "any
-VST3 plugins built with NIH-plug need to be able to comply with the terms of the
-GPLv3 license." NIH-plug itself is ISC; it is those bindings specifically that
-carry the copyleft, and `Tangent.vst3` links them, so `Tangent.vst3` is GPLv3.
-That is still true and nothing below changes.
-
-**What is no longer true, corrected 2026-08-15.** This section used to say
-"Steinberg dual-licenses the VST3 SDK: GPLv3, or a separate proprietary
-agreement with Steinberg." That was accurate when written and stopped being
-accurate on **2025-10-29**, when Steinberg relicensed the VST3 SDK to **MIT**
-with VST 3.8. Verified at source: `steinbergmedia/vst3sdk/LICENSE.txt` and
+The VST3 SDK is **MIT**. Steinberg relicensed it on **2025-10-29**, with
+VST 3.8; until then it was dual-licensed, GPLv3 or a separate proprietary
+agreement with Steinberg. Verified at source:
+`steinbergmedia/vst3sdk/LICENSE.txt` and
 `steinbergmedia/vst3_pluginterfaces/LICENSE.txt` are both plain MIT
 ("Copyright (c) 2026, Steinberg Media Technologies GmbH"), the GitHub API
 reports `spdx_id: MIT` on both repositories, and the SDK README states that
@@ -33,67 +24,14 @@ reports `spdx_id: MIT` on both repositories, and the SDK README states that
 available." There is no host/plug-in distinction under MIT; the old SDK licence
 had one.
 
-Two consequences worth writing down, because both are load-bearing for future
-work:
+So **an MIT application may host VST3 plugins.** That is what makes the
+Recorder view's plugin-hosting workstream legally possible; see
+`docs/RECORDER-PLAN.md` §8. Tangent's host reads the VST3 interfaces through
+the `vst3` crate (coupler-rs, `MIT OR Apache-2.0`). The only surviving
+obligation is trademark, and it is now optional under MIT (see the trademark
+section below, which still applies).
 
-1. `vst3-sys`'s GPLv3 is now a **historical artifact of a 2023 crate that has
-   not been touched since 2023-06-19**, not a requirement anyone still imposes.
-   The MIT-licensed `vst3` crate (coupler-rs, `MIT OR Apache-2.0`) exists and is
-   maintained. If `plugin/` ever moves off `nih_plug`/`vst3-sys`, the GPLv3
-   quarantine could be dissolved entirely. It is blocked today only because the
-   maintained successor (`nice-plug`, ISC, which uses the MIT `vst3` crate)
-   requires egui 0.35 and this project is pinned at 0.33.
-2. **An MIT application may host VST3 plugins.** That is what makes the Recorder
-   view's plugin-hosting workstream legally possible; see `docs/RECORDER-PLAN.md`
-   §8. The only surviving obligation is trademark, and it is now optional under
-   MIT — see the trademark section below, which still applies.
-
-Copyleft attaches to the **binary that does the linking**, not to source that
-happens to be compiled into it. MIT is GPL-compatible, so the same MIT sources
-in this repo are lawfully compiled into both the MIT standalone and the GPLv3
-plugin. Nothing here needs relicensing, and contributions stay MIT.
-
-## Why shipping both in one installer does not infect the standalone
-
-GPLv3 section 5 defines an **aggregate**:
-
-> A compilation of a covered work with other separate and independent works,
-> which are not by their nature extensions of the covered work, and which are
-> not combined with it such as to form a larger program, in or on a volume of a
-> storage or distribution medium, is called an "aggregate" [...] Inclusion of a
-> covered work in an aggregate does not cause this License to apply to the other
-> parts of the aggregate.
-
-The standalone and the plugin are separate executables. Neither loads, links to,
-or requires the other; they communicate through nothing; each runs alone. Putting
-both on one disk image is distribution on a shared medium, which is exactly what
-section 5 describes.
-
-**Three rules keep that true. Do not break them casually:**
-
-1. **The plugin stays optional.** The installer offers it as a checkbox and the
-   standalone works fully without it. A fused product that cannot be taken apart
-   is a much weaker aggregation argument.
-2. **They never link.** No shared dynamic library between the two, no plugin
-   loading the app or vice versa, no IPC that makes one require the other. If
-   they ever need to share code at runtime rather than at compile time, this
-   analysis has to be redone before shipping.
-3. **Each carries its own licence.** `LICENSE` (MIT) next to the app,
-   `LICENSE-GPL-3.0` inside the `.vst3` bundle.
-
-## Obligations that actually have to be met for the plugin
-
-- Ship or offer the **complete corresponding source** for the plugin, including
-  the exact NIH-plug revision it was built against. The repo is public, which
-  covers this, provided releases record the commit rather than "latest".
-- Include the GPLv3 text with the plugin (`LICENSE-GPL-3.0`).
-- Add no further restrictions on the plugin binary.
-
-`scripts/build-plugin.sh` is responsible for putting the licence text and the
-pinned NIH-plug revision inside the bundle. If that step is ever dropped, the
-release is non-compliant, quietly.
-
-## LAME, statically linked into the macOS and FreeBSD standalones
+## LAME, statically linked into the macOS and FreeBSD builds
 
 The default `mp3` feature pulls `mp3lame-encoder` 0.2.5, whose `mp3lame-sys`
 0.1.11 vendors the unmodified LAME 3.100 sources
@@ -105,8 +43,8 @@ their MP3 export runs through the separate `tangent-ffmpeg` process.
 
 LAME is licensed under the GNU Library General Public License, version 2 or,
 at your option, any later version. The two wrapper crates declare LGPL-3.0.
-The standalone stays MIT; a weak-copyleft static link does not relicense it,
-but it does attach three obligations to the artifacts that carry the library:
+The app stays MIT; a weak-copyleft static link does not relicense it, but
+it does attach three obligations to the artifacts that carry the library:
 
 1. **Notice.** Each artifact must say it contains LAME and where the licence
    texts are. The notice of record is this section plus the LAME entry in
@@ -157,7 +95,38 @@ by sha256, and the Linux tarballs and the Windows artifact ship them as
   updates; the cached copy in `dist/vendor` is never signed.
 
 macOS and FreeBSD are unaffected (AVFoundation, and the `multimedia/ffmpeg`
-port, respectively). Because the artifacts are handed out through
+port, respectively).
+
+**Why it does not make the app GPL.** GPLv3 section 5 defines an
+**aggregate**:
+
+> A compilation of a covered work with other separate and independent works,
+> which are not by their nature extensions of the covered work, and which are
+> not combined with it such as to form a larger program, in or on a volume of a
+> storage or distribution medium, is called an "aggregate" [...] Inclusion of a
+> covered work in an aggregate does not cause this License to apply to the other
+> parts of the aggregate.
+
+Tangent and `tangent-ffmpeg` are separate executables. Tangent starts the
+encoder as a process of its own and talks to it the way separate programs do:
+command-line arguments, a pipe for a take's frames, a file for an export's
+samples. Neither links to the other. Putting both in one download is
+distribution on a shared medium, which is exactly what section 5 describes.
+
+**Three rules keep that true. Do not break them casually:**
+
+1. **The app runs without it.** Tangent looks for `tangent-ffmpeg` beside
+   itself and then for an `ffmpeg` on `PATH`; with neither, a take still
+   records its audio and MIDI. Video, and MP3 export on Linux and Windows,
+   are what it is for.
+2. **They never link.** No ffmpeg library is compiled into Tangent or loaded
+   by it. If Tangent ever needs ffmpeg as a library rather than as a program
+   it starts, this analysis has to be redone before shipping.
+3. **Each carries its own licence.** `LICENSE` (MIT) next to the app;
+   ffmpeg's licence text and a provenance note in `ffmpeg-licenses/` next to
+   the encoder.
+
+**The source it is owed.** Because the artifacts are handed out through
 paid-adjacent channels (the Gumroad post-purchase page and the supporter
 email), GPLv3 section 6(d) is the only applicable source-offer option, and it
 requires the **complete corresponding source of those exact builds** to be
@@ -210,8 +179,8 @@ edit changes that.
 
 Steinberg's VST trademark terms are not a copyright matter and apply regardless
 of which SDK licence is used. The relevant one: **"VST" must not appear in the
-product name.** "Tangent" satisfies this. Do not ship anything called
-"Tangent VST".
+product name.** "Tangent" satisfies this. "VST" belongs only where Tangent
+says what it hosts, as in "VST3 plugin hosting".
 
 Tangent's own name and icon are covered by [TRADEMARK.md](TRADEMARK.md) at the
 repo root. That file is the single policy; change it rather than adding

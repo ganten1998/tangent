@@ -3,11 +3,10 @@
 //! One `draw` for all of them: the path in the pushed [`BuiltinFace`] picks
 //! the layout, the kit supplies every part, and what a face returns is a
 //! wish (`FaceAction`) the app maps onto requests. Nothing here touches
-//! `Settings`, the engine, or a disk — a face is a picture of pushed data
-//! and a stream of small asks, which is what lets the same code sit in the
-//! desktop and (one day) the plugin build unchanged.
+//! `Settings`, the engine, or a disk: a face is a picture of pushed data
+//! and a stream of small asks.
 //!
-//! **That last clause is why the IR browser is shaped the way it is.** It
+//! **That is why the IR browser is shaped the way it is.** It
 //! walks folders, but it never opens one: the face writes where it wants to
 //! stand into `FaceLive::ir_dir` and the app lists it, exactly as the
 //! drumpad's media explorer is listed by `app::refresh_media`. Path
@@ -27,7 +26,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// panel, and the line under it. The engine's `builtin_fx::UNITS` is the
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
-pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
+pub const SUITE_UNITS: [(&str, &str, &str); 15] = [
     ("@tangent-eq", "Tangent EQ", "5 bands - no more, no less"),
     (
         "@tangent-imager",
@@ -99,6 +98,21 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
         // _the_same_list` compares the two up to this suffix.
         "Tangent IR (Experimental)",
         "plays any impulse response you can capture",
+    ),
+    // Asked for by name, after the shelf was full. Its face is its own
+    // (`faces_bitcrush`): a glass showing the stair over the knob rows.
+    (
+        crate::faces_bitcrush::BITCRUSH_PATH,
+        "Tangent Bitcrush",
+        "fewer bits, a slower clock, and no filter to hide the folds",
+    ),
+    // The hardware loop: the bay's signal out of the interface, through
+    // whatever is patched there, and back. Spelled out of its own module
+    // so the face and the picker share one sentinel and one name.
+    (
+        crate::faces_hwinsert::HWINSERT_PATH,
+        crate::faces_hwinsert::HWINSERT_NAME,
+        crate::faces_hwinsert::HWINSERT_ABOUT,
     ),
 ];
 
@@ -523,6 +537,11 @@ pub enum FaceAction {
     /// readings are printed there and only there. The face never guesses a
     /// scale. See `face::SliderAsk::Type`.
     Type { id: u32, text: String },
+    /// **The hardware insert's routing and its ping.** Appended at the END,
+    /// this enum's law. The face asks; the host checks the jacks against the
+    /// device, writes the bay's state and answers on the pushed lines. See
+    /// `faces_hwinsert`.
+    HwInsert(crate::faces_hwinsert::HwAsk),
 }
 
 /// What a slider row asked for, as the action the face raises: a value is
@@ -540,7 +559,7 @@ fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
 }
 
 /// One continuous parameter as a kit row. Returns the ask.
-fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option<FaceAction> {
+pub(crate) fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option<FaceAction> {
     let p = param(face, id)?;
     slider_row(ui, st, &p.name, &p.reading, p.value, p.default)
         .map(|ask| ask_to_action(id, ask))
@@ -550,7 +569,7 @@ fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option
 /// stepping wraps, and a double-click lands on the position the DSP calls
 /// home — `p.default`, pushed with the parameter, never a number spelled
 /// here.
-fn step_row(
+pub(crate) fn step_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
     face: &BuiltinFace,
@@ -871,6 +890,8 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         crate::faces_analog::ANALOG_PATH => crate::faces_analog::draw_analog(ui, st, live),
         crate::faces_sampler::SAMPLER_PATH => crate::faces_sampler::draw_sampler(ui, st, live),
+        crate::faces_bitcrush::BITCRUSH_PATH => crate::faces_bitcrush::draw_bitcrush(ui, st, live),
+        crate::faces_hwinsert::HWINSERT_PATH => crate::faces_hwinsert::draw_hwinsert(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
         // continuous ones, the cycling button for anything stepped, so a
@@ -1745,7 +1766,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
         (Some(path), true) => IrMenuRow {
             label: "Delete".to_owned(),
             live: true,
-            tip: format!("{path}\n\nremove this file from the disk — there is no undo"),
+            tip: format!("{path}\n\nremove this file from the disk; there is no undo"),
             ask: Some(IrMenuAsk::Delete {
                 path: path.clone(),
                 loaded: ir_same(&path, loaded),
@@ -1753,7 +1774,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
         },
         (Some(_), false) => dead(
             "Delete",
-            "Tangent only deletes inside its own IRs folder — copy this\n\
+            "Tangent only deletes inside its own IRs folder: copy this\n\
              impulse home first if you want to manage it here",
         ),
         (None, _) => dead("Delete", "right-click an impulse to delete it"),
@@ -1781,7 +1802,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
             // be opened over a folder row — so "this folder" is exactly the
             // word somebody would read as the one they right-clicked.
             tip: format!(
-                "{}\n\nput a copy in {} — a name already there is never\n\
+                "{}\n\nput a copy in {}. A name already there is never\n\
                  written over: the copy is numbered and the app says which\n\
                  name it got",
                 live.ir_clip,
@@ -1789,10 +1810,10 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
             ),
             ask: Some(IrMenuAsk::Paste { into: menu.dir.clone() }),
         },
-        (true, _) => dead("Paste", "nothing copied yet — Copy an impulse first"),
+        (true, _) => dead("Paste", "nothing copied yet: Copy an impulse first"),
         (false, false) => dead(
             "Paste",
-            "Tangent only writes inside its own IRs folder — walk home\n\
+            "Tangent only writes inside its own IRs folder: walk home\n\
              with the IRs chip and paste there",
         ),
     };
@@ -1861,7 +1882,7 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     if l.name.is_positive() {
         face::lcd_glass(ui.painter(), l.name, st);
         let shown = if loaded.is_empty() {
-            "no impulse loaded — click to load one".to_owned()
+            "no impulse loaded: click to load one".to_owned()
         } else {
             std::path::Path::new(&loaded)
                 .file_stem()
@@ -2054,7 +2075,7 @@ fn draw_ir_browser(
         l.browse_up,
         "..",
         "ir-up",
-        "up one folder — the browser goes anywhere on disk",
+        "up one folder: the browser goes anywhere on disk",
         parent != live.ir_dir,
     ) {
         live.ir_dir = parent;
@@ -2070,7 +2091,7 @@ fn draw_ir_browser(
         l.browse_home,
         "IRs",
         "ir-home",
-        "back to the IRs folder — where the Wizard saves and where this opens",
+        "back to the IRs folder, where the Wizard saves and where this opens",
         !at_root && !live.ir_root.is_empty(),
     ) {
         live.ir_dir = live.ir_root.clone();
@@ -2167,7 +2188,7 @@ fn draw_ir_browser(
                     ui.painter(),
                     r.width() - 10.0,
                     if at_root {
-                        "no impulses here yet — the Wizard fills this folder"
+                        "no impulses here yet: the Wizard fills this folder"
                     } else {
                         "no impulses in this folder"
                     },
@@ -2971,6 +2992,7 @@ mod tests {
             ("@tangent-amp", 9),
             ("@tangent-ir", 2),
             ("@tangent-tape", 8),
+            ("@tangent-bitcrush", 6),
         ] {
             for w in [200.0f32, 296.0, 316.0, 376.0, 446.0, 516.0, 900.0, 1400.0] {
                 let mut live = a_full_face(path, n);

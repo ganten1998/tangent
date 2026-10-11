@@ -1,19 +1,18 @@
 //! Where notes come from, when the app is the one choosing.
 //!
 //! The desktop app opens a MIDI device itself: it enumerates ports, picks one
-//! at startup, and lets the user switch with a dialog. A VST3 editor does none
-//! of that — the host hands it note events and there is no device list to
-//! offer — which is exactly what `Caps::midi_ports` says.
+//! at startup, and lets the user switch with a dialog. Whether a host may do
+//! that at all is what `Caps::midi_ports` says.
 //!
 //! So the app holds an `Option<Box<dyn MidiPorts>>`: `Some` on the desktop,
-//! `None` in a plugin. A trait rather than a `cfg`, because the alternative is
-//! `midir` in the shared crate, and the whole point of `tangent-ui`'s dependency
-//! list is that `midir` cannot be reached from here at all.
+//! `None` in a test that hands none over. A trait rather than a `cfg`, because
+//! the alternative is `midir` in the shared crate, and the whole point of
+//! `tangent-ui`'s dependency list is that `midir` cannot be reached from here
+//! at all.
 //!
 //! Note what is NOT behind this trait: the `mpsc` channel the events arrive
-//! on. That is `std`, it is host-agnostic, and a plugin uses the same one —
-//! `process()` sends into it from the audio thread and the editor drains it on
-//! the next frame, which is the same shape as `midir`'s callback thread.
+//! on. That is `std` and host-agnostic: `midir`'s callback thread sends into
+//! it and the app drains it on the next frame.
 
 /// One clip's picture, made by the host after decoding.
 ///
@@ -75,6 +74,23 @@ pub struct ExportProgress {
     pub fraction: f32,
     /// What is happening, in words: rendering, encoding, writing.
     pub label: String,
+    pub peaks: Vec<(f32, f32)>,
+    /// **One named wave per file a stems pass writes**, in desk order, each
+    /// filled the same way as `peaks` from its own lane. Empty for a
+    /// single-file export, which draws `peaks` alone exactly as it always
+    /// has; when it is not empty the window draws THESE and not `peaks`, and
+    /// a pass that also writes the master mix says so with a row of its own
+    /// at the head of the list. The owner: "we need to show all waveforms
+    /// being drawn, not just the one".
+    pub rows: Vec<ExportRow>,
+}
+
+/// One file's wave in the export window: what it is called on the desk, and
+/// what it has heard so far. See [`ExportProgress::rows`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportRow {
+    pub name: String,
+    /// [`EXPORT_PEAKS`] (min, max) columns, filled as the render walks.
     pub peaks: Vec<(f32, f32)>,
 }
 
@@ -251,7 +267,6 @@ pub struct DeviceInfo {
 /// each of them: list what is there, open one by uid, ask which is open. The
 /// alternative was two traits differing only in their doc comments.
 ///
-/// `Send` for the same reason [`MidiPorts`] is: the app that owns it has to be.
 pub trait CaptureDevices: Send {
     /// Everything present right now. Re-read each time a picker opens, because
     /// devices are plugged and unplugged while the app runs — and on macOS a
@@ -601,8 +616,8 @@ impl OutputPath {
 /// The **request pattern**, not a blocking call. `rfd`'s native panel runs a
 /// nested run loop, and raising one from inside an egui frame means re-entering
 /// the frame that is already on the stack. So `tangent-ui` records that it wants
-/// a folder, the host drains it *after* `frame()` returns, and a plugin refuses
-/// simply by never draining — the same shape as the plugin's `pending_resize`.
+/// a folder, the host drains it *after* `frame()` returns, and a host refuses
+/// simply by never draining.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirRequest {
     /// Where the picker should open. `None` means the platform decides.
@@ -626,7 +641,7 @@ pub const PROJECT_EXTENSIONS: &[&str] = &["tan", "tangent"];
 /// A file the app has asked the host to choose.
 ///
 /// The same request pattern as [`DirRequest`], and for the same reason: a
-/// native panel cannot be raised from inside an egui frame. A plugin refuses
+/// native panel cannot be raised from inside an egui frame. A host refuses
 /// simply by never draining it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRequest {
@@ -1181,10 +1196,6 @@ pub struct PresetLoaded {
 }
 
 /// A source of MIDI the app picks for itself.
-///
-/// `Send` because the app that owns it has to be: `nih_plug_egui` requires the
-/// editor's state to be `'static + Send`, and a trait object is only as `Send`
-/// as its bound says.
 pub trait MidiPorts: Send {
     /// Every input port that could be opened, right now. Re-read each time the
     /// dialog opens: devices are unplugged while the app is running.
@@ -1230,7 +1241,8 @@ pub trait MidiPorts: Send {
     /// app — could not appear until it was over, so the splash was proof the
     /// load had FINISHED rather than cover for it happening.
     ///
-    /// Default is a no-op, so the plugin and the test fake say nothing.
+    /// Default is a no-op, so a source with no chain and the test fake say
+    /// nothing.
     fn auto_connect(&mut self, _tx: mpsc::Sender<MidiEvent>) {}
 }
 
@@ -1277,8 +1289,9 @@ pub struct BuiltinFaceParam {
 /// the host whenever the bay loads or changes — the `push_fx_params`
 /// precedent, with values.
 ///
-/// `strip` is the SEAT (the flat rack-seat space, stride `INSERTS`), the
-/// addressing every insert road here already speaks. An empty `params` with
+/// Pushed FOR a bay, by its identity (`TangentApp::set_bay_face`): it
+/// carried the host's `(seat, bay)` in two fields, which no track past the
+/// frozen map's thirty-two rows has (W7-slot-gaps). An empty `params` with
 /// an empty `path` clears the entry: the bay unloaded or holds a plugin.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BuiltinFace {
@@ -1291,8 +1304,6 @@ pub struct BuiltinFace {
     /// IR's file path) - pushed so a face can SHOW what is loaded without
     /// a second road. Appended; empty for units that carry none.
     pub extra: Vec<(String, String)>,
-    pub strip: usize,
-    pub slot: usize,
     /// The unit's sentinel path (`"@tangent-comp"`), which is what routes a
     /// click on the chip to the right face.
     pub path: String,
@@ -1788,8 +1799,8 @@ mod tests {
     /// and the splash appeared only once the load had already finished.
     ///
     /// It runs on the frame after the splash is up now. This is the seam that
-    /// makes that possible, and the default being a no-op is what lets the
-    /// plugin and the fakes ignore it.
+    /// makes that possible, and the default being a no-op is what lets a
+    /// source with no chain and the fakes ignore it.
     #[test]
     fn the_priority_chain_is_a_separate_call_from_construction() {
         let (tx, _rx) = mpsc::channel();
@@ -1805,8 +1816,8 @@ mod tests {
         assert_eq!(p.open_ports(), vec!["USB-MIDI 1".to_owned()]);
     }
 
-    /// A source that has no chain says nothing rather than erroring — the
-    /// plugin has no ports of its own to pick from.
+    /// A source that has no chain says nothing rather than erroring: not
+    /// every source has an order of its own to pick from.
     #[test]
     fn a_source_with_no_chain_ignores_the_request() {
         struct Bare;
@@ -1881,16 +1892,6 @@ mod tests {
             one,
             "a device that would not open closed one that had"
         );
-    }
-
-    /// The trait object has to be `Send`, or `TangentApp` stops being `Send` and
-    /// `create_egui_editor` refuses it with a wall of trait errors in the
-    /// plugin crate rather than here.
-    #[test]
-    fn the_trait_object_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<Box<dyn MidiPorts>>();
-        assert_send::<Box<dyn CaptureDevices>>();
     }
 
     /// A fake camera list, for the same reason the fake MIDI port exists: the

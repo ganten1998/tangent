@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tangent_record::audio::Timebase;
-use tangent_ui::recorder::{Desk, STRIPS};
+use tangent_ui::desk_legacy::V32Desk as Desk;
 
 use crate::builtin_fx::{
     ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH, IR_PATH,
@@ -134,10 +134,11 @@ fn noise(seconds: f64) -> Arc<tangent_record::decode::Clip> {
 /// Nothing sends, nothing is muted, nothing is soloed — the desk every shape
 /// starts from, so no shape is quietly paying for the effects bus.
 fn quiet_desk() -> Desk {
+    // Each array as wide as the desk's own type says: no width named here.
     Desk {
-        send: [0.0; STRIPS],
-        muted: [false; STRIPS],
-        soloed: [false; STRIPS],
+        send: std::array::from_fn(|_| 0.0),
+        muted: std::array::from_fn(|_| false),
+        soloed: std::array::from_fn(|_| false),
     }
 }
 
@@ -1665,7 +1666,7 @@ fn a_desk_of_folders_is_the_same_grained() {
                     .unwrap_or_else(|| panic!("{path} loaded but bay {bay} reports no tenant"));
             }
         }
-        let mut parents = [-1i32; crate::instrument::CHANNELS];
+        let mut parents = [-1i32; crate::instrument::LEGACY_LANES];
         for child in 1..=children {
             parents[child] = 0;
         }
@@ -1893,7 +1894,7 @@ fn a_lane_with_a_tail_insert_is_the_same_grained() {
         let mut e = audio_desk(with_clips, head);
         if let Some(unit) = tail {
             for lane in 0..lanes {
-                let seat = tangent_ui::recorder::folder_extra_seat(lane);
+                let seat = tangent_ui::desk_legacy::folder_extra_seat(lane);
                 e.load_insert(seat, 0, Some(Path::new(unit)), None)
                     .unwrap_or_else(|err| panic!("{unit} did not load into the tail of lane {lane}: {err}"))
                     .unwrap_or_else(|| panic!("{unit} loaded but the tail bay reports no tenant"));
@@ -2826,7 +2827,7 @@ fn the_pins_that_arrive_mid_roll_do_not_re_run_a_rack() {
         (
             "punched",
             |e, on| {
-                let mut p = [None; crate::instrument::CHANNELS];
+                let mut p = [None; crate::instrument::LEGACY_LANES];
                 if on {
                     p[0] = Some(u64::from(BLOCK as u32) * 150);
                     p[1] = Some(u64::from(BLOCK as u32) * 150);
@@ -3302,7 +3303,20 @@ fn rt_bench() {
     rows.push(measure("16 lanes x [EQ, comp, plate] @ 256 fr", &mut e, WARMUP, 256));
     drop(e);
 
-    let mut e = audio_desk(16, &[DENOISE_PATH]);
+    // Spectral Studio by name, as the row says: a fresh denoise opens on
+    // the Bank since 2026-10-11, and this row's history is the spectral one.
+    let mut e = audio_desk(16, &[]);
+    let studio = {
+        let spec = crate::builtin_fx::spec_for(DENOISE_PATH).expect("the denoise has a spec");
+        let mut v = spec.defaults();
+        v[6] = crate::units::denoise::DenoiseKernel::SpectralStudio.dial();
+        crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
+    };
+    for lane in 0..16 {
+        e.load_insert(lane, 0, Some(Path::new(DENOISE_PATH)), Some(&studio))
+            .unwrap_or_else(|err| panic!("the denoise did not load into lane {lane}: {err}"))
+            .unwrap_or_else(|| panic!("the denoise loaded but lane {lane} reports no tenant"));
+    }
     rows.push(measure("16 lanes x denoise (spectral studio)", &mut e, WARMUP, BLOCK));
     drop(e);
 
@@ -3531,4 +3545,756 @@ fn rt_bench() {
     }
     println!("\ndeadline at 128 frames / 48 kHz: {DEADLINE_US:.1} us per block");
     println!("(64 frames = {:.1} us, 256 frames = {:.1} us)", DEADLINE_US / 2.0, DEADLINE_US * 2.0);
+}
+
+/// **A desk built through the slot API, as the bridge builds one**: `lanes`
+/// lanes (the legacy thirty-two and as many installed past them), nothing
+/// armed and nothing listening, a noise clip on each of `clipped`, and the
+/// plan `shape` makes of them, rolling. The shim words cannot say a bus or a
+/// send, so the post-fork rungs are built here.
+fn slot_desk(lanes: usize, clipped: &[usize], shape: impl FnOnce(&mut crate::desk_plan::PlanInputs)) -> Engine {
+    slot_desk_from(lanes, clipped, 0, shape)
+}
+
+/// [`slot_desk`] with every clip starting at frame `start`: a minute in is
+/// a desk of lanes with nothing under the playhead, which is what most of a
+/// song is for most of its tracks.
+fn slot_desk_from(
+    lanes: usize,
+    clipped: &[usize],
+    start: u64,
+    shape: impl FnOnce(&mut crate::desk_plan::PlanInputs),
+) -> Engine {
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::instrument::{LaneKind, LaneSpec, SlotPlaced};
+    let mut e = Engine::offline_sized(RATE, Timebase::new(), lanes.max(32)).expect("an offline engine needs no device");
+    e.set_armed(0);
+    e.set_midi_off(u64::MAX);
+    e.set_desk(&quiet_desk());
+    let fresh: Vec<(Slot, LaneSpec)> =
+        (32..lanes).map(|s| (Slot(s as u32), LaneSpec { kind: LaneKind::Audio, drum: false })).collect();
+    if !fresh.is_empty() {
+        e.install_lanes(fresh).expect("the lanes install");
+    }
+    e.settle_offline();
+    let mut inputs = PlanInputs {
+        lanes: (0..lanes)
+            .map(|s| InLane {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                flags: LaneFlags::MIDI_OFF,
+                parent: None,
+                punch: None,
+                midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                pick: None,
+            })
+            .collect(),
+        ..PlanInputs::default()
+    };
+    shape(&mut inputs);
+    e.publish_plan(&inputs).expect("the plan goes");
+    let clip = noise(12.0);
+    let len = clip.frames() as u64;
+    e.set_clips_slotted(
+        clipped
+            .iter()
+            .map(|&s| SlotPlaced {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane"),
+                placed: Placed { clip: Arc::clone(&clip), strip: 0, start, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 },
+            })
+            .collect(),
+    );
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    grain_from_env(&e);
+    e
+}
+
+/// `unit` into bay `bay` of lane `slot`'s rack `rack`.
+fn seat_at(e: &mut Engine, slot: usize, rack: u16, bay: usize, unit: &str) {
+    use crate::instrument::{RackAddr, RackOwner};
+    let addr = RackAddr { owner: RackOwner::Lane(crate::desk_plan::Slot(slot as u32)), rack };
+    e.load_insert_at(addr, bay, Some(Path::new(unit)), None)
+        .unwrap_or_else(|err| panic!("{unit} did not load into lane {slot}: {err}"))
+        .unwrap_or_else(|| panic!("{unit} loaded but the bay reports no tenant"));
+}
+
+/// **The machine's one-minute load average**, printed beside every rung.
+///
+/// The quiet-window rule (design, W7-scale-and-budgets) is that a rung
+/// started above a load of two is re-run rather than reported: the numbers
+/// below are deadline numbers, and a busy machine moves the tail first. It is
+/// read here rather than by the person running the bench so the figure sits
+/// in the log on the line it qualifies.
+fn load_average() -> f64 {
+    #[cfg(unix)]
+    {
+        let mut l = [0.0f64; 3];
+        // SAFETY: a plain out array of exactly the length passed.
+        if unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } >= 1 {
+            return l[0];
+        }
+    }
+    f64::NAN
+}
+
+/// What `TANGENT_FANOUT` says, for the header: the lane render's pool is
+/// chosen once per process, so a serial run and a forked run are two runs.
+fn fanout_label() -> String {
+    match std::env::var("TANGENT_FANOUT").as_deref() {
+        Ok("0") => "serial (TANGENT_FANOUT=0)".to_owned(),
+        Ok("force") => "pool forced (TANGENT_FANOUT=force: real-time plan, performance cores less one)".to_owned(),
+        _ => "default gate (an offline engine has no pool)".to_owned(),
+    }
+}
+
+fn env_num(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// **One rung, repeated**: `repeats` readings of `blocks` blocks each, every
+/// reading from frame zero after `warmup` untimed blocks, reported as the
+/// median of the readings' means with their spread, and the median p99.
+///
+/// A median of repeats rather than one long reading, because what this is
+/// for is comparing two builds or two settings on a machine that is never
+/// perfectly still: one reading that met a background job is an outlier in
+/// a set and the whole answer on its own.
+struct Rung {
+    name: String,
+    /// The median, lowest and highest of the readings' means, in us.
+    mean: f64,
+    lo: f64,
+    hi: f64,
+    /// The median of the readings' p99s, in us.
+    p99: f64,
+    /// Blocks past the deadline, over every reading.
+    over: usize,
+}
+
+fn rung(name: &str, e: &mut Engine, warmup: usize, blocks: usize, repeats: usize) -> Rung {
+    rung_at(name, e, warmup, blocks, repeats, BLOCK)
+}
+
+/// [`rung`] at a callback of `frames`, against that callback's deadline.
+fn rung_at(name: &str, e: &mut Engine, warmup: usize, blocks: usize, repeats: usize, frames: usize) -> Rung {
+    let deadline = deadline_us(frames);
+    let mut out = vec![0.0f32; frames * 2];
+    let mut means = Vec::with_capacity(repeats);
+    let mut p99s = Vec::with_capacity(repeats);
+    let mut over = 0;
+    let mut peak = 0.0f32;
+    let load_before = load_average();
+    for _ in 0..repeats.max(1) {
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        e.set_transport(generation, 0);
+        for _ in 0..warmup {
+            e.render_offline(&mut out);
+        }
+        let mut us = Vec::with_capacity(blocks);
+        for _ in 0..blocks.max(1) {
+            let t = Instant::now();
+            e.render_offline(&mut out);
+            us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+            peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        over += us.iter().filter(|v| **v > deadline).count();
+        means.push(us.iter().sum::<f64>() / us.len() as f64);
+        us.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));
+        p99s.push(us[((us.len() - 1) as f64 * 0.99) as usize]);
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        v[v.len() / 2]
+    };
+    let r = Rung {
+        name: name.to_owned(),
+        mean: med(&mut means),
+        lo: means[0],
+        hi: means[means.len() - 1],
+        p99: med(&mut p99s),
+        over,
+    };
+    println!(
+        "{:<46} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.1}% {:>6}   [load {load_before:.2} -> {:.2}, peak {peak:.4}]",
+        r.name,
+        r.mean,
+        r.lo,
+        r.hi,
+        r.p99,
+        r.mean / deadline * 100.0,
+        r.over,
+        load_average(),
+    );
+    r
+}
+
+fn rung_header(title: &str, repeats: usize, blocks: usize) {
+    println!(
+        "\n{title}: {BLOCK} frames at {RATE} Hz, deadline {DEADLINE_US:.0} us\n\
+         lane render: {}\n{repeats} readings x {blocks} blocks per rung, each from frame zero\n",
+        fanout_label()
+    );
+    println!(
+        "{:<46} {:>9} {:>9} {:>9} {:>9} {:>8} {:>6}",
+        "rung", "mean us", "lowest", "highest", "p99", "mean/dl", "over"
+    );
+}
+
+/// **The post-fork rungs** (design 11.8, measured and never asserted in
+/// time): fifty returns, each a bus with a plate fed by its own track's
+/// send, and twenty-five folders side by side, each holding two tracks with
+/// [EQ, comp, plate] in its bays; each with the levels walked, then forked.
+///
+/// **The pool is the engine's own**, which `TANGENT_FANOUT` chooses: `0`
+/// renders everything on the calling thread, and `force` gives the offline
+/// engine the live pool (the real-time plan on the performance cores less
+/// one), which is the fork a session would take. `TANGENT_SCALE_POOL=export`
+/// swaps in the export's wider pool of plain threads instead.
+///
+/// ```text
+/// TANGENT_FANOUT=force cargo test --release -p tangent --bin tangent -- bus_and_folder_rungs --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a bench: run it deliberately with --ignored --nocapture"]
+fn bus_and_folder_rungs() {
+    use crate::desk_plan::{InSend, LaneFlags, SendFrom, SendTo, Slot};
+    let repeats = env_num("TANGENT_SCALE_REPEATS", 5);
+    let blocks = env_num("TANGENT_SCALE_BLOCKS", 1000);
+    let export_pool = std::env::var("TANGENT_SCALE_POOL").as_deref() == Ok("export");
+    rung_header("Tangent post-fork rungs", repeats, blocks);
+    let returns = |level_fork: bool| {
+        let tracks: Vec<usize> = (0..50).collect();
+        let mut e = slot_desk(100, &tracks, |p| {
+            for b in 50..100 {
+                p.lanes[b].flags = LaneFlags::BUS | LaneFlags::MIDI_OFF;
+            }
+            p.sends = (0..50)
+                .map(|k| InSend { from: SendFrom::Lane(Slot(k)), to: SendTo::Lane(Slot(50 + k)), level: 0.5, pre: false })
+                .collect();
+        });
+        for b in 50..100 {
+            seat_at(&mut e, b, 0, 0, PLATE_PATH);
+        }
+        if export_pool {
+            e.set_offline_fanout(true);
+        }
+        e.set_level_fork(level_fork);
+        e
+    };
+    let folders = |level_fork: bool| {
+        let tracks: Vec<usize> = (0..75).collect();
+        let mut e = slot_desk(75, &tracks, |p| {
+            for f in 0..25u32 {
+                let at = (f * 3) as usize;
+                p.lanes[at + 1].parent = Some(Slot(f * 3));
+                p.lanes[at + 2].parent = Some(Slot(f * 3));
+            }
+        });
+        for f in 0..25 {
+            for (bay, unit) in [EQ_PATH, COMP_PATH, PLATE_PATH].into_iter().enumerate() {
+                seat_at(&mut e, f * 3, 0, bay, unit);
+            }
+        }
+        if export_pool {
+            e.set_offline_fanout(true);
+        }
+        e.set_level_fork(level_fork);
+        e
+    };
+    for (name, build) in [
+        ("50 returns x plate", &returns as &dyn Fn(bool) -> Engine),
+        ("25 folders x [EQ, comp, plate]", &folders as &dyn Fn(bool) -> Engine),
+    ] {
+        for level_fork in [false, true] {
+            let mut e = build(level_fork);
+            let label = format!("{name}, levels {}", if level_fork { "forked" } else { "walked" });
+            rung(&label, &mut e, WARMUP, blocks, repeats);
+        }
+    }
+}
+
+/// **The scale rungs** (design W7-scale-and-budgets): desks of 32, 64, 256
+/// and 1,024 lanes built through the slot API as the bridge builds them,
+/// each lane playing noise through nothing, one EQ, one compressor or one
+/// plate, or through [EQ, comp, plate]; and the IDLE rung, the same lanes
+/// with their clips a minute in, which is what a big session is for most of
+/// its length and the shape the active list is for.
+///
+/// What it is read for: the marginal cost of a bare lane at each width (the
+/// decide and fold walks are the floor every lane pays), the idle rung
+/// against its budget of 4% of the deadline at 1,024 lanes, and the same
+/// desks forked and walked, which is two runs (`TANGENT_FANOUT=0`, then
+/// `force`). Measured, never asserted.
+///
+/// `TANGENT_SCALE_WIDTHS` (default `32,64,256,1024`), `TANGENT_SCALE_SHAPES`
+/// (default `bare,eq,comp,plate,chain,idle`), `TANGENT_SCALE_REPEATS`
+/// (default 5) and `TANGENT_SCALE_BLOCKS` (default 1000) narrow it.
+/// `TANGENT_SCALE_REST=0` walks every lane every chunk (the active list
+/// off), which is the A/B for what resting saves.
+///
+/// ```text
+/// TANGENT_FANOUT=0 cargo test --release -p tangent --bin tangent -- scale_rungs --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a bench: run it deliberately with --ignored --nocapture"]
+fn scale_rungs() {
+    let list = |k: &str, d: &str| -> Vec<String> {
+        std::env::var(k)
+            .unwrap_or_else(|_| d.to_owned())
+            .split(',')
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    let widths: Vec<usize> =
+        list("TANGENT_SCALE_WIDTHS", "32,64,256,1024").iter().filter_map(|w| w.parse().ok()).collect();
+    let shapes = list("TANGENT_SCALE_SHAPES", "bare,eq,comp,plate,chain,idle");
+    let repeats = env_num("TANGENT_SCALE_REPEATS", 5);
+    let blocks = env_num("TANGENT_SCALE_BLOCKS", 1000);
+    let rest = std::env::var("TANGENT_SCALE_REST").as_deref() != Ok("0");
+    let frames = env_num("TANGENT_SCALE_FRAMES", BLOCK).clamp(16, 512);
+    // **`TANGENT_SCALE_PEERS=n` forks onto an export pool of `n` plain
+    // threads** in place of the engine's own: the width question
+    // (`LanePool::new`'s cap), asked of one desk at several widths.
+    let peers = std::env::var("TANGENT_SCALE_PEERS").ok().and_then(|v| v.parse::<usize>().ok());
+    rung_header("Tangent scale rungs", repeats, blocks);
+    if frames != BLOCK {
+        println!("at a {frames}-frame callback, deadline {:.0} us", deadline_us(frames));
+    }
+    if let Some(p) = peers {
+        println!("an export pool of {p} peers");
+    }
+    println!("idle lanes {}\n", if rest { "rest (the active list)" } else { "are walked (TANGENT_SCALE_REST=0)" });
+    // [shape] -> [(width, median mean)]
+    let mut by_shape: Vec<(String, Vec<(usize, f64)>)> = Vec::new();
+    for shape in &shapes {
+        let units: &[&str] = match shape.as_str() {
+            "bare" | "idle" => &[],
+            "eq" => &[EQ_PATH],
+            "comp" => &[COMP_PATH],
+            "plate" => &[PLATE_PATH],
+            "chain" => &[EQ_PATH, COMP_PATH, PLATE_PATH],
+            other => {
+                println!("no shape called {other}");
+                continue;
+            }
+        };
+        let mut row = Vec::new();
+        for &lanes in &widths {
+            let all: Vec<usize> = (0..lanes).collect();
+            // **A minute in** for the idle rung: every lane has a clip and
+            // nothing under the playhead, so each one is visited by the walks
+            // and has nothing to render.
+            let start = if shape == "idle" { u64::from(RATE) * 60 } else { 0 };
+            let mut e = slot_desk_from(lanes, &all, start, |_| {});
+            e.set_active_list(rest);
+            if let Some(p) = peers {
+                e.set_offline_fanout_width(p);
+            }
+            for slot in 0..lanes {
+                for (bay, unit) in units.iter().enumerate() {
+                    seat_at(&mut e, slot, 0, bay, unit);
+                }
+            }
+            // The idle rung warms past the park window (`RACK_PARK_S`, eight
+            // seconds), as the rt_bench row with ten idle lanes does: four
+            // hundred blocks would time lanes that have not rested yet.
+            let warmup = if shape == "idle" { 3_600 } else { WARMUP };
+            let label = format!(
+                "{lanes} lanes {}",
+                match shape.as_str() {
+                    "bare" => "bare".to_owned(),
+                    "idle" => "idle (clips a minute in)".to_owned(),
+                    "chain" => "x [EQ, comp, plate]".to_owned(),
+                    s => format!("x {s}"),
+                }
+            );
+            // The idle warm-up is a time (the park window), so it is counted
+            // in this callback's blocks.
+            let warmup = warmup * BLOCK / frames;
+            let r = rung_at(&label, &mut e, warmup, blocks, repeats, frames);
+            row.push((lanes, r.mean));
+        }
+        by_shape.push((shape.clone(), row));
+    }
+    println!("\n── what the rungs imply ──");
+    for (shape, row) in &by_shape {
+        for pair in row.windows(2) {
+            let ((a, ma), (b, mb)) = (pair[0], pair[1]);
+            println!(
+                "{shape:<6} marginal per lane, {a:>4} -> {b:>4}: {:>7.3} us/block",
+                (mb - ma) / (b - a) as f64
+            );
+        }
+        for &(n, m) in row {
+            println!("{shape:<6} {n:>4} lanes: {:>7.3} us/block per lane, {:>6.2}% of the deadline", m / n as f64, m / deadline_us(frames) * 100.0);
+        }
+    }
+    println!("\nbudget: 1024 idle lanes at most 4% of the deadline = {:.1} us per block", deadline_us(frames) * 0.04);
+}
+
+/// **A desk where lanes rest and wake, built twice** for
+/// [`a_resting_lane_renders_what_the_full_walk_rendered`]: forty-eight lanes
+/// (sixteen past the legacy thirty-two), two playing throughout, eight
+/// playing a short clip each and going quiet after it (so their grain rings
+/// hold slots the playhead has passed), one whose clip starts three seconds
+/// in, one whose clip is a minute away (it parks after `RACK_PARK_S` and
+/// only then rests), and the rest with nothing at all; an EQ, a plate and a
+/// compressor on some of them, a plate on the far-off one and an EQ on an
+/// empty one. With `grained`, the grain render is on (AUTO), which is what
+/// a session runs and what moves the span a resting lane's quiet frames
+/// count by.
+fn resting_desk(grained: bool) -> (Engine, crate::desk_plan::PlanInputs, Vec<crate::instrument::SlotPlaced>) {
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::instrument::{LaneKind, LaneSpec, SlotPlaced};
+    const LANES: usize = 48;
+    let mut e = Engine::offline_sized(RATE, Timebase::new(), LANES).expect("an offline engine needs no device");
+    e.set_armed(0);
+    e.set_midi_off(u64::MAX);
+    e.set_desk(&quiet_desk());
+    e.install_lanes((32..LANES).map(|s| (Slot(s as u32), LaneSpec { kind: LaneKind::Audio, drum: false })).collect())
+        .expect("the lanes install");
+    e.settle_offline();
+    let inputs = PlanInputs {
+        lanes: (0..LANES)
+            .map(|s| InLane {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                flags: LaneFlags::MIDI_OFF,
+                parent: None,
+                punch: None,
+                midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                pick: None,
+            })
+            .collect(),
+        ..PlanInputs::default()
+    };
+    e.publish_plan(&inputs).expect("the plan goes");
+    let rate = u64::from(RATE);
+    let long = noise(12.0);
+    let short = noise(0.3);
+    let placed = |slot: usize, clip: &Arc<tangent_record::decode::Clip>, start: u64| SlotPlaced {
+        slot: Slot(slot as u32),
+        gen: e.lane_gen(Slot(slot as u32)).expect("a lane"),
+        placed: Placed {
+            clip: Arc::clone(clip),
+            strip: 0,
+            start,
+            offset: 0,
+            len: clip.frames() as u64,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 0.5,
+        },
+    };
+    let mut clips = vec![placed(0, &long, 0), placed(1, &long, 0)];
+    for k in 2..10 {
+        clips.push(placed(k, &short, k as u64 * rate * 2 / 5));
+    }
+    clips.push(placed(40, &short, rate * 3));
+    clips.push(placed(44, &long, rate * 60));
+    e.set_clips_slotted(clips.clone());
+    // Lane 21 carries an instrument and nothing to play: it rests, and the
+    // audition held on it later is heard only if the audition wakes it.
+    for (slot, unit) in [(3, EQ_PATH), (5, PLATE_PATH), (9, COMP_PATH), (21, ANALOG_PATH), (44, PLATE_PATH), (46, EQ_PATH)] {
+        seat_at(&mut e, slot, 0, 0, unit);
+    }
+    e.set_effects(crate::effects::Sends { reverb: 0.4, ..crate::effects::Sends::default() });
+    for k in 2..10 {
+        e.set_lane_levels(Slot(k), 0.8, 0.0, 0.3);
+    }
+    e.set_grain_ms(if grained { -1.0 } else { 0.0 });
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    (e, inputs, clips)
+}
+
+/// **A lane that rests renders exactly what the full walk rendered**
+/// (design W7-scale-and-budgets: the active-list walk is bit-identical to
+/// the full serial walk), with the grain render off and on.
+///
+/// Two engines of one desk, one resting its idle lanes and one walking
+/// every lane every chunk, are handed the same events between blocks and
+/// compared sample by sample, bit for bit: a resting lane's fader moved, an
+/// audition held on one (an instrument on it) and let go, a plugin seated in
+/// one, a solo and a mute through a new plan and back, a clip list swapped
+/// in that gives one a clip, a locate backwards that lands inside a loop set
+/// in the same breath, the loop wrapping four times (two lanes play inside
+/// it, one across its head and one up to its very end, while the lanes with
+/// nothing to play rest beside them), the loop taken away, and a fader moved
+/// again near the end. Then every lane's fader and its park counter are
+/// compared, paid up: a fader is what a lane that is woken late would come
+/// back on wrong, and the counter is the one thing resting defers rather
+/// than skips, so a counter off by any amount would one day park a lane on
+/// one engine and not the other.
+///
+/// **Two wakes are asked of the engine directly**, because nothing in the
+/// sound can show them while the lane they wake has nothing to play: a
+/// plugin seated in a resting lane wakes it that chunk, and a loop's wrap
+/// wakes every resting lane on the chunk that consumes it (`fill_active`'s
+/// `flush`). The loop is set WITH the locate, not after it: a playhead that
+/// is already past a loop's end when the loop arrives plays on and never
+/// wraps (`run_transport`), and a loop set that way once left this test
+/// comparing a phase in which nothing wrapped. So the wraps are counted, off
+/// the transport going backwards, and must have happened.
+///
+/// And it must have rested: an engine that never rested anything would pass
+/// this by comparing two full walks.
+#[test]
+fn a_resting_lane_renders_what_the_full_walk_rendered() {
+    use crate::desk_plan::{LaneFlags, Slot};
+    const BLOCKS: usize = 3_400;
+    for grained in [false, true] {
+        let (mut rest, mut inputs, clips) = resting_desk(grained);
+        let (mut walk, _, _) = resting_desk(grained);
+        rest.set_active_list(true);
+        walk.set_active_list(false);
+        let rate = u64::from(RATE);
+        let mut a = vec![0.0f32; BLOCK * 2];
+        let mut b = vec![0.0f32; BLOCK * 2];
+        let mut most = 0usize;
+        let mut woke = 0usize;
+        // The loop's phase: where the transport stood after the last block,
+        // how many times it went backwards (each a wrap, the locate aside),
+        // and the fewest resting lanes any wrap was owed a visit for.
+        let (loop_from, loop_to) = (1_700, 2_600);
+        let mut was_at = 0u64;
+        let mut wraps = 0usize;
+        let mut wrapped = false;
+        let mut fewest_owed = usize::MAX;
+        for block in 0..BLOCKS {
+            let mut both = |f: &mut dyn FnMut(&mut Engine)| {
+                f(&mut rest);
+                f(&mut walk);
+            };
+            match block {
+                300 => both(&mut |e| e.set_channel_gain(20, 0.5)),
+                500 => both(&mut |e| e.set_audition(Slot(21), Some(64))),
+                520 => both(&mut |e| e.set_audition(Slot(21), None)),
+                700 => both(&mut |e| seat_at(e, 22, 0, 0, EQ_PATH)),
+                // Moved after the last chunk that wakes every lane, so only
+                // its own target can wake it before the end.
+                n if n == BLOCKS - 100 => both(&mut |e| e.set_channel_gain(20, 0.25)),
+                900 | 1100 => {
+                    let on = block == 900;
+                    let flip = |f: LaneFlags, x: LaneFlags| if on { f | x } else { LaneFlags(f.0 & !x.0) };
+                    inputs.lanes[23].flags = flip(inputs.lanes[23].flags, LaneFlags::MUTED);
+                    inputs.lanes[1].flags = flip(inputs.lanes[1].flags, LaneFlags::SOLOED);
+                    both(&mut |e| {
+                        e.publish_plan(&inputs).expect("the plan goes");
+                    });
+                }
+                1300 => both(&mut |e| {
+                    let mut more = clips.clone();
+                    let gen = e.lane_gen(Slot(30)).expect("a lane");
+                    let short = noise(0.3);
+                    more.push(crate::instrument::SlotPlaced {
+                        slot: Slot(30),
+                        gen,
+                        placed: Placed {
+                            len: short.frames() as u64,
+                            clip: short,
+                            strip: 0,
+                            start: rate * 4,
+                            offset: 0,
+                            fade_in: 0,
+                            fade_out: 0,
+                            gain: 0.5,
+                        },
+                    });
+                    more.sort_by_key(|c| c.slot.0);
+                    e.set_clips_slotted(more);
+                }),
+                // One second in, inside [1.0 s, 1.5 s): lane 2's clip
+                // crosses the loop's head, lane 3's ends where the loop
+                // does, and a lap is 187.5 blocks, so it wraps four times
+                // before it is taken away.
+                n if n == loop_from => both(&mut |e| {
+                    e.set_transport(7, rate);
+                    e.set_loop(rate, rate * 3 / 2);
+                }),
+                n if n == loop_to => both(&mut |e| e.set_loop(0, 0)),
+                // Every lane woken (a clip list swapped in, the same one),
+                // so the counters compared below are all paid.
+                n if n == BLOCKS - 2 => both(&mut |e| e.set_clips_slotted(clips.clone())),
+                _ => {}
+            }
+            let resting_22 = rest.lane_fader(22).is_some_and(|(_, r)| r);
+            // Every lane resting as the chunk after a wrap begins: the
+            // chunk that consumes the wrap's flush must visit each of them.
+            let owed: Option<Vec<usize>> =
+                wrapped.then(|| (0..48).filter(|&s| rest.lane_fader(s).is_some_and(|(_, r)| r)).collect());
+            rest.render_offline(&mut a);
+            walk.render_offline(&mut b);
+            if block == 700 {
+                assert!(resting_22, "grained {grained}: lane 22 was not resting when its plugin arrived");
+                assert_eq!(rest.lane_visited(22), Some(true), "grained {grained}: a plugin arrived and lane 22 slept through it");
+            }
+            if let Some(owed) = &owed {
+                for &s in owed {
+                    assert_eq!(
+                        rest.lane_visited(s),
+                        Some(true),
+                        "grained {grained}: block {block}: the loop wrapped and lane {s} slept through it"
+                    );
+                }
+                fewest_owed = fewest_owed.min(owed.len());
+            }
+            let at = rest.transport_position();
+            assert_eq!(at, walk.transport_position(), "grained {grained}: block {block}: the two transports parted");
+            // Backwards inside the loop's phase is a wrap; the locate that
+            // opens the phase is its first block and is not counted.
+            wrapped = block > loop_from && block < loop_to && at < was_at;
+            wraps += usize::from(wrapped);
+            was_at = at;
+            let now = rest.resting_lanes();
+            if now < most {
+                woke += 1;
+            }
+            most = most.max(now);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    x.to_bits() == y.to_bits(),
+                    "grained {grained}: block {block} sample {i}: the resting walk gave {x}, the full walk {y}"
+                );
+            }
+        }
+        assert!(most >= 30, "grained {grained}: at most {most} lanes rested, so the test proved little");
+        assert!(woke > 0, "grained {grained}: no resting lane ever woke");
+        assert_eq!(wraps, 4, "grained {grained}: the loop wrapped {wraps} times, not the four its laps make");
+        // Four wraps, so four visits owed and this is a real count.
+        assert!(
+            (20..usize::MAX).contains(&fewest_owed),
+            "grained {grained}: a wrap met only {fewest_owed} resting lanes, so its wake was hardly asked"
+        );
+        for slot in 0..48 {
+            assert_eq!(
+                rest.lane_quiet(slot),
+                walk.lane_quiet(slot),
+                "grained {grained}: lane {slot}'s park counter drifted while it rested"
+            );
+            assert_eq!(
+                rest.lane_fader(slot).map(|(g, _)| g),
+                walk.lane_fader(slot).map(|(g, _)| g),
+                "grained {grained}: lane {slot}'s fader came back from resting somewhere else"
+            );
+        }
+        let peak = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.001, "grained {grained}: the render was silent, so the test proved nothing");
+    }
+}
+
+/// **A lane does not rest while its grain ring still holds what the fold
+/// will read** (`LaneGrains::dead_before`, a term of the rest decided at
+/// the decide walk's idle exit).
+///
+/// The one visit that reaches the idle exit with audio still ahead in the
+/// ring is a grained lane's look-ahead: the ring serves this chunk, the
+/// grain clock asks for the next grain, and the visit finds nothing to feed
+/// it. Here a plate's tail has fallen under the park floor, so the lane is
+/// no longer `loud`, and the clip list is then swapped for an empty one: the
+/// plate lane's next look-ahead visit takes the idle exit with the grain it
+/// is being served from still ahead of the playhead. The plate sits on a
+/// lane of the grain clock's first phase (slot 4 of four phases at 128
+/// frames), which asks for its next grain on the FIRST chunk of the one
+/// being served, so three chunks of that grain are still to come. The full
+/// walk folds them; a lane that rested on that visit would drop them, a tail
+/// under -80 dBFS, which on a desk with nothing else playing is every bit of
+/// the output. (A lane on the last phase asks on the grain's last chunk,
+/// with nothing left to drop: the first draft of this test sat there and
+/// could not fail.)
+///
+/// And the lane must rest once its ring has run dry, or this would pass by
+/// never resting it at all.
+#[test]
+fn a_lane_does_not_rest_while_its_ring_still_holds_a_tail() {
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::instrument::SlotPlaced;
+    const LANES: usize = 32;
+    // `slot % phases == 0`: the first phase (`Renderer::plan_grains`).
+    const PLATE: usize = 4;
+    let rate = u64::from(RATE);
+    let build = || {
+        let mut e = Engine::offline_sized(RATE, Timebase::new(), LANES).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        e.settle_offline();
+        let inputs = PlanInputs {
+            lanes: (0..LANES)
+                .map(|s| InLane {
+                    slot: Slot(s as u32),
+                    gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                    flags: LaneFlags::MIDI_OFF,
+                    parent: None,
+                    punch: None,
+                    midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                    pick: None,
+                })
+                .collect(),
+            ..PlanInputs::default()
+        };
+        e.publish_plan(&inputs).expect("the plan goes");
+        // Half a second of noise into a plate, as the park test plays it.
+        let clip = noise(0.5);
+        let len = clip.frames() as u64;
+        e.set_clips_slotted(vec![SlotPlaced {
+            slot: Slot(PLATE as u32),
+            gen: e.lane_gen(Slot(PLATE as u32)).expect("a lane"),
+            placed: Placed { clip, strip: 0, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 },
+        }]);
+        seat_at(&mut e, PLATE, 0, 0, PLATE_PATH);
+        e.set_grain_ms(-1.0);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    };
+    let (mut rest, mut walk) = (build(), build());
+    rest.set_active_list(true);
+    walk.set_active_list(false);
+    // Five seconds in: the plate is under the floor by about two and a
+    // half (`a_reverb_tail_is_never_cut_off_by_a_lane_going_to_rest`) and
+    // its lane parks only `RACK_PARK_S` after that, so it is still rendering
+    // ahead when its clip goes.
+    let swap = (5 * rate) as usize / BLOCK;
+    let blocks = swap + 400;
+    let mut a = vec![0.0f32; BLOCK * 2];
+    let mut b = vec![0.0f32; BLOCK * 2];
+    let mut before = 0.0f32;
+    let mut after = 0.0f32;
+    for block in 0..blocks {
+        if block == swap {
+            rest.set_clips_slotted(Vec::new());
+            walk.set_clips_slotted(Vec::new());
+        }
+        rest.render_offline(&mut a);
+        walk.render_offline(&mut b);
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits(),
+                "block {block} sample {i}: the resting walk gave {x}, the full walk {y}"
+            );
+        }
+        let peak = b.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        if block + 1 == swap {
+            before = peak;
+        } else if block >= swap {
+            after = after.max(peak);
+        }
+    }
+    // The tail was under the park floor (so the lane was not `loud`) and
+    // still sounding when its clip went, and the full walk folded some of it
+    // after: there was something for a lane resting too early to drop.
+    assert!(
+        before > 0.0 && before < 7.0e-5,
+        "the plate's tail stood at {before} when its clip went, not under the park floor and above silence"
+    );
+    assert!(after > 0.0, "nothing of the tail was folded after the clip went, so the test proved nothing");
+    assert_eq!(
+        rest.lane_fader(PLATE).map(|(_, r)| r),
+        Some(true),
+        "the plate's lane never rested once its ring ran dry"
+    );
 }

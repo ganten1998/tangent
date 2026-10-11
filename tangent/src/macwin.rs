@@ -1777,7 +1777,7 @@ fn install_quit_hook(ctx: &egui::Context) -> bool {
     QUIT_HOOKED.with(|h| h.set(Some(ok)));
     if !ok {
         eprintln!(
-            "could not hook applicationShouldTerminate: — Cmd+Q will not ask \
+            "could not hook applicationShouldTerminate:, so Cmd+Q will not ask \
              about unsaved work and will quit through exit(), which is the \
              road a loaded plugin's static destructors can crash on"
         );
