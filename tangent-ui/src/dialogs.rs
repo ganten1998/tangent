@@ -129,6 +129,9 @@ pub enum Dialog {
         /// project's own under the Exports root (`TangentApp::export_home`) -
         /// shown in that row in place of a placeholder.
         home: String,
+        /// The TRACKS and TIME rows' working state, and the window's own
+        /// "starting" state once Export is pressed. See [`ExportPick`].
+        pick: ExportPick,
     },
     /// Choose a camera or an audio input for the recorder.
     ///
@@ -6138,6 +6141,14 @@ pub fn export_row_parts(row: Rect) -> (Rect, Rect) {
 /// initial helper message is shown behind the waveform draw". The line
 /// above the wave is where this window already says what it is doing, and
 /// a cover is one more thing it is doing.
+/// A cover's words on one line: its label, and its detail after it.
+fn cover_words(b: &crate::busy::Busy) -> String {
+    match b.detail.as_deref() {
+        Some(d) if !d.is_empty() => format!("{}  {d}", b.label),
+        _ => b.label.clone(),
+    }
+}
+
 fn export_line(p: &crate::ports::ExportProgress, cover: Option<&crate::busy::Busy>) -> String {
     match cover.filter(|b| b.is_visible()) {
         Some(b) => match b.detail.as_deref() {
@@ -7508,10 +7519,12 @@ fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> 
 /// empty band under a dialog that already had plenty, which is the fault the
 /// Track menu's own size comment argues against a few hundred lines down.
 ///
-/// So the number is unchanged and the guard is
+/// So the number was unchanged and the guard is
 /// `the_project_export_dialog_fits_the_window_it_asks_for`, which finds the
-/// Export button in the painted frame. It bites at three hundred and forty,
-/// which is the budget the next row to be added here has to fit inside.
+/// Export button in the painted frame. It bit at three hundred and forty,
+/// which was the budget the next row had to fit inside - and the TRACKS and
+/// TIME rows did not; see [`EXPORT_PROJECT_H`] for what they cost.
+///
 /// Height reserved for the Project dialog's Done row.
 ///
 /// Measured rather than guessed at: `the_project_dialogs_done_button_stays_on
@@ -7520,10 +7533,239 @@ fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> 
 /// instead of hiding the button.
 const PROJECT_DONE_H: f32 = 30.0;
 
-const EXPORT_PROJECT_H: f32 = 446.0;
-/// The floor the same stack still fits in — and it does: the guard is green
-/// here too, with the band down to about twenty-five points.
-const EXPORT_PROJECT_MIN_H: f32 = 396.0;
+/// **Grown for the TRACKS and TIME rows, and measured.** The checklist is
+/// a fixed band (drawn always, live only for "Selected tracks", so the
+/// height is never a function of a chip) and Custom's START and END sit on
+/// a line of their own with what they read as under it. The guard below
+/// now goes red at about five hundred and thirty; six hundred and ten keeps
+/// the eighty points of slack this window has always carried.
+const EXPORT_PROJECT_H: f32 = 610.0;
+/// The floor the same stack still fits in, with the band down to about
+/// thirty points.
+const EXPORT_PROJECT_MIN_H: f32 = 560.0;
+
+/// **One row of the TRACKS checklist**: a track by identity, what it is
+/// called, whether it is checked, and what the window needs to refuse a
+/// press that would write silence or nothing. A folder's group is never a
+/// row - its stem is its children twice over - but a folder with clips of
+/// its own is one, for those alone ("own clips"); a member of a folder says
+/// whose it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportTrack {
+    pub id: crate::desk_id::TrackId,
+    /// The row as the list draws it: the track's name, its folder's before
+    /// it, "(own clips)" after a folder's own row.
+    pub label: String,
+    pub on: bool,
+    /// **A bus or a return: a row only when stems are written.** In a
+    /// mixdown a bus is never left out (a checked track routed into it
+    /// reaches the master only through it, and with the unchecked sources
+    /// gone it passes exactly the checked tracks' share), so a bus box
+    /// there would change nothing; the window does not offer one.
+    pub bus: bool,
+    /// Whether it has anything to make a stem of, or to play
+    /// (`TangentApp::exports_a_stem`).
+    pub stem: bool,
+    /// Whether the desk, its mutes and solos as they stand, lets it be
+    /// heard (`TangentApp::strip_heard`).
+    pub heard: bool,
+}
+
+impl ExportTrack {
+    /// Whether the row is offered for this export: a bus only with stems.
+    pub fn offered(&self, spec: &crate::ports::ProjectExportSpec) -> bool {
+        !self.bus || spec.stems
+    }
+}
+
+/// **What the Export window holds beyond the spec**: the TRACKS checklist,
+/// the TIME row's two fields, what it needs to read them, and whether the
+/// window is STARTING the export it was asked for.
+///
+/// **The window stays up until the pass has started, and says so.** It used
+/// to close on the press, and the host's cover ("Preparing export") was
+/// painted in the main window alone, behind it. The setup that cover
+/// announces is one blocking call (every rack re-instantiated in a fresh
+/// offline engine), and it was only held off until the cover had been
+/// painted twice (`Busy::outlived_the_asking_frame`), on the reasoning that
+/// the dialog's OS window would be gone by then. That is a paint count
+/// standing in for a window server's answer, and on the owner's machine it
+/// was the wrong answer: the options window was still on screen when the
+/// block began, so the message sat under it for the whole setup. Nothing
+/// headless can see the window server, so this no longer relies on it: the
+/// window the user is looking at carries the cover itself (`cover`, the
+/// host's own mirrored through `TangentApp::set_surface_cover`) and goes only
+/// once the pass is under way - see `TangentApp::settle_export_dialog`.
+#[derive(Debug, Clone)]
+pub struct ExportPick {
+    pub tracks: Vec<ExportTrack>,
+    /// START and END as typed, for the Custom chip.
+    pub custom: [String; 2],
+    /// The song's length, for "Whole song" and the fields' defaults.
+    pub song_s: f64,
+    /// The maps a bar position is read against.
+    pub tempo: crate::tempo::TempoMap,
+    pub meter: crate::tempo::MeterMap,
+    /// Export was pressed: the body stands still and the window says what
+    /// the host is doing until the pass has started.
+    pub starting: bool,
+    /// The host's busy cover while it stands, painted over this window.
+    pub cover: Option<crate::busy::Busy>,
+}
+
+impl Default for ExportPick {
+    fn default() -> Self {
+        Self {
+            tracks: Vec::new(),
+            custom: ["1| 1| 000".to_owned(), "1| 1| 000".to_owned()],
+            song_s: 0.0,
+            tempo: crate::tempo::TempoMap::constant(120.0),
+            meter: crate::tempo::MeterMap::default(),
+            starting: false,
+            cover: None,
+        }
+    }
+}
+
+/// The TRACKS row's chips.
+pub const EXPORT_TRACK_CHIPS: [&str; 2] = ["Everything", "Selected tracks"];
+
+/// **The TIME row's chips.** Three, not four: the owner asked for Loop and
+/// Selection, and in this app they are one span - the loop region IS the
+/// time selection (`TangentApp::loop_region`) - so two chips would be two
+/// names for one range and a person would wonder which one they had.
+pub const EXPORT_TIME_CHIPS: [&str; 3] = ["Whole song", "Loop/selection", "Custom"];
+
+/// How tall the TRACKS checklist is, scrolled past that.
+const EXPORT_TRACK_LIST_H: f32 = 84.0;
+
+/// **A position typed into START or END, in song seconds**, the two ways
+/// this app writes one:
+///
+/// - **bars**, as the band's clock prints them, `bar| beat| thousandths`
+///   (`5| 1| 000`, or `5|1`, or `5|`): bar and beat count from one, the
+///   thousandths are of a beat, and the beat must be one the bar's
+///   signature has. Read against the song's own tempo and meter maps, so
+///   bar 17 is where bar 17 is after a tempo change.
+/// - **time**, as a trim field takes it (`recorder::parse_time`): `72.5` or
+///   `1:12.5`.
+///
+/// The bar wants its `|`, because `1:12` is already a minute and twelve.
+/// `None` for anything else, and never a guess.
+pub fn parse_export_position(
+    text: &str,
+    tempo: &crate::tempo::TempoMap,
+    meter: &crate::tempo::MeterMap,
+) -> Option<f64> {
+    let t = text.trim();
+    if !t.contains('|') {
+        return crate::recorder::parse_time(t);
+    }
+    let parts: Vec<&str> = t.split('|').map(str::trim).collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let bar: u32 = parts.first()?.parse().ok().filter(|b| *b >= 1)?;
+    let beat: u32 = match parts.get(1) {
+        None | Some(&"") => 1,
+        Some(b) => b.parse().ok()?,
+    };
+    let thou: u32 = match parts.get(2) {
+        None | Some(&"") => 0,
+        Some(th) => th.parse().ok().filter(|v| *v <= 999)?,
+    };
+    let sig = meter.sig_at_bar(bar - 1);
+    if beat < 1 || beat > u32::from(sig.beats.max(1)) {
+        return None;
+    }
+    let per_beat = 4.0 / f64::from(sig.unit.max(1));
+    let quarter = meter.quarter_at_bar(bar - 1) + (f64::from(beat - 1) + f64::from(thou) / 1000.0) * per_beat;
+    Some(tempo.seconds_at_beat(quarter))
+}
+
+/// **A position in song seconds as the band's clock prints bars**,
+/// `bar| beat| thousandths`, read against the song's maps: what START and
+/// END are filled with, and what [`parse_export_position`] reads back to
+/// the same place.
+pub fn export_position_text(
+    seconds: f64,
+    tempo: &crate::tempo::TempoMap,
+    meter: &crate::tempo::MeterMap,
+) -> String {
+    let (mut bar, beat) = meter.bar_beat_at_quarter(tempo.beat_at_seconds(seconds.max(0.0)));
+    let total = (beat * 1000.0).round().max(0.0) as u64;
+    let mut whole = total / 1000;
+    let thou = total % 1000;
+    if whole >= u64::from(meter.sig_at_bar(bar).beats.max(1)) {
+        bar += 1;
+        whole = 0;
+    }
+    format!("{}| {}| {thou:03}", bar + 1, whole + 1)
+}
+
+/// **The Custom span the two fields name**, or what is wrong with them, in
+/// the words the row prints under them.
+pub fn export_custom_span(pick: &ExportPick) -> Result<(f64, f64), String> {
+    let read = |i: usize, what: &str| {
+        parse_export_position(&pick.custom[i], &pick.tempo, &pick.meter).ok_or_else(|| {
+            format!("{what}: a bar (5| 1| 000) or a time (1:12.5)")
+        })
+    };
+    let a = read(0, "START")?;
+    let b = read(1, "END")?;
+    if b <= a {
+        return Err("END has to come after START".to_owned());
+    }
+    // A span with none of the song in it renders silence: said, not sent.
+    if a >= pick.song_s {
+        return Err(format!(
+            "START is past the song's end ({})",
+            crate::recorder_panel::time_text(pick.song_s)
+        ));
+    }
+    Ok((a, b))
+}
+
+/// **The spec the Export button sends**, from what the rows say, or why it
+/// cannot be sent yet: the TRACKS row resolved to the checked tracks, the
+/// TIME row to a span. `sel` is the time selection standing in the arrange
+/// view (the loop region).
+pub fn resolve_project_export(
+    spec: &crate::ports::ProjectExportSpec,
+    pick: &ExportPick,
+    sel: Option<(f64, f64)>,
+) -> Result<crate::ports::ProjectExportSpec, String> {
+    use crate::ports::ExportTime;
+    let mut out = spec.clone();
+    if out.tracks.is_some() {
+        let on: Vec<&ExportTrack> = pick.tracks.iter().filter(|t| t.on && t.offered(spec)).collect();
+        if on.is_empty() {
+            return Err("no track is checked".to_owned());
+        }
+        // **Silence, or no file, is refused here, in words**: a mixdown
+        // hears its checked tracks as the desk would play them (a bus
+        // carries, so it is not one of them), and a stems-only pass writes a
+        // file for each checked row with something to make one of.
+        if out.master {
+            let plays: Vec<&&ExportTrack> = on.iter().filter(|t| !t.bus && t.stem).collect();
+            if plays.is_empty() {
+                return Err("the checked tracks have nothing to play".to_owned());
+            }
+            if !plays.iter().any(|t| t.heard) {
+                return Err("the desk's mute or solo silences every checked track".to_owned());
+            }
+        } else if !on.iter().any(|t| t.stem) {
+            return Err("none of the checked tracks has anything for a stem".to_owned());
+        }
+        out.tracks = Some(on.iter().map(|t| t.id).collect());
+    }
+    out.span = match out.time {
+        ExportTime::Whole => None,
+        ExportTime::Selection => Some(sel.ok_or_else(|| "there is no loop or selection".to_owned())?),
+        ExportTime::Custom => Some(export_custom_span(pick)?),
+    };
+    Ok(out)
+}
 
 /// The SOURCE row's chip labels — the one array, so the drawing and the
 /// test cannot disagree about how many there are or what they say.
@@ -11198,7 +11440,7 @@ fn show_on(
                 },
             )
         }
-        Dialog::ExportProject { spec, sel, home } => {
+        Dialog::ExportProject { spec, sel, home, pick } => {
             let sel = *sel;
             let t = theme(face);
             show_dialog_viewport(
@@ -11255,9 +11497,15 @@ fn show_on(
                         ui.add_space(2.0);
                         picked
                     };
+                    let window = ui.max_rect();
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
+                            // **Pressed: nothing here moves until the pass
+                            // has started.** See `ExportPick`.
+                            if pick.starting {
+                                ui.disable();
+                            }
                             if let Some(i) = choice(
                                 ui,
                                 "SOURCE",
@@ -11306,21 +11554,167 @@ fn show_on(
                             if let Some(i) = picked {
                                 set_export_stem_mode(spec, i);
                             }
-                            if let Some(range) = sel {
-                                let at = usize::from(spec.span.is_some());
-                                if let Some(i) = choice(
-                                    ui,
-                                    "TIME",
-                                    &["Entire project", "Time selection"],
-                                    at,
-                                ) {
-                                    spec.span = (i == 1).then_some(range);
+                            // ── TRACKS: everything, or the checked ones ──
+                            //
+                            // Drawn always and live only when "Selected
+                            // tracks" is chosen, as the STEMS row is, so the
+                            // window's height is never a function of a chip.
+                            if let Some(i) =
+                                choice(ui, "TRACKS", &EXPORT_TRACK_CHIPS, usize::from(spec.tracks.is_some()))
+                            {
+                                let offered = spec.clone();
+                                spec.tracks = (i == 1).then(|| {
+                                    pick.tracks.iter().filter(|r| r.on && r.offered(&offered)).map(|r| r.id).collect()
+                                });
+                            }
+                            // Buses are rows only when stems are written; see
+                            // `ExportTrack::bus`.
+                            let shown = spec.clone();
+                            let picking = spec.tracks.is_some();
+                            ui.add_enabled_ui(picking, |ui| {
+                                egui::Frame::NONE
+                                    .stroke(Stroke::new(1.0_f32, dim.gamma_multiply(0.5)))
+                                    .inner_margin(egui::Margin::symmetric(6, 3))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("export-tracks")
+                                            .max_height(EXPORT_TRACK_LIST_H)
+                                            .min_scrolled_height(EXPORT_TRACK_LIST_H)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if pick.tracks.is_empty() {
+                                                    ui.label(
+                                                        RichText::new("no tracks on the desk")
+                                                            .font(plain(9.0))
+                                                            .color(dim),
+                                                    );
+                                                }
+                                                for row in pick.tracks.iter_mut().filter(|r| r.offered(&shown)) {
+                                                    let label = match (row.bus, shown.master) {
+                                                        (false, _) => row.label.clone(),
+                                                        (true, false) => format!("{} (bus)", row.label),
+                                                        // Its stem; the mix carries it either way.
+                                                        (true, true) => format!("{} (bus, stem only)", row.label),
+                                                    };
+                                                    ui.checkbox(
+                                                        &mut row.on,
+                                                        RichText::new(label).font(plain(9.5)).color(t.text),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                ui.horizontal(|ui| {
+                                    let offered = pick.tracks.iter().filter(|r| r.offered(&shown)).count();
+                                    let on = pick.tracks.iter().filter(|r| r.on && r.offered(&shown)).count();
+                                    ui.label(
+                                        RichText::new(format!("{on} of {offered} checked"))
+                                            .font(plain(8.5))
+                                            .color(dim),
+                                    );
+                                    if ui
+                                        .add(Button::new(RichText::new("All").font(plain(9.0)).color(t.text)))
+                                        .clicked()
+                                    {
+                                        pick.tracks.iter_mut().filter(|r| r.offered(&shown)).for_each(|r| r.on = true);
+                                    }
+                                    if ui
+                                        .add(Button::new(RichText::new("None").font(plain(9.0)).color(t.text)))
+                                        .clicked()
+                                    {
+                                        pick.tracks.iter_mut().filter(|r| r.offered(&shown)).for_each(|r| r.on = false);
+                                    }
+                                });
+                            });
+                            // The spec follows the boxes, so what is sent and
+                            // what is remembered are what is checked.
+                            if picking {
+                                spec.tracks = Some(
+                                    pick.tracks.iter().filter(|r| r.on && r.offered(&shown)).map(|r| r.id).collect(),
+                                );
+                            }
+                            ui.add_space(2.0);
+                            // ── TIME: the song, the loop/selection, or typed ──
+                            {
+                                use crate::ports::ExportTime as T;
+                                if sel.is_none() && spec.time == T::Selection {
+                                    // The selection it named is gone.
+                                    spec.time = T::Whole;
                                 }
-                            } else {
-                                // No selection standing in the arrange view:
-                                // the whole project is the one honest answer.
-                                let _ = choice(ui, "TIME", &["Entire project"], 0);
-                                spec.span = None;
+                                let at = match spec.time {
+                                    T::Whole => 0,
+                                    T::Selection => 1,
+                                    T::Custom => 2,
+                                };
+                                let mut picked = None;
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        Vec2::new(96.0, 18.0),
+                                        egui::Label::new(RichText::new("TIME").font(bold(9.5)).color(dim)),
+                                    );
+                                    for (i, o) in EXPORT_TIME_CHIPS.iter().enumerate() {
+                                        let text = RichText::new(*o)
+                                            .font(plain(9.5))
+                                            .color(if i == at { t.bg } else { t.text });
+                                        let b = Button::new(text).fill(if i == at { t.text } else { t.bg });
+                                        // No loop or selection standing: that
+                                        // chip has nothing to name.
+                                        if ui.add_enabled(i != 1 || sel.is_some(), b).clicked() {
+                                            picked = Some(i);
+                                        }
+                                    }
+                                });
+                                if let Some(i) = picked {
+                                    spec.time = [T::Whole, T::Selection, T::Custom][i];
+                                }
+                                let custom = spec.time == T::Custom;
+                                ui.add_enabled_ui(custom, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(96.0 + ui.spacing().item_spacing.x);
+                                        ui.style_mut().visuals.extreme_bg_color =
+                                            Color32::from_rgb(0x1A, 0x16, 0x12);
+                                        for (i, what) in ["START", "END"].iter().enumerate() {
+                                            ui.label(RichText::new(*what).font(bold(8.5)).color(dim));
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut pick.custom[i])
+                                                    .id_salt(("export-time", i))
+                                                    .font(plain(9.5))
+                                                    .text_color(Color32::WHITE)
+                                                    .desired_width(78.0),
+                                            );
+                                        }
+                                    });
+                                });
+                                // What the chosen span IS, or why it is not one.
+                                let said = match spec.time {
+                                    T::Whole => format!(
+                                        "0:00.0 to {}, the whole song",
+                                        crate::recorder_panel::time_text(pick.song_s)
+                                    ),
+                                    T::Selection => match sel {
+                                        Some((a, b)) => format!(
+                                            "{} to {}, {} long",
+                                            crate::recorder_panel::time_text(a),
+                                            crate::recorder_panel::time_text(b),
+                                            crate::recorder_panel::time_text(b - a)
+                                        ),
+                                        None => "no loop or selection".to_owned(),
+                                    },
+                                    T::Custom => match export_custom_span(pick) {
+                                        Ok((a, b)) => format!(
+                                            "{} to {}, {} long",
+                                            crate::recorder_panel::time_text(a),
+                                            crate::recorder_panel::time_text(b),
+                                            crate::recorder_panel::time_text(b - a)
+                                        ),
+                                        Err(why) => why,
+                                    },
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add_space(96.0 + ui.spacing().item_spacing.x);
+                                    ui.label(RichText::new(said).font(plain(8.0)).color(dim));
+                                });
+                                ui.add_space(2.0);
                             }
                             let rates: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
                             let at = rates.iter().position(|r| *r == spec.rate).unwrap_or(1);
@@ -11451,15 +11845,33 @@ fn show_on(
                                 }
                             });
                             ui.add_space(8.0);
+                            let ready = resolve_project_export(spec, pick, sel);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if pick.starting {
+                                    // Said in the window the eye is on, in the
+                                    // host's own words while its cover stands.
+                                    let words = pick
+                                        .cover
+                                        .as_ref()
+                                        .map_or_else(|| "Starting the export".to_owned(), cover_words);
+                                    ui.label(RichText::new(words).font(bold(10.5)).color(t.text));
+                                    return;
+                                }
                                 if ui
-                                    .add(Button::new(
-                                        RichText::new("Export").font(bold(11.0)).color(t.text),
-                                    ))
+                                    .add_enabled(
+                                        ready.is_ok(),
+                                        Button::new(RichText::new("Export").font(bold(11.0)).color(t.text)),
+                                    )
                                     .clicked()
                                 {
-                                    action = Some(DialogAction::ProjectExportRun(spec.clone()));
-                                    result.close = true;
+                                    if let Ok(run) = &ready {
+                                        // **Not closed**: the window says what
+                                        // the host is doing until the pass has
+                                        // started. See `ExportPick`.
+                                        *spec = run.clone();
+                                        pick.starting = true;
+                                        action = Some(DialogAction::ProjectExportRun(run.clone()));
+                                    }
                                 }
                                 if ui
                                     .add(Button::new(RichText::new("Cancel").color(t.text)))
@@ -11467,8 +11879,20 @@ fn show_on(
                                 {
                                     result.close = true;
                                 }
+                                if let Err(why) = &ready {
+                                    ui.label(RichText::new(why).font(plain(8.5)).color(dim));
+                                }
                             });
                         });
+                    // **The host's cover, over this window too.** On the
+                    // desktop this window floats in front of the main one,
+                    // where the cover is painted, so the cover is painted
+                    // here as well while it stands - the same scrim and card,
+                    // on the cover band of THIS surface.
+                    if let Some(cover) = pick.cover.as_ref().filter(|_| pick.starting) {
+                        let painter = ui.ctx().layer_painter(crate::busy::cover_layer("tangent-busy-export-dialog"));
+                        cover.paint_over(&painter, window, face, ui.input(|i| i.time));
+                    }
                 },
             )
         }
@@ -17511,6 +17935,7 @@ at: None,
             spec: crate::ports::ProjectExportSpec::default(),
             sel: Some((0.0, 4.0)),
             home: "/Users/someone/Documents/Tangent Media/Exports/Nocturne".to_owned(),
+            pick: ExportPick::default(),
         });
         let placement = Placement {
             at: None,
@@ -18075,11 +18500,280 @@ at: None,
             spec: crate::ports::ProjectExportSpec::default(),
             sel: None,
             home: String::new(),
+            pick: ExportPick::default(),
         });
         let (bare, with) = frame_with_and_without_cover("Preparing export", |ctx| {
             let _ = show(ctx, &mut dialog, FALLBACK_FACE, cover_placement());
         });
         cover_is_on_top(&bare, &with, "Preparing export", "Export");
+    }
+
+    /// One checklist row: a track with something on it that the desk plays.
+    fn track_row(id: u32, label: &str) -> ExportTrack {
+        ExportTrack { id: crate::desk_id::TrackId(id), label: label.to_owned(), on: true, bus: false, stem: true, heard: true }
+    }
+
+    /// Three tracks for the TRACKS row's tests.
+    fn three_tracks() -> Vec<ExportTrack> {
+        ["Kick", "Bass", "Gtr"].iter().enumerate().map(|(i, l)| track_row(10 + i as u32, l)).collect()
+    }
+
+    /// **The Export window carries the host's cover while it starts the
+    /// pass: painted by the window ITSELF, in front of its own rows.**
+    ///
+    /// The owner: "the loading message for exporting stems shows up under
+    /// the export options window". The cover ("Preparing export  stems") was
+    /// painted in the main window alone and the options window, an OS window
+    /// in front of it, closed on the press - except that it was still on
+    /// screen when the setup's block began, so the message sat behind it for
+    /// the whole block. This draws the window with NO main-window cover at
+    /// all: whatever says "Preparing export" here is the window's own paint,
+    /// which on the desktop lands in the window the user is looking at.
+    ///
+    /// Revert-check: take the `paint_over` out of the ExportProject arm and
+    /// the card's words are gone (the first assert goes red); close the
+    /// window on the press again and the second test below goes red.
+    #[test]
+    fn the_export_window_carries_the_hosts_cover_while_it_starts_the_pass() {
+        let mut busy = crate::busy::Busy::new("Preparing export").with_detail("stems");
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        // Shown once by the host, as `paint_busy` would: the mirror shows
+        // only a cover that is up.
+        let _ = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+            busy.draw(&painter, ctx.content_rect(), FALLBACK_FACE, 0.0);
+        });
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let draw = |starting: bool| {
+            let mut dialog = Some(Dialog::ExportProject {
+                spec: crate::ports::ProjectExportSpec { master: false, stems: true, ..Default::default() },
+                sel: None,
+                home: String::new(),
+                pick: ExportPick { starting, cover: Some(busy.clone()), tracks: three_tracks(), ..ExportPick::default() },
+            });
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = ctx
+                    .run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let _ = show(ctx, &mut dialog, FALLBACK_FACE, cover_placement());
+                        },
+                    )
+                    .shapes;
+            }
+            assert!(dialog.is_some(), "the window closed itself");
+            shapes
+        };
+        let shapes = draw(true);
+        let window = crate::shell::inline_rect(&ctx, DIALOG_ID).expect("the dialog drew nothing inline");
+        let texts = painted_texts(&shapes);
+        let at = |want: &str| shapes.iter().position(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == want));
+        let card = at("Preparing export").unwrap_or_else(|| panic!("the window does not carry the cover: {texts:?}"));
+        let rows = at("SOURCE").expect("the window's own rows");
+        assert!(card > rows, "the cover was painted under the window's own rows");
+        let (_, card_at) = texts.iter().find(|(s, _)| s == "Preparing export").expect("the card");
+        assert!(window.contains_rect(*card_at), "the cover's card at {card_at:?} is off the window at {window:?}");
+        // And its words on the foot, where the Export button stood.
+        assert!(texts.iter().any(|(s, _)| s == "Preparing export  stems"), "the foot does not say it: {texts:?}");
+        assert!(at("Export").is_none(), "the Export button can still be pressed a second time");
+        // Not starting: the window carries no cover, whatever it is handed.
+        let shapes = draw(false);
+        assert!(
+            !painted_texts(&shapes).iter().any(|(s, _)| s.starts_with("Preparing export")),
+            "a window nobody pressed Export in painted the host's cover"
+        );
+    }
+
+    /// **Export does not close the window**: it sends the resolved spec and
+    /// stands still, starting. Closing on the press is what left the window
+    /// on screen over the host's cover with nothing in it saying why.
+    #[test]
+    fn pressing_export_sends_the_resolved_spec_and_keeps_the_window_starting() {
+        let mut slot = Slot::new(Dialog::ExportProject {
+            spec: crate::ports::ProjectExportSpec {
+                master: true,
+                tracks: Some(vec![crate::desk_id::TrackId(10)]),
+                time: crate::ports::ExportTime::Selection,
+                ..Default::default()
+            },
+            sel: Some((2.0, 6.0)),
+            home: String::new(),
+            pick: ExportPick {
+                tracks: three_tracks().into_iter().enumerate().map(|(i, t)| ExportTrack { on: i != 1, ..t }).collect(),
+                ..ExportPick::default()
+            },
+        });
+        let Some(DialogAction::ProjectExportRun(sent)) = slot.click("Export") else {
+            panic!("Export sent nothing");
+        };
+        assert_eq!(sent.span, Some((2.0, 6.0)), "the loop/selection was not the span");
+        assert_eq!(
+            sent.tracks,
+            Some(vec![crate::desk_id::TrackId(10), crate::desk_id::TrackId(12)]),
+            "the checked tracks were not the ones sent"
+        );
+        match &slot.dialog {
+            Some(Dialog::ExportProject { pick, .. }) => assert!(pick.starting, "the window is not starting"),
+            _ => panic!("the window closed on the press"),
+        }
+    }
+
+    /// **The TRACKS checklist answers to its boxes, All and None**, and a
+    /// selection with nothing checked cannot be exported.
+    #[test]
+    fn the_tracks_checklist_answers_to_all_and_none() {
+        let mut slot = Slot::new(Dialog::ExportProject {
+            spec: crate::ports::ProjectExportSpec { tracks: Some(Vec::new()), ..Default::default() },
+            sel: None,
+            home: String::new(),
+            pick: ExportPick { tracks: three_tracks(), ..ExportPick::default() },
+        });
+        let _ = slot.click("None");
+        let ready = |slot: &Slot| match &slot.dialog {
+            Some(Dialog::ExportProject { spec, pick, sel, .. }) => resolve_project_export(spec, pick, *sel),
+            _ => panic!("the window closed"),
+        };
+        assert_eq!(ready(&slot).map(|s| s.tracks), Err("no track is checked".to_owned()));
+        assert!(slot.says("no track is checked"), "the window does not say why Export is greyed");
+        let _ = slot.click("All");
+        let ids = ready(&slot).expect("ready").tracks.expect("selected tracks");
+        assert_eq!(ids.len(), 3, "All did not check every track");
+        let _ = slot.click("Bass");
+        let ids = ready(&slot).expect("ready").tracks.expect("selected tracks");
+        assert_eq!(ids, vec![crate::desk_id::TrackId(10), crate::desk_id::TrackId(12)], "a box did not uncheck its track");
+        // Everything: the boxes are kept, and the export takes the desk whole.
+        let _ = slot.click("Everything");
+        assert_eq!(ready(&slot).expect("ready").tracks, None);
+    }
+
+    /// **START and END read as bars or as time**, against the song's own
+    /// maps, and refuse what is neither.
+    #[test]
+    fn a_typed_position_reads_as_bars_or_as_time() {
+        let tempo = crate::tempo::TempoMap::constant(120.0);
+        let meter = crate::tempo::MeterMap::default();
+        let read = |t: &str| parse_export_position(t, &tempo, &meter);
+        // 120 bpm in 4/4: a beat is half a second, a bar two.
+        assert_eq!(read("1| 1| 000"), Some(0.0));
+        assert_eq!(read("5|1|000"), Some(8.0));
+        assert_eq!(read("5|3"), Some(9.0));
+        assert_eq!(read("5|"), Some(8.0));
+        assert_eq!(read(" 2 | 1 | 500 "), Some(2.25));
+        // Time, as a trim field takes it.
+        assert_eq!(read("72.5"), Some(72.5));
+        assert_eq!(read("1:12.5"), Some(72.5));
+        // Neither, and never a guess.
+        for bad in ["", "soon", "0|1", "5|5", "5|0", "5|1|1000", "5|1|0|0", "|2", "-3", "1:-4"] {
+            assert_eq!(read(bad), None, "{bad:?} was read as a position");
+        }
+        // Against a MAP: 6/8 from bar 3 and 60 bpm from quarter 8 (bar 3).
+        let tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 8.0, bpm: 60.0, ramp: false },
+        ]);
+        let meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint { at_bar: 0, sig: crate::recorder::TimeSignature { beats: 4, unit: 4 } },
+            crate::tempo::MeterPoint { at_bar: 2, sig: crate::recorder::TimeSignature { beats: 6, unit: 8 } },
+        ]);
+        // Bar 3 is 8 quarters in: 4 s at 120. Its 4th eighth is 1.5
+        // quarters on, at 60 bpm: 1.5 s more.
+        assert_eq!(parse_export_position("3|1", &tempo, &meter), Some(4.0));
+        assert_eq!(parse_export_position("3|4", &tempo, &meter), Some(5.5));
+        assert_eq!(parse_export_position("3|7", &tempo, &meter), None, "6/8 has six beats");
+        // And what the fields are filled with reads back to the same place.
+        for s in [0.0, 1.0, 3.75, 4.0, 5.5, 9.25, 61.0] {
+            let text = export_position_text(s, &tempo, &meter);
+            let back = parse_export_position(&text, &tempo, &meter).expect("its own text");
+            assert!((back - s).abs() < 1.0e-3, "{s} s printed as {text:?} reads back as {back}");
+        }
+        assert_eq!(export_position_text(4.0, &tempo, &meter), "3| 1| 000");
+    }
+
+    /// **The TIME row's span, for each chip**: the whole song is no span,
+    /// the loop/selection is the selection, Custom is what the fields say -
+    /// and an END that does not come after its START is refused, not
+    /// swapped and not exported empty.
+    #[test]
+    fn each_time_choice_resolves_to_its_span_and_custom_refuses_an_end_before_its_start() {
+        use crate::ports::ExportTime as T;
+        let spec = |time| crate::ports::ProjectExportSpec { time, ..Default::default() };
+        let pick = |a: &str, b: &str| ExportPick { custom: [a.to_owned(), b.to_owned()], song_s: 70.0, ..ExportPick::default() };
+        let ok = pick("2|1", "4|1");
+        assert_eq!(resolve_project_export(&spec(T::Whole), &ok, Some((1.0, 3.0))).map(|s| s.span), Ok(None));
+        assert_eq!(resolve_project_export(&spec(T::Selection), &ok, Some((1.0, 3.0))).map(|s| s.span), Ok(Some((1.0, 3.0))));
+        assert!(resolve_project_export(&spec(T::Selection), &ok, None).is_err(), "a selection that is not there was exported");
+        assert_eq!(resolve_project_export(&spec(T::Custom), &ok, None).map(|s| s.span), Ok(Some((2.0, 6.0))));
+        assert_eq!(resolve_project_export(&spec(T::Custom), &pick("0:30", "1:00"), None).map(|s| s.span), Ok(Some((30.0, 60.0))));
+        for (a, b) in [("4|1", "4|1"), ("4|1", "2|1"), ("1:00", "0:30")] {
+            assert_eq!(
+                export_custom_span(&pick(a, b)),
+                Err("END has to come after START".to_owned()),
+                "{a} to {b} was not refused"
+            );
+            assert!(resolve_project_export(&spec(T::Custom), &pick(a, b), None).is_err());
+        }
+        assert!(export_custom_span(&pick("later", "4|1")).unwrap_err().starts_with("START"));
+        assert!(export_custom_span(&pick("1|1", "4|9")).unwrap_err().starts_with("END"));
+        // A span entirely past the song's end is silence: refused, in words,
+        // never exported and never quietly read as the whole song.
+        assert_eq!(
+            export_custom_span(&pick("1:20", "1:30")),
+            Err("START is past the song's end (1:10.0)".to_owned())
+        );
+        assert!(resolve_project_export(&spec(T::Custom), &pick("1:20", "1:30"), None).is_err());
+        // Starting inside it and running past it is fine: the end is the tail.
+        assert_eq!(export_custom_span(&pick("1:00", "1:30")), Ok((60.0, 90.0)));
+    }
+
+    /// **A bus is a checklist row only when stems are written**, and a
+    /// press that would write silence or no file is refused in words: a
+    /// mixdown of tracks with nothing to play, or that the desk's solo or
+    /// mute silences, and a stems pass with nothing to make a stem of.
+    /// Checking only a bus used to silence the master and write nothing.
+    #[test]
+    fn a_selection_that_would_export_silence_or_nothing_is_refused() {
+        use crate::ports::ProjectExportSpec as S;
+        let bus = ExportTrack { bus: true, ..track_row(20, "Room") };
+        let empty = ExportTrack { stem: false, ..track_row(21, "Empty") };
+        let quiet = ExportTrack { heard: false, ..track_row(22, "Quiet") };
+        let pick = |rows: Vec<ExportTrack>| ExportPick { tracks: rows, ..ExportPick::default() };
+        let mix = S { tracks: Some(Vec::new()), ..S::default() };
+        let stems = S { master: false, stems: true, tracks: Some(Vec::new()), ..S::default() };
+        // A mixdown offers no bus, so a bus alone is nothing checked.
+        assert!(!bus.offered(&mix) && bus.offered(&stems));
+        assert_eq!(resolve_project_export(&mix, &pick(vec![bus.clone()]), None).map(|s| s.tracks), Err("no track is checked".to_owned()));
+        // For stems it is a file of its own.
+        assert_eq!(
+            resolve_project_export(&stems, &pick(vec![bus.clone()]), None).map(|s| s.tracks),
+            Ok(Some(vec![crate::desk_id::TrackId(20)]))
+        );
+        assert_eq!(
+            resolve_project_export(&mix, &pick(vec![empty.clone()]), None).map(|s| s.tracks),
+            Err("the checked tracks have nothing to play".to_owned())
+        );
+        assert_eq!(
+            resolve_project_export(&mix, &pick(vec![quiet.clone(), empty.clone()]), None).map(|s| s.tracks),
+            Err("the desk's mute or solo silences every checked track".to_owned())
+        );
+        assert_eq!(
+            resolve_project_export(&stems, &pick(vec![empty.clone()]), None).map(|s| s.tracks),
+            Err("none of the checked tracks has anything for a stem".to_owned())
+        );
+        // One heard track with something on it is enough, and a bus checked
+        // for a mixdown never rides along in the spec.
+        let ok = resolve_project_export(&mix, &pick(vec![bus, empty, quiet, track_row(23, "Kick")]), None).expect("ready");
+        assert_eq!(
+            ok.tracks,
+            Some(vec![crate::desk_id::TrackId(21), crate::desk_id::TrackId(22), crate::desk_id::TrackId(23)])
+        );
     }
 
     /// **The busy cover paints over the export RENDER window**, which is the
