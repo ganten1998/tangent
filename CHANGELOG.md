@@ -12,6 +12,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Export only some tracks, or only part of the song.** The Export window
+  has a TRACKS row: Everything (as before) or Selected tracks, a checklist
+  of every track, bus and return with All and None buttons. It opens with
+  your current selection checked (selecting a folder checks the tracks in
+  it). For stems it picks which stems are written. For a mixdown it picks
+  which tracks are heard: the others are left out of that export only, and
+  your mutes, solos and undo history are not touched. The TIME row picks
+  Whole song, Loop/selection (the loop region, which in Tangent is the time
+  selection) or Custom, with START and END fields that take a bar
+  (`5| 1| 000`, as the clock shows it, or just `5|`) or a time (`1:12.5`).
+  The line under them shows the range you chose and how long it is, and
+  Export stays greyed out until END comes after START. The export renders
+  that range plus its usual two-second tail, at full speed or in real time,
+  including when a Tangent Insert makes the export run in real time. Both
+  choices are remembered for the rest of the session.
+
 - **Tangent Bitcrush, a bitcrusher.** In the insert picker with the rest of
   the house effects. BITS takes the signal down from 24 bits to 1, smoothly,
   fractions of a bit included; RATE holds each sample for longer, from the
@@ -246,6 +262,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   yet, its grid chip included.
 
 ### Fixed
+
+- **The "Preparing export" message no longer hides behind the Export
+  window.** Pressing Export closed the window, and the message about the
+  slow setup (loading every plugin a second time) was drawn behind it, so
+  the window seemed stuck in front of a frozen app. The Export window now
+  stays open after you press Export and shows the message itself, in front
+  of its own settings, until the export starts, and then closes.
 
 - **A stems export shows every stem's wave, and nothing sits on them.** The
   export window drew one wave whatever the pass wrote; a stems export now

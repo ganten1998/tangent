@@ -36722,6 +36722,114 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &mut self.tapring
     }
 
+    /// **The Export window's TRACKS and TIME rows as they open.**
+    ///
+    /// The checklist is every row of the desk but a folder (a folder's stem
+    /// is its children twice over), in desk order, a member of a folder
+    /// named under it and a bus marked. What comes up checked, first answer
+    /// wins: the desk's selection when it holds anything (a selected folder
+    /// checks its members); else the tracks the last export of this session
+    /// checked, those still standing; else everything. The TIME fields come
+    /// back as the last Custom span typed (`custom`), else the loop or
+    /// selection, else the whole song, written as bars.
+    fn export_pick(
+        &self,
+        spec: &crate::ports::ProjectExportSpec,
+        custom: Option<(f64, f64)>,
+    ) -> dialogs::ExportPick {
+        let rows: Vec<usize> = (0..self.desk_extent()).filter(|r| !self.is_folder(*r)).collect();
+        let selected: std::collections::BTreeSet<usize> = {
+            let mut out = std::collections::BTreeSet::new();
+            for r in self.selected_rows() {
+                if self.is_folder(r) {
+                    out.extend(rows.iter().copied().filter(|c| self.folder_chain_holds(*c, r)));
+                } else {
+                    out.insert(r);
+                }
+            }
+            out
+        };
+        let remembered: Option<&Vec<crate::desk_id::TrackId>> = spec.tracks.as_ref();
+        let tracks = rows
+            .iter()
+            .map(|&r| {
+                let id = self.track_id_at(r);
+                let name = match self.channel_display_name(r).trim() {
+                    "" => format!("Track {}", r + 1),
+                    n => n.to_owned(),
+                };
+                let label = match self.folder_of(r) {
+                    Some(f) => format!("{} / {name}", self.channel_display_name(f).trim()),
+                    None => name,
+                };
+                let label = if self.is_bus(r) { format!("{label} (bus)") } else { label };
+                let on = if !selected.is_empty() {
+                    selected.contains(&r)
+                } else if let Some(ids) = remembered.filter(|ids| rows.iter().any(|r| ids.contains(&self.track_id_at(*r)))) {
+                    ids.contains(&id)
+                } else {
+                    true
+                };
+                dialogs::ExportTrack { id, label, on }
+            })
+            .collect();
+        let tempo = self.live_tempo_map();
+        let meter = self.live_meter_map();
+        let song_s = self.arr_span_s();
+        let (a, b) = custom.or_else(|| self.loop_region()).unwrap_or((0.0, song_s));
+        dialogs::ExportPick {
+            tracks,
+            custom: [
+                dialogs::export_position_text(a, &tempo, &meter),
+                dialogs::export_position_text(b, &tempo, &meter),
+            ],
+            song_s,
+            tempo,
+            meter,
+            starting: false,
+            cover: None,
+        }
+    }
+
+    /// Whether row `c` sits inside folder `f`, however deep.
+    fn folder_chain_holds(&self, c: usize, f: usize) -> bool {
+        let mut at = self.folder_of(c);
+        while let Some(p) = at {
+            if p == f {
+                return true;
+            }
+            at = self.folder_of(p);
+        }
+        false
+    }
+
+    /// **The Export window, once Export was pressed: carrying the host's
+    /// cover, or gone.** Asked every frame before the dialog is drawn.
+    ///
+    /// It stays up, saying what the host is doing (its cover, mirrored
+    /// through `set_surface_cover`), until the pass has started: the request
+    /// has been taken AND either the cover is down or the export window has
+    /// come up to carry the render. A press the host refused raises no
+    /// cover, so the window goes on the next frame, its refusal said in the
+    /// notification column. See `dialogs::ExportPick` for why the window
+    /// cannot simply close on the press.
+    fn settle_export_dialog(&mut self) {
+        let waiting = self.project_request.is_some();
+        let rendering = self.export_progress.is_some();
+        let cover = self.surface_cover.clone();
+        let Some(Dialog::ExportProject { pick, .. }) = self.dialog.as_mut() else {
+            return;
+        };
+        if !pick.starting {
+            return;
+        }
+        if !waiting && (cover.is_none() || rendering) {
+            self.dialog = None;
+        } else {
+            pick.cover = cover;
+        }
+    }
+
     /// The export destination the native chooser picked: into the OPEN
     /// dialog (so the row updates under the hand) and the session memory.
     pub fn set_export_dir(&mut self, dir: std::path::PathBuf) {
@@ -39342,8 +39450,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::ProjectExportOpen => {
                 let mut spec = self.export_project_spec.clone();
                 // A stale span from an earlier session of the dialog must
-                // not outlive the selection it named.
+                // not outlive the selection it named: the TIME chip is what
+                // is remembered, and the span is resolved again at the press.
+                // A typed one comes back in its fields (`export_pick`).
+                let custom = spec.span.filter(|_| spec.time == crate::ports::ExportTime::Custom);
                 spec.span = None;
+                let pick = self.export_pick(&spec, custom);
+                if spec.tracks.is_some() {
+                    spec.tracks = Some(pick.tracks.iter().filter(|r| r.on).map(|r| r.id).collect());
+                }
                 // **And the SAMPLE RATE opens on the device's own.**
                 //
                 // `ProjectExportSpec::default()` rests at 48000 and the
@@ -39367,13 +39482,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 self.dialog = Some(Dialog::ExportProject {
                     spec,
-                    sel: self.time_sel.filter(|(a, b)| b > a),
+                    sel: self.loop_region(),
                     home: self.export_home().display().to_string(),
+                    pick,
                 });
             }
             DialogAction::ProjectExportRun(spec) => {
                 // Remembered for the session: an export is run a dozen
-                // times an evening with one field changed.
+                // times an evening with one field changed. The TRACKS and
+                // TIME choices with it, the way every other row is.
                 self.export_project_spec = spec.clone();
                 self.project_request = Some(crate::ports::ProjectRequest::Export(spec));
             }
@@ -44842,6 +44959,9 @@ impl TangentApp {
                 // BEFORE the window is borrowed: `quantize_target` reads the
                 // whole app and cannot run inside a mutable borrow of one
                 // field.
+                // The Export window, once pressed, carries the host's cover
+                // until its pass has started, and then goes.
+                self.settle_export_dialog();
                 if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
                     let now = self.quantize_target();
                     let sig = self.settings.time_signature();
@@ -57145,6 +57265,123 @@ mod tests {
     /// exported into one `Exports/project/` and each `mix.wav` replaced the
     /// last project's. The Export dialog's DIRECTORY row says which folder,
     /// before anything is written.
+    /// **The Export window's TRACKS checklist: no folder in it, a folder's
+    /// members named under it, a bus marked, and checked from the desk's
+    /// selection** (a selected folder checks its members), else from what
+    /// the session's last export checked, else everything.
+    #[test]
+    fn the_export_checklist_leaves_out_folders_and_opens_on_the_desks_selection() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for (ch, name) in [(0usize, "Kick"), (1, "Bass"), (3, "GROUP"), (4, "KID A"), (5, "KID B")] {
+            app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+            app.settings.rows[ch].name = name.to_owned();
+        }
+        app.settings.rows[3].folder = true;
+        app.settings.rows[4].in_folder = true;
+        app.settings.rows[5].in_folder = true;
+        app.make_bus_on(6, recorder::BusRole::Bus);
+        let id = |app: &TangentApp, r: usize| app.track_id_at(r);
+        app.selected_tracks = vec![id(&app, 0), id(&app, 3)];
+        let spec = crate::ports::ProjectExportSpec { tracks: Some(Vec::new()), ..Default::default() };
+        let pick = app.export_pick(&spec, None);
+        assert!(pick.tracks.iter().all(|t| t.id != id(&app, 3)), "the folder is in the checklist");
+        assert_eq!(pick.tracks.len(), app.desk_extent() - 1, "a row other than the folder is missing");
+        let ids: Vec<crate::desk_id::TrackId> = (0..app.desk_extent()).map(|r| id(&app, r)).collect();
+        let row = |pick: &dialogs::ExportPick, r: usize| {
+            pick.tracks.iter().find(|t| t.id == ids[r]).cloned().expect("the row")
+        };
+        assert_eq!(row(&pick, 4).label, "GROUP / KID A", "a member does not say whose it is");
+        assert!(row(&pick, 6).label.ends_with("(bus)"), "the bus is not marked");
+        let on: Vec<usize> = (0..app.desk_extent()).filter(|r| *r != 3 && row(&pick, *r).on).collect();
+        assert_eq!(on, vec![0, 4, 5], "the desk's selection (a folder's members for the folder) did not come up checked");
+        // Nothing selected: what the last export checked, still standing.
+        app.selected_tracks.clear();
+        let spec = crate::ports::ProjectExportSpec { tracks: Some(vec![id(&app, 1)]), ..Default::default() };
+        let pick = app.export_pick(&spec, None);
+        let on: Vec<usize> = (0..app.desk_extent()).filter(|r| *r != 3 && row(&pick, *r).on).collect();
+        assert_eq!(on, vec![1], "the last export's tracks did not come back");
+        // Nothing to go on: everything.
+        let pick = app.export_pick(&crate::ports::ProjectExportSpec::default(), None);
+        assert!(pick.tracks.iter().all(|t| t.on));
+        // And the dialog opens on it, the spec's tracks the boxes.
+        app.export_project_spec.tracks = Some(vec![id(&app, 1)]);
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        match &app.dialog {
+            Some(Dialog::ExportProject { spec, pick, .. }) => {
+                assert_eq!(spec.tracks, Some(vec![id(&app, 1)]));
+                assert_eq!(pick.tracks.iter().filter(|t| t.on).count(), 1);
+            }
+            _ => panic!("the Export dialog did not open"),
+        }
+    }
+
+    /// **Once Export is pressed the window carries the host's cover until
+    /// the pass has started, and only then goes.** The fault: "the loading
+    /// message for exporting stems shows up under the export options
+    /// window". The window closed on the press and the host's "Preparing
+    /// export" was painted in the main window alone, behind it - and the
+    /// window was still on screen when the setup's block began. Now it holds
+    /// the cover itself while the host's request is pending or its cover
+    /// stands, and goes the frame after: the cover down, or the export
+    /// window up to carry the render. A press the host refused raises no
+    /// cover, so the window goes at once.
+    ///
+    /// Revert-check: have `settle_export_dialog` close the window whenever
+    /// it is starting and the first assert below goes red.
+    #[test]
+    fn a_pressed_export_window_carries_the_cover_until_the_pass_has_started() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let frame = |ctx: &egui::Context, app: &mut TangentApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let press = |app: &mut TangentApp| {
+            app.apply_dialog_action(DialogAction::ProjectExportOpen);
+            if let Some(Dialog::ExportProject { pick, .. }) = app.dialog.as_mut() {
+                pick.starting = true;
+            }
+        };
+        let starting = |app: &TangentApp| match &app.dialog {
+            Some(Dialog::ExportProject { pick, .. }) => Some((pick.starting, pick.cover.is_some())),
+            _ => None,
+        };
+        let cover = crate::busy::Busy::new("Preparing export").with_detail("stems");
+        // The host has the request and its cover stands: the window holds
+        // it, whatever frame it is.
+        press(&mut app);
+        app.set_surface_cover(Some(cover.clone()));
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+            assert_eq!(starting(&app), Some((true, true)), "the window went while the host's cover stood");
+        }
+        // The request not taken yet: it waits for it, cover or none.
+        app.set_surface_cover(None);
+        app.project_request = Some(crate::ports::ProjectRequest::Save);
+        frame(&ctx, &mut app);
+        assert!(starting(&app).is_some(), "the window went before the host took the export");
+        app.project_request = None;
+        // The cover down: the pass has started, and the window goes.
+        frame(&ctx, &mut app);
+        assert_eq!(starting(&app), None, "the window outlived the start of its pass");
+        // The export window up carries the render, cover or none.
+        press(&mut app);
+        app.set_surface_cover(Some(cover));
+        app.set_export_progress(Some(crate::ports::ExportProgress::default()));
+        frame(&ctx, &mut app);
+        assert_eq!(starting(&app), None, "the window stayed up under the export window");
+        app.set_export_progress(None);
+        app.set_surface_cover(None);
+        // A window nobody pressed Export in is not closed by any of this.
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        frame(&ctx, &mut app);
+        assert_eq!(starting(&app), Some((false, false)), "an unpressed window closed");
+    }
+
     #[test]
     fn each_projects_exports_land_in_a_folder_of_its_own() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
