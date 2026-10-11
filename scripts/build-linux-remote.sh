@@ -142,7 +142,7 @@ if [ -x dist/vendor/linux/tangent-ffmpeg ]; then
 fi
 
 # ── Build ────────────────────────────────────────────────────────────────────
-echo "==> Building the standalone (first run compiles everything)"
+echo "==> Building the app (first run compiles everything)"
 ssh_ "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
 
 # ── Bring it home ────────────────────────────────────────────────────────────

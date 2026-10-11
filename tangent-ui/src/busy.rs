@@ -103,8 +103,8 @@
 //!
 //! A pure painter over a given rect, like every other band in this crate: the
 //! only state it keeps is when it was first painted and when it last had
-//! something new to say, both stamped by its own [`Busy::draw`]. No viewport,
-//! no window, nothing the plugin build cannot do.
+//! something new to say, both stamped by its own [`Busy::draw`]. No viewport
+//! and no window, so it draws the same in a window, inline and in a test.
 
 use crate::face::fit_mono;
 use crate::fonts;
@@ -709,8 +709,8 @@ fn veil_of(face: Color32) -> (Color32, f32) {
 /// Air between the card and the edge of the window.
 const MARGIN: f32 = 16.0;
 /// The card's nominal width, and the narrowest it may be squeezed to before
-/// the overlay gives up and shows the scrim alone. A plugin editor is a small
-/// window and this has to be sane inside one.
+/// the overlay gives up and shows the scrim alone. A window can be small, and
+/// this has to be sane inside one.
 const CARD_W: f32 = 440.0;
 const CARD_MIN_W: f32 = 160.0;
 /// The card's inner margin.
@@ -1187,8 +1187,8 @@ mod tests {
     }
 
     /// It must draw at every size a window can be, including the degenerate
-    /// ones and the small ones a plugin editor really is — an overlay that
-    /// panics turns a slow operation into a crashed one.
+    /// ones and the very small ones: an overlay that panics turns a slow
+    /// operation into a crashed one.
     #[test]
     fn it_draws_at_every_size_without_panicking() {
         let ctx = ctx();

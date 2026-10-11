@@ -19,8 +19,8 @@
 //! a desk at all ([`Structural`]: too many rows, two rows with one id, the
 //! wrong shape) is refused, and then the refusal carries the raw JSON so the
 //! caller can keep it beside the file rather than lose it. What the caller
-//! does with a refusal (a side file, `extra["desk_refused"]`, a refused open)
-//! is the persistence lane's; this module never touches the disk.
+//! does with a refusal (a side file, a refused open) is the persistence
+//! lane's; this module never touches the disk.
 //!
 //! **Nothing is allocated by a value.** A key's number (`t4000000000`,
 //! `c65535`, a hardware jack) is parsed and compared, never used as a size;
@@ -42,10 +42,10 @@ use crate::recorder::MidiInputSel;
 /// The `format` a format-2 desk says it is.
 pub const DESK_FORMAT: u64 = 2;
 
-/// **The one switch.** On: settings, documents, templates and DAW blobs
-/// write the format-2 desk, stamped 23 and 8, with the backups, the pending
-/// marker, the drumpad's track keys and the host's pstate names that come
-/// with it. Flipped by W4-integrate (B) in the commit that lands the
+/// **The one switch.** On: settings (the file and the JSON road),
+/// documents and templates write the format-2 desk, stamped 23 and 8, with
+/// the backups, the pending marker, the drumpad's track keys and the host's
+/// pstate names that come with it. Flipped by W4-integrate (B) in the commit that lands the
 /// copy-only shelf (`tangent/src/shelf.rs`), so nothing is ever written in
 /// format 2 before every plugin state can be found by its new name.
 pub const WRITE_V8: bool = true;

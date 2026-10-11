@@ -26,9 +26,11 @@ Before it, §2j: one gesture set across all eight knobs.
 Before it, §2i (the master column) and §2h (six effect knobs, the true-peak
 limiter, video without a camera).
 Before it, §2d: the fretboard voicing solver and the guitar view. §2c before it has the
-rename, the 2.2.0 tester-report UI fixes, the egui 0.33 downgrade and the
-MIT/GPLv3 split. Read §2c then §2d FIRST; everything above them still says
-"Ivory" and that is now the internal codename, not the product.
+rename, the 2.2.0 tester-report UI fixes and the egui 0.33 downgrade; the
+MIT/GPLv3 split it also records ended with the VST3 plugin, which stopped
+shipping at 4.77.0 and whose crate was removed on 2026-10-10. Read §2c then §2d
+FIRST; everything above them still says "Ivory" and that is now the internal
+codename, not the product.
 This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
@@ -251,16 +253,20 @@ exact asset name. The `Tangent-*` aliases were also back-filled onto the v2.2.0
 release, because the fulfilment email was redeployed with new links before new
 assets existed and 404'd for about ten minutes.
 
-**egui/eframe are pinned at 0.33, deliberately, and must NOT be bumped.**
-`nih_plug_egui` pins egui 0.31 through a stale `egui-baseview` rev; upstream
-`egui-baseview` is on 0.33. 0.33 is the only version where the desktop app and
-a nih-plug plugin editor can share one GUI. Bumping to 0.35 forks the GUI in
-two. The API differences that bite: eframe 0.33 uses `App::update(ctx)` not
-`App::ui(ui)`, `show_viewport_immediate` hands the closure a `Context` not a
-`Ui`, `Context::run` not `run_ui`, and `Stroke::new` takes `impl Into<f32>` so
-float literals need `_f32`. All of the Context-to-Ui bridging is one function,
-**`ivory/src/shell.rs::viewport_ui`**, which is also the shape the plugin
-editor needs. It is tested to hand over the whole viewport, because a default
+**egui/eframe are pinned at 0.33, deliberately.** *Retired reason
+(2026-10-10): the pin was chosen so the desktop app and the nih-plug plugin
+editor could share one GUI, and the plugin crate is gone, so this paragraph's
+"must not be bumped" no longer binds; whether to lift the pin is a separate
+call.* As written then: `nih_plug_egui` pins egui 0.31 through a stale
+`egui-baseview` rev; upstream `egui-baseview` is on 0.33. 0.33 is the only
+version where the desktop app and a nih-plug plugin editor can share one GUI.
+Bumping to 0.35 forks the GUI in two. The API differences that bite, still
+true of 0.33: eframe 0.33 uses `App::update(ctx)` not `App::ui(ui)`,
+`show_viewport_immediate` hands the closure a `Context` not a `Ui`,
+`Context::run` not `run_ui`, and `Stroke::new` takes `impl Into<f32>` so float
+literals need `_f32`. All of the Context-to-Ui bridging is one function,
+**`ivory/src/shell.rs::viewport_ui`**, which was also the shape the plugin
+editor needed. It is tested to hand over the whole viewport, because a default
 `CentralPanel` adds margin and would silently shift the piano.
 
 **2.2.0 tester-report fixes** are D-UI-10 through D-UI-14 in DIVERGENCES.md:
@@ -280,6 +286,13 @@ is ordered and proven deterministic; out-of-range pitches fold to their pitch
 class and are flagged rather than dropped. **Next: the voicing solver**, which
 is where the taste lives and which the owner must play-test, since determinism
 is testable and musicality is not.
+
+> **Retired (2026-10-10).** The next two paragraphs are the 2.x record. The
+> VST3 plugin stopped shipping at 4.77.0, and its crate (`plugin/`),
+> `scripts/build-plugin.sh`, `scripts/verify-plugin.c` and `LICENSE-GPL-3.0`
+> were removed on 2026-10-10 by the owner's ruling ("yes, delete the plugin
+> crate too"). LICENSING.md now covers one MIT program and the lawfulness of
+> hosting other people's plugins.
 
 **LICENSING.md** records the MIT/GPLv3 split: everything in the repo stays MIT
 including the standalone binary; only the `.vst3` bundle is GPL-3.0-or-later,
@@ -447,6 +460,12 @@ overflow panic (`note_slack: usize::MAX`), but determinism was never reviewed.
 
 ## 2e. 2026-08-14 — 2.3.0 shipped, and the plugin is half built
 
+> **Retired (2026-10-10).** The plugin this section starts building stopped
+> shipping at 4.77.0, and its crate, `docs/PLUGIN-PLAN.md`,
+> `scripts/build-plugin.sh` and `scripts/verify-plugin.c` were removed on
+> 2026-10-10 by the owner's ruling. The plugin subsections below are the
+> record of how it was built, not work to pick up.
+
 **2.3.0 IS PUBLIC** on all three platforms (macOS signed+notarized, Windows,
 Linux x86_64 — the first Linux build this project has ever produced). Every
 permalink, including the legacy `Ivory-*` names in supporter emails already
@@ -541,6 +560,13 @@ one — it must be GATED, not merely left to no-op.
 
 ## 2f. 2026-08-14 (later) — the plugin exists, and so do the installers
 
+> **Retired (2026-10-10).** The plugin described here is gone (see the note
+> under §2e). What still holds: the theory band and its play-test, the
+> `send_viewport_cmd` seam, the `llvm-rc` and `lsbom` lessons,
+> `build-cross.sh`, the two process lessons, and the installers, which now
+> carry only the app and clean up a `Tangent.vst3` an older install left
+> behind.
+
 **The VST3 plugin is built, loads and instantiates.** Steps 5-8 of
 `docs/PLUGIN-PLAN.md` are done. Also landed: the theory band (a new user
 request), and a fix for a Windows bug that had shipped in every release.
@@ -578,6 +604,8 @@ keeping every call, gated on `caps`. The seam was three things, not nine:
 and keeps exactly the third of the mechanism that does damage.
 `a_plugin_frame_never_commands_the_hosts_window` runs four frames under
 `Caps::PLUGIN` and asserts zero commands; it fails if any one gate is removed.
+(Now `a_frame_that_does_not_own_the_window_commands_nothing`, under
+`Caps::NONE`, the test harness's capability set.)
 
 **`llvm-rc` treats any argument starting with `/` as a switch.** An absolute
 Unix input path is therefore not an input: `/Users/...` parses as `/U` and it
@@ -636,13 +664,14 @@ rewriting rather than re-deriving.
 
 ### What is NOT done
 
-1. **Nobody has opened the plugin in a DAW.** It loads, instantiates and
-   reports one event input and no audio buses under `scripts/verify-plugin.c`,
-   which is real proof and is not the same as seeing it draw. Test it in
-   Reaper: MIDI track, add Tangent, play.
-2. **The Linux plugin has not been built.** No ssh key for the Void box exists
-   on this machine (`~/.ssh` has only `codeberg_ed25519`). One
-   `ssh-copy-id` and `scripts/build-linux-remote.sh <host>` does the rest.
+1. *(Moot since the plugin was removed, 2026-10-10.)* **Nobody has opened
+   the plugin in a DAW.** It loads, instantiates and reports one event input
+   and no audio buses under `scripts/verify-plugin.c`, which is real proof and
+   is not the same as seeing it draw. Test it in Reaper: MIDI track, add
+   Tangent, play.
+2. *(Moot, the same.)* **The Linux plugin has not been built.** No ssh key for
+   the Void box exists on this machine (`~/.ssh` has only `codeberg_ed25519`).
+   One `ssh-copy-id` and `scripts/build-linux-remote.sh <host>` does the rest.
 3. **The macOS .pkg is unsigned.** It needs a *Developer ID Installer*
    certificate — a different certificate from the *Developer ID Application*
    one that already signs and notarizes the app, same account, separate
@@ -657,10 +686,11 @@ rewriting rather than re-deriving.
 ### Commands added this round
 
 ```
-scripts/build-plugin.sh macos|windows|linux    # the .vst3 bundle
 scripts/build-installer.sh macos|windows|linux # the installers
-cc -o /tmp/vp scripts/verify-plugin.c && /tmp/vp <bundle>/Contents/MacOS/Tangent
 ```
+
+(`scripts/build-plugin.sh` and `scripts/verify-plugin.c` were listed here too;
+both were removed with the plugin on 2026-10-10.)
 
 ## 2g. 2026-08-18 — the built-in instrument, its patches, and two effect knobs
 

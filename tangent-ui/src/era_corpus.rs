@@ -17,9 +17,9 @@
 //! observation below is a plain-text picture of what a fixture opened as,
 //! and each fixture's picture is pinned as written.
 //!
-//! The DAW blobs ride the same road (`Settings::from_json` is the plugin's
-//! `#[persist = "settings"]` reader), here rather than in the plugin crate,
-//! whose tests the gate does not run.
+//! The DAW blobs are what the retired VST3 saved into a DAW project (its
+//! `#[persist = "settings"]` field, written by `Settings::to_json`), kept as
+//! fixtures because `Settings::from_json` still reads that text.
 //!
 //! `TANGENT_ERA_DUMP=/some/dir cargo test -p tangent-ui --lib
 //! era_corpus::write_observations -- --ignored` writes each fixture's
@@ -360,8 +360,9 @@ fn the_24_channel_window_opens_to_its_lifted_picture_under_the_switch() {
 
 /// **Opened once, every fixture is a fixed point**: written by this build
 /// and read back, it writes the same bytes and opens to the same picture.
-/// The DAW blobs are the plugin's whole persistence, so a blob that drifted
-/// on each save would drift in every project that holds it.
+/// A DAW blob was the retired VST3's whole persistence, so a blob that
+/// drifted on each save drifted in every project that held it; the JSON
+/// road keeps the same promise.
 #[test]
 fn every_fixture_round_trips_once_opened() {
     round_trips();
@@ -1127,8 +1128,9 @@ const DEFAULT_V2_BYTES: (u64, usize) = (0x2b4e_95dd_5375_0895, 29341);
 #[test]
 fn production_writes_the_format_2_bytes() {
     assert!(crate::desk_format::WRITE_V8, "the switch is off: production writes the legacy desk");
-    // `to_json` is the DAW blob's text (compact); the file is the same map
-    // pretty-printed, which `FORMAT2_BYTES` pins through `settings_v2`.
+    // `to_json` is the JSON road's text (compact, a DAW blob's shape); the
+    // file is the same map pretty-printed, which `FORMAT2_BYTES` pins
+    // through `settings_v2`.
     let compact = |s: &Settings| Value::Object(s.to_map_as(Format::V2)).to_string();
     for (name, text) in SETTINGS {
         let s = Settings::from_json(text);
@@ -1346,12 +1348,13 @@ fn refusable(desk: &mut Value) {
     desk["rows"][1]["id"] = first;
 }
 
-/// **A refused desk refuses the document's OPEN and touches nothing**, and
-/// a DAW blob keeps it across a save: the blob is the only copy, so the
-/// raw desk rides under `extra["desk_refused"]` while every other setting
-/// is read.
+/// **A refused desk refuses the document's OPEN and touches nothing**: the
+/// strict read says why, and a lenient read and its save keep the raw desk
+/// as the file had it. (The settings file's half, a side file and every
+/// other setting kept, is `a_refused_settings_desk_keeps_every_other_setting`
+/// in settings.rs.)
 #[test]
-fn a_refused_desk_refuses_the_open_and_rides_a_daw_blob() {
+fn a_refused_desk_refuses_the_open_and_touches_nothing() {
     let (_, text) = DOCUMENTS[5];
     let mut v: Value = serde_json::from_str(&document_v2(&Arrangement::from_json(text))).expect("json");
     refusable(&mut v["desk"]);
@@ -1370,18 +1373,6 @@ fn a_refused_desk_refuses_the_open_and_rides_a_daw_blob() {
     let after: Value = serde_json::from_str(&std::fs::read_to_string(&doc).expect("doc")).expect("json");
     assert_eq!(after["desk"], v["desk"], "a lenient save wrote the refused desk away");
     let _ = std::fs::remove_dir_all(&dir);
-
-    let (_, blob) = SETTINGS[10];
-    let mut b: Value = serde_json::from_str(&settings_v2(&Settings::from_json(blob))).expect("json");
-    refusable(&mut b["desk"]);
-    b["theme_name"] = Value::from("Kept Theme");
-    let s = Settings::from_json(&b.to_string());
-    assert_eq!(s.theme_name, "Kept Theme", "a refused desk cost another setting");
-    assert_eq!(s.legacy_inserts(), Settings::default().legacy_inserts(), "the desk is not the default desk");
-    assert_eq!(s.extra.get("desk_refused"), Some(&b["desk"]), "the raw desk was not kept");
-    assert!(s.desk_notice.as_deref().is_some_and(|n| n.contains("could not be read")), "the refusal was not said");
-    let saved = Settings::from_json(&s.to_json());
-    assert_eq!(saved.extra.get("desk_refused"), Some(&b["desk"]), "a save lost the refused desk");
 }
 
 /// **What the format-2 writers write for every era fixture**, pinned: the

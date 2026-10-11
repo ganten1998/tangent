@@ -110,10 +110,10 @@ pub enum MenuAction {
     SetTuning(String),
     /// Open the custom-tuning editor.
     ///
-    /// A dialog, not a window, which is why it survives in a plugin for the
-    /// same reason "Teach Chord Name..." does: it needs no second OS window, no
+    /// A dialog, not a window, so it is offered under every `Caps` for the
+    /// same reason "Teach Chord Name..." is: it needs no second OS window, no
     /// device and no size of its own. It is offered only while the fretboard is
-    /// showing — an editor for something the user cannot see is a control with
+    /// showing: an editor for something the user cannot see is a control with
     /// no visible effect.
     EditCustomTuning,
     SetCapo(u8),
@@ -437,8 +437,8 @@ enum Entry {
 /// Push a category, as a hover when there is something worth hovering for.
 ///
 /// The shape follows the content, which is what keeps `Caps` honest: under
-/// `Caps::PLUGIN` the Window category loses Borderless and Keyboard loses its
-/// device row, so a category can arrive here with one item or none. An empty
+/// `Caps::NONE` the Window category loses Borderless and the reader row, so a
+/// category can arrive here with one item or none. An empty
 /// hover is a dead end the user cannot tell from a bug, and a one-item hover
 /// charges a hover to reach a single row. So nothing vanishes, one item is
 /// drawn as an ordinary row, and two or more open.
@@ -807,8 +807,8 @@ const REST_FOR: std::time::Duration = std::time::Duration::from_millis(60);
 /// where a whole row would make the first deliberate hover feel dead.
 const ARM_SLOP: f32 = 6.0;
 
-/// Stable surface identities. On the desktop these are viewport ids; in a
-/// plugin they are `Area` ids. One string each, so the two paths cannot drift.
+/// Stable surface identities. As windows these are viewport ids; inline they
+/// are `Area` ids. One string each, so the two paths cannot drift.
 const MENU_ID: &str = "ivory-menu";
 const SUBMENU_ID: &str = "ivory-menu-sub";
 
@@ -865,7 +865,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // anything useful without; a hover to reach it was a hover charged to
     // everybody once, on the day they could least afford it.
     //
-    // A plugin is handed its notes by the host and has no device to choose.
+    // Only where there are ports to choose from (`Caps::midi_ports`).
     if view.caps.midi_ports {
         everywhere.push(item("Select MIDI Input...", MenuAction::SelectMidiInput));
     }
@@ -878,20 +878,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // one hover from the top, and Borderless joins them because it is the only
     // other thing there is to say about the window.
     let mut window: Vec<SubItem> = Vec::new();
-    if view.caps.size_presets {
-        // Offered wherever a size can be CHOSEN, which includes a plugin: it
-        // cannot set its own window, but it can ask, and VST3 has a path for
-        // exactly that. Leaving it out was the difference between an editor you
-        // can read and one you cannot.
-        window.extend(SIZE_PERCENTS.iter().map(|&p| SubItem {
-            label: format!("{p}%"),
-            action: MenuAction::SetSizePercent(p),
-            enabled: true,
-        }));
-    }
+    window.extend(SIZE_PERCENTS.iter().map(|&p| SubItem {
+        label: format!("{p}%"),
+        action: MenuAction::SetSizePercent(p),
+        enabled: true,
+    }));
     // Borderless is a different question with a different answer: window
-    // chrome belongs to whoever owns the window, and in a plugin that is the
-    // host. Label shows what you would switch TO.
+    // chrome belongs to whoever owns the window, so it is offered only where
+    // that is us (`Caps::window_sizing`). Label shows what you would switch TO.
     if view.caps.window_sizing {
         window.push(row(
             if view.borderless {
@@ -903,9 +897,8 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         ));
     }
     // **Where a person goes looking for it**, which is the same category as
-    // every other question about how the window behaves. Only where there
-    // ARE child windows to give up: in a plugin the dialogs are already
-    // inline and the row would be a switch with nothing on either side of it.
+    // every other question about how the window behaves. Only where the
+    // window is ours to arrange (`Caps::window_sizing`), which is every build.
     if view.caps.window_sizing {
         window.push(row(
             if view.screen_reader {
@@ -1374,7 +1367,8 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     tail.push(Entry::Separator);
     // **The band's own door.** Its key (V) retired as unused clutter, and
     // the rule stands: a feature whose key leaves gets its row back. Gated
-    // like every recorder row — a plugin editor has no band to show.
+    // like every recorder row: a build with no capture devices has no band
+    // to show.
     if view.caps.capture_devices {
         tail.push(item(
             if view.recorder_on {
@@ -1575,11 +1569,12 @@ impl MenuState {
 
         // Squeeze to fit, when there is a hard ceiling.
         //
-        // A menu that scrolls is a menu that LOOKS cut off — the rows past the
-        // edge are simply absent, and nothing on screen says to scroll. On a
-        // desktop it never comes up: the menu is its own window and may be
-        // taller than the app. In a plugin editor, which can easily be shorter
-        // than the ~550 points this menu wants, it came up immediately.
+        // A menu that scrolls is a menu that LOOKS cut off: the rows past the
+        // edge are simply absent, and nothing on screen says to scroll. With
+        // child windows it never comes up: the menu is its own window and may
+        // be taller than the app. Drawn inside the window (screen-reader mode,
+        // fullscreen), in a window that can easily be shorter than the ~550
+        // points this menu wants, it came up immediately.
         //
         // Menus are static once shown, so the fix is to measure first and
         // shrink the rows until the whole thing fits. Down to a floor: below
@@ -1593,8 +1588,8 @@ impl MenuState {
             // the screen but cannot shrink it. Themes is the tall one: the
             // factory set went to thirty-two on 2026-10-08, which with its
             // headings is thirty-five rows (735 points at 21) before any
-            // user theme, and on a short plugin editor the bottom of the
-            // list simply was not there.
+            // user theme, and on a short screen the bottom of the list
+            // simply was not there.
             let tallest_sub = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -2161,8 +2156,9 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     // ── Closing when the user goes elsewhere ───────────────────────────────
     //
     // Two different signals for the same intent, because the two hosts offer
-    // different evidence. A window knows it lost focus; a layer in someone
-    // else's window has no focus to lose and has to watch the pointer instead.
+    // different evidence. A window knows it lost focus; a layer inside the
+    // main window has no focus of its own to lose and has to watch the
+    // pointer instead.
     if caps.child_windows {
         if menu_report.focused == Some(true)
             || submenu_report.is_some_and(|r| r.focused == Some(true))
@@ -2388,7 +2384,7 @@ mod tests {
         // the background colour, so the order it is drawn in is the same
         // question with a quieter answer.
         let mut v = view();
-        v.caps = Caps::PLUGIN;
+        v.caps = Caps::NONE;
         let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let menu = {
             let st = state.as_ref().expect("the menu did not open");
@@ -2463,7 +2459,7 @@ mod tests {
             |_| {},
         );
         let mut v = view();
-        v.caps = Caps::PLUGIN;
+        v.caps = Caps::NONE;
         let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let (menu, row_h, row_top) = {
             let st = state.as_ref().expect("the menu did not open");
@@ -2540,7 +2536,7 @@ mod tests {
             |_| {},
         );
         let mut v = view();
-        v.caps = Caps::PLUGIN;
+        v.caps = Caps::NONE;
         let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let (menu, row_h, tops) = {
             let st = state.as_ref().expect("the menu did not open");
@@ -3033,9 +3029,9 @@ mod tests {
     /// Most of what these tests assert is "this row exists, with this label,
     /// greyed exactly when it cannot act". Grouping the menu into categories
     /// moved a dozen rows one level down without changing any of that, so the
-    /// tests ask the whole menu rather than the top level of it. The plugin
-    /// test in particular MUST use this: a row that needs a window is just as
-    /// dead one level down.
+    /// tests ask the whole menu rather than the top level of it. A test of
+    /// what `Caps` takes away in particular MUST use this: a row that needs a
+    /// device is just as dead one level down.
     fn all_rows(v: MenuView) -> Vec<(String, MenuAction, bool)> {
         build_entries(v)
             .into_iter()
@@ -3285,7 +3281,7 @@ mod tests {
             detection_enabled: false,
             ..view()
         });
-        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+        for caps in [Caps::DESKTOP, Caps::NONE, Caps::MINIMAL] {
             both(MenuView { caps, ..fullest() });
         }
     }
@@ -3429,7 +3425,7 @@ mod tests {
     /// `clamp_submenu` and then simply ran off the bottom. Themes is the
     /// tallest there is since the factory set went to thirty-two, and a
     /// person with a few themes of their own makes it taller still; a
-    /// 640-point plugin editor is the short case that matters.
+    /// 640-point screen is the short case that matters.
     #[test]
     fn the_themes_hover_fits_a_short_screen() {
         let ctx = egui::Context::default();
@@ -3455,13 +3451,13 @@ mod tests {
 
     /// A category must be worth the hover it costs.
     ///
-    /// `Caps` can hollow one out (Window loses Borderless in a plugin,
-    /// Keyboard loses its device row), and an empty hover is a dead end the
+    /// `Caps` can hollow one out (Window loses Borderless and the reader row
+    /// without `window_sizing`), and an empty hover is a dead end the
     /// user cannot tell from a bug, while a one-item hover charges a hover for
     /// a single row.
     #[test]
     fn no_category_opens_onto_nothing_or_onto_a_single_row() {
-        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+        for caps in [Caps::DESKTOP, Caps::NONE, Caps::MINIMAL] {
             for on in [false, true] {
                 let v = MenuView {
                     caps,
@@ -3562,7 +3558,7 @@ mod tests {
     /// row offers to pop a surface out or put one back.
     #[test]
     fn nothing_can_be_detached_any_more() {
-        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+        for caps in [Caps::DESKTOP, Caps::NONE, Caps::MINIMAL] {
             let v = MenuView { caps, ..fullest() };
             for (label, ..) in all_rows(v) {
                 assert!(
@@ -3574,9 +3570,9 @@ mod tests {
     }
 
     /// The custom-tuning editor is a fretboard control, so it appears with the
-    /// fretboard and not before. It is a dialog rather than a window, so it
-    /// survives a plugin, by the same reasoning that keeps "Teach Chord
-    /// Name..." there.
+    /// fretboard and not before. It is a dialog rather than a window, so it is
+    /// offered under every `Caps`, by the same reasoning that keeps "Teach
+    /// Chord Name..." there.
     #[test]
     fn custom_tuning_is_offered_only_while_the_fretboard_is_showing() {
         assert_eq!(
@@ -3592,11 +3588,11 @@ mod tests {
             find(on.clone(), MenuAction::EditCustomTuning),
             Some(("Custom Tuning...".to_owned(), true))
         );
-        let plugin = MenuView {
-            caps: Caps::PLUGIN,
+        let bare = MenuView {
+            caps: Caps::NONE,
             ..on.clone()
         };
-        assert!(find(plugin, MenuAction::EditCustomTuning).is_some());
+        assert!(find(bare, MenuAction::EditCustomTuning).is_some());
         // It sits in the Fretboard hover, NOT in Tuning, where every item must
         // resolve to a shipped tuning.
         assert!(sub(on.clone(), "Fretboard")
@@ -3647,25 +3643,26 @@ mod tests {
         assert_eq!(actions.len(), crate::settings::ResetScope::ALL.len());
     }
 
-    /// In a plugin, every row that survives must be one the host can actually
-    /// honour. An inert row is worse than an absent one: the user cannot tell
-    /// whether they mis-clicked or the app is broken.
+    /// With every capability withheld, no row that needs a window, a MIDI
+    /// port or a capture device survives. An inert row is worse than an
+    /// absent one: the user cannot tell whether they mis-clicked or the app
+    /// is broken.
     #[test]
-    fn no_surviving_plugin_row_needs_a_window_or_a_device() {
+    fn no_surviving_row_needs_a_window_or_a_device_the_host_lacks() {
         let v = MenuView {
-            caps: Caps::PLUGIN,
+            caps: Caps::NONE,
             fretboard_on: true,
             detection_enabled: true,
             chord_strip: true,
-            // Turned ON deliberately. The settings file is shared with the
-            // standalone, so a plugin WILL be handed `show_recorder: true` by
-            // somebody's config; the category has to be absent because of
-            // `caps`, not because the flag happened to be false.
+            // Turned ON deliberately. A settings file a Full build wrote says
+            // `show_recorder: true`, and any host may be handed it; the
+            // category has to be absent because of `caps`, not because the
+            // flag happened to be false.
             recorder_on: true,
             // And an instrument LOADED, for the same reason: the settings file
-            // remembers a plugin path, so a plugin instance will be handed one.
-            // The Instrument Window and Unload rows have to be absent because
-            // of `caps`, not because nothing happened to be loaded.
+            // remembers a plugin path, so any host may be handed one. The
+            // Instrument Window and Unload rows have to be absent because of
+            // `caps`, not because nothing happened to be loaded.
             metronome_on: true,
             ..view()
         };
@@ -3675,8 +3672,8 @@ mod tests {
         // survives a few lines down.
         //
         // EVERY recorder action is here. It is forbidden by what it is ABOUT:
-        // a capture a plugin may not perform, so a row offering it is a
-        // promise the editor cannot keep. The detach pairs, the take's own
+        // a capture this host may not perform, so a row offering it is a
+        // promise it cannot keep. The detach pairs, the take's own
         // rows, the click and the count-in that stood here went with their
         // rows (`every_menu_action_is_built_somewhere`).
         let forbidden = [
@@ -3687,29 +3684,19 @@ mod tests {
         for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),
-                "{label} needs something a plugin editor does not have"
+                "{label} needs something this host does not have"
             );
         }
-        // Size IS offered, and this assertion used to say the opposite —
-        // which is how a plugin shipped with no way to change its size at all.
-        // A plugin cannot SET its geometry, but it can ask the host for one,
-        // and refusing to offer the choice is not the same as being unable to
-        // make it. Borderless is the row that genuinely cannot survive: window
-        // chrome belongs to whoever owns the window.
-        assert!(
-            all_rows(v.clone())
-                .iter()
-                .any(|(_, a, _)| *a == MenuAction::SetSizePercent(100)),
-            "a plugin with no size choices has no way to be made readable"
-        );
+        // Borderless is the row that genuinely cannot survive: window chrome
+        // belongs to whoever owns the window.
         assert!(
             !all_rows(v.clone())
                 .iter()
                 .any(|(_, a, _)| *a == MenuAction::ToggleBorderless),
-            "window chrome is the host's in a plugin"
+            "window chrome was offered by a host that does not own the window"
         );
-        // And what SHOULD survive still does: the whole point is a plugin that
-        // can still teach a chord, change tuning and pick a colour.
+        // And what SHOULD survive still does: a host that can do none of
+        // that can still teach a chord, change tuning and pick a colour.
         let kept = all_rows(v.clone());
         for want in [
             MenuAction::TeachChordName,
@@ -3724,7 +3711,7 @@ mod tests {
             );
         }
         // Every category is still there, and still in the same order: none of
-        // them is emptied out by `Caps::PLUGIN`.
+        // them is emptied out by `Caps::NONE`.
         assert_eq!(
             category_names(v.clone()),
             vec![
@@ -3877,7 +3864,7 @@ mod tests {
                 ..view()
             },
             MenuView {
-                caps: Caps::PLUGIN,
+                caps: Caps::NONE,
                 ..view()
             },
         ] {
@@ -4236,15 +4223,12 @@ mod tests {
     }
 
 
-    /// The subject is absent, not greyed, where no device may be opened. A
-    /// plugin must not reach for a camera behind the DAW's back, and a Minimal
-    /// build has not linked the code that would.
-    ///
-    /// `Caps::PLUGIN` and `Caps::MINIMAL` together, because they arrive at the
-    /// same answer from opposite directions and only one of them is obvious.
+    /// The subject is absent, not greyed, where no device may be opened: a
+    /// Minimal build has not linked the code that would, and `Caps::NONE`
+    /// withholds the devices a build has.
     #[test]
     fn the_recorder_category_is_absent_entirely_without_capture_devices() {
-        for caps in [Caps::PLUGIN, Caps::MINIMAL] {
+        for caps in [Caps::NONE, Caps::MINIMAL] {
             let v = MenuView {
                 caps,
                 recorder_on: true,

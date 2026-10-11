@@ -1075,8 +1075,8 @@ mod tests {
         fixture!("doc-v7.json"),
     ];
 
-    /// The era settings files. (The DAW blobs keep their plugins' state in
-    /// the DAW's project, never on a shelf of ours.)
+    /// The era settings files. (The DAW blobs the retired VST3 saved kept
+    /// their plugins' state in the DAW's project, never on a shelf of ours.)
     const SETTINGS: [(&str, &str); 8] = [
         fixture!("settings-v12.json"),
         fixture!("settings-v17-pads16.json"),
@@ -1849,7 +1849,7 @@ mod tests {
             let mut app = tangent_ui::app::TangentApp::with_license(
                 &ctx,
                 Settings::default(),
-                Caps::PLUGIN,
+                Caps::NONE,
                 crate::composite::tiers::free("shelf"),
             );
             match road {
@@ -1954,7 +1954,7 @@ mod tests {
             let mut app = tangent_ui::app::TangentApp::with_license(
                 &ctx,
                 Settings::default(),
-                Caps::PLUGIN,
+                Caps::NONE,
                 crate::composite::tiers::free("shelf"),
             );
             app.open_project(&doc);
@@ -2008,7 +2008,7 @@ mod tests {
         root: &Path,
     ) -> (tangent_ui::app::TangentApp, PathBuf) {
         let app = || {
-            tangent_ui::app::TangentApp::with_license(ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("shelf"))
+            tangent_ui::app::TangentApp::with_license(ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("shelf"))
         };
         let mut a = app();
         a.bootstrap_project(&root.join("Projects"));

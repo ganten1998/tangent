@@ -37,9 +37,8 @@ use crate::recorder_panel::{contrast_ratio, distinct_surface, luminance, surface
 /// Everything a face needs to dress itself: the dialog surface, and the
 /// cluster's glass. Built once per frame by whoever opens the face, from the
 /// same settings colours the timecode reads, and handed down — the kit never
-/// reaches into `Settings` itself, because the plugin build shares these
-/// panels and a widget that reads global state is a widget that cannot be
-/// tested by handing it colours.
+/// reaches into `Settings` itself, because a widget that reads global state
+/// is a widget that cannot be tested by handing it colours.
 #[derive(Clone, Copy)]
 pub struct FaceStyle {
     pub s: Surface,
@@ -287,9 +286,10 @@ pub fn keep<T>(slot: &mut Option<T>, wish: Option<T>) {
 
 /// Remember which control the hand has just clicked, and hand back the one
 /// it clicked before this. Kept in egui's own per-context scratch — never a
-/// static, because the plugin build runs several contexts in one process,
-/// and never `Settings`, because a widget that reads global state is a widget
-/// that cannot be tested.
+/// static, because one process runs several contexts (the compositor's
+/// offscreen one beside the window's, and every test its own), and never
+/// `Settings`, because a widget that reads global state is a widget that
+/// cannot be tested.
 ///
 /// EVERY click a face row takes has to pass through here, whether or not the
 /// row itself cares about the answer, because the answer is "what did the

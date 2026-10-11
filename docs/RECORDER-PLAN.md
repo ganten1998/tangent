@@ -1,5 +1,13 @@
 # Tangent Recorder: the implementation plan
 
+> **Note (2026-10-10).** This plan is the record of a shipped feature. Where it
+> names `plugin/`, `Caps::PLUGIN`, nih-plug, `pending_resize`, `paint_into`,
+> `request_natural_size` or `docs/PLUGIN-PLAN.md`, it describes the VST3 build
+> of Tangent, which stopped shipping at 4.77.0 and whose crate was removed on
+> 2026-10-10. Its claims that `plugin/` is the only GPL place in the repo are
+> no longer true: there is no GPL code in the repo at all. The test harness's
+> capability set is `Caps::NONE` now.
+
 An all-in-one piano recording view. Press one button; get a directory holding a
 video with the performance audio correctly synced, the audio on its own, and the
 MIDI on its own. Camera preview lives in the window. The standalone can host
