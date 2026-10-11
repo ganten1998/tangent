@@ -1907,12 +1907,25 @@ impl Layout {
         // made a row of buttons that dominated it. The owner: "shrink the
         // scanner/met tempo arm and grid section to be the original height —
         // a half strip (i think) it looks better that way." Twenty IS about
-        // half the corner now, so the two readings agree.
+        // half the corner on a full panel, so the two readings agree there.
+        //
+        // **And twenty is HELD, not half the corner.** The half strip was
+        // first built as a share of the corner's height, which is twenty on
+        // a full panel and less on every shorter one: under 383 points of
+        // arrangement the four shrank with it, to seven points under 157,
+        // and the grid box cut steps that twenty points would have held. The
+        // owner's ruling, "hold buttons at 20pt": twenty whenever the corner
+        // is twenty tall (an arrangement of 209 points and up), and the
+        // corner's own height under that, which is how they were sized
+        // before the ruler grew. The width still wins: on a header too narrow
+        // for four buttons of twenty and the navigator's cell and a half,
+        // the width solve makes all four smaller together. On a full panel
+        // half the corner was already twenty, so it lays out exactly as it
+        // did (`the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty`).
         const TOOL_MAX: f32 = 20.0;
         let side = corner
             .height()
             .min((corner.width() - TOOL_GAP * 4.0) / 5.5)
-            .min(corner.height() * 0.5)
             .clamp(1.0, TOOL_MAX);
         // Centred in the corner's height: the cells are square and the
         // corner is taller than they are, and a row of buttons pinned to the
@@ -4622,14 +4635,16 @@ pub const WORD_AIR: f32 = 0.25;
 /// tessellator snaps to a whole pixel; and a box's edges fall wherever the
 /// layout puts them. So a word laid out inside its box can still have no
 /// whole-pixel position that holds all of its ink. BAR in Courier Prime at
-/// 100%, in the 12.95-point box of a 260-point arrangement (twelve whole
-/// pixels, 51 to 63): by its advances it fits at 7 points, 12.2 wide, but
-/// its ink there is thirteen pixels, and fitted by its advances alone it was
-/// painted at 7 with a column cut off by the clip. At 6.5 its ink is twelve
-/// pixels and it is drawn whole. Measured over every whole-point
-/// arrangement height from 100 to 420, every bundled face and the scales
-/// from 100% to 200%: 15,377 (height, word) cases drawn whole that the
-/// advances alone had cut, and not one the other way.
+/// 100%, in the 14-point box of an arrangement under 157 points (fourteen
+/// whole pixels, 54 to 68): by its advances it fits at the box's own 8
+/// points, 13.8 wide, but its ink there is fifteen pixels, and fitted by its
+/// advances alone it would be painted at 8 with a column cut off by the
+/// clip. At 7.5 its ink is fourteen pixels and it is drawn whole. Measured
+/// over every whole-point arrangement height from 100 to 420, every bundled
+/// face and the scales from 100% to 200%: 7,061 (height, word) cases drawn
+/// whole that the advances alone would cut, and not one the other way. It
+/// was 15,377 while the box was half the corner and went down to seven
+/// points.
 pub fn fitted_word_size(
     painter: &Painter,
     word: &str,
@@ -4671,10 +4686,12 @@ pub fn fitted_word_size(
 /// its advances can still put one column of ink past an edge (BAR in Courier
 /// Prime at 150%, 1/128 in JetBrains Mono at 100%), and the clip would cut
 /// that column off a word that fits: moving it in by a pixel keeps it whole.
-/// Down as well as across: in the seven-point box of an arrangement under
-/// 157 points, a single digit in JetBrains Mono at 100% centres with its
-/// ink half a pixel below the box, and goes up a pixel. A thousandth of
-/// slack, so float noise is not a pixel.
+/// Down as well as across: in a seven-point box, the arrange gridbox's size
+/// under 157 points while the corner's buttons were half its height, a
+/// single digit in JetBrains Mono at 100% centres with its ink half a pixel
+/// below the box, and goes up a pixel. No box the arrangement draws now is
+/// that short, so `a_word_whose_ink_falls_under_its_box_is_moved_up_into_it`
+/// holds that one. A thousandth of slack, so float noise is not a pixel.
 fn ink_placed_inside(room: Rect, galley: &egui::Galley, ppp: f32) -> Option<Pos2> {
     const SLACK: f32 = 1.0e-3;
     let centred = room.center() - galley.size() * 0.5;
@@ -4756,11 +4773,14 @@ fn grid_box_type(cell: Rect) -> f32 {
 /// Terminess. The ladder prints five characters too (1/128, at the finest
 /// steps of meters as common as 3/4 and 7/8) and six (1/1024).
 ///
-/// **And it is twenty points only in an arrangement at least 383 tall.**
-/// Under that it follows the ruler down, to seven points under 157, and the
-/// shorter the arrangement the shorter the steps that no longer fit it
-/// above the floor: under 257 points even BAR is cut at some heights in
-/// Courier Prime. `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// **And it is twenty points in an arrangement at least 209 tall**, as are
+/// the three buttons beside it. Under that all four are as tall as the
+/// corner they stand in, down to fourteen points under 157, and the shorter
+/// the arrangement the shorter the steps that no longer fit the box above
+/// the floor: under 181 points, four-character steps such as 1/16 are cut
+/// at some heights in Courier Prime and JetBrains Mono. A step of three
+/// characters or fewer, BAR among them, is never cut.
+/// `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
 /// sweeps every size the layout draws and names, for each face, the height
 /// from which a step of each length is never cut.
 fn grid_box_word(painter: &Painter, cell: Rect, word: &str, ink: Color32) {
@@ -8838,6 +8858,10 @@ LaneView {
             // "shrink the scanner/met tempo arm and grid section to be the
             // original height — a half strip". Both bounds, because "equal
             // sized" is satisfied by four buttons of any one wrong size.
+            // Twenty is about half of this full panel's corner; on a shorter
+            // one it is held, not halved, and
+            // `the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty`
+            // sweeps every height.
             assert!(
                 first.height() <= 20.01,
                 "the buttons are {:.1}pt, past the original twenty, at header {hw}",
@@ -8867,6 +8891,222 @@ LaneView {
                 "the navigator overlaps the grid box at header {hw}"
             );
         }
+    }
+
+    /// **The corner's four buttons hold twenty points wherever the corner
+    /// has twenty, and a full panel lays them out exactly as it did.**
+    ///
+    /// The owner asked for the buttons at "the original height, a half
+    /// strip", and that was built as half the corner's height: twenty on a
+    /// full panel and less on every shorter one, so under 383 points of
+    /// arrangement all four shrank, to seven points under 157, and the grid
+    /// box cut steps a twenty-point box holds. His ruling, "hold buttons at
+    /// 20pt": twenty whenever the corner is at least twenty tall, the
+    /// corner's own height under that, and the width still winning on a
+    /// header too narrow for four buttons and the navigator's cell and a
+    /// half.
+    ///
+    /// Swept over every whole point of arrangement height from 100 to 420,
+    /// at 1300 and 2560 wide, the window's narrowest, and 240 and 180 (too
+    /// narrow for four buttons of twenty: the seam gives those a header of
+    /// half the width), with the header at both ends of the seam, on its own
+    /// share and dragged to 220, and the arrangement at the window's origin
+    /// and below the band. Held at every one:
+    ///
+    /// - the four are one size, square, and three points apart;
+    /// - twenty points wherever the corner is twenty tall and wide enough
+    ///   for four of them and the navigator's thirty, which on every header
+    ///   the seam allows is every arrangement from 209 points up; the
+    ///   corner's own height where it is shorter than twenty; and where the
+    ///   header is too narrow, the side that leaves the navigator exactly a
+    ///   cell and a half;
+    /// - centred in the corner's height and inside it, apart from the
+    ///   navigator, and clear of everything else the layout places: the
+    ///   ruler, its strip, the seam, the headers and the lanes;
+    /// - wherever half the corner was no smaller than the side the width and
+    ///   the cap allow, which is every full panel (383 points and up) at
+    ///   every width, all five rectangles are the half-strip rule's to the
+    ///   bit, worked out here with its own numbers.
+    ///
+    /// And at every height on the 1300-point window, a press at the middle
+    /// and just inside each corner of each lands on it, and the screen
+    /// reader's node for each stands on its rectangle: the press, the paint
+    /// and the reader all read the one `Layout`.
+    ///
+    /// Revert checks, performed: put the half-corner share back and this
+    /// fails at the first height it sweeps, 100 points, the buttons seven
+    /// points in a corner of fourteen; pin the four to the corner's top
+    /// rather than centring them and it fails at 209 points, the first
+    /// corner taller than its buttons, and with the centring assert out as
+    /// well, at 383, where a full panel no longer lays out as it did.
+    #[test]
+    fn the_corner_buttons_hold_twenty_points_wherever_the_corner_has_twenty() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        let bits = |r: Rect| [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()];
+        // The corner the layout puts the toolbar in: the cell over the
+        // headers and left of the ruler, three points in from its sides and
+        // two from its top and bottom. Its far corner is where the header
+        // starts, to the bit.
+        let corner_of = |r: Rect, l: &Layout| {
+            Rect::from_min_max(r.min, Pos2::new(l.header.right(), l.header.top())).shrink2(Vec2::new(3.0, 2.0))
+        };
+        // The four and the navigator by the rule they had before the hold:
+        // half the corner's height, held to twenty and to the width five and
+        // a half cells need, centred. In its own numbers rather than the
+        // layout's constants, so it stays the rule as it was.
+        let half_strip = |corner: Rect| -> [Rect; 5] {
+            let side = corner
+                .height()
+                .min((corner.width() - 3.0 * 4.0) / 5.5)
+                .min(corner.height() * 0.5)
+                .clamp(1.0, 20.0);
+            let top = corner.top() + ((corner.height() - side) * 0.5).max(0.0);
+            let cell = |k: f32| {
+                Rect::from_min_size(Pos2::new(corner.left() + k * (side + 3.0), top), Vec2::splat(side))
+            };
+            let nav = Rect::from_min_max(Pos2::new(cell(3.0).right() + 3.0, top), Pos2::new(corner.right(), top + side))
+                .intersect(corner);
+            let nav = if nav.width() >= side * 1.5 { nav } else { Rect::NOTHING };
+            [cell(0.0), cell(1.0), cell(2.0), cell(3.0), nav]
+        };
+        let mut swept = 0usize;
+        for origin in [Pos2::ZERO, Pos2::new(0.0, 81.0)] {
+            for w in [1300.0_f32, 2560.0, crate::settings::MIN_WINDOW.x, 240.0, 180.0] {
+                for header_w in [Some(header_floor), None, Some(220.0), Some(w * 0.5)] {
+                    for h in 100u32..=420 {
+                        let r = Rect::from_min_size(origin, Vec2::new(w, h as f32));
+                        let mut v = a_view(&cs);
+                        v.header_w = header_w;
+                        let l = Layout::new(r, &v);
+                        let at = format!("{w}x{h} at {origin:?}, header {header_w:?}");
+                        let corner = corner_of(r, &l);
+                        let four = [l.tool_met, l.tool_snap, l.tool_tempo, l.tool_grid];
+                        let side = four[0].width();
+                        // ── one size, square, in a row ──────────────────────
+                        for (n, b) in four.iter().enumerate() {
+                            assert!(b.is_positive(), "{at}: button {n} is not drawn");
+                            assert!(
+                                (b.width() - side).abs() < 1.0e-3 && (b.height() - side).abs() < 1.0e-3,
+                                "{at}: button {n} is {:.3}x{:.3}, the first {side:.3} square",
+                                b.width(),
+                                b.height()
+                            );
+                        }
+                        for pair in four.windows(2) {
+                            assert!(
+                                (pair[1].left() - pair[0].right() - 3.0).abs() < 1.0e-3
+                                    && (pair[1].top() - pair[0].top()).abs() < 1.0e-3,
+                                "{at}: {:?} and {:?} are not three points apart in a row",
+                                pair[0],
+                                pair[1]
+                            );
+                        }
+                        // ── the size: twenty, the corner, or the width ──────
+                        let twenty_fits = 4.0 * 20.0 + 4.0 * 3.0 + 1.5 * 20.0 <= corner.width();
+                        let corner_fits = 4.0 * corner.height() + 4.0 * 3.0 + 1.5 * corner.height() <= corner.width();
+                        if corner.height() >= 20.0 && twenty_fits {
+                            assert!(
+                                (side - 20.0).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} tall with room for twenty",
+                                corner.height()
+                            );
+                        } else if corner.height() < 20.0 && corner_fits {
+                            assert!(
+                                (side - corner.height()).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} tall",
+                                corner.height()
+                            );
+                        } else {
+                            // The header decides: four cells, four gaps and
+                            // the navigator's cell and a half, and the whole
+                            // corner's width spent on them.
+                            assert!(
+                                side < corner.height().min(20.0)
+                                    && (5.5 * side + 4.0 * 3.0 - corner.width()).abs() < 1.0e-3,
+                                "{at}: the buttons are {side:.3} points in a corner {:.3} wide and {:.3} tall",
+                                corner.width(),
+                                corner.height()
+                            );
+                        }
+                        // The threshold the changelog names, on every header
+                        // the seam allows.
+                        if l.header.width() >= header_floor {
+                            if h >= 209 {
+                                assert!((side - 20.0).abs() < 1.0e-3, "{at}: {side:.3} points, not twenty");
+                            } else {
+                                assert!(side < 20.0, "{at}: twenty points in a corner {:.3} tall", corner.height());
+                            }
+                        }
+                        // ── where they stand ───────────────────────────────
+                        assert!(l.tool_nav.is_positive(), "{at}: the navigator was squeezed out");
+                        assert!(
+                            l.tool_nav.left() >= l.tool_grid.right() + 1.0,
+                            "{at}: the navigator {:?} is on the grid box {:?}",
+                            l.tool_nav,
+                            l.tool_grid
+                        );
+                        for b in four.iter().chain([&l.tool_nav]) {
+                            let (above, below) = (b.top() - corner.top(), corner.bottom() - b.bottom());
+                            assert!(
+                                above >= -1.0e-3 && (above - below).abs() < 1.0e-3,
+                                "{at}: {b:?} is not centred in the corner {corner:?}"
+                            );
+                            assert!(
+                                b.left() >= corner.left() - 1.0e-3 && b.right() <= corner.right() + 1.0e-3,
+                                "{at}: {b:?} is outside the corner {corner:?}"
+                            );
+                            for (what, other) in [
+                                ("the ruler", l.ruler),
+                                ("the ruler's strip", l.meter_strip),
+                                ("the seam", l.grip),
+                                ("the headers", l.header),
+                                ("the lanes", l.lanes_area),
+                            ] {
+                                assert!(!b.intersects(other), "{at}: {b:?} is on {what}, {other:?}");
+                            }
+                        }
+                        // ── a full panel, to the bit ───────────────────────
+                        let was = half_strip(corner);
+                        if corner.height() * 0.5 >= ((corner.width() - 12.0) / 5.5).min(20.0) {
+                            let now = [l.tool_met, l.tool_snap, l.tool_tempo, l.tool_grid, l.tool_nav];
+                            for (k, (now, was)) in now.iter().zip(&was).enumerate() {
+                                assert_eq!(
+                                    bits(*now),
+                                    bits(*was),
+                                    "{at}: rectangle {k} is {now:?}, and the half strip put it at {was:?}"
+                                );
+                            }
+                        } else {
+                            assert!(h < 383, "{at}: a full panel's half corner decided its buttons");
+                        }
+                        // ── the press and the reader ───────────────────────
+                        if w == 1300.0 && header_w.is_none() {
+                            let hits = targets(r, &v);
+                            let nodes = a11y_nodes_from(&v, &hits);
+                            for (b, hit, label) in [
+                                (l.tool_met, Hit::ToolMetronome, "Metronome"),
+                                (l.tool_snap, Hit::ToolSnap, "Snap to grid"),
+                                (l.tool_tempo, Hit::ToolTempoLane, "Tempo lane"),
+                                (l.tool_grid, Hit::ToolGrid, "Grid"),
+                                (l.tool_nav, Hit::ToolNav, "Visible span"),
+                            ] {
+                                let inside = b.shrink(0.5);
+                                for p in [b.center(), inside.left_top(), inside.right_top(), inside.left_bottom(), inside.right_bottom()]
+                                {
+                                    assert_eq!(hit_test(r, &v, p), Some(hit), "{at}: a press at {p:?} on {b:?}");
+                                }
+                                assert!(hits.contains(&(b, hit)), "{at}: {hit:?} is not a target at {b:?}");
+                                let node = nodes.iter().find(|n| n.label == label);
+                                assert_eq!(node.map(|n| n.rect), Some(b), "{at}: the reader's {label} is not on {b:?}");
+                            }
+                        }
+                        swept += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(swept, 2 * 5 * 4 * 321, "the sweep skipped a case");
     }
 
     /// Every word painted BELOW the ruler's chip strip, with the ink it was
@@ -13139,7 +13379,7 @@ selected: false,
     /// left and ran under the navigator on the right, the overflow behind
     /// the owner's "0.000000".
     ///
-    /// The twenty-point box, the one an arrangement of 383 points or more
+    /// The twenty-point box, the one an arrangement of 209 points or more
     /// draws; `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
     /// sweeps the smaller ones a shorter arrangement draws, and names what
     /// they cut. Swept over every word the box can print: all 192
@@ -13280,15 +13520,15 @@ selected: false,
     /// `grid_box_word` gives it, clipped to the box. The sweeps above and
     /// below hold `grid_box_word` to every word in every box; this holds
     /// `draw` to `grid_box_word`, at steps three to six characters wide, in
-    /// every bundled face, in the twenty-point box and in the thirteen-point
-    /// one a 260-point arrangement draws.
+    /// every bundled face, in the twenty-point box and in the fourteen-point
+    /// one a 150-point arrangement draws, the smallest there is.
     ///
     /// Revert check, performed: hand the box back to `painter.text` at its
     /// own size and this fails on its first step, BAR, which is no longer
     /// clipped to its box.
     #[test]
     fn the_arrange_gridbox_paints_its_step_through_the_fit() {
-        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 260.0));
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 150.0));
         let steps = [
             (4u8, 4u8, 0i8, GRID_BAR),
             (4, 4, -1, "1/2"),
@@ -13316,8 +13556,8 @@ selected: false,
                 let cell = Layout::new(r, &v).tool_grid;
                 if r == short {
                     assert!(
-                        (cell.width() - 12.95).abs() < 0.01,
-                        "a 260-point arrangement no longer draws a 12.95-point box: {cell:?}"
+                        (cell.width() - 14.0).abs() < 0.01,
+                        "a 150-point arrangement no longer draws a 14-point box: {cell:?}"
                     );
                 }
                 let out = ctx.run(
@@ -13355,10 +13595,13 @@ selected: false,
     /// step either fits the box it is in, or it is named here as cut.**
     ///
     /// The box is twenty points square only while the arrangement is at
-    /// least 383 points tall. It is half the corner the ruler leaves, the
-    /// ruler is 0.115 of the arrangement held to 18..52 points, and the
-    /// corner is the ruler less four; so under 383 the box shrinks with the
-    /// arrangement, to seven points under 157. Short arrangements are no
+    /// least 209 points tall. Under that it is the corner the ruler leaves,
+    /// the ruler is 0.115 of the arrangement held to 18..52 points, and the
+    /// corner is the ruler less four; so under 209 the box shrinks with the
+    /// arrangement, to fourteen points under 157. It was half the corner,
+    /// twenty only from 383 and seven under 157, until the owner held the
+    /// corner's buttons at twenty ("hold buttons at 20pt"), and the heights
+    /// in the table below came down with it. Short arrangements are no
     /// corner case: the window's floor is 320 tall and the band takes 81 of
     /// it, and the window keeps the shape of the bands showing, so a window
     /// with few bands is short at any width (the band and the piano alone
@@ -13389,30 +13632,40 @@ selected: false,
     /// monospaced, so it is a table of lengths, pinned at the foot: the
     /// arrangement height from which a step of so many characters is never
     /// cut, at any of the five scales. Under it, it is cut at some heights
-    /// and not at others, as the box's edges fall on or between pixels: BAR
-    /// in Courier Prime at 100% is 10.9 points by its advances at the floor
-    /// and twelve whole pixels of ink, and the 12.72-point box of a
-    /// 256-point arrangement, its edges between pixels, holds eleven.
+    /// and not at others, as the box's edges fall on or between pixels: 1/16
+    /// in Courier Prime at 100% is 14.9 points by its advances at the floor
+    /// and sixteen whole pixels of ink; the 16.58-point box of a 179-point
+    /// arrangement holds sixteen whole pixels, and the 16.70-point box of a
+    /// 180-point one, its edges further between pixels, holds fifteen. Every
+    /// step of up to five characters fits wherever the box is twenty points,
+    /// in every face at every scale.
     ///
     /// | characters, e.g.        | Courier Prime | JetBrains Mono | Terminess |
     /// |-------------------------|---------------|----------------|-----------|
     /// | 1: 1, 2, 8              | never cut     | never cut      | never cut |
-    /// | 2: 1· (a dotted whole)  | from 181      | from 181       | from 159  |
-    /// | 3: BAR, 1/2, 5/8        | from 257      | from 257       | from 222  |
-    /// | 4: 1/16, 1/4·, 10/8     | from 327      | from 327       | from 276  |
-    /// | 5: 1/128, 11/16         | from 381      | from 383       | from 327  |
-    /// | 6: 1/1024, 1/2048       | cut at every height | cut at every height | from 383 |
+    /// | 2: 1· (a dotted whole)  | never cut     | never cut      | never cut |
+    /// | 3: BAR, 1/2, 5/8        | never cut     | never cut      | never cut |
+    /// | 4: 1/16, 1/4·, 10/8     | from 181      | from 181       | never cut |
+    /// | 5: 1/128, 11/16         | from 208      | from 209       | from 181  |
+    /// | 6: 1/1024, 1/2048       | cut at every height | cut at every height | from 209 |
     ///
-    /// Revert checks, performed: fit by the advances alone, as the fit did,
-    /// and this fails on 1/8 in Courier Prime at 100% in the 12.72-point box
-    /// of a 256-point arrangement, painted at 7 points where no whole-pixel
-    /// position holds its ink; give every word the box's own size and it
-    /// fails on the first word it sweeps, 1/64 in the seven-point box, left
-    /// at 8 points; take the clip away and it fails on that same word, its
-    /// clip the whole screen; hold the ink inside across and not down, and it
-    /// fails on 2 in JetBrains Mono at 100% in the seven-point box, its ink
-    /// half a pixel under the box; lower `WORD_FLOOR` to 6 and the table
-    /// fails, every length fitting lower.
+    /// Revert checks, performed: put the corner's buttons back at half the
+    /// corner and this fails on its smallest box, seven points again, and
+    /// with the box asserts out, on the table, which then reads as it did
+    /// before the hold (three characters from 257, five from 381 and 383);
+    /// fit by the advances alone, as the fit did, and it fails on BAR in
+    /// Courier Prime at 100% in the fourteen-point box, left at 8 points
+    /// where no whole-pixel position holds its ink; give every word the
+    /// box's own size and it fails on the first word it sweeps, 1/64 in the
+    /// fourteen-point box, left at 8 points; take the clip away and it fails
+    /// on that same word, its clip the whole screen; lower `WORD_FLOOR` to 6
+    /// and the table fails, every length that is cut fitting lower (four
+    /// characters from 166 in Courier Prime, five from 196) except the six
+    /// characters Courier Prime and JetBrains Mono cut at every height. Hold
+    /// the ink inside across and not down, and this no longer fails, since
+    /// no box it sweeps puts a word's ink past its top or bottom;
+    /// `a_word_whose_ink_falls_under_its_box_is_moved_up_into_it` fails
+    /// instead.
     #[test]
     fn every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut() {
         use std::collections::BTreeMap;
@@ -13448,18 +13701,18 @@ selected: false,
             }
         }
         let side = |b: &Rect| b.width();
-        assert!((side(&boxes[0].0) - 7.0).abs() < 1.0e-3, "the smallest box is {:?}", boxes[0]);
-        assert_eq!((boxes[0].1, boxes[0].2), (100, 156), "the box no longer stays at seven points up to 156");
+        assert!((side(&boxes[0].0) - 14.0).abs() < 1.0e-3, "the smallest box is {:?}", boxes[0]);
+        assert_eq!((boxes[0].1, boxes[0].2), (100, 156), "the box no longer stays at fourteen points up to 156");
         let full = boxes.last().expect("boxes");
         assert!((side(&full.0) - 20.0).abs() < 1.0e-3, "the largest box is {full:?}");
-        assert_eq!((full.1, full.2), (383, 420), "the box is no longer whole from 383 points");
+        assert_eq!((full.1, full.2), (209, 420), "the box is no longer whole from 209 points");
         // ── every word the box prints ─────────────────────────────────────
         // In its own spelling, numerals the whole way down: the glyph
         // spelling's quarter is the MIDI editor's chip's, which is one size
         // and swept there (`midi_editor`'s `every_grid_word_is_painted_inside_its_chip`).
-        // In the seven-point box ♪, which comes off the fallback face, is
-        // taller than the box, so this sweep would be holding the box to a
-        // word it never prints.
+        // The box never prints ♪, which comes off the fallback face (and was
+        // taller than the seven-point box this sweep once reached), so
+        // sweeping it here would hold the box to a word it never prints.
         let mut words: Vec<String> = Vec::new();
         for &(beats, unit) in &valid_signatures() {
             for e in -6i8..=3 {
@@ -13562,19 +13815,74 @@ selected: false,
                 // 421: cut at every height swept, the full box's included.
                 let heights = match face {
                     crate::fonts::FontChoice::Courier => {
-                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(381)), (6, Some(421))]
+                        vec![(1, None), (2, None), (3, None), (4, Some(181)), (5, Some(208)), (6, Some(421))]
                     }
                     crate::fonts::FontChoice::JetBrains => {
-                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(383)), (6, Some(421))]
+                        vec![(1, None), (2, None), (3, None), (4, Some(181)), (5, Some(209)), (6, Some(421))]
                     }
                     crate::fonts::FontChoice::Terminess => {
-                        vec![(1, None), (2, Some(159)), (3, Some(222)), (4, Some(276)), (5, Some(327)), (6, Some(383))]
+                        vec![(1, None), (2, None), (3, None), (4, None), (5, Some(181)), (6, Some(209))]
                     }
                 };
                 (format!("{face:?}"), heights)
             })
             .collect();
         assert_eq!(got, want, "the arrangement heights from which steps of 1 to 6 characters are never cut");
+        // **The bar the hold was set to clear**, held in its own words so a
+        // later re-pin of the table cannot lose it: every step of up to five
+        // characters fits wherever the box is twenty points.
+        for ((face, n), tallest) in &tallest_cut {
+            assert!(
+                *n > 5 || *tallest < full.1,
+                "{face}: a step of {n} characters is cut at {tallest} points, where the box is twenty"
+            );
+        }
+    }
+
+    /// **A word whose ink would fall under its box is moved up into it.**
+    ///
+    /// `ink_placed_inside` moves a word down or up as well as across, and no
+    /// size of the arrange gridbox needs the second half any more: the
+    /// smallest is fourteen points and prints at eight. While the corner's
+    /// buttons were half the corner the box was seven points under 157, and
+    /// there a single digit in JetBrains Mono at 100% centred with its ink
+    /// half a pixel under the box. That box is held here, where the layout
+    /// drew it, so the half of the placement the sweeps above no longer
+    /// reach is still held to something.
+    ///
+    /// Revert check, performed: hold the ink inside across and not down, and
+    /// this fails, the 2's ink at 13 in a box whose bottom is 12.5.
+    #[test]
+    fn a_word_whose_ink_falls_under_its_box_is_moved_up_into_it() {
+        // The seven-point box a 100-point arrangement drew while the buttons
+        // were half the corner.
+        let cell = Rect::from_min_max(Pos2::new(33.0, 5.5), Pos2::new(40.0, 12.5));
+        let ctx = context_at(crate::fonts::FontChoice::JetBrains, 1.0);
+        let painted = PaintedWord::painted_by(&ctx, "a digit under its box", |p| {
+            grid_box_word(p, cell, "2", Color32::WHITE);
+        });
+        let [word] = painted.as_slice() else {
+            panic!("painted {painted:?}, not one word");
+        };
+        // The fixture: centred where `CENTER_CENTER` centres it, on the pixel
+        // the tessellator snaps it to, its ink crosses the box's bottom.
+        let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+        let g = measure.layout_no_wrap("2".to_owned(), FontId::new(word.size, crate::fonts::courier_bold()), Color32::WHITE);
+        let centred = (cell.center().y - g.size().y * 0.5).round();
+        assert!(
+            centred + g.mesh_bounds.max.y > cell.bottom() + 1.0e-3,
+            "fixture: centred, the 2's ink ends at {}, inside the box's bottom {}",
+            centred + g.mesh_bounds.max.y,
+            cell.bottom()
+        );
+        assert!(
+            word.ink.top() >= cell.top() - 1.0e-3
+                && word.ink.bottom() <= cell.bottom() + 1.0e-3
+                && word.ink.left() >= cell.left() - 1.0e-3
+                && word.ink.right() <= cell.right() + 1.0e-3,
+            "the 2's ink is at {:?}, outside its box {cell:?}",
+            word.ink
+        );
     }
 
     /// **Every step of every meter is said as a note**, the way a player
