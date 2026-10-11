@@ -4112,21 +4112,23 @@ pub fn a11y_nodes_from(
             // control that only ever steps one way walks a keyboard down to
             // 1/32 and strands it there. The announced value is the grid the
             // box prints; the travel is the exponent laid onto 0..1.
+            //
+            // **Over the steps the box takes, -6 to 3** (`GRID_BOX_FINEST`
+            // to `GRID_BOX_COARSEST`). It said -5 to 3, a step short of the
+            // settings' own clamp, so at the finest step the value was under
+            // the minimum it declared and the travel was -0.125.
             Hit::ToolGrid => Node::slider(
                 id,
                 r,
                 "Grid",
                 f64::from(view.grid_exp),
-                -5.0,
-                3.0,
+                f64::from(GRID_BOX_FINEST),
+                f64::from(GRID_BOX_COARSEST),
                 {
                     let sg = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
                     grid_spoken(view.grid_exp, sg.beats, sg.unit)
                 },
-                Travel {
-                    norm: (f32::from(view.grid_exp) + 5.0) / 8.0,
-                    up: false,
-                },
+                Travel { norm: grid_box_travel(view.grid_exp), up: false },
             ),
             Hit::ToolNav => Node::readout(
                 id,
@@ -5484,6 +5486,53 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
         let (n, u) = beats_counted(q, unit);
         counted(n, u)
     })
+}
+
+/// **The arrange gridbox's finest step**, -6: what the settings clamp
+/// `arr_grid_exp` to at the fine end wherever it is written (the wheel, the
+/// drag, the keys, a settings file) and what its ladder is printed and said
+/// down to.
+pub const GRID_BOX_FINEST: i8 = -6;
+
+/// **The arrange gridbox's coarsest step**, 3: eight bars.
+pub const GRID_BOX_COARSEST: i8 = 3;
+
+/// **Where step `exp` sits on the arrange gridbox's slider**: 0 at
+/// [`GRID_BOX_FINEST`], 1 at [`GRID_BOX_COARSEST`], a ninth of the way a
+/// step. What its reader node declares as its travel ([`a11y_nodes`]), and
+/// what [`grid_box_step_for`] reads a key press back from, so the two
+/// cannot disagree about where a step is.
+pub fn grid_box_travel(exp: i8) -> f32 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    f32::from(exp.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST) - GRID_BOX_FINEST) / span
+}
+
+/// **The step a key on the arrange gridbox asks for**, from the step it is
+/// on and `want`, the slider's travel after the key
+/// (`a11y::Gesture::nudged` of [`grid_box_travel`]).
+///
+/// The nearest step to `want`, so Home and End reach the two ends and Space
+/// or Enter, which leave the travel where it was, leave the step. **And an
+/// arrow always moves one step**, whichever way it pressed: its nudge is a
+/// twentieth of the travel (a hundredth with Shift) and a step is a ninth,
+/// so the nearest step to where an arrow lands is the one it started on.
+/// Read that way, which is how the box was read, the arrows never moved it
+/// at all, and at -6, below the travel's old floor, the down arrow went UP
+/// a step.
+pub fn grid_box_step_for(now: i8, want: f32) -> i8 {
+    let span = f32::from(GRID_BOX_COARSEST - GRID_BOX_FINEST);
+    let here = grid_box_travel(now);
+    let want = want.clamp(0.0, 1.0);
+    // Ten steps on the travel, a ninth of it apart.
+    let nearest = (want * span).round() as i8 + GRID_BOX_FINEST;
+    let moved = if nearest != now || (want - here).abs() < 1.0e-6 {
+        nearest
+    } else if want > here {
+        now + 1
+    } else {
+        now - 1
+    };
+    moved.clamp(GRID_BOX_FINEST, GRID_BOX_COARSEST)
 }
 
 /// **Where a tempo handle is drawn, and grabbed.**
@@ -10601,10 +10650,80 @@ ArrangeView {
         assert_eq!(grid_label_text(-2, 6, 8), "1/8");
         assert!((grid_quarters(-2, 6, 8) - 0.5).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
-        assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
+        // Four steps up from the finest, -6, of the nine between it and 3.
+        assert!((t.norm - 4.0 / 9.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.
         assert!(crate::a11y::Gesture::Least.nudged(t.norm) <= 0.0);
         assert!(crate::a11y::Gesture::Most.nudged(t.norm) >= 1.0);
+    }
+
+    /// **The grid box's slider spans the steps the box takes, -6 to 3, and
+    /// every key on it lands on the step it means.**
+    ///
+    /// It declared -5 to 3 with the travel `(exp + 5) / 8`, a step short of
+    /// the settings' clamp (`arr_grid_exp` is held to -6..3 wherever it is
+    /// written) and of the ladder this box prints and says. At -6, the finest
+    /// step, the node's value was under its own minimum and its travel was
+    /// -0.125, a position a reader can only take as out of range. Every
+    /// step, then: the value inside the declared range, which is -6 to 3;
+    /// the travel inside 0..1 and rising a ninth a step; and read back
+    /// through `grid_box_step_for`, the road `apply_arrange_key` takes, Space
+    /// (the travel unmoved) stays, Home and End reach the two ends, and an
+    /// arrow, with Shift or without, moves exactly one step its own way.
+    /// `a_key_on_the_grid_box_moves_it_one_step` in `app.rs` drives the same
+    /// presses through egui's focus to the settings.
+    ///
+    /// Revert checks, performed: declare -5 to 3 again, with the travel
+    /// `(exp + 5) / 8`, and this fails on the first step it reads, -6, whose
+    /// range is not the box's; read a key back as the nearest step alone, as
+    /// the road did, and it fails on the first arrow, Up at -6, which stays
+    /// at -6.
+    #[test]
+    fn the_grid_box_slider_spans_every_step_the_box_takes() {
+        use crate::a11y::{Gesture, Kind};
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut last: Option<f32> = None;
+        for exp in GRID_BOX_FINEST..=GRID_BOX_COARSEST {
+            let mut v = a_view(&cs);
+            v.grid_exp = exp;
+            let nodes = a11y_nodes(rect(), &v);
+            let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
+            let Kind::Slider { now, min, max } = g.kind else {
+                panic!("step {exp}: the grid box is not a slider: {:?}", g.kind);
+            };
+            assert_eq!((min, max), (-6.0, 3.0), "step {exp}: the slider's range is not the box's");
+            assert!(
+                (min..=max).contains(&now) && now == f64::from(exp),
+                "step {exp}: the slider reads {now}, outside its range {min}..{max}"
+            );
+            let t = g.travel.expect("the grid box cannot be nudged");
+            assert!((0.0..=1.0).contains(&t.norm), "step {exp}: the travel is {}", t.norm);
+            if let Some(below) = last {
+                assert!(
+                    (t.norm - below - 1.0 / 9.0).abs() < 1.0e-6,
+                    "step {exp}: the travel rose {} from the step under it, not a ninth",
+                    t.norm - below
+                );
+            }
+            last = Some(t.norm);
+            let key = |g: Gesture| grid_box_step_for(exp, g.nudged(t.norm));
+            assert_eq!(key(Gesture::Activate), exp, "step {exp}: Space moved the box");
+            assert_eq!(key(Gesture::Least), GRID_BOX_FINEST, "step {exp}: Home");
+            assert_eq!(key(Gesture::Most), GRID_BOX_COARSEST, "step {exp}: End");
+            for fine in [false, true] {
+                assert_eq!(
+                    key(Gesture::Increase { fine }),
+                    (exp + 1).min(GRID_BOX_COARSEST),
+                    "step {exp}: the up arrow (fine: {fine})"
+                );
+                assert_eq!(
+                    key(Gesture::Decrease { fine }),
+                    (exp - 1).max(GRID_BOX_FINEST),
+                    "step {exp}: the down arrow (fine: {fine})"
+                );
+            }
+        }
+        assert_eq!(last, Some(1.0), "the coarsest step is not the end of the travel");
     }
 
     /// **Every theme, in both modes, measured where the paint actually
