@@ -426,6 +426,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         next_id: crate::arrangement::Aside(s.next_track_id),
         legacy_states: crate::arrangement::Aside(None),
         dropped: crate::arrangement::Aside(Vec::new()),
+        viewport: crate::arrangement::Aside(None),
         specials: s.specials.clone(),
     }
 }

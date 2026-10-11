@@ -1391,6 +1391,40 @@ pub struct DeskSnap {
     /// the opener's one notice. Never written and never hashed; empty on
     /// every snapshot but a document just read.
     pub dropped: Aside<Vec<crate::desk_format::Dropped>>,
+    /// **Where the arrangement was left looking**: the window onto the song
+    /// (its first second and how many seconds wide), so a project opens at
+    /// the stretch somebody was working on and not at whatever the last
+    /// project on this machine was zoomed to. The owner: "make it so that
+    /// the viewport ... is session bound".
+    ///
+    /// [`Aside`], and kept out of the walk on purpose, because a zoom is not
+    /// an edit: the window moves on every wheel notch, every edge scroll and
+    /// every frame a take grows past the right edge, so in the walk it would
+    /// light the asterisk on a scroll and push an undo moment per notch. It
+    /// is written with the document at a save, read back at an open, and
+    /// left alone by undo (`TangentApp::desk_snapshot` is its one writer).
+    /// `None` is a document that does not say, which opens at the default.
+    pub viewport: Aside<Option<Viewport>>,
+}
+
+/// **The arrangement's window onto the song**, as a document carries it:
+/// see [`DeskSnap::viewport`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    /// The window's left edge, in seconds from the song's start.
+    pub start_s: f64,
+    /// How many seconds the window spans: the horizontal zoom.
+    pub len_s: f64,
+}
+
+impl Viewport {
+    /// A window a reader may trust: finite, starting at or after zero, and
+    /// some width wide. Anything else is no window, which opens at the
+    /// default rather than at a picture nobody can use.
+    pub fn sane(start_s: f64, len_s: f64) -> Option<Self> {
+        (start_s.is_finite() && len_s.is_finite() && start_s >= 0.0 && len_s > 0.0)
+            .then_some(Self { start_s, len_s })
+    }
 }
 
 /// **A note the reader keeps beside a desk that is not part of the desk**:
@@ -1938,6 +1972,9 @@ impl DeskRef<'_> {
             // `TangentApp::desk_snapshot`.
             legacy_states: Aside(None),
             dropped: Aside(Vec::new()),
+            // Not the desk's: the app puts the live window on in
+            // `TangentApp::desk_snapshot`.
+            viewport: Aside(None),
         }
     }
 
@@ -2736,6 +2773,14 @@ impl DeskSnap {
                 .collect();
             m.insert("frozen".into(), Value::Array(frozen));
         }
+        // **The window, LAST and only when there is one**: appended after
+        // every key an earlier build wrote, so none of theirs moves.
+        if let Some(v) = self.viewport.0 {
+            let mut vm = Map::new();
+            vm.insert("start_s".into(), serde_json::json!(v.start_s));
+            vm.insert("len_s".into(), serde_json::json!(v.len_s));
+            m.insert("viewport".into(), Value::Object(vm));
+        }
         Value::Object(m)
     }
 
@@ -3330,6 +3375,13 @@ impl DeskSnap {
             next_id: Aside(width as u64),
             legacy_states: Aside(None),
             dropped: Aside(Vec::new()),
+            // **Where the arrangement was left looking.** Absent in every
+            // document before it, and absent or unreadable is no window: the
+            // open shows the default (see `DeskSnap::viewport`).
+            viewport: Aside(m.get("viewport").and_then(Value::as_object).and_then(|vm| {
+                let f = |k: &str| vm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+                Viewport::sane(f("start_s"), f("len_s"))
+            })),
             specials: model.specials,
         })
     }
@@ -5995,6 +6047,7 @@ mod tests {
             next_id: Aside(32),
             legacy_states: Aside(None),
             dropped: Aside(Vec::new()),
+            viewport: Aside(Some(Viewport { start_s: 12.5, len_s: 96.0 })),
             // Every special with something said (W5), each fact one a
             // format-2 desk keeps: the drum bus's send is its effects knob.
             specials: {
@@ -6608,6 +6661,16 @@ mod tests {
             view(a).quantize_fit = "stretch".into();
         });
         moves_both("the view going unsaid", |a| desk(a).view = None);
+        // **And one thing that must NOT move it**: where the arrangement
+        // was left looking is not an edit (`DeskSnap::viewport`).
+        {
+            let base = a_document_with_everything_in_it();
+            let mut zoomed = a_document_with_everything_in_it();
+            desk(&mut zoomed).viewport = Aside(Some(Viewport { start_s: 300.0, len_s: 2.0 }));
+            assert_ne!(zoomed.to_json(), base.to_json(), "the window is not in the document");
+            assert_eq!(zoomed.fingerprint(), base.fingerprint(), "a scroll moved the fingerprint");
+            assert_eq!(words(&zoomed), words(&base), "a scroll moved the words undo compares");
+        }
         moves_both("the take name", |a| desk(a).take_name = Some("etude".into()));
         // **A CLEARED name is not an unsaid one.** The empty string is a
         // document saying "no name", which a session holding one has to be
@@ -7022,6 +7085,31 @@ mod tests {
     /// the number, every freshly opened project would open dirty. The
     /// document is asserted to be a fixed point first, because that is the
     /// property the fingerprint is allowed to lean on.
+    /// **The window the document carries comes back as it went, and a
+    /// window nobody could use is no window**: the open shows the default
+    /// rather than a picture zero seconds wide or before the song.
+    #[test]
+    fn the_viewport_round_trips_and_a_bad_one_reads_as_none() {
+        let a = a_document_with_everything_in_it();
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(
+            back.desk.expect("the desk came back").viewport.0,
+            Some(Viewport { start_s: 12.5, len_s: 96.0 }),
+            "the window did not come back"
+        );
+        for bad in [
+            serde_json::json!({ "start_s": -1.0, "len_s": 10.0 }),
+            serde_json::json!({ "start_s": 0.0, "len_s": 0.0 }),
+            serde_json::json!({ "start_s": 0.0 }),
+            serde_json::json!("wide"),
+        ] {
+            let mut v: Value = serde_json::from_str(&a.to_json()).unwrap();
+            v["desk"]["viewport"] = bad.clone();
+            let read = Arrangement::from_json(&v.to_string());
+            assert_eq!(read.desk.unwrap().viewport.0, None, "{bad} was read as a window");
+        }
+    }
+
     #[test]
     fn a_round_trip_keeps_the_fingerprint() {
         // **The document as the reader hands it over.** Format 2 writes the
