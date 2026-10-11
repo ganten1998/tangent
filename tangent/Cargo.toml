@@ -108,7 +108,9 @@ serde = { version = "1", features = ["derive"] }
 # unifies features per crate, so this is also what any binary that links
 # tangent-ui gets; naming it here keeps the intent visible in both places.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-dirs = "6"
+# No `dirs` among the dependencies that ship: every road to a person's home
+# is `tangent_core::config::home`, which a test build moves to a scratch
+# folder (see the dev-dependencies). `ban_scan` refuses a second road.
 fd-lock = "4"
 # Optional: the LAME C build cannot be CROSS-compiled at all — autoconf tests
 # its toolchain by compiling and RUNNING programs, which a macOS host cannot do
@@ -119,6 +121,20 @@ mp3lame-encoder = { version = "0.2.5", optional = true }
 
 [dev-dependencies]
 ttf-parser = "0.25"
+# **The binary's tests never reach a person's files.** `test-home` puts
+# `tangent_core::config::home`, and every config, media, project and take
+# folder built on it, in a scratch folder per test process. It has to be a
+# feature: `cfg(test)` is per crate, and the tangent-core and tangent-ui
+# these tests link are ordinary builds that resolved the owner's real
+# `~/.config/tangent`, `Documents/Tangent Media` and `Movies/Tangent`.
+# Resolver 2 gives a dev-dependency's features to test builds alone, so
+# `cargo build` and every shipped artifact resolve the real home;
+# `scripts/check-home.sh features` proves it, and `home_tests` in main.rs
+# pins that this test build has it.
+tangent-core = { path = "../tangent-core", features = ["test-home"] }
+# One `#[ignore]` probe measures what the per-frame home lookups cost before
+# they were cached, and that "before" is `dirs::home_dir` itself. Tests only.
+dirs = "6"
 
 # No build-dependencies. `build.rs` shells out to whichever resource compiler
 # is present rather than taking `winres`, because the dependency has to be

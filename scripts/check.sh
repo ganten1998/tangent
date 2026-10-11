@@ -35,7 +35,8 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
 
 # `named_leg <at least> <cargo test args...>`: a test run filtered to the
-# tests a leg names, which must PASS at least that many of them.
+# tests a leg names, which must PASS at least that many of them, in a home
+# `scripts/check-home.sh` watches like every test leg here.
 #
 # **A filter that matches nothing is green.** `cargo test some::path` with no
 # test under that path reports "0 passed" and exits 0, so a leg that names
@@ -45,7 +46,7 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 named_leg() {
   local want="$1" out ran
   shift
-  if ! out="$(cargo test "$@" 2>&1)"; then
+  if ! out="$(scripts/check-home.sh run cargo test "$@" 2>&1)"; then
     printf '%s\n' "$out"
     return 1
   fi
@@ -57,7 +58,7 @@ named_leg() {
   fi
 }
 
-echo "==> cargo test --workspace"
+echo "==> cargo test --workspace  (in a scratch home it watches: no test reaches a person's files)"
 # **`--exclude linuxvideo`, because the root `exclude` does not reach it.**
 #
 # Cargo's workspace `exclude` stops auto-discovery; it does NOT stop a package
@@ -79,7 +80,34 @@ echo "==> cargo test --workspace"
 # `tangent` never run - which on a cross-platform check hid five failures in
 # `tangent_ui` behind one in `tangent`. A gate that is going to fail should say
 # how much is failing.
-cargo test --workspace --exclude linuxvideo --no-fail-fast
+#
+# **In a home it watches, and every test leg below too** (design
+# W8-safe-tests). The fix is in the build: every road to a person's home is
+# `tangent_core::config::home`, which a test build sends to a scratch folder
+# (tangent-core's `test-home`, turned on only by [dev-dependencies] lines:
+# the binary's, tangent-ui's, and tangent-core's own for its `tests/`;
+# `cfg(test)` holds only while a crate compiles as its own unit tests and
+# never reached the copies everything else links, which resolved the
+# owner's real `~/.config/tangent` once the internal builds' staging folder
+# was gone). `scripts/check-home.sh run` is the proof and the net: HOME is a
+# fresh folder seeded with decoys where Tangent keeps a person's files, the
+# real folders are watched read-only, and a run that creates, changes or
+# deletes anything in either fails here, naming it, Tangent open or not
+# (close it first: but for its log, which no test reaches, what it writes
+# cannot be told from a test's write). The selftest holds `run` to that
+# with stub commands before anything relies on it.
+scripts/check-home.sh selftest
+scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-fast
+
+echo "==> no build that ships carries test-home  (resolver 2 keeps it in test builds)"
+# A dev-dependency's features reach test builds alone, so `cargo build` and
+# every artifact resolve the real home. Read the way a build resolves
+# features: the binary with every feature on every target and the plugin,
+# dev edges off (neither may carry it), and each member's test build alone,
+# dev edges on, as the `-p` legs below build it (every one that links
+# tangent-core must carry it, tangent-core's own included, or its tests
+# resolve the real home, and the check could not see the feature at all).
+scripts/check-home.sh features
 
 echo "==> cargo test --release  (the render and export goldens, in the profile that ships)"
 # **The shipped builds are release, and every leg above is debug.** The render
@@ -108,9 +136,20 @@ echo "==> the ban scans  (no live code names the fixed desk, no surface undersel
 # tree-wide one over every crate's shipped code, `copy_scan` the phrase scan
 # over every surface that says what a key does, and the dash rule over
 # everything else that ships: every crate's strings, and what a download or
-# an installer carries for a person to read.
-named_leg 24 -p tangent-ui --lib -- --exact \
+# an installer carries for a person to read. W8-safe-tests added the second
+# road to a home (`ban_scan`), what the scans count as a test (a cfg is read
+# by evaluating it, a module declaration however it is laid out), the media
+# chooser's lines named exactly, and the two tests that hold each test build
+# to its scratch home: `-p tangent-ui` and `-p tangent` alone, because a
+# workspace run unifies either crate's dev-dependency line into the other's.
+named_leg 30 -p tangent-ui --lib -- --exact \
   ban_scan::no_live_code_names_the_fixed_desk \
+  ban_scan::no_live_code_finds_a_home_but_the_one_road \
+  ban_scan::a_home_found_off_the_one_road_fails_the_scan_when_planted \
+  ban_scan::a_cfg_that_only_spells_test_or_says_not_test_is_read_as_shipping \
+  ban_scan::a_test_only_module_is_found_however_its_declaration_is_laid_out \
+  era_corpus::a_second_media_root_beside_the_chooser_fails_the_scan_when_planted \
+  settings::tests::the_media_choosers_build_on_the_one_road_to_a_home \
   ban_scan::every_banned_name_and_clamp_fails_the_scan_when_planted \
   ban_scan::every_exemption_names_what_is_still_there \
   ban_scan::test_only_modules_are_found_from_their_declarations \
@@ -134,7 +173,8 @@ named_leg 24 -p tangent-ui --lib -- --exact \
   app::save_tests::a_save_writes_the_desk_the_session_shows \
   copy_scan::the_lexer_reads_shipped_literals_only \
   copy_scan::the_new_copy_passes_the_scan
-named_leg 13 -p tangent --bin tangent -- --exact \
+named_leg 14 -p tangent --bin tangent -- --exact \
+  home_tests::this_test_build_keeps_every_home_path_in_a_scratch_folder \
   instrument::lanesets::no_engine_walk_clamps_a_lane_onto_another \
   instrument::lanesets::the_clamp_scan_finds_every_spelling_it_bans \
   instrument::lanesets::no_renderer_walk_shifts_a_lane_into_a_word \
@@ -150,10 +190,13 @@ named_leg 13 -p tangent --bin tangent -- --exact \
   slot_gaps::no_host_road_names_a_bay_by_the_frozen_maps_seat
 
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
-cargo test -p tangent-core
+# The crate alone is also the one build where its integration tests get
+# `test-home` from nothing but its own dev-dependency line (the workspace
+# run above unifies the binary's in): `tests/test_home.rs` pins it here.
+scripts/check-home.sh run cargo test -p tangent-core
 
 echo "==> cargo test -p tangent-core --test differential -- --ignored  (full 13,133-row sweep)"
-cargo test -p tangent-core --test differential -- --ignored
+scripts/check-home.sh run cargo test -p tangent-core --test differential -- --ignored
 
 echo "==> cargo check -p tangent --no-default-features  (the Minimal build)"
 # **The Minimal build is part of the gate.** `tangent` with no features is the
