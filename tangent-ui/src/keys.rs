@@ -575,6 +575,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("C-F", "ctrl+F: group the selection into a folder"),
             ("C-S-F", "ctrl+shift+F: freeze the selected track - again to thaw it"),
             ("C-C/V/X", "copy the track · paste onto an empty slot · cut"),
+            // **C-M here too, now that the chord answers over the desk.** It
+            // opens the panel where a click on the click strip's sound chip
+            // does, not in the middle as on the timeline, and the row says
+            // so, as the arrangement's row says where it opens there.
+            ("C-M", "the metronome panel, at the click strip's sound chip - again to close it"),
             ("FLDR", "the folder glyph: hide or show its tracks"),
             ("NOTE", "the \u{266a} at a track's foot: its MIDI to the theory view"),
             ("S-1", "shift+1: the theory view"),
@@ -1084,10 +1089,13 @@ mod tests {
         })
     }
 
-    /// The labels every card carries that `fn paint` dispatches for all
-    /// views at once: undo/redo and the shift view keys. They sit outside
-    /// the panel section, so the section boundary must not exempt them.
-    const PAINT_CHORDS: &[&str] = &["C-Z", "C-S-Z", "S-1", "S-2", "S-3"];
+    /// The labels whose key `fn paint` reads for every view that cards them.
+    /// Undo/redo and the shift view keys are on every card and sit outside
+    /// the panel section, so the section boundary must not exempt them. The
+    /// metronome's chord is on the arrangement's card and the mixer's, and
+    /// is read once a frame in `paint` for both surfaces (the timeline's
+    /// pass is handed it), so its row is checked there for both cards.
+    const PAINT_CHORDS: &[&str] = &["C-Z", "C-S-Z", "S-1", "S-2", "S-3", "C-M"];
 
     /// The modifier words a label promises. "chord" is command-or-ctrl,
     /// which is how every handler spells it.
@@ -1577,27 +1585,36 @@ mod tests {
         );
     }
 
-    /// **The metronome chord is described as it behaves.** Cmd/Ctrl+M opens
-    /// the panel in the MIDDLE of the timeline - the owner's call, since a
-    /// panel that opens wherever the hand happens to be has to be found -
-    /// and the card went on saying "at the pointer" after the centring
-    /// shipped. A second press closes it, which the row never said while
-    /// the close never ran.
+    /// **The metronome chord is described as it behaves, on both cards that
+    /// carry it.** Cmd/Ctrl+M opens the panel in the MIDDLE of the timeline -
+    /// the owner's call, since a panel that opens wherever the hand happens
+    /// to be has to be found - and the card went on saying "at the pointer"
+    /// after the centring shipped. Over the desk it opens off the click
+    /// strip's sound chip, where a click on the chip opens it, and the
+    /// desk's card had no row for it while the chord did nothing there. A
+    /// second press closes it on both, which the arrangement's row never said
+    /// while the close never ran.
     #[test]
     fn the_metronome_chord_is_described_as_it_behaves() {
-        let rows = card_rows(Gates::default(), HelpView::Arrange);
-        let (_, said) = rows
-            .iter()
-            .find(|(k, _)| *k == "C-M")
-            .expect("no C-M row on the arrangement's card");
-        assert!(
-            !said.contains("pointer"),
-            "the card says Cmd+M opens at the pointer; it opens in the middle of the timeline: {said}"
-        );
-        assert!(
-            said.contains("again to close"),
-            "the card does not say a second Cmd+M closes the panel: {said}"
-        );
+        for (view, opens) in [(HelpView::Arrange, "middle"), (HelpView::Mixer, "sound chip")] {
+            let rows = card_rows(Gates::default(), view);
+            let (_, said) = rows
+                .iter()
+                .find(|(k, _)| *k == "C-M")
+                .unwrap_or_else(|| panic!("no C-M row on the {view:?} card"));
+            assert!(
+                !said.contains("pointer"),
+                "the {view:?} card says Cmd+M opens at the pointer: {said}"
+            );
+            assert!(
+                said.contains(opens),
+                "the {view:?} card does not say Cmd+M opens the panel at the {opens}: {said}"
+            );
+            assert!(
+                said.contains("again to close"),
+                "the {view:?} card does not say a second Cmd+M closes the panel: {said}"
+            );
+        }
     }
 
     /// **The right button's two clip gestures are on the arrangement's
