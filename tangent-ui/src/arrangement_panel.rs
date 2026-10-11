@@ -5281,42 +5281,66 @@ fn note_label(q: f64, unit: u8, quarter_glyph: bool) -> String {
     if quarter_glyph && (q - 1.0).abs() < 1.0e-9 {
         return "\u{266a}".to_owned();
     }
+    match note_value(q, unit) {
+        NoteValue::Plain(d) if d <= 1 => "1".to_owned(),
+        NoteValue::Plain(d) => format!("1/{d}"),
+        // Dotted: one and a half of a clean value.
+        NoteValue::Dotted(d) if d <= 1 => "1\u{00b7}".to_owned(),
+        NoteValue::Dotted(d) => format!("1/{d}\u{00b7}"),
+        // Nothing nameable: count it, in beats of the meter.
+        //
+        // This used to say the length in quarters, `format!("{q:.3}q")`, and
+        // that is what the owner found: "there's a '0 frequency on the grid
+        // frequency in arrange mode reads as quite a lot of 0.000000s". In
+        // 4/2 the bar rung printed "8.000q", six characters in a box drawn
+        // for three: the 8 spilled onto the tempo-lane switch, where it
+        // barely shows, and the navigator, painted after it, covered the q,
+        // so a row of zeros was what read. Nor was it one rare meter: 5/4,
+        // 7/8 and 9/8, three of the eight in `TIME_SIGNATURES`, reached it at
+        // the same rung. `no_rung_of_any_signature_is_spelled_as_a_decimal`
+        // sweeps them all. The bar rung has since been given a name of its
+        // own, `GRID_BAR`, and no longer comes here; what still does is a
+        // rung under the bar that no note names, like 10/8's five eighths.
+        NoteValue::Counted(n, unit) => format!("{n}/{unit}"),
+    }
+}
+
+/// **What a length in quarters is, as a note**: one note value, one dotted
+/// note value, or a count of the meter's beats.
+///
+/// The one decision [`note_label`] prints and [`grid_spoken`] says aloud, so
+/// the box and the screen reader cannot sort a step differently. The reader
+/// used to sort it a second time, by matching the box's text against a
+/// table of eight spellings, and every step the table did not list fell
+/// through to "of a bar": 428 of the (signature, step) pairs, a whole note
+/// read as "1 of a bar" in 4/2 and a 128th as "1/128 of a bar" in 4/4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteValue {
+    /// One 1/d note: 1 is a whole note, 2 a half, 4 a quarter.
+    Plain(u64),
+    /// A dotted 1/d note, one and a half of it: 6/8's beat is `Dotted(4)`.
+    Dotted(u64),
+    /// n notes of 1/unit, the meter's own beat: 10/8's half bar is
+    /// `Counted(5, 8)`.
+    Counted(u64, u8),
+}
+
+/// Sorts `q` quarter notes into a [`NoteValue`]: a plain note when `4 / q`
+/// is a whole number, a dotted one when two thirds of `q` is, and otherwise
+/// counted in the meter's beats ([`beats_counted`]).
+fn note_value(q: f64, unit: u8) -> NoteValue {
     let denom = 4.0 / q;
     let rounded = denom.round();
     if (denom - rounded).abs() < 1.0e-9 && rounded >= 1.0 {
-        return if rounded <= 1.0 {
-            "1".to_owned()
-        } else {
-            format!("1/{}", rounded as u64)
-        };
+        return NoteValue::Plain(rounded as u64);
     }
-    // Dotted: one and a half of a clean value.
-    let plain = q * 2.0 / 3.0;
-    let d = 4.0 / plain;
+    let d = 4.0 / (q * 2.0 / 3.0);
     let dr = d.round();
     if (d - dr).abs() < 1.0e-9 && dr >= 1.0 {
-        return if dr <= 1.0 {
-            "1\u{00b7}".to_owned()
-        } else {
-            format!("1/{}\u{00b7}", dr as u64)
-        };
+        return NoteValue::Dotted(dr as u64);
     }
-    // Nothing nameable: count it, in beats of the meter.
-    //
-    // This used to say the length in quarters, `format!("{q:.3}q")`, and that
-    // is what the owner found: "there's a '0 frequency on the grid frequency
-    // in arrange mode reads as quite a lot of 0.000000s". In 4/2 the bar rung
-    // printed "8.000q", six characters in a box drawn for three: the 8
-    // spilled onto the tempo-lane switch, where it barely shows, and the
-    // navigator, painted after it, covered the q, so a row of zeros was what
-    // read. Nor was it one rare meter: 5/4, 7/8 and 9/8, three of the eight
-    // in `TIME_SIGNATURES`, reached it at the same rung.
-    // `no_rung_of_any_signature_is_spelled_as_a_decimal` sweeps them all.
-    // The bar rung has since been given a name of its own, `GRID_BAR`, and
-    // no longer comes here; what still does is a rung under the bar that no
-    // note names, like 10/8's five eighths.
     let (n, unit) = beats_counted(q, unit);
-    format!("{n}/{unit}")
+    NoteValue::Counted(n, unit)
 }
 
 /// **A length in quarters, counted in the meter's beats**: `(n, unit)`, n
@@ -5332,15 +5356,29 @@ fn beats_counted(q: f64, unit: u8) -> (u64, u8) {
     (n as u64, unit)
 }
 
-/// What a 1/unit note is called aloud, for the units a signature can have.
-fn note_word(unit: u8) -> Option<&'static str> {
-    Some(match unit {
+/// **What a 1/d note is called aloud**, for every d the grid can reach: the
+/// note values a signature counts in (whole to thirty-second) and every
+/// halving under them the ladder walks to, down to the 4096th note that the
+/// finest step of 1/32 is.
+///
+/// Said the way a player says them, "hundred twenty-eighth" and not "one
+/// slash one hundred twenty-eight": a reader that has to spell a fraction
+/// out has not named the note.
+fn note_word(d: u64) -> Option<&'static str> {
+    Some(match d {
         1 => "whole",
         2 => "half",
         4 => "quarter",
         8 => "eighth",
         16 => "sixteenth",
         32 => "thirty-second",
+        64 => "sixty-fourth",
+        128 => "hundred twenty-eighth",
+        256 => "two hundred fifty-sixth",
+        512 => "five hundred twelfth",
+        1024 => "thousand twenty-fourth",
+        2048 => "two thousand forty-eighth",
+        4096 => "four thousand ninety-sixth",
         _ => return None,
     })
 }
@@ -5370,41 +5408,36 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
     // Spoken in words rather than in the box's shorthand: a reader saying
     // "one slash eight" has not said "an eighth note".
     //
-    // **Off the TEXT spelling**, because this is the ARRANGE box's readout
-    // and the arrange box prints numerals now. It is not a free choice:
-    // leave it on `grid_label`'s spelling and the quarter rung arrives as
-    // `\u{266a}`, which no arm below names, so it drops into the catch-all
-    // and a reader is told "♪ of a bar" — a character read aloud instead of
-    // a note named, and wrong arithmetic on top of it, since in 6/8 a
-    // quarter note is a THIRD of the bar. That is the box, the reader and
-    // the magnet disagreeing again, which is what this function was
-    // rewritten to end. `the_grid_box_can_be_stepped_both_ways` is the guard.
-    let label = note_label(q, unit, false);
-    match label.as_str() {
-        "1/4" => "quarter note".to_owned(),
-        "1/2" => "half note".to_owned(),
-        "1/8" => "eighth note".to_owned(),
-        "1/16" => "sixteenth note".to_owned(),
-        "1/32" => "thirty-second note".to_owned(),
-        "1/64" => "sixty-fourth note".to_owned(),
-        "1/4\u{00b7}" => "dotted quarter note".to_owned(),
-        "1/8\u{00b7}" => "dotted eighth note".to_owned(),
-        other => {
-            // **A counted rung is said as the notes it counts.** The box
-            // prints 10/8's half bar as "5/8"; read through the catch-all
-            // that is "5/8 of a bar", a wrong fraction (it is HALF the bar)
-            // said with confidence. Matched against the count itself rather
-            // than parsed out of the text, so only a counted label is read
-            // this way.
-            let (n, u) = beats_counted(q, unit);
-            match note_word(u) {
-                Some(word) if n >= 2 && other == format!("{n}/{u}") => {
-                    format!("{n} {word} notes")
-                }
-                _ => format!("{other} of a bar"),
-            }
-        }
-    }
+    // **Sorted by `note_value`, the decision the box prints**, rather than
+    // by reading the box's text back. It read the text, against a table of
+    // eight spellings, and everything the table lacked fell through to
+    // "{label} of a bar": in 4/2 the whole note under the bar was "1 of a
+    // bar", right after the bar's "1 bar"; 12/8's dotted half was "1/2· of a
+    // bar", a dot read aloud; and the finest steps were "1/128 of a bar" and
+    // finer, each a fraction of a bar that was not one. 428 (signature,
+    // step) pairs in all, in 182 of the 192 meters. Before that table it
+    // was the quarter: the glyph spelling sent "♪ of a bar".
+    // `every_step_of_every_meter_is_said_as_a_note` sweeps all 192 meters.
+    let counted = |n: u64, u: u8| match note_word(u64::from(u)) {
+        // **A counted step is said as the notes it counts.** The box prints
+        // 10/8's half bar as "5/8"; as "5/8 of a bar" that is a wrong
+        // fraction (it is HALF the bar) said with confidence.
+        Some(word) if n == 1 => format!("1 {word} note"),
+        Some(word) => format!("{n} {word} notes"),
+        // A unit no signature has; the app never builds one.
+        None => format!("{n} beats"),
+    };
+    let named = match note_value(q, unit) {
+        NoteValue::Plain(d) => note_word(d).map(|word| format!("{word} note")),
+        NoteValue::Dotted(d) => note_word(d).map(|word| format!("dotted {word} note")),
+        NoteValue::Counted(n, u) => Some(counted(n, u)),
+    };
+    named.unwrap_or_else(|| {
+        // A note the table has no name for, which no valid meter reaches:
+        // said as a count of the meter's beats rather than as a fraction.
+        let (n, u) = beats_counted(q, unit);
+        counted(n, u)
+    })
 }
 
 /// **Where a tempo handle is drawn, and grabbed.**
@@ -10499,12 +10532,11 @@ ArrangeView {
     ///
     /// The printed spelling changed under this test — the quarter rung reads
     /// "1/4" rather than `\u{266a}` now — and the SPOKEN assertion below did
-    /// not, deliberately. It is the guard on `grid_spoken` having followed
-    /// the box across: point that function at the glyph spelling while the
-    /// box prints numerals, or leave its match arm on `\u{266a}`, and the
-    /// quarter rung falls through to the "of a bar" catch-all. This line
-    /// then says "1/4 of a bar" and goes red, which is the whole point of
-    /// keeping it worded as a note.
+    /// not, deliberately: the reader names the note, whatever the box draws.
+    /// It used to name it by matching the box's text, so a respelt box could
+    /// drop the quarter into an "of a bar" catch-all; it sorts the division
+    /// itself now (`note_value`), and `every_step_of_every_meter_is_said_as_a_note`
+    /// holds every step of every meter to a note's name.
     #[test]
     fn the_grid_box_can_be_stepped_both_ways() {
         let cs: Vec<ClipView<'_>> = Vec::new();
@@ -13130,6 +13162,108 @@ selected: false,
                 assert_eq!(drawn.clip, cell, "{at}: {want} is not clipped to its box");
             }
         }
+    }
+
+    /// **Every step of every meter is said as a note**, the way a player
+    /// would say it, and no ladder says one twice.
+    ///
+    /// The box prints shorthand because it is the width of a thumb; the
+    /// screen reader is the one place the step is said in full, and it used
+    /// to fall through to "{label} of a bar" for 428 (signature, step) pairs:
+    /// in 4/2 the whole note under the bar was "1 of a bar" right after the
+    /// bar's own "1 bar", 12/8's dotted half was "1/2· of a bar", and the
+    /// finest steps were "1/128 of a bar" and finer, none of them a fraction
+    /// of a bar at all. Every valid signature, every step `grid_quarters`
+    /// takes (-7 to 6). Held:
+    ///
+    /// - nothing says "of a bar", a dot or a slash: no fraction is read out;
+    /// - above the bar it counts bars ("2 bars"), the bar is "1 bar", and
+    ///   every step under it is a note: "eighth note", "dotted quarter
+    ///   note", "5 eighth notes";
+    /// - it names what the box prints, so the two cannot disagree: a box's
+    ///   1/d is the 1/d note, its dot is "dotted", its n/u is n notes of
+    ///   1/u;
+    /// - no ladder says one of its steps twice.
+    ///
+    /// Revert check, performed: put back the reader that matched the box's
+    /// text against a table, and this fails on the first signature it
+    /// sweeps, 1/1, whose finest step it said as "1/128 of a bar".
+    #[test]
+    fn every_step_of_every_meter_is_said_as_a_note() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let fractions = ['/', '\u{00b7}', '\u{2044}', '\u{2215}', '\u{00bc}', '\u{00bd}', '\u{00be}'];
+        for &(beats, unit) in &sigs {
+            let mut said: Vec<(i8, String)> = Vec::new();
+            for e in -7i8..=6 {
+                let s = grid_spoken(e, beats, unit);
+                let at = format!("{beats}/{unit} at step {e}");
+                assert!(!s.contains("of a bar"), "{at} is said {s:?}");
+                assert!(
+                    !s.chars().any(|c| fractions.contains(&c) || ('\u{2150}'..='\u{215f}').contains(&c)),
+                    "{at} is said with a fraction: {s:?}"
+                );
+                if e > 0 {
+                    assert_eq!(s, format!("{} bars", 1u32 << e), "{at}");
+                } else if e == 0 {
+                    assert_eq!(s, "1 bar", "{at}");
+                } else {
+                    // What the box prints, said: 1 and 1/d are one note,
+                    // a dot makes it dotted, and n/u counts n notes of 1/u.
+                    let label = grid_label_text(e, beats, unit);
+                    let (body, dotted) = match label.strip_suffix('\u{00b7}') {
+                        Some(body) => (body, true),
+                        None => (label.as_str(), false),
+                    };
+                    let (n, d) = match body.split_once('/') {
+                        Some((n, d)) => (
+                            n.parse::<u64>().expect("a count"),
+                            d.parse::<u64>().expect("a note value"),
+                        ),
+                        None => (1, body.parse::<u64>().expect("a whole note")),
+                    };
+                    let word = note_word(d).unwrap_or_else(|| panic!("{at}: no name for a 1/{d} note"));
+                    let want = match (n, dotted) {
+                        (1, false) => format!("{word} note"),
+                        (1, true) => format!("dotted {word} note"),
+                        (n, false) => format!("{n} {word} notes"),
+                        (_, true) => panic!("{at}: the box prints a dotted count, {label:?}"),
+                    };
+                    assert_eq!(s, want, "{at}, which the box prints {label:?}");
+                }
+                if let Some((prev, _)) = said.iter().find(|(_, w)| *w == s) {
+                    panic!("{beats}/{unit}: steps {prev} and {e} are both said {s:?}");
+                }
+                said.push((e, s));
+            }
+        }
+        // Where the owner and the sweep met them.
+        let ladder: Vec<String> = (-7i8..=3).rev().map(|e| grid_spoken(e, 4, 2)).collect();
+        assert_eq!(
+            ladder,
+            [
+                "8 bars",
+                "4 bars",
+                "2 bars",
+                "1 bar",
+                "whole note",
+                "half note",
+                "quarter note",
+                "eighth note",
+                "sixteenth note",
+                "thirty-second note",
+                "sixty-fourth note",
+            ]
+        );
+        assert_eq!(grid_spoken(-1, 12, 8), "dotted half note");
+        assert_eq!(grid_spoken(-1, 6, 8), "dotted quarter note");
+        assert_eq!(grid_spoken(-7, 4, 4), "hundred twenty-eighth note");
+        assert_eq!(grid_spoken(-7, 3, 4), "two hundred fifty-sixth note");
+        assert_eq!(grid_spoken(-7, 1, 32), "four thousand ninety-sixth note");
+        assert_eq!(grid_spoken(-1, 12, 4), "dotted whole note");
+        assert_eq!(grid_spoken(-1, 6, 32), "dotted sixteenth note");
+        assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
+        assert_eq!(grid_spoken(-1, 4, 1), "2 whole notes");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window
