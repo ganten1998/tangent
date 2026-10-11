@@ -384,6 +384,129 @@ mod tests {
         }
     }
 
+    /// **A note on the cursor sounds wherever a callback meets the press that
+    /// plays from it.** The realtime export's own press (`start_bounce`:
+    /// stop, locate to the span's head, play) pushes a locate and the level
+    /// together, as does any frame that locates and plays at once. A
+    /// callback that meets the push after the locate and before the level,
+    /// or that sees the generation move between its own loads, holds one
+    /// chunk stopped on the new place, and that chunk's render stamped the
+    /// lanes' grain rings with the very span the next chunk rolls from. The
+    /// next chunk was served it as it stood, so the note on the cursor never
+    /// reached its instrument: a realtime export's first note was silent
+    /// whenever a callback happened to meet its press there.
+    ///
+    /// One DX7 note on the cursor and nothing else on the desk, so a note
+    /// that never reached its instrument is a silent render. That it sounds
+    /// ONCE is `instrument::rolling_from_a_standstill`'s, which compares a
+    /// render against the located one bit for bit.
+    #[test]
+    fn a_note_on_the_cursor_sounds_wherever_a_callback_meets_the_press_that_plays_from_it() {
+        use crate::instrument::{meet_transport_loads_for_test, ClipNote, PlacedMidi, TransportStores};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        const LANE: usize = 2;
+        let rate = 48_000u32;
+        let apply = |e: &Engine, store: Store| match store {
+            Store::Locate { generation, frames } => e.set_transport(generation, frames),
+            Store::Rolling(rolling) => e.set_rolling(rolling),
+        };
+        #[derive(Clone, Copy, Debug)]
+        enum Meet {
+            Between(usize),
+            Inside(u32),
+        }
+        for meet in [
+            Meet::Between(0),
+            Meet::Between(1),
+            Meet::Between(2),
+            Meet::Inside(1),
+            Meet::Inside(2),
+            Meet::Inside(3),
+        ] {
+            let mut e = Engine::offline(rate, tangent_record::audio::Timebase::new())
+                .expect("an offline engine needs no device");
+            e.set_builtin_strips(1 << LANE);
+            e.sync_instrument_lanes(1 << LANE, 0);
+            // Rendering ahead, as the app ships.
+            e.set_grain_ms(-1.0);
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: LANE,
+                start: 0,
+                len: 4 * u64::from(rate),
+                notes: Arc::new(vec![ClipNote { at: u64::from(rate), dur: 12_000, key: 60, vel: 110 }]),
+            }]);
+            let mut out = vec![0.0f32; 2 * 128];
+            // Parked at two seconds, stopped, as the desk waits for the press.
+            let mut t = Transport::new();
+            t.locate(2.0);
+            for _ in 0..8 {
+                t.push(Some(&e));
+                e.render_offline(&mut out);
+            }
+            // The export's press, which is a ruler click and Play as well:
+            // the cursor at one second, on the note.
+            t.stop();
+            t.locate(1.0);
+            t.toggle_play();
+            let acked = e.transport_acked(t.generation);
+            let stores: Vec<Store> = t
+                .stores(acked, e.transport_position(), f64::from(rate))
+                .into_iter()
+                .flatten()
+                .collect();
+            match meet {
+                Meet::Between(k) => {
+                    for &store in stores.iter().take(k) {
+                        apply(&e, store);
+                    }
+                    e.render_offline(&mut out);
+                    for &store in stores.iter().skip(k) {
+                        apply(&e, store);
+                    }
+                }
+                Meet::Inside(n) => {
+                    let fired = Rc::new(Cell::new(false));
+                    let (landed, all) = (Rc::clone(&fired), stores.clone());
+                    meet_transport_loads_for_test(Some(Box::new(move |loads: u32, host: &TransportStores<'_>| {
+                        if loads != n || landed.get() {
+                            return;
+                        }
+                        landed.set(true);
+                        for &store in &all {
+                            match store {
+                                Store::Locate { generation, frames } => host.set_transport(generation, frames),
+                                Store::Rolling(rolling) => host.set_rolling(rolling),
+                            }
+                        }
+                    })));
+                    e.render_offline(&mut out);
+                    meet_transport_loads_for_test(None);
+                    if !fired.get() {
+                        for &store in &stores {
+                            apply(&e, store);
+                        }
+                    }
+                }
+            }
+            // And on, reconciled every callback as the app reconciles it.
+            let mut peak = 0.0f32;
+            for _ in 0..40 {
+                t.push(Some(&e));
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            assert!(
+                e.transport_position() > u64::from(rate),
+                "{meet:?}: the song never rolled from the cursor"
+            );
+            assert!(peak > 0.01, "{meet:?}: the note on the cursor never sounded ({peak})");
+        }
+    }
+
     /// **Play pauses in place; only stop goes home.** The second press of
     /// play used to locate to 0:00, which made it a second stop button — a
     /// transport where you cannot stop to listen and carry on from there.
