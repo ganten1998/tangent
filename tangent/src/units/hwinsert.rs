@@ -105,54 +105,55 @@ const DRIFT_SETTLE_S: f64 = 2.0;
 /// window after window.
 const DRIFT_WINDOW_S: f64 = 4.0;
 
-/// The window lows the clock check keeps: four it judges and one more,
-/// so every judged low has a neighbour on each side to be checked against
-/// (see [`drift_verdict`]).
-const DRIFT_KEEP: usize = 5;
+/// The window means the clock check keeps: about three minutes of them.
+///
+/// On a real device the input's lead moves on a grid (the input arrives a
+/// whole callback at a time), so two clocks show as one whole step every so
+/// often (64 frames every 13 s at 100 ppm and 64-frame buffers, 256 every
+/// 53 s at 256) rather than a few frames each window, and the verdict needs
+/// a history long enough to see several of them.
+const DRIFT_HISTORY: usize = 48;
 
-/// The least a window's low must move to count as a step of a walk, frames.
-/// 100 ppm moves it 19 frames a window at 48 kHz; a still one moves it
-/// none.
+/// The least a window's mean must move to count as a step, frames.
 const DRIFT_MIN_STEP: i64 = 4;
 
-/// **The clock check's verdict** over the last [`DRIFT_KEEP`] window lows,
-/// oldest first, given whether two clocks were already called (`was`) and
-/// how many verdicts in a row the lows have held still since (`still`).
+/// Steps it takes to call two clocks: a one-off step (an underrun, a USB
+/// hiccup) lands in at most two windows' means, so a run of three windows
+/// in a row, or three separate runs, is more than any single event makes,
+/// or any two.
+const DRIFT_STEPS: usize = 3;
+
+/// **The clock check's verdict** over the window means kept, oldest first.
 ///
-/// A window whose low fell an input block or more below both its
-/// neighbours is one late input callback, not a trend, and reads as its
-/// neighbours. Two clocks are called when the lows walked at least three
-/// steps' worth one way across the four judged windows, with at least two
-/// of the three steps going that way: a one-off step (an underrun, a USB
-/// hiccup) walks in one step and then holds, and is not. Once called, the
-/// verdict stands until the lows have held still for two verdicts in a
-/// row, so one odd window does not flip the bay between wet and dry.
-fn drift_verdict(lows: &[i64; DRIFT_KEEP], in_block: i64, was: bool, still: &mut u32) -> bool {
-    let mut l = *lows;
-    for i in 1..DRIFT_KEEP - 1 {
-        let floor = lows[i - 1].min(lows[i + 1]);
-        if lows[i] <= floor - in_block.max(1) {
-            l[i] = floor;
+/// A window that moved by [`DRIFT_MIN_STEP`] or more is a step, and steps
+/// in consecutive windows are one run. Two clocks are called when every
+/// step went the same way (none against) and there are either
+/// [`DRIFT_STEPS`] runs (a drift on a device whose input lands a whole
+/// callback at a time steps every so often) or one run that long (a drift
+/// that moves the mean a little every window). One event (a step and then
+/// holding) makes one run of at most two windows, so neither one hiccup
+/// nor two are called; a late input callback moves a window's mean by a
+/// block over hundreds of chunks, far under a step. The history is the
+/// hysteresis: a called drift keeps its steps in view for minutes, so the
+/// bay does not flip between wet and dry.
+fn drift_verdict(means: &[i64]) -> bool {
+    let (mut up, mut down) = (false, false);
+    let (mut runs, mut run, mut longest) = (0usize, 0usize, 0usize);
+    for w in means.windows(2) {
+        let d = w[1] - w[0];
+        if d.abs() >= DRIFT_MIN_STEP {
+            up |= d > 0;
+            down |= d < 0;
+            if run == 0 {
+                runs += 1;
+            }
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
         }
     }
-    let judged = &l[..DRIFT_KEEP - 1];
-    let net = judged[judged.len() - 1] - judged[0];
-    let way = net.signum();
-    let agree = judged.windows(2).filter(|w| (w[1] - w[0]) * way >= DRIFT_MIN_STEP).count();
-    let walking = way != 0 && net.abs() >= 3 * DRIFT_MIN_STEP && agree >= 2;
-    if walking {
-        *still = 0;
-        return true;
-    }
-    if !was {
-        return false;
-    }
-    if net.abs() < 2 * DRIFT_MIN_STEP {
-        *still += 1;
-    } else {
-        *still = 0;
-    }
-    *still < 2
+    up != down && (runs >= DRIFT_STEPS || longest >= DRIFT_STEPS)
 }
 
 /// The callback size's window, seconds: the size the stream is keyed on is
@@ -540,6 +541,9 @@ pub struct HwClocks {
     /// The renderer's finding, this epoch, that the input's lead keeps
     /// moving: two clocks it was not told about.
     pub drifting: AtomicBool,
+    /// Whether `out_block` is the stream's adopted size yet, or only the
+    /// largest callback seen so far (the first second of a stream).
+    pub size_known: AtomicBool,
 }
 
 /// **Whether an input and an output name one device**: `Some(true)` one,
@@ -756,18 +760,19 @@ pub struct HwHub {
     seen: Mutex<Seen>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Seen {
     input: Option<u64>,
     varispeed: bool,
     /// The clock check: where its judging began, the window it is in and
-    /// that window's lowest lead, and the last windows' lows.
+    /// that window's sum of leads and their count, and the last windows'
+    /// means.
     judge_from: u64,
     win_end: u64,
-    win_low: i64,
-    lows: [i64; DRIFT_KEEP],
-    lows_n: usize,
-    still: u32,
+    win_sum: i64,
+    win_n: i64,
+    means: [i64; DRIFT_HISTORY],
+    means_n: usize,
     /// Callbacks seen this stream: the first few are the start-up burst.
     blk_calls: u32,
     /// The callback size: the window's end and largest, the size a window
@@ -776,6 +781,26 @@ struct Seen {
     blk_max: u32,
     blk_cand: u32,
     blk_steady: u32,
+}
+
+impl Default for Seen {
+    fn default() -> Self {
+        Self {
+            input: Default::default(),
+            varispeed: Default::default(),
+            judge_from: Default::default(),
+            win_end: Default::default(),
+            win_sum: Default::default(),
+            win_n: Default::default(),
+            means: [0; DRIFT_HISTORY],
+            means_n: Default::default(),
+            blk_calls: Default::default(),
+            blk_end: Default::default(),
+            blk_max: Default::default(),
+            blk_cand: Default::default(),
+            blk_steady: Default::default(),
+        }
+    }
 }
 
 /// What the renderer knows about the device this chunk.
@@ -899,6 +924,7 @@ impl HwHub {
             gen,
             prev,
             committed: false,
+            seen_at_attach: 0,
         })
     }
 
@@ -980,6 +1006,13 @@ impl HwHub {
                 // first seconds, a saved measurement would read unmeasured
                 // and the desk would re-align a moment later, with a click.
                 seen.blk_calls = seen.blk_calls.saturating_add(1);
+                if seen.blk_steady == 0 {
+                    // Provisional, and never 0: an unmeasured bay is keyed
+                    // on the largest callback seen while the size is not
+                    // known. A measured one ignores it (`size_known`).
+                    let seen_max = c.out_block.load(Ordering::Relaxed).max(dev.out_block);
+                    c.out_block.store(seen_max, Ordering::Relaxed);
+                }
                 if seen.blk_calls > STARTUP_CALLBACKS {
                     if seen.blk_end == 0 {
                         seen.blk_end = out + (rate * BLOCK_WINDOW_S) as u64;
@@ -994,8 +1027,10 @@ impl HwHub {
                         seen.blk_max = 0;
                         seen.blk_end = out + (rate * BLOCK_WINDOW_S) as u64;
                     }
-                    let keyed = if seen.blk_steady == 0 { seen.blk_max } else { seen.blk_steady };
-                    c.out_block.store(keyed, Ordering::Relaxed);
+                    if seen.blk_steady != 0 {
+                        c.out_block.store(seen.blk_steady, Ordering::Relaxed);
+                        c.size_known.store(true, Ordering::Relaxed);
+                    }
                 }
                 let rebase = seen.input != input || seen.varispeed != dev.varispeed;
                 if rebase {
@@ -1017,42 +1052,35 @@ impl HwHub {
                 if rebase {
                     seen.judge_from = out + (rate * DRIFT_SETTLE_S) as u64;
                     seen.win_end = 0;
-                    seen.lows_n = 0;
-                    seen.still = 0;
+                    seen.means_n = 0;
                     c.drifting.store(false, Ordering::Relaxed);
                 }
                 // **The clock check, by trend.** On one crystal the input's
                 // lead over the output wanders in a band about an input block
-                // wide and its lowest point holds still; on two it walks
-                // away. The low point of each window is compared with the
-                // last ones: walking the same way, by more than a few frames,
-                // window after window, is two clocks; one step and then
-                // stillness (a hiccup) is not.
+                // wide and its mean over a window holds still; on two it
+                // walks away, a step at a time. See `drift_verdict`.
                 let produced = c.in_clock.load(Ordering::Relaxed) + backlog;
                 let here = produced as i64 - out as i64;
                 if input.is_some() && !dev.varispeed && out >= seen.judge_from {
                     if seen.win_end == 0 {
                         seen.win_end = out + (rate * DRIFT_WINDOW_S) as u64;
-                        seen.win_low = here;
+                        (seen.win_sum, seen.win_n) = (0, 0);
                     }
-                    seen.win_low = seen.win_low.min(here);
+                    seen.win_sum += here;
+                    seen.win_n += 1;
                     if out >= seen.win_end {
-                        let low = seen.win_low;
-                        if seen.lows_n == DRIFT_KEEP {
-                            seen.lows.copy_within(1.., 0);
-                            seen.lows_n -= 1;
+                        let mean = seen.win_sum / seen.win_n.max(1);
+                        if seen.means_n == DRIFT_HISTORY {
+                            seen.means.copy_within(1.., 0);
+                            seen.means_n -= 1;
                         }
-                        let n = seen.lows_n;
-                        seen.lows[n] = low;
-                        seen.lows_n += 1;
-                        if seen.lows_n == DRIFT_KEEP {
-                            let was = c.drifting.load(Ordering::Relaxed);
-                            let lows = seen.lows;
-                            let verdict = drift_verdict(&lows, i64::from(dev.in_block), was, &mut seen.still);
-                            c.drifting.store(verdict, Ordering::Relaxed);
-                        }
+                        let n = seen.means_n;
+                        seen.means[n] = mean;
+                        seen.means_n += 1;
+                        let means = seen.means;
+                        c.drifting.store(drift_verdict(&means[..seen.means_n]), Ordering::Relaxed);
                         seen.win_end = out + (rate * DRIFT_WINDOW_S) as u64;
-                        seen.win_low = here;
+                        (seen.win_sum, seen.win_n) = (0, 0);
                     }
                 }
                 (rebase, c.drifting.load(Ordering::Relaxed))
@@ -1216,6 +1244,9 @@ pub struct HwClaim {
     prev: Option<Prev>,
     /// Whether this claim's tenant has run: past that, a handover is final.
     committed: bool,
+    /// The ping request the tenant took over at attach: asks up to it were
+    /// the old tenant's to answer, asks after it are the new one's.
+    seen_at_attach: u32,
 }
 
 /// A port as the tenant before a handover had it.
@@ -1238,9 +1269,13 @@ impl HwClaim {
         }
         self.committed = true;
         let p = &self.port;
-        if self.prev.is_some() && p.pinging.swap(false, Ordering::Relaxed) {
+        // Every ask up to the one this tenant took over at attach was the
+        // old tenant's, which has stopped: answered as not running. An ask
+        // after the attach is this tenant's, and it runs it.
+        if self.prev.is_some() && p.ping_done.load(Ordering::Acquire) != self.seen_at_attach {
+            p.pinging.store(false, Ordering::Relaxed);
             p.ping_result.store(PingFail::Expired.code(), Ordering::Relaxed);
-            p.ping_done.store(p.ping_req.load(Ordering::Relaxed), Ordering::Release);
+            p.ping_done.store(self.seen_at_attach, Ordering::Release);
         }
     }
 
@@ -1474,10 +1509,11 @@ impl HwInsert {
     /// an engine that has none to give).
     pub fn attach(&mut self, claim: Option<HwClaim>) {
         self.claim = claim;
-        if let Some(c) = &self.claim {
+        if let Some(c) = self.claim.as_mut() {
+            c.seen_at_attach = c.port.ping_req.load(Ordering::Acquire);
             self.clocks = Some(Arc::clone(&c.clocks));
             c.set_routes(self.send, self.ret);
-            self.ping_seen = c.port.ping_req.load(Ordering::Relaxed);
+            self.ping_seen = c.seen_at_attach;
         }
         self.delta = None;
     }
@@ -1947,11 +1983,13 @@ impl HwInsert {
             clocks.in_block.load(Ordering::Relaxed),
             clocks.rate.load(Ordering::Relaxed),
         );
-        // The stream's size is not known yet (its start-up burst): a saved
-        // measurement stands as it was saved, rather than reading unmeasured
-        // for a block or two and moving the desk.
-        if ob == 0 {
-            if let Some(m) = self.measured {
+        // The stream's size is not adopted yet (its first second): a saved
+        // measurement taken at this rate stands as it was saved, rather than
+        // reading unmeasured against a provisional size and moving the desk
+        // when the real one is adopted. An unmeasured bay is keyed on the
+        // provisional size, the largest callback seen.
+        if !clocks.size_known.load(Ordering::Relaxed) {
+            if let Some(m) = self.measured.filter(|m| m.rate == rate) {
                 return (latency_for(m.loop_frames, m.out_block, m.in_block), m.loop_frames, true);
             }
         }
@@ -2316,12 +2354,20 @@ mod tests {
                 }
             }
             self.blocks += 1;
+            // **The input side is a callback of its own, a fixed block
+            // long**, as a real device's is: it fires whenever the input
+            // clock has a whole block, which with two clocks is now and then
+            // one block more or one fewer per output block, a whole block at
+            // a time. A late callback holds its block for one output block.
             let late = self.late_every > 0 && self.blocks % self.late_every == 0;
-            if !late && self.blocks % self.in_every.max(1) == 0 {
-                let lost = (self.lose * in_ch).min(self.held.len());
-                self.lose -= lost / in_ch;
-                self.held.drain(..lost);
-                self.pending.append(&mut self.held);
+            let lost = (self.lose * in_ch).min(self.held.len());
+            self.lose -= lost / in_ch;
+            self.held.drain(..lost);
+            let chunk = self.block * self.in_every.max(1) * in_ch;
+            if !late {
+                while self.held.len() >= chunk {
+                    self.pending.extend(self.held.drain(..chunk));
+                }
             }
             self.last_out = dev;
         }
@@ -2737,7 +2783,8 @@ mod tests {
     /// link says so, and the bay passes dry in time rather than crackling.
     #[test]
     fn an_input_on_another_clock_is_found_and_passes_dry() {
-        // 100 ppm either way: one frame in ten thousand.
+        // 100 ppm either way: one frame in ten thousand, which the input's
+        // fixed-size callbacks turn into a whole block now and then.
         for drift in [10_000i64, -10_000] {
             let mut dev = FakeDevice::new(4, 4, 128, 30);
             dev.drift = drift;
@@ -2747,7 +2794,7 @@ mod tests {
             while u.link() != Link::ClockDrift {
                 let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
                 n += 1;
-                assert!(n < 12_000, "drift {drift}: never found ({:?})", u.link());
+                assert!(n < 48_000 * 100 / 128, "drift {drift}: never found ({:?})", u.link());
             }
             let latency = u.latency() as usize;
             assert_eq!(lands(&mut dev, &mut u), latency, "drift {drift}: not dry in time");
@@ -2876,11 +2923,13 @@ mod tests {
         let mut dev = FakeDevice::new(4, 4, 128, 30);
         dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
         let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
-        // Well into the judging, then a step of 900 frames (more than the
-        // old range band) and half a minute more.
+        // Well into the judging, then seven dropped input callbacks (896
+        // frames, more than the old range band) and half a minute more. A
+        // dropped stretch is whole callbacks, so the lead moves by exactly
+        // what was lost and the relock puts the loop back where it was.
         let _ = run_impulse(&mut dev, &mut u, 48_000 * 10 / 128, usize::MAX);
         let before = lands(&mut dev, &mut u);
-        dev.lose = 900;
+        dev.lose = 7 * 128;
         for _ in 0..(48_000 * 30 / 128) {
             let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
             assert_ne!(u.link(), Link::ClockDrift, "a hiccup was called two clocks");
@@ -3080,73 +3129,83 @@ mod tests {
         None
     }
 
-    /// **An input that falls behind is called two clocks even while it makes
-    /// the loop starve.** At small buffers a drift starves the bay every few
-    /// seconds; a starve used to restart the judgement (for every bay on the
-    /// engine), so the verdict never came. It must, at 100 and 300 ppm, at
-    /// 64- and 32-frame buffers, with another bay on the hub beside it.
+    /// How long a 100 ppm drift may take to be called at `block`-frame
+    /// buffers, seconds: the settle, then three whole-block steps of the
+    /// input's lead (one every `block / 4.8` seconds at 48 kHz), and two
+    /// windows of slack.
+    fn drift_bound_s(block: usize) -> usize {
+        2 + 3 * block * 10 / 48 + 12
+    }
+
+    /// **Two clocks are called at every buffer size, either way, through the
+    /// starves they cause.** The fake's input arrives in whole callbacks of
+    /// its own size, so 100 ppm shows as one whole-block step of the lead
+    /// every few seconds (every 53 at 256 frames), as on a real device. A
+    /// second bay on the hub is called with it, and a starve (the input
+    /// behind) does not hold the verdict back.
     #[test]
-    fn an_input_falling_behind_is_called_two_clocks_through_its_starves() {
-        for block in [64usize, 32] {
-            for every in [10_000i64, 3_333] {
+    fn two_clocks_are_called_at_every_buffer_size_either_way() {
+        for block in [32usize, 64, 128, 256] {
+            for drift in [-10_000i64, 10_000] {
                 let mut dev = FakeDevice::new(6, 6, block, 30);
-                dev.drift = -every;
+                dev.drift = drift;
                 dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0), (4, 4, 1.0), (5, 5, 1.0)];
                 let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
                 let mut other = HwInsert::new(48_000.0);
                 other.set_routes(Some(Jacks::pair(4)), Some(Jacks::pair(4)));
                 other.attach(dev.hub.claim(8, Some(2)));
-                let found = until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 40);
-                assert!(found.is_some(), "{block}-frame buffers, 1 in {every}: never called");
-                assert!(dev.hub.port_for(7).unwrap().slips() > 0, "fixture: the drift never starved the loop");
+                let found = until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, drift_bound_s(block));
+                assert!(found.is_some(), "{block}-frame buffers, drift {drift}: never called");
                 assert_eq!(other.link(), Link::ClockDrift, "the other bay was not called with it");
+                if drift < 0 && block <= 64 {
+                    assert!(dev.hub.port_for(7).unwrap().slips() > 0, "fixture: the drift never starved the loop");
+                }
+                // And it stays called.
+                assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::Connected, 60), None, "{block}: flapped back");
             }
         }
     }
 
-    /// **The verdict does not flap, and one clock with late callbacks is
-    /// never called.** A late input callback drops one window's low by a
-    /// block: one clock with those every dozen seconds stays connected for a
-    /// minute, and 100 ppm with the same stays called once it is called.
+    /// **One clock is never called two**, with late input callbacks every
+    /// dozen seconds, and with one-off steps of the lead (a lost block, a
+    /// big loss) that move it once and hold.
     #[test]
-    fn late_callbacks_neither_trip_one_clock_nor_flap_a_drift() {
-        let mut dev = FakeDevice::new(6, 6, 128, 30);
-        dev.late_every = 4_700;
-        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
-        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
-        let mut other = HwInsert::new(48_000.0);
-        assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 60), None, "one clock was called two");
-        let mut dev = FakeDevice::new(6, 6, 128, 30);
-        dev.late_every = 4_700;
-        dev.drift = 10_000;
-        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
-        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
-        assert!(until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 40).is_some(), "100 ppm was never called");
-        assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::Connected, 40), None, "the verdict flapped back");
+    fn one_clock_with_late_callbacks_and_one_off_steps_is_never_called() {
+        for block in [64usize, 256] {
+            let mut dev = FakeDevice::new(6, 6, block, 30);
+            dev.late_every = 48_000 * 12 / block;
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            let mut other = HwInsert::new(48_000.0);
+            assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 40), None, "{block}: late callbacks");
+            dev.lose = block;
+            assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 40), None, "{block}: one lost block");
+            // A dropped stretch is whole callbacks.
+            dev.lose = 7 * block;
+            assert_eq!(until_link(&mut dev, &mut u, &mut other, Link::ClockDrift, 100), None, "{block}: one big loss");
+        }
     }
 
-    /// The verdict itself, on lows written down.
+    /// The verdict itself, on window means written down.
     #[test]
-    fn the_drift_verdict_walks_ignores_outliers_and_holds() {
-        let mut still = 0;
-        // Still: no.
-        assert!(!drift_verdict(&[0, 0, 0, 0, 0], 128, false, &mut still));
-        // 100 ppm (19 a window) either way: yes.
-        assert!(drift_verdict(&[0, 19, 38, 57, 76], 128, false, &mut still));
-        assert!(drift_verdict(&[0, -19, -38, -57, -76], 128, false, &mut still));
-        // A late callback in one window, one clock: no.
-        assert!(!drift_verdict(&[0, -128, 0, 0, 0], 128, false, &mut still));
-        assert!(!drift_verdict(&[0, 0, -130, 0, 0], 128, false, &mut still));
-        // The same under a drift: still yes.
-        assert!(drift_verdict(&[0, -19, -170, -57, -76], 128, false, &mut still));
-        // A one-off step: no.
-        assert!(!drift_verdict(&[0, 0, -900, -900, -900], 128, false, &mut still));
-        // Called, then one odd window: stays called; still for two verdicts:
-        // released.
-        let mut still = 0;
-        assert!(drift_verdict(&[0, 19, 19, 19, 19], 128, true, &mut still));
-        assert!(drift_verdict(&[19, 19, 19, 19, 19], 128, true, &mut still));
-        assert!(!drift_verdict(&[19, 19, 19, 19, 19], 128, true, &mut still));
+    fn the_drift_verdict_wants_steps_one_way() {
+        // Still, or a few frames of wander: no.
+        assert!(!drift_verdict(&[0; 20]));
+        assert!(!drift_verdict(&[0, 2, -1, 3, 0, -2, 1, 0]));
+        // A smooth 19 a window either way: yes.
+        assert!(drift_verdict(&[0, 19, 38, 57]));
+        assert!(drift_verdict(&[0, -19, -38, -57]));
+        // Whole-block steps now and then, the same way: yes once there are
+        // three windows that moved.
+        assert!(!drift_verdict(&[0, 0, 0, -40, -128, -128, -128, -128]));
+        assert!(!drift_verdict(&[0, 0, -40, -128, -128, -128, -170, -256, -256]));
+        assert!(drift_verdict(&[0, 0, -40, -128, -128, -128, -170, -256, -256, -256, -384]));
+        // One step and holding, however big: no.
+        assert!(!drift_verdict(&[0, 0, -450, -900, -900, -900, -900]));
+        // Two one-off events the same way: no.
+        assert!(!drift_verdict(&[0, -32, -64, -64, -64, -64, -500, -900, -900]));
+        // Steps both ways (a hiccup and its recovery): no.
+        assert!(!drift_verdict(&[0, -64, -64, 0, -64, 0, -64]));
     }
 
     /// **A stream's start-up burst does not key the size.** The first
@@ -3177,6 +3236,95 @@ mod tests {
             assert!(dev.hub.port_for(7).unwrap().loop_frames().1, "block {k}: the measurement read unmeasured");
         }
         assert_eq!(lands(&mut dev, &mut u), figure as usize);
+    }
+
+    /// **Callbacks that jitter from the very start keep a saved figure.**
+    /// 470, 471, 470... (WASAPI in event mode, CoreAudio converting a rate):
+    /// a bay reopened with a measurement taken at the stream's adopted size
+    /// (471) reports it, measured, on every block from the first, and never
+    /// flips to unmeasured against a provisional size. A measurement taken
+    /// at another rate is not trusted while the size is unknown.
+    #[test]
+    fn jittering_callbacks_from_the_start_keep_a_saved_figure() {
+        let jitter = || std::iter::repeat_n([470usize, 471], 2_000).flatten().collect::<Vec<_>>();
+        let mut dev = FakeDevice::new(4, 4, 470, 30);
+        dev.sizes = jitter();
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 400, usize::MAX);
+        assert!(ping(&mut dev, &mut u) >= 0);
+        let m = u.measured().expect("measured");
+        assert_eq!(m.out_block, 471);
+        let figure = u.latency();
+        let mut dev = FakeDevice::new(4, 4, 470, 30);
+        dev.sizes = jitter();
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = HwInsert::new(48_000.0);
+        u.set_routes(Some(Jacks::pair(2)), Some(Jacks::pair(2)));
+        u.set_measured(Some(m));
+        u.attach(dev.hub.claim(7, Some(1)));
+        for k in 0..600 {
+            let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+            assert_eq!(u.latency(), figure, "block {k}: the figure moved");
+            assert!(dev.hub.port_for(7).unwrap().loop_frames().1, "block {k}: read unmeasured");
+        }
+        // Measured at another rate: not trusted, even before the size is known.
+        let mut dev = FakeDevice::new(4, 4, 470, 30);
+        dev.sizes = jitter();
+        let mut u = HwInsert::new(48_000.0);
+        u.set_routes(Some(Jacks::pair(2)), Some(Jacks::pair(2)));
+        u.set_measured(Some(Measured { rate: 44_100, ..m }));
+        u.attach(dev.hub.claim(7, Some(1)));
+        let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+        assert!(!dev.hub.port_for(7).unwrap().loop_frames().1, "a measurement at 44.1 kHz was trusted at 48");
+    }
+
+    /// **Pings asked around a reload are each answered once, by the right
+    /// tenant.** Asked between the new tenant's claim and its attach: the
+    /// old tenant's to answer, so it is answered (not running) when the new
+    /// one commits, not left pinging for ever. Asked after the attach while
+    /// the old tenant's ping runs: the old one is answered, and the new
+    /// tenant runs the new ask to a real answer.
+    #[test]
+    fn pings_asked_around_a_reload_are_each_answered_once() {
+        // Between claim and attach.
+        let mut dev = FakeDevice::new(4, 4, 128, 30);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut old = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut old, 8, usize::MAX);
+        let claim = dev.hub.claim(7, Some(1));
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        let mut new = HwInsert::new(48_000.0);
+        new.set_routes(Some(Jacks::pair(2)), Some(Jacks::pair(2)));
+        new.attach(claim);
+        drop(old);
+        let _ = run_impulse(&mut dev, &mut new, 4, usize::MAX);
+        let port = dev.hub.port_for(7).unwrap();
+        assert!(!port.pinging(), "an ask between claim and attach was never answered");
+        assert_eq!(PingFail::from_code(port.ping_answer().1), Some(PingFail::Expired));
+
+        // After attach, while the old tenant's ping runs.
+        let mut dev = FakeDevice::new(4, 4, 128, 30);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut old = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut old, 8, usize::MAX);
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        let _ = run_impulse(&mut dev, &mut old, 40, usize::MAX);
+        let mut new = HwInsert::new(48_000.0);
+        new.set_routes(Some(Jacks::pair(2)), Some(Jacks::pair(2)));
+        new.attach(dev.hub.claim(7, Some(1)));
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        drop(old);
+        let mut n = 0;
+        while dev.hub.port_for(7).unwrap().pinging() {
+            let _ = run_impulse(&mut dev, &mut new, 1, usize::MAX);
+            n += 1;
+            assert!(n < 3_000, "the new ask was never answered");
+        }
+        let (seq, result) = dev.hub.port_for(7).unwrap().ping_answer();
+        assert_eq!(seq, 2, "the answer is not the new ask's");
+        assert!(result >= 0, "the new tenant's ping was answered as not running: {result}");
+        assert!(new.measured().is_some());
     }
 
     /// **A refused reload leaves the old tenant's ping to it.** The claim
