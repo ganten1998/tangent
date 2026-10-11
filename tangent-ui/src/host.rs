@@ -1,9 +1,10 @@
 //! What the thing hosting us can actually do.
 //!
-//! Tangent runs in two places that differ less than they look. The desktop app
-//! owns a window, opens MIDI devices, and can spawn more windows. A VST3 editor
-//! owns none of that: it is handed one child window by the host, receives its
-//! notes from the host, and is resized by the host.
+//! The desktop binary owns a window, opens its own MIDI devices, raises native
+//! panels and can spawn more windows. Not every app this crate builds may do
+//! all of that: screen-reader mode and fullscreen give the child windows up, a
+//! Minimal build links no capture code, and a test builds the app in a bare
+//! egui context that owns nothing outside it ([`Caps::NONE`]).
 //!
 //! `Caps` is how the shared GUI asks, instead of assuming. It is deliberately
 //! plain data rather than a trait: every field is a fact about the host that
@@ -11,52 +12,42 @@
 //! for a host that does not exist yet.
 //!
 //! The rule for adding a field: it must name a CAPABILITY, not a host. Code
-//! that says `if caps.child_windows` still reads correctly the day someone
-//! writes a CLAP or AUv3 build; code that says `if is_plugin` has to be
-//! revisited every time.
+//! that says `if caps.child_windows` still reads correctly whatever turned the
+//! windows off; code that says `if is_desktop` has to be revisited every time.
 
 /// What this host permits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     /// The UI may open additional OS windows.
     ///
-    /// **False does not mean "the calls fail".** In a plugin,
-    /// `egui::Context::show_viewport_immediate` still RUNS: the context is
-    /// created with `embed_viewports: true`, so it invokes the closure inline
-    /// and opens a second `CentralPanel` under the same id as the first,
-    /// painting garbage over the piano. A hard error would have been kinder.
-    /// Anything that would have been a window has to be drawn in the canvas
-    /// instead, and this is the flag that decides.
-    pub child_windows: bool,
-    /// The UI may set its own size by sending viewport commands. A plugin
-    /// editor may NOT: `egui-baseview` honours `ViewportCommand::InnerSize`,
-    /// so an ungated one reaches into the DAW and resizes the editor behind
-    /// the host's back. This also gates the borderless toggle, the geometry
-    /// write-back and the offscreen rescue — everything that treats the window
-    /// as ours.
-    pub window_sizing: bool,
-    /// A size percentage is a meaningful thing to offer.
+    /// Off in screen-reader mode and in fullscreen, where every menu and
+    /// dialog is drawn in the canvas instead, and in [`Caps::NONE`].
     ///
-    /// True for BOTH hosts, and the distinction from `window_sizing` is the
-    /// point. A plugin cannot set its own size, but it can ASK: VST3 has
-    /// `IPlugFrame::resizeView` and nih-plug wires it to
-    /// `GuiContext::request_resize`. So the Size submenu belongs in a plugin,
-    /// it just takes a different road to the same place — the host is told,
-    /// and the host decides.
-    pub size_presets: bool,
-    /// The UI chooses its own MIDI input. A plugin is given notes by the host
-    /// and has no device list to offer.
+    /// **False does not mean "the calls fail".** In a context that embeds its
+    /// viewports, which a bare `egui::Context` does,
+    /// `egui::Context::show_viewport_immediate` still RUNS: it invokes the
+    /// closure inline and opens a second `CentralPanel` under the same id as
+    /// the first, painting garbage over the piano. A hard error would have been
+    /// kinder. Anything that would have been a window has to be drawn in the
+    /// canvas instead, and this is the flag that decides.
+    pub child_windows: bool,
+    /// The UI may set its own size by sending viewport commands. This also
+    /// gates the borderless toggle, the geometry write-back and the offscreen
+    /// rescue: everything that treats the window as ours. Off only in
+    /// [`Caps::NONE`], whose context has no window to send them to.
+    pub window_sizing: bool,
+    /// The UI chooses its own MIDI input. Off only in [`Caps::NONE`], which
+    /// has no device list to offer.
     pub midi_ports: bool,
-    /// Settings changes may be written to `~/.config/tangent/`. A plugin shares
-    /// that file with the standalone and with every other instance, so the
-    /// last window closed would otherwise decide everyone's colours.
+    /// Settings changes may be written to `~/.config/tangent/`. Off in every
+    /// test that builds an app it must not let near that file, which is what
+    /// [`Caps::NONE`] and the tests' own `QUIET` sets are for.
     pub persist_global_settings: bool,
     /// The UI may open a camera or an audio input.
     ///
-    /// False in a plugin, which has no business opening a device behind the
-    /// DAW's back, and false in a Minimal build, where the code to do it is not
-    /// linked at all. **The Recorder band's height must be exactly zero when
-    /// this is false** — `fit_bands` shrinks the piano to make room for any
+    /// False in a Minimal build, where the code to do it is not linked at all,
+    /// and in [`Caps::NONE`]. **The Recorder band's height must be exactly zero
+    /// when this is false**: `fit_bands` shrinks the piano to make room for any
     /// band with a non-zero height, including one that will never be painted.
     pub capture_devices: bool,
     /// The UI may create take directories and write media outside the config
@@ -65,15 +56,11 @@ pub struct Caps {
     /// Deliberately separate from `persist_global_settings`, which is about one
     /// specific shared file. Conflating "shares settings.json" with "may write
     /// a 2 GB video into the user's Movies folder" is exactly the mistake this
-    /// struct's own rule warns against. False in a plugin for a second reason
-    /// too: multiple instances and offline bounce make plugin-side file writing
-    /// actively dangerous.
+    /// struct's own rule warns against.
     pub write_user_files: bool,
-    /// A "Choose folder..." button is a meaningful thing to offer.
-    ///
-    /// False in a plugin, where a native modal raised inside a DAW is a hang
-    /// report waiting to happen — and where, with `persist_global_settings`
-    /// false, there would be nowhere to put the answer anyway.
+    /// A "Choose folder..." button is a meaningful thing to offer: this host
+    /// may raise a native panel at all. Off only in [`Caps::NONE`], where there
+    /// is no panel to raise and nothing would drain the request.
     pub native_file_dialogs: bool,
 }
 
@@ -82,7 +69,6 @@ impl Caps {
     pub const DESKTOP: Caps = Caps {
         child_windows: true,
         window_sizing: true,
-        size_presets: true,
         midi_ports: true,
         persist_global_settings: true,
         capture_devices: true,
@@ -90,12 +76,18 @@ impl Caps {
         native_file_dialogs: true,
     };
 
-    /// A plugin editor: one host-owned window, host-supplied notes, host-driven
-    /// size, and shared config it must not fight over.
-    pub const PLUGIN: Caps = Caps {
+    /// **Nothing at all**: no window of its own, no viewport command, no MIDI
+    /// port, no settings file, no capture device, no user file and no native
+    /// panel.
+    ///
+    /// What the test harnesses build an app with, so a test reaches nothing
+    /// outside its egui context. With `child_windows` off every menu and
+    /// dialog draws inline in that context, as they do in screen-reader mode
+    /// and in fullscreen, which is where a test can see them. No build
+    /// constructs it.
+    pub const NONE: Caps = Caps {
         child_windows: false,
         window_sizing: false,
-        size_presets: true,
         midi_ports: false,
         persist_global_settings: false,
         capture_devices: false,
@@ -139,27 +131,22 @@ impl Default for Caps {
 mod tests {
     use super::*;
 
+    /// **`NONE` withholds everything**, because the test harness leans on
+    /// every part of that: no window to command, no device to open, no panel
+    /// to raise, and above all no settings file to write. A field that went
+    /// true here would be every test built on it reaching for that thing.
     #[test]
-    fn the_plugin_gives_up_everything_the_desktop_owns() {
+    fn none_withholds_every_capability() {
         assert_eq!(Caps::default(), Caps::DESKTOP);
-        let p = Caps::PLUGIN;
-        assert!(!p.child_windows && !p.window_sizing);
+        let n = Caps::NONE;
+        assert!(!n.child_windows && !n.window_sizing, "a test owns no window");
+        assert!(!n.midi_ports, "a test opens no MIDI device");
+        assert!(!n.persist_global_settings, "a test writes no settings file");
         assert!(
-            p.size_presets,
-            "a plugin can still ASK the host for a size, and must be able to"
+            !n.capture_devices && !n.write_user_files,
+            "a test opens no camera and writes no take"
         );
-        assert!(!p.midi_ports, "a plugin is handed its notes");
-        assert!(!p.persist_global_settings, "a plugin shares that file");
-        assert!(!p.capture_devices, "a plugin must not open a camera");
-        assert!(
-            !p.write_user_files,
-            "multiple instances and offline bounce make plugin-side file \
-             writing actively dangerous"
-        );
-        assert!(
-            !p.native_file_dialogs,
-            "a native modal inside a DAW is a hang report waiting to happen"
-        );
+        assert!(!n.native_file_dialogs, "a test raises no native panel");
     }
 
     /// A Minimal build is the desktop MINUS the two things whose code is not
@@ -175,7 +162,7 @@ mod tests {
             "Minimal still owns a real window and a real MIDI device"
         );
         assert!(
-            m.persist_global_settings && m.native_file_dialogs && m.size_presets,
+            m.persist_global_settings && m.native_file_dialogs,
             "nothing else is taken away"
         );
     }
@@ -187,7 +174,7 @@ mod tests {
     /// to create one by editing a single field.
     #[test]
     fn capture_and_writing_files_travel_together() {
-        for c in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL, Caps::default()] {
+        for c in [Caps::DESKTOP, Caps::NONE, Caps::MINIMAL, Caps::default()] {
             assert_eq!(
                 c.capture_devices, c.write_user_files,
                 "{c:?} can do one half of recording and not the other"
@@ -205,8 +192,8 @@ mod tests {
 /// window manager placing the window, because both look like "the size
 /// changed and nobody here asked for it".
 ///
-/// **All-false is the correct answer for every host that cannot say** — the
-/// plugin editor, Windows, Linux. Nothing here may be a platform type; the
+/// **All-false is the correct answer for every host that cannot say**:
+/// Windows, Linux. Nothing here may be a platform type; the
 /// firewall keeps this crate from seeing winit at all, so the desktop binary
 /// fills this in and hands it across.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +218,8 @@ pub struct Gesture {
     /// in the other direction: `mouse_down` is FALSE on every host that
     /// cannot say, so "the hand has let go" and "nobody can tell me" are the
     /// same bit. Anything that ENDS a gesture on it would therefore end every
-    /// gesture immediately in the plugin, on Windows and on Linux. Only a
-    /// host that sets this may be believed when it says the button is up.
+    /// gesture immediately on Windows and on Linux. Only a host that sets
+    /// this may be believed when it says the button is up.
     pub mouse_known: bool,
 }
 

@@ -340,10 +340,9 @@ define_class!(
     #[unsafe(super(NSObject))]
     // Deliberately NOT `#[name = "..."]`. objc2's default derives the runtime
     // name from the module path *and the crate version*, and registering a
-    // fixed class name twice in one process is a hard runtime failure — which is
-    // a live risk here rather than a theoretical one, because Tangent ships both
-    // a standalone app and a VST3 and a host can load a plugin into a process
-    // that already contains this crate.
+    // fixed class name twice in one process is a hard runtime failure. The
+    // derived name is the safe one: nothing else loaded into the process can
+    // have registered it first.
     #[ivars = DelegateIvars]
     struct FrameDelegate;
 

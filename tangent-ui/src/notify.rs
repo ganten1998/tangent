@@ -1032,8 +1032,8 @@ fn dress_on(face: Color32) -> crate::recorder_panel::Surface {
 ///
 /// **The face is whatever is UNDER the top-left corner**, which is not one
 /// thing: the piano and theory band in some views, the arrangement's field in
-/// others, the desk's strip in a plugin editor. So the caller names it and the
-/// card is built from it, rather than the card picking a colour and hoping.
+/// others. So the caller names it and the card is built from it, rather than
+/// the card picking a colour and hoping.
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
     pub bg: Color32,

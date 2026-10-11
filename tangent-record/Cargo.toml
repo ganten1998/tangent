@@ -5,7 +5,7 @@
 # opposite one. `tangent-ui` exists so that platform things are UNREACHABLE from
 # shared GUI code. This crate exists so that platform things have somewhere to
 # live that is NOT the GUI: cpal, a camera, an encoder and a file writer all
-# belong to a desktop and none of them belong in a VST3 editor.
+# belong to the desktop binary and none of them belong in the GUI crate.
 #
 # So: `ivory` depends on this crate; `tangent-ui` and `tangent-core` must NEVER.
 # `scripts/check-firewall.sh` asserts that, and see docs/RECORDER-PLAN.md §10

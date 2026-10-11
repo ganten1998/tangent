@@ -1,9 +1,8 @@
 //! The desktop half of the app: an eframe window, and a real MIDI device.
 //!
-//! Everything that draws lives in `tangent_ui::app::TangentApp`, which the VST3
-//! build also uses. What is left here is exactly the three things a standalone
-//! has and a plugin editor does not — an `eframe::App` impl, a `midir`
-//! connection, and a command line — plus the `Caps` value that says so.
+//! Everything that draws lives in `tangent_ui::app::TangentApp`. What is left
+//! here is what only a binary can have: an `eframe::App` impl, a `midir`
+//! connection, and a command line, plus the `Caps` value that says so.
 //!
 //! The wrapper struct is not ceremony. `impl eframe::App for TangentApp` cannot
 //! be written from this crate: the orphan rule forbids implementing a foreign
@@ -34,8 +33,7 @@ use crate::shelf::{incoming_state, shelve_displaced, DisplacedShelf};
 /// A real MIDI input, opened with `midir`.
 ///
 /// Holds the egui context so the callback thread can wake the UI on every
-/// event: repaints are event-driven rather than busy-looped (D-UI-3). A plugin
-/// needs no equivalent — the host calls `process()` and then the editor.
+/// event: repaints are event-driven rather than busy-looped (D-UI-3).
 pub struct DeviceMidi {
     ctx: egui::Context,
     /// **One connection PER OPEN DEVICE**, not one for the app.
@@ -20212,26 +20210,7 @@ impl DesktopApp {
                 want
             );
         }
-        // Dev switch: run the DESKTOP binary through the PLUGIN's capability
-        // set, so the in-canvas menu and dialogs can be looked at, screenshot
-        // and debugged in a window — without a DAW, a rebuild, an installer
-        // and a plugin rescan between each attempt.
-        //
-        //   IVORY_INLINE=1 /Applications/Tangent.app/Contents/MacOS/tangent
-        //
-        // Environment-gated, so a normal launch cannot reach it. It is a
-        // faithful test of the path: the same `Caps::PLUGIN` the plugin uses,
-        // which also means the window will not resize itself.
-        //   IVORY_INLINE=menu also opens the menu on the first frame.
-        let caps = if matches!(
-            std::env::var("IVORY_INLINE").as_deref(),
-            Ok("1") | Ok("menu")
-        ) {
-            eprintln!("IVORY_INLINE=1: running with the plugin's capabilities");
-            Caps::PLUGIN
-        } else {
-            Caps::DESKTOP
-        };
+        let caps = Caps::DESKTOP;
         // **Which in-place renames the old builds would have run on the global
         // shelf**, read off the settings this launch loaded before the app
         // takes them: the conversion below copies through exactly that set
@@ -20241,9 +20220,10 @@ impl DesktopApp {
         let mut app = TangentApp::new(&cc.egui_ctx, settings, caps);
         // **How much of the screen this desktop actually leaves a window.**
         // Asked once, here, because it cannot be asked from `tangent-ui` at
-        // all: the answer is behind Win32 and AppKit and that crate is linked
-        // into a plugin. Without it the layout is sized against the RAW
-        // display and a laptop's taskbar eats the bottom band.
+        // all: the answer is behind Win32 and AppKit, which that crate may
+        // not reach (`scripts/check-firewall.sh`). Without it the layout is
+        // sized against the RAW display and a laptop's taskbar eats the
+        // bottom band.
         if let Some(f) = crate::display::usable_height_fraction() {
             app.set_display_usable_fraction(f);
         }
@@ -23155,7 +23135,7 @@ mod tests {
     /// than a bench author's idea of one.
     ///
     /// **Read-only with respect to the projects.** It opens each document and
-    /// never saves; `Caps::PLUGIN` leaves `persist_global_settings` down so
+    /// never saves; `Caps::NONE` leaves `persist_global_settings` down so
     /// nothing reaches the runner's own settings either, and
     /// `IVORY_SETTINGS_PATH` is redirected as a second belt.
     ///
@@ -23194,9 +23174,9 @@ mod tests {
         for name in names {
             let doc = root.join(&name).join("project.tan");
             let ctx = egui::Context::default();
-            // `PLUGIN` and not `DESKTOP`: `Caps::DESKTOP` sets
+            // `NONE` and not `DESKTOP`: `Caps::DESKTOP` sets
             // `persist_global_settings`, and this opens somebody's real work.
-            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
             app.open_project(&doc);
             let rate = 48_000u32;
             let Some(mut e) = furnish_probe_engine(&app, rate) else {
@@ -23258,7 +23238,7 @@ mod tests {
         // And the media roots, or the app resolves the owner's own Documents.
         unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
         let ctx = egui::Context::default();
-        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         app.open_project(&doc);
         let rate = 48_000u32;
         let Some(mut e) = furnish_probe_engine(&app, rate) else {
@@ -26698,7 +26678,7 @@ mod tests {
 
         // A fresh session, and a sample loaded onto its sampler.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         let scratch = root.join("Untitled");
         app.adopt_template(&template, &scratch);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
@@ -26724,7 +26704,7 @@ mod tests {
         build_template(&app, Some(scratch.as_path()).filter(|_| real), &stage, &shelf).expect("the template");
         let templated = stage.join("media").join("New.wav").is_file();
         // A session made from that template: the host reads the shelf it adopts.
-        let mut next = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut next = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         let later = root.join("Untitled 2");
         next.adopt_template(&stage, &later);
         next.set_sampler_media(sampler_media_on_shelf(&stage.join("state")));
@@ -28033,7 +28013,7 @@ mod tests {
         let legacy = song.join("state").join("insert-state-0-0.bin");
         std::fs::write(&legacy, b"/x/s0.vst3\0as the legacy build saved it").expect("a legacy sidecar");
         let ctx = egui::Context::default();
-        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         app.open_project(&doc);
         assert!(app.doc_legacy_states().is_some(), "fixture: the legacy project carries no marker");
         // The live shelf, by identity.
@@ -28181,7 +28161,7 @@ mod tests {
         let legacy = serde_json::to_vec_pretty(&legacy).expect("json");
         std::fs::write(&sidecar, &legacy).expect("the release build's kit");
         let ctx = egui::Context::default();
-        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         app.open_project(&doc);
         assert_eq!(app.drumpad_kit_of(2).map(|k| k.pads[36].path.clone()).as_deref(), Some("media/kick.wav"), "fixture: no kit on lane 2");
 
@@ -28242,7 +28222,7 @@ mod tests {
         let on_disk = std::fs::read(&saved).unwrap();
         // Opened, and turned down since: an edit nobody has saved.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("desk"));
         app.open_project(&saved);
         app.set_clip_gain(clip, 0.5);
         assert!(app.project_dirty_exact(), "the fixture's edit is not unsaved");
@@ -30909,7 +30889,7 @@ mod tests {
     /// person writes, and there is no hook between a `#[test]` and the
     /// constructor it calls.
     ///
-    /// Revert-check: change the seeding test's `Caps::PLUGIN` to
+    /// Revert-check: change the seeding test's `Caps::NONE` to
     /// `Caps::DESKTOP` and this goes red naming it. Run 2026-10-09 on
     /// `a_sample_loaded_during_a_session_rides_into_its_template_and_duplicate`
     /// (which sets no redirect) and on composite's `splash` shot with its
@@ -38000,7 +37980,7 @@ mod arr_identity {
 
     fn app_of(settings: Settings) -> TangentApp {
         let ctx = egui::Context::default();
-        TangentApp::with_license(&ctx, settings, Caps::PLUGIN, crate::composite::tiers::free("w5-rec"))
+        TangentApp::with_license(&ctx, settings, Caps::NONE, crate::composite::tiers::free("w5-rec"))
     }
 
     /// One frame of the app, which keeps its undo line from the desk it drew.
@@ -38344,7 +38324,7 @@ mod deaf_takes {
     #[test]
     fn the_line_names_the_track_and_says_it_is_not_recording() {
         let ctx = egui::Context::default();
-        let app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("deaf-line"));
+        let app = TangentApp::with_license(&ctx, Settings::default(), Caps::NONE, crate::composite::tiers::free("deaf-line"));
         let id = app.track_at(1).expect("the shipped desk's second row");
         let line = deaf_take_line(&app, id);
         assert!(line.starts_with("Track 2 (") && line.contains("is not recording"), "{line}");

@@ -274,7 +274,7 @@ Tests reach the format-2 writers through internal `*_as(Format::V2)` entry point
 - **Structural errors refuse the DESK only.** These are: more than `MAX_ROWS` rows, duplicate ids, a desk not of the documented shape.
   - **settings.json:** every other setting is kept. The desk becomes the default desk, and the raw desk JSON goes to `settings.desk-refused.json` (first free `-N`) with a notice. Never `Settings.unreadable`, never a first launch.
   - **document or template:** the open is refused with a message; nothing is written over it.
-  - **DAW blob (`Settings::from_json`):** every other setting is kept, the desk becomes the default desk, and the raw desk is kept under `extra["desk_refused"]`, so the DAW session keeps it across saves.
+  - ~~**DAW blob (`Settings::from_json`):** every other setting is kept, the desk becomes the default desk, and the raw desk is kept under `extra["desk_refused"]`, so the DAW session keeps it across saves.~~ Removed 2026-10-10 with the plugin crate (`lane/ul-w8-plugin-gone`): the DAW session was the only thing that kept a blob. `from_json` is a test road now; it keeps every other setting and the default desk, and leaves the refused desk in `desk_refused` for its caller.
 - Nothing is allocated by a key's numeric value. `LEGACY_MAX_STRIPS`, `INSERT_SPACE` and `TOTAL_SEATS` bound only the legacy reader.
 - **Writer side:** under cfg(test), `DeskModel::check()` runs after every structural edit and in the undo sentinel.
 
@@ -655,7 +655,7 @@ Further rules:
   - Remove deletes the row.
 - **Palette:** `% PALETTE_SLOTS` (32), so tracks 0..31 keep today's colours.
 - **Copy (W3):**
-  - About is tier-aware: "32-track desk" free, "unlimited tracks" with a supporter. Minimal and the plugin keep their chord-display line.
+  - About is tier-aware: "32-track desk" free, "unlimited tracks" with a supporter. Minimal keeps its chord-display line (the plugin did too, until its crate was removed on 2026-10-10).
   - The Supporter Key dialog says: "Tangent is free, with up to 32 tracks. A supporter key (or a certain code) takes the track limit away and lights the heart. Buses, returns, sends and routes have no limit for anyone."
   - The same facts go into README, STORE-CONTENT, a new GUMROAD page, the tangent-fulfil email and CHANGELOG [Unreleased].
   - Keys already sold gain unlimited tracks (they are perpetual: `max_major: 0`).
@@ -767,7 +767,7 @@ Every relaunch lands every state. No new-build path renames or deletes a legacy 
 - **Copy:** the phrase scan (W3; folded into check.sh in W8).
 - **Gate:** check.sh on macOS ARM.
 - **Other platforms:** void, bsdbox and Windows run with `--no-fail-fast`; the 4 known ARM-only failures are expected there.
-- **Plugin:** `cargo check --manifest-path plugin/Cargo.toml` from W1.
+- ~~**Plugin:** `cargo check --manifest-path plugin/Cargo.toml` from W1.~~ Removed 2026-10-10 with the plugin crate (`lane/ul-w8-plugin-gone`).
 
 ---
 
@@ -1277,7 +1277,7 @@ Also:
   - legacy keys are consumed with shift_remove;
   - `track_ids`, `next_track_id`;
   - a pre-write hook writes `settings.pre-v23.json` and `.shelf-v23.pending` before the first format-2 write;
-  - the desk refusal policy (default desk, raw desk to `settings.desk-refused.json`, a notice, never `unreadable`), and `from_json` keeps a refused desk under `extra.desk_refused`.
+  - the desk refusal policy (default desk, raw desk to `settings.desk-refused.json`, a notice, never `unreadable`), and `from_json` keeps a refused desk under `extra.desk_refused` (that half was removed on 2026-10-10 with the plugin crate; see 6.3).
 - `arrangement.rs`:
   - DeskSnap ids, `next_id`, `Says`, `legacy_states`;
   - `to_value` and `from_value` go through desk_format;
@@ -1312,7 +1312,7 @@ Also:
   - a second format-2 write makes no backup.
 - **Error policy:**
   - a v23 settings file, a v8 document and a DAW blob, each with one dangling plugin, bypass, route, key and send, open with those entries dropped, a notice, and everything else byte-identical;
-  - a structurally refused desk keeps every other setting (settings), refuses the open and leaves the file untouched (document), and keeps the raw desk across a save (DAW blob).
+  - a structurally refused desk keeps every other setting (settings), refuses the open and leaves the file untouched (document), and keeps the raw desk across a save (DAW blob; that case was removed on 2026-10-10 with the plugin crate).
 - **Ids:**
   - reorder, undo and redo keep every row's id;
   - add, paste and make_folder mint fresh ids;
@@ -1379,7 +1379,7 @@ Two checkpoints, each green:
 **Files.**
 
 - `tangent-ui/src/dialogs.rs`:
-  - `about_lines(caps, supporter)`, with Minimal and the plugin keeping the chord-display line;
+  - `about_lines(caps, supporter)`, with Minimal keeping the chord-display line (the plugin too, until its crate was removed on 2026-10-10);
   - the Supporter Key dialog strings;
   - the about tests re-pinned for free and supporter.
 - `README.md`.
@@ -1937,6 +1937,7 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 3. **A one-line `#[cfg(test)] mod x;`** (and the comment/blank-line-split form the implementer reported) is recognised as a test-only module file. Plant each and prove it.
 4. **The media-path exemption in settings.rs** is back to naming exactly the lines it allowed (the chooser's real default and `test_path()`), so a second hard-coded `.join("Tangent Media")` fails the scan. Plant one and prove it.
 5. **Copy the owner decides later, not now:** leave the installer pages' retired-plugin wording as is (owner's call, already on the checklist).
+   **Overruled by the owner, 2026-10-10:** "remove those mentions of the vst plugin -- that's what it means to be dead", then "yes, delete the plugin crate too". The copy was removed in 1bb4c84 and cb871d2 (`lane/ul-w8-vst-dead`), and the plugin crate, its build and verify scripts, `LICENSE-GPL-3.0` and its gate legs on `lane/ul-w8-plugin-gone`. The cleanup that removes an older install's `Tangent.vst3` stays.
 
 **Files.** tangent-core/src/config.rs (and Cargo.toml), tangent-ui/src/settings.rs and Cargo.toml as needed, tangent/Cargo.toml, tangent-ui/src/copy_scan.rs, tangent-ui/src/ban_scan.rs, scripts/check.sh, any test that names a real home path, this document.
 
@@ -2055,7 +2056,7 @@ All blockers were verified against the code at 624d78a. None was wrong. Five fix
 - *Resolution:* referential errors drop the entry with a notice; structural errors refuse only the desk.
   - settings: the default desk plus a `settings.desk-refused.json` side file;
   - document: the open is refused and the file untouched;
-  - DAW blob: the raw desk is kept under `extra.desk_refused`.
+  - ~~DAW blob: the raw desk is kept under `extra.desk_refused`.~~ Removed 2026-10-10 with the plugin crate (see 6.3).
   - It never routes to `unreadable` or to the defaults fallback.
   - `DeskModel::check` runs in the sentinel (6.3; W2, W3).
 
@@ -2109,7 +2110,7 @@ All blockers were verified against the code at 624d78a. None was wrong. Five fix
 
 **C3. Plugin crate tests never ran.**
 - *Verified in code:* check.sh only runs `cargo check` on the plugin.
-- *Resolution:* the DAW blob fixtures and round trips live in tangent-ui's `era_corpus.rs`, and the plugin step stays `cargo check`.
+- *Resolution:* the DAW blob fixtures and round trips live in tangent-ui's `era_corpus.rs`, and the plugin step stays `cargo check`. (The plugin crate and its step were removed on 2026-10-10; the fixtures stay.)
 
 **C4. The Reset Everything test could not be checked as written.**
 - *Verified in code:* `reset_settings(Everything)` raises `NewKeeping` and calls `relock_cheat`.
@@ -2215,7 +2216,7 @@ Examples: `t3-c0-b1`, `t12-n36-b2`, `t0-p4-b0`, `master-c1-b2`, `drums-c1-b2`. S
 
 ## Appendix E: era table (every reader keeps opening these)
 
-**settings.json and DAW blobs (`plugin/src/lib.rs #[persist = "settings"]`):**
+**settings.json and DAW blobs (`plugin/src/lib.rs #[persist = "settings"]`; the plugin crate was removed on 2026-10-10, and its blobs stay in the era corpus as `Settings::from_json` fixtures):**
 
 - stamp ≤ 18 (pre-5.0, hand-copied only since `purge_pre_5_0`): the frozen `migrate_from` arms, with was<16 and was<17 growing to the ERA width; then lift by sends length.
 - v19, 19 sends (16 ch): V16, strip masks including phase; shelf v20.
@@ -2285,7 +2286,7 @@ Examples: `t3-c0-b1`, `t12-n36-b2`, `t0-p4-b0`, `master-c1-b2`, `drums-c1-b2`. S
 7. **A licence ever hides or silences music.**
    - *Mitigations:* persistence, the engine and drawing are tier-blind (scan); a free app opens, plays and saves a 200-track project whole.
 8. **A dangling reference or a bad desk costs a whole file.**
-   - *Mitigations:* the 6.3 error policy; `DeskModel::check` in the sentinel; side files for refused desks; the DAW blob keeps the raw desk.
+   - *Mitigations:* the 6.3 error policy; `DeskModel::check` in the sentinel; side files for refused desks; ~~the DAW blob keeps the raw desk~~ (removed 2026-10-10 with the plugin crate).
 9. **Session state lands on the wrong track after a structural edit.**
    - *Mitigations:* TrackId/SeatBay keys; `on_desk_shape_change`; the classification scan; width tests per field.
 10. **Inputs: a wrong layout records the wrong device column with plausible audio.**
@@ -2302,7 +2303,7 @@ Examples: `t3-c0-b1`, `t12-n36-b2`, `t0-p4-b0`, `master-c1-b2`, `drums-c1-b2`. S
 14. **Test churn weakens coverage.**
     - *Mitigations:* the census with replacement ledgers; parametrized widths that keep 32; literal era goldens; owner-ruling pins kept verbatim; revert checks.
 15. **The plugin crate and the Minimal build.**
-    - *Mitigations:* DAW blob tests in tangent-ui; the plugin `cargo check` in the gate; Minimal covered by the pending marker and its compile check.
+    - *Mitigations:* DAW blob tests in tangent-ui; the plugin `cargo check` in the gate; Minimal covered by the pending marker and its compile check. (The plugin crate was removed on 2026-10-10.)
 16. **Copy contradicts itself across surfaces.**
     - *Mitigations:* the phrase scan; the W8 owner checklist (fulfil redeploy, Gumroad, website).
 17. **Behaviour changes the owner will see** (Remove deletes the row, folders count, the pedalboard leaves with its row, pad FX follow their lane, vacant rows hidden, a trailing add, the removal fade, Add appends during a record, the copy).

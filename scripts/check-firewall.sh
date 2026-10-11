@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # The shared crates must not be able to reach the host.
 #
-# `tangent-ui` and `tangent-core` are linked by BOTH the desktop binary and the
-# VST3 plugin. A plugin has no window to own, no MIDI device to open, no native
-# file dialog to raise, and above all no business calling `process::exit` —
-# which in a plugin means killing the user's DAW, mid-session, with their work
-# open.
+# `tangent-ui` and `tangent-core` are the GUI and the engine, and the
+# `tangent` binary is the host around them: the window, the MIDI device, the
+# native file dialogs, the single-instance lock, the recorder and the plugin
+# host are its business and nobody else's (docs/RECORDER-PLAN.md §2). That is
+# what lets the GUI run in a bare egui context, which is how the test suite
+# drives the whole app and how the compositor paints its panels into a video
+# frame; and the process is the binary's too, so no library may end it.
 #
 # Leaving those crates out of the dependency list makes all of it a COMPILE
 # ERROR rather than a code-review question. This script asserts that the
@@ -60,9 +62,10 @@ for crate in tangent-ui tangent-core; do
 done
 
 # ── Forbidden calls ──────────────────────────────────────────────────────────
-# `process::exit` unwinds nothing and runs no destructor. In the standalone it
-# is a legitimate way to refuse a second instance; in a plugin it is a crash
-# report against someone else's software.
+# `process::exit` unwinds nothing and runs no destructor. In the binary it is a
+# legitimate way to refuse a second instance; in a library it ends the process
+# behind the binary's back, so nothing the binary would save on the way out is
+# saved, and under `cargo test` it takes the whole test run with it.
 for crate in tangent-ui tangent-core; do
   hits=$(grep -rnE '\bprocess::exit\b|\bstd::process::abort\b' "$crate/src" 2>/dev/null || true)
   if [ -n "$hits" ]; then
@@ -73,36 +76,6 @@ for crate in tangent-ui tangent-core; do
     say "$crate never exits the process" "ok"
   fi
 done
-
-# ── The plugin has no recorder ───────────────────────────────────────────────
-# A VST3 has no business capturing a camera, opening an audio device, writing a
-# take directory, or hosting a second plugin inside itself. The DAW already owns
-# every one of those, and does them better.
-#
-# This is structurally true rather than merely intended: `tangent-record` and
-# `tangent-host` are dependencies of the `tangent` BINARY, and the plugin depends on
-# `tangent-ui` and `tangent-core` only, so there is no path. Asserted anyway,
-# because "there is no path" is a property of today's manifests and somebody
-# adding one convenient dependency is exactly how it stops being true.
-#
-# The plugin is its own workspace with its own lock file, so this has to run
-# from inside plugin/ — a `-p tangent-vst3` from the root cannot resolve it, and
-# that inability IS the GPL quarantine working.
-if [ -f plugin/Cargo.toml ]; then
-  plugin_tree="$( (cd plugin && cargo tree --edges normal --prefix none --target all 2>/dev/null) | awk '{print $1}' )"
-  if [ -z "$plugin_tree" ]; then
-    say "plugin tree unavailable (offline?), skipped" "--"
-  else
-    for dep in tangent-record tangent-host cpal midly rtrb vst3; do
-      if printf '%s\n' "$plugin_tree" | grep -qx "$dep"; then
-        say "the plugin must not depend on $dep" "FAIL"
-        fail=1
-      else
-        say "the plugin has no $dep" "ok"
-      fi
-    done
-  fi
-fi
 
 # ── Direction of dependency ──────────────────────────────────────────────────
 # tangent -> tangent-ui -> tangent-core, never the reverse.
@@ -157,6 +130,6 @@ fi
 if [ "$fail" = 0 ]; then
   echo "  firewall intact"
 else
-  echo "  FIREWALL BREACHED — see docs/PLUGIN-PLAN.md" >&2
+  echo "  FIREWALL BREACHED: see the header of scripts/check-firewall.sh" >&2
   exit 1
 fi

@@ -12118,7 +12118,7 @@ mod tests {
 // A popup and not a band, because that is what they are: set once at the start
 // of a session, and in the way for the rest of it. It hangs off the cog in the
 // band and it is drawn by the same painters as everything else here, so it
-// works in a window, in a plugin, and in a recording.
+// works in a window, inline, and in a recording.
 
 /// How wide the popup is, as a share of the window, and the bounds on that.
 /// **Small.** The first cut took a third of the window and gave every row
@@ -13196,8 +13196,8 @@ impl MetLayout {
         // **The floor bows to the surface.** `clamp(min, max)` PANICS when
         // min > max, and a window narrower than the panel's own minimum makes
         // exactly that: 260 against a 30-point screen. Rare, and reachable —
-        // a plugin editor's inline surface is small, and the first frame of a
-        // resize can be anything.
+        // an inline surface in a small window is small, and the first frame
+        // of a resize can be anything.
         let w = (screen.width() * MET_W.0)
             .clamp(MET_W.1.min(screen.width()), MET_W.2.min(screen.width()));
         let h = (w * MET_ASPECT).min(screen.height() * 0.85);
