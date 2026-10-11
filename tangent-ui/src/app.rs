@@ -3380,7 +3380,7 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
     let legacy = template_kit.parent().and_then(|t| {
         match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(t)) {
             crate::arrangement::LoadOutcome::Loaded(a) => a.desk.as_ref().and_then(|d| {
-                (0..d.rows.len()).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..d.rows.len()).find(|ch| d.row_holds(*ch, dialogs::DRUMPAD_PATH))
             }),
             _ => None,
         }
@@ -3792,7 +3792,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 /// and an open that disagree about what a silent desk means is two rules.
 fn default_armed(settings: &Settings) -> Option<usize> {
     let kinds: Vec<u8> = settings.rows.iter().map(|r| crate::desk_model::RowKind::byte(r.kind)).collect();
-    crate::arrangement::armed_by_default(&kinds, |n| settings.row_plugin(n, 0) == Some(dialogs::BUILTIN_PATH))
+    crate::arrangement::armed_by_default(&kinds, |n| settings.row_holds(n, dialogs::BUILTIN_PATH))
 }
 
 #[cfg(test)]
@@ -3858,6 +3858,30 @@ mod default_arm_tests {
         // An empty desk is silent, which is the honest reading of a desk with
         // nothing to play.
         assert_eq!(default_armed(&desk(&[], &[])), None);
+    }
+
+    /// **A track's instrument is wherever its bay is.** Two or more
+    /// instruments on one track all play, so the DX7 behind an analog, in a
+    /// track's third bay, still opens its channel live, and a drumpad in a
+    /// track's extra rack makes it the desk's kit: `row_holds` asks all six
+    /// bays, on the settings, the saved desk and the app alike, where these
+    /// readers asked the first bay alone.
+    #[test]
+    fn an_instrument_in_any_bay_is_the_tracks() {
+        use crate::desk_id::{Node, Rack, SeatBay};
+        let mut s = desk(&[1, 1], &[crate::faces_analog::ANALOG_PATH, ""]);
+        let third = SeatBay::new(Node::Track(s.rows[0].id), Rack::Chain(0), 2);
+        let extra = SeatBay::new(Node::Track(s.rows[1].id), Rack::Chain(1), 0);
+        s.plugins.insert(third, dialogs::BUILTIN_PATH.to_owned());
+        s.plugins.insert(extra, dialogs::DRUMPAD_PATH.to_owned());
+        assert_eq!(crate::desk_id::chain_bays().count(), 6, "a track has six bays");
+        assert!(s.row_holds(0, dialogs::BUILTIN_PATH) && s.row_holds(1, dialogs::DRUMPAD_PATH));
+        assert!(!s.row_holds(0, dialogs::DRUMPAD_PATH) && !s.row_holds(2, dialogs::BUILTIN_PATH));
+        assert_eq!(default_armed(&s), Some(0), "the DX7 behind the analog did not open its channel live");
+        let caps = Caps { persist_global_settings: false, ..Caps::DESKTOP };
+        let (_ctx, app) = tests::headless_with(caps, s);
+        assert!(app.row_holds(1, dialogs::DRUMPAD_PATH), "the app does not see the kit in the extra rack");
+        assert!(!app.row_holds(0, dialogs::DRUMPAD_PATH));
     }
 }
 
@@ -23332,11 +23356,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             song_s: self.recorder.position_s,
             dark: self.settings.me_dark,
             pad_names: {
-                // By the row's own first bay, at any row (W7-slot-gaps: it
+                // By the row's own bays, any of them, at any row (W7-slot-gaps: it
                 // read the row number as a seat, which from row 32 on is
                 // another rack's: the specials', then other tracks').
                 let drum_lane = (0..self.desk_extent()).find(|n| {
-                    self.row_plugin(*n, 0) == Some(dialogs::DRUMPAD_PATH)
+                    self.row_holds(*n, dialogs::DRUMPAD_PATH)
                 });
                 (Some(clip.lane) == drum_lane).then(|| {
                     std::array::from_fn(|i| self.pad_label(i))
@@ -23763,10 +23787,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .desk
             .as_ref()
             .and_then(|d| {
-                (0..d.rows.len()).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..d.rows.len()).find(|ch| d.row_holds(*ch, dialogs::DRUMPAD_PATH))
             })
             .or_else(|| {
-                (0..self.desk_extent()).find(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..self.desk_extent()).find(|ch| self.row_holds(*ch, dialogs::DRUMPAD_PATH))
             });
         let (kits, saved_track) = match doc {
             Some(doc) => crate::drumpad::DrumpadDoc::load_track_kits(
@@ -25527,7 +25551,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
         let drum_lane = (0..self.desk_extent())
-            .find(|n| self.row_plugin(*n, 0) == Some(dialogs::DRUMPAD_PATH));
+            .find(|n| self.row_holds(*n, dialogs::DRUMPAD_PATH));
         let lane = self
             .midi_edit
             .as_ref()
@@ -36033,6 +36057,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.plugin(self.row_bay(n, bay)?)
     }
 
+    /// **Whether the track on row `n` holds `path` in any of its six bays**
+    /// (`desk_id::chain_bays`): two or more instruments on one track all
+    /// play, so a kit in the third bay is that track's kit as surely as one
+    /// in the first.
+    pub fn row_holds(&self, n: usize, path: &str) -> bool {
+        let node = self.row_node(n);
+        crate::desk_id::chain_bays()
+            .any(|(rack, bay)| self.plugin(crate::desk_id::SeatBay::new(node, rack, bay)) == Some(path))
+    }
+
     /// **The bay the frozen map names `(seat, bay)`** under the rows as they
     /// stand: the tests' way to name the legacy fixtures' bays. Nothing the
     /// host is handed or asks crosses it any more (W7-slot-gaps retired the
@@ -37690,10 +37724,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // bay disagreed about which kit you were looking at.
                     let want = self
                         .selected_row()
-                        .filter(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        .filter(|ch| self.row_holds(*ch, dialogs::DRUMPAD_PATH))
                         .or_else(|| {
                             (0..self.desk_extent())
-                                .find(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                                .find(|ch| self.row_holds(*ch, dialogs::DRUMPAD_PATH))
                         });
                     match want {
                         Some(ch) => self.open_drumpad_for(ch),
@@ -53325,7 +53359,7 @@ mod tests {
         let armed: Vec<usize> = (0..shipped.rows.len()).filter(|n| shipped.rows[*n].arm).collect();
         assert_eq!(
             armed,
-            crate::arrangement::armed_by_default(&kinds, |n| shipped.row_plugin(n, 0) == Some(dialogs::BUILTIN_PATH))
+            crate::arrangement::armed_by_default(&kinds, |n| shipped.row_holds(n, dialogs::BUILTIN_PATH))
                 .into_iter()
                 .collect::<Vec<_>>(),
             "the template's arm is not the shipped rule"
