@@ -2881,6 +2881,11 @@ const OFF: f32 = 0.0005;
 /// knob is a few hundred block boundaries.
 const KNOB_SLEW: f32 = 0.0004;
 
+/// How close the limiter's slewed position must be to the dial's before it
+/// is set to it outright: a ten-thousandth of travel, 0.0048 dB of threshold.
+/// See where it is used for why the glide alone never gets there.
+const LIMITER_SNAP: f32 = 1.0e-4;
+
 /// How much of each effect, straight off the knobs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sends {
@@ -3212,6 +3217,14 @@ impl Effects {
             self.mix.hpf += (want.hpf - self.mix.hpf) * KNOB_SLEW;
             self.mix.lpf += (want.lpf - self.mix.lpf) * KNOB_SLEW;
             self.mix.limiter += (want.limiter - self.mix.limiter) * KNOB_SLEW;
+            // **The ceiling ARRIVES at the dial.** In f32 this glide stalls
+            // once a step rounds to nothing, which near the top of the dial
+            // is ~7.5e-5 of travel short: the shipping -1 dB ceiling sat at
+            // -0.996 dB for the whole session, measured. Close enough to
+            // snap is a step of under 0.005 dB, which nobody hears.
+            if (want.limiter - self.mix.limiter).abs() < LIMITER_SNAP {
+                self.mix.limiter = want.limiter;
+            }
             self.mix.gain += (want.gain - self.mix.gain) * KNOB_SLEW;
             // Decibels, converted per sample so a drag glides rather than
             // stepping at each block boundary. `powf` per frame is the price
@@ -3597,6 +3610,36 @@ mod tests {
     /// because that is where the claim lives: a buffer whose samples all sit
     /// under full scale can still hand a converter a curve that goes over,
     /// and "true peak" is the promise that it does not.
+    /// **A settled ceiling is the dial's, to the thousandth of a decibel.**
+    ///
+    /// The knob's glide stalled in f32 short of its target, so the shipping
+    /// -1 dB ceiling held a sample peak of -0.996 dBFS for as long as the
+    /// session ran. Sample peak, with a 1 kHz tone 4.5 dB into it, at the
+    /// shipping position and two others.
+    #[test]
+    fn a_settled_limiter_holds_its_sample_peak_at_the_dial() {
+        for want_db in [-1.0_f32, -0.5, -6.0] {
+            let mut fx = Effects::new(SR);
+            let p = Params::default();
+            let sends = Sends { limiter: threshold_at(want_db), ..Sends::default() };
+            let amp = 10f32.powf((want_db + 4.5) / 20.0);
+            let mut worst = 0.0f32;
+            for block in 0..40 {
+                let mut buf = sine(2_048, 1_000.0, amp, block * 2_048);
+                fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+                if block >= 30 {
+                    worst = buf.iter().fold(worst, |m, s| m.max(s.abs()));
+                }
+            }
+            let got_db = 20.0 * worst.log10();
+            assert!(
+                got_db <= want_db + 0.001,
+                "a {want_db} dB ceiling settled at a {got_db:.4} dBFS sample peak"
+            );
+            assert!(got_db > want_db - 0.1, "a {want_db} dB ceiling only reached {got_db:.4} dBFS");
+        }
+    }
+
     #[test]
     fn the_limiter_holds_a_true_peak_ceiling_at_every_threshold() {
         // 7 kHz at 48 k is a little over six samples a cycle: the peaks land
