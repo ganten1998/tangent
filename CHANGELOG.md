@@ -284,6 +284,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A muted track is silent from an export's first sample.** A track
+  muted on the desk, or silenced by a solo on another track, used to fade
+  out over the first tenth of a second of every export, so its start was
+  in the file. A fader, the master, a polarity switch or a gain curve set
+  away from unity likewise started at full level and slid to its setting.
+  An export now starts with every level already where the desk has it, at
+  full speed and in real time. Mute and solo changes during the song, by
+  hand or by a mute curve, still fade as they always did.
+
 - **The "Preparing export" message no longer hides behind the Export
   window.** Pressing Export closed the window, and the message about the
   slow setup (loading every plugin a second time) was drawn behind it, so

@@ -2619,6 +2619,10 @@ struct Shared {
     /// whole, and the previous plan keeps playing; the host shows the stall
     /// line, and every test asserts it stays zero.
     plan_refused: AtomicU32,
+    /// **The next chunk lands every slewed gain on its target**
+    /// (`Engine::land_gains`): raised by an export, a freeze or a realtime
+    /// pass at its start, taken by the first chunk of the next callback.
+    land_gains: AtomicBool,
     /// **A test's rack counter**: the seat it watches (`usize::MAX`, none)
     /// and how many times that seat's rack has run. What proves a bus's
     /// rack runs once a block, counted where every rack runs (`run_rack`),
@@ -3696,6 +3700,7 @@ impl Shared {
             hw: crate::units::hwinsert::HwHub::new(),
             lanes: LaneStore::new(),
             plan_refused: AtomicU32::new(0),
+            land_gains: AtomicBool::new(false),
             #[cfg(test)]
             rack_count_seat: AtomicUsize::new(usize::MAX),
             #[cfg(test)]
@@ -12787,10 +12792,20 @@ impl Renderer {
         }
         let mut lufs_moved = false;
 
+        // **An export's head lands every level on its target**
+        // (`Engine::land_gains`): the first chunk of the callback that takes
+        // the flag slews with a coefficient of one, after the ops above (an
+        // export's plan is in), and every chunk after it with the desk's
+        // own. Restored after the loop, so nothing else ever sees the one.
+        let desk_coeff = self.gain_coeff;
+        let mut land = self.shared.land_gains.load(Ordering::Relaxed)
+            && self.shared.land_gains.swap(false, Ordering::Acquire);
         let mut done = 0usize;
         while done < frames {
             let n = chunk.min(frames - done);
             self.chunks += 1;
+            self.gain_coeff = if land { 1.0 } else { desk_coeff };
+            land = false;
             // **The desk's lane words, once, before anything in the chunk
             // reads one.** `collect_notes` is the first reader. See
             // `DeskLanes`.
@@ -13404,10 +13419,10 @@ impl Renderer {
                     dst.copy_from_slice(src);
                     self.spine.desk.key_prev_frames = n;
                 }
-                // **A lane LEFT OUT of an export keys nothing.** A muted
-                // source still keys by the desk's rule, but a track the
-                // export left out is not in the export at all, so a
-                // left-out kick must not duck the bass it was keying.
+                // **A lane LEFT OUT of an export keys nothing**: its column
+                // is zeroed here as well as at its fader (`snap_left_out`),
+                // so a left-out kick never ducks the bass it was keying,
+                // whatever else reaches its column.
                 let stride = self.stride();
                 for lane in self.plan.lanes.iter() {
                     if !lane.flags.contains(crate::desk_plan::LaneFlags::LEFT_OUT) {
@@ -13772,6 +13787,7 @@ impl Renderer {
             }
             done += n;
         }
+        self.gain_coeff = desk_coeff;
 
         // **The taps are pushed by the CALLER**, not here: under varispeed
         // they hold program frames and have to be squeezed to the device's
@@ -27395,6 +27411,37 @@ impl Engine {
 
     pub fn set_track_gain(&self, linear: f32) {
         self.shared.set_track_gain(linear);
+    }
+
+    /// **The next block starts with every fader, mute, solo, send gate and
+    /// polarity where it is going, not on its way there.**
+    ///
+    /// Every strip's level is a one-pole slew toward its target
+    /// (`GAIN_TAU_SECONDS`), the anti-click a live desk needs. At the head
+    /// of an export it is a leak: a fresh offline engine's levels all start
+    /// at unity, so a track muted or silenced by a solo on the desk faded
+    /// OUT over its first tenth of a second and that head was in the file,
+    /// and a fader, a polarity or a master below unity faded in from it. So
+    /// an export, a freeze and a realtime pass raise this at their start
+    /// and the first chunk of the next callback slews with a coefficient
+    /// of one: every level lands on its target at its first frame, and from
+    /// the second chunk on the desk's ramps are the desk's again, so a mute
+    /// curve that moves inside the song still ramps.
+    ///
+    /// On the live engine (a realtime pass) the levels have long since
+    /// settled where the desk has them, so landing them moves nothing
+    /// audible: it takes a muted track from the denormal its fade decays
+    /// into to an exact zero, and the transport's locate is the only
+    /// discontinuity at that press, as it always was.
+    pub fn land_gains(&self) {
+        self.shared.land_gains.store(true, Ordering::Release);
+    }
+
+    /// [`Self::land_gains`] taken back before a block took it: one build
+    /// rendered both ways, so a test can tell what landing changed.
+    #[cfg(test)]
+    pub fn keep_slewing(&self) {
+        self.shared.land_gains.store(false, Ordering::Release);
     }
 
     /// Hear the live input, or stop hearing it.

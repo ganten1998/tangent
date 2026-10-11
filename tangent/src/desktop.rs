@@ -11088,6 +11088,14 @@ impl DesktopApp {
                 let _ = self.bridge.sync(&self.app, e);
             }
         }
+        // **The take's first sample is the desk as it stands**: every level
+        // landed on its target by the block that rolls (`Engine::land_gains`),
+        // raised before the roll so no rolling block precedes it. A track
+        // muted on the desk is then an exact zero from the head, where its
+        // fade had left a denormal; settled levels move nothing audible.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            e.land_gains();
+        }
         // From the span's head, rolling before the take opens — the same
         // press-order the transport itself keeps.
         self.recorder.transport.stop();
@@ -28681,6 +28689,11 @@ mod tests {
         let left = start.find("self.bridge.set_left_out(Some(out));").expect("the pass does not publish its left-out tracks");
         let rolls = start.find("self.recorder.transport.toggle_play();").expect("the pass rolls");
         assert!(bounds < rolls && left < rolls, "the pass rolls before its span or its tracks are set");
+        // Its first sample is the desk as it stands: every level landed
+        // before the roll (`Engine::land_gains`), so a muted track is an
+        // exact zero from the head of the take.
+        let lands = start.find("e.land_gains();").expect("the realtime pass does not land the desk's levels");
+        assert!(lands < rolls, "the realtime pass rolls before it lands the desk's levels");
         assert!(
             start.contains("crate::engine_bridge::stem_files(&self.app, &delivery)"),
             "the realtime pass names its stems by a rule of its own"

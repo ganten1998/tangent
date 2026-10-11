@@ -471,6 +471,11 @@ pub fn full_build_with(
         }
         BuildFor::Probe => {}
     }
+    // **Its first block starts where the desk is**, every level on its
+    // target (`Engine::land_gains`): a fresh engine's faders all stand at
+    // unity, and slewed from there a track muted or silenced by a solo on
+    // the desk faded out over the head of the file.
+    e.land_gains();
     // Everything sent lands before the first block: an offline engine has
     // no callback to wait for.
     e.settle_offline();
@@ -4564,9 +4569,9 @@ mod tests {
     /// **A mixdown of selected tracks hears those alone, as the desk would
     /// play them, and touches nothing of the desk's.** The master of "Kick"
     /// checked is the master of the desk with every other track's clip
-    /// DELETED, sample for sample (not merely muted: a mute slews, so the
-    /// head of a muted track is in the file, where a track left out is
-    /// gone from the first frame); and every box checked is "Everything", the desk's
+    /// DELETED, sample for sample (gone, not merely muted: a muted track
+    /// still keys a sidechain by the desk's rule, a track left out is not
+    /// in the export at all); and every box checked is "Everything", the desk's
     /// own solo included - here a solo on Bass, so Kick checked alone is
     /// silence (the window refuses that before it is sent; this is the
     /// engine's half).
@@ -4595,10 +4600,11 @@ mod tests {
         let everything = export_of(&soloed, &all, &dir3.join("everything"));
         assert!(mix(&checked).0 == mix(&everything).0, "every box checked is not Everything");
         // A solo on a track left out silences the checked ones, as on the
-        // desk: past the desk's own solo slew at the head, nothing.
+        // desk, from the first frame: the export lands the desk's levels
+        // (`Engine::land_gains`), so not even the head of the solo's slew.
         let kick_only = wav_samples(&export_of(&soloed, &spec, &dir3.join("kick"))["mix.wav"].0);
-        let past_head = kick_only[(RATE as usize / 10) * 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(past_head < 1.0e-4, "a checked track was heard through the desk's solo on another ({past_head})");
+        let loudest = kick_only.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(loudest == 0.0, "a checked track was heard through the desk's solo on another ({loudest})");
         // A stems-only pass leaves nothing out of the render.
         assert_eq!(export_left_out(&app, &ExportSpec { master: false, stems: true, ..spec.clone() }), None);
         for d in [dir, dir2, dir3] {
@@ -4608,8 +4614,9 @@ mod tests {
 
     /// **A track left out of an export keys nothing.** A kick keying a
     /// compressor on the bass: with the kick unchecked, the bass must sound
-    /// as it does on a desk whose kick has no clip at all - not merely
-    /// muted, since a muted source still keys by the desk's rule.
+    /// as it does on a desk whose kick has no clip at all. A MUTED kick keys
+    /// nothing either: the key is cut after the kick's fader, and an export
+    /// starts with the mute in place (`Engine::land_gains`).
     #[test]
     fn a_left_out_kick_does_not_duck_a_checked_bass() {
         let desk_m = |kick: bool, muted: bool| {
@@ -4653,10 +4660,11 @@ mod tests {
         let want = render(&desk(false), "key-none", false);
         let keyed = render(&with_kick, "key-whole", false);
         assert!(keyed != want, "the fixture's key ducks nothing, so this proves nothing");
-        // The desk's own rule, which an export does not change: a MUTED kick
-        // still moves the bass. Left out is not muted.
+        // A MUTED kick keys nothing from the first sample either. It used to
+        // duck the head of the bass through the mute's fade at the start of
+        // the export, which this test once read as a rule of the desk's.
         let muted = render(&desk_m(true, true), "key-muted", false);
-        assert!(muted != want, "a muted kick keys nothing here, so muted and left out cannot be told apart");
+        assert!(muted == want, "a muted kick ducked the bass");
         assert!(got == want, "a left-out kick still ducked the bass");
     }
 
@@ -4698,6 +4706,202 @@ mod tests {
         let out = export_left_out(&app, &spec);
         assert_eq!(play(&mut e, &mut b, out), 0.0, "a left-out track was heard live");
         assert!(play(&mut e, &mut b, None) > 0.0, "the desk did not come back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A two-track desk for the head of an export: row 0 holds a clip from
+    /// 0:00, row 1 nothing unless `edit` puts something there.
+    fn head_desk(tag: &str, edit: impl FnOnce(&mut Settings, &mut Arrangement)) -> (PathBuf, TangentApp) {
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        let mut doc = Arrangement::default();
+        doc.add_clip(audio(0, "n0.wav", 0.0));
+        edit(&mut s, &mut doc);
+        let c = Corpus { name: "head", settings: s, doc, live: vec![], kits: vec![], freeze: vec![] };
+        let dir = scratch(tag);
+        let app = open(&c, &dir);
+        (dir, app)
+    }
+
+    /// One export of `spec` built once and rendered with or without
+    /// `Engine::land_gains`, its files by name.
+    fn export_landed(app: &TangentApp, spec: &ExportSpec, dir: &Path, land: bool) -> BTreeMap<String, (Vec<u8>, bool)> {
+        let built = full_build(app, RATE, Timebase::new(), BuildFor::Export(spec.clone())).expect("an export");
+        if !land {
+            built.engine.keep_slewing();
+        }
+        render_files(built, app, spec, None, dir).into_iter().map(|(n, b, loud)| (n, (b, loud))).collect()
+    }
+
+    /// **The level of `got` against `want` over `[from, from + len)`**, as a
+    /// ratio of their summed magnitudes: what a gain between them was over
+    /// that window.
+    fn level(got: &[f32], want: &[f32], from: usize, len: usize) -> f64 {
+        let sum = |v: &[f32]| v[from * 2..(from + len) * 2].iter().map(|x| f64::from(x.abs())).sum::<f64>();
+        sum(got) / sum(want).max(f64::MIN_POSITIVE)
+    }
+
+    /// **The desk's fade, frame by frame from `at`**: about all of it in its
+    /// first millisecond, about `1/e` of it at the ten-millisecond time
+    /// constant, nothing worth the name a tenth of a second on. A step to
+    /// silence fails the first, no mute at all the last.
+    fn assert_fades_out(got: &[f32], want: &[f32], at: usize, what: &str) {
+        let head = level(got, want, at, 48);
+        let tau = level(got, want, at + 432, 96);
+        let tail = level(got, want, at + 4_800, 4_800);
+        assert!(head > 0.85, "{what}: stepped instead of fading ({head})");
+        assert!((0.2..0.55).contains(&tau), "{what}: not the desk's ten-millisecond fade ({tau})");
+        assert!(tail < 1.0e-3, "{what}: never got quiet ({tail})");
+    }
+
+    /// **A track muted on the desk, and one silenced by a solo on another,
+    /// are exact zeros from an export's first frame.** A fresh offline
+    /// engine's levels start at unity and slewed from there, so the head of
+    /// every muted track was in the file (`Engine::land_gains`). And
+    /// landing is what did it: the same build left slewing still leaks.
+    #[test]
+    fn a_muted_or_solo_silenced_track_is_silent_from_an_exports_first_frame() {
+        let spec = ExportSpec { rate: RATE, depth: tangent_ui::ports::ExportDepth::Float32, ..Default::default() };
+        for (tag, edit) in [
+            ("head-mute", (|s: &mut Settings| s.rows[0].mute = true) as fn(&mut Settings)),
+            ("head-solo", |s: &mut Settings| s.rows[1].solo = true),
+        ] {
+            let (dir, app) = head_desk(tag, |s, _| edit(s));
+            let mix = |land: bool, sub: &str| wav_samples(&export_landed(&app, &spec, &dir.join(sub), land)["mix.wav"].0);
+            let landed = mix(true, "landed");
+            assert!(landed.len() > RATE as usize, "{tag}: the export is too short to say anything");
+            if let Some(at) = landed.iter().position(|v| *v != 0.0) {
+                panic!("{tag}: heard at sample {at} ({})", landed[at]);
+            }
+            let slewed = mix(false, "slewed");
+            assert!(slewed.iter().any(|v| *v != 0.0), "{tag}: the slewed head is silent too, so this proves nothing");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **A mute curve that moves INSIDE the song still fades**, as the desk
+    /// fades it, and an export whose head is unity is the file it was:
+    /// landing moved nothing in it.
+    #[test]
+    fn a_mute_curve_inside_an_export_still_fades() {
+        let spec = ExportSpec { rate: RATE, depth: tangent_ui::ports::ExportDepth::Float32, ..Default::default() };
+        let (dir, app) = head_desk("curve-mute", |_, doc| {
+            doc.automation =
+                Automation::from_curves(vec![curve(0, AutoParam::Mute, &[(0.0, 0.0, Shape::Hold), (0.25, 1.0, Shape::Hold)])]);
+        });
+        let (dir2, open_desk) = head_desk("curve-mute-ref", |_, _| {});
+        let landed = export_landed(&app, &spec, &dir.join("landed"), true);
+        let slewed = export_landed(&app, &spec, &dir.join("slewed"), false);
+        assert!(landed["mix.wav"].0 == slewed["mix.wav"].0, "landing changed an export whose head is unity");
+        let got = wav_samples(&landed["mix.wav"].0);
+        let want = wav_samples(&export_of(&open_desk, &spec, &dir2.join("ref"))["mix.wav"].0);
+        let at = got.iter().zip(&want).position(|(a, b)| a != b).expect("the curve muted nothing") / 2;
+        assert!((12_000..12_000 + 1_024).contains(&at), "the curve's mute began at frame {at}");
+        assert_fades_out(&got, &want, at, "the mute curve");
+        for d in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// **A freeze starts where the desk is too**, which for a freeze is
+    /// nowhere near a mute: it turns the desk's mutes and solos off for the
+    /// track it renders, and its file is that track's own sound before its
+    /// fader, so neither a mute on the frozen track nor a solo on another
+    /// one reaches a sample of it, the first included. The frozen file of a
+    /// muted track and of one silenced by a solo is the file of the same
+    /// track on an open desk, landed or not.
+    #[test]
+    fn a_freeze_of_a_muted_or_solo_silenced_track_is_whole_from_its_first_frame() {
+        let spec = ExportSpec {
+            rate: RATE,
+            master: false,
+            stems: true,
+            depth: tangent_ui::ports::ExportDepth::Float32,
+            name: "freeze".to_owned(),
+            ..Default::default()
+        };
+        let freeze = |app: &TangentApp, out: &Path, land: bool| {
+            let built = full_build(app, RATE, Timebase::new(), BuildFor::Freeze(app.track_ids()[0])).expect("a freeze");
+            if !land {
+                built.engine.keep_slewing();
+            }
+            let bytes =
+                render_files(built, app, &spec, Some(0), out).into_iter().find(|(n, ..)| n == "frozen-01.wav").expect("the freeze").1;
+            wav_samples(&bytes)
+        };
+        let (dir, open_desk) = head_desk("freeze-open", |_, _| {});
+        let want = freeze(&open_desk, &dir.join("open"), true);
+        assert!(want.iter().take(96).any(|v| *v != 0.0), "the frozen track's head is silent, so this proves nothing");
+        for (tag, edit) in [
+            ("freeze-mute", (|s: &mut Settings| s.rows[0].mute = true) as fn(&mut Settings)),
+            ("freeze-solo", |s: &mut Settings| s.rows[1].solo = true),
+        ] {
+            let (d, app) = head_desk(tag, |s, _| edit(s));
+            assert!(freeze(&app, &d.join("landed"), true) == want, "{tag}: the freeze is not the open desk's");
+            assert!(freeze(&app, &d.join("slewed"), false) == want, "{tag}: the freeze moved with landing");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The live desk's own fades, and a realtime pass's head.** On a live
+    /// engine a mute pressed while playing still fades as it always did
+    /// (nothing lands it); and a realtime pass started over a desk whose
+    /// track has stood muted is an exact zero from its first sample, where
+    /// the fade had left that track at a denormal.
+    #[test]
+    fn a_live_mute_still_fades_and_a_realtime_pass_starts_silent() {
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        let mut doc = Arrangement::default();
+        doc.add_clip(audio(0, "n0.wav", 0.0));
+        let c = Corpus { name: "live-head", settings: s.clone(), doc, live: vec![], kits: vec![], freeze: vec![] };
+        let dir = scratch("live-head");
+        let app = open(&c, &dir);
+        let mut muted_s = s.clone();
+        muted_s.rows[0].mute = true;
+        let muted = app_with(muted_s);
+        let live = |mute_at: Option<usize>| {
+            let mut e = Engine::offline(RATE, Timebase::new()).expect("an engine");
+            let mut b = Bridge::new();
+            b.sync(&app, &mut e);
+            let doc_path = app.clip_doc().expect("the clips' document");
+            let (placed, midi, _) = export_clip_placement(app.arrangement(), &app.frozen_lanes(), RATE, |rel| {
+                Arrangement::resolve(&doc_path, rel)
+            });
+            e.set_clips_slotted(b.slot_clips(placed));
+            e.set_midi_slotted(b.slot_midi(midi));
+            e.settle_offline();
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = Vec::new();
+            let mut block = vec![0.0f32; 512 * 2];
+            for i in 0..48 {
+                if mute_at == Some(i) {
+                    b.sync(&muted, &mut e);
+                }
+                block.fill(0.0);
+                e.render_offline(&mut block);
+                out.extend_from_slice(&block);
+            }
+            (e, b, out)
+        };
+        let (_, _, open_out) = live(None);
+        let (mut e, _b, got) = live(Some(8));
+        assert_fades_out(&got, &open_out, 8 * 512, "a live mute");
+        // The realtime pass's press, over that desk a third of a second on:
+        // landed, then located to the head and rolling.
+        e.land_gains();
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut block = vec![0.0f32; 512 * 2];
+        for i in 0..48 {
+            block.fill(0.0);
+            e.render_offline(&mut block);
+            if let Some(at) = block.iter().position(|v| *v != 0.0) {
+                panic!("the muted track was heard at block {i}, sample {at} ({})", block[at]);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
