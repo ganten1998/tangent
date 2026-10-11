@@ -352,6 +352,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   release; it made one per BPM it passed. A tempo typed or dragged on an
   empty song is now its own undo step too.
 
+- **A click on the metronome panel over the mixer presses once.** Every
+  row of it was pressed twice, so the beats and the count-in moved two at
+  a time and the count-in's "carries on" switch flipped and flipped back.
+  The panel over the arrangement was not affected.
+
 - **An Analog track's dry stem lines up with the others.** In a dry stems
   export it came out 68 samples (1.4 ms at 48 kHz) behind every other stem
   and the mix, by the delay the Analog reports for its own sound. It now

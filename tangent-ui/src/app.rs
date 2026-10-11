@@ -27179,7 +27179,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Before the bay menu and before the lanes, because it is drawn in
         // front of both — a panel that is painted over something it does not
         // take presses from is a panel you can click through.
-        if self.met_menu_owns_press(ctx) {
+        //
+        // **Pressed ONCE a frame.** This pass runs whichever surface is up,
+        // and on the desk the mixer's pass has already handed the frame's
+        // press to the panel (`met_owns`) - `met_stage` answers the mixer
+        // for both while the timeline is shut. Asking again pressed every
+        // row of the desk's panel twice: BEATS plus stepped two beats, NOTE
+        // plus skipped a note value, IN TAKE flipped and flipped back. On the
+        // desk this only stands down for the panel.
+        if self.arrangement_rect.is_none() && self.mixer_rect.is_some() {
+            if self.met_menu.is_some() {
+                return;
+            }
+        } else if self.met_menu_owns_press(ctx) {
             return;
         }
         // The BAY's FX menu: while it is up it owns every press.
@@ -75446,6 +75458,38 @@ mod tests {").expect("the tests module")];
         assert!(app.num_edit.is_none(), "an undrawn panel's field is still taking keys");
         assert_eq!(app.time_signature(), Sig { beats: 3, unit: 4 }, "the field was thrown away, not committed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **One click on the metronome panel is one press, on the desk as on
+    /// the timeline.**
+    ///
+    /// Over the mixer the panel took every press twice: the mixer's pass
+    /// handed the frame's press to it, and `arrangement_input`, which runs
+    /// on every surface, asked again - `met_stage` answers the mixer for
+    /// both while the timeline is shut. BEATS plus stepped two beats, NOTE
+    /// plus skipped a note value, and IN TAKE flipped and flipped back.
+    ///
+    /// Revert-check: put `met_menu_owns_press` back in `arrangement_input`
+    /// for the desk and BEATS lands on 6.
+    #[test]
+    fn a_click_on_the_metronome_panel_presses_once_on_either_surface() {
+        use crate::recorder_panel::MetHit;
+        use recorder::TimeSignature as Sig;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, stage, anchor) = met_panel_up("metonce", desk);
+            let in_take = app.settings.record_count_in_in_take;
+            let before = app.hist_at;
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Beats(1)), egui::Modifiers::NONE);
+            assert_eq!(app.time_signature(), Sig { beats: 5, unit: 4 }, "on {on} one BEATS + was not one beat");
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Unit(1)), egui::Modifiers::NONE);
+            assert_eq!(app.time_signature(), Sig { beats: 5, unit: 8 }, "on {on} one NOTE + was not one note value");
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::CountInInTake), egui::Modifiers::NONE);
+            assert_ne!(app.settings.record_count_in_in_take, in_take, "on {on} IN TAKE flipped and flipped back");
+            assert_eq!(app.hist_at, before + 3, "on {on} three presses are not three moments");
+            assert!(app.met_menu.is_some(), "on {on} a press inside closed the panel");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// **A screen reader reaches BEATS, opens it with Enter, types, and
