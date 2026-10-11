@@ -190,7 +190,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   for a chain: an effect processes what reaches its bay, so an effect
   between two instruments processes only the first, and one after both
   processes their sum; delay compensation keeps the layered instruments
-  together. A track with one instrument sounds exactly as it did.
+  together, dry stems included. A drum kit layered with other instruments
+  enters at the head of its track's chain and goes through it once with
+  them. A track with one instrument sounds exactly as it did.
 
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be

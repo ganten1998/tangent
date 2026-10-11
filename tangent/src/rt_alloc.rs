@@ -390,8 +390,18 @@ mod tests {
     /// `instrument::Layer`): a DX7 at the head, an analog layered over it,
     /// the keyboard entering at the third bay, a sampler in the extra rack,
     /// and a kit with an analog beside it, every one of them playing a note
-    /// on the fork. Their alignment lines and the keyboard's inlet were all
-    /// built on the host; the callback only steps through them.
+    /// on the fork. Their alignment lines, the keyboard's inlet and the
+    /// kit's pour buffers were all built on the host; the callback only
+    /// steps through them, and wakes a rested line with a fill.
+    ///
+    /// **What this can and cannot catch.** The engine before layering
+    /// allocated nothing on this desk either: it simply played one
+    /// instrument a track. So this is not a regression test against that
+    /// engine; it pins the NEW roads (`layer_in`, `pour_inlets`,
+    /// `pour_kits`, `DelayRing::wake`) to zero, and fails the day one of
+    /// them builds a line or a buffer lazily on the callback. That they are
+    /// the roads this desk takes is proven on the same shapes by the
+    /// `slot_engine::layers` tests (the sums only fit through them).
     #[test]
     fn layered_instruments_allocate_nothing_on_the_callback() {
         use crate::desk_plan::Slot;

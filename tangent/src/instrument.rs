@@ -4245,20 +4245,20 @@ struct Hosted {
     /// `MAX_BLOCK` so `Instance::process`'s internal `resize` never allocates.
     bufs: Vec<Vec<f32>>,
     channels: usize,
-    /// **A voice's two alignment lines**, `[what came before, its own
-    /// output]`, used only when it is LAYERED over an instrument earlier in
-    /// its chain (see [`Layer`]). Made with the box on the host, for a voice
-    /// only; `None` for an effect, and for a test's hand-built box, which
-    /// then layers without aligning.
-    align: Option<Box<[DelayRing; 2]>>,
+    /// **A voice's alignment lines** (see [`Align`]), used only when it is
+    /// LAYERED over an instrument earlier in its chain (see [`Layer`]). Made
+    /// with the box on the host, for a voice only; `None` for an effect, and
+    /// for a test's hand-built box, which then layers without aligning.
+    align: Option<Box<Align>>,
 }
 
 /// **The longest wait a layered instrument's alignment can hold**, frames:
-/// a sixth of a second at 48 kHz. Past it the wait is clamped, and the two
-/// instruments sit off by the difference; a chain that late ahead of a
-/// second instrument is a linear-phase effect between two synths, and a
-/// line long enough for every such plugin would cost every voice bay on the
-/// desk the memory of the longest one.
+/// the ring is this long and a wait reads one frame behind the write at
+/// most this less one, 8191 frames, a sixth of a second at 48 kHz. Past it
+/// the wait is clamped, and the instruments sit off by the difference; a
+/// chain that late ahead of a second instrument is a linear-phase effect
+/// between two synths, and a line long enough for every such plugin would
+/// cost every voice bay on the desk the memory of the longest one.
 pub(crate) const ALIGN_CAP: usize = 8192;
 
 /// **A fixed delay, preallocated**: `TAP_CHANNELS` rows of [`ALIGN_CAP`]
@@ -4268,11 +4268,32 @@ pub(crate) struct DelayRing {
     buf: Vec<f32>,
     cap: usize,
     w: usize,
+    /// **Not stepped since it last was**: the instrument it serves stopped
+    /// being layered (a bay bypassed or emptied ahead of it, a DX7 dragged
+    /// back to the first bay), and what the ring holds is from then. Raised
+    /// by [`Self::rest`] on every block it is not stepped, and taken by the
+    /// next step, which starts from silence rather than replaying it.
+    stale: bool,
 }
 
 impl DelayRing {
     pub(crate) fn new(cap: usize) -> Self {
-        Self { buf: vec![0.0; cap * TAP_CHANNELS], cap, w: 0 }
+        Self { buf: vec![0.0; cap * TAP_CHANNELS], cap, w: 0, stale: false }
+    }
+
+    /// This block does not step the ring: the next one that does starts
+    /// from silence.
+    fn rest(&mut self) {
+        self.stale = true;
+    }
+
+    /// Empty a ring that rested, in place: a fill, no allocation.
+    fn wake(&mut self) {
+        if self.stale {
+            self.buf.fill(0.0);
+            self.w = 0;
+            self.stale = false;
+        }
     }
 
     /// The read index `d` frames behind write index `w`.
@@ -4284,27 +4305,48 @@ impl DelayRing {
         }
     }
 
-    /// **`src(c, f)` delayed by `delay` frames, ADDED into `dst`.** Every
-    /// frame goes through the ring whatever the delay, so a wait that
-    /// changes picks up the audio that was already in flight rather than a
-    /// stale lap of it; a delay of zero reads back what it just wrote.
-    fn add_delayed(&mut self, frames: usize, delay: u32, src: impl Fn(usize, usize) -> f32, dst: &mut [Vec<f32>]) {
+    /// **`src(c, f)` delayed by `delay` frames, ADDED into `dst`** and, when
+    /// there is one, into `also` too (a dry row taking the same delayed
+    /// audio). Every frame goes through the ring whatever the delay, so a
+    /// wait that changes picks up the audio already in flight; a delay of
+    /// zero reads back what it just wrote.
+    fn add_delayed(
+        &mut self,
+        frames: usize,
+        delay: u32,
+        src: impl Fn(usize, usize) -> f32,
+        dst: &mut [Vec<f32>],
+        mut also: Option<&mut [Vec<f32>]>,
+    ) {
         if self.cap == 0 {
-            for (c, row) in dst.iter_mut().enumerate().take(TAP_CHANNELS) {
-                for (f, d) in row.iter_mut().enumerate().take(frames) {
-                    *d += src(c, f);
+            for c in 0..TAP_CHANNELS {
+                for f in 0..frames {
+                    let v = src(c, f);
+                    if let Some(d) = dst.get_mut(c).and_then(|r| r.get_mut(f)) {
+                        *d += v;
+                    }
+                    if let Some(d) = also.as_deref_mut().and_then(|a| a.get_mut(c)).and_then(|r| r.get_mut(f)) {
+                        *d += v;
+                    }
                 }
             }
             return;
         }
+        self.wake();
         let d = (delay as usize).min(self.cap - 1);
         let cap = self.cap;
-        for (c, row) in dst.iter_mut().enumerate().take(TAP_CHANNELS) {
+        for c in 0..TAP_CHANNELS {
             let mut w = self.w;
-            for (f, out) in row.iter_mut().enumerate().take(frames) {
+            for f in 0..frames {
                 let r = self.behind(w, d);
                 self.buf[c * cap + w] = src(c, f);
-                *out += self.buf[c * cap + r];
+                let v = self.buf[c * cap + r];
+                if let Some(x) = dst.get_mut(c).and_then(|row| row.get_mut(f)) {
+                    *x += v;
+                }
+                if let Some(x) = also.as_deref_mut().and_then(|a| a.get_mut(c)).and_then(|row| row.get_mut(f)) {
+                    *x += v;
+                }
                 w += 1;
                 if w == cap {
                     w = 0;
@@ -4320,6 +4362,7 @@ impl DelayRing {
         if self.cap == 0 {
             return;
         }
+        self.wake();
         let d = (delay as usize).min(self.cap - 1);
         let cap = self.cap;
         for (c, row) in rows.iter_mut().enumerate().take(TAP_CHANNELS) {
@@ -4338,19 +4381,41 @@ impl DelayRing {
     }
 }
 
+/// **The three lines a layered instrument is aligned by** (see [`Layer`]):
+/// what came before it in the chain (`prior`), its own output (`own`), and
+/// the dry row before it (`dry`). Built on the host with the instrument.
+pub(crate) struct Align {
+    prior: DelayRing,
+    own: DelayRing,
+    dry: DelayRing,
+}
+
+impl Align {
+    pub(crate) fn new() -> Self {
+        Self { prior: DelayRing::new(ALIGN_CAP), own: DelayRing::new(ALIGN_CAP), dry: DelayRing::new(ALIGN_CAP) }
+    }
+
+    /// The instrument is not layered this block: none of its lines steps.
+    fn rest(&mut self) {
+        self.prior.rest();
+        self.own.rest();
+        self.dry.rest();
+    }
+}
+
 /// **A mask-rendered instrument (the DX7, the modelled keyboard) as a lane
-/// holds it**: the instrument, and the line that aligns it when it enters
-/// its chain past an earlier bay that is late (see [`Layer`]). Built on the
-/// host with the instrument and carried over on its ring with it, so the
-/// line costs a lane nothing until it has one of these.
+/// holds it**: the instrument, and the lines that align it when it enters
+/// its chain past an earlier bay (see [`Layer`]). Built on the host with the
+/// instrument and carried over on its ring with it, so the lines cost a lane
+/// nothing until it has one of these.
 pub(crate) struct Seated<T> {
     inst: T,
-    ring: DelayRing,
+    align: Align,
 }
 
 impl<T> Seated<T> {
     pub(crate) fn new(inst: T) -> Self {
-        Self { inst, ring: DelayRing::new(ALIGN_CAP) }
+        Self { inst, align: Align::new() }
     }
 }
 
@@ -4381,44 +4446,56 @@ impl<T> std::ops::DerefMut for Seated<T> {
 /// a clip on a MIDI lane), so a chain with one instrument is the chain it
 /// always was, sample for sample.
 ///
-/// The DX7 and the modelled keyboard are not seated in the rack: they render
-/// before it, into the lane's source. From the first bay (`pos` 0) that is
-/// the head of the chain, ahead of the pedalboard, exactly as ever, and it
-/// is an instrument already sounding (`sounded`) for every voice after it.
-/// From a later bay they are an [`Inlet`], added where their bay is.
+/// The DX7, the modelled keyboard and a drum kit are not seated in the
+/// rack: they render outside it, into the lane's source. From the first bay
+/// (`pos` 0) the DX7 and keyboard are the head of the chain, ahead of the
+/// pedalboard, exactly as ever, and an instrument already sounding
+/// (`sounded`) for every voice after it; from a later bay they are an
+/// [`Inlet`], added where their bay is. A kit layered with another
+/// instrument always enters at the head, wherever its bay is (its pads have
+/// bays of their own, and the kit is rendered before the lane walk:
+/// `Renderer::pour_kits`).
 ///
 /// **Delay compensation, per bay.** The desk aligns a lane as if every bay
-/// of its chain were in series (`Rack::latency` sums them), and an added
-/// instrument is in parallel with what came before it. So at a layered
-/// instrument's bay, what came before (late by `lat` and the bays ahead of
-/// this one) is held by the instrument's own figure, and the instrument by
-/// the figure of everything ahead of it, and the sum leaves the bay as late
-/// as the series sum says. A voice carries its two lines (`Hosted::align`);
-/// an inlet carries one (`Seated::ring`), its own figure being zero.
+/// of its chain were in series (`Rack::latency` sums them). A layered
+/// instrument is in parallel with what came before it, and what came before
+/// may be EARLIER than that series sum says (a voice that replaced the
+/// signal threw away the delay of the bays ahead of it; a bypassed bay
+/// delays nothing). So `carried` follows how late the signal really is, and
+/// at a layered bay both are brought to the series sum through it: what
+/// came before is held by the difference, the instrument by the series sum
+/// ahead of its bay. From the first layering on, the chain leaves exactly
+/// as late as the desk compensates it for. The dry row is brought to the
+/// same figure the same way (`dry_carried`), and that figure is what the
+/// dry stem's own compensation is told it has paid.
 struct Layer<'a> {
     /// An instrument has already sounded into the chain at this point.
     sounded: bool,
-    /// What the chain has paid ahead of this rack's first bay, frames: the
+    /// The series sum ahead of this rack's first bay, frames: the
     /// pedalboard, and on the extra rack the whole of the own one.
     lat: u32,
+    /// How late the signal in the chain actually is, frames.
+    carried: u32,
+    /// How late the dry row actually is, frames: what the dry stem has paid.
+    dry_carried: u32,
     /// This rack's first bay as a chain position: 0 for a track's own
     /// rack, [`INSERTS`] for its extra one.
     base: usize,
     /// The DX7 and the keyboard, when each enters later than the head.
     inlets: [Option<Inlet<'a>>; 2],
-    /// Whether the voices in the rack are played at all. A pass that runs a
-    /// lane's rack a SECOND time over something arriving (a kit's pads over
-    /// their own lane's chain) passes a voice's bay by: the voice is played
-    /// once, by the lane's notes, in the lane pass, and a second clock with
-    /// no notes would put silence where the arrival was and run the
-    /// instrument at twice the rate.
+    /// Whether the voices in the rack are played at all. The kit pass runs
+    /// a drum lane's chain over its kit while the lane pass did not take
+    /// the kit in (a kit alone, or a layered lane that did not render this
+    /// chunk): a voice there is played by the lane pass, from its notes, or
+    /// not at all, and a second clock with no notes would put silence where
+    /// the kit was.
     voices: bool,
 }
 
 impl Layer<'_> {
     /// A chain with nothing ahead of it: the first voice replaces.
     fn fresh() -> Self {
-        Self { sounded: false, lat: 0, base: 0, inlets: [None, None], voices: true }
+        Self { sounded: false, lat: 0, carried: 0, dry_carried: 0, base: 0, inlets: [None, None], voices: true }
     }
 
     /// A chain run for its EFFECTS over something arriving: its voices'
@@ -4430,11 +4507,11 @@ impl Layer<'_> {
 
 /// One mask-rendered instrument entering its chain at bay `pos`: its block,
 /// interleaved `TAP_CHANNELS` wide (silence when it is not sounding, so the
-/// line still empties), and its alignment line.
+/// lines still empty), and its alignment lines.
 struct Inlet<'a> {
     pos: usize,
     audio: &'a [f32],
-    ring: &'a mut DelayRing,
+    align: &'a mut Align,
 }
 
 /// **The chain positions past which nothing is a bay**: a track's six.
@@ -4462,34 +4539,70 @@ fn bays_paid(shared: &Shared, seat: usize, bay: usize) -> u32 {
         .fold(0u32, u32::saturating_add)
 }
 
-/// **Pour every inlet due at or before chain position `upto`** into
-/// `planar`, each aligned to `lat` (what the chain has paid ahead of it) and
-/// added raw into the dry row: an instrument's own audio before any effect
-/// of its chain has touched it, which is what a dry stem is.
-fn pour_inlets(
+/// **One instrument layered into the chain** at a bay whose series sum
+/// ahead is `ahead` and whose own delay is `own` (see [`Layer`]): what came
+/// before (`planar`, and the dry row) is brought to `ahead + own`, and the
+/// instrument's `src`, held by `ahead`, is added to both. Without lines (a
+/// test's hand-built box) it is added as it is.
+#[allow(clippy::too_many_arguments)]
+fn layer_in(
     layer: &mut Layer<'_>,
-    upto: usize,
-    lat: u32,
+    align: Option<&mut Align>,
+    own: u32,
+    ahead: u32,
+    src: impl Fn(usize, usize) -> f32,
     planar: &mut [Vec<f32>],
     frames: usize,
     mut dry: Option<&mut [Vec<f32>]>,
 ) {
-    for slot in layer.inlets.iter_mut() {
-        if !slot.as_ref().is_some_and(|i| i.pos <= upto) {
-            continue;
+    let target = ahead.saturating_add(own);
+    match align {
+        Some(a) => {
+            a.prior.delay_in_place(planar, frames, target.saturating_sub(layer.carried));
+            match dry.as_deref_mut() {
+                Some(rows) => a.dry.delay_in_place(rows, frames, target.saturating_sub(layer.dry_carried)),
+                None => a.dry.rest(),
+            }
+            a.own.add_delayed(frames, ahead, src, planar, dry);
         }
-        let Some(inlet) = slot.take() else { continue };
-        let audio = inlet.audio;
-        let at = |c: usize, f: usize| audio.get(f * TAP_CHANNELS + c).copied().unwrap_or(0.0);
-        inlet.ring.add_delayed(frames, lat, at, planar);
-        if let Some(rows) = dry.as_deref_mut() {
-            for (c, row) in rows.iter_mut().enumerate().take(TAP_CHANNELS) {
-                for (f, d) in row.iter_mut().enumerate().take(frames) {
-                    *d += at(c, f);
+        None => {
+            for c in 0..TAP_CHANNELS {
+                for f in 0..frames {
+                    let v = src(c, f);
+                    if let Some(x) = planar.get_mut(c).and_then(|r| r.get_mut(f)) {
+                        *x += v;
+                    }
+                    if let Some(x) = dry.as_deref_mut().and_then(|d| d.get_mut(c)).and_then(|r| r.get_mut(f)) {
+                        *x += v;
+                    }
                 }
             }
         }
-        layer.sounded = true;
+    }
+    layer.carried = target;
+    layer.dry_carried = target;
+    layer.sounded = true;
+}
+
+/// **Pour every inlet due at or before chain position `upto`** into
+/// `planar` and the dry row, each layered in with `ahead` the series sum
+/// ahead of its bay and a delay of its own of none.
+fn pour_inlets(
+    layer: &mut Layer<'_>,
+    upto: usize,
+    ahead: u32,
+    planar: &mut [Vec<f32>],
+    frames: usize,
+    mut dry: Option<&mut [Vec<f32>]>,
+) {
+    for i in 0..layer.inlets.len() {
+        if !layer.inlets[i].as_ref().is_some_and(|x| x.pos <= upto) {
+            continue;
+        }
+        let Some(inlet) = layer.inlets[i].take() else { continue };
+        let audio = inlet.audio;
+        let at = |c: usize, f: usize| audio.get(f * TAP_CHANNELS + c).copied().unwrap_or(0.0);
+        layer_in(layer, Some(inlet.align), 0, ahead, at, planar, frames, dry.as_deref_mut());
     }
 }
 
@@ -7398,7 +7511,9 @@ impl Lane {
         let rows = |rows: &[Vec<f32>]| rows.iter().map(|r| r.capacity() * 4).sum::<usize>();
         let grain: usize = b.grain.slots.iter().map(|s| rows(s)).sum();
         let pdc = |d: &DelayLine| d.ring.iter().map(|r| r.capacity() * 4).sum::<usize>();
-        let pads = b.pads.as_ref().map_or(0, |p| size_of::<PadBank>() + pdc(&p.pdc) + pdc(&p.dry_pdc));
+        let pads = b.pads.as_ref().map_or(0, |p| {
+            size_of::<PadBank>() + pdc(&p.pdc) + pdc(&p.dry_pdc) + (p.kit_wet.capacity() + p.kit_dry.capacity()) * size_of::<f32>()
+        });
         size_of::<Lane>()
             + racks
             + grain
@@ -7528,6 +7643,19 @@ pub struct PadBank {
     /// are the bank's (`pad_rack_index`). They stay with the lane: a second
     /// bank attached takes them over (`Lane::attach`).
     racks: [Option<Box<PadRack>>; PADS],
+    /// **The kit as it enters its lane's chain, when it is LAYERED** with
+    /// another instrument on its track (see [`Layer`]): rendered before the
+    /// lane walk by `Renderer::pour_kits`, interleaved `TAP_CHANNELS` wide,
+    /// the pads' bays applied (`wet`) and not (`dry`), and summed at the
+    /// head of the lane's chain by `render_lane`. A kit alone never fills
+    /// them: its pass runs its lane's chain over it, as it always has.
+    kit_wet: Vec<f32>,
+    kit_dry: Vec<f32>,
+    /// This chunk's kit is in `kit_wet` and waits for its lane's render:
+    /// `mix_pads` passes the lane by, and the lane pours it.
+    poured: bool,
+    /// The decide walk found another instrument on the kit's lane.
+    layered: bool,
 }
 
 impl PadBank {
@@ -7540,6 +7668,10 @@ impl PadBank {
             hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             racks: [const { None }; PADS],
+            kit_wet: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            kit_dry: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            poured: false,
+            layered: false,
         }
     }
 
@@ -8999,6 +9131,9 @@ struct LaneSeats<'a> {
     board: &'a mut [Rack],
     dx7: &'a mut Option<Box<Seated<crate::dx7::Dx7>>>,
     keys: &'a mut Option<Box<Seated<crate::keys::Keys>>>,
+    /// The lane's kit, `(wet, dry)`, when `pour_kits` rendered it for this
+    /// lane's chain this chunk.
+    kit: Option<(&'a [f32], &'a [f32])>,
 }
 
 /// **What the lane pass decided about one lane before it rendered.**
@@ -9717,6 +9852,10 @@ fn render_lane(
             voiced |= active;
         }
     }
+    // **A kit layered with the lane's other instruments** (`pour_kits`):
+    // rendered before the walk, summed at the head below.
+    let kit = seats.kit;
+    voiced |= kit.is_some();
     if !voiced && !rack_live && !has_audio {
         // Nothing to play and nothing to play it through: an
         // inactive instrument on a bare lane. The seed above has
@@ -9749,6 +9888,36 @@ fn render_lane(
             dst[..n].copy_from_slice(&src[..n]);
         }
     }
+    // The kit at the head, after the dry copy so its dry row takes the
+    // kit's own dry sum (its voices before their pads' bays) rather than
+    // the wet one.
+    if let Some((wet, dry)) = kit {
+        for c in 0..TAP_CHANNELS {
+            if let Some(dst) = io.fx_in.get_mut(c) {
+                for f in 0..frames.min(dst.len()) {
+                    dst[f] += wet.get(f * TAP_CHANNELS + c).copied().unwrap_or(0.0);
+                }
+            }
+            if plan.stems_dry {
+                if let Some(dst) = io.dry_io.get_mut(c) {
+                    for f in 0..frames.min(dst.len()) {
+                        dst[f] += dry.get(f * TAP_CHANNELS + c).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+    }
+    // An instrument at the head is not layered in: its lines rest.
+    if is_builtin && dx7_head {
+        if let Some(d) = seats.dx7.as_deref_mut() {
+            d.align.rest();
+        }
+    }
+    if is_keys && keys_head {
+        if let Some(k) = seats.keys.as_deref_mut() {
+            k.align.rest();
+        }
+    }
     // **The lane pass stands aside for a seat the ROOM is playing.**
     //
     // One rack per seat, one clock per chunk. See
@@ -9773,19 +9942,21 @@ fn render_lane(
         // has sounded already, the board ahead of the rack has paid its
         // figure, and an instrument in a later bay enters there.
         let mut layer = Layer {
-            sounded: (is_builtin && dx7_head) || (is_keys && keys_head),
+            sounded: (is_builtin && dx7_head) || (is_keys && keys_head) || kit.is_some(),
             lat: if plan.board_runs { plan.pedal_latency } else { 0 },
+            carried: if plan.board_runs { plan.pedal_latency } else { 0 },
+            dry_carried: 0,
             base: 0,
             inlets: [
                 match (is_builtin && !dx7_head, seats.dx7.as_deref_mut(), io.builtin.get(..want)) {
                     (true, Some(d), Some(audio)) => {
-                        Some(Inlet { pos: usize::from(plan.inlets[0]), audio, ring: &mut d.ring })
+                        Some(Inlet { pos: usize::from(plan.inlets[0]), audio, align: &mut d.align })
                     }
                     _ => None,
                 },
                 match (is_keys && !keys_head, seats.keys.as_deref_mut(), io.keys_scratch.get(..want)) {
                     (true, Some(k), Some(audio)) => {
-                        Some(Inlet { pos: usize::from(plan.inlets[1]), audio, ring: &mut k.ring })
+                        Some(Inlet { pos: usize::from(plan.inlets[1]), audio, align: &mut k.align })
                     }
                     _ => None,
                 },
@@ -9857,7 +10028,7 @@ fn render_lane(
             });
         // Guarded by `!is_folder` at this block's head — a folder's
         // rack belongs to the fold, per the checklist's rule.
-        let paid = run_rack(
+        run_rack(
             seats.rack,
             &mut io.fx_in,
             frames,
@@ -9892,7 +10063,7 @@ fn render_lane(
         // **And bays 3..5, over what bays 0..2 just left.** Six bays
         // are one chain; see `run_extra_rack`, which holds the
         // is_folder guard this block's head already applied.
-        let paid_extra = run_extra_rack(
+        run_extra_rack(
             seats.extra,
             is_folder,
             &desk.auto_params,
@@ -9916,10 +10087,15 @@ fn render_lane(
             at,
             &mut layer,
         );
-        // The LAST voice to write the dry row is the one whose delay it
-        // carries: a voice replaces the row, as it replaces the channel.
-        if let Some(paid) = paid_extra.or(paid) {
-            *io.dry_paid = paid;
+        // What the dry row has paid: the delay of the voice that last
+        // replaced it, or the figure the layered instruments were brought
+        // to (`Layer::dry_carried`), and nothing when no instrument in the
+        // rack wrote it.
+        *io.dry_paid = layer.dry_carried;
+        // An inlet the chain never reached (a frozen rack stands down
+        // whole) did not step its lines.
+        for inlet in layer.inlets.iter_mut().flatten() {
+            inlet.align.rest();
         }
     }
     // **The lane does NOT wait here any more.** Its delay compensation used
@@ -10302,6 +10478,10 @@ fn run_rack(
             if tap_bay == Some(bay) {
                 push_insert_tap(shared, planar, frames);
             }
+            // A voice's lines do not step this block (`DelayRing::rest`).
+            if let Some(a) = p.align.as_deref_mut() {
+                a.rest();
+            }
             continue;
         }
         // **A voice on a pass that plays none** (`Layer::voices`): what
@@ -10309,6 +10489,9 @@ fn run_rack(
         if p.voice && !layer.voices {
             if tap_bay == Some(bay) {
                 push_insert_tap(shared, planar, frames);
+            }
+            if let Some(a) = p.align.as_deref_mut() {
+                a.rest();
             }
             continue;
         }
@@ -10378,6 +10561,9 @@ fn run_rack(
                 .process_voice(notes, controls, bay_params, transport, sample, frames, &mut p.bufs)
                 .is_err()
             {
+                if let Some(a) = p.align.as_deref_mut() {
+                    a.rest();
+                }
                 continue;
             }
         } else if p
@@ -10447,46 +10633,34 @@ fn run_rack(
             }
         }
         let wrote = p.channels.max(1);
+        // This bay's own delay, as the series sum counts it.
+        let own = shared
+            .seat_cell(SeatKind::Latency, seat * INSERTS + bay)
+            .map_or(0, |c| c.load(Ordering::Relaxed));
         // **A voice LAYERED over an instrument earlier in the chain ADDS**
-        // (see [`Layer`]): what came before is held by this voice's own
-        // figure, the voice by what the chain ahead of it has paid, and the
-        // two are summed, so the bay leaves as late as the series sum the
-        // desk compensates says. Its dry stem is its own output added to
-        // the row; the row's paid figure stays the first instrument's.
+        // (see [`Layer`] and `layer_in`): what came before, and the dry row,
+        // are brought to the series sum through this bay, and the voice,
+        // held by the series sum ahead of it, is added to both.
         if p.voice && layer.sounded {
-            let own = shared
-                .seat_cell(SeatKind::Latency, seat * INSERTS + bay)
-                .map_or(0, |c| c.load(Ordering::Relaxed));
             let ahead = layer.lat.saturating_add(bays_paid(shared, seat, bay));
             let Hosted { bufs, align, .. } = &mut **p;
             let at = |c: usize, f: usize| bufs.get(c.min(wrote - 1)).and_then(|b| b.get(f)).copied().unwrap_or(0.0);
-            match align.as_deref_mut() {
-                Some([prior, mine]) => {
-                    prior.delay_in_place(planar, frames, own);
-                    mine.add_delayed(frames, ahead, at, planar);
-                }
-                None => {
-                    for (c, row) in planar.iter_mut().enumerate() {
-                        for (f, d) in row.iter_mut().enumerate().take(frames) {
-                            *d += at(c, f);
-                        }
-                    }
-                }
-            }
-            if let Some(rows) = dry.as_deref_mut() {
-                for (c, row) in rows.iter_mut().enumerate() {
-                    for (f, d) in row.iter_mut().enumerate().take(frames) {
-                        *d += at(c, f);
-                    }
-                }
-            }
+            layer_in(layer, align.as_deref_mut(), own, ahead, at, planar, frames, dry.as_deref_mut());
             if tap_bay == Some(bay) {
                 push_insert_tap(shared, planar, frames);
             }
             continue;
         }
         if p.voice {
+            // The first instrument of the chain: it replaces the signal, and
+            // the signal is now exactly as late as it is.
             layer.sounded = true;
+            layer.carried = own;
+            if let Some(a) = p.align.as_deref_mut() {
+                a.rest();
+            }
+        } else {
+            layer.carried = layer.carried.saturating_add(own);
         }
         let src_bufs: &[Vec<f32>] = if p.voice { &p.bufs } else { &out[..] };
         for c in 0..planar.len() {
@@ -10512,11 +10686,8 @@ fn run_rack(
                 // **And what the row has already paid**: this bay's figure,
                 // read back from the cell `Rack::latency` sums - so the dry
                 // copy is let off exactly the share of `own` it carries.
-                paid = Some(
-                    shared
-                        .seat_cell(SeatKind::Latency, seat * INSERTS + bay)
-                        .map_or(0, |c| c.load(Ordering::Relaxed)),
-                );
+                paid = Some(own);
+                layer.dry_carried = own;
             }
         }
         // **The armed bay's POST audio, read after the copy-back** — `planar`
@@ -15701,90 +15872,94 @@ impl Renderer {
             return;
         }
         for ch in 0..self.spine.ext.desk.drums.capacity() {
-            if self.spine.ext.desk.drums.contains(ch) {
+            // A kit its lane poured into its own chain (`pour_kits`) is that
+            // lane's audio now, and has no pass of its own.
+            let poured = self
+                .spine
+                .lanes
+                .get(ch)
+                .and_then(Option::as_deref)
+                .and_then(|l| l.peek().pads.as_deref())
+                .is_some_and(|b| b.poured);
+            if self.spine.ext.desk.drums.contains(ch) && !poured {
                 self.mix_pad_lane(Some(ch), frames, muted, soloed, coeff);
             }
         }
     }
 
-    /// **One drum lane's kit, summed onto its own strip.**
+    /// **Every kit LAYERED with another instrument on its track, rendered
+    /// before the lane walk** (see [`Layer`]): its voices and its pads' bays
+    /// summed (`render_kit`) and left in its bank (`PadBank::kit_wet`, with
+    /// its dry sum), for its lane's render to add at the head of its chain.
+    /// Its lane then carries it through ONE run of its chain, with its
+    /// fader, its compensation and its stem, and `mix_pads` passes it by.
     ///
-    /// Split out of `mix_pads` so the whole of it runs once per channel
-    /// holding a drumpad — a drum instrument loads a full instance per
-    /// channel, the way every industry sampler does, and that means a full
-    /// pass each. `drum_lane` is `None` for the case that predates lanes
-    /// entirely: no channel carries a kit, the drumpad window is being
-    /// played bare, and the hidden `Strip::Drums` internals rule at unity.
-    ///
-    /// `pad_out` is SCRATCH and is reused across lanes rather than
-    /// allocated per lane. It is half a megabyte; sixteen would be eight for
-    /// a case nobody has, and the lanes run one at a time so one buffer is
-    /// all that is ever live.
-    fn mix_pad_lane(
-        &mut self,
-        drum_lane: Option<usize>,
-        frames: usize,
-        muted: u64,
-        soloed: u64,
-        coeff: f32,
-    ) {
-        let stride = self.stride();
-        // The lane whose kit and voices this pass belongs to. The bare
-        // drumpad case has no channel, and borrows lane 0's slot for them —
-        // nothing else can be using it, because a drumpad on channel 0 would
-        // have put channel 0 in the target list instead.
-        let lane_ix = drum_lane.unwrap_or(0);
-        // **The DRUM BUS is the pads' strip now**: its fader, pan, mute,
-        // solo and send govern the summed kit, and its rack runs over it —
-        // bus-wide effects live on the DRUMS channel, exactly as the owner
-        // ruled. The old in-panel master is gone.
-        // **The kit belongs to its LANE now.** With a drumpad assigned to
-        // a channel, that channel's fader, pan, mute, solo, send, meter —
-        // and STEM — govern the summed kit: the visible drum bus strip is
-        // retired, and the lane is the one place the drums answer to. The
-        // old hidden Drums internals only rule when no lane carries the
-        // pad (the drumpad window played bare), where they rest at unity.
-        // `drum_lane` is this pass's own — the argument, not the shared
-        // first-lane index, which is what made every lane fold onto the
-        // first one's strip.
-        let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
-        // **A LANE answers to the folder tree; the bare pad window does
-        // not** — it has no lane and so no group. See the target walk above,
-        // and `channel_is_heard` for the rule itself.
-        let heard = match drum_lane {
-            Some(ch) => self.spine.ext.heard.get(ch).copied().unwrap_or(false),
-            None => strip_is_heard(bus_strip, muted, soloed),
-        };
-        let master = if heard {
-            match drum_lane {
-                Some(ch) => self.lane_gain(ch),
-                None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
+    /// Only for a lane that renders this chunk and renders the chunk itself
+    /// (`wants`, and a span of the chunk: a drum lane is pinned, so it is
+    /// never rendered ahead). One that does not leaves its kit to
+    /// `mix_pads`, whose pass runs the chain's effects past its voices
+    /// (`Layer::effects_only`), so nothing is clocked twice either way.
+    fn pour_kits(&mut self, frames: usize) {
+        let dry_on = self.stems_dry;
+        // Last chunk's pours are spent, on every lane: one that stopped
+        // being a drum lane must not pour a kit it rendered then.
+        for lane in self.spine.lanes.iter_mut().flatten() {
+            if let Some(bank) = lane.body_mut().pads.as_deref_mut() {
+                bank.poured = false;
             }
-        } else {
-            0.0
-        };
-        let (bus_l, bus_r) = pan_gains(match drum_lane {
-            Some(ch) => self.lane_pan(ch),
-            None => Shared::f32_of(&self.shared.drums_pan),
-        });
-        // Through the accessor like every other control, even though the
-        // drum BUS sits past the sixteen channels a curve can name: it falls
-        // through to the atomic, and going round it is how the other three
-        // sites came to be missed. Its plan entries, when the plan carries
-        // any, in place of the knob (`InSend`).
-        let bus_send = self.fx_send(bus_strip);
-        let bus_fx_pre = self.fx_pre_send(bus_strip);
-        // **The strip's pre-fader gate**, replayed from where it stood at
-        // the head of the chunk (`clear_send_buffers`; the bare bus's in
-        // `mix_pads`): the kit's pre-fader sends answer to its mute and solo
-        // as a lane's own audio does, whether or not the lane renders.
-        let (gate_from, gate_to) = match drum_lane {
-            Some(ch) => (
-                self.spine.lanes.get(ch).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate_from),
-                send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, ch),
-            ),
-            None => (self.drums_gate_from, if heard { 1.0 } else { 0.0 }),
-        };
+        }
+        for ch in 0..self.spine.ext.desk.drums.capacity() {
+            if !self.spine.ext.desk.drums.contains(ch) {
+                continue;
+            }
+            let due = self
+                .spine
+                .lanes
+                .get_mut(ch)
+                .and_then(Option::as_deref_mut)
+                .map(Lane::body_mut)
+                .and_then(|b| {
+                    let renders = b.wants && b.len == frames;
+                    let bank = b.pads.as_deref_mut()?;
+                    Some(bank.layered && renders && frames * TAP_CHANNELS <= bank.kit_wet.len())
+                })
+                .unwrap_or(false);
+            if !due {
+                continue;
+            }
+            self.render_kit(ch, frames);
+            let Some(bank) = self
+                .spine
+                .lanes
+                .get_mut(ch)
+                .and_then(Option::as_deref_mut)
+                .map(Lane::body_mut)
+                .and_then(|b| b.pads.as_deref_mut())
+            else {
+                continue;
+            };
+            for c in 0..TAP_CHANNELS {
+                for f in 0..frames {
+                    bank.kit_wet[f * TAP_CHANNELS + c] = self.fx_in.get(c).and_then(|r| r.get(f)).copied().unwrap_or(0.0);
+                    bank.kit_dry[f * TAP_CHANNELS + c] = if dry_on {
+                        self.dry_io.get(c).and_then(|r| r.get(f)).copied().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            bank.poured = true;
+        }
+    }
+
+    /// **A kit's own sound, before its lane's chain**: every pad's voice
+    /// struck this chunk and played through its pad's own bays, summed into
+    /// `fx_in`, and the voices' raw sum into `dry_io` when stems are dry; the
+    /// pads' meters published. The first half of `mix_pad_lane`, split out
+    /// so a kit LAYERED with other instruments on its track can be rendered
+    /// before the lane walk and enter the lane's own chain (see
+    /// `Renderer::pour_kits`) instead of running that chain a second time.
+    fn render_kit(&mut self, lane_ix: usize, frames: usize) {
         // The knobs, read once per chunk like the channel gains: they are
         // published at human speed. The clamps are the audio thread refusing
         // to trust numbers it did not make; the setter sanitised them too.
@@ -16075,6 +16250,89 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// **One drum lane's kit, summed onto its own strip.**
+    ///
+    /// Split out of `mix_pads` so the whole of it runs once per channel
+    /// holding a drumpad — a drum instrument loads a full instance per
+    /// channel, the way every industry sampler does, and that means a full
+    /// pass each. `drum_lane` is `None` for the case that predates lanes
+    /// entirely: no channel carries a kit, the drumpad window is being
+    /// played bare, and the hidden `Strip::Drums` internals rule at unity.
+    ///
+    /// `pad_out` is SCRATCH and is reused across lanes rather than
+    /// allocated per lane. It is half a megabyte; sixteen would be eight for
+    /// a case nobody has, and the lanes run one at a time so one buffer is
+    /// all that is ever live.
+    fn mix_pad_lane(
+        &mut self,
+        drum_lane: Option<usize>,
+        frames: usize,
+        muted: u64,
+        soloed: u64,
+        coeff: f32,
+    ) {
+        let stride = self.stride();
+        // The lane whose kit and voices this pass belongs to. The bare
+        // drumpad case has no channel, and borrows lane 0's slot for them —
+        // nothing else can be using it, because a drumpad on channel 0 would
+        // have put channel 0 in the target list instead.
+        let lane_ix = drum_lane.unwrap_or(0);
+        // **The DRUM BUS is the pads' strip now**: its fader, pan, mute,
+        // solo and send govern the summed kit, and its rack runs over it —
+        // bus-wide effects live on the DRUMS channel, exactly as the owner
+        // ruled. The old in-panel master is gone.
+        // **The kit belongs to its LANE now.** With a drumpad assigned to
+        // a channel, that channel's fader, pan, mute, solo, send, meter —
+        // and STEM — govern the summed kit: the visible drum bus strip is
+        // retired, and the lane is the one place the drums answer to. The
+        // old hidden Drums internals only rule when no lane carries the
+        // pad (the drumpad window played bare), where they rest at unity.
+        // `drum_lane` is this pass's own — the argument, not the shared
+        // first-lane index, which is what made every lane fold onto the
+        // first one's strip.
+        let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
+        // **A LANE answers to the folder tree; the bare pad window does
+        // not** — it has no lane and so no group. See the target walk above,
+        // and `channel_is_heard` for the rule itself.
+        let heard = match drum_lane {
+            Some(ch) => self.spine.ext.heard.get(ch).copied().unwrap_or(false),
+            None => strip_is_heard(bus_strip, muted, soloed),
+        };
+        let master = if heard {
+            match drum_lane {
+                Some(ch) => self.lane_gain(ch),
+                None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
+            }
+        } else {
+            0.0
+        };
+        let (bus_l, bus_r) = pan_gains(match drum_lane {
+            Some(ch) => self.lane_pan(ch),
+            None => Shared::f32_of(&self.shared.drums_pan),
+        });
+        // Through the accessor like every other control, even though the
+        // drum BUS sits past the sixteen channels a curve can name: it falls
+        // through to the atomic, and going round it is how the other three
+        // sites came to be missed. Its plan entries, when the plan carries
+        // any, in place of the knob (`InSend`).
+        let bus_send = self.fx_send(bus_strip);
+        let bus_fx_pre = self.fx_pre_send(bus_strip);
+        // **The strip's pre-fader gate**, replayed from where it stood at
+        // the head of the chunk (`clear_send_buffers`; the bare bus's in
+        // `mix_pads`): the kit's pre-fader sends answer to its mute and solo
+        // as a lane's own audio does, whether or not the lane renders.
+        let (gate_from, gate_to) = match drum_lane {
+            Some(ch) => (
+                self.spine.lanes.get(ch).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate_from),
+                send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, ch),
+            ),
+            None => (self.drums_gate_from, if heard { 1.0 } else { 0.0 }),
+        };
+        // **The kit itself**: its voices and its pads' own bays, summed
+        // into `fx_in` (and its dry sum into `dry_io`). See `render_kit`.
+        self.render_kit(lane_ix, frames);
         // **The rack of the strip the kit actually lands on**, over the
         // summed kit.
         //
@@ -17992,6 +18250,9 @@ impl Renderer {
                     && !lane.chains[CHAIN_OWN].holds_a_voice()
                     && !lane.chains[CHAIN_EXTRA].holds_a_voice();
                 if self.spine.ext.desk.drums.contains(ch) {
+                    if let Some(bank) = lane.pads.as_deref_mut() {
+                        bank.layered = !kit_alone;
+                    }
                     let obey = [
                         self.shared.lanes.get(ch).pads.obey[0].load(Ordering::Relaxed),
                         self.shared.lanes.get(ch).pads.obey[1].load(Ordering::Relaxed),
@@ -18379,6 +18640,9 @@ impl Renderer {
         // from (`LanePool::run_list`): ascending, so the serial walk and the
         // fork's lane-to-hand order are today's. Bought at build, at the
         // spine's capacity, so filling it allocates nothing.
+        // **The kits layered with other instruments, rendered now**, so
+        // their lanes' renders below pour them into their own chains.
+        self.pour_kits(frames);
         let mut wanted = std::mem::take(&mut self.spine.ext.wanted);
         wanted.clear();
         let resting = &self.spine.ext.resting;
@@ -18504,6 +18768,7 @@ impl Renderer {
                     len,
                     folds,
                     sample,
+                    pads,
                     ..
                 } = body;
                 let [rack, extra] = chains;
@@ -18518,6 +18783,10 @@ impl Renderer {
                     board: &mut board[..],
                     dx7,
                     keys,
+                    kit: pads
+                        .as_deref()
+                        .filter(|b| b.poured)
+                        .map(|b| (&b.kit_wet[..], &b.kit_dry[..])),
                 };
                 let mut io = LaneIo {
                     fx_in: grain.hold(*at, *len),
@@ -24227,7 +24496,7 @@ impl Engine {
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
                 channels,
                 voice,
-                align: voice.then(|| Box::new([DelayRing::new(ALIGN_CAP), DelayRing::new(ALIGN_CAP)])),
+                align: voice.then(|| Box::new(Align::new())),
             }))),
         ) {
             // **The seat never took it, so nothing here may say it did.**
@@ -42966,6 +43235,8 @@ mod slot_engine {
             Trim(usize),
             /// The sampler, with a flat file.
             Sampler(usize),
+            /// The denoiser, a lookahead effect at its defaults.
+            Denoise(usize),
         }
 
         fn trim_floor() -> Vec<u8> {
@@ -43017,6 +43288,7 @@ mod slot_engine {
                     Part::Analog(at) => (at, crate::builtin_fx::ANALOG_PATH, None),
                     Part::Trim(at) => (at, crate::builtin_fx::TRIM_PATH, Some(trim_floor())),
                     Part::Sampler(at) => (at, crate::builtin_fx::SAMPLER_PATH, None),
+                    Part::Denoise(at) => (at, crate::builtin_fx::DENOISE_PATH, None),
                     Part::Dx7(_) | Part::Keys(_) => continue,
                 };
                 let addr = RackAddr { owner: RackOwner::Lane(slot), rack: (at / INSERTS) as u16 };
@@ -43037,7 +43309,13 @@ mod slot_engine {
 
         /// The lane's stem for one clip note (and `pedal`), `blocks` long.
         fn stem(parts: &[Part], dur: u64, pedal: &[ClipPedal], blocks: usize) -> (Vec<f32>, Engine) {
+            stem_of(parts, dur, pedal, blocks, false)
+        }
+
+        /// [`stem`], the stem taken DRY when `dry`.
+        fn stem_of(parts: &[Part], dur: u64, pedal: &[ClipPedal], blocks: usize, dry: bool) -> (Vec<f32>, Engine) {
             let mut e = desk(parts, false);
+            e.set_stems_dry(dry);
             let slot = Slot(LANE as u32);
             e.set_midi_slotted(vec![SlotPlacedMidi {
                 slot,
@@ -43195,6 +43473,111 @@ mod slot_engine {
             assert!(tail < 1e-4, "the live note-off left the track sounding ({tail})");
             let r = e.offline.as_ref().expect("a renderer");
             assert!(!r.lane_body(LANE).dx7.as_ref().is_some_and(|d| d.active()), "the DX7 kept the note");
+        }
+
+        /// The analog's delay, and the denoiser's at its defaults.
+        fn denoise_latency() -> usize {
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::DENOISE_PATH).expect("the denoiser");
+            spec.create(48_000.0, &spec.defaults()).latency() as usize
+        }
+
+        /// **The dry stem of a layered track is its instruments' dry stems
+        /// summed and aligned like the wet one.** A DX7 at the head and the
+        /// analog after it: the dry row is brought to the series sum through
+        /// the analog's bay, the DX7's part held by the analog's delay, and
+        /// the row is said to have paid that much. It used to keep the DX7's
+        /// figure (none) while the analog's part came in at its own, so the
+        /// analog's dry part landed its delay late against the DX7's and the
+        /// wet stem.
+        #[test]
+        fn a_layered_tracks_dry_stem_is_its_instruments_dry_stems_aligned() {
+            let lat = analog_latency();
+            let (dx7, _) = stem_of(&[Part::Dx7(0)], 12_000, &[], 40, true);
+            let (analog, _) = stem_of(&[Part::Analog(1)], 12_000, &[], 40, true);
+            let (both, _) = stem_of(&[Part::Dx7(0), Part::Analog(1)], 12_000, &[], 40, true);
+            assert!(peak(&dx7) > 1e-3 && peak(&analog) > 1e-3, "a dry stem is silent");
+            let err = misfit(&both, &[(&dx7, lat), (&analog, 0)]);
+            assert!(err <= 1e-5 * peak(&both), "the layered dry stem is not its parts aligned: off by {err}");
+        }
+
+        /// **What the first instrument threw away is not counted.** A
+        /// lookahead effect (the denoiser) ahead of the sampler, which
+        /// REPLACES the signal and so carries none of that delay, then the
+        /// analog layered after it. Both are brought to the series sum the
+        /// lane reports (the denoiser's and the analog's): the sampler held
+        /// by both, the analog by the denoiser's. Aligning to the series sum
+        /// alone held the sampler by the analog's delay only, and the analog
+        /// came out late against it by the denoiser's.
+        #[test]
+        fn a_layered_instrument_is_aligned_to_what_the_chain_really_carries() {
+            let (lat, look) = (analog_latency(), denoise_latency());
+            assert!(look > 0, "the denoiser looks ahead by nothing at its defaults, so this proves nothing");
+            let (first, _) = stem(&[Part::Denoise(0), Part::Sampler(1)], 12_000, &[], 40);
+            let (second, _) = stem(&[Part::Analog(2)], 12_000, &[], 40);
+            let (all, _) = stem(&[Part::Denoise(0), Part::Sampler(1), Part::Analog(2)], 12_000, &[], 40);
+            assert!(peak(&first) > 1e-3 && peak(&second) > 1e-3, "an instrument alone is silent");
+            let err = misfit(&all, &[(&first, look + lat), (&second, look)]);
+            assert!(err <= 1e-5 * peak(&all), "the layered chain is not aligned to what it carries: off by {err}");
+        }
+
+        /// **A kit layered with other instruments runs its lane's chain ONCE
+        /// a block.** A drum lane with the analog in its second bay and a
+        /// trim in its third, a clip striking the kit and playing the analog:
+        /// the lane's own seat is clocked once per block. The kit used to
+        /// have its own pass over that same chain on top of the lane's, so
+        /// every effect on the track ran twice a block (a delay at half its
+        /// time, a hosted plugin called twice). And the same with the DX7
+        /// beside the kit and no voice in the rack at all.
+        #[test]
+        fn a_kit_layered_with_other_instruments_runs_its_lanes_chain_once_a_block() {
+            for with_dx7 in [false, true] {
+                let mut e = wide(WIDTH);
+                let slot = Slot(LANE as u32);
+                let gen = e.lane_gen(slot).expect("a lane");
+                e.attach(slot, gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                e.attach(slot, gen, LanePart::Kit(Box::new(kit_with(0)))).expect("the kit");
+                let own = LaneFlags::DRUM.with(LaneFlags::MIDI_OFF, true).with(LaneFlags::BUILTIN, with_dx7);
+                let inputs = plan(&e, WIDTH, &|s| if s == LANE { own } else { LaneFlags::MIDI_OFF });
+                e.publish_plan(&inputs).expect("the plan goes");
+                if with_dx7 {
+                    e.sync_instruments(&[slot], &[]);
+                }
+                let addr = RackAddr { owner: RackOwner::Lane(slot), rack: 0 };
+                if !with_dx7 {
+                    e.load_insert_at(addr, 1, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                        .expect("the analog loads")
+                        .expect("and seats");
+                }
+                e.load_insert_at(addr, 2, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
+                    .expect("the trim loads")
+                    .expect("and seats");
+                let mut out = vec![0.0f32; BLOCK * 2];
+                e.set_rolling(false);
+                for _ in 0..3 {
+                    e.render_offline(&mut out);
+                }
+                e.set_midi_slotted(vec![SlotPlacedMidi {
+                    slot,
+                    gen,
+                    placed: PlacedMidi {
+                        strip: 0,
+                        start: 0,
+                        len: 48_000,
+                        notes: Arc::new(vec![ClipNote { at: 0, dur: 20_000, key: PAD_BASE, vel: 110 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                }]);
+                let r = e.offline.as_ref().expect("a renderer");
+                r.shared.rack_count_seat.store(lane_seat(LANE, CHAIN_OWN), Ordering::Relaxed);
+                r.shared.rack_count.store(0, Ordering::Relaxed);
+                const BLOCKS: usize = 12;
+                let (_, stems) = roll(&mut e, BLOCKS);
+                let r = e.offline.as_ref().expect("a renderer");
+                let runs = r.shared.rack_count.load(Ordering::Relaxed);
+                assert_eq!(runs, BLOCKS as u64, "with the DX7 {with_dx7}: the lane's chain ran {runs} times in {BLOCKS} blocks");
+                let lane = column(&stems, e.lane_capacity(), LANE);
+                assert!(peak(&lane) > 1e-3, "with the DX7 {with_dx7}: the layered kit track is silent");
+            }
         }
 
         /// **A track not listening hears no live note on any of its
@@ -46174,6 +46557,62 @@ mod sampler_road {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
         }
+    }
+
+    /// **A voice that stops being layered and starts again replays nothing
+    /// from before.** The sampler, layered (an instrument ahead of it, the
+    /// chain ahead paying 100 frames, so its own output is held by 100),
+    /// plays its flat file for two blocks; then it is the first instrument
+    /// of its chain for two (the one ahead bypassed or taken out), where it
+    /// replaces the signal and its lines do not step; then it is layered
+    /// again, over silence. Its first 100 frames back are its line's wait,
+    /// which is silence: the lines rested, and the next step starts from
+    /// none. They used to hold the last 100 frames of the first two blocks
+    /// and played them again, a burst of a sound that ended long ago.
+    #[test]
+    fn a_voice_layered_again_replays_nothing_from_before() {
+        let shared = Shared::new();
+        let notes = [Note { offset: 0, pitch: 60, velocity: 1.0, on: true }];
+        let params: [&[tangent_host::ParamPoint]; INSERTS] = [&[], &[], &[]];
+        let file = a_sample("flat.wav", 0.25);
+        let mut rack = rack_with_a_sampler();
+        if let Some(p) = rack.slots[0].0.as_mut() {
+            p.align = Some(Box::new(Align::new()));
+        }
+        let block = |rack: &mut Rack, layered: bool| -> Vec<f32> {
+            let mut planar = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+            let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+            let mut layer = Layer { sounded: layered, lat: 100, ..Layer::fresh() };
+            // **NOT-A-CHANNEL:** a synthetic rack built by this test.
+            run_rack(
+                rack,
+                &mut planar,
+                512,
+                &mut out,
+                &notes,
+                &[],
+                &params,
+                &shared,
+                &DeskLanes::read(&shared).frozen,
+                0,
+                Some(&file),
+                None,
+                None,
+                u64::MAX,
+                &mut layer,
+            );
+            planar.swap_remove(0)
+        };
+        for _ in 0..2 {
+            block(&mut rack, true);
+        }
+        let alone = block(&mut rack, false);
+        assert!(alone[511] > 0.2, "the sampler alone did not play: {}", alone[511]);
+        block(&mut rack, false);
+        let back = block(&mut rack, true);
+        let replayed = back[..100].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(replayed == 0.0, "the layered voice replayed {replayed} from before it rested");
+        assert!(back[511] > 0.0, "the layered voice is silent after its wait");
     }
 
     /// **A sampler bay plays the sample it is handed, and only that one.**
