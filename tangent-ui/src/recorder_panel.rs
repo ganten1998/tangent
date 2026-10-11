@@ -2900,6 +2900,8 @@ fn num_field_key(f: NumField) -> usize {
         NumField::Varispeed => 106,
         NumField::VariMin => 107,
         NumField::VariMax => 108,
+        NumField::MetBeats => 109,
+        NumField::MetUnit => 110,
         // Offset well past the band's own fields: there can be one of these
         // per bar, and two controls that answer `true` to `is_same_control`
         // are two controls a drag can slide between.
@@ -7656,7 +7658,7 @@ mod tests {
     /// this walks every cell it draws and asks what is under it.
     #[test]
     fn the_metronome_panel_answers_every_cell_it_draws() {
-        use super::{met_hit_test, met_popup_rect, MetHit, MET_DIVS, MET_UNITS};
+        use super::{met_hit_test, met_popup_rect, MetHit, MET_DIVS};
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
         let anchor = Rect::from_min_size(Pos2::new(300.0, 80.0), Vec2::splat(22.0));
         let panel = met_popup_rect(screen, anchor);
@@ -7664,27 +7666,34 @@ mod tests {
         assert!(screen.contains_rect(panel), "the panel hangs off the surface");
 
         let l = MetLayout::new(screen, anchor);
-        // Every division and every note value is reachable, and each answers
-        // with ITS OWN value rather than a neighbour's.
+        // Every division is reachable, and each answers with ITS OWN value
+        // rather than a neighbour's.
         for (cell, (d, _)) in MetLayout::cells(l.rows[3], MET_DIVS.len())
             .iter()
             .zip(MET_DIVS)
         {
             assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Div(d)));
         }
-        for (cell, u) in MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
-            assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Unit(u)));
-        }
-        // Minus and plus step the beats; the count between them is a READOUT
-        // and pressing it must not change anything.
+        // **BEATS and NOTE: minus, a FIELD, plus.** The number between the
+        // two steps opens for typing - it was a readout that did nothing -
+        // and the NOTE row took the same shape when it became a field, so
+        // the two stand one over the other the way a signature is written.
         let beats = MetLayout::cells(l.rows[1], 3);
         assert_eq!(met_hit_test(screen, anchor, beats[0].center()), Some(MetHit::Beats(-1)));
-        assert_eq!(met_hit_test(screen, anchor, beats[2].center()), Some(MetHit::Beats(1)));
         assert_eq!(
             met_hit_test(screen, anchor, beats[1].center()),
-            None,
-            "the beat count acted like a button"
+            Some(MetHit::Type(NumField::MetBeats)),
+            "the beat count does not open for typing"
         );
+        assert_eq!(met_hit_test(screen, anchor, beats[2].center()), Some(MetHit::Beats(1)));
+        let unit = MetLayout::cells(l.rows[2], 3);
+        assert_eq!(met_hit_test(screen, anchor, unit[0].center()), Some(MetHit::Unit(-1)));
+        assert_eq!(
+            met_hit_test(screen, anchor, unit[1].center()),
+            Some(MetHit::Type(NumField::MetUnit)),
+            "the note value does not open for typing"
+        );
+        assert_eq!(met_hit_test(screen, anchor, unit[2].center()), Some(MetHit::Unit(1)));
         let sound = MetLayout::cells(l.rows[4], 2);
         // Default is the FIRST of the two and Custom the second — the order
         // the owner asked for, and the one the drawing paints.
@@ -7758,6 +7767,222 @@ mod tests {
         let tiny = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 20.0));
         let _ = met_popup_rect(tiny, anchor);
         let _ = met_hit_test(tiny, anchor, Pos2::new(5.0, 5.0));
+    }
+
+    /// **BEATS and NOTE fit every size the panel takes, and nothing in
+    /// those two rows overlaps.**
+    ///
+    /// The panel is 22% of its surface, held between 260 and 380 points,
+    /// and as tall as the surface lets it be - summoned to the middle by
+    /// Cmd+M or hung off a chip near a corner. At every size here the two
+    /// rows keep three separate boxes clear of their words, each pressing
+    /// as what it draws, and the widest number either field can take, 32
+    /// with the caret after it, still prints. (A longer typed number, which
+    /// the commit refuses, shrinks to fit as every word in the panel does.)
+    ///
+    /// Revert-checks, both performed: make BEATS's middle box a readout
+    /// again, or lay NOTE's hit test back out as four preset boxes, and a
+    /// box answers something other than what it draws.
+    #[test]
+    fn the_metronomes_typed_fields_fit_every_panel_size() {
+        use super::{met_hit_test, MetHit};
+        let widest = "32\u{2502}";
+        for w in [260.0_f32, 300.0, 420.0, 640.0, 900.0, 1182.0, 1300.0, 1727.0, 2560.0, 3440.0] {
+            for h in [240.0_f32, 300.0, 420.0, 600.0, 900.0, 1440.0] {
+                let screen = Rect::from_min_size(Pos2::new(0.0, 60.0), Vec2::new(w, h));
+                let anchors = [
+                    Rect::from_center_size(screen.center(), Vec2::splat(1.0)),
+                    Rect::from_min_size(screen.min + Vec2::splat(4.0), Vec2::splat(22.0)),
+                    Rect::from_min_size(screen.max - Vec2::splat(26.0), Vec2::splat(22.0)),
+                ];
+                for anchor in anchors {
+                    let l = MetLayout::new(screen, anchor);
+                    assert!(l.panel.is_positive() && screen.contains_rect(l.panel), "{w}x{h}: the panel");
+                    for (row, want) in [
+                        (l.rows[1], [MetHit::Beats(-1), MetHit::Type(NumField::MetBeats), MetHit::Beats(1)]),
+                        (l.rows[2], [MetHit::Unit(-1), MetHit::Type(NumField::MetUnit), MetHit::Unit(1)]),
+                    ] {
+                        let cells = MetLayout::cells(row, 3);
+                        assert_eq!(cells.len(), 3, "{w}x{h}: the row is not minus, field, plus");
+                        let words_end = row.left() + row.width() * MET_TRACK.0;
+                        for (i, c) in cells.iter().enumerate() {
+                            assert!(c.is_positive() && l.panel.contains_rect(*c), "{w}x{h}: box {i} is off the panel");
+                            assert!(c.left() >= words_end, "{w}x{h}: box {i} runs into the row's word");
+                            for d in &cells[i + 1..] {
+                                assert!(!c.intersects(*d), "{w}x{h}: two boxes of one row overlap");
+                            }
+                            assert_eq!(met_hit_test(screen, anchor, c.center()), Some(want[i]), "{w}x{h}: box {i}");
+                        }
+                        let field = cells[1];
+                        let size = fit_text(field.shrink(field.width() * 0.08), widest, field.height() * 0.56);
+                        assert!(size >= MIN_TEXT, "{w}x{h}: a typed 32 does not print ({size})");
+                    }
+                    assert!(!l.rows[1].intersects(l.rows[2]), "{w}x{h}: BEATS and NOTE overlap");
+                }
+            }
+        }
+    }
+
+    /// **A field shows the number it holds, and while it is typed into, the
+    /// text and the caret** - in its own box and no other.
+    ///
+    /// Revert-checks, both performed: draw the boxes as the old readouts
+    /// (the number, whatever is typed) and the typing block goes red; drop
+    /// the field filter and one field's typing paints into both boxes.
+    #[test]
+    fn the_metronomes_fields_show_their_number_and_the_caret_while_typed() {
+        use crate::recorder::NumEdit;
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = Rect::from_center_size(screen.center(), Vec2::splat(1.0));
+        let l = MetLayout::new(screen, anchor);
+        let beats_box = MetLayout::cells(l.rows[1], 3)[1];
+        let note_box = MetLayout::cells(l.rows[2], 3)[1];
+        let drawn = |typing: Option<&NumEdit>| -> (Vec<String>, Vec<String>) {
+            let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                let v = MetView {
+                    bpm: 120.0,
+                    beats: 7,
+                    unit: 8,
+                    div: 1,
+                    sample: "",
+                    count_in_bars: 1,
+                    count_in_in_take: false,
+                    held: false,
+                    typing,
+                };
+                draw_met(&painter, screen, anchor, v, &Settings::default());
+            });
+            fn walk(shape: &egui::Shape, r: Rect, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, r, out)),
+                    egui::Shape::Text(t) if r.contains(t.visual_bounding_rect().center()) => {
+                        out.push(t.galley.text().to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            let (mut b, mut n) = (Vec::new(), Vec::new());
+            for c in &out.shapes {
+                walk(&c.shape, beats_box, &mut b);
+                walk(&c.shape, note_box, &mut n);
+            }
+            (b, n)
+        };
+        assert_eq!(drawn(None), (vec!["7".to_owned()], vec!["8".to_owned()]), "the fields at rest");
+        let mut beats = NumEdit::prefilled(NumField::MetBeats, "7".to_owned());
+        beats.push('1');
+        beats.push('1');
+        assert_eq!(
+            drawn(Some(&beats)),
+            (vec!["11\u{2502}".to_owned()], vec!["8".to_owned()]),
+            "BEATS being typed"
+        );
+        let mut unit = NumEdit::prefilled(NumField::MetUnit, "8".to_owned());
+        unit.push('3');
+        unit.push('2');
+        assert_eq!(drawn(Some(&unit)), (vec!["7".to_owned()], vec!["32\u{2502}".to_owned()]), "NOTE being typed");
+        // A field open somewhere else is not these fields'.
+        let tempo = NumEdit::prefilled(NumField::Tempo, "90".to_owned());
+        assert_eq!(drawn(Some(&tempo)), (vec!["7".to_owned()], vec!["8".to_owned()]), "the tempo's typing");
+    }
+
+    /// **NOTE's minus and plus walk exactly the note values a signature can
+    /// have**, and stop at either end the way BEATS stops at 1 and 32.
+    ///
+    /// The list IS `TimeSignature::is_valid`'s set - 1 and 32 included,
+    /// which the four presets it replaced (2 to 16) could not reach.
+    #[test]
+    fn the_note_steps_walk_exactly_the_note_values_a_signature_takes() {
+        use crate::recorder::TimeSignature;
+        let valid: Vec<u8> = (0..=u8::MAX)
+            .filter(|&unit| TimeSignature { beats: 4, unit }.is_valid())
+            .collect();
+        assert_eq!(MET_UNITS.to_vec(), valid, "the steps are not the note values a signature takes");
+        assert_eq!(met_unit_step(8, 1), 16);
+        assert_eq!(met_unit_step(8, -1), 4);
+        assert_eq!(met_unit_step(16, 1), 32);
+        assert_eq!(met_unit_step(2, -1), 1);
+        assert_eq!(met_unit_step(32, 1), 32, "plus ran past 32");
+        assert_eq!(met_unit_step(1, -1), 1, "minus ran past 1");
+        // Off the list (unreachable: the signature is sanitised where it is
+        // read) nothing moves.
+        assert_eq!(met_unit_step(3, 1), 3);
+    }
+
+    /// **A reader hears BEATS and NOTE as fields that can be typed into,
+    /// holding their numbers**, and every node the panel offers stands
+    /// where its control is: pressed at its middle, the panel answers with
+    /// that control.
+    ///
+    /// Revert-checks, both performed: build BEATS as `Node::readout` and the
+    /// kind assertion goes red; stand NOTE's node on its minus box and the
+    /// press-back block does.
+    #[test]
+    fn a_reader_hears_the_metronomes_fields_as_editable() {
+        use super::{met_a11y_nodes, met_hit_test, MetHit};
+        use crate::a11y::Kind;
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = Rect::from_center_size(screen.center(), Vec2::splat(1.0));
+        fn view(typing: Option<&crate::recorder::NumEdit>) -> MetView<'_> {
+            MetView {
+                bpm: 120.0,
+                beats: 15,
+                unit: 32,
+                div: 1,
+                sample: "",
+                count_in_bars: 2,
+                count_in_in_take: false,
+                held: false,
+                typing,
+            }
+        }
+        let nodes = met_a11y_nodes(screen, anchor, view(None));
+        let find = |nodes: &[crate::a11y::Node], label: &str| {
+            nodes.iter().find(|n| n.label == label).cloned().unwrap_or_else(|| panic!("no {label:?} node"))
+        };
+        let beats = find(&nodes, "Beats");
+        let note = find(&nodes, "Note value");
+        assert_eq!((beats.kind.clone(), beats.value.as_deref()), (Kind::Field, Some("15")));
+        assert_eq!((note.kind.clone(), note.value.as_deref()), (Kind::Field, Some("32")));
+        assert_eq!(met_hit_test(screen, anchor, beats.rect.center()), Some(MetHit::Type(NumField::MetBeats)));
+        assert_eq!(met_hit_test(screen, anchor, note.rect.center()), Some(MetHit::Type(NumField::MetUnit)));
+        // While one is open it holds what is being typed - no caret glyph,
+        // which a reader would say as a box-drawing character.
+        let mut typing = crate::recorder::NumEdit::prefilled(NumField::MetBeats, "15".to_owned());
+        typing.push('7');
+        let open = met_a11y_nodes(screen, anchor, view(Some(&typing)));
+        assert_eq!(find(&open, "Beats").value.as_deref(), Some("7"));
+        assert_eq!(find(&open, "Note value").value.as_deref(), Some("32"));
+        // Every control the panel draws is offered, once, where it is.
+        let mut ids = std::collections::HashSet::new();
+        for n in &nodes {
+            assert!(ids.insert(n.id), "{:?} is offered twice", n.label);
+            assert!(n.rect.is_positive(), "{:?} has no area", n.label);
+        }
+        for (label, want) in [
+            ("One beat fewer", MetHit::Beats(-1)),
+            ("One beat more", MetHit::Beats(1)),
+            ("Note value down", MetHit::Unit(-1)),
+            ("Note value up", MetHit::Unit(1)),
+            ("Click on every beat", MetHit::Div(1)),
+            ("Default click sound", MetHit::SoundReset),
+            ("Choose a click sound", MetHit::SoundPick),
+            ("Count-in one bar more", MetHit::CountIn(1)),
+            ("Count-in carries on into the take", MetHit::CountInInTake),
+            ("Close the metronome panel", MetHit::Close),
+        ] {
+            assert_eq!(met_hit_test(screen, anchor, find(&nodes, label).rect.center()), Some(want), "{label}");
+        }
+        assert!(matches!(
+            met_hit_test(screen, anchor, find(&nodes, "Tempo").rect.center()),
+            Some(MetHit::Tempo(_))
+        ));
+        // A held tempo is offered, and says it cannot be moved.
+        let held = met_a11y_nodes(screen, anchor, MetView { held: true, ..view(None) });
+        assert!(!find(&held, "Tempo").enabled, "a held tempo reads as movable");
     }
 
     /// **The close box always shows an X.**
@@ -11304,6 +11529,7 @@ mod tests {
                     count_in_bars: 1,
                     count_in_in_take: false,
                     held,
+                    typing: None,
                 };
                 draw_met(&painter, screen, anchor, v, &Settings::default());
             });
@@ -13287,9 +13513,33 @@ impl MetLayout {
 pub const MET_DIVS: [(i64, &str); 5] =
     [(0, "bar"), (1, "beat"), (2, "1/2"), (3, "1/3"), (4, "1/4")];
 
-/// The bottom numbers a signature may have. Buttons rather than a field,
-/// because the bottom number is a power of two and a field would invite 3.
-pub const MET_UNITS: [u8; 4] = [2, 4, 8, 16];
+/// The bottom numbers a signature may have, in order: what the NOTE row's
+/// minus and plus step through.
+///
+/// **Exactly what `TimeSignature::is_valid` allows**, 1 and 32 included. The
+/// row was four buttons, 2 to 16, "because the bottom number is a power of
+/// two and a field would invite 3" - which also put 3/1 and 15/32 out of
+/// reach. It is a typed field now, the owner's ask, and the field refuses 3
+/// rather than inviting it; minus and plus walk this list, the BEATS row's
+/// own shape directly above it.
+pub const MET_UNITS: [u8; 6] = [1, 2, 4, 8, 16, 32];
+
+/// The bottom number one step along [`MET_UNITS`] from `unit`: the NOTE
+/// row's minus (`d` < 0) and plus. Pinned at either end, the way BEATS stops
+/// at 1 and 32, and a unit off the list (none can be: the signature is
+/// sanitised where it is read) stays where it is.
+pub fn met_unit_step(unit: u8, d: i8) -> u8 {
+    let Some(at) = MET_UNITS.iter().position(|&u| u == unit) else {
+        return unit;
+    };
+    let last = MET_UNITS.len() - 1;
+    let to = match d.signum() {
+        -1 => at.saturating_sub(1),
+        1 => (at + 1).min(last),
+        _ => at,
+    };
+    MET_UNITS[to]
+}
 /// The metronome panel's TEMPO row inks: the accent fill and the ink handle,
 /// or both faded into the band while the tempo is held - the TAP chip's dim.
 fn met_tempo_inks(held: bool, p: &Palette) -> (Color32, Color32) {
@@ -13318,6 +13568,10 @@ pub struct MetView<'a> {
     /// drawn dim, and the app refuses it - the band's knob's rule, on the
     /// other road to the same number. See `RecorderState::tempo_held`.
     pub held: bool,
+    /// **The field being typed into**, when it is one of this panel's
+    /// (BEATS or NOTE). A borrow of what the app holds, as the band's own
+    /// `editing` is, so the caret drawn is the caret the keys move.
+    pub typing: Option<&'a crate::recorder::NumEdit>,
 }
 
 /// What a press inside the metronome panel means.
@@ -13327,8 +13581,13 @@ pub enum MetHit {
     Tempo(f32),
     /// One beat fewer, or one more.
     Beats(i8),
-    /// One of [`MET_UNITS`].
-    Unit(u8),
+    /// The next note value along [`MET_UNITS`]: a smaller bottom number for
+    /// minus, a bigger one for plus. See [`met_unit_step`].
+    Unit(i8),
+    /// **Open BEATS or NOTE for typing** - the number between the minus and
+    /// the plus, which was a readout that did nothing when pressed. Always
+    /// [`NumField::MetBeats`] or [`NumField::MetUnit`].
+    Type(NumField),
     /// One of [`MET_DIVS`].
     Div(i64),
     /// One count-in bar fewer, or one more.
@@ -13371,19 +13630,32 @@ pub fn met_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<MetHit> {
         let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
         return Some(MetHit::Tempo(t));
     }
-    // BEATS: minus, the count, plus. The count is a READOUT — pressing it
-    // does nothing rather than doing something arbitrary.
+    // BEATS: minus, the count, plus. **The count is a FIELD**: a press
+    // opens it for typing, so 7, 11 or 15 is one word away rather than a
+    // walk of presses - the owner's ask. It used to be a readout that did
+    // nothing at all when pressed.
     let beats = MetLayout::cells(l.rows[1], 3);
     if beats.first().is_some_and(|c| c.contains(pos)) {
         return Some(MetHit::Beats(-1));
     }
+    if beats.get(1).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Type(NumField::MetBeats));
+    }
     if beats.get(2).is_some_and(|c| c.contains(pos)) {
         return Some(MetHit::Beats(1));
     }
-    for (cell, unit) in MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
-        if cell.contains(pos) {
-            return Some(MetHit::Unit(unit));
-        }
+    // NOTE: the BEATS row's own shape, so the two fields stand one over the
+    // other the way a signature is written. Minus and plus walk the note
+    // values; the field between them takes any of them typed.
+    let unit = MetLayout::cells(l.rows[2], 3);
+    if unit.first().is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Unit(-1));
+    }
+    if unit.get(1).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Type(NumField::MetUnit));
+    }
+    if unit.get(2).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Unit(1));
     }
     for (cell, (d, _)) in MetLayout::cells(l.rows[3], MET_DIVS.len()).iter().zip(MET_DIVS) {
         if cell.contains(pos) {
@@ -13524,24 +13796,43 @@ pub fn draw_met(
         );
     }
 
-    // ── BEATS: minus, the count, plus ──
+    // **A typed field: the varispeed range's own box** (`draw_vari_range`),
+    // so a number you can type into looks the same in both of these panels.
+    // While it is open it shows the text being typed with the caret drawn
+    // in - `NumEdit::display`, what the band's knob shows - and the number
+    // it holds otherwise.
+    let field = |r: Rect, which: NumField| {
+        let well = surface_of(p.field);
+        painter.rect_filled(r, 2.0, well.bg);
+        painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+        let text = met_field_shows(&v, which);
+        let size = fit_text(r.shrink(r.width() * 0.08), &text, r.height() * 0.56);
+        if size >= MIN_TEXT {
+            painter.text(r.center(), Align2::CENTER_CENTER, &text, font_light(size), well.ink);
+        }
+    };
+
+    // ── BEATS: minus, the field, plus ──
     let row = l.rows[1];
     if row.is_positive() {
         label(row, "BEATS");
         let cells = MetLayout::cells(row, 3);
         if let [minus, count, plus] = cells.as_slice() {
             cell(*minus, "-", false);
-            cell(*count, &format!("{}", v.beats.max(1)), false);
+            field(*count, NumField::MetBeats);
             cell(*plus, "+", false);
         }
     }
 
-    // ── UNIT: what gets the beat ──
+    // ── NOTE: what gets the beat - minus, the field, plus ──
     let row = l.rows[2];
     if row.is_positive() {
         label(row, "NOTE");
-        for (r, unit) in MetLayout::cells(row, MET_UNITS.len()).iter().zip(MET_UNITS) {
-            cell(*r, &format!("{unit}"), v.unit == unit);
+        let cells = MetLayout::cells(row, 3);
+        if let [minus, unit, plus] = cells.as_slice() {
+            cell(*minus, "-", false);
+            field(*unit, NumField::MetUnit);
+            cell(*plus, "+", false);
         }
     }
 
@@ -13619,6 +13910,125 @@ pub fn draw_met(
         }
     }
 
+}
+
+/// What the metronome panel's BEATS or NOTE field shows: the text being
+/// typed, caret drawn in, while it is the open one, and the number it holds
+/// otherwise. One function for the painter and its test.
+fn met_field_shows(v: &MetView<'_>, field: NumField) -> String {
+    match v.typing.filter(|e| e.field == field) {
+        Some(e) => e.display(),
+        None if field == NumField::MetUnit => v.unit.max(1).to_string(),
+        None => v.beats.max(1).to_string(),
+    }
+}
+
+/// A click division in words, for a screen reader: "1/3" is read aloud as
+/// "one slash three", which is nobody's name for a triplet click.
+fn met_div_words(d: i64) -> &'static str {
+    match d {
+        0 => "Click once a bar",
+        1 => "Click on every beat",
+        2 => "Click on every half beat",
+        3 => "Click on every third of a beat",
+        _ => "Click on every quarter beat",
+    }
+}
+
+/// **Everything in the metronome panel a keyboard can reach and a screen
+/// reader can say**, in reading order, because allocation order is tab
+/// order.
+///
+/// Built from the same [`MetLayout`] the painter and [`met_hit_test`] read,
+/// one rect per control, so a node cannot stand anywhere but over the thing
+/// it names - and the app presses a node through `met_hit_test` at that
+/// rect, the mouse's own road (see `a11y::press_point`).
+///
+/// **BEATS and NOTE are FIELDS** (`a11y::Kind::Field`): announced as text
+/// somebody can edit, holding the number they hold - or what is being typed
+/// while one is open.
+pub fn met_a11y_nodes(screen: Rect, anchor: Rect, v: MetView<'_>) -> Vec<crate::a11y::Node> {
+    use crate::a11y::{Node, Travel};
+    let l = MetLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return Vec::new();
+    }
+    let id = |k: &str| egui::Id::new(("met", k));
+    let mut out = Vec::new();
+    let track = MetLayout::track(l.rows[0]);
+    let span = (MAX_BPM - MIN_BPM).max(1.0);
+    out.push(
+        Node::slider(
+            id("tempo"),
+            track,
+            "Tempo",
+            v.bpm,
+            MIN_BPM,
+            MAX_BPM,
+            format!("{} bpm", tempo_text(v.bpm)),
+            Travel { norm: (((v.bpm - MIN_BPM) / span) as f32).clamp(0.0, 1.0), up: false },
+        )
+        // Held, the press is refused (`met_menu_press`) - and a node that
+        // claims the arrows while refusing them takes the keys behind it
+        // down with it.
+        .enabled(!v.held),
+    );
+    // What a field holds for a reader: the typed text WITHOUT the caret
+    // glyph, which would otherwise be read out as a box-drawing character.
+    let holds = |f: NumField| match v.typing.filter(|e| e.field == f) {
+        Some(e) => e.text.clone(),
+        None => met_field_shows(&v, f),
+    };
+    if let [minus, field, plus] = MetLayout::cells(l.rows[1], 3).as_slice() {
+        out.push(Node::button(id("beats-minus"), *minus, "One beat fewer"));
+        out.push(Node::field(id("beats"), *field, "Beats", holds(NumField::MetBeats)));
+        out.push(Node::button(id("beats-plus"), *plus, "One beat more"));
+    }
+    if let [minus, field, plus] = MetLayout::cells(l.rows[2], 3).as_slice() {
+        out.push(Node::button(id("note-minus"), *minus, "Note value down"));
+        out.push(Node::field(id("note"), *field, "Note value", holds(NumField::MetUnit)));
+        out.push(Node::button(id("note-plus"), *plus, "Note value up"));
+    }
+    for (r, (d, _)) in MetLayout::cells(l.rows[3], MET_DIVS.len()).iter().zip(MET_DIVS) {
+        out.push(Node::toggle(egui::Id::new(("met", "click", d)), *r, met_div_words(d), v.div == d));
+    }
+    if let [reset, pick] = MetLayout::cells(l.rows[4], 2).as_slice() {
+        out.push(Node::toggle(id("sound-default"), *reset, "Default click sound", v.sample.is_empty()));
+        let name = std::path::Path::new(v.sample)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        out.push(Node::button(
+            id("sound-custom"),
+            *pick,
+            if name.is_empty() {
+                "Choose a click sound".to_owned()
+            } else {
+                format!("Choose a click sound, now {name}")
+            },
+        ));
+    }
+    if let [minus, count, plus] = MetLayout::cells(l.rows[5], 3).as_slice() {
+        out.push(Node::button(id("count-minus"), *minus, "Count-in one bar fewer"));
+        let bars = match v.count_in_bars.max(0) {
+            0 => "off".to_owned(),
+            1 => "1 bar".to_owned(),
+            n => format!("{n} bars"),
+        };
+        out.push(Node::readout(id("count"), *count, "Count-in", bars));
+        out.push(Node::button(id("count-plus"), *plus, "Count-in one bar more"));
+    }
+    // One question with two words, as `met_hit_test` answers it: the whole
+    // row toggles.
+    out.push(Node::toggle(
+        id("in-take"),
+        MetLayout::track(l.rows[6]),
+        "Count-in carries on into the take",
+        v.count_in_in_take,
+    ));
+    out.push(Node::button(id("close"), l.close, "Close the metronome panel"));
+    out.retain(|n| n.rect.is_positive());
+    out
 }
 
 /// What a press inside the varispeed range panel means.

@@ -3661,6 +3661,16 @@ pub enum NumField {
     /// word rather than a number — the machinery is the same, and a second
     /// inline-typing system for one field would be the thing to explain.
     MarkerName(usize),
+    /// **The metronome panel's BEATS field**: the top number of the song's
+    /// signature, typed on its own. The owner's ask: "make it so that the
+    /// beats and note fields in the metronome menu are typed fields so they
+    /// can accomodate odd signatures". A plain whole number, 1 to 32 - see
+    /// [`TimeSignature::with_typed_beats`].
+    MetBeats,
+    /// **The metronome panel's NOTE field**: the bottom number, typed on its
+    /// own. 1, 2, 4, 8, 16 or 32 and nothing else - see
+    /// [`TimeSignature::with_typed_unit`].
+    MetUnit,
 }
 
 impl NumField {
@@ -3669,6 +3679,10 @@ impl NumField {
     /// purpose: a new variant is appended at the END (this enum's law) and has
     /// to say where it lives, rather than defaulting to one side and being
     /// cleared, or kept, by accident.
+    ///
+    /// **The metronome's two are not the band's.** Its panel hangs on the
+    /// timeline or the desk, never on the band, so hiding the band must not
+    /// close a field somebody is typing into over the lanes.
     pub fn lives_in_band(self) -> bool {
         match self {
             NumField::Master
@@ -3678,8 +3692,17 @@ impl NumField {
             | NumField::VariMin
             | NumField::VariMax
             | NumField::Varispeed => true,
-            NumField::MeterAt(_) | NumField::MarkerName(_) => false,
+            NumField::MeterAt(_)
+            | NumField::MarkerName(_)
+            | NumField::MetBeats
+            | NumField::MetUnit => false,
         }
+    }
+
+    /// **Whether the field is typed into the METRONOME's panel**, and so
+    /// lives exactly as long as that panel does.
+    pub fn lives_in_metronome(self) -> bool {
+        matches!(self, NumField::MetBeats | NumField::MetUnit)
     }
 }
 
@@ -3843,6 +3866,14 @@ impl NumEdit {
         if matches!(field, NumField::Meter | NumField::MeterAt(_)) {
             let ok = ch.is_ascii_digit() || (ch == '/' && !text.contains('/'));
             return (ok && text.len() < MAX).then_some(MAX);
+        }
+        // **The metronome's halves of a signature are whole numbers and
+        // nothing else**: no slash, because each field IS one side of it, and
+        // no minus or point, which no beat count or note value has. A digit
+        // too many still goes in - 33 is refused when it is committed, never
+        // trimmed to a 3 nobody typed.
+        if field.lives_in_metronome() {
+            return (ch.is_ascii_digit() && text.len() < MAX).then_some(MAX);
         }
         let ok = ch.is_ascii_digit()
             // One dot, and a minus only in front. Neither check is about
@@ -4035,6 +4066,37 @@ impl TimeSignature {
         };
         sig.is_valid().then_some(sig)
     }
+
+    /// This signature with its TOP number typed in: the metronome panel's
+    /// BEATS field.
+    ///
+    /// **Refused, never clamped.** `None` unless the text is a whole number
+    /// [`Self::is_valid`] allows here: 33 is not "as many as there can be",
+    /// it is a number this field cannot take, and the reading the owner was
+    /// looking at is still the one they have - the rule every typed field
+    /// keeps (`commit_number`).
+    pub fn with_typed_beats(self, text: &str) -> Option<Self> {
+        let sig = Self { beats: typed_number(text)?, ..self };
+        sig.is_valid().then_some(sig)
+    }
+
+    /// This signature with its BOTTOM number typed in: the metronome panel's
+    /// NOTE field. A power of two up to 32 or nothing - 3 and 12 are refused,
+    /// not rounded to a note value somebody did not type.
+    pub fn with_typed_unit(self, text: &str) -> Option<Self> {
+        let sig = Self { unit: typed_number(text)?, ..self };
+        sig.is_valid().then_some(sig)
+    }
+}
+
+/// A whole number as somebody types one into a field: digits and nothing
+/// else. Stricter than `str::parse`, which takes a leading `+`.
+fn typed_number(text: &str) -> Option<u8> {
+    let t = text.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
 }
 
 /// One audio device, as the status panel reports it.
@@ -4397,6 +4459,93 @@ mod tests {
         // And the numeric fields still refuse what this filter is for.
         assert_eq!(typed(NumField::Tempo, "12d0"), "120", "a letter reached a number");
         assert_eq!(typed(NumField::Tempo, "1/20"), "120", "a slash reached a number");
+    }
+
+    /// **The metronome's BEATS and NOTE fields take digits and nothing
+    /// else**, and opening one on its reading still lets the first digit
+    /// replace it.
+    ///
+    /// Each is ONE side of a signature, so a slash has no place in it - "7/8"
+    /// typed into BEATS is "78", which the commit then refuses - and neither
+    /// a beat count nor a note value has a sign or a point. Letters are the
+    /// app's single-key shortcuts arriving at a field with focus, and must
+    /// not land. A digit past 32 still goes in: trimming it at the keyboard
+    /// would turn a typed 33 into a 3 nobody asked for.
+    ///
+    /// Revert-checks, both performed: drop the metronome branch from
+    /// `accepts` and the field falls to the numeric filter, which takes the
+    /// `.`; put the two in `lives_in_band` and the place assertion goes red.
+    #[test]
+    fn the_metronome_fields_take_digits_and_nothing_else() {
+        let typed = |field: NumField, s: &str| {
+            let mut e = NumEdit::new(field);
+            for ch in s.chars() {
+                e.push(ch);
+            }
+            e.text
+        };
+        for f in [NumField::MetBeats, NumField::MetUnit] {
+            assert_eq!(typed(f, "7"), "7");
+            assert_eq!(typed(f, "15"), "15");
+            assert_eq!(typed(f, "7/8"), "78", "{f:?} took a slash");
+            assert_eq!(typed(f, "1.5"), "15", "{f:?} took a point");
+            assert_eq!(typed(f, "-3"), "3", "{f:?} took a sign");
+            assert_eq!(typed(f, "1a2b"), "12", "{f:?} took a letter");
+            assert_eq!(typed(f, "333"), "333", "{f:?} trimmed digits at the keyboard");
+            assert!(f.lives_in_metronome() && !f.lives_in_band(), "{f:?} lives somewhere else");
+            // Opened on the reading, the first digit replaces it.
+            let mut e = NumEdit::prefilled(f, "4".to_owned());
+            e.push('x');
+            assert_eq!(e.text, "4", "{f:?}: a refused key cleared the reading");
+            e.push('7');
+            assert_eq!(e.text, "7", "{f:?}: typing appended to the reading");
+        }
+        assert!(!NumField::Meter.lives_in_metronome());
+    }
+
+    /// **A typed half of a signature is refused, never clamped.**
+    ///
+    /// The range is exactly `TimeSignature::is_valid`'s: any beat count from
+    /// 1 to 32 over the signature's own note value, and 1, 2, 4, 8, 16 or 32
+    /// under its own beat count. Everything else is `None` - not the nearest
+    /// legal number - so a slip of the finger keeps the signature somebody
+    /// was looking at rather than inventing one.
+    ///
+    /// Revert-checks, all three performed: clamp the beats into 1..=32 and 0
+    /// comes back as a signature of 1; round the unit up to a power of two
+    /// and 0 comes back as 1; drop the digits-only rule and "+3" parses.
+    #[test]
+    fn a_typed_half_of_a_signature_is_refused_never_clamped() {
+        let sig = TimeSignature { beats: 4, unit: 8 };
+        for beats in 1..=32u8 {
+            assert_eq!(
+                sig.with_typed_beats(&beats.to_string()),
+                Some(TimeSignature { beats, unit: 8 }),
+                "{beats} beats was refused"
+            );
+        }
+        for junk in ["0", "33", "99", "255", "256", "300", "", "  ", "+3", "-1", "7/8", "3.0", "abc"] {
+            assert_eq!(sig.with_typed_beats(junk), None, "{junk:?} beats was accepted");
+        }
+        for unit in [1u8, 2, 4, 8, 16, 32] {
+            assert_eq!(
+                sig.with_typed_unit(&unit.to_string()),
+                Some(TimeSignature { beats: 4, unit }),
+                "a unit of {unit} was refused"
+            );
+        }
+        for junk in ["0", "3", "5", "6", "7", "12", "24", "64", "128", "", "+4", "8/", "x"] {
+            assert_eq!(sig.with_typed_unit(junk), None, "{junk:?} as a unit was accepted");
+        }
+        // Each half leaves the other alone.
+        assert_eq!(
+            TimeSignature { beats: 15, unit: 32 }.with_typed_unit("16"),
+            Some(TimeSignature { beats: 15, unit: 16 })
+        );
+        assert_eq!(
+            TimeSignature { beats: 3, unit: 1 }.with_typed_beats("11"),
+            Some(TimeSignature { beats: 11, unit: 1 })
+        );
     }
     /// **Every pad of every channel gets its own seat, and no old seat moved.**
     ///
