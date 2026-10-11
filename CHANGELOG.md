@@ -371,6 +371,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   keyboard. Each change to the range, typed or by RESET, is one step of
   undo.
 
+- **Hiding the recorder band keeps the number you were typing into it.**
+  Choosing Hide Recorder Band from the band's right-click menu while
+  typing a tempo, a level, an effect's amount, the varispeed or an end of
+  its range threw the number away. It is set as the band goes now, as a
+  click anywhere else sets it.
+
 - **An Analog track's dry stem lines up with the others.** In a dry stems
   export it came out 68 samples (1.4 ms at 48 kHz) behind every other stem
   and the mix, by the delay the Analog reports for its own sound. It now
