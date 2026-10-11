@@ -180,6 +180,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The band's clip lamp no longer lights on a limited master.** With the
+  master limiter in circuit at -1 dB, driving into it lit the lamp even
+  though nothing left above -1 dBFS, because the lamp also latched on the
+  signal going into the limiter. It now answers only for what leaves: after
+  the limiter and the master fader, at full scale. How hard the limiter is
+  working is still shown by its gain-reduction readout. The limiter's
+  ceiling also settles exactly at its dial now; at -1 dB it had held
+  -0.996 dBFS.
+
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be
   routed into somebody else's audio, and removing a track left routes aimed
