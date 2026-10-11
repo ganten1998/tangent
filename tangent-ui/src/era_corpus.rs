@@ -1117,7 +1117,7 @@ fn fnv(text: &str) -> u64 {
 /// **What production writes for the default settings**, pinned at the
 /// flip (W4-integrate (B)): the format-2 file a fresh install's first save
 /// writes, stamp included. The fixtures' are `FORMAT2_BYTES` below.
-const DEFAULT_V2_BYTES: (u64, usize) = (0x2b4e_95dd_5375_0895, 29341);
+const DEFAULT_V2_BYTES: (u64, usize) = (0xa396_60c0_9bc5_d8bc, 29342);
 
 /// **Production writes the format-2 bytes**, stamps included, for every
 /// fixture and for the default settings: `WRITE_V8` is on, so what a user's
@@ -1383,20 +1383,20 @@ fn a_refused_desk_refuses_the_open_and_touches_nothing() {
 /// the Keys rack's knobs, and `write_format_2_fixtures` writes them out for
 /// reading. Re-pin only with a deliberate change to the format.
 const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
-    ("settings-v12.json", 0x432f_d744_1b83_4a7d, 69415),
-    ("settings-v17-pads16.json", 0x9acb_8826_ea59_4245, 69631),
-    ("settings-v18.json", 0x41cb_5151_6266_38a2, 69632),
-    ("settings-v19.json", 0x0ff0_f786_81db_ebac, 70932),
+    ("settings-v12.json", 0xcf90_7463_db04_c1cc, 69416),
+    ("settings-v17-pads16.json", 0x36b9_6067_72e0_c1b4, 69632),
+    ("settings-v18.json", 0x9591_043b_1e5a_7765, 69633),
+    ("settings-v19.json", 0xdfd3_71f3_c4ca_0f37, 70933),
     // Lifted (`desk_lift::V24_LIFT`, on with the switch since W4-integrate
     // (B)): the window's buses and master on the specials, its pads on
     // their rows. Unlifted it wrote 0xbee3_aa56_2a6b_446b, 72152.
-    ("settings-v20-27.json", 0x1837_62b4_50b0_2490, 72160),
-    ("settings-v20.json", 0x6c84_131e_295a_79e2, 73277),
-    ("settings-v21.json", 0xd14a_bb30_2ea1_663b, 72084),
-    ("settings-v22.json", 0x3c53_5ed0_cffe_362f, 72119),
-    ("daw-3x.json", 0x32cb_378d_3f9e_5d6e, 68924),
-    ("daw-4x.json", 0x5cb2_3bc0_7ea0_417e, 69320),
-    ("daw-5x.json", 0x221a_f6cd_f561_e43c, 70257),
+    ("settings-v20-27.json", 0x3309_53c6_5839_c883, 72161),
+    ("settings-v20.json", 0xd266_9919_ec06_d8a5, 73278),
+    ("settings-v21.json", 0x5a2d_3407_fbbd_b9b2, 72085),
+    ("settings-v22.json", 0xa193_416c_708e_f3be, 72120),
+    ("daw-3x.json", 0x034e_5ee6_cbc7_03a9, 68925),
+    ("daw-4x.json", 0x120d_564a_9e54_1e19, 69321),
+    ("daw-5x.json", 0x1e6a_62dc_dca0_7b27, 70258),
     // **The documents read their drum row's badge** (W6): a document from
     // before the badges derives them as it is read, the drum where the
     // drumpad stands, where the derivation ran at the apply while the desk
