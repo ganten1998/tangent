@@ -165,7 +165,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   track that went silent), and the numbered `001-...` stems from before the
   rename, into `older/<date and time>/` inside the stems folder. Files
   Tangent did not write are never touched. A track named "Café" typed on
-  one system and pasted from another is treated as one name.
+  one system and pasted from another is treated as one name, and so is a
+  name in any other script: Cyrillic or Greek letters with their marks, a
+  Korean syllable, a Japanese kana with its voicing marks. The file is
+  written in the composed form either way.
 
 - **Tangent Denoise opens on the Bank.** A freshly inserted denoiser, and a
   reset to defaults, now start on the Bank kernel instead of Spectral Studio,

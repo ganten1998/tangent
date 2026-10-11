@@ -18621,21 +18621,36 @@ fn live_punches(
 ///   device name given a `_`), and no longer than [`STEM_NAME_MAX`] bytes,
 ///   cut on a character.
 /// - **Never empty**: a name with nothing left is `Track`.
-/// - **One form**: a decomposed name (macOS's `e` and a combining acute) is
-///   composed first (`nfc_latin::compose`), so it is written and compared
-///   as the `é` a person sees.
+/// - **One form**: every name is put in Unicode's composed form (NFC,
+///   [`nfc`]) first, so a decomposed name (macOS's `e` and a combining
+///   acute, a Hangul syllable as its jamo, a kana and its dakuten) is
+///   written and compared as the one character a person sees.
 /// - **Unique, as a case-blind file system sees it** (macOS and Windows
 ///   both): the first of two tracks called "Bass" is `Bass.wav`, the second
 ///   `Bass 2.wav`, and a number already taken by a track of that name is
 ///   stepped over, so no stem is ever written over another.
+/// **`s` in Unicode's Normalization Form C**, every script's: the composed
+/// spelling of a name, which is what a person typing it elsewhere produces
+/// and what they see either way. macOS hands names back decomposed, so an
+/// `é`, a Hangul syllable or a kana with its dakuten can arrive as two or
+/// three code points that look the same as the one. Through the
+/// `unicode-normalization` crate (pinned in `tangent/Cargo.toml`): it
+/// replaced a table of the Latin letters alone, which left every other
+/// script's two spellings two names.
+#[cfg(feature = "recorder")]
+fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
+}
+
 #[cfg(feature = "recorder")]
 pub(crate) fn stem_file_names<S: AsRef<str>>(names: &[S]) -> Vec<String> {
     let bases: Vec<String> = names
         .iter()
         .map(|n| {
             // Composed first, so the name written and the name compared are
-            // one form: see `nfc_latin`.
-            let mut b = sanitize_file_stem_or(&crate::nfc_latin::compose(n.as_ref()), "Track");
+            // one form: see `nfc`.
+            let mut b = sanitize_file_stem_or(&nfc(n.as_ref()), "Track");
             if b.len() > STEM_NAME_MAX {
                 let mut cut = STEM_NAME_MAX;
                 while !b.is_char_boundary(cut) {
@@ -28644,6 +28659,55 @@ mod tests {
         let long = stem_file_names(&["é".repeat(400)]);
         assert!(long[0].len() <= STEM_NAME_MAX + ".wav".len(), "a {}-byte name", long[0].len());
         assert!(long[0].ends_with("é.wav"), "the cut split a character: {:?}", &long[0][long[0].len() - 8..]);
+    }
+
+    /// **Every script's two spellings of a name are one name** (`nfc`):
+    /// what macOS hands back decomposed is written composed, and collides
+    /// with the composed spelling, so the second track of that name is a
+    /// numbered file and never the same file. The Latin cases the old
+    /// Latin-only table answered are kept, beside Cyrillic, Greek, a Hangul
+    /// syllable spelled as its jamo and kana carrying a dakuten.
+    #[test]
+    fn a_names_composed_and_decomposed_spellings_are_one_name_in_every_script() {
+        // The Latin cases of the table it replaced.
+        assert_eq!(nfc("Cafe\u{301}"), "Caf\u{e9}");
+        assert_eq!(nfc("Caf\u{e9}"), "Caf\u{e9}");
+        assert_eq!(nfc("Vie\u{323}\u{302}t"), "Vi\u{1ec7}t", "two marks on one letter");
+        assert_eq!(nfc("A\u{30a}ngstro\u{308}m"), "\u{c5}ngstr\u{f6}m");
+        assert_eq!(nfc("x\u{301}"), "x\u{301}", "a mark with nothing to compose with stays");
+        assert_eq!(nfc("\u{301}"), "\u{301}");
+        assert_eq!(nfc("Bass"), "Bass");
+        // What the table never could: the marks in either order (canonical
+        // ordering), and every other script.
+        assert_eq!(nfc("Vie\u{302}\u{323}t"), "Vi\u{1ec7}t", "the marks in the other order");
+        assert_eq!(nfc("\u{41c}\u{43e}\u{438}\u{306}"), "\u{41c}\u{43e}\u{439}", "Cyrillic short i");
+        assert_eq!(nfc("\u{3ba}\u{3b1}\u{3bb}\u{3b7}\u{3bc}\u{3b5}\u{301}\u{3c1}\u{3b1}"), "\u{3ba}\u{3b1}\u{3bb}\u{3b7}\u{3bc}\u{3ad}\u{3c1}\u{3b1}", "Greek tonos");
+        assert_eq!(nfc("\u{1112}\u{1161}\u{11ab}\u{1100}\u{116e}\u{11a8}"), "\u{d55c}\u{ad6d}", "Hangul jamo into syllables");
+        assert_eq!(nfc("\u{30ad}\u{3099}\u{30bf}\u{30fc}"), "\u{30ae}\u{30bf}\u{30fc}", "katakana with dakuten");
+        assert_eq!(nfc("\u{304b}\u{3099}\u{304f}"), "\u{304c}\u{304f}", "hiragana with dakuten");
+        // And the stems: each pair is one name, so the second is numbered.
+        for (composed, decomposed) in [
+            ("Caf\u{e9}", "Cafe\u{301}"),
+            ("\u{41c}\u{43e}\u{439}", "\u{41c}\u{43e}\u{438}\u{306}"),
+            ("\u{3bc}\u{3ad}\u{3c1}\u{3b1}", "\u{3bc}\u{3b5}\u{301}\u{3c1}\u{3b1}"),
+            ("\u{d55c}\u{ad6d}", "\u{1112}\u{1161}\u{11ab}\u{1100}\u{116e}\u{11a8}"),
+            ("\u{30ae}\u{30bf}\u{30fc}", "\u{30ad}\u{3099}\u{30bf}\u{30fc}"),
+            ("\u{304c}\u{304f}", "\u{304b}\u{3099}\u{304f}"),
+        ] {
+            assert_eq!(
+                stem_file_names(&[composed, decomposed]),
+                vec![format!("{composed}.wav"), format!("{composed} 2.wav")],
+                "{composed:?} and {decomposed:?} are two names"
+            );
+            // Decomposed first: written composed, all the same.
+            assert_eq!(stem_file_names(&[decomposed])[0], format!("{composed}.wav"), "{decomposed:?} written as it came");
+        }
+        // Case-blind as well as form-blind: a capital Cyrillic short i
+        // composed and a small one decomposed are one file on macOS.
+        assert_eq!(
+            stem_file_names(&["\u{419}\u{43e}\u{434}", "\u{438}\u{306}\u{43e}\u{434}"]),
+            vec!["\u{419}\u{43e}\u{434}.wav".to_owned(), "\u{439}\u{43e}\u{434} 2.wav".to_owned()]
+        );
     }
 
     /// **The span an export renders, by TIME choice, and its frames**: the

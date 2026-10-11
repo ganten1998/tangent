@@ -37,7 +37,7 @@ mp3 = ["dep:mp3lame-encoder"]
 # Steinberg ASIO for the Windows build: the industry's low-latency door.
 # Needs CPAL_ASIO_DIR pointing at the SDK at build time.
 asio = ["cpal/asio", "tangent-record?/asio"]
-recorder = ["dep:tangent-record", "dep:tangent-host", "dep:cpal", "dep:rtrb"]
+recorder = ["dep:tangent-record", "dep:tangent-host", "dep:cpal", "dep:rtrb", "dep:unicode-normalization"]
 
 [dependencies]
 # The GUI always enables the engine's `learning` feature — the re-ranker is a
@@ -117,6 +117,15 @@ fd-lock = "4"
 # both ship `tangent-ffmpeg`, so MP3 delivery goes through the sidecar and only
 # a build with no sidecar at all falls back to WAV with an honest note.
 mp3lame-encoder = { version = "0.2.5", optional = true }
+# **Unicode's NFC, for the names an export writes** (`desktop::stem_file_names`):
+# macOS hands back a name decomposed (an `e` and a combining acute, a Hangul
+# syllable as its jamo, a kana and its dakuten) where one typed elsewhere is
+# composed, and the two look identical, so two stems would collide in a
+# person's eyes and not in the check. The crate the Rust ecosystem uses for
+# it (MIT or Apache-2.0, its one dependency tinyvec is Zlib, Apache-2.0 or
+# MIT), pinned exactly so a lock refresh cannot move the tables under a
+# golden name. Part of `recorder`, the only build that exports.
+unicode-normalization = { version = "=0.1.25", optional = true }
 
 [dev-dependencies]
 ttf-parser = "0.25"
