@@ -10350,16 +10350,13 @@ const SETTLE_FALL_RATIO: f32 = 0.708;
 
 /// Which column of the monitor ring carries device input `want`.
 ///
-/// The ring holds the PICKED channels, laid end to end, so a device index
-/// has to be looked up through the picks — the inverse of the strip loop's
-/// `dev_col`. Falls back to the identity (clamped) when no pick names it,
-/// which is exactly right for `Picks::EVERYTHING`.
-fn ir_ring_col(picks: &tangent_record::audio::Picks, want: usize, ch_in: usize) -> usize {
-    for k in 0..ch_in {
-        if picks.source(k, ch_in).unwrap_or(k) == want {
-            return k;
-        }
-    }
+/// **Its own number.** The ring carries WHOLE DEVICE FRAMES whatever is
+/// picked (`tangent_record::audio::capture_channel_monitored`), so the column
+/// of device input 3 is 3. This used to look the input up through the picks,
+/// written when the ring held only the picked channels end to end: with the
+/// desk's picks at [In 3] it answered column 0 for a return on In 3, and the
+/// wizard measured input 1. Clamped to the ring's width.
+fn ir_ring_col(want: usize, ch_in: usize) -> usize {
     want.min(ch_in.saturating_sub(1))
 }
 
@@ -13657,8 +13654,8 @@ impl Renderer {
         if let Some(job) = self.ir.as_mut() {
             if !job.cols_ready {
                 job.cols = (
-                    ir_ring_col(&self.monitor_columns, job.in_pair.0, ch_in),
-                    ir_ring_col(&self.monitor_columns, job.in_pair.1, ch_in),
+                    ir_ring_col(job.in_pair.0, ch_in),
+                    ir_ring_col(job.in_pair.1, ch_in),
                 );
                 job.cols_ready = true;
             }
@@ -48256,6 +48253,36 @@ mod hw_insert_road {
     #[test]
     fn the_loops_limit_is_the_compensation_limit() {
         assert_eq!(crate::units::hwinsert::PDC_LIMIT as usize, MAX_PDC_FRAMES);
+    }
+
+    /// **The IR wizard reads its return by device channel**: the monitor
+    /// ring carries whole device frames, so with the desk's picks at [In 3]
+    /// a return on In 3 is column 2, not the pick's index 0 (which read
+    /// input 1).
+    #[test]
+    fn the_ir_wizard_reads_its_return_by_device_channel() {
+        assert_eq!(ir_ring_col(2, 8), 2);
+        assert_eq!(ir_ring_col(7, 8), 7);
+        assert_eq!(ir_ring_col(9, 8), 7, "clamped to the ring");
+        // Through a real capture: picks [In 3], the device is 4 wide, and
+        // only input 3 carries anything.
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let (mut tx, rx) = RingBuffer::<f32>::new(48_000 * 4);
+        let picks = tangent_record::audio::Picks::from_slice(&[tangent_record::audio::ChannelPick::Mono(2)]);
+        e.set_monitor(Some((rx, 4, vec![1].into_boxed_slice(), 512, picks)));
+        e.start_ir_tone((0, 1), (2, 2), -12.0);
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            for _ in 0..512 {
+                for c in 0..4 {
+                    let _ = tx.push(if c == 2 { 0.5 } else { 0.0 });
+                }
+            }
+        }
+        let (_, peak) = e.ir_return_db();
+        assert!(peak > -7.0, "the wizard metered {peak:.1} dBFS: it read another input");
     }
 
     /// **A lane holding a loop renders in device time**: it is pinned out of
