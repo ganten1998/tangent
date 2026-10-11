@@ -75,6 +75,29 @@ pub const CLICK_LEVEL: f32 = 0.5;
 /// The send and return trims' travel, dB, centred on unity.
 pub const GAIN_DB: (f32, f32) = (-24.0, 24.0);
 
+/// **The longest delay the desk can compensate**, frames: `MAX_PDC_FRAMES`
+/// in `instrument.rs`, restated because this module must stand without it
+/// (a test there pins the two). A loop whose latency would pass it cannot
+/// be lined up, so the bay refuses it rather than compensating part of it.
+pub const PDC_LIMIT: u32 = 8_192;
+
+/// How long a ping request may wait for the bay to run before it is
+/// dropped, seconds. A bay that is bypassed or stood down never runs, and a
+/// request that waited out a bypass must not fire a click into the box the
+/// moment the bay comes back, possibly in the middle of a take.
+pub const PING_EXPIRE_S: f64 = 2.0;
+
+/// The last stretch of the settle the return's level is measured over,
+/// seconds: the quiet the click has to stand out of.
+const QUIET_S: f64 = 0.05;
+
+/// How many times the quiet's loudest sample the click must reach.
+const QUIET_RATIO: f32 = 4.0;
+
+/// Chunks of an epoch the clock check lets pass before it starts to judge:
+/// two streams starting up land their first callbacks wherever they like.
+const DRIFT_SETTLE: u32 = 64;
+
 /// Starved blocks in a row before the unit decides its alignment no longer
 /// describes the streams and takes a new one (the input stopped, or a
 /// driver restarted under the same epoch).
@@ -200,6 +223,12 @@ pub enum Link {
     Offline = 9,
     /// Every port is taken.
     NoPort = 10,
+    /// The input's lead over the output keeps moving: two clocks.
+    ClockDrift = 11,
+    /// The input is a different device from the output: two clocks.
+    SeparateDevice = 12,
+    /// The loop is longer than delay compensation can absorb.
+    TooLong = 13,
 }
 
 impl Link {
@@ -215,6 +244,9 @@ impl Link {
             8 => Link::Varispeed,
             9 => Link::Offline,
             10 => Link::NoPort,
+            11 => Link::ClockDrift,
+            12 => Link::SeparateDevice,
+            13 => Link::TooLong,
             _ => Link::Waiting,
         }
     }
@@ -242,6 +274,18 @@ impl Link {
             Link::Varispeed => "Paused while the varispeed is engaged. Passing dry.",
             Link::Offline => "No device: an offline render cannot play through hardware.",
             Link::NoPort => "Disconnected: every hardware insert port is in use.",
+            Link::ClockDrift => {
+                "Disconnected: the input and the output are running on different clocks, so the loop \
+                 cannot stay in time. Use one interface for both, or an aggregate device."
+            }
+            Link::SeparateDevice => {
+                "Disconnected: the input is a different device from the output, so the two run on \
+                 different clocks. Use one interface for both, or an aggregate device."
+            }
+            Link::TooLong => {
+                "Refused: the loop is longer than delay compensation can absorb (8192 samples). \
+                 Lower the buffer size, or shorten the loop."
+            }
         }
     }
 }
@@ -276,17 +320,22 @@ pub fn chunk_of(out_block: u32) -> u32 {
 
 /// What the bay reports for a loop of `loop_frames`: the loop, plus the
 /// chunk the unit renders at once (its last frame must find its return
-/// already arrived), plus one input block of guard for the input's jitter.
+/// already arrived), plus TWO input blocks of guard. One covers the input's
+/// sawtooth (it arrives a block at a time); the other covers what a lane's
+/// rack cannot see yet, because a lane runs before the chunk's input is
+/// read and the monitor may leave up to a block unread. The figure is the
+/// same wherever the bay sits, so a bay moved from a lane to the master, or
+/// to the room when its track is armed, keeps its timing.
 pub fn latency_for(loop_frames: u32, out_block: u32, in_block: u32) -> u32 {
     loop_frames
         .saturating_add(chunk_of(out_block))
-        .saturating_add(in_block)
+        .saturating_add(in_block.saturating_mul(2))
 }
 
 /// The loop an unmeasured insert assumes: the one that makes its reported
 /// latency exactly the law's round trip.
 pub fn estimated_loop(out_block: u32, in_block: u32) -> u32 {
-    law_frames(out_block, in_block).saturating_sub(chunk_of(out_block).saturating_add(in_block))
+    law_frames(out_block, in_block).saturating_sub(chunk_of(out_block).saturating_add(in_block.saturating_mul(2)))
 }
 
 /// Why a ping did not come back with a number.
@@ -299,6 +348,14 @@ pub enum PingFail {
     /// The loop was not connected when the ping was asked for, or came apart
     /// while it listened.
     Disconnected = 3,
+    /// The return was not quiet before the click: the click did not stand
+    /// far enough above what was already coming back.
+    Busy = 4,
+    /// The bay did not run for so long after the ask (bypassed, stood
+    /// down) that the ask was dropped rather than fired late.
+    Expired = 5,
+    /// The measured loop is longer than delay compensation can absorb.
+    TooLong = 6,
 }
 
 impl PingFail {
@@ -307,6 +364,9 @@ impl PingFail {
             -1 => Some(PingFail::Silent),
             -2 => Some(PingFail::Unclear),
             -3 => Some(PingFail::Disconnected),
+            -4 => Some(PingFail::Busy),
+            -5 => Some(PingFail::Expired),
+            -6 => Some(PingFail::TooLong),
             _ => None,
         }
     }
@@ -320,6 +380,15 @@ impl PingFail {
             PingFail::Silent => "The ping did not come back: check the cables, the levels and that the unit is not muted.",
             PingFail::Unclear => "The ping came back buried: set the unit dry or bypassed and ping again.",
             PingFail::Disconnected => "The ping needs a connected loop: choose both sides first.",
+            PingFail::Busy => {
+                "The return was not quiet before the click: stop playback, let the unit's tail die \
+                 away, and ping again."
+            }
+            PingFail::Expired => "The ping was dropped: the insert was not running. Ping again.",
+            PingFail::TooLong => {
+                "The loop is longer than delay compensation can absorb (8192 samples): lower the \
+                 buffer size or shorten the loop."
+            }
         }
     }
 }
@@ -337,8 +406,11 @@ impl PingFail {
 ///
 /// `capture` is magnitudes, one per frame. Refuses a capture with nothing in
 /// it (under -80 dBFS) and one where the peak does not stand at least eight
-/// times above the average, which is noise or a box still ringing.
-pub fn find_click(capture: &[f32]) -> Result<usize, PingFail> {
+/// times above the average, which is noise or a box still ringing; and,
+/// given the loudest the return was in the quiet before the click (`quiet`),
+/// one whose peak does not stand [`QUIET_RATIO`] times above it, because a
+/// tail or a programme that loud can read as the click.
+pub fn find_click(capture: &[f32], quiet: f32) -> Result<usize, PingFail> {
     let mut peak = 0.0f32;
     let mut sum = 0.0f64;
     for &v in capture {
@@ -350,6 +422,9 @@ pub fn find_click(capture: &[f32]) -> Result<usize, PingFail> {
     }
     if peak < 1.0e-4 {
         return Err(PingFail::Silent);
+    }
+    if peak < QUIET_RATIO * quiet {
+        return Err(PingFail::Busy);
     }
     let mean = (sum / capture.len().max(1) as f64) as f32;
     if peak < 8.0 * mean {
@@ -372,8 +447,15 @@ pub fn find_click(capture: &[f32]) -> Result<usize, PingFail> {
 pub struct HwClocks {
     /// Device output frames rendered. The chunk being rendered starts here.
     pub out_clock: AtomicU64,
-    /// Device input frames received, the stale ones included.
+    /// Device input frames received, the stale ones included: what has
+    /// been written into the ports' return rings.
     pub in_clock: AtomicU64,
+    /// **Device input frames PRODUCED by the chunk's start**: `in_clock`
+    /// plus what was still waiting in the input ring. The lead the loops
+    /// align by is taken from this, once a chunk, so it does not depend on
+    /// how much the monitor had drained (a backlog) or on where in the chunk
+    /// a bay runs (before or after the input pass).
+    pub in_base: AtomicU64,
     /// Bumped whenever the two counters were re-based together: a new
     /// input stream, the input going away, the varispeed engaging.
     pub epoch: AtomicU32,
@@ -385,6 +467,27 @@ pub struct HwClocks {
     pub in_channels: AtomicU32,
     /// False on an engine with no device (an offline render).
     pub live: AtomicBool,
+    /// The host's word that the input is a different device from the
+    /// output (see [`one_device`]).
+    pub separate: AtomicBool,
+    /// The renderer's finding, this epoch, that the input's lead keeps
+    /// moving: two clocks it was not told about.
+    pub drifting: AtomicBool,
+}
+
+/// **Whether an input and an output name one device.** CoreAudio and ASIO
+/// name both halves alike; WASAPI wraps them ("Speakers (Scarlett 2i2
+/// USB)", "Analogue 1 + 2 (Scarlett 2i2 USB)"), so the part in parentheses
+/// is compared as well, the rule `devices::audio_selection` matches inputs
+/// to outputs by. An aggregate device is one device.
+pub fn one_device(input: &str, output: &str) -> bool {
+    fn core(name: &str) -> &str {
+        match (name.find('('), name.rfind(')')) {
+            (Some(a), Some(b)) if b > a + 1 => &name[a + 1..b],
+            _ => name,
+        }
+    }
+    input == output || core(input) == core(output)
 }
 
 /// What a port owns that is not a number: the two rings.
@@ -403,6 +506,14 @@ struct PortIo {
 #[derive(Debug)]
 pub struct HwPort {
     claimed: AtomicBool,
+    /// Which claim holds it: bumped when a reload hands the port from the
+    /// tenant going out to the one coming in, so the old claim's drop
+    /// leaves it alone.
+    gen: AtomicU32,
+    /// The output frame a ping was asked at (see [`PING_EXPIRE_S`]).
+    ping_asked_at: AtomicU64,
+    /// The unit's own finding that its loop is past [`PDC_LIMIT`].
+    over: AtomicBool,
     /// `seat * INSERTS + bay` of the bay that claimed it, `u32::MAX` none.
     key: AtomicU32,
     /// The lane that bay's rack belongs to, `u32::MAX` for a bus or the
@@ -440,6 +551,9 @@ impl HwPort {
     fn new() -> Self {
         Self {
             claimed: AtomicBool::new(false),
+            gen: AtomicU32::new(0),
+            ping_asked_at: AtomicU64::new(0),
+            over: AtomicBool::new(false),
             key: AtomicU32::new(u32::MAX),
             lane: AtomicU32::new(u32::MAX),
             send: AtomicU32::new(0),
@@ -475,12 +589,21 @@ impl HwPort {
         )
     }
 
+    /// The link as the face should read it: the renderer's, or the unit's
+    /// own refusal of a loop too long to compensate.
     pub fn link(&self) -> Link {
-        Link::from_u8(self.status.load(Ordering::Relaxed))
+        let link = Link::from_u8(self.status.load(Ordering::Relaxed));
+        if link.connected() && self.over.load(Ordering::Relaxed) {
+            Link::TooLong
+        } else {
+            link
+        }
     }
 
-    /// Ask the unit for a ping. Answered on [`HwPort::ping_answer`].
-    pub fn ask_ping(&self) {
+    /// Ask the unit for a ping, at output frame `now` (the hub's
+    /// `out_clock`). Answered on [`HwPort::ping_answer`].
+    pub fn ask_ping(&self, now: u64) {
+        self.ping_asked_at.store(now, Ordering::Relaxed);
         self.ping_req.fetch_add(1, Ordering::Release);
     }
 
@@ -544,10 +667,15 @@ pub struct HwHub {
     seen: Mutex<Seen>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Seen {
     input: Option<u64>,
     varispeed: bool,
+    /// The clock check: chunks seen this epoch, and the least and most lead
+    /// since it started judging.
+    chunks: u32,
+    lo: i64,
+    hi: i64,
 }
 
 /// What the renderer knows about the device this chunk.
@@ -561,6 +689,9 @@ pub struct DeviceView {
     pub in_block: u32,
     pub rate: u32,
     pub varispeed: bool,
+    /// Input frames delivered and not yet read: what the input ring holds
+    /// at the chunk's start.
+    pub in_backlog: usize,
 }
 
 impl Default for HwHub {
@@ -588,52 +719,71 @@ impl HwHub {
     }
 
     /// **Claim a port for the bay `key`**, on the host, sizing its rings.
-    /// `None` when all [`HW_PORTS`] are taken. Any other port still naming
-    /// the same bay (the tenant this load replaces, on its way out) stops
-    /// answering for it, so the host's questions reach the new one.
+    ///
+    /// **A bay that already holds one hands it on.** Every jack change and
+    /// every state restore is a reload, and the new tenant is built while
+    /// the old one still runs; claiming a second port for it would run a
+    /// desk of sixteen loops out of ports on its first reload. So the port
+    /// answering for `key` passes to the new claim (its generation moves,
+    /// and the old claim's drop then leaves it alone), keeping its rings and
+    /// its place, with the ping road reset for the new tenant.
+    ///
+    /// `None` when all [`HW_PORTS`] are taken by other bays.
     pub fn claim(&self, key: u32, lane: Option<usize>) -> Option<HwClaim> {
-        let port = self.ports.iter().find(|p| {
-            p.claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        })?;
-        for other in &self.ports {
-            if !Arc::ptr_eq(other, port) && other.key.load(Ordering::Relaxed) == key {
-                other.key.store(u32::MAX, Ordering::Relaxed);
+        let held = self
+            .ports
+            .iter()
+            .find(|p| p.is_claimed() && p.key.load(Ordering::Relaxed) == key);
+        let port = match held {
+            Some(p) => p,
+            None => {
+                let p = self.ports.iter().find(|p| {
+                    p.claimed
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                })?;
+                self.claimed.fetch_add(1, Ordering::Relaxed);
+                let mut io = p.io.lock().unwrap_or_else(|e| e.into_inner());
+                if io.send.len() != SEND_CAP * 2 {
+                    io.send = vec![0.0; SEND_CAP * 2];
+                } else {
+                    io.send.fill(0.0);
+                }
+                if io.ret.len() != RET_CAP * 2 {
+                    io.ret = vec![0.0; RET_CAP * 2];
+                }
+                io.ret_from = self.clocks.in_clock.load(Ordering::Relaxed);
+                drop(io);
+                p.status.store(Link::Waiting as u8, Ordering::Relaxed);
+                p.slips.store(0, Ordering::Relaxed);
+                p
             }
-        }
-        {
-            let mut io = port.io.lock().unwrap_or_else(|p| p.into_inner());
-            if io.send.len() != SEND_CAP * 2 {
-                io.send = vec![0.0; SEND_CAP * 2];
-            } else {
-                io.send.fill(0.0);
-            }
-            if io.ret.len() != RET_CAP * 2 {
-                io.ret = vec![0.0; RET_CAP * 2];
-            }
-            io.ret_from = self.clocks.in_clock.load(Ordering::Relaxed);
-        }
+        };
+        let gen = port.gen.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         port.lane.store(
             lane.and_then(|l| u32::try_from(l).ok()).unwrap_or(u32::MAX),
             Ordering::Relaxed,
         );
-        port.status.store(Link::Waiting as u8, Ordering::Relaxed);
-        port.slips.store(0, Ordering::Relaxed);
         port.pinging.store(false, Ordering::Relaxed);
-        // A fresh bay has asked nothing and been answered nothing: the
-        // tenant this port served before must not lend it a measurement.
+        port.over.store(false, Ordering::Relaxed);
+        // A fresh tenant has asked nothing and been answered nothing: the
+        // one this port served before must not lend it a measurement.
         port.ping_req.store(0, Ordering::Relaxed);
         port.ping_done.store(0, Ordering::Relaxed);
         port.ping_result.store(0, Ordering::Relaxed);
         port.adopted.store(0, Ordering::Relaxed);
         port.key.store(key, Ordering::Relaxed);
-        self.claimed.fetch_add(1, Ordering::Relaxed);
         Some(HwClaim {
             port: Arc::clone(port),
             clocks: Arc::clone(&self.clocks),
             count: Arc::clone(&self.claimed),
+            gen,
         })
+    }
+
+    /// How many ports no bay holds.
+    pub fn free_ports(&self) -> usize {
+        self.ports.iter().filter(|p| !p.is_claimed()).count()
     }
 
     /// The port answering for bay `key`, if one is claimed for it.
@@ -678,31 +828,70 @@ impl HwHub {
         let c = &self.clocks;
         c.out_channels.store(dev.out_channels as u32, Ordering::Relaxed);
         c.in_channels.store(dev.input.map_or(0, |(_, w)| w as u32), Ordering::Relaxed);
-        c.out_block.store(dev.out_block, Ordering::Relaxed);
+        // **The largest callback this stream has handed over, latched**,
+        // not the last one: WASAPI in event mode and CoreAudio converting a
+        // rate hand over callbacks of varying length, and a latency keyed on
+        // the last one would move every block, re-align the whole desk each
+        // time (a click) and read a measured loop as unmeasured half the
+        // time. The engine is rebuilt with a new hub for a new output
+        // stream, so the latch never outlives its stream.
+        c.out_block.fetch_max(dev.out_block, Ordering::Relaxed);
         c.in_block.store(dev.in_block, Ordering::Relaxed);
         c.rate.store(dev.rate, Ordering::Relaxed);
-        let now = Seen { input: dev.input.map(|(id, _)| id), varispeed: dev.varispeed };
-        let rebase = match self.seen.try_lock() {
+        let backlog = dev.in_backlog as u64;
+        let out = c.out_clock.load(Ordering::Relaxed);
+        let input = dev.input.map(|(id, _)| id);
+        let (rebase, drifting) = match self.seen.try_lock() {
             Ok(mut seen) => {
-                let changed = *seen != now;
-                *seen = now;
-                changed
+                let rebase = seen.input != input || seen.varispeed != dev.varispeed;
+                if rebase {
+                    *seen = Seen { input, varispeed: dev.varispeed, chunks: 0, lo: 0, hi: 0 };
+                    // Re-based so the input frame produced last stands one
+                    // before the output frame about to render: the counters
+                    // mean the same thing in every epoch, whatever the ring
+                    // held when it began.
+                    c.in_clock.store(out.saturating_sub(backlog), Ordering::Relaxed);
+                    c.epoch.fetch_add(1, Ordering::Relaxed);
+                    c.drifting.store(false, Ordering::Relaxed);
+                }
+                // **The clock check.** On one crystal the input's lead over
+                // the output wanders inside a band about an input block and a
+                // chunk wide; on two it walks away for ever. Past twice that
+                // band (plus slack for a scheduler hiccup) the loop is judged
+                // to be on two clocks, for the rest of the epoch.
+                let produced = c.in_clock.load(Ordering::Relaxed) + backlog;
+                let here = produced as i64 - out as i64;
+                if input.is_some() && !dev.varispeed {
+                    seen.chunks = seen.chunks.saturating_add(1);
+                    if seen.chunks == DRIFT_SETTLE {
+                        (seen.lo, seen.hi) = (here, here);
+                    } else if seen.chunks > DRIFT_SETTLE {
+                        seen.lo = seen.lo.min(here);
+                        seen.hi = seen.hi.max(here);
+                        let band = 2 * (i64::from(dev.in_block) + i64::from(chunk_of(c.out_block.load(Ordering::Relaxed))))
+                            + 256;
+                        if seen.hi - seen.lo > band {
+                            c.drifting.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                (rebase, c.drifting.load(Ordering::Relaxed))
             }
-            Err(_) => false,
+            Err(_) => (false, c.drifting.load(Ordering::Relaxed)),
         };
         if rebase {
-            let out = c.out_clock.load(Ordering::Relaxed);
-            c.in_clock.store(out, Ordering::Relaxed);
-            c.epoch.fetch_add(1, Ordering::Relaxed);
+            let at = c.in_clock.load(Ordering::Relaxed);
             for p in self.claimed_ports() {
                 if let Ok(mut io) = p.io.try_lock() {
-                    io.ret_from = out;
+                    io.ret_from = at;
                 }
             }
         }
+        c.in_base.store(c.in_clock.load(Ordering::Relaxed) + backlog, Ordering::Relaxed);
         if self.claimed.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let separate = c.separate.load(Ordering::Relaxed);
         let live = c.live.load(Ordering::Relaxed);
         for p in self.claimed_ports() {
             let (send, ret) = p.routes();
@@ -726,6 +915,10 @@ impl HwHub {
                                     cols = (a as u32) | ((b as u32) << 16);
                                     if dev.varispeed {
                                         Link::Varispeed
+                                    } else if separate {
+                                        Link::SeparateDevice
+                                    } else if drifting {
+                                        Link::ClockDrift
                                     } else {
                                         Link::Connected
                                     }
@@ -838,6 +1031,7 @@ pub struct HwClaim {
     port: Arc<HwPort>,
     clocks: Arc<HwClocks>,
     count: Arc<AtomicUsize>,
+    gen: u32,
 }
 
 impl HwClaim {
@@ -859,6 +1053,10 @@ impl HwClaim {
 impl Drop for HwClaim {
     fn drop(&mut self) {
         let p = &self.port;
+        // Handed on to a newer tenant of the same bay: not ours to free.
+        if p.gen.load(Ordering::Acquire) != self.gen {
+            return;
+        }
         p.send.store(0, Ordering::Relaxed);
         p.ret.store(0, Ordering::Relaxed);
         p.key.store(u32::MAX, Ordering::Relaxed);
@@ -872,15 +1070,17 @@ impl Drop for HwClaim {
 
 // ── the bay's half ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Ping {
     Idle,
-    /// The send is silent while the box lets go; fires when this reaches 0.
-    Settle { left: usize },
+    /// The send is silent while the box lets go; fires when `left` reaches
+    /// 0. `scan` is the next return frame to look at, and `quiet` the
+    /// loudest the return was over the settle's last [`QUIET_S`].
+    Settle { left: usize, scan: u64, quiet: f32 },
     /// The click went out; capturing the return from input frame `from`.
     /// `dip` is how far the input stood below its usual lead when it fired
     /// (see [`HwInsert::lead`]), taken off the answer.
-    Listen { from: u64, got: usize, dip: u32 },
+    Listen { from: u64, got: usize, dip: u32, quiet: f32 },
 }
 
 /// Chunks of input lead the unit remembers; see [`HwInsert::lead`]. An
@@ -909,6 +1109,11 @@ pub struct HwInsert {
     /// disconnected insert passes dry IN TIME.
     dry: Vec<f32>,
     dry_at: usize,
+    /// The second pass's own delay line (a send destination's rack runs
+    /// twice a chunk): its dry share is as late as the first pass's, which
+    /// is what the bay tells delay compensation.
+    dry2: Vec<f32>,
+    dry2_at: usize,
     /// The input frame read for output frame `O` is `O + delta - latency`.
     delta: Option<i64>,
     lock_epoch: u32,
@@ -930,6 +1135,11 @@ pub struct HwInsert {
     /// (the bay was bypassed or the lane stood down) both change what it does.
     last_c: Option<u64>,
     next_c: u64,
+    /// The output frame the programme started going round the loop again
+    /// (after a load, a bypass, a ping, a disconnect): until its return can
+    /// have come back, the bay plays the delayed dry instead of an empty
+    /// return, so going into circuit is seamless and in time.
+    sent_from: Option<u64>,
     ping_seen: u32,
     ping: Ping,
     capture: Vec<f32>,
@@ -946,7 +1156,7 @@ impl HwInsert {
         // The delay line covers the longest loop a ping can report, plus the
         // chunk and an input block of guard, plus room for the biggest input
         // block a driver hands over.
-        let dry_frames = window + MAX_CHUNK as usize + 8_192 + 1;
+        let dry_frames = PDC_LIMIT as usize + MAX_CHUNK as usize + 1;
         Self {
             rate,
             slew: (f64::from(SLEW_AT_44K) * 44_100.0 / f64::from(rate)) as f32,
@@ -963,6 +1173,8 @@ impl HwInsert {
             claim: None,
             dry: vec![0.0; dry_frames * 2],
             dry_at: 0,
+            dry2: vec![0.0; dry_frames * 2],
+            dry2_at: 0,
             delta: None,
             lock_epoch: 0,
             lock_loop: 0,
@@ -973,6 +1185,7 @@ impl HwInsert {
             lead_seen: 0,
             last_c: None,
             next_c: 0,
+            sent_from: None,
             ping_seen: 0,
             ping: Ping::Idle,
             capture: vec![0.0; window],
@@ -1060,10 +1273,13 @@ impl HwInsert {
     pub fn clear(&mut self) {
         self.dry.fill(0.0);
         self.dry_at = 0;
+        self.dry2.fill(0.0);
+        self.dry2_at = 0;
         self.delta = None;
         self.starved = 0;
         self.lead_seen = 0;
         self.last_c = None;
+        self.sent_from = None;
         self.ping = Ping::Idle;
         self.send_g = self.send_t;
         self.ret_g = self.ret_t;
@@ -1085,13 +1301,7 @@ impl HwInsert {
     /// The dry delay line: write this frame, read the one `delay` back.
     #[inline]
     fn dry_step(&mut self, l: f32, r: f32, delay: usize) -> (f32, f32) {
-        let cap = self.dry.len() / 2;
-        let w = self.dry_at;
-        self.dry[w * 2] = l;
-        self.dry[w * 2 + 1] = r;
-        let back = (w + cap - delay.min(cap - 1)) % cap;
-        self.dry_at = (w + 1) % cap;
-        (self.dry[back * 2], self.dry[back * 2 + 1])
+        delay_step(&mut self.dry, &mut self.dry_at, l, r, delay)
     }
 
     /// **One block through the loop.** Planar in, planar out, `frames` of
@@ -1124,8 +1334,9 @@ impl HwInsert {
             self.last_c = Some(c);
             self.next_c = c + frames as u64;
         }
-        let link = port.link();
-        self.link = link;
+        // The renderer's word, not `HwPort::link`, which folds in the
+        // over-limit flag this block is about to decide afresh.
+        let link = Link::from_u8(port.status.load(Ordering::Relaxed));
         let (ob, ib, rate) = (
             clocks.out_block.load(Ordering::Relaxed),
             clocks.in_block.load(Ordering::Relaxed),
@@ -1135,22 +1346,40 @@ impl HwInsert {
             Some(m) if m.rate == rate && m.out_block == ob && m.in_block == ib => (m.loop_frames, true),
             _ => (estimated_loop(ob, ib), false),
         };
-        let cap = self.dry.len() / 2;
-        let latency = latency_for(loop_now, ob, ib).min((cap - 1 - MAX_CHUNK as usize) as u32);
+        // **Past what the desk can compensate, refused**: a loop the PDC
+        // can absorb only part of would leave the track partly late, so the
+        // bay passes dry at the limit and says why.
+        let wanted = latency_for(loop_now, ob, ib);
+        let over = wanted > PDC_LIMIT;
+        let latency = wanted.min(PDC_LIMIT);
         self.latency = latency;
         port.latency.store(latency, Ordering::Relaxed);
         port.loop_frames.store(loop_now, Ordering::Relaxed);
         port.measured.store(measured, Ordering::Relaxed);
+        port.over.store(over, Ordering::Relaxed);
+        let link = if over && link.connected() { Link::TooLong } else { link };
+        self.link = link;
 
-        // A ping asked for since the last block.
+        // A ping asked for since the last block. One already under way
+        // absorbs a second press (its answer answers both): restarting would
+        // measure the first click as the second's. An ask that waited out
+        // a bypass is dropped rather than fired late.
         if first {
             let req = port.ping_req.load(Ordering::Acquire);
             if req != self.ping_seen {
                 self.ping_seen = req;
-                if link.connected() {
+                let asked = port.ping_asked_at.load(Ordering::Relaxed);
+                let stale = c.saturating_sub(asked) as f64 > f64::from(self.rate) * PING_EXPIRE_S;
+                if self.ping != Ping::Idle {
+                    // Absorbed: the ping under way answers this ask too.
+                } else if stale {
+                    self.finish_ping(PingFail::Expired.code());
+                } else if link.connected() {
                     port.pinging.store(true, Ordering::Relaxed);
                     self.ping = Ping::Settle {
                         left: (f64::from(self.rate) * PING_SETTLE_S) as usize,
+                        scan: clocks.in_base.load(Ordering::Relaxed),
+                        quiet: 0.0,
                     };
                 } else {
                     self.finish_ping(PingFail::Disconnected.code());
@@ -1186,8 +1415,8 @@ impl HwInsert {
             // is run again over its arrivals). The loop is one cable: what
             // this pass sends joins the first pass's send, and comes back in
             // the return that the FIRST pass reads, next chunk on. So this
-            // pass sends and adds no wet of its own; its dry share is
-            // undelayed, the one place the bay is not in time.
+            // pass sends and adds no wet of its own; its dry share goes
+            // through its own delay line, as late as the first pass's.
             let mono = !self.send.is_some_and(|j| j.stereo);
             for f in 0..frames {
                 let l = input.first().and_then(|ch| ch.get(f)).copied().unwrap_or(0.0);
@@ -1202,11 +1431,12 @@ impl HwInsert {
                     }
                 }
                 let keep = 1.0 - self.mix_g;
+                let (dl, dr) = self.dry2_step(l, r, latency as usize);
                 if let Some(d) = out.get_mut(0).and_then(|ch| ch.get_mut(f)) {
-                    *d = l * keep;
+                    *d = dl * keep;
                 }
                 if let Some(d) = out.get_mut(1).and_then(|ch| ch.get_mut(f)) {
-                    *d = r * keep;
+                    *d = dr * keep;
                 }
             }
             return;
@@ -1216,7 +1446,11 @@ impl HwInsert {
             self.lead_seen = 0;
             self.delta = None;
         }
-        let here = in_now as i64 - c as i64;
+        // From the chunk's base, not the live counter: a bay on a lane runs
+        // before this chunk's input is read and one on the master after it,
+        // and the alignment must not depend on which.
+        let base = clocks.in_base.load(Ordering::Relaxed);
+        let here = base as i64 - c as i64;
         let lead = self.lead(here);
         // The alignment: the input frame that carries output frame `O`'s
         // return is `O + loop + lead`. Taken again when the epoch, the loop
@@ -1237,19 +1471,40 @@ impl HwInsert {
         let mut fire = false;
         let pinging = match self.ping {
             Ping::Idle => false,
-            Ping::Settle { left } => {
+            Ping::Settle { left, scan, quiet } => {
+                // What came back while the send was silent: its loudest over
+                // the settle's last stretch is the quiet the click must
+                // stand out of.
+                let tail = (f64::from(self.rate) * QUIET_S) as usize;
+                let mut quiet = quiet;
+                let mut at = scan.max(io.ret_from);
+                while at < in_now {
+                    let i = (at % RET_CAP as u64) as usize * 2;
+                    if left <= tail {
+                        quiet = quiet.max(io.ret[i].abs()).max(io.ret[i + 1].abs());
+                    }
+                    at += 1;
+                }
                 if left == 0 {
                     fire = true;
                     let dip = u32::try_from((lead - here).max(0)).unwrap_or(u32::MAX);
-                    self.ping = Ping::Listen { from: in_now, got: 0, dip };
+                    self.ping = Ping::Listen { from: base, got: 0, dip, quiet };
                 } else {
-                    self.ping = Ping::Settle { left: left.saturating_sub(frames) };
+                    self.ping = Ping::Settle { left: left.saturating_sub(frames), scan: at, quiet };
                 }
                 true
             }
             Ping::Listen { .. } => true,
         };
 
+        // The programme is going round the loop from here (or not, while a
+        // ping has the send). See `sent_from`.
+        if pinging {
+            self.sent_from = None;
+        } else if self.sent_from.is_none() {
+            self.sent_from = Some(c);
+        }
+        let warm_from = self.sent_from.map(|s| s + u64::from(latency));
         let mono_send = !self.send.is_some_and(|j| j.stereo);
         let mono_ret = !self.ret.is_some_and(|j| j.stereo);
         let sign = if self.invert { -1.0 } else { 1.0 };
@@ -1285,9 +1540,15 @@ impl HwInsert {
                 wr = if mono_ret { wl } else { io.ret[at + 1] };
             }
             let g = self.ret_g * sign;
-            let (wl, wr) = if pinging { (0.0, 0.0) } else { (wl * g, wr * g) };
-            let m = self.mix_g;
-            let (ol, or) = (dl * (1.0 - m) + wl * m, dr * (1.0 - m) + wr * m);
+            // Before the loop carries the programme (just in circuit, or a
+            // ping holding the send), the delayed dry stands in for the
+            // wet: in time, and never a hole.
+            let (ol, or) = if warm_from.is_none_or(|w| o < w) {
+                (dl, dr)
+            } else {
+                let m = self.mix_g;
+                (dl * (1.0 - m) + wl * g * m, dr * (1.0 - m) + wr * g * m)
+            };
             if let Some(d) = out.get_mut(0).and_then(|ch| ch.get_mut(f)) {
                 *d = ol;
             }
@@ -1298,7 +1559,7 @@ impl HwInsert {
 
         // The ping's capture: every return frame that has arrived since the
         // click went out, as a magnitude, until the window is full.
-        if let Ping::Listen { from, got, dip } = self.ping {
+        if let Ping::Listen { from, got, dip, quiet } = self.ping {
             let window = self.capture.len();
             let mut got = got;
             while got < window {
@@ -1316,7 +1577,17 @@ impl HwInsert {
                 // The click is `k` frames into a capture that began at the
                 // input's lead at the time it fired; against the lead's
                 // reference it is `dip` frames earlier than that.
-                match find_click(&self.capture).map(|k| u32::try_from(k).unwrap_or(u32::MAX).saturating_sub(dip)) {
+                // A click found before the reference could not have come
+                // round the loop: something else was in the return.
+                let found = find_click(&self.capture, quiet).and_then(|k| {
+                    let k = u32::try_from(k).unwrap_or(u32::MAX);
+                    let loop_frames = k.checked_sub(dip).ok_or(PingFail::Unclear)?;
+                    if latency_for(loop_frames, ob, ib) > PDC_LIMIT {
+                        return Err(PingFail::TooLong);
+                    }
+                    Ok(loop_frames)
+                });
+                match found {
                     Ok(k) => {
                         let m = Measured {
                             loop_frames: k,
@@ -1328,7 +1599,7 @@ impl HwInsert {
                         self.fresh = Some(m);
                         // Reported from this answer on, so the host's next
                         // read of the bay's figure is the measured one.
-                        self.latency = latency_for(m.loop_frames, ob, ib).min((cap - 1 - MAX_CHUNK as usize) as u32);
+                        self.latency = latency_for(m.loop_frames, ob, ib);
                         port.latency.store(self.latency, Ordering::Relaxed);
                         port.loop_frames.store(m.loop_frames, Ordering::Relaxed);
                         port.measured.store(true, Ordering::Relaxed);
@@ -1340,7 +1611,7 @@ impl HwInsert {
                     Err(why) => self.finish_ping(why.code()),
                 }
             } else {
-                self.ping = Ping::Listen { from, got, dip };
+                self.ping = Ping::Listen { from, got, dip, quiet };
             }
         }
 
@@ -1348,11 +1619,21 @@ impl HwInsert {
             self.starved += 1;
             port.slips.fetch_add(1, Ordering::Relaxed);
             if self.starved >= RELOCK_AFTER {
+                // A new alignment from a fresh look at the lead: the window
+                // still holds the old reference, and taking it again would
+                // starve on for as long as it lasted.
                 self.delta = None;
+                self.lead_seen = 0;
             }
         } else {
             self.starved = 0;
         }
+    }
+
+    /// The second pass's dry share, through its own line.
+    #[inline]
+    fn dry2_step(&mut self, l: f32, r: f32, delay: usize) -> (f32, f32) {
+        delay_step(&mut self.dry2, &mut self.dry2_at, l, r, delay)
     }
 
     /// Note this chunk's lead of the input over the output and answer the
@@ -1372,6 +1653,7 @@ impl HwInsert {
     /// The bay's input, delayed by its latency, as its output: what an
     /// insert with no loop does, in time with everything else.
     fn pass_dry(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        self.sent_from = None;
         let latency = self.latency as usize;
         for f in 0..frames {
             let l = input.first().and_then(|ch| ch.get(f)).copied().unwrap_or(0.0);
@@ -1385,6 +1667,19 @@ impl HwInsert {
             }
         }
     }
+}
+
+/// One frame through an interleaved stereo delay line: write it, read the
+/// one `delay` frames back.
+#[inline]
+fn delay_step(line: &mut [f32], at: &mut usize, l: f32, r: f32, delay: usize) -> (f32, f32) {
+    let cap = line.len() / 2;
+    let w = *at;
+    line[w * 2] = l;
+    line[w * 2 + 1] = r;
+    let back = (w + cap - delay.min(cap - 1)) % cap;
+    *at = (w + 1) % cap;
+    (line[back * 2], line[back * 2 + 1])
 }
 
 // ── the state lines ─────────────────────────────────────────────────────────
@@ -1529,12 +1824,12 @@ mod tests {
                     }
                 }
                 let mag: Vec<f32> = cap.iter().map(|v| v.abs()).collect();
-                assert_eq!(find_click(&mag), Ok(d), "delay {d}, shape {shape}");
+                assert_eq!(find_click(&mag, 0.0), Ok(d), "delay {d}, shape {shape}");
             }
         }
-        assert_eq!(find_click(&vec![0.0; n]), Err(PingFail::Silent));
+        assert_eq!(find_click(&vec![0.0; n], 0.0), Err(PingFail::Silent));
         let busy: Vec<f32> = (0..n).map(|k| 0.3 + 0.01 * ((k % 7) as f32)).collect();
-        assert_eq!(find_click(&busy), Err(PingFail::Unclear));
+        assert_eq!(find_click(&busy, 0.0), Err(PingFail::Unclear));
     }
 
     /// A fake interface, one crystal for both directions: the renderer's
@@ -1545,6 +1840,8 @@ mod tests {
         pub hub: HwHub,
         pub out_ch: usize,
         pub in_ch: usize,
+        /// The nominal callback, and the input's block unless `in_every`
+        /// widens it.
         pub block: usize,
         /// Device frames in flight between the jacks: every output frame
         /// arrives at the input this many frames later.
@@ -1556,8 +1853,30 @@ mod tests {
         /// The input is delivered every this many output blocks, in one
         /// burst: an input buffer bigger than the output's.
         pub in_every: usize,
+        /// Produced by the input and not yet delivered by its driver.
         held: Vec<f32>,
+        /// Delivered into the input ring and not yet read: the monitor's
+        /// backlog.
+        pending: Vec<f32>,
         blocks: usize,
+        /// Whether the bay runs AFTER this chunk's input is read (the room
+        /// pass, the master, a bus) rather than before it (a lane).
+        pub after_input: bool,
+        /// Frames the monitor leaves unread, chunk by chunk (cycled): a
+        /// backlog that comes and goes.
+        pub hold_back: Vec<usize>,
+        /// The callback sizes, cycled; empty is always `block`.
+        pub sizes: Vec<usize>,
+        /// Two clocks: every `drift.abs()` output frames the input produces
+        /// one frame more (positive) or one fewer (negative). 0 is one clock.
+        pub drift: i64,
+        /// A box that also plays a tone of this level back, whatever it is
+        /// sent: a return that is never quiet.
+        pub hum: f32,
+        /// Input frames the driver loses, once, at the next delivery: a
+        /// glitch that moves the input's lead for good.
+        pub lose: usize,
+        ticks: u64,
     }
 
     impl FakeDevice {
@@ -1575,47 +1894,99 @@ mod tests {
                 last_out: Vec::new(),
                 in_every: 1,
                 held: Vec::new(),
+                pending: Vec::new(),
                 blocks: 0,
+                after_input: false,
+                hold_back: Vec::new(),
+                sizes: Vec::new(),
+                drift: 0,
+                hum: 0.0,
+                lose: 0,
+                ticks: 0,
             }
         }
 
-        fn view(&self) -> DeviceView {
+        /// The output frame a ping asked now would be stamped with.
+        pub fn now(&self) -> u64 {
+            self.hub.clocks().out_clock.load(Ordering::Relaxed)
+        }
+
+        /// The size of the next callback.
+        pub fn next_frames(&self) -> usize {
+            if self.sizes.is_empty() {
+                self.block
+            } else {
+                self.sizes[self.blocks % self.sizes.len()]
+            }
+        }
+
+        fn view(&self, frames: usize) -> DeviceView {
             DeviceView {
                 out_channels: self.out_ch,
                 input: Some((1, self.in_ch)),
-                out_block: self.block as u32,
+                out_block: frames as u32,
                 in_block: (self.block * self.in_every) as u32,
                 rate: 48_000,
                 varispeed: false,
+                in_backlog: self.pending.len() / self.in_ch,
             }
         }
 
-        /// One device block: begin, the unit, the fold, then the device
-        /// plays the block and records the next input block. The input
-        /// arrives a block late, as two separate streams deliver it.
+        /// The monitor's read: everything delivered but this chunk's hold-back.
+        fn read_input(&mut self) {
+            let hold = if self.hold_back.is_empty() {
+                0
+            } else {
+                self.hold_back[self.blocks % self.hold_back.len()]
+            };
+            let frames = self.pending.len() / self.in_ch;
+            let take = frames.saturating_sub(hold) * self.in_ch;
+            let read: Vec<f32> = self.pending.drain(..take).collect();
+            self.hub.feed(&read, &[], self.in_ch);
+        }
+
+        /// One device callback: the chunk's start, the bay before or after
+        /// the input is read, the fold, then the device plays the block and
+        /// its input side records what comes back.
         pub fn block(&mut self, unit: &mut HwInsert, input: &[Vec<f32>], out: &mut [Vec<f32>]) {
+            let frames = self.next_frames();
             let in_ch = self.in_ch;
-            self.hub.begin_chunk(self.view(), |c| (c < in_ch).then_some(c));
-            unit.process(input, self.block, out);
-            let mut dev = vec![0.0f32; self.block * self.out_ch];
-            self.hub.fold(&mut dev, self.out_ch, self.block);
-            let mut arrived = Vec::with_capacity(self.block * in_ch);
-            for f in 0..self.block {
+            self.hub.begin_chunk(self.view(frames), |c| (c < in_ch).then_some(c));
+            if self.after_input {
+                self.read_input();
+                unit.process(input, frames, out);
+            } else {
+                unit.process(input, frames, out);
+                self.read_input();
+            }
+            let mut dev = vec![0.0f32; frames * self.out_ch];
+            self.hub.fold(&mut dev, self.out_ch, frames);
+            for f in 0..frames {
                 let mut frame = vec![0.0f32; in_ch];
                 for &(o, i, g) in &self.patch {
                     if o < self.out_ch && i < in_ch {
-                        frame[i] += dev[f * self.out_ch + o] * g;
+                        frame[i] += dev[f * self.out_ch + o] * g + self.hum * (self.ticks as f32 * 0.3).sin();
                     }
                 }
                 self.line.push_back(frame);
                 let got = self.line.pop_front().unwrap_or_default();
-                arrived.extend_from_slice(&got);
+                self.ticks += 1;
+                let every = self.drift.unsigned_abs();
+                let slip = every > 0 && self.ticks % every == 0;
+                if slip && self.drift < 0 {
+                    continue;
+                }
+                self.held.extend_from_slice(&got);
+                if slip && self.drift > 0 {
+                    self.held.extend_from_slice(&got);
+                }
             }
-            self.held.extend_from_slice(&arrived);
             self.blocks += 1;
             if self.blocks % self.in_every.max(1) == 0 {
-                self.hub.feed(&self.held, &[], in_ch);
-                self.held.clear();
+                let lost = (self.lose * in_ch).min(self.held.len());
+                self.lose -= lost / in_ch;
+                self.held.drain(..lost);
+                self.pending.append(&mut self.held);
             }
             self.last_out = dev;
         }
@@ -1629,9 +2000,9 @@ mod tests {
     }
 
     fn run_impulse(dev: &mut FakeDevice, u: &mut HwInsert, blocks: usize, at_block: usize) -> Vec<(f32, f32)> {
-        let b = dev.block;
         let mut heard = Vec::new();
         for k in 0..blocks {
+            let b = dev.next_frames();
             let mut l = vec![0.0f32; b];
             if k == at_block {
                 l[0] = 1.0;
@@ -1658,7 +2029,7 @@ mod tests {
             // Settle, then ping.
             let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
             assert_eq!(u.link(), Link::Connected);
-            dev.hub.port_for(7).expect("claimed").ask_ping();
+            dev.hub.port_for(7).expect("claimed").ask_ping(dev.now());
             let mut blocks = 0;
             while dev.hub.port_for(7).expect("claimed").pinging() {
                 let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
@@ -1684,7 +2055,7 @@ mod tests {
             let stray = heard.iter().enumerate().filter(|(k, (l, r))| *k != at && (l.abs() > 1e-3 || r.abs() > 1e-3)).count();
             assert_eq!(stray, 0, "the loop smeared the impulse");
             // A second ping on the same cable answers the same number.
-            dev.hub.port_for(7).unwrap().ask_ping();
+            dev.hub.port_for(7).unwrap().ask_ping(dev.now());
             while dev.hub.port_for(7).unwrap().pinging() {
                 let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
             }
@@ -1703,7 +2074,7 @@ mod tests {
             dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
             let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
             let _ = run_impulse(&mut dev, &mut u, 12, usize::MAX);
-            dev.hub.port_for(7).unwrap().ask_ping();
+            dev.hub.port_for(7).unwrap().ask_ping(dev.now());
             while dev.hub.port_for(7).unwrap().pinging() {
                 let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
             }
@@ -1861,7 +2232,7 @@ mod tests {
             let dev = FakeDevice::new(4, 4, out_b as usize, 10);
             let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
             dev.hub.begin_chunk(
-                DeviceView { in_block: in_b, ..dev.view() },
+                DeviceView { in_block: in_b, ..dev.view(out_b as usize) },
                 |c| Some(c),
             );
             let input = vec![vec![0.0f32; 16]; 2];
@@ -1879,7 +2250,7 @@ mod tests {
         let mut dev = FakeDevice::new(4, 4, 256, 10);
         let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
         let _ = run_impulse(&mut dev, &mut u, 4, usize::MAX);
-        dev.hub.port_for(7).unwrap().ask_ping();
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
         let mut n = 0;
         while dev.hub.port_for(7).unwrap().pinging() {
             let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
@@ -1893,7 +2264,7 @@ mod tests {
         let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
         dev.out_ch = 2;
         let _ = run_impulse(&mut dev, &mut u, 2, usize::MAX);
-        dev.hub.port_for(7).unwrap().ask_ping();
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
         let _ = run_impulse(&mut dev, &mut u, 2, usize::MAX);
         assert_eq!(
             PingFail::from_code(dev.hub.port_for(7).unwrap().ping_answer().1),
@@ -1907,18 +2278,316 @@ mod tests {
     fn claims_are_one_per_port_and_come_back() {
         let hub = HwHub::new();
         let a = hub.claim(3, Some(0)).expect("a port");
-        let b = hub.claim(3, Some(0)).expect("another port");
-        assert!(std::ptr::eq(hub.port_for(3).unwrap(), b.port()));
-        assert_eq!(a.port().key(), u32::MAX);
+        // A reload of the same bay: the port is handed on, not doubled.
+        let b = hub.claim(3, Some(0)).expect("the same port");
+        assert!(std::ptr::eq(a.port(), b.port()), "a reload took a second port");
+        assert_eq!(hub.free_ports(), HW_PORTS - 1);
         let mut lanes = [0u32; HW_PORTS];
         assert_eq!(hub.held_lanes(&mut lanes), 1);
+        // The tenant going out lets go and the port stays the new one's.
+        b.set_routes(Some(Jacks::pair(2)), Some(Jacks::pair(2)));
         drop(a);
+        assert!(std::ptr::eq(hub.port_for(3).expect("still held"), b.port()));
+        assert_eq!(b.port().routes().0, Some(Jacks::pair(2)), "the old tenant's drop cleared the new one's jacks");
         drop(b);
         assert!(hub.port_for(3).is_none());
         assert_eq!(hub.held_lanes(&mut lanes), 0);
-        let all: Vec<_> = (0..HW_PORTS as u32).map(|k| hub.claim(k, None)).collect();
-        assert!(all.iter().all(Option::is_some));
+        assert_eq!(hub.free_ports(), HW_PORTS);
+        // Sixteen bays, each reloaded, never run out.
+        let mut all: Vec<_> = (0..HW_PORTS as u32).map(|k| hub.claim(k, None).expect("a port")).collect();
+        for k in 0..HW_PORTS as u32 {
+            let next = hub.claim(k, None).expect("a reload of a full desk ran out of ports");
+            all[k as usize] = next;
+        }
+        assert_eq!(hub.free_ports(), 0);
         assert!(hub.claim(99, None).is_none(), "a seventeenth loop got a port");
+        drop(all);
+        assert_eq!(hub.free_ports(), HW_PORTS);
+    }
+
+    /// Settle, ping, wait for the answer; the answer.
+    fn ping(dev: &mut FakeDevice, u: &mut HwInsert) -> i64 {
+        dev.hub.port_for(7).expect("claimed").ask_ping(dev.now());
+        let mut n = 0;
+        while dev.hub.port_for(7).expect("claimed").pinging() {
+            let _ = run_impulse(dev, u, 1, usize::MAX);
+            n += 1;
+            assert!(n < 3_000, "the ping never finished");
+        }
+        dev.hub.port_for(7).expect("claimed").ping_answer().1
+    }
+
+    /// Where an impulse into the bay comes out, against where it went in.
+    fn lands(dev: &mut FakeDevice, u: &mut HwInsert) -> usize {
+        let start = 4;
+        let mut at = 0;
+        for k in 0..start {
+            at += if dev.sizes.is_empty() { dev.block } else { dev.sizes[(dev.blocks + k) % dev.sizes.len()] };
+        }
+        let heard = run_impulse(dev, u, start + 120, start);
+        heard.iter().position(|(l, _)| l.abs() > 0.5).expect("the impulse came back") - at
+    }
+
+    /// **Where in the chunk a bay runs does not move its loop.** A lane's
+    /// rack runs before the chunk's input is read, the room's and the
+    /// master's after it; a ping taken in one place and played in the other
+    /// lands exactly at the reported latency both ways.
+    #[test]
+    fn a_bay_that_moves_across_the_input_pass_keeps_its_timing() {
+        for (ping_after, play_after) in [(false, true), (true, false), (false, false), (true, true)] {
+            let mut dev = FakeDevice::new(4, 4, 128, 61);
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            dev.after_input = ping_after;
+            let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+            assert!(ping(&mut dev, &mut u) >= 0);
+            dev.after_input = play_after;
+            let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+            assert_eq!(lands(&mut dev, &mut u), u.latency() as usize, "pinged after: {ping_after}, played after: {play_after}");
+        }
+    }
+
+    /// **A backlog in the input ring does not move the loop**: the monitor
+    /// leaves a varying number of frames unread chunk to chunk, and the
+    /// measured loop and the landing are what they are with none.
+    #[test]
+    fn a_backlog_that_comes_and_goes_does_not_move_the_loop() {
+        let clean = {
+            let mut dev = FakeDevice::new(4, 4, 128, 90);
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+            ping(&mut dev, &mut u)
+        };
+        for pattern in [vec![0usize, 37, 100, 5, 64, 0, 120], vec![64; 3], vec![120, 0]] {
+            let mut dev = FakeDevice::new(4, 4, 128, 90);
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            dev.hold_back = pattern.clone();
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+            assert_eq!(ping(&mut dev, &mut u), clean, "the backlog {pattern:?} moved the measured loop");
+            let slips = dev.hub.port_for(7).unwrap().slips();
+            assert_eq!(lands(&mut dev, &mut u), u.latency() as usize, "{pattern:?}");
+            assert_eq!(dev.hub.port_for(7).unwrap().slips(), slips, "{pattern:?} starved the loop");
+        }
+    }
+
+    /// **Callbacks of varying length keep one latency**: the figure is
+    /// keyed on the largest callback the stream has handed over, so it
+    /// neither moves block to block nor flips a measured loop to unmeasured.
+    #[test]
+    fn callbacks_of_varying_length_keep_one_latency() {
+        let mut dev = FakeDevice::new(4, 4, 128, 40);
+        dev.sizes = vec![128, 96, 128, 64, 112, 128];
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 12, usize::MAX);
+        assert!(ping(&mut dev, &mut u) >= 0);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..60 {
+            let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+            seen.insert((u.latency(), dev.hub.port_for(7).unwrap().loop_frames().1));
+        }
+        assert_eq!(seen.len(), 1, "the latency or its measured flag moved: {seen:?}");
+        assert!(seen.iter().all(|(_, measured)| *measured));
+        assert_eq!(lands(&mut dev, &mut u), u.latency() as usize);
+    }
+
+    /// **Two clocks are found and refused, either way round**: an input
+    /// running fast or slow against the output walks the lead away, the
+    /// link says so, and the bay passes dry in time rather than crackling.
+    #[test]
+    fn an_input_on_another_clock_is_found_and_passes_dry() {
+        for drift in [50i64, -50] {
+            let mut dev = FakeDevice::new(4, 4, 128, 30);
+            dev.drift = drift;
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            let mut n = 0;
+            while u.link() != Link::ClockDrift {
+                let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+                n += 1;
+                assert!(n < 3_000, "drift {drift}: never found ({:?})", u.link());
+            }
+            let latency = u.latency() as usize;
+            assert_eq!(lands(&mut dev, &mut u), latency, "drift {drift}: not dry in time");
+        }
+        // One clock never trips it, however long it runs.
+        let mut dev = FakeDevice::new(4, 4, 128, 30);
+        dev.in_every = 3;
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 2_000, usize::MAX);
+        assert_eq!(u.link(), Link::Connected);
+        // And the host's word that the input is another device.
+        dev.hub.clocks().separate.store(true, Ordering::Relaxed);
+        let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+        assert_eq!(u.link(), Link::SeparateDevice);
+        assert!(one_device("Scarlett 18i20 USB", "Scarlett 18i20 USB"));
+        assert!(one_device("Analogue 1 + 2 (Scarlett 2i2 USB)", "Speakers (Scarlett 2i2 USB)"));
+        assert!(!one_device("MacBook Pro Microphone", "Scarlett 18i20 USB"));
+    }
+
+    /// **A loop the desk cannot compensate is refused**: an estimate past
+    /// the PDC limit links TooLong and passes dry at the limit, and a ping
+    /// that measures one refuses it.
+    #[test]
+    fn a_loop_past_the_compensation_limit_is_refused() {
+        // 4096-frame buffers: the law alone is 12288 frames.
+        let mut dev = FakeDevice::new(4, 4, 4096, 30);
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 3, usize::MAX);
+        assert_eq!(u.link(), Link::TooLong);
+        assert_eq!(dev.hub.port_for(7).unwrap().link(), Link::TooLong);
+        assert_eq!(u.latency(), PDC_LIMIT);
+        // A 9000-frame cable at small buffers: the ping says so.
+        let mut dev = FakeDevice::new(4, 4, 128, 9_000);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+        assert_eq!(PingFail::from_code(ping(&mut dev, &mut u)), Some(PingFail::TooLong));
+        assert!(u.measured().is_none());
+    }
+
+    /// **A ping refuses what it cannot trust**: a return still loud with
+    /// programme when the click fires, an ask that waited out a stood-down
+    /// bay, and a second press while the first is listening (absorbed: one
+    /// click, one answer for both).
+    #[test]
+    fn a_ping_refuses_a_busy_return_a_stale_ask_and_a_double_press() {
+        // Busy: a box that keeps playing a tone back whatever it is sent.
+        let mut dev = FakeDevice::new(4, 4, 128, 20);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        dev.hum = 0.4;
+        let mut n = 0u32;
+        while dev.hub.port_for(7).unwrap().pinging() {
+            let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+            n += 1;
+            assert!(n < 3_000);
+        }
+        assert_eq!(PingFail::from_code(dev.hub.port_for(7).unwrap().ping_answer().1), Some(PingFail::Busy));
+
+        // Stale: asked, then the bay does not run for three seconds.
+        let mut dev = FakeDevice::new(4, 4, 128, 20);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        let mut idle = HwInsert::new(48_000.0);
+        let _ = run_impulse(&mut dev, &mut idle, 48_000 * 3 / 128, usize::MAX);
+        let start = dev.last_out.len();
+        let _ = run_impulse(&mut dev, &mut u, 2, usize::MAX);
+        let _ = start;
+        assert_eq!(PingFail::from_code(dev.hub.port_for(7).unwrap().ping_answer().1), Some(PingFail::Expired));
+        assert!(!dev.hub.port_for(7).unwrap().pinging());
+
+        // A double press: one click goes out, one answer, the right one.
+        let mut dev = FakeDevice::new(4, 4, 128, 77);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 8, usize::MAX);
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        let mut clicks = 0;
+        let mut n = 0;
+        while dev.hub.port_for(7).unwrap().pinging() {
+            if n == 70 {
+                dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+            }
+            let _ = run_impulse(&mut dev, &mut u, 1, usize::MAX);
+            clicks += dev.last_out.chunks(4).filter(|f| f[2] > 0.4).count();
+            n += 1;
+            assert!(n < 3_000);
+        }
+        assert_eq!(clicks, 1, "a second press fired a second click");
+        let (seq, result) = dev.hub.port_for(7).unwrap().ping_answer();
+        assert_eq!(seq, 2, "the second press was left unanswered");
+        assert!(result >= 0);
+        assert_eq!(lands(&mut dev, &mut u), u.latency() as usize);
+    }
+
+    /// **A glitch that moves the input for good is recovered from at
+    /// once**: the input loses 300 frames, the loop starves, and within a
+    /// few blocks it has a new alignment, because the relock takes a fresh
+    /// look at the lead rather than the window that still holds the old one.
+    #[test]
+    fn a_lost_stretch_of_input_is_recovered_from_quickly() {
+        let mut dev = FakeDevice::new(4, 4, 128, 30);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let _ = run_impulse(&mut dev, &mut u, 80, usize::MAX);
+        dev.lose = 300;
+        let before = dev.hub.port_for(7).unwrap().slips();
+        let _ = run_impulse(&mut dev, &mut u, 30, usize::MAX);
+        let after = dev.hub.port_for(7).unwrap().slips();
+        assert!(after > before, "fixture: the loss did not starve the loop");
+        assert!(after - before <= RELOCK_AFTER + 2, "starved {} blocks before it recovered", after - before);
+        let _ = run_impulse(&mut dev, &mut u, 30, usize::MAX);
+        assert_eq!(dev.hub.port_for(7).unwrap().slips(), after, "it went on starving");
+        assert_eq!(u.link(), Link::Connected);
+    }
+
+    /// **A ping leaves no hole**: while it holds the send, and until the
+    /// programme has come round the loop again, the bay plays its input
+    /// delayed by its latency, so a steady signal through a wire stays
+    /// steady from before the ping to after it.
+    #[test]
+    fn a_ping_leaves_no_hole_in_the_track() {
+        let mut dev = FakeDevice::new(4, 4, 128, 25);
+        dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        let input = vec![vec![0.25f32; 128]; 2];
+        let mut out = vec![vec![0.0f32; 128]; 2];
+        for _ in 0..40 {
+            dev.block(&mut u, &input, &mut out);
+        }
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
+        let mut n = 0;
+        while n < 40 || dev.hub.port_for(7).unwrap().pinging() {
+            dev.block(&mut u, &input, &mut out);
+            for v in out.iter().flatten() {
+                assert!((v - 0.25).abs() < 1e-4, "block {n}: a {v} in a steady 0.25");
+            }
+            n += 1;
+            assert!(n < 3_000);
+        }
+        for _ in 0..40 {
+            dev.block(&mut u, &input, &mut out);
+            assert!(out.iter().flatten().all(|v| (v - 0.25).abs() < 1e-4));
+        }
+    }
+
+    /// **A send destination's second pass is in time too**: fully dry, an
+    /// impulse through the second pass comes out at the bay's latency.
+    #[test]
+    fn a_second_pass_in_a_chunk_is_as_late_as_the_first() {
+        let mut dev = FakeDevice::new(4, 4, 128, 20);
+        let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+        u.set_param(2, 0.0);
+        u.clear();
+        let mut heard = Vec::new();
+        for k in 0..20 {
+            let b = dev.next_frames();
+            let silence = vec![vec![0.0f32; b]; 2];
+            let mut l = vec![0.0f32; b];
+            if k == 4 {
+                l[0] = 1.0;
+            }
+            let hit = vec![l.clone(), l];
+            let in_ch = dev.in_ch;
+            dev.hub.begin_chunk(dev.view(b), |c| (c < in_ch).then_some(c));
+            let mut first = vec![vec![0.0f32; b]; 2];
+            let mut second = vec![vec![0.0f32; b]; 2];
+            u.process(&silence, b, &mut first);
+            u.process(&hit, b, &mut second);
+            dev.read_input();
+            let mut d = vec![0.0f32; b * 4];
+            dev.hub.fold(&mut d, 4, b);
+            heard.extend_from_slice(&second[0]);
+        }
+        let at = heard.iter().position(|v| v.abs() > 0.5).expect("the second pass's dry came out");
+        assert_eq!(at - 4 * 128, u.latency() as usize);
     }
 
     /// **Nothing on the audio thread allocates**: the unit's block, a ping
@@ -1933,12 +2602,12 @@ mod tests {
         let mut out = vec![vec![0.0f32; block]; 2];
         let mut dev_out = vec![0.0f32; block * 6];
         let arrived = vec![0.0f32; block * 6];
-        let view = dev.view();
+        let view = dev.view(block);
         // Warm up outside the window.
         for _ in 0..4 {
             dev.block(&mut u, &input, &mut out);
         }
-        dev.hub.port_for(7).unwrap().ask_ping();
+        dev.hub.port_for(7).unwrap().ask_ping(dev.now());
         let ((), counted) = crate::rt_alloc::count_allocs(|| {
             for _ in 0..800 {
                 dev.hub.begin_chunk(view, |c| (c < 6).then_some(c));
