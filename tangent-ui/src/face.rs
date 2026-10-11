@@ -1668,6 +1668,7 @@ pub(crate) mod fit {
         ("@tangent-plate", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-wah", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-ir", 2, &[], false, Vec2::new(600.0, 400.0), Vec2::new(1160.0, 620.0)),
+        ("@tangent-bitcrush", 6, &[5], false, Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
         // The analog's ids are sparse (0..85 with gaps between the blocks),
         // and this harness numbers its parameters densely, so the count is
         // the id ceiling: every dial the panel draws finds a pushed value,

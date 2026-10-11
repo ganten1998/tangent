@@ -33780,11 +33780,11 @@ mod tests {
     #[test]
     fn every_suite_unit_loads_into_a_bay_and_answers_its_lanes() {
         use crate::builtin_fx::{
-            AMP_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH,
-            IMAGER_PATH, IR_PATH, PLATE_PATH, TAPE_PATH, TREM_PATH, WAH_PATH,
+            AMP_PATH, BITCRUSH_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH,
+            EQ_PATH, IMAGER_PATH, IR_PATH, PLATE_PATH, TAPE_PATH, TREM_PATH, WAH_PATH,
         };
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let cases: [(&str, &str, usize); 13] = [
+        let cases: [(&str, &str, usize); 14] = [
             // Five bands of five knobs. Was 15 when the face showed three;
             // the two extra bands were APPENDED at ids 15..25, so this number
             // going UP is the whole change and this number going DOWN would
@@ -33802,6 +33802,7 @@ mod tests {
             (PLATE_PATH, "Tangent Plate", 4),
             (WAH_PATH, "Tangent Wah", 4),
             (IR_PATH, "Tangent IR", 2),
+            (BITCRUSH_PATH, "Tangent Bitcrush", 6),
         ];
         for (i, (path, class, lanes)) in cases.iter().enumerate() {
             // One per seat, bay 0 — four different racks holding the whole
@@ -33844,6 +33845,28 @@ mod tests {
         for (i, (a, b)) in flat.iter().zip(&through).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} flat, {b} through the EQ");
         }
+    }
+
+    /// **Tangent Bitcrush at its wire is a null through the real rack, and
+    /// at its rest it is not.** The wire is a state blob restored into the
+    /// bay (24 bits, full rate, unity both ways), which is the road a saved
+    /// session takes; the rest is a freshly inserted unit, which has to be
+    /// audible the moment it is seated or the owner hears nothing happen.
+    #[test]
+    fn a_bitcrusher_at_its_wire_is_a_null_through_the_master_rack() {
+        use crate::builtin_fx::{spec_for, state_text, BITCRUSH_PATH};
+        let spec = spec_for(BITCRUSH_PATH).unwrap();
+        let wire = state_text(spec, &[1.0, 1.0, 0.5, 1.0, 0.5, 0.0], &[]).into_bytes();
+        let flat = drums_through_master_bay(None);
+        let through = drums_through_master_bay(Some((BITCRUSH_PATH, Some(wire))));
+        assert!(flat.iter().any(|s| s.abs() > 0.001), "the fixture made no sound");
+        assert_eq!(flat.len(), through.len());
+        for (i, (a, b)) in flat.iter().zip(&through).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} flat, {b} through the wire");
+        }
+        let crushed = drums_through_master_bay(Some((BITCRUSH_PATH, None)));
+        let moved = flat.iter().zip(&crushed).filter(|(a, b)| a != b).count();
+        assert!(moved > flat.len() / 10, "the shipped crush changed {moved} of {} samples", flat.len());
     }
 
     /// **The live road moves the sound, the ledger and the sidecar** — a

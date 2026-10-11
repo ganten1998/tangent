@@ -268,6 +268,46 @@ mod tests {
         );
     }
 
+    /// **No built-in effect goes to the allocator to process a block**:
+    /// automation applied, the knobs gliding, mono and stereo, a block both
+    /// smaller and larger than the planar adapter's scratch. Walked over the
+    /// whole table so a unit added tomorrow is measured the day it lands;
+    /// Tangent Bitcrush is the one this was written for, and it holds no
+    /// scratch at all.
+    #[test]
+    fn no_built_in_effect_allocates_to_process_a_block() {
+        for spec in crate::builtin_fx::UNITS.iter().filter(|u| !u.voice) {
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            for channels in [2usize, 1] {
+                for frames in [64usize, 1_500] {
+                    let input: Vec<Vec<f32>> = (0..channels)
+                        .map(|c| (0..frames).map(|i| ((i + c) as f32 * 0.01).sin() * 0.5).collect())
+                        .collect();
+                    let mut out = vec![vec![0.0f32; frames]; channels];
+                    let points: Vec<tangent_host::ParamPoint> = spec
+                        .params
+                        .iter()
+                        .map(|p| tangent_host::ParamPoint { offset: 0, id: p.id, value: 0.3 })
+                        .collect();
+                    // One warm block outside the window: a kernel that
+                    // sizes something lazily on its first call is a
+                    // load-time cost, not a per-block one.
+                    unit.process(&input, frames, &mut out);
+                    let ((), c) = least_of(3, || {
+                        unit.apply(&points);
+                        unit.process(&input, frames, &mut out);
+                    });
+                    assert_eq!(
+                        c,
+                        Counted::default(),
+                        "{} allocated processing {channels} channel(s) of {frames}",
+                        spec.path
+                    );
+                }
+            }
+        }
+    }
+
     /// The 32-lane desk the baseline renders: noise on every lane, an EQ in
     /// every first bay, the fork on so the hands do real work.
     fn baseline_desk() -> Engine {
