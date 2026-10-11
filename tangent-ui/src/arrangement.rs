@@ -2385,6 +2385,16 @@ impl DeskSnap {
         self.plugins.get(&self.row_bay(row, bay)?).map(String::as_str).filter(|p| !p.is_empty())
     }
 
+    /// **Whether the track on `row` holds `path` in any of its six bays**
+    /// (`desk_id::chain_bays`): where an instrument may sit.
+    pub fn row_holds(&self, row: usize, path: &str) -> bool {
+        use crate::desk_id::{Node, SeatBay};
+        self.rows.get(row).is_some_and(|r| {
+            crate::desk_id::chain_bays()
+                .any(|(rack, bay)| self.plugins.get(&SeatBay::new(Node::Track(r.id), rack, bay)).is_some_and(|p| p == path))
+        })
+    }
+
     /// What stands at legacy FLAT bay `flat` under this snapshot's rows, if
     /// anything: the tests' way to ask by the frozen map's numbers.
     #[cfg(test)]

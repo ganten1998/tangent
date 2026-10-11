@@ -16294,8 +16294,20 @@ impl DesktopApp {
         for ch in 0..self.app.desk_extent() {
             let strip = Strip::Channel(ch);
             let live = match self.app.channel_kind(ch) {
+                // A plugin in its first bay, or one of the house's
+                // instruments in any bay: a second instrument on a track
+                // plays, so one standing in its third bay is a loss too.
                 Some(tangent_ui::recorder::ChannelKind::Midi) => {
                     crate::engine_bridge::row_instrument(&self.app, ch).is_some()
+                        || [
+                            tangent_ui::dialogs::BUILTIN_PATH,
+                            tangent_ui::dialogs::KEYS_PATH,
+                            tangent_ui::dialogs::DRUMPAD_PATH,
+                            crate::builtin_fx::ANALOG_PATH,
+                            crate::builtin_fx::SAMPLER_PATH,
+                        ]
+                        .into_iter()
+                        .any(|path| self.app.row_holds(ch, path))
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => self
                     .app

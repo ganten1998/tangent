@@ -62,6 +62,14 @@ pub const MAX_ROWS: usize = 65_536;
 /// the reader then throws away.
 pub const MAX_CHAIN: usize = 2;
 
+/// **A track's six bays in chain order**: its own rack's three, then its
+/// extra rack's. Where a track's instruments may sit: two or more on one
+/// track all play from its notes, so "does this track carry the drumpad"
+/// asks all six, never the first alone.
+pub fn chain_bays() -> impl Iterator<Item = (Rack, u8)> {
+    (0..STRIP_RACKS as u16).flat_map(|c| (0..BAYS as u8).map(move |b| (Rack::Chain(c), b)))
+}
+
 /// The plugin-state sidecar's name prefix. The body is unchanged from the
 /// legacy files: `<bundle path> NUL <TGST state>`.
 pub const STATE_PREFIX: &str = "pstate-";
