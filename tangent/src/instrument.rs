@@ -12844,15 +12844,14 @@ impl Renderer {
             };
             let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
-                // **The lamp answers for the peak INTO the limiter.** With a
-                // limiter in circuit the master never clips, so the latch
-                // below, taken after it, could never light: the owner's
-                // "make it such that the VU meters trigger on peak again".
-                // A sample at the ceiling here is a peak the limiter is
-                // about to catch, and that is what a peak lamp is for.
-                if mix.iter().any(|s| s.abs() >= CLIP_LEVEL) {
-                    clipped = true;
-                }
+                // **No lamp here, INTO the limiter.** It latched on this mix
+                // for a while, so a limiter catching anything over full
+                // scale lit it - and the owner read "peaking" off a master
+                // held at -1 dBFS: "consistently gets triggered as peaking
+                // when the limiter is engaged and at -1dB". The meter and
+                // the lamp both answer for what LEAVES, below, after the
+                // limiter and the master fader; how hard the limiter is
+                // working is the gain-reduction readout's job.
                 self.master_effects.process(
                     mix,
                     n,
@@ -25179,6 +25178,14 @@ impl Engine {
     /// the limiter guarantees. The click and the audition ride above it on
     /// the cue road, unmetered, so a metronome can never light the clip lamp
     /// over a correctly limited master.
+    ///
+    /// **What leaves, exactly**: after the master inserts and the limiter,
+    /// after the master fader, balance and mono fold - the device's own
+    /// samples less the cue. `clipped` latches when one of those samples
+    /// reaches `CLIP_LEVEL` (0.9999, -0.0009 dBFS), sample peak, and on
+    /// nothing else: a limiter holding the master at -1 dBFS never lights
+    /// it however hard it is driven, and a fader pushing the master over
+    /// full scale after the limiter does.
     ///
     /// The peak is read-and-cleared, so a transient between two UI frames is
     /// never missed; the hold decays here rather than in the callback, at the
@@ -39838,15 +39845,13 @@ mod tests {
         assert_eq!(e.offline_stem_lead(LEGACY_LANES + 5), 300, "an out-of-range lane reads the bare lead");
     }
 
-    /// **The lamp answers for the peak INTO the limiter.** A limiter in
-    /// circuit holds the master under the ceiling, so a latch taken after it
-    /// could never light: an input hot enough to clip lights the lamp while
-    /// the output stays held. The owner's "make it such that the VU meters
-    /// trigger on peak again (they currently do not)".
-    #[test]
-    fn the_lamp_lights_for_a_peak_into_the_limiter() {
+    /// What one render of a tone `amp` hard into the master reports: the
+    /// device's real sample peak, the take's, the meter's own peak cell and
+    /// whether the clip lamp latched. `limiter` is the knob position and
+    /// `master` the master fader's gain, applied after the limiter.
+    fn drive_the_master(amp: f32, limiter: f32, master: f32) -> (f32, f32, f32, bool) {
         let shared = Arc::new(Shared::new());
-        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 14);
+        let (tap_tx, mut tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         r.monitor = Some(in_rx);
@@ -39857,27 +39862,90 @@ mod tests {
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         shared.armed.store(1 << 1, Ordering::Relaxed);
-        shared.monitor_on.store(false, Ordering::Relaxed);
-        shared
-            .limiter_mix
-            .store(tangent_ui::recorder::LIMITER_SHIPS_AT.to_bits(), Ordering::Relaxed);
+        shared.monitor_on.store(true, Ordering::Relaxed);
+        shared.limiter_mix.store(limiter.to_bits(), Ordering::Relaxed);
+        shared.master_gain.store(master.to_bits(), Ordering::Relaxed);
         r.lane_body_mut(1).channel_gain = 1.0;
         let mut out = vec![0.0f32; 256 * 2];
-        let mut peak = 0.0f32;
+        let (mut dev, mut take, mut metered) = (0.0f32, 0.0f32, 0.0f32);
         for b in 0..200 {
             for i in 0..256 {
-                // A 1 kHz-ish tone at 1.5, well over the ceiling.
                 let t = (b * 256 + i) as f32 / 48_000.0;
-                let _ = in_tx.push(1.5 * (t * 6_283.0).sin());
+                let _ = in_tx.push(amp * (t * 6_283.0).sin());
+            }
+            // The knob slews from rest to its position over the first blocks;
+            // the settled half of the render is what is measured, and the
+            // latch and the meter's peak are cleared at the same point, the
+            // way the clear button and the UI's read clear them.
+            if b == 100 {
+                shared.clipped.store(false, Ordering::Relaxed);
+                shared.peak_l.store(0, Ordering::Relaxed);
+                shared.peak_r.store(0, Ordering::Relaxed);
             }
             let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
             r.render(&mut out, now as Nanos, now as Nanos);
+            while let Ok(s) = tap_rx.pop() {
+                if b > 100 {
+                    take = take.max(s.abs());
+                }
+            }
             if b > 100 {
-                peak = peak.max(out.iter().fold(0.0f32, |a, s| a.max(s.abs())));
+                dev = dev.max(out.iter().fold(0.0f32, |a, s| a.max(s.abs())));
+                metered = metered
+                    .max(Shared::f32_of(&shared.peak_l))
+                    .max(Shared::f32_of(&shared.peak_r));
             }
         }
-        assert!(shared.clipped.load(Ordering::Relaxed), "a peak into the limiter did not light the lamp");
-        assert!(peak < 1.0, "the limiter let the master through at {peak}");
+        (dev, take, metered, shared.clipped.load(Ordering::Relaxed))
+    }
+
+    /// **The meter measures what leaves, and the lamp answers for it.**
+    ///
+    /// The owner's "it consistently gets triggered as peaking when the
+    /// limiter is engaged and at -1dB": a tone at +3.5 dBFS (1.5) driven into
+    /// the master limiter at its shipping -1 dB ceiling. What leaves is held
+    /// at -1 dBFS; the lamp latched anyway, because it was latched on the
+    /// signal going INTO the limiter, which no meter on the band displays.
+    #[test]
+    fn a_master_held_at_minus_one_by_the_limiter_does_not_light_the_clip_lamp() {
+        let (dev, take, metered, clipped) =
+            drive_the_master(1.5, tangent_ui::recorder::LIMITER_SHIPS_AT, 1.0);
+        let db = |v: f32| 20.0 * v.log10();
+        eprintln!(
+            "limited: device {:.3} dBFS, take {:.3} dBFS, meter {:.3} dBFS, lamp {clipped}",
+            db(dev),
+            db(take),
+            db(metered)
+        );
+        // The limiter holds: nothing leaves above its -1 dB ceiling.
+        assert!(db(dev) <= -1.0 + 0.001, "the limiter let the device {:.3} dBFS", db(dev));
+        assert!(db(take) <= -1.0 + 0.001, "the limiter let the take {:.3} dBFS", db(take));
+        // The meter reads that output, not what went into the limiter.
+        assert!(
+            (metered - dev).abs() < 1.0e-6,
+            "the meter's peak {:.3} dBFS is not the device's {:.3} dBFS",
+            db(metered),
+            db(dev)
+        );
+        assert!(!clipped, "the lamp latched on a master held at {:.3} dBFS", db(dev));
+    }
+
+    /// **And a master that really reaches full scale still lights it**:
+    /// the same drive with the limiter out of circuit, and with the limiter
+    /// in but the master fader +6 dB after it. The lamp is the output's.
+    #[test]
+    fn a_master_that_reaches_full_scale_lights_the_clip_lamp() {
+        let db = |v: f32| 20.0 * v.log10();
+        let (dev, _, metered, clipped) = drive_the_master(1.5, 1.0, 1.0);
+        eprintln!("unlimited: device {:.3} dBFS, meter {:.3} dBFS, lamp {clipped}", db(dev), db(metered));
+        assert!(dev >= 1.0, "the fixture did not reach full scale: {dev}");
+        assert!(clipped, "an unlimited master at {:.3} dBFS did not light the lamp", db(dev));
+        let (dev, _, metered, clipped) =
+            drive_the_master(1.5, tangent_ui::recorder::LIMITER_SHIPS_AT, 2.0);
+        eprintln!("fader +6: device {:.3} dBFS, meter {:.3} dBFS, lamp {clipped}", db(dev), db(metered));
+        assert!(dev >= 1.0, "the fader did not take the master past full scale: {dev}");
+        assert!((metered - dev).abs() < 1.0e-6, "the meter is not reading after the master fader");
+        assert!(clipped, "a master faded to {:.3} dBFS did not light the lamp", db(dev));
     }
 
     #[test]
