@@ -2725,6 +2725,13 @@ pub enum RecorderRequest {
         from: crate::desk_id::SeatBay,
         to: crate::desk_id::SeatBay,
     },
+    /// **A Tangent Insert bay's routing or ping.** Appended at the END, this
+    /// enum's law. `bay` by identity, the `SetInsertIr` convention; the host
+    /// checks a route against the device before it writes the bay's state.
+    HwInsert {
+        bay: crate::desk_id::SeatBay,
+        ask: crate::faces_hwinsert::HwAsk,
+    },
 }
 
 /// How hard an auditioned note is struck.

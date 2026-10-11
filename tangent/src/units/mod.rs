@@ -24,6 +24,7 @@ pub mod drive;
 #[cfg(feature = "recorder")]
 pub mod echo;
 pub mod eq;
+pub mod hwinsert;
 pub mod imager;
 /// Wraps DSP that lives in the recorder-gated `effects` module, so the
 /// Minimal build — which has no effects chain to borrow from — skips it.
