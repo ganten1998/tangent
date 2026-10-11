@@ -63,6 +63,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Tangent Denoise opens on the Bank.** A freshly inserted denoiser, and a
+  reset to defaults, now start on the Bank kernel instead of Spectral Studio,
+  with the other dials where they were. Saved projects keep the kernel they
+  were saved with, and a project saved before the Kernel choice existed still
+  opens on Spectral Studio as it did.
+
 - **A supporter key now takes the track limit away, and the free app holds
   32 tracks.** Without a key the desk holds up to 32 tracks: MIDI and audio
   tracks and folders count. With one there is no limit but the machine's.

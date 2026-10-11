@@ -256,8 +256,11 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
 /// forever and a value must never move one knob to the left because a
 /// parameter was added, so a new one takes a new number at the end of the
 /// road — which is also why a session written before a parameter existed
-/// reads it as the spec's default (Spectral Studio; 10 ms; 2 dB) and not
-/// as position zero.
+/// reads it as the spec's default (10 ms; 2 dB) and not as position zero.
+/// The KERNEL is the one exception: a fresh bay opens on the Bank (the
+/// owner, 2026-10-11), while a blob with no `kernel=` line keeps reading
+/// as Spectral Studio, what it has read as since the selector landed. See
+/// [`absent_reads_as`].
 ///
 /// The defaults for `smooth` and `release` moved on 2026-09-16 (the
 /// softest knee, 100 ms) with the owner's new numbers; a bay saved before
@@ -269,7 +272,7 @@ const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.197, steps: 0 },
     ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
-    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.5, steps: DENOISE_KERNEL_STEPS },
+    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.0, steps: DENOISE_KERNEL_STEPS },
     ParamSpec { id: 7, symbol: "attack", name: "Attack", units: "ms", default: 0.5, steps: 0 },
     ParamSpec { id: 8, symbol: "treble", name: "Treble Boost", units: "dB", default: 1.0 / 3.0, steps: 0 },
 ];
@@ -1291,12 +1294,34 @@ pub fn extra_from_state(spec: &UnitSpec, bytes: &[u8]) -> Vec<(String, String)> 
         .collect()
 }
 
+/// **What a symbol a saved blob LACKS reads as, when that is no longer the
+/// spec's default.**
+///
+/// A missing line normally reads as the spec's default, which is right
+/// while the default has never moved: the blob was written before the
+/// knob existed, and the default is what that knob gave the day it
+/// arrived. Once a default moves, the two part company. A fresh bay should
+/// open on the new one; a saved one must go on playing what it played.
+/// Each entry here is a default that moved after blobs without its line
+/// were already in the world, pinned to what those blobs have always read.
+///
+/// The denoise's kernel: a fresh bay opens on the Bank since 2026-10-11,
+/// and a blob from before the selector stays on
+/// [`crate::units::denoise::DenoiseKernel::UNWRITTEN`] (Spectral Studio).
+fn absent_reads_as(path: &str, symbol: &str) -> Option<f32> {
+    match (path, symbol) {
+        (DENOISE_PATH, "kernel") => Some(crate::units::denoise::DenoiseKernel::UNWRITTEN.dial()),
+        _ => None,
+    }
+}
+
 /// Read a state blob back into a full value table.
 ///
 /// Forgiving about lines and strict about the container, on the LV2 model: a
 /// symbol this build does not know is skipped (a newer build's parameter), a
-/// symbol the blob lacks reads as its default (an older build's file), a value
-/// that does not parse or is not finite reads as its default — but a blob that
+/// symbol the blob lacks reads as its default (an older build's file; see
+/// [`absent_reads_as`] for a default that moved since), a value that does
+/// not parse or is not finite reads as that same value; but a blob that
 /// is not this format at all is an `Err`, because it is another plugin's state
 /// or a damaged file, and the user should hear that their settings did not
 /// come back rather than get defaults dressed as a restore.
@@ -1306,7 +1331,11 @@ pub fn values_from_state(spec: &UnitSpec, bytes: &[u8]) -> Result<Vec<f32>, Stri
     if lines.next() != Some("tangentfx 1") {
         return Err("the stored block is not a built-in effect's state".to_owned());
     }
-    let mut values = spec.defaults();
+    let mut values: Vec<f32> = spec
+        .params
+        .iter()
+        .map(|p| absent_reads_as(spec.path, p.symbol).unwrap_or(p.default))
+        .collect();
     for line in lines {
         let Some((symbol, value)) = line.split_once('=') else {
             continue;
@@ -3168,7 +3197,8 @@ mod tests {
         }
         // The kernel menu steps across exactly the kernel's enum, ends
         // inclusive, and its default position is the one the enum calls
-        // Spectral Studio — a literal in the table, pinned to its source.
+        // Bank (the owner, 2026-10-11): a literal in the table, pinned to
+        // its source.
         use crate::units::denoise::DenoiseKernel;
         assert_eq!(
             DENOISE_KERNEL_STEPS as usize,
@@ -3177,8 +3207,8 @@ mod tests {
         );
         assert_eq!(
             DenoiseKernel::from_dial(d.kernel),
-            DenoiseKernel::SpectralStudio,
-            "the shipped denoise no longer opens on Spectral Studio"
+            DenoiseKernel::Bank,
+            "the shipped denoise no longer opens on the Bank"
         );
         // The amp's table is nine knobs to the kernel's eight: VIB is a
         // panel SWITCH the wrapper folds into vib_depth (off = depth 0),
@@ -3610,6 +3640,79 @@ mod tests {
         );
     }
 
+    /// **A fresh denoise opens on the Bank; a saved one plays the engine it
+    /// was saved with.**
+    ///
+    /// The owner, 2026-10-11: "make the bank setting the default for the
+    /// denoise plugin". A new bay is `spec.defaults()` through
+    /// `UnitSpec::create` (the loader's `None` state), and a reset-to-default
+    /// reads the face's `default`, which is the same spec row. A saved bay is
+    /// `values_from_state` over its blob, and that must not follow: a blob
+    /// that names its kernel keeps it, and a blob written before the selector
+    /// existed keeps reading as Spectral Studio, every value of it exactly
+    /// what it decoded to before the default moved.
+    ///
+    /// Revert-check: put `values_from_state` back on `spec.defaults()` and
+    /// the pre-selector blob opens on the Bank, which this names.
+    #[test]
+    fn a_fresh_denoise_opens_on_the_bank_and_a_saved_one_keeps_its_engine() {
+        use crate::units::denoise::{DenoiseKernel, DenoiseParams, DENOISE_LOOKAHEAD_MS};
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let at = spec.params.iter().position(|p| p.symbol == "kernel").expect("a kernel knob");
+        let la = (48_000.0 * DENOISE_LOOKAHEAD_MS / 1_000.0).round() as u32;
+
+        // Fresh: the spec row, the kernel's own default and the face agree,
+        // and the latency is the bank's (its lookahead, which ships on).
+        let fresh = spec.defaults();
+        assert_eq!(DenoiseKernel::from_dial(fresh[at]), DenoiseKernel::Bank);
+        assert_eq!(fresh[at], DenoiseParams::default().kernel);
+        assert_eq!(describe(DENOISE_PATH, 6, fresh[at], &fresh), "Bank");
+        assert_eq!(
+            spec.create(48_000.0, &fresh).latency(),
+            la,
+            "a fresh denoise does not report the bank's lookahead"
+        );
+        // The owner's other dials did not move with the engine (the softest
+        // knee, 100 ms): a fresh bay is what choosing Bank on a fresh bay
+        // gave before, with nothing else touched.
+        assert_eq!((fresh[2], fresh[3]), (0.0, 0.197), "a fresh bay's smooth/release moved with the engine");
+
+        // Saved, naming its kernel: every engine comes back as itself.
+        for k in DenoiseKernel::ALL {
+            let mut v = spec.defaults();
+            v[at] = k.dial();
+            let back = values_from_state(spec, state_text(spec, &v, &[]).as_bytes()).expect("reads");
+            assert_eq!(DenoiseKernel::from_dial(back[at]), k, "a saved {} reopened as another engine", k.label());
+            assert_eq!(back, v, "a saved {} bay did not come back value for value", k.label());
+        }
+
+        // Saved before the selector: exactly the table it decoded to before
+        // the fresh default moved, written out rather than derived, so a
+        // second default moving underneath it is caught too.
+        let old_blob = b"tangentfx 1\nlearn=0\nreduce=0.3\nsmooth=0.5\nrelease=0.5\nsc_hpf=0\nlookahead=0\n";
+        let back = values_from_state(spec, old_blob).expect("a pre-kernel blob still reads");
+        assert_eq!(
+            back,
+            vec![0.0, 0.3, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0 / 3.0],
+            "a blob written before the Kernel parameter no longer decodes as it did"
+        );
+        assert_eq!(
+            DenoiseKernel::from_dial(back[at]),
+            DenoiseKernel::SpectralStudio,
+            "a blob written before the Kernel parameter followed the fresh default onto the Bank"
+        );
+        // And a kernel line that does not parse reads as the same promise,
+        // as it did before (it read as the spec default, then Studio).
+        let garbled = b"tangentfx 1\nkernel=bank\n";
+        let back = values_from_state(spec, garbled).expect("reads");
+        assert_eq!(DenoiseKernel::from_dial(back[at]), DenoiseKernel::SpectralStudio);
+        // No other unit's missing lines changed meaning.
+        for other in UNITS.iter().filter(|u| u.path != DENOISE_PATH) {
+            let back = values_from_state(other, b"tangentfx 1\n").expect("an empty blob reads");
+            assert_eq!(back, other.defaults(), "{}'s empty blob no longer reads as its defaults", other.class);
+        }
+    }
+
     /// **Learn, freeze, persist, restore: the denoise's whole threshold
     /// story at the unit level.** The dial up is listening, the falling edge
     /// freezes, the snapshot is offered for exactly the freeze block, and a
@@ -3617,7 +3720,12 @@ mod tests {
     #[test]
     fn the_denoise_learns_on_the_falling_edge_and_the_extra_state_restores_it() {
         let spec = spec_for(DENOISE_PATH).unwrap();
-        let mut unit = spec.create(48_000.0, &spec.defaults());
+        // On Spectral Studio by name: this test is about a SPECTRAL print
+        // and the bank's knees taken beside it, and the unit opens on the
+        // Bank since 2026-10-11.
+        let mut studio = spec.defaults();
+        studio[6] = crate::units::denoise::DenoiseKernel::SpectralStudio.dial();
+        let mut unit = spec.create(48_000.0, &studio);
         assert!(
             unit.learn_snapshot().is_none(),
             "an idle denoise offered a snapshot"
@@ -3646,7 +3754,7 @@ mod tests {
             thr.iter().any(|t| *t > 0.05),
             "a broadband learn froze an all-off bank: {thr:?}"
         );
-        // The unit ships on Spectral Studio, so this print is the spectral
+        // The unit runs Spectral Studio here, so this print is the spectral
         // kernel's own reading and the knees beside it are the BANK's
         // measurement of the same noise, taken by `learn_feed` during the
         // same pass - see `Band::knee_db`. Real knees, then: every band
@@ -3675,7 +3783,7 @@ mod tests {
             .map(|(k, t)| (format!("t{k}"), t.to_string()))
             .chain(knees.iter().enumerate().map(|(k, t)| (format!("k{k}"), t.to_string())))
             .collect();
-        let mut restored = spec.create(48_000.0, &spec.defaults());
+        let mut restored = spec.create(48_000.0, &studio);
         assert!(restored.apply_extra_state(&extra).is_none());
         let BuiltinUnit::Denoise(r) = &restored else {
             panic!("the denoise path built something else");
@@ -3895,8 +4003,8 @@ mod tests {
     ///
     /// `Denoise::process` sends every kernel but the Bank to
     /// `process_spectral` and returns; `params.smooth` and `params.release`
-    /// are read below that line. So on Spectral Studio — the unit's SHIPPED
-    /// kernel — those two dials are inert, and the face used to print a
+    /// are read below that line. So on Spectral Studio (the unit's SHIPPED
+    /// kernel until 2026-10-11) those two dials are inert, and the face used to print a
     /// confident "2.8:1" and "219 ms" under both of them. Measured, not
     /// inferred: the same take rendered at smooth 0.0 and 1.0 and at release
     /// 0.0 and 1.0 comes back byte for byte identical, all four hashes equal
