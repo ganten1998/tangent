@@ -180,6 +180,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Track numbers in the arrangement are no longer cut off.** The second
+  figure of a lane number (10, 11, ...) ran out of its column toward the arm
+  button. The column is now as wide as the desk's longest number, so two,
+  three and four figures fit at full size in every typeface, and the plus on
+  an empty numbered slot no longer sits on top of its number.
+
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be
   routed into somebody else's audio, and removing a track left routes aimed

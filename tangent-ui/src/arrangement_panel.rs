@@ -560,6 +560,11 @@ impl LaneId {
 pub struct ArrangeView<'a> {
     /// The lanes the layout will place: see [`Lanes`].
     pub lanes: Lanes<'a>,
+    /// **How many rows the desk numbers**, the whole desk and not the
+    /// window `lanes` carries: the widest number any header can wear, so the
+    /// number column is cut for it (see [`number_column_w`]) and does not
+    /// jump as a scroll walks from row 99 to row 100.
+    pub desk_rows: usize,
     /// The MASTER's level — linear, as the desk's fader sits.
     pub master_gain: f32,
     /// What it is making right now, for the slim meter beside the knob.
@@ -1012,6 +1017,39 @@ pub enum RowKind {
 /// the title roughly one character.
 pub const FOLDER_INDENT: f32 = 10.0;
 
+/// **The lane number's type**, in points, before any shrink.
+const NUM_PT: f32 = 10.0;
+/// The number's last resort: below this it is not a number, and a column
+/// too narrow for it at this size draws it clipped rather than as a smudge.
+const NUM_FLOOR_PT: f32 = 6.5;
+/// **The widest digit any bundled face draws at [`NUM_PT`]**: Courier
+/// Prime and JetBrains Mono advance 0.6 of the em, Terminess 0.5.
+/// `every_lane_number_fits_its_column` measures all three against it.
+const NUM_DIGIT_W: f32 = 6.0;
+/// Where the number begins inside its column: the four points off the
+/// plate's edge it has always been drawn at.
+const NUM_LEAD: f32 = 3.0;
+/// The digits the column is never cut narrower than, so a desk under ten
+/// tracks lines up with one over it.
+const NUM_MIN_DIGITS: usize = 2;
+/// The digits it is never cut WIDER than: a five-figure desk shrinks its
+/// type (to [`NUM_FLOOR_PT`]) rather than taking more from the name.
+const NUM_MAX_DIGITS: usize = 4;
+
+/// **The width of the lane number's column, for a desk whose widest number
+/// is `widest`.**
+///
+/// It was a fixed twelve points, of which nine were left after the lead,
+/// and a two-figure number at ten points is twelve wide: "10" ran three
+/// points out of its column, its second figure ending a point short of the
+/// arm dot, the owner's "gets cut off slightly at the 2nd digit". The column
+/// is cut for the desk's widest number now, two figures at least and four
+/// at most, a point of air after it.
+pub fn number_column_w(widest: usize) -> f32 {
+    let digits = widest.max(1).to_string().len().clamp(NUM_MIN_DIGITS, NUM_MAX_DIGITS);
+    NUM_LEAD + digits as f32 * NUM_DIGIT_W + 1.0
+}
+
 /// The `AutoView` for a row, wherever it lives.
 ///
 /// One lookup, because `lanes` holds the channels and the master's rows sit
@@ -1072,6 +1110,9 @@ pub struct Row {
 
 pub struct Layout {
     pub header: Rect,
+    /// The lane number's column width, one for the whole desk: see
+    /// [`number_column_w`]. The painter sizes the number against it.
+    pub num_w: f32,
     pub ruler: Rect,
     /// The top sliver of the ruler: the time-signature chips and the
     /// MARKER FLAGS, which share it.
@@ -1635,6 +1676,7 @@ impl Layout {
                 header_rows: ByRow::default(),
                 master_row: BusRow::NONE,
                 lane_bar: LaneBar::NONE,
+                num_w: 0.0,
             };
         }
         // The frame first — see [`Frame`] for why it is its own step.
@@ -1806,6 +1848,17 @@ impl Layout {
         // ends flush.
         let mut lane_rows = Vec::with_capacity(visible + 1);
         let mut header_rows = Vec::with_capacity(visible + 1);
+        // **One number column for the whole desk**, cut for its widest
+        // number: the desk's own count, or a numbered row in the window past
+        // it if a caller's count fell short. The trailing add wears no
+        // number, so it is not counted.
+        let num_w = number_column_w(
+            view.lanes
+                .rows()
+                .filter(|(_, l)| l.used || l.plus == crate::mixer_panel::Plus::Row)
+                .map(|(r, _)| r + 1)
+                .fold(view.desk_rows, usize::max),
+        );
         for (i, lane) in placeable().take(visible + 1) {
             let at = rows.len();
             push(RowKind::Track(i), lane_h, &mut y, &mut rows);
@@ -1819,6 +1872,7 @@ impl Layout {
                 if row.header.is_positive() {
                     let mut h = Self::header_row(
                         row.header,
+                        num_w,
                         lane.used,
                         if lane.in_folder { FOLDER_INDENT } else { 0.0 },
                         lane.is_folder,
@@ -1968,12 +2022,20 @@ impl Layout {
             header_rows,
             master_row,
             lane_bar,
+            num_w,
         }
     }
 
     /// The cells across one header, REAPER's row at Tangent's density:
     /// number, arm dot, name, gain knob, slim meter, M/S.
-    fn header_row(row: Rect, used: bool, indent: f32, folder: bool, plus: crate::mixer_panel::Plus) -> HeaderRow {
+    fn header_row(
+        row: Rect,
+        num_w: f32,
+        used: bool,
+        indent: f32,
+        folder: bool,
+        plus: crate::mixer_panel::Plus,
+    ) -> HeaderRow {
         // **The indent moves the CONTENTS, and `panel` keeps the whole row.**
         //
         // The panel is what a press is tested against and what the plate is
@@ -1999,9 +2061,14 @@ impl Layout {
             // height: at a squeezed row the old full-height centre put the
             // plus on top of the lane's own number.
             let d = (r.height() * 0.44).clamp(16.0, 26.0).min((r.height() - 16.0).max(12.0));
+            // **And right of the number's column**, which is level with the
+            // plus rather than above it: a tenth of the row in put the ring
+            // over the slot's own number on every header narrower than
+            // about three hundred points. The trailing add has no number and
+            // stands in the same place anyway, so the pluses make one column.
             let add = Rect::from_center_size(
                 Pos2::new(
-                    r.left() + r.width() * 0.10,
+                    (r.left() + r.width() * 0.10).max(r.left() + num_w + 2.0 + d * 0.5),
                     r.center().y.max(r.top() + 13.0 + d * 0.5),
                 ),
                 Vec2::splat(d),
@@ -2054,8 +2121,9 @@ impl Layout {
         };
         // The number and the arm keep FIXED seats at the left — the
         // proportional cuts walked the dot into the track title whenever
-        // the header widened.
-        let number = Rect::from_min_max(r.min, Pos2::new(r.left() + 12.0, r.bottom()));
+        // the header widened. Fixed for the DESK, that is: the column is as
+        // wide as the desk's widest number (`number_column_w`).
+        let number = Rect::from_min_max(r.min, Pos2::new(r.left() + num_w, r.bottom()));
         // The arm's GEOMETRY stands even where the arm does not: the
         // theory/automation pair anchors off its right edge, so a folder -
         // which cannot record and returns NOTHING for the field - still
@@ -7294,7 +7362,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // could be PRESSED and not seen.
     draw_auto_headers(painter, &l, view, &p);
 
-    let num_font = FontId::new(10.0, crate::fonts::courier());
+    let num_font = FontId::new(NUM_PT, crate::fonts::courier());
     // **The MASTER, above the tracks, in the mixer's own colours.**
     //
     // The desk draws a strip for it and the timeline drew none, so a
@@ -7557,11 +7625,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let ink_on = on_ink(face);
         // The trailing add is no row yet, so it wears no number.
         let numbered = lane.used || lane.plus == crate::mixer_panel::Plus::Row;
+        let num = if numbered { format!("{}", i + 1) } else { String::new() };
+        // **Its column is cut for the desk's widest number** (see
+        // `number_column_w`), so a number fits at full size up to four
+        // figures. Past that the type gives way, down to the floor, rather
+        // than the column taking the name's room.
+        let num_font = {
+            let room = l.num_w - NUM_LEAD - 0.5;
+            let wide = if num.len() > NUM_MAX_DIGITS {
+                painter.layout_no_wrap(num.clone(), num_font.clone(), Color32::WHITE).rect.width()
+            } else {
+                0.0
+            };
+            if wide > room && wide > 0.0 {
+                FontId::new(
+                    ((NUM_PT * room / wide * 2.0).floor() * 0.5).max(NUM_FLOOR_PT),
+                    num_font.family.clone(),
+                )
+            } else {
+                num_font.clone()
+            }
+        };
         painter.text(
-            Pos2::new(plate.left() + 4.0, plate.center().y),
+            // `plate.left() + 4` is the column's left plus its lead: the
+            // plate sits a point outside the row the column is cut from.
+            Pos2::new(plate.left() + 1.0 + NUM_LEAD, plate.center().y),
             Align2::LEFT_CENTER,
-            if numbered { format!("{}", i + 1) } else { String::new() },
-            num_font.clone(),
+            num,
+            num_font,
             if lane.used {
                 quiet(ink_on, face, 0.30)
             } else {
@@ -9617,6 +9708,161 @@ LaneView {
         );
     }
 
+    /// **No lane number is cut, in any face, at any header width, on a desk
+    /// of any length.**
+    ///
+    /// The owner: "Track count in arrangement view gets cut off slightly at
+    /// the 2nd digit". The column was a fixed twelve points, nine of them
+    /// after the lead, and "10" at ten points is twelve wide, so the second
+    /// figure ran out of the column toward the arm. Desks of 9, 10, 99, 100,
+    /// 999, 1000, 1234 and 12345 rows, the last few rows of each in the
+    /// window (a folder child and an empty numbered slot among them), at the
+    /// width floor, the default, 220 and half the view, on several windows,
+    /// in all three bundled faces: every number is painted whole inside its
+    /// column, clear of every other control on its header, at no less than
+    /// the 6.5 point floor, and four figures keep the full ten points. The
+    /// room is not the name's: every track keeps its input chip and a name
+    /// no narrower than the twenty points the dials already leave it (their
+    /// forty-point column less the note and wrench).
+    ///
+    /// Revert check: make `number_column_w` answer the old twelve and this
+    /// fails on desk 10, "10" running past its column.
+    #[test]
+    fn every_lane_number_fits_its_column() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        let mut bad: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            crate::fonts::apply_text_styles(&ctx);
+            // The widest digit, measured: the constant the column is cut by.
+            let mut digit = 0.0_f32;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for d in 0..10 {
+                        let g = ui.painter().layout_no_wrap(
+                            d.to_string(),
+                            FontId::new(NUM_PT, crate::fonts::courier()),
+                            Color32::WHITE,
+                        );
+                        digit = digit.max(g.size().x);
+                    }
+                });
+            });
+            assert!(
+                digit <= NUM_DIGIT_W + 0.01,
+                "{face:?}: a digit is {digit}pt at {NUM_PT}pt, the column allows {NUM_DIGIT_W}"
+            );
+            for desk in [9usize, 10, 99, 100, 999, 1000, 1234, 12345] {
+                let first = desk.saturating_sub(7);
+                let lanes = || -> Vec<(usize, LaneView<'static>)> {
+                    (first..desk)
+                        .map(|row| {
+                            let k = row - first;
+                            let mut lane = a_lane(k != 2);
+                            lane.in_folder = k == 4;
+                            (row, lane)
+                        })
+                        .collect()
+                };
+                for (w, h) in [(940.0, 420.0), (1300.0, 420.0), (1920.0, 900.0), (2560.0, 1300.0)] {
+                    let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+                    for header_w in [Some(header_floor), None, Some(220.0), Some(w * 0.5)] {
+                        let mut v = a_view(&clips);
+                        v.lanes = Lanes::new(lanes());
+                        v.desk_rows = desk;
+                        v.active = 8;
+                        v.header_w = header_w;
+                        let l = Layout::new(r, &v);
+                        let out = ctx.run(
+                            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    ui.set_clip_rect(r);
+                                    draw(ui.painter(), r, &v);
+                                });
+                            },
+                        );
+                        for (i, row) in l.header_rows.iter() {
+                            if !row.panel.is_positive() {
+                                continue;
+                            }
+                            let want = format!("{}", i + 1);
+                            let at = format!("{face:?} desk {desk} {w}x{h} header {header_w:?} row {want}");
+                            let Some((laid, ink, size)) = out.shapes.iter().find_map(|s| match &s.shape {
+                                egui::Shape::Text(t)
+                                    if t.galley.text() == want
+                                        && row.panel.contains(t.visual_bounding_rect().center()) =>
+                                {
+                                    Some((
+                                        Rect::from_min_size(t.pos, t.galley.size()),
+                                        t.visual_bounding_rect(),
+                                        t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                                    ))
+                                }
+                                _ => None,
+                            }) else {
+                                bad.push(format!("{at}: no number painted"));
+                                continue;
+                            };
+                            seen += 1;
+                            // The column: the header's own cell on a track, and
+                            // the same seat on an empty slot, which has none.
+                            let indent = if v.lanes[i].in_folder { FOLDER_INDENT } else { 0.0 };
+                            let col_left = row.panel.left() + 3.0 + indent;
+                            let col_right = if row.number.is_positive() {
+                                assert_eq!(row.number.left(), col_left, "{at}: the column moved");
+                                row.number.right()
+                            } else {
+                                col_left + l.num_w
+                            };
+                            for (what, b) in [("laid out", laid), ("drawn", ink)] {
+                                if b.left() < col_left - 0.01 || b.right() > col_right + 0.5 {
+                                    bad.push(format!(
+                                        "{at}: {what} {:.1}..{:.1}, the column {col_left:.1}..{col_right:.1}",
+                                        b.left(),
+                                        b.right()
+                                    ));
+                                }
+                            }
+                            if size < NUM_FLOOR_PT || (want.len() <= NUM_MAX_DIGITS && size < NUM_PT) {
+                                bad.push(format!("{at}: drawn at {size}pt"));
+                            }
+                            // And the room it took was not the name's: a track
+                            // still has a name and an input chip to press.
+                            if v.lanes[i].used && !(row.name.width() >= 19.5 && row.input.is_positive()) {
+                                bad.push(format!("{at}: name {:?}, input {:?}", row.name, row.input));
+                            }
+                            let mut others = vec![
+                                ("arm", row.arm),
+                                ("note", row.theory),
+                                ("wrench", row.automation),
+                                ("name", row.name),
+                                ("input", row.input),
+                                ("plus", row.add),
+                                ("collapse", row.collapse),
+                                ("folder box", row.folder),
+                                ("pan", row.pan),
+                                ("routing", row.routing),
+                            ];
+                            others.extend(row.bays.iter().map(|b| ("bay", *b)));
+                            for (what, o) in others {
+                                if o.is_positive() && o.intersects(ink) {
+                                    bad.push(format!("{at}: the number {ink:?} runs into the {what} {o:?}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen > 1000, "only {seen} numbers were checked");
+        bad.dedup();
+        assert!(bad.is_empty(), "{} clipped numbers:\n  {}", bad.len(), bad.join("\n  "));
+    }
+
     pub(super) fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             master_gain: 1.0,
@@ -9640,6 +9886,7 @@ ArrangeView {
             selected_channel: None,
             selected_tracks: Vec::new(),
             lanes: Lanes::dense((0..CHANNELS).map(|i| a_lane(i < 3)).collect()),
+            desk_rows: CHANNELS,
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
             active: CHANNELS,

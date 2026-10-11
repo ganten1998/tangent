@@ -30022,6 +30022,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The drawn lanes and the trailing add, in ranks (see
             // `ArrangeView::lane_scroll`).
             active: index.shown_len() + 1,
+            // The widest number a header can wear: the number column is cut
+            // for the whole desk, not the window (`number_column_w`).
+            desk_rows: self.desk_extent(),
             // **The master's row.** Its level and colour come from the same
             // place the desk's own strip reads, so the two views cannot
             // disagree about how loud the master is or what it looks like.
