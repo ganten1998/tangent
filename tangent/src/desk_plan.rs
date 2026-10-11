@@ -103,6 +103,12 @@ impl LaneFlags {
     /// only on the plan of the pass (`engine_bridge::export_left_out`). It
     /// silences what stands below it as a muted folder does.
     pub const LEFT_OUT: Self = Self(1 << 16);
+    /// **A folder's OWN ROW left out of this export**, and nothing else of
+    /// it: the clips and the instrument standing on the folder row are
+    /// silent (the folder joins [`PostTable::row_quiet`]) while its fader
+    /// still carries its children to the master. What a folder's checklist
+    /// row ("own clips") answers; see `engine_bridge::export_left_out`.
+    pub const ROW_LEFT_OUT: Self = Self(1 << 17);
 
     pub const fn contains(self, f: Self) -> bool {
         self.0 & f.0 == f.0
@@ -1251,8 +1257,14 @@ pub fn build_plan(inputs: &PlanInputs, prev: Option<&DeskPlan>) -> DeskPlan {
         ]
         .iter()
         .any(|f| f.contains(LaneFlags::SOLOED));
-    // A folder heard only to carry: its own row is no carried thing.
+    // A folder heard only to carry: its own row is no carried thing. And a
+    // folder whose own row an export leaves out (`ROW_LEFT_OUT`).
     let mut row_quiet = LaneSet::with_capacity(n);
+    for (r, l) in lanes.iter().enumerate() {
+        if l.flags.contains(LaneFlags::ROW_LEFT_OUT) {
+            row_quiet.insert(r);
+        }
+    }
     if any_solo {
         for (r, l) in lanes.iter().enumerate() {
             let f = l.flags;
@@ -1933,7 +1945,7 @@ pub fn resolve_heard(
 /// with its curve folded in.
 pub fn lane_heard_flat(plan: &DeskPlan, rank: usize, muted: bool) -> bool {
     let flags = plan.lanes.get(rank).map_or(LaneFlags::default(), |l| l.flags);
-    if flags.contains(LaneFlags::LEFT_OUT) {
+    if flags.contains(LaneFlags::LEFT_OUT) || flags.contains(LaneFlags::ROW_LEFT_OUT) {
         return false;
     }
     let soloed = flags.contains(LaneFlags::SOLOED);
@@ -3626,6 +3638,15 @@ mod tests {
         let plan = build_plan(&inputs(&lanes), None);
         resolve_heard(&plan, &[], &mut out);
         assert!(!out[1], "a solo let a left-out lane through");
+        // A folder's OWN ROW left out: quiet, while it and its child are
+        // heard and carry.
+        lanes[1].flags = LaneFlags::default();
+        lanes[2].flags = LaneFlags::ROW_LEFT_OUT;
+        let plan = build_plan(&inputs(&lanes), None);
+        resolve_heard(&plan, &[], &mut out);
+        assert_eq!(out, vec![true, true, true, true], "a folder's own row took its group with it");
+        assert_eq!(plan.post.row_quiet.iter().collect::<Vec<_>>(), vec![2], "the folder's own row is not quiet");
+        assert!(!lane_heard_flat(&plan, 2, false), "the folder's own row was heard");
         // And the bit off, the desk is the desk again.
         for l in &mut lanes {
             l.flags = LaneFlags::default();

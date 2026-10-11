@@ -7545,15 +7545,37 @@ const EXPORT_PROJECT_H: f32 = 610.0;
 const EXPORT_PROJECT_MIN_H: f32 = 560.0;
 
 /// **One row of the TRACKS checklist**: a track by identity, what it is
-/// called, and whether it is checked. Folders are never rows - a folder's
-/// stem is its children twice over - and a member of one says whose it is.
+/// called, whether it is checked, and what the window needs to refuse a
+/// press that would write silence or nothing. A folder's group is never a
+/// row - its stem is its children twice over - but a folder with clips of
+/// its own is one, for those alone ("own clips"); a member of a folder says
+/// whose it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportTrack {
     pub id: crate::desk_id::TrackId,
     /// The row as the list draws it: the track's name, its folder's before
-    /// it, and "(bus)" after a bus.
+    /// it, "(own clips)" after a folder's own row.
     pub label: String,
     pub on: bool,
+    /// **A bus or a return: a row only when stems are written.** In a
+    /// mixdown a bus is never left out (a checked track routed into it
+    /// reaches the master only through it, and with the unchecked sources
+    /// gone it passes exactly the checked tracks' share), so a bus box
+    /// there would change nothing; the window does not offer one.
+    pub bus: bool,
+    /// Whether it has anything to make a stem of, or to play
+    /// (`TangentApp::exports_a_stem`).
+    pub stem: bool,
+    /// Whether the desk, its mutes and solos as they stand, lets it be
+    /// heard (`TangentApp::strip_heard`).
+    pub heard: bool,
+}
+
+impl ExportTrack {
+    /// Whether the row is offered for this export: a bus only with stems.
+    pub fn offered(&self, spec: &crate::ports::ProjectExportSpec) -> bool {
+        !self.bus || spec.stems
+    }
 }
 
 /// **What the Export window holds beyond the spec**: the TRACKS checklist,
@@ -7694,6 +7716,13 @@ pub fn export_custom_span(pick: &ExportPick) -> Result<(f64, f64), String> {
     if b <= a {
         return Err("END has to come after START".to_owned());
     }
+    // A span with none of the song in it renders silence: said, not sent.
+    if a >= pick.song_s {
+        return Err(format!(
+            "START is past the song's end ({})",
+            crate::recorder_panel::time_text(pick.song_s)
+        ));
+    }
     Ok((a, b))
 }
 
@@ -7709,11 +7738,26 @@ pub fn resolve_project_export(
     use crate::ports::ExportTime;
     let mut out = spec.clone();
     if out.tracks.is_some() {
-        let on: Vec<crate::desk_id::TrackId> = pick.tracks.iter().filter(|t| t.on).map(|t| t.id).collect();
+        let on: Vec<&ExportTrack> = pick.tracks.iter().filter(|t| t.on && t.offered(spec)).collect();
         if on.is_empty() {
             return Err("no track is checked".to_owned());
         }
-        out.tracks = Some(on);
+        // **Silence, or no file, is refused here, in words**: a mixdown
+        // hears its checked tracks as the desk would play them (a bus
+        // carries, so it is not one of them), and a stems-only pass writes a
+        // file for each checked row with something to make one of.
+        if out.master {
+            let plays: Vec<&&ExportTrack> = on.iter().filter(|t| !t.bus && t.stem).collect();
+            if plays.is_empty() {
+                return Err("the checked tracks have nothing to play".to_owned());
+            }
+            if !plays.iter().any(|t| t.heard) {
+                return Err("the desk's mute or solo silences every checked track".to_owned());
+            }
+        } else if !on.iter().any(|t| t.stem) {
+            return Err("none of the checked tracks has anything for a stem".to_owned());
+        }
+        out.tracks = Some(on.iter().map(|t| t.id).collect());
     }
     out.span = match out.time {
         ExportTime::Whole => None,
@@ -11518,10 +11562,14 @@ fn show_on(
                             if let Some(i) =
                                 choice(ui, "TRACKS", &EXPORT_TRACK_CHIPS, usize::from(spec.tracks.is_some()))
                             {
+                                let offered = spec.clone();
                                 spec.tracks = (i == 1).then(|| {
-                                    pick.tracks.iter().filter(|r| r.on).map(|r| r.id).collect()
+                                    pick.tracks.iter().filter(|r| r.on && r.offered(&offered)).map(|r| r.id).collect()
                                 });
                             }
+                            // Buses are rows only when stems are written; see
+                            // `ExportTrack::bus`.
+                            let shown = spec.clone();
                             let picking = spec.tracks.is_some();
                             ui.add_enabled_ui(picking, |ui| {
                                 egui::Frame::NONE
@@ -11542,20 +11590,25 @@ fn show_on(
                                                             .color(dim),
                                                     );
                                                 }
-                                                for row in pick.tracks.iter_mut() {
+                                                for row in pick.tracks.iter_mut().filter(|r| r.offered(&shown)) {
+                                                    let label = match (row.bus, shown.master) {
+                                                        (false, _) => row.label.clone(),
+                                                        (true, false) => format!("{} (bus)", row.label),
+                                                        // Its stem; the mix carries it either way.
+                                                        (true, true) => format!("{} (bus, stem only)", row.label),
+                                                    };
                                                     ui.checkbox(
                                                         &mut row.on,
-                                                        RichText::new(&row.label)
-                                                            .font(plain(9.5))
-                                                            .color(t.text),
+                                                        RichText::new(label).font(plain(9.5)).color(t.text),
                                                     );
                                                 }
                                             });
                                     });
                                 ui.horizontal(|ui| {
-                                    let on = pick.tracks.iter().filter(|r| r.on).count();
+                                    let offered = pick.tracks.iter().filter(|r| r.offered(&shown)).count();
+                                    let on = pick.tracks.iter().filter(|r| r.on && r.offered(&shown)).count();
                                     ui.label(
-                                        RichText::new(format!("{on} of {} checked", pick.tracks.len()))
+                                        RichText::new(format!("{on} of {offered} checked"))
                                             .font(plain(8.5))
                                             .color(dim),
                                     );
@@ -11563,21 +11616,22 @@ fn show_on(
                                         .add(Button::new(RichText::new("All").font(plain(9.0)).color(t.text)))
                                         .clicked()
                                     {
-                                        pick.tracks.iter_mut().for_each(|r| r.on = true);
+                                        pick.tracks.iter_mut().filter(|r| r.offered(&shown)).for_each(|r| r.on = true);
                                     }
                                     if ui
                                         .add(Button::new(RichText::new("None").font(plain(9.0)).color(t.text)))
                                         .clicked()
                                     {
-                                        pick.tracks.iter_mut().for_each(|r| r.on = false);
+                                        pick.tracks.iter_mut().filter(|r| r.offered(&shown)).for_each(|r| r.on = false);
                                     }
                                 });
                             });
                             // The spec follows the boxes, so what is sent and
                             // what is remembered are what is checked.
                             if picking {
-                                spec.tracks =
-                                    Some(pick.tracks.iter().filter(|r| r.on).map(|r| r.id).collect());
+                                spec.tracks = Some(
+                                    pick.tracks.iter().filter(|r| r.on && r.offered(&shown)).map(|r| r.id).collect(),
+                                );
                             }
                             ui.add_space(2.0);
                             // ── TIME: the song, the loop/selection, or typed ──
@@ -18454,13 +18508,14 @@ at: None,
         cover_is_on_top(&bare, &with, "Preparing export", "Export");
     }
 
-    /// Three tracks, the middle one a bus, for the TRACKS row's tests.
+    /// One checklist row: a track with something on it that the desk plays.
+    fn track_row(id: u32, label: &str) -> ExportTrack {
+        ExportTrack { id: crate::desk_id::TrackId(id), label: label.to_owned(), on: true, bus: false, stem: true, heard: true }
+    }
+
+    /// Three tracks for the TRACKS row's tests.
     fn three_tracks() -> Vec<ExportTrack> {
-        ["Kick", "Bass", "Verb (bus)"]
-            .iter()
-            .enumerate()
-            .map(|(i, l)| ExportTrack { id: crate::desk_id::TrackId(10 + i as u32), label: (*l).to_owned(), on: true })
-            .collect()
+        ["Kick", "Bass", "Gtr"].iter().enumerate().map(|(i, l)| track_row(10 + i as u32, l)).collect()
     }
 
     /// **The Export window carries the host's cover while it starts the
@@ -18650,7 +18705,7 @@ at: None,
     fn each_time_choice_resolves_to_its_span_and_custom_refuses_an_end_before_its_start() {
         use crate::ports::ExportTime as T;
         let spec = |time| crate::ports::ProjectExportSpec { time, ..Default::default() };
-        let pick = |a: &str, b: &str| ExportPick { custom: [a.to_owned(), b.to_owned()], ..ExportPick::default() };
+        let pick = |a: &str, b: &str| ExportPick { custom: [a.to_owned(), b.to_owned()], song_s: 70.0, ..ExportPick::default() };
         let ok = pick("2|1", "4|1");
         assert_eq!(resolve_project_export(&spec(T::Whole), &ok, Some((1.0, 3.0))).map(|s| s.span), Ok(None));
         assert_eq!(resolve_project_export(&spec(T::Selection), &ok, Some((1.0, 3.0))).map(|s| s.span), Ok(Some((1.0, 3.0))));
@@ -18667,6 +18722,58 @@ at: None,
         }
         assert!(export_custom_span(&pick("later", "4|1")).unwrap_err().starts_with("START"));
         assert!(export_custom_span(&pick("1|1", "4|9")).unwrap_err().starts_with("END"));
+        // A span entirely past the song's end is silence: refused, in words,
+        // never exported and never quietly read as the whole song.
+        assert_eq!(
+            export_custom_span(&pick("1:20", "1:30")),
+            Err("START is past the song's end (1:10.0)".to_owned())
+        );
+        assert!(resolve_project_export(&spec(T::Custom), &pick("1:20", "1:30"), None).is_err());
+        // Starting inside it and running past it is fine: the end is the tail.
+        assert_eq!(export_custom_span(&pick("1:00", "1:30")), Ok((60.0, 90.0)));
+    }
+
+    /// **A bus is a checklist row only when stems are written**, and a
+    /// press that would write silence or no file is refused in words: a
+    /// mixdown of tracks with nothing to play, or that the desk's solo or
+    /// mute silences, and a stems pass with nothing to make a stem of.
+    /// Checking only a bus used to silence the master and write nothing.
+    #[test]
+    fn a_selection_that_would_export_silence_or_nothing_is_refused() {
+        use crate::ports::ProjectExportSpec as S;
+        let bus = ExportTrack { bus: true, ..track_row(20, "Room") };
+        let empty = ExportTrack { stem: false, ..track_row(21, "Empty") };
+        let quiet = ExportTrack { heard: false, ..track_row(22, "Quiet") };
+        let pick = |rows: Vec<ExportTrack>| ExportPick { tracks: rows, ..ExportPick::default() };
+        let mix = S { tracks: Some(Vec::new()), ..S::default() };
+        let stems = S { master: false, stems: true, tracks: Some(Vec::new()), ..S::default() };
+        // A mixdown offers no bus, so a bus alone is nothing checked.
+        assert!(!bus.offered(&mix) && bus.offered(&stems));
+        assert_eq!(resolve_project_export(&mix, &pick(vec![bus.clone()]), None).map(|s| s.tracks), Err("no track is checked".to_owned()));
+        // For stems it is a file of its own.
+        assert_eq!(
+            resolve_project_export(&stems, &pick(vec![bus.clone()]), None).map(|s| s.tracks),
+            Ok(Some(vec![crate::desk_id::TrackId(20)]))
+        );
+        assert_eq!(
+            resolve_project_export(&mix, &pick(vec![empty.clone()]), None).map(|s| s.tracks),
+            Err("the checked tracks have nothing to play".to_owned())
+        );
+        assert_eq!(
+            resolve_project_export(&mix, &pick(vec![quiet.clone(), empty.clone()]), None).map(|s| s.tracks),
+            Err("the desk's mute or solo silences every checked track".to_owned())
+        );
+        assert_eq!(
+            resolve_project_export(&stems, &pick(vec![empty.clone()]), None).map(|s| s.tracks),
+            Err("none of the checked tracks has anything for a stem".to_owned())
+        );
+        // One heard track with something on it is enough, and a bus checked
+        // for a mixdown never rides along in the spec.
+        let ok = resolve_project_export(&mix, &pick(vec![bus, empty, quiet, track_row(23, "Kick")]), None).expect("ready");
+        assert_eq!(
+            ok.tracks,
+            Some(vec![crate::desk_id::TrackId(21), crate::desk_id::TrackId(22), crate::desk_id::TrackId(23)])
+        );
     }
 
     /// **The busy cover paints over the export RENDER window**, which is the

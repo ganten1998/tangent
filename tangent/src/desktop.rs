@@ -612,14 +612,26 @@ fn export_progress_of(b: &OfflineBounce, fraction: f32, label: &str) -> tangent_
 pub(crate) const EXPORT_TAIL_S: f64 = 2.0;
 
 /// **The song seconds an export renders, before its tail**: the TIME row's
-/// span when it names one with an end after its start, else the whole song
-/// from 0:00. A start before 0:00 starts at 0:00. Both export roads ask
-/// this, so a span means the same thing realtime and at full speed.
+/// span when it names one, else the whole song from 0:00. A start before
+/// 0:00 starts at 0:00. A span with nothing in it (its end at or before its
+/// start, or at or before 0:00) answers an empty range, which both roads
+/// refuse with a sentence - it used to be quietly read as the whole song.
+/// Both export roads ask this, so a span means the same thing realtime and
+/// at full speed.
 #[cfg(feature = "recorder")]
 pub(crate) fn export_bounds(span: Option<(f64, f64)>, song_s: f64) -> (f64, f64) {
     match span {
-        Some((a, b)) if b > a && b > 0.0 => (a.max(0.0), b),
-        _ => (0.0, song_s.max(0.0)),
+        Some((a, b)) => (a.max(0.0), b),
+        None => (0.0, song_s.max(0.0)),
+    }
+}
+
+/// What a refused empty range says: an empty timeline, or an empty span.
+#[cfg(feature = "recorder")]
+fn nothing_to_export(span: Option<(f64, f64)>) -> &'static str {
+    match span {
+        Some(_) => "Nothing to export: the chosen span has nothing in it.",
+        None => "Nothing to export: the timeline is empty.",
     }
 }
 
@@ -748,6 +760,113 @@ fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
     dir.with_file_name(format!(".{name}.writing"))
 }
 
+/// **What a stems folder's last export wrote**, beside the stems: the names
+/// [`tidy_stems_folder`] may retire, and the only ones.
+#[cfg(feature = "recorder")]
+const STEMS_MANIFEST: &str = ".tangent-stems.json";
+
+/// **Every file the delivery left of `paths`**: each WAV the format pass
+/// kept, and the MP3 it made beside it, as `deliver_formats` shapes them.
+#[cfg(feature = "recorder")]
+fn delivered_files(paths: &[std::path::PathBuf], spec: &tangent_ui::ports::ProjectExportSpec) -> Vec<std::path::PathBuf> {
+    use tangent_ui::ports::ExportFormat;
+    let want = |f: ExportFormat| spec.primary == f || spec.secondary == Some(f);
+    let mut out = Vec::new();
+    for p in paths {
+        if want(ExportFormat::Wav) {
+            out.push(p.clone());
+        }
+        if want(ExportFormat::Mp3) {
+            out.push(p.with_extension("mp3"));
+        }
+    }
+    out
+}
+
+/// A stem Tangent wrote before stems were named for their tracks:
+/// `NNN-<track>.wav` (or `.mp3`), three digits or more and a dash.
+#[cfg(feature = "recorder")]
+fn is_legacy_stem(name: &str) -> bool {
+    let digits = name.bytes().take_while(u8::is_ascii_digit).count();
+    let lower = name.to_ascii_lowercase();
+    digits >= 3
+        && name.as_bytes().get(digits) == Some(&b'-')
+        && name.len() > digits + 1
+        && (lower.ends_with(".wav") || lower.ends_with(".mp3"))
+}
+
+/// **The stems folder holds this export's stems and nothing older of
+/// Tangent's, and nothing is ever deleted.** Called once a stems export has
+/// landed in `dir`, with every file it left there (`written`).
+///
+/// What moves, into `older/<YYYY-MM-DD_HHMMSS>/` (UTC, the take folders'
+/// stamp) beside them: a file the PREVIOUS export listed in the folder's
+/// manifest ([`STEMS_MANIFEST`]) that this one did not write again - a
+/// track since renamed, removed or unchecked, a lane that went silent - and
+/// a `NNN-<track>.wav` from before stems were named for their tracks. What
+/// never moves: anything else, which is somebody's own. The manifest is
+/// then rewritten to list what this export wrote. Answers where each file
+/// that moved went.
+#[cfg(feature = "recorder")]
+pub(crate) fn tidy_stems_folder(
+    dir: &std::path::Path,
+    written: &[std::path::PathBuf],
+    now: tangent_record::wav::Wallclock,
+) -> Vec<std::path::PathBuf> {
+    let name_of = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mine: std::collections::BTreeSet<String> = written
+        .iter()
+        .filter(|p| p.parent() == Some(dir))
+        .filter_map(|p| name_of(p))
+        .collect();
+    let listed: std::collections::BTreeSet<String> = std::fs::read(dir.join(STEMS_MANIFEST))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let stale: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .filter(|p| {
+                    name_of(p).is_some_and(|n| {
+                        n != STEMS_MANIFEST && !mine.contains(&n) && (listed.contains(&n) || is_legacy_stem(&n))
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut moved = Vec::new();
+    if !stale.is_empty() {
+        let stamp = format!(
+            "{:04}-{:02}-{:02}_{:02}{:02}{:02}",
+            now.year, now.month, now.day, now.hour, now.minute, now.second
+        );
+        let mut home = dir.join("older").join(&stamp);
+        let mut n = 2;
+        while home.exists() {
+            home = dir.join("older").join(format!("{stamp} {n}"));
+            n += 1;
+        }
+        if std::fs::create_dir_all(&home).is_ok() {
+            for p in stale {
+                if let Some(n) = p.file_name() {
+                    let to = home.join(n);
+                    if std::fs::rename(&p, &to).is_ok() {
+                        moved.push(to);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&mine.iter().collect::<Vec<_>>()) {
+        let _ = std::fs::write(dir.join(STEMS_MANIFEST), json);
+    }
+    moved
+}
+
 /// **A realtime pass's stems into place, or gone**, and where each one that
 /// landed is now.
 ///
@@ -777,11 +896,13 @@ fn land_stems(
                     landed.push(home);
                 }
             }
-            home => {
+            // **The stage's own file goes; nothing in `dir` is deleted.** A
+            // lane that never sounded used to delete the last export's file
+            // of its name here, whoever's it was; the stems folder's tidy
+            // (`tidy_stems_folder`) now retires what an earlier export of
+            // Tangent's wrote, into `older/`, and touches nothing else.
+            _ => {
                 let _ = std::fs::remove_file(&s.path);
-                if let Some(home) = home.filter(|_| ran_whole && closed) {
-                    let _ = std::fs::remove_file(home);
-                }
             }
         }
     }
@@ -847,13 +968,13 @@ fn land_export(
                     landed.push(home);
                 }
             }
-            home => {
+            // The stage's file goes; the last export's file of this name
+            // is left for the stems folder's tidy (`tidy_stems_folder`),
+            // which retires it into `older/` and never deletes.
+            _ => {
                 let _ = std::fs::remove_file(&path);
                 if problem.is_none() {
                     silent += 1;
-                    if let Some(home) = home {
-                        let _ = std::fs::remove_file(home);
-                    }
                 }
             }
         }
@@ -10943,13 +11064,16 @@ impl DesktopApp {
                 .notify(Kind::Error, "Open the band to export: the audio path is closed.");
             refuse!();
         }
+        if let Some(why) = crate::engine_bridge::no_stems_refusal(&self.app, &delivery) {
+            self.app.notify(Kind::Error, why);
+            refuse!();
+        }
         // The same span the full-speed pass renders (`export_bounds`), and
         // the same tail after its end.
         let (from_s, to_s) = export_bounds(span, self.app.arr_span_s());
         let until_s = to_s + EXPORT_TAIL_S;
         if to_s <= from_s {
-            self.app
-                .notify(Kind::Error, "Nothing to export: the timeline is empty.");
+            self.app.notify(Kind::Error, nothing_to_export(span));
             refuse!();
         }
         let root = self.app.record_root();
@@ -11027,11 +11151,13 @@ impl DesktopApp {
                     format: tangent_record::wav::SampleFormat::Float32,
                 };
                 // **The same stems, under the same names, as the full-speed
-                // pass** (`engine_bridge::stem_files`): never a folder, a
-                // bus as its own mix, only the checked tracks, each file
-                // named for its track. This road used to keep its own rule
-                // (clips, or a folder collecting children) and its own
-                // names, and wrote every folder's children twice.
+                // pass** (`engine_bridge::stem_files`): never a folder's
+                // group (a folder's own row when it has one), a bus as its
+                // own mix, only the checked tracks, each file named for its
+                // track. This road used to keep its own rule (clips, or a
+                // folder collecting children) and its own names, and wrote
+                // every folder's children twice.
+                let mut own = Vec::new();
                 for (row, file) in crate::engine_bridge::stem_files(&self.app, &delivery) {
                     // **Bound to the row's lane at the press** (design 7.13:
                     // stems bind `(slot, gen)` at the press): the tap's column
@@ -11044,6 +11170,9 @@ impl DesktopApp {
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
                         stem_writers.push(StemWriter { lane, path: path.clone(), writer: w, loud: false });
+                        if self.app.is_folder(row) {
+                            own.push(crate::desk_plan::Slot(lane as u32));
+                        }
                     }
                 }
                 stem_dir = Some(dir);
@@ -11055,7 +11184,7 @@ impl DesktopApp {
                     .iter()
                     .map(|w| crate::desk_plan::Slot(w.lane as u32))
                     .collect();
-                arm_stem_tap(e, true, &slots, stems_dry);
+                arm_stem_tap_own(e, true, &slots, &own, stems_dry);
             }
         }
         // **The delivery is the pass's own**, made with it past the last
@@ -11171,7 +11300,13 @@ impl DesktopApp {
                 // Into place only for a pass that ran whole; a failed one
                 // takes back what it wrote and leaves the folder as it was.
                 let landed = match b.stem_dir.as_deref() {
-                    Some(dir) => land_stems(b.stem_writers, dir, problem.is_none()),
+                    Some(dir) => {
+                        let landed = land_stems(b.stem_writers, dir, problem.is_none());
+                        if problem.is_none() {
+                            tidy_stems_folder(dir, &landed, tangent_record::wav::Wallclock::now_utc());
+                        }
+                        landed
+                    }
                     None => Vec::new(),
                 };
                 // **The same format pass the offline export runs**, and the
@@ -11297,6 +11432,10 @@ impl DesktopApp {
         self.app.set_export_progress(None);
         match deliver_formats_inner(&paths, &spec, true) {
             Ok(()) => {
+                if spec.stems {
+                    let folder = out_dir.join(spec.stems_folder());
+                    tidy_stems_folder(&folder, &delivered_files(&paths, &spec), tangent_record::wav::Wallclock::now_utc());
+                }
                 self.app.notify_lower(EXPORT_RUNNING);
                 self.app
                     .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
@@ -11404,12 +11543,16 @@ impl DesktopApp {
             self.app.notify(Kind::Error, why);
             refuse!();
         }
+        // A stems pass that would write no file at all says so instead.
+        if let Some(why) = crate::engine_bridge::no_stems_refusal(&self.app, &spec).filter(|_| freeze.is_none()) {
+            self.app.notify(Kind::Error, why);
+            refuse!();
+        }
         // The whole project, or the TIME row's span: the loop/selection or
         // a START and END typed in. See `export_bounds`.
         let (from_s, to_s) = export_bounds(spec.span, self.app.arr_span_s());
         if to_s <= from_s {
-            self.app
-                .notify(Kind::Error, "Nothing to export: the timeline is empty.");
+            self.app.notify(Kind::Error, nothing_to_export(spec.span));
             refuse!();
         }
         let out_dir = if freeze.is_some() {
@@ -11836,6 +11979,12 @@ impl DesktopApp {
             self.app.notify(Kind::Error, format!("export: {e}"));
             self.app.set_export_progress(None);
             return;
+        }
+        // The stems folder holds this export's stems and nothing older of
+        // Tangent's: see `tidy_stems_folder`.
+        if spec.stems {
+            let folder = out_dir.join(spec.stems_folder());
+            tidy_stems_folder(&folder, &delivered_files(&paths, &spec), tangent_record::wav::Wallclock::now_utc());
         }
         self.app.notify_lower(EXPORT_RUNNING);
         let skipped = match silent {
@@ -18464,6 +18613,9 @@ fn live_punches(
 ///   device name given a `_`), and no longer than [`STEM_NAME_MAX`] bytes,
 ///   cut on a character.
 /// - **Never empty**: a name with nothing left is `Track`.
+/// - **One form**: a decomposed name (macOS's `e` and a combining acute) is
+///   composed first (`nfc_latin::compose`), so it is written and compared
+///   as the `é` a person sees.
 /// - **Unique, as a case-blind file system sees it** (macOS and Windows
 ///   both): the first of two tracks called "Bass" is `Bass.wav`, the second
 ///   `Bass 2.wav`, and a number already taken by a track of that name is
@@ -18473,7 +18625,9 @@ pub(crate) fn stem_file_names<S: AsRef<str>>(names: &[S]) -> Vec<String> {
     let bases: Vec<String> = names
         .iter()
         .map(|n| {
-            let mut b = sanitize_file_stem_or(n.as_ref(), "Track");
+            // Composed first, so the name written and the name compared are
+            // one form: see `nfc_latin`.
+            let mut b = sanitize_file_stem_or(&crate::nfc_latin::compose(n.as_ref()), "Track");
             if b.len() > STEM_NAME_MAX {
                 let mut cut = STEM_NAME_MAX;
                 while !b.is_char_boundary(cut) {
@@ -18544,8 +18698,22 @@ const STEM_NAME_MAX: usize = 200;
 /// writer finds its lane's pair by `Engine::stem_column`.
 #[cfg(feature = "recorder")]
 pub(crate) fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, slots: &[crate::desk_plan::Slot], dry: bool) {
+    arm_stem_tap_own(e, stems, slots, &[], dry);
+}
+
+/// [`arm_stem_tap`], with the slots in `own` taking a folder's OWN ROW (the
+/// clips and instrument standing on it) rather than its group: see
+/// `engine_bridge::stem_files`, which names which rows those are.
+#[cfg(feature = "recorder")]
+pub(crate) fn arm_stem_tap_own(
+    e: &crate::instrument::Engine,
+    stems: bool,
+    slots: &[crate::desk_plan::Slot],
+    own: &[crate::desk_plan::Slot],
+    dry: bool,
+) {
     if stems && !slots.is_empty() {
-        e.arm_stems(slots);
+        e.arm_stems_own(slots, own);
     } else {
         e.set_stems(false);
     }
@@ -24376,14 +24544,68 @@ mod tests {
         assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]));
         assert!(!stems_stage(&dir).exists(), "a failed export left its stage behind");
         // Whole: the stem that sounded takes its place, and the lane that
-        // never sounded has none, as before.
+        // never sounded writes none - and deletes nothing: the last file of
+        // its name is the stems folder's tidy's to retire, never landing's
+        // to delete (`tidy_stems_folder`).
         assert_eq!(land_stems(pass(), &dir, true), vec![dir.join("01-Bass.wav")]);
         let bass = tangent_record::decode::decode(&dir.join("01-Bass.wav"), 8_000).expect("the new stem decodes");
         assert_eq!(bass.frames(), 32, "the bass that landed is not this pass's");
-        assert!(read("02-Keys.wav").is_none(), "a lane that never sounded kept a stem");
+        assert_eq!(read("02-Keys.wav").as_deref(), Some(&b"last keys"[..]), "landing deleted a file");
         assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]), "somebody's own file went with the stems");
         assert!(!stems_stage(&dir).exists(), "the stage was left behind");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A stems folder holds exactly the current stems, and nothing is
+    /// ever deleted.** What the last export listed and this one did not
+    /// write again, and the `NNN-<track>.wav` stems from before the rename,
+    /// move into `older/<stamp>/`; this export's files, and anything
+    /// Tangent did not write (a file of somebody's own, an `NNN-` name that
+    /// is not a sound file), stay exactly where they are; the manifest then
+    /// lists this export's files. A second export the same second gets a
+    /// folder of its own.
+    #[test]
+    fn a_stems_export_retires_tangents_older_stems_and_touches_nothing_else() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-tidy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let put = |n: &str| std::fs::write(dir.join(n), n.as_bytes()).unwrap();
+        for n in ["001-Kick.wav", "012-Bass.mp3", "Bass.wav", "Keys.wav", "Old Name.wav", "notes.txt", "01-mine.wav", "123-readme.txt"] {
+            put(n);
+        }
+        // The last export wrote Bass, Keys and Old Name.
+        std::fs::write(dir.join(STEMS_MANIFEST), br#"["Bass.wav", "Keys.wav", "Old Name.wav"]"#).unwrap();
+        let at = tangent_record::wav::Wallclock::from_unix(1_760_000_000, 0);
+        // This one writes Bass and Vox; Keys went silent, Old Name was renamed.
+        put("Vox.wav");
+        let moved = tidy_stems_folder(&dir, &[dir.join("Bass.wav"), dir.join("Vox.wav")], at);
+        let older = dir.join("older").join("2025-10-09_085320");
+        let mut names: Vec<String> = moved.iter().map(|p| p.strip_prefix(&older).unwrap().display().to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["001-Kick.wav", "012-Bass.mp3", "Keys.wav", "Old Name.wav"]);
+        for n in ["Bass.wav", "Vox.wav", "notes.txt", "01-mine.wav", "123-readme.txt"] {
+            assert_eq!(std::fs::read(dir.join(n)).unwrap(), n.as_bytes(), "{n} was touched");
+        }
+        for n in ["001-Kick.wav", "Keys.wav"] {
+            assert_eq!(std::fs::read(older.join(n)).unwrap(), n.as_bytes(), "{n} did not arrive whole");
+            assert!(!dir.join(n).exists());
+        }
+        let listed: Vec<String> = serde_json::from_slice(&std::fs::read(dir.join(STEMS_MANIFEST)).unwrap()).unwrap();
+        assert_eq!(listed, vec!["Bass.wav", "Vox.wav"]);
+        // The next export, the same second, writing Vox alone: Bass goes, to
+        // a folder of its own; what is in older/ is left alone.
+        let moved = tidy_stems_folder(&dir, &[dir.join("Vox.wav")], at);
+        assert_eq!(moved, vec![dir.join("older").join("2025-10-09_085320 2").join("Bass.wav")]);
+        assert!(older.join("Keys.wav").exists());
+        // Nothing stale: nothing moves and no folder is made.
+        let moved = tidy_stems_folder(&dir, &[dir.join("Vox.wav")], at);
+        assert!(moved.is_empty());
+        assert!(!dir.join("older").join("2025-10-09_085320 3").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The realtime pass stages its stems and lands them only when it ran
@@ -24730,7 +24952,10 @@ mod tests {
         assert_eq!(silent, 1, "the lane that never sounded was not counted");
         let mix = tangent_record::decode::decode(&out_dir.join("Mix.wav"), 8_000).expect("the new master decodes");
         assert_eq!(mix.frames(), 32, "the master that landed is not this pass's");
-        assert!(read(stems.join("02-Keys.wav")).is_none(), "a lane that never sounded kept a stem");
+        assert!(
+            read(stems.join("02-Keys.wav")).as_deref() == Some(&b"last keys"[..]),
+            "landing deleted a file: retiring the last export's is the tidy's, into older/"
+        );
         assert!(
             read(out_dir.join("notes.txt")).as_deref() == Some(&b"mine"[..]),
             "somebody's own file went with the export"
@@ -28401,6 +28626,11 @@ mod tests {
                 "Vox--.wav",
             ]
         );
+        // One "Café" composed and one decomposed are one name to a person.
+        assert_eq!(
+            stem_file_names(&["Caf\u{e9}", "Cafe\u{301}"]),
+            vec!["Caf\u{e9}.wav".to_owned(), "Caf\u{e9} 2.wav".to_owned()]
+        );
         let lower: std::collections::BTreeSet<String> = got.iter().map(|n| n.to_lowercase()).collect();
         assert_eq!(lower.len(), got.len(), "two stems would land on one file on a case-blind disk");
         let long = stem_file_names(&["é".repeat(400)]);
@@ -28416,7 +28646,11 @@ mod tests {
     fn an_export_renders_its_span_plus_the_tail_and_nothing_else() {
         assert_eq!(export_bounds(None, 30.0), (0.0, 30.0));
         assert_eq!(export_bounds(Some((4.0, 12.0)), 30.0), (4.0, 12.0));
-        assert_eq!(export_bounds(Some((12.0, 4.0)), 30.0), (0.0, 30.0));
+        // An empty or backward span is an empty range, refused - never the
+        // whole song.
+        assert_eq!(export_bounds(Some((12.0, 4.0)), 30.0), (12.0, 4.0));
+        assert_eq!(export_bounds(Some((-3.0, -1.0)), 30.0), (0.0, -1.0));
+        assert_eq!(export_frames(Some((12.0, 4.0)), 30.0, 48_000, 1.0).1, 0);
         assert_eq!(export_bounds(Some((-1.0, 2.0)), 30.0), (0.0, 2.0));
         assert_eq!(export_frames(None, 30.0, 48_000, 1.0), (0, 32 * 48_000));
         assert_eq!(export_frames(Some((4.0, 12.0)), 30.0, 48_000, 1.0), (4 * 48_000, 10 * 48_000));
@@ -28455,6 +28689,17 @@ mod tests {
             src.contains(".and_then(|b| crate::engine_bridge::export_left_out(&self.app, &b.delivery))"),
             "the frame's push does not keep the pass's tracks"
         );
+        assert!(start.contains("no_stems_refusal(&self.app, &delivery)"), "a realtime pass with no stem to write runs");
+        // Both roads tidy the stems folder they landed in, and the
+        // realtime one its staging folder too (`tidy_stems_folder`).
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name}"));
+            &src[at..at + src[at..].find("\n    fn ").expect("its end")]
+        };
+        assert!(body("fn write_export(").contains("tidy_stems_folder(&folder, &delivered_files(&paths, &spec)"));
+        assert!(body("fn finish_bounce(").contains("tidy_stems_folder(&folder, &delivered_files(&paths, &spec)"));
+        assert!(body("fn tick_bounce(&mut self").contains("tidy_stems_folder(dir, &landed"));
+        assert!(body("fn start_offline_render(").contains("no_stems_refusal(&self.app, &spec)"));
     }
 
     /// **A staged template takes the shelf's place, and a failure leaves one
