@@ -9973,6 +9973,11 @@ fn run_rack(
             // bypass is the untouched signal, as above.
             if let Backend::Builtin(crate::builtin_fx::BuiltinUnit::HwInsert(u)) = &mut p.backend {
                 u.bypassed(planar, frames, out);
+                // And its figure, which only this path works out while it
+                // is out of circuit: a bay bypassed since it loaded would
+                // otherwise sit in the compensation graph at the figure it
+                // loaded with, and jump the day it is switched in.
+                Rack::set_latency(shared, seat, bay, u.latency());
                 for (dst, src) in planar.iter_mut().zip(out.iter()).take(TAP_CHANNELS) {
                     let n = frames.min(dst.len()).min(src.len());
                     dst[..n].copy_from_slice(&src[..n]);
@@ -23898,6 +23903,7 @@ impl Engine {
         if let Backend::Builtin(crate::builtin_fx::BuiltinUnit::HwInsert(u)) = &mut backend {
             let key = u32::try_from(seat * INSERTS + bay).unwrap_or(u32::MAX);
             u.attach(self.shared.hw.claim(key, lane_of_seat(seat)));
+            u.set_clocks(self.shared.hw.clocks_arc());
         }
         self.close_seat_editor(seat, bay);
         if let Some(b) = self.host_bay_mut(seat, bay) {
@@ -25110,7 +25116,7 @@ impl Engine {
     }
 
     /// Tell the loops whether the input is a different device from the
-    /// output (see `units::hwinsert::one_device`).
+    /// output (see `units::hwinsert::same_device`).
     pub fn set_hw_separate_input(&self, separate: bool) {
         self.shared.hw.clocks().separate.store(separate, Ordering::Relaxed);
     }
@@ -48184,6 +48190,96 @@ mod hw_insert_road {
             late.tape[start..].iter().skip(2).step_by(WIDE).all(|v| v.abs() < 0.4),
             "the ping fired after the bay came back"
         );
+    }
+
+    /// **A bay bypassed since it loaded is already as late as it will be in
+    /// circuit**: opened bypassed (a saved project), its figure reaches the
+    /// compensation cell from the first block and its dry is delayed by it,
+    /// so switching it in mid-note neither jumps nor gaps.
+    #[test]
+    fn a_bay_bypassed_since_it_loaded_switches_in_without_a_jump() {
+        // Never pinged and bypassed from the moment it loads: it loads
+        // reporting nothing it knows, and the bypass path has to tell the
+        // compensation graph the figure it works out.
+        let mut fresh = Rig::new(40, lane_seat(2, CHAIN_OWN), Jacks::pair(2), Jacks::pair(4), 1.0);
+        fresh.e.set_insert_bypass(&[(lane_seat(2, CHAIN_OWN), 0)]);
+        for _ in 0..8 {
+            fresh.block();
+        }
+        let figure = fresh.live(lane_seat(2, CHAIN_OWN)).latency;
+        let told = fresh
+            .e
+            .shared
+            .seat_cell(SeatKind::Latency, lane_seat(2, CHAIN_OWN) * INSERTS)
+            .expect("the lane's cell")
+            .load(Ordering::Relaxed);
+        assert!(figure > 0);
+        assert_eq!(told, figure, "a bay bypassed since it loaded never told the graph its figure");
+        // Measured once, saved, and reopened bypassed: the project as it
+        // comes off the disk.
+        let mut rig = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            rig.block();
+        }
+        rig.ping(MASTER_SEAT);
+        rig.e.adopt_hw_ping_at(Rig::addr(MASTER_SEAT), 0).expect("an answer");
+        let saved = rig.e.save_insert_state(MASTER_SEAT, 0).expect("state");
+        rig.e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None).unwrap();
+        for _ in 0..4 {
+            rig.block();
+        }
+        rig.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        rig.e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&saved))
+            .unwrap()
+            .unwrap();
+        rig.e.set_pad_kit(5, {
+            let mut kit = PadKit::default();
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.05; 24_000 * 2],
+                rate: 48_000,
+                source: PathBuf::new(),
+            }));
+            kit
+        });
+        rig.e.set_channel_gain(5, 1.0);
+        rig.e.set_drum_strips(1 << 5);
+        for _ in 0..8 {
+            rig.block();
+        }
+        let cell = |rig: &Rig| {
+            rig.e
+                .shared
+                .seat_cell(SeatKind::Latency, MASTER_SEAT * INSERTS)
+                .expect("the master's cell")
+                .load(Ordering::Relaxed)
+        };
+        let figure = rig.live(MASTER_SEAT).latency;
+        assert!(rig.live(MASTER_SEAT).measured, "the reopened bay lost its measurement");
+        assert_eq!(cell(&rig), figure, "the compensation graph never heard the bypassed bay's figure");
+        rig.e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: 5,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 20_000, key: PAD_BASE, vel: 100 }]),
+        }]);
+        rig.e.set_transport(1, 0);
+        rig.e.set_rolling(true);
+        let from = rig.tape.len();
+        for k in 0..60 {
+            if k == 20 {
+                rig.e.set_insert_bypass(&[]);
+            }
+            rig.block();
+        }
+        let main: Vec<f32> = rig.tape[from..].iter().step_by(WIDE).copied().collect();
+        let at = main.iter().position(|v| v.abs() > 1e-3).expect("a sound");
+        assert_eq!(at, figure as usize, "the bypassed bay was not as late as its figure");
+        let level = main[at + 200];
+        for (k, v) in main[at + 200..at + 13_000].iter().enumerate() {
+            assert!((v - level).abs() < 1e-4, "frame {k} after the onset jumped to {v} from {level}");
+        }
+        assert_eq!(cell(&rig), rig.live(MASTER_SEAT).latency);
     }
 
     /// **A ping is refused on a bypassed bay, and one that waited out a

@@ -186,7 +186,9 @@ pub fn hw_inserts_in_circuit(app: &TangentApp, row: Option<usize>) -> Vec<SeatBa
 }
 
 /// **Whether an export can run through the loops in circuit, and how.**
-/// `links` is each in-circuit Tangent Insert's (connected, status line).
+/// `links` is each in-circuit Tangent Insert's (connected, pinging, status
+/// line). A loop that is pinging has its send silenced and its wet held for
+/// over a second, so an export waits for it rather than writing that in.
 ///
 /// None in circuit: `Ok(false)`, nothing to do. Every one connected:
 /// `Ok(true)` when the export asked for full speed and must run in real time
@@ -194,15 +196,19 @@ pub fn hw_inserts_in_circuit(app: &TangentApp, row: Option<usize>) -> Vec<SeatBa
 /// input open, a return missing, the varispeed engaged, no jacks chosen):
 /// `Err`, because a realtime pass through a loop that is down writes the
 /// track dry and says nothing.
-pub fn hw_export_verdict(realtime: bool, links: &[(bool, String)]) -> Result<bool, String> {
+pub fn hw_export_verdict(realtime: bool, links: &[(bool, bool, String)]) -> Result<bool, String> {
     if links.is_empty() {
         return Ok(false);
     }
-    if let Some((_, status)) = links.iter().find(|(up, _)| !*up) {
+    if let Some((_, _, status)) = links.iter().find(|(up, _, _)| !*up) {
         return Err(format!(
-            "export: this project plays through a Tangent Insert whose loop is down ({status}) \
+            "export: this project plays through a Tangent Insert whose loop is down: {status} \
              Fix the loop, or bypass the insert, and export again."
         ));
+    }
+    if links.iter().any(|(_, pinging, _)| *pinging) {
+        return Err("export: a Tangent Insert is pinging its loop. Wait for the ping to finish, then export again."
+            .to_owned());
     }
     Ok(!realtime)
 }
@@ -2224,15 +2230,19 @@ mod tests {
     /// rather than writing the track dry.
     #[test]
     fn an_export_runs_through_its_loops_only_when_every_one_is_up() {
-        let up = (true, "Connected.".to_owned());
-        let down = (false, crate::units::hwinsert::Link::NoInput.sentence().to_owned());
+        let up = (true, false, "Connected.".to_owned());
+        let down = (false, false, crate::units::hwinsert::Link::NoInput.sentence().to_owned());
+        let pinging = (true, true, "Connected.".to_owned());
         assert_eq!(hw_export_verdict(false, &[]), Ok(false), "a desk with no loops was touched");
         assert_eq!(hw_export_verdict(true, &[]), Ok(false));
         assert_eq!(hw_export_verdict(false, &[up.clone()]), Ok(true), "a full-speed export was not made realtime");
         assert_eq!(hw_export_verdict(true, &[up.clone(), up.clone()]), Ok(false));
         for realtime in [false, true] {
             let why = hw_export_verdict(realtime, &[up.clone(), down.clone()]).expect_err("a dry export ran");
-            assert!(why.contains(&down.1), "{why}");
+            assert!(why.contains(&down.2), "{why}");
+            assert!(why.contains(". Fix the loop"), "{why}");
+            let why = hw_export_verdict(realtime, &[up.clone(), pinging.clone()]).expect_err("an export ran through a ping");
+            assert!(why.contains("pinging"), "{why}");
         }
     }
 

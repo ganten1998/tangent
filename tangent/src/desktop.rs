@@ -8358,7 +8358,8 @@ impl DesktopApp {
                 .recorder
                 .session
                 .audio_device_name()
-                .is_some_and(|input| !crate::units::hwinsert::one_device(input, &e.output().device));
+                .and_then(|input| crate::units::hwinsert::same_device(input, &e.output().device))
+                == Some(false);
             e.set_hw_separate_input(separate);
         }
         if !self.recorder.engine.as_ref().is_some_and(crate::instrument::Engine::has_hw_inserts) {
@@ -11866,7 +11867,7 @@ impl DesktopApp {
         // become one and is refused in `start_offline_render`.
         let req = match req {
             tangent_ui::ports::ProjectRequest::Export(mut spec) => {
-                let links: Vec<(bool, String)> = crate::engine_bridge::hw_inserts_in_circuit(&self.app, None)
+                let links: Vec<(bool, bool, String)> = crate::engine_bridge::hw_inserts_in_circuit(&self.app, None)
                     .into_iter()
                     .map(|sb| {
                         self.bridge
@@ -11874,8 +11875,8 @@ impl DesktopApp {
                             .zip(self.recorder.engine.as_ref())
                             .and_then(|(at, e)| hw_live(&self.app, e, at.0, at.1))
                             .map_or_else(
-                                || (false, "No audio device is running.".to_owned()),
-                                |l| (l.connected, l.status),
+                                || (false, false, "No audio device is running.".to_owned()),
+                                |l| (l.connected, l.pinging, l.status),
                             )
                     })
                     .collect();
