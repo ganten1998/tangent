@@ -4591,18 +4591,17 @@ pub const WORD_FLOOR: f32 = 6.5;
 /// plain one.
 pub const WORD_AIR: f32 = 0.25;
 
-/// **The size a word is drawn at in a room `width` wide: shrunk to the
-/// width, never spilled.**
+/// **The size a word is drawn at in `room`: shrunk to the room's width,
+/// never spilled.**
 ///
-/// `ceiling` when the word is laid out inside the room at that size, so a
-/// word its box was drawn for keeps exactly the size it always had (BAR and
-/// 1/2 in the arrange gridbox, 11 points). Otherwise the largest half point
-/// under the ceiling at which it is laid out inside with [`WORD_AIR`] either
-/// side, measured in the face that is installed, and never under
-/// [`WORD_FLOOR`]. A word that does not fit even at the floor is given the
-/// floor and left to the clip in [`paint_fitted_word`]: past that point a
-/// smaller word is a smudge, and which words those are is a question for
-/// the box, not for the type.
+/// `ceiling` when the word fits the room at that size, so a word its box was
+/// drawn for keeps exactly the size it always had (BAR and 1/2 in the
+/// arrange gridbox, 11 points). Otherwise the largest half point under the
+/// ceiling at which it fits with [`WORD_AIR`] either side, measured in the
+/// face that is installed, and never under [`WORD_FLOOR`]. A word that does
+/// not fit even at the floor is given the floor and left to the clip in
+/// [`paint_fitted_word`]: past that point a smaller word is a smudge, and
+/// which words those are is a question for the box, not for the type.
 ///
 /// This is the INPUT chip's rule ([`input_chip`]: the height names the
 /// ceiling and the width decides), except that it never truncates. A grid
@@ -4614,33 +4613,92 @@ pub const WORD_AIR: f32 = 0.25;
 /// a whole pixel. Found by walking down rather than by scaling the width
 /// once, because glyphs land on pixels and a word's width is not quite in
 /// proportion to its size.
+///
+/// **A word fits when its advances AND its ink do** ([`ink_placed_inside`]).
+/// A word is laid out and centred by its advances, but its glyphs are drawn
+/// as the atlas holds them, whole pixels rounded outward, at a position the
+/// tessellator snaps to a whole pixel; and a box's edges fall wherever the
+/// layout puts them. So a word laid out inside its box can still have no
+/// whole-pixel position that holds all of its ink. BAR in Courier Prime at
+/// 100%, in the 12.95-point box of a 260-point arrangement (twelve whole
+/// pixels, 51 to 63): by its advances it fits at 7 points, 12.2 wide, but
+/// its ink there is thirteen pixels, and fitted by its advances alone it was
+/// painted at 7 with a column cut off by the clip. At 6.5 its ink is twelve
+/// pixels and it is drawn whole. Measured over every whole-point
+/// arrangement height from 100 to 420, every bundled face and the scales
+/// from 100% to 200%: 15,377 (height, word) cases drawn whole that the
+/// advances alone had cut, and not one the other way.
 pub fn fitted_word_size(
     painter: &Painter,
     word: &str,
     family: &egui::FontFamily,
     ceiling: f32,
-    width: f32,
+    room: Rect,
 ) -> f32 {
-    let wide = |size: f32| {
-        painter
-            .layout_no_wrap(word.to_owned(), FontId::new(size, family.clone()), Color32::WHITE)
-            .rect
-            .width()
+    let ppp = painter.ctx().pixels_per_point();
+    // Laid out no wider than `width`, and all of its ink placeable inside
+    // the room by whole pixels.
+    let fits = |size: f32, width: f32| {
+        let g = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family.clone()), Color32::WHITE);
+        g.rect.width() <= width && ink_placed_inside(room, &g, ppp).is_some()
     };
-    if wide(ceiling) <= width {
+    if fits(ceiling, room.width()) {
         return ceiling;
     }
     // A ceiling already under the floor is its own floor: shrinking stops
     // there, and growing is not what this is for.
     let floor = WORD_FLOOR.min(ceiling);
-    let room = width - 2.0 * WORD_AIR;
+    let with_air = room.width() - 2.0 * WORD_AIR;
     // The first half point under the ceiling (10.5 under 11, 9.5 under the
     // MIDI chip's 9.9), then down by halves.
     let mut size = (ceiling * 2.0).ceil() * 0.5 - 0.5;
-    while size > floor && wide(size) > room {
+    while size > floor && !fits(size, with_air) {
         size -= 0.5;
     }
     size.max(floor)
+}
+
+/// **Where `galley` is drawn in `room` so that all of its ink is inside**:
+/// centred, as `Align2::CENTER_CENTER` centres it, and then, if the ink the
+/// tessellator will draw there crosses an edge, moved in by the whole pixels
+/// it crosses by. `None` when no whole-pixel position holds all of it.
+///
+/// The ink is the galley's mesh, every glyph as the atlas draws it, at the
+/// position the tessellator snaps to a pixel (`round_text_to_pixels`), so it
+/// lands on whole pixels while the room's edges need not. A word that fits by
+/// its advances can still put one column of ink past an edge (BAR in Courier
+/// Prime at 150%, 1/128 in JetBrains Mono at 100%), and the clip would cut
+/// that column off a word that fits: moving it in by a pixel keeps it whole.
+/// Down as well as across: in the seven-point box of an arrangement under
+/// 157 points, a single digit in JetBrains Mono at 100% centres with its
+/// ink half a pixel below the box, and goes up a pixel. A thousandth of
+/// slack, so float noise is not a pixel.
+fn ink_placed_inside(room: Rect, galley: &egui::Galley, ppp: f32) -> Option<Pos2> {
+    const SLACK: f32 = 1.0e-3;
+    let centred = room.center() - galley.size() * 0.5;
+    let drawn = galley.mesh_bounds;
+    if !drawn.is_positive() {
+        return Some(centred);
+    }
+    // One axis: where the word goes along it, given where centring put it,
+    // its ink's extent from its own origin, and the room's two edges.
+    let along = |at: f32, ink: (f32, f32), edges: (f32, f32)| -> Option<f32> {
+        let snapped = (at * ppp).round() / ppp;
+        let (lo, hi) = (snapped + ink.0, snapped + ink.1);
+        let shift = if hi > edges.1 + SLACK {
+            -((hi - edges.1) * ppp - SLACK).ceil() / ppp
+        } else if lo < edges.0 - SLACK {
+            ((edges.0 - lo) * ppp - SLACK).ceil() / ppp
+        } else {
+            // Inside where centring put it: left there, exactly.
+            return Some(at);
+        };
+        (lo + shift >= edges.0 - SLACK && hi + shift <= edges.1 + SLACK).then_some(snapped + shift)
+    };
+    Some(Pos2::new(
+        along(centred.x, (drawn.min.x, drawn.max.x), (room.left(), room.right()))?,
+        along(centred.y, (drawn.min.y, drawn.max.y), (room.top(), room.bottom()))?,
+    ))
 }
 
 /// **A word painted in its box at [`fitted_word_size`], and never outside
@@ -4649,22 +4707,15 @@ pub fn fitted_word_size(
 /// `room` is where the word may be laid out: the box itself, or the part of
 /// it inside a border. `bx` is the box, and the word is clipped to it,
 /// within whatever clip the painter already has. The clip is the backstop
-/// and not the fit: every word a grid ladder can print fits its box above
-/// the floor except the few `fitted_word_size` cannot, and those are cut at
-/// the box's edge instead of painting over the next control. That is the
-/// class of fault behind the owner's "0.000000": a grid step six characters
-/// wide in the arrange gridbox, spilling onto the tempo lane's switch, with
-/// the navigator painted over its tail.
-///
-/// **Centred as `Align2::CENTER_CENTER` centres it, then held inside by
-/// whole pixels.** A word is laid out by its advances, but its glyphs are
-/// drawn as whole pixels rounded outward and the text is snapped to a pixel,
-/// so a word that fits by its advances can still put one column of ink past
-/// the room's edge: BAR in Courier Prime at 150%, 1/128 in JetBrains Mono at
-/// 100%. The clip would cut that column off a word that fits. So when the
-/// ink the snap is going to draw crosses an edge and the room is wide
-/// enough for it, the word moves in by the pixels it crosses by; otherwise
-/// it stays exactly where centring put it.
+/// and not the fit: a word that fits is placed with all of its ink inside
+/// the room ([`ink_placed_inside`]) and the clip cuts nothing from it; a
+/// word that does not fit even at the floor is painted at the floor,
+/// centred, and cut at the box's edge instead of painting over the next
+/// control. Which words those are, at which sizes of the arrange gridbox,
+/// `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// names. That is the class of fault behind the owner's "0.000000": a grid
+/// step six characters wide in the arrange gridbox, spilling onto the tempo
+/// lane's switch, with the navigator painted over its tail.
 pub fn paint_fitted_word(
     painter: &Painter,
     bx: Rect,
@@ -4677,23 +4728,10 @@ pub fn paint_fitted_word(
     if !room.is_positive() || word.is_empty() {
         return;
     }
-    let size = fitted_word_size(painter, word, &family, ceiling, room.width());
+    let size = fitted_word_size(painter, word, &family, ceiling, room);
     let galley = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family), ink);
-    let mut pos = room.center() - galley.size() * 0.5;
-    let drawn = galley.mesh_bounds;
-    if drawn.is_positive() && drawn.width() <= room.width() {
-        // Where the tessellator will put it (`round_text_to_pixels`), and
-        // the ink that lands there.
-        let ppp = painter.ctx().pixels_per_point();
-        let snapped = (pos.x * ppp).round() / ppp;
-        let (left, right) = (snapped + drawn.min.x, snapped + drawn.max.x);
-        // A thousandth of slack, so float noise is not a pixel.
-        if right > room.right() + 1.0e-3 {
-            pos.x = snapped - ((right - room.right()) * ppp).ceil() / ppp;
-        } else if left < room.left() - 1.0e-3 {
-            pos.x = snapped + ((room.left() - left) * ppp).ceil() / ppp;
-        }
-    }
+    let pos = ink_placed_inside(room, &galley, painter.ctx().pixels_per_point())
+        .unwrap_or_else(|| room.center() - galley.size() * 0.5);
     painter
         .with_clip_rect(bx.intersect(painter.clip_rect()))
         .galley(pos, galley, ink);
@@ -4715,6 +4753,14 @@ fn grid_box_type(cell: Rect) -> f32 {
 /// is 25.6 points wide in Courier Prime and JetBrains Mono and 21.5 in
 /// Terminess. The ladder prints five characters too (1/128, at the finest
 /// steps of meters as common as 3/4 and 7/8) and six (1/1024).
+///
+/// **And it is twenty points only in an arrangement at least 383 tall.**
+/// Under that it follows the ruler down, to seven points under 157, and the
+/// shorter the arrangement the shorter the steps that no longer fit it
+/// above the floor: under 257 points even BAR is cut at some heights in
+/// Courier Prime. `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+/// sweeps every size the layout draws and names, for each face, the height
+/// from which a step of each length is never cut.
 fn grid_box_word(painter: &Painter, cell: Rect, word: &str, ink: Color32) {
     paint_fitted_word(
         painter,
@@ -12968,12 +13014,16 @@ selected: false,
     /// left and ran under the navigator on the right, the overflow behind
     /// the owner's "0.000000".
     ///
-    /// Swept over every word the box can print: all 192 signatures, every
-    /// step the box reaches (-6 to 3, the settings' clamp), in both
-    /// spellings. Each is painted by `grid_box_word`, the call `draw` makes
-    /// (`the_arrange_gridbox_paints_its_step_through_the_fit` holds `draw` to
-    /// it), into the real box, in every bundled face and at 100% to 200%
-    /// display scale, and read back as the tessellator draws it. Held:
+    /// The twenty-point box, the one an arrangement of 383 points or more
+    /// draws; `every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut`
+    /// sweeps the smaller ones a shorter arrangement draws, and names what
+    /// they cut. Swept over every word the box can print: all 192
+    /// signatures, every step the box reaches (-6 to 3, the settings'
+    /// clamp), in both spellings. Each is painted by `grid_box_word`, the
+    /// call `draw` makes (`the_arrange_gridbox_paints_its_step_through_the_fit`
+    /// holds `draw` to it), into the real box, in every bundled face and at
+    /// 100% to 200% display scale, and read back as the tessellator draws
+    /// it. Held:
     ///
     /// - a word that is laid out inside the box at eleven points is painted
     ///   at exactly eleven: BAR and 1/2 are, by name, in every face;
@@ -13102,16 +13152,18 @@ selected: false,
 
     /// **The arrange gridbox paints its step through the fit**, read off the
     /// real frame: the same word, the same size and the same place that
-    /// `grid_box_word` gives it, clipped to the box. The sweep above holds
-    /// `grid_box_word` to every word; this holds `draw` to `grid_box_word`,
-    /// at steps three to six characters wide, in every bundled face.
+    /// `grid_box_word` gives it, clipped to the box. The sweeps above and
+    /// below hold `grid_box_word` to every word in every box; this holds
+    /// `draw` to `grid_box_word`, at steps three to six characters wide, in
+    /// every bundled face, in the twenty-point box and in the thirteen-point
+    /// one a 260-point arrangement draws.
     ///
     /// Revert check, performed: hand the box back to `painter.text` at its
     /// own size and this fails on its first step, BAR, which is no longer
     /// clipped to its box.
     #[test]
     fn the_arrange_gridbox_paints_its_step_through_the_fit() {
-        let r = rect();
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 260.0));
         let steps = [
             (4u8, 4u8, 0i8, GRID_BAR),
             (4, 4, -1, "1/2"),
@@ -13127,12 +13179,22 @@ selected: false,
             // painted between frames is handed out with the next frame's,
             // and the next frame is the real one.
             let apart = context_at(face, 1.0);
-            for (k, (beats, unit, exp, want)) in steps.into_iter().enumerate() {
+            for (k, (r, (beats, unit, exp, want))) in [rect(), short]
+                .into_iter()
+                .flat_map(|r| steps.into_iter().map(move |s| (r, s)))
+                .enumerate()
+            {
                 let cs: Vec<ClipView<'_>> = Vec::new();
                 let mut v = a_view(&cs);
                 v.grid_exp = exp;
                 v.meter = crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
                 let cell = Layout::new(r, &v).tool_grid;
+                if r == short {
+                    assert!(
+                        (cell.width() - 12.95).abs() < 0.01,
+                        "a 260-point arrangement no longer draws a 12.95-point box: {cell:?}"
+                    );
+                }
                 let out = ctx.run(
                     egui::RawInput { screen_rect: Some(r), ..Default::default() },
                     |ctx| {
@@ -13146,7 +13208,7 @@ selected: false,
                     .into_iter()
                     .filter(|w| cell.intersects(w.laid))
                     .collect();
-                let at = format!("{face:?} {beats}/{unit} step {exp}");
+                let at = format!("{face:?} {beats}/{unit} step {exp} in a {}-point box", cell.width());
                 let [drawn] = on_box.as_slice() else {
                     panic!("{at}: the box painted {on_box:?}");
                 };
@@ -13162,6 +13224,232 @@ selected: false,
                 assert_eq!(drawn.clip, cell, "{at}: {want} is not clipped to its box");
             }
         }
+    }
+
+    /// **Every size the arrange gridbox is drawn at, not only its largest: a
+    /// step either fits the box it is in, or it is named here as cut.**
+    ///
+    /// The box is twenty points square only while the arrangement is at
+    /// least 383 points tall. It is half the corner the ruler leaves, the
+    /// ruler is 0.115 of the arrangement held to 18..52 points, and the
+    /// corner is the ruler less four; so under 383 the box shrinks with the
+    /// arrangement, to seven points under 157. Short arrangements are no
+    /// corner case: the window's floor is 320 tall and the band takes 81 of
+    /// it, and the window keeps the shape of the bands showing, so a window
+    /// with few bands is short at any width (the band and the piano alone
+    /// are 340 tall at 1300 wide, which leaves the arrangement 150).
+    /// `every_arrange_grid_step_is_painted_inside_its_box` sweeps the
+    /// twenty-point box alone, at more scales; this sweeps every box.
+    ///
+    /// Driven through `Layout::new` at every whole point of height from 100
+    /// to 420, at the window's narrowest, 1300 and 2560 wide, with the header
+    /// at both ends of the seam and on its own share. The header never
+    /// decides the box (the corner is at least 144 wide, room for boxes of
+    /// 24), which is asserted, so the box is a function of the height. Every
+    /// box that gives, every word the box prints (192 signatures, steps -6
+    /// to 3, in its numerals), every bundled face, at 100% to 200%, painted
+    /// by `grid_box_word` and read off the tessellated paint. A word fits a
+    /// box when it is laid out inside it and its ink, which lands on whole
+    /// pixels, is no more pixels wide or tall than the box holds whole ones;
+    /// that is worked out here from the glyphs, not asked of the code. Held
+    /// for every word in every box: one that fits at the box's own size keeps
+    /// that size; one that fits smaller is shrunk until it is laid out no
+    /// wider than the box less `WORD_AIR` a side, never under `WORD_FLOOR`,
+    /// with every pixel of its ink inside the box; one that does not fit even
+    /// at the floor is painted at the floor and cut at the box's edges; and
+    /// every word is clipped to its box.
+    ///
+    /// **Which are cut is the report the owner asked for**: a step that
+    /// cannot fit above the floor is to be said, not smudged. The faces are
+    /// monospaced, so it is a table of lengths, pinned at the foot: the
+    /// arrangement height from which a step of so many characters is never
+    /// cut, at any of the five scales. Under it, it is cut at some heights
+    /// and not at others, as the box's edges fall on or between pixels: BAR
+    /// in Courier Prime at 100% is 10.9 points by its advances at the floor
+    /// and twelve whole pixels of ink, and the 12.72-point box of a
+    /// 256-point arrangement, its edges between pixels, holds eleven.
+    ///
+    /// | characters, e.g.        | Courier Prime | JetBrains Mono | Terminess |
+    /// |-------------------------|---------------|----------------|-----------|
+    /// | 1: 1, 2, 8              | never cut     | never cut      | never cut |
+    /// | 2: 1· (a dotted whole)  | from 181      | from 181       | from 159  |
+    /// | 3: BAR, 1/2, 5/8        | from 257      | from 257       | from 222  |
+    /// | 4: 1/16, 1/4·, 10/8     | from 327      | from 327       | from 276  |
+    /// | 5: 1/128, 11/16         | from 381      | from 383       | from 327  |
+    /// | 6: 1/1024, 1/2048       | cut at every height | cut at every height | from 383 |
+    ///
+    /// Revert checks, performed: fit by the advances alone, as the fit did,
+    /// and this fails on 1/8 in Courier Prime at 100% in the 12.72-point box
+    /// of a 256-point arrangement, painted at 7 points where no whole-pixel
+    /// position holds its ink; give every word the box's own size and it
+    /// fails on the first word it sweeps, 1/64 in the seven-point box, left
+    /// at 8 points; take the clip away and it fails on that same word, its
+    /// clip the whole screen; hold the ink inside across and not down, and it
+    /// fails on 2 in JetBrains Mono at 100% in the seven-point box, its ink
+    /// half a pixel under the box; lower `WORD_FLOOR` to 6 and the table
+    /// fails, every length fitting lower.
+    #[test]
+    fn every_size_of_the_arrange_grid_box_holds_its_steps_or_names_the_cut() {
+        use std::collections::BTreeMap;
+        // ── every box the layout draws, by the heights that draw it ──────
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let (_, header_floor, _) = HEADER_W;
+        // (box, the lowest and highest height that draw it)
+        let mut boxes: Vec<(Rect, u32, u32)> = Vec::new();
+        for h in 100u32..=420 {
+            let mut cell: Option<Rect> = None;
+            for w in [crate::settings::MIN_WINDOW.x, 1300.0, 2560.0] {
+                for header_w in [Some(header_floor), None, Some(w * 0.5)] {
+                    let mut v = a_view(&cs);
+                    v.header_w = header_w;
+                    let c = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h as f32)), &v).tool_grid;
+                    assert!(
+                        (c.width() - c.height()).abs() < 1.0e-3,
+                        "{w}x{h}: the box is not square: {c:?}"
+                    );
+                    match cell {
+                        None => cell = Some(c),
+                        Some(was) => assert!(
+                            (was.width() - c.width()).abs() < 1.0e-3,
+                            "{w}x{h} with header {header_w:?}: the header changed the box, {was:?} to {c:?}"
+                        ),
+                    }
+                }
+            }
+            let cell = cell.expect("a box");
+            match boxes.last_mut() {
+                Some((b, _, hi)) if (b.width() - cell.width()).abs() < 1.0e-3 => *hi = h,
+                _ => boxes.push((cell, h, h)),
+            }
+        }
+        let side = |b: &Rect| b.width();
+        assert!((side(&boxes[0].0) - 7.0).abs() < 1.0e-3, "the smallest box is {:?}", boxes[0]);
+        assert_eq!((boxes[0].1, boxes[0].2), (100, 156), "the box no longer stays at seven points up to 156");
+        let full = boxes.last().expect("boxes");
+        assert!((side(&full.0) - 20.0).abs() < 1.0e-3, "the largest box is {full:?}");
+        assert_eq!((full.1, full.2), (383, 420), "the box is no longer whole from 383 points");
+        // ── every word the box prints ─────────────────────────────────────
+        // In its own spelling, numerals the whole way down: the glyph
+        // spelling's quarter is the MIDI editor's chip's, which is one size
+        // and swept there (`midi_editor`'s `every_grid_word_is_painted_inside_its_chip`).
+        // In the seven-point box ♪, which comes off the fallback face, is
+        // taller than the box, so this sweep would be holding the box to a
+        // word it never prints.
+        let mut words: Vec<String> = Vec::new();
+        for &(beats, unit) in &valid_signatures() {
+            for e in -6i8..=3 {
+                let w = grid_label_text(e, beats, unit);
+                if !words.contains(&w) {
+                    words.push(w);
+                }
+            }
+        }
+        // ── the sweep ─────────────────────────────────────────────────────
+        // (face, characters) -> the tallest arrangement that cut one.
+        let mut tallest_cut: BTreeMap<(String, usize), u32> = BTreeMap::new();
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                // Whether `w` at `size` fits `cell` with `width` for its
+                // advances: laid out no wider, and its ink, which lands on
+                // whole pixels, no more pixels wide or tall than the box
+                // holds whole ones.
+                let fits = |w: &str, size: f32, cell: Rect, width: f32| {
+                    let g = measure.layout_no_wrap(
+                        w.to_owned(),
+                        FontId::new(size, crate::fonts::courier_bold()),
+                        Color32::WHITE,
+                    );
+                    let whole = |a: f32, b: f32| ((b * ppp + 1.0e-3).floor() - (a * ppp - 1.0e-3).ceil()) / ppp;
+                    g.rect.width() <= width
+                        && g.mesh_bounds.width() <= whole(cell.left(), cell.right()) + 1.0e-3
+                        && g.mesh_bounds.height() <= whole(cell.top(), cell.bottom()) + 1.0e-3
+                };
+                for (b, &(cell, lo, hi)) in boxes.iter().enumerate() {
+                    let ceiling = grid_box_type(cell);
+                    let room = cell.width() - 2.0 * WORD_AIR;
+                    let painted: Vec<PaintedWord> = words
+                        .iter()
+                        .enumerate()
+                        .map(|(k, w)| {
+                            let p = PaintedWord::painted_by(&ctx, ("box sizes", b, k), |p| {
+                                grid_box_word(p, cell, w, Color32::WHITE);
+                            });
+                            let [one] = p.as_slice() else {
+                                panic!("{face:?} at {ppp}x, {w:?} in {cell:?}: painted {p:?}");
+                            };
+                            one.clone()
+                        })
+                        .collect();
+                    for (w, word) in words.iter().zip(&painted) {
+                        let at = format!(
+                            "{face:?} at {ppp}x, {w:?} in the {:.2}-point box of a {lo}..{hi}-point arrangement",
+                            cell.width()
+                        );
+                        assert_eq!(&word.text, w, "{at}");
+                        assert_eq!(word.clip, cell, "{at}: not clipped to its box");
+                        assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                        if fits(w, ceiling, cell, cell.width()) {
+                            assert_eq!(word.size, ceiling, "{at}: fits at {ceiling} and was painted at {}", word.size);
+                        } else if !fits(w, WORD_FLOOR, cell, room) {
+                            // Cut: at the floor, and the clip holds it.
+                            assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                            let n = w.chars().count();
+                            let tallest = tallest_cut.entry((format!("{face:?}"), n)).or_insert(0);
+                            *tallest = (*tallest).max(hi);
+                            continue;
+                        } else {
+                            assert!(word.size < ceiling, "{at}: does not fit at {ceiling} and was not shrunk");
+                            assert!(
+                                word.laid.width() <= room + 1.0e-3,
+                                "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} a side",
+                                word.size,
+                                word.laid.width()
+                            );
+                        }
+                        assert!(
+                            word.ink.left() >= cell.left() - 1.0e-3
+                                && word.ink.right() <= cell.right() + 1.0e-3
+                                && word.ink.top() >= cell.top() - 1.0e-3
+                                && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                            "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                            word.size,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
+        // ── the report ────────────────────────────────────────────────────
+        // The arrangement height from which a step of n characters is never
+        // cut, `Some(h)`, or `None` where it never is at all.
+        let report = |face: &str| -> Vec<(usize, Option<u32>)> {
+            (1..=6).map(|n| (n, tallest_cut.get(&(face.to_owned(), n)).map(|h| h + 1))).collect()
+        };
+        let got: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| (format!("{face:?}"), report(&format!("{face:?}"))))
+            .collect();
+        let want: Vec<(String, Vec<(usize, Option<u32>)>)> = crate::fonts::FontChoice::ALL
+            .iter()
+            .map(|face| {
+                // 421: cut at every height swept, the full box's included.
+                let heights = match face {
+                    crate::fonts::FontChoice::Courier => {
+                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(381)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::JetBrains => {
+                        vec![(1, None), (2, Some(181)), (3, Some(257)), (4, Some(327)), (5, Some(383)), (6, Some(421))]
+                    }
+                    crate::fonts::FontChoice::Terminess => {
+                        vec![(1, None), (2, Some(159)), (3, Some(222)), (4, Some(276)), (5, Some(327)), (6, Some(383))]
+                    }
+                };
+                (format!("{face:?}"), heights)
+            })
+            .collect();
+        assert_eq!(got, want, "the arrangement heights from which steps of 1 to 6 characters are never cut");
     }
 
     /// **Every step of every meter is said as a note**, the way a player
