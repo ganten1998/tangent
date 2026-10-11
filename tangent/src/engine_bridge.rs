@@ -472,10 +472,11 @@ pub fn full_build_with(
         BuildFor::Probe => {}
     }
     // **Its first block starts where the desk is**, every level on its
-    // target (`Engine::land_gains`): a fresh engine's faders all stand at
-    // unity, and slewed from there a track muted or silenced by a solo on
-    // the desk faded out over the head of the file.
-    e.land_gains();
+    // target (`Engine::land_gains_at`): a fresh engine's faders all stand
+    // at unity, and slewed from there a track muted or silenced by a solo
+    // on the desk faded out over the head of the file. At generation 1, the
+    // locate every offline render rolls from (`set_transport(1, first)`).
+    e.land_gains_at(1);
     // Everything sent lands before the first block: an offline engine has
     // no callback to wait for.
     e.settle_offline();
@@ -4601,7 +4602,7 @@ mod tests {
         assert!(mix(&checked).0 == mix(&everything).0, "every box checked is not Everything");
         // A solo on a track left out silences the checked ones, as on the
         // desk, from the first frame: the export lands the desk's levels
-        // (`Engine::land_gains`), so not even the head of the solo's slew.
+        // (`Engine::land_gains_at`), so not even the head of the solo's slew.
         let kick_only = wav_samples(&export_of(&soloed, &spec, &dir3.join("kick"))["mix.wav"].0);
         let loudest = kick_only.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(loudest == 0.0, "a checked track was heard through the desk's solo on another ({loudest})");
@@ -4616,7 +4617,7 @@ mod tests {
     /// compressor on the bass: with the kick unchecked, the bass must sound
     /// as it does on a desk whose kick has no clip at all. A MUTED kick keys
     /// nothing either: the key is cut after the kick's fader, and an export
-    /// starts with the mute in place (`Engine::land_gains`).
+    /// starts with the mute in place (`Engine::land_gains_at`).
     #[test]
     fn a_left_out_kick_does_not_duck_a_checked_bass() {
         let desk_m = |kick: bool, muted: bool| {
@@ -4724,7 +4725,7 @@ mod tests {
     }
 
     /// One export of `spec` built once and rendered with or without
-    /// `Engine::land_gains`, its files by name.
+    /// `Engine::land_gains_at`, its files by name.
     fn export_landed(app: &TangentApp, spec: &ExportSpec, dir: &Path, land: bool) -> BTreeMap<String, (Vec<u8>, bool)> {
         let built = full_build(app, RATE, Timebase::new(), BuildFor::Export(spec.clone())).expect("an export");
         if !land {
@@ -4757,7 +4758,7 @@ mod tests {
     /// **A track muted on the desk, and one silenced by a solo on another,
     /// are exact zeros from an export's first frame.** A fresh offline
     /// engine's levels start at unity and slewed from there, so the head of
-    /// every muted track was in the file (`Engine::land_gains`). And
+    /// every muted track was in the file (`Engine::land_gains_at`). And
     /// landing is what did it: the same build left slewing still leaks.
     #[test]
     fn a_muted_or_solo_silenced_track_is_silent_from_an_exports_first_frame() {
@@ -4890,11 +4891,15 @@ mod tests {
         let (mut e, _b, got) = live(Some(8));
         assert_fades_out(&got, &open_out, 8 * 512, "a live mute");
         // The realtime pass's press, over that desk a third of a second on:
-        // landed, then located to the head and rolling.
-        e.land_gains();
-        e.set_transport(1, 0);
-        e.set_rolling(true);
+        // the land asked for the press's locate, a few callbacks still
+        // playing the old place (the frame before the host's push), then
+        // the locate to the head.
+        e.land_gains_at(2);
         let mut block = vec![0.0f32; 512 * 2];
+        for _ in 0..3 {
+            e.render_offline(&mut block);
+        }
+        e.set_transport(2, 0);
         for i in 0..48 {
             block.fill(0.0);
             e.render_offline(&mut block);
@@ -4903,6 +4908,100 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A realtime pass lands the block that plays its span's head, not the
+    /// next callback.** The press edits the host's transport and asks for
+    /// the land; the engine hears the locate a UI frame later
+    /// (`Transport::push`), and callbacks in between are parked at the old
+    /// place. Modelled here on an export's own engine, left slewing, parked
+    /// and settled at 0.7 s, with `start_bounce`'s press, four parked
+    /// callbacks, then the push: the take is the full-speed export, sample
+    /// for sample. Two heads a parked land would get wrong: the automation
+    /// corpus desk (a gain curve at 0.2 at the head, 0.9 by 0.6 s, with its
+    /// send, pan, mute and master curves), and a mute curve ON at the head
+    /// and off by 0.5 s.
+    #[test]
+    fn a_realtime_pass_lands_its_spans_head_and_not_a_parked_block() {
+        let spec = ExportSpec { rate: RATE, depth: tangent_ui::ports::ExportDepth::Float32, ..Default::default() };
+        let realtime = |app: &TangentApp, frames: usize, land: bool| {
+            let Built { engine: mut e, .. } =
+                full_build(app, RATE, Timebase::new(), BuildFor::Export(spec.clone())).expect("an engine");
+            e.keep_slewing();
+            let mut t = crate::transport::Transport::new();
+            let mut block = vec![0.0f32; 1024 * 2];
+            // The desk as it was being listened to: parked at 0.7 s, settled.
+            t.locate(0.7);
+            t.push(Some(&e));
+            for _ in 0..16 {
+                block.fill(0.0);
+                e.render_offline(&mut block);
+            }
+            // `start_bounce`'s press, and the frame before the push.
+            t.stop();
+            t.locate(0.0);
+            t.toggle_play();
+            if land {
+                e.land_gains_at(t.generation());
+            }
+            for _ in 0..4 {
+                block.fill(0.0);
+                e.render_offline(&mut block);
+            }
+            t.push(Some(&e));
+            let mut out = Vec::with_capacity(frames * 2);
+            while out.len() < frames * 2 {
+                let n = 1024.min(frames - out.len() / 2);
+                let b = &mut block[..n * 2];
+                b.fill(0.0);
+                e.render_offline(b);
+                out.extend_from_slice(b);
+            }
+            out
+        };
+        // The automation corpus desk without its Trim curve: a unit's own
+        // parameter smoothing is the unit's, and a realtime pass's Trim
+        // glides from where the parked desk left it as any host's would.
+        // Every curve the DESK slews (gain, pan, send, mute, the master) stays.
+        let desk = || {
+            let mut c = corpus().into_iter().find(|c| c.name == "automation").expect("the automation desk");
+            let curves: Vec<Curve> =
+                c.doc.automation.curves().iter().filter(|c| !matches!(c.param, AutoParam::Plugin { .. })).cloned().collect();
+            c.doc.automation = Automation::from_curves(curves);
+            c
+        };
+        // And without the return's reverb: the Plate's modulation runs on
+        // through the parked blocks a live desk plays, so a realtime pass's
+        // tail is the tail of a reverb that was running (as it always is;
+        // no land is about that). Its send curve stays, and its knob glide
+        // lands (`Effects::land`): the full-speed export's own reverb and
+        // delay mixes no longer fade in from nothing either.
+        let mut automation = desk();
+        automation.settings.reverb_mix = 0.0;
+        let dir = scratch("rt-head-automation");
+        let auto_app = open(&automation, &dir);
+        let (dir2, mute_app) = head_desk("rt-head-mute", |_, doc| {
+            doc.automation = Automation::from_curves(vec![curve(
+                0,
+                AutoParam::Mute,
+                &[(0.0, 1.0, Shape::Hold), (0.5, 0.0, Shape::Hold)],
+            )]);
+        });
+        for (tag, app, d) in [("automation", &auto_app, &dir), ("mute curve", &mute_app, &dir2)] {
+            let want = wav_samples(&export_of(app, &spec, &d.join("full"))["mix.wav"].0);
+            let frames = want.len() / 2;
+            let got = realtime(app, frames, true);
+            if let Some(at) = got.iter().zip(&want).position(|(a, b)| a != b) {
+                panic!("{tag}: the realtime take parts from the export at frame {} ({} against {})", at / 2, got[at], want[at]);
+            }
+            assert!(realtime(app, frames, false) != want, "{tag}: the head slews to the same file, so this proves nothing");
+        }
+        // The mute curve's head is silence, from the first sample.
+        let head = realtime(&mute_app, RATE as usize / 2, true);
+        assert!(head.iter().all(|v| *v == 0.0), "the head under the mute curve was heard");
+        for d in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     /// **Each TIME choice renders exactly its frames**: a span starts its

@@ -3023,6 +3023,29 @@ impl Effects {
         }
     }
 
+    /// The knobs as the glide chases them: each in its travel.
+    fn wanted(sends: Sends) -> Sends {
+        Sends {
+            reverb: sends.reverb.clamp(0.0, 1.0),
+            delay: sends.delay.clamp(0.0, 1.0),
+            chorus: sends.chorus.clamp(0.0, 1.0),
+            phaser: sends.phaser.clamp(0.0, 1.0),
+            hpf: sends.hpf.clamp(0.0, 1.0),
+            lpf: sends.lpf.clamp(0.0, 1.0),
+            gain: sends.gain.clamp(0.0, 1.0),
+            limiter: sends.limiter.clamp(0.0, 1.0),
+        }
+    }
+
+    /// **Every mix ON its knob now, not gliding there** (the engine's land,
+    /// `Engine::land_gains_at`): a fresh chain's mixes start at
+    /// `Sends::default`, so an export's head faded the reverb, the delay and
+    /// the rest in from nothing over its first tenth of a second, where a
+    /// desk that had been playing had them where the knobs said.
+    pub fn land(&mut self, sends: Sends) {
+        self.mix = Self::wanted(sends);
+    }
+
     /// Apply both, in place, to an interleaved buffer.
     ///
     /// `reverb` and `delay` are 0..=1 straight off the knobs. `bpm` sets the
@@ -3038,16 +3061,7 @@ impl Effects {
         p: &Params,
         bpm: f64,
     ) {
-        let want = Sends {
-            reverb: sends.reverb.clamp(0.0, 1.0),
-            delay: sends.delay.clamp(0.0, 1.0),
-            chorus: sends.chorus.clamp(0.0, 1.0),
-            phaser: sends.phaser.clamp(0.0, 1.0),
-            hpf: sends.hpf.clamp(0.0, 1.0),
-            lpf: sends.lpf.clamp(0.0, 1.0),
-            gain: sends.gain.clamp(0.0, 1.0),
-            limiter: sends.limiter.clamp(0.0, 1.0),
-        };
+        let want = Self::wanted(sends);
         // Every knob at rest AND every mix arrived there: nothing to do, and
         // nothing ringing that would be cut off by not doing it.
         // **The limiter's "off" is the top of its travel**, unlike everything
