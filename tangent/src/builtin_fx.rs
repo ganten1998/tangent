@@ -410,6 +410,10 @@ const BITCRUSH_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 3, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
     ParamSpec { id: 4, symbol: "output", name: "Output", units: "dB", default: 0.5, steps: 0 },
     ParamSpec { id: 5, symbol: "dither", name: "Dither", units: "", default: 0.0, steps: 2 },
+    // Appended on the owner's ruling (2026-10-11). Off, so a blob saved
+    // before it existed (no `aa=` line) reads as the classic folding it
+    // was saved with, and a fresh unit opens on it too.
+    ParamSpec { id: 6, symbol: "aa", name: "Anti-alias", units: "", default: 0.0, steps: 2 },
 ];
 
 /// The insert's four knobs. Both trims centre on unity over the kernel's
@@ -1094,7 +1098,7 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
             .iter()
             .map(|k| k.label().to_owned())
             .collect(),
-        (DENOISE_PATH, 5) | (AMP_PATH, 0) | (BITCRUSH_PATH, 5) => {
+        (DENOISE_PATH, 5) | (AMP_PATH, 0) | (BITCRUSH_PATH, 5 | 6) => {
             vec!["off".to_owned(), "on".to_owned()]
         }
         // One diode against one, or against two — what the toggle does to
@@ -2380,7 +2384,8 @@ impl BitcrushUnit {
             2 => self.params.drive = v,
             3 => self.params.mix = v,
             4 => self.params.output = v,
-            _ => self.params.dither = v,
+            5 => self.params.dither = v,
+            _ => self.params.aa = v,
         }
     }
 
@@ -3430,7 +3435,7 @@ mod tests {
         let bc = crate::units::bitcrush::BitcrushParams::default();
         for (spec, want) in BITCRUSH_FACE_PARAMS
             .iter()
-            .zip([bc.bits, bc.rate, bc.drive, bc.mix, bc.output, bc.dither])
+            .zip([bc.bits, bc.rate, bc.drive, bc.mix, bc.output, bc.dither, bc.aa])
         {
             assert_eq!(spec.default, want, "{} drifted from BitcrushParams::default", spec.symbol);
         }
@@ -4699,6 +4704,8 @@ mod tests {
         assert_eq!(choices(BITCRUSH_PATH, 5), vec!["off", "on"]);
         assert_eq!(describe(BITCRUSH_PATH, 5, 0.0, &rest), "off");
         assert_eq!(describe(BITCRUSH_PATH, 5, 1.0, &rest), "on");
+        assert_eq!(choices(BITCRUSH_PATH, 6), vec!["off", "on"]);
+        assert_eq!(describe(BITCRUSH_PATH, 6, rest[6], &rest), "off");
         for id in 0..5 {
             assert!(choices(BITCRUSH_PATH, id).is_empty(), "dial {id} grew steps");
         }
@@ -4721,9 +4728,10 @@ mod tests {
         assert_eq!(f::BITS_RANGE, k::BITS_RANGE);
         assert_eq!(f::RATE_HZ, k::RATE_HZ);
         assert_eq!(f::DRIVE_DB, k::DRIVE_DB);
+        assert_eq!(f::AA_CUTOFF, k::AA_CUTOFF);
         // The stair at the shipped rest, held against the kernel crushing
         // the same tone at the same rate.
-        let (clean, stair) = f::staircase(k::BITS_DEFAULT, k::RATE_DEFAULT, 0.5);
+        let (clean, stair) = f::staircase(k::BITS_DEFAULT, k::RATE_DEFAULT, 0.5, false);
         let mut kernel = k::Bitcrush::new(48_000.0);
         let mut buf = clean.clone();
         let n = buf.len();
@@ -4744,7 +4752,8 @@ mod tests {
         let spec = spec_for(BITCRUSH_PATH).unwrap();
         let frames = 2_048;
         let input = tricky_planar(frames);
-        let wire = [1.0, 1.0, 0.5, 1.0, 0.5, 0.0];
+        // The anti-alias switch ON: at "full" it is out of circuit.
+        let wire = [1.0, 1.0, 0.5, 1.0, 0.5, 0.0, 1.0];
         let mut unit = spec.create(48_000.0, &wire);
         let out = run(&mut unit, &input, frames);
         for (c, (a, b)) in input.iter().zip(&out).enumerate() {
@@ -4758,9 +4767,16 @@ mod tests {
         assert_ne!(out[0], mono[0], "a mono block went through the crusher untouched");
         assert!(out[0].iter().all(|s| s.is_finite()));
         // Every knob off its rest, through the blob and back.
-        let moved = [0.6, 0.2, 0.7, 0.4, 0.3, 1.0];
+        let moved = [0.6, 0.2, 0.7, 0.4, 0.3, 1.0, 1.0];
         let text = state_text(spec, &moved, &[]);
         assert_eq!(values_from_state(spec, text.as_bytes()).unwrap(), moved.to_vec());
+        // A blob saved before the anti-alias switch existed has no `aa=`
+        // line, and reads with it OFF: the folding it was saved with.
+        let old = "tangentfx 1\nbits=0.6\nrate=0.2\ndrive=0.7\nmix=0.4\noutput=0.3\ndither=1\n";
+        assert_eq!(
+            values_from_state(spec, old.as_bytes()).unwrap(),
+            vec![0.6, 0.2, 0.7, 0.4, 0.3, 1.0, 0.0]
+        );
         // An automation point lands on the knob it names, and a stale id
         // moves nothing.
         let mut unit = spec.create(48_000.0, &spec.defaults());
