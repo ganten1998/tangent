@@ -106,6 +106,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Windows installer no longer has a components page. Their pages, and the
   Linux `install.sh --help`, describe Tangent alone.
 
+- **The metronome panel's BEATS and NOTE are typed fields.** Press the
+  number between the minus and the plus and type any beat count from 1 to
+  32, over a note value of 1, 2, 4, 8, 16 or 32, so 7/8, 11/16, 15/32 and
+  3/1 are a few keys away. Enter or Tab sets it and Escape leaves it as it
+  was; pressing anywhere else sets what was typed. A number a signature
+  cannot have, like 33 beats or a note of 3, is turned down and the
+  signature stays as it was. NOTE's four buttons became a minus, the field
+  and a plus, like BEATS above it, and its steps reach all six note values.
+  Each change is one step of undo, and the timeline's bars, the click and
+  the count-in follow it, while the song plays too.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and
