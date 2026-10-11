@@ -1784,7 +1784,6 @@ dependencies = [
 name = "tangent-ui"
 version = "5.0.0-dev"
 dependencies = [
- "dirs",
  "egui",
  "log",
  "serde",

@@ -37,11 +37,23 @@ serde = { version = "1", features = ["derive"] }
 # only a decimal the fast path cannot settle takes the slow road, and a real
 # document parses in about a millisecond either way.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-dirs = "6"
+# **No `dirs`.** Every folder this crate names under a person's home (the
+# media root, the old take folder, where the explorer opens) is reached
+# through `tangent_core::config`, the one road, so a test build's redirect
+# covers it; without the crate here a second road is a compile error rather
+# than a review comment (`ban_scan` refuses one in every crate).
 log = "0.4"
 
 [dev-dependencies]
 ttf-parser = "0.25"
+# **This crate's tests never reach a person's files.** `test-home` puts
+# `tangent_core::config::home` in a scratch folder for a test build: this
+# crate's `cfg(test)` cannot, since it does not reach the tangent-core these
+# tests link, which read the real `~/.config/tangent` (the taught chords, for
+# every app a test built). A dev-dependency's features reach test builds
+# alone (resolver 2), so the plugin, which links this crate, never carries
+# it; `scripts/check-home.sh features` proves that.
+tangent-core = { path = "../tangent-core", features = ["test-home"] }
 
 [lints]
 workspace = true
