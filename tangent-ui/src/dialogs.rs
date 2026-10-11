@@ -6074,6 +6074,181 @@ pub fn export_layout(rect: Rect) -> ExportLayout {
     ExportLayout { label, wave, bar }
 }
 
+/// A stem row's name line, the floor under its well, and the air below it.
+///
+/// The floor is what keeps a row READABLE when there are many: a wave
+/// squeezed to a few points is a line, not a picture of a stem, so past
+/// this the rows stop shrinking and the list scrolls instead.
+pub const EXPORT_ROW_NAME_H: f32 = 16.0;
+pub const EXPORT_ROW_MIN_WELL: f32 = 36.0;
+pub const EXPORT_ROW_GAP: f32 = 6.0;
+
+/// **How tall one stem row is**, name and air included, in a wave area
+/// `area_h` tall that has `rows` of them to show.
+///
+/// An even share of the area while the share clears the floor, so a pass
+/// of three stems fills the window the way one wave does; the floor once it
+/// does not, and the rows past the bottom are reached by scrolling.
+pub fn export_row_pitch(area_h: f32, rows: usize) -> f32 {
+    let floor = EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP;
+    if rows == 0 {
+        return floor;
+    }
+    (area_h.max(0.0) / rows as f32).max(floor)
+}
+
+/// A row's two parts: the line its name is written on, and the well its
+/// wave is drawn in, BELOW the name and never under it. The air at the
+/// foot is the row's own, so two wells never touch.
+pub fn export_row_parts(row: Rect) -> (Rect, Rect) {
+    let name = Rect::from_min_size(row.min, Vec2::new(row.width(), EXPORT_ROW_NAME_H));
+    let well = Rect::from_min_max(
+        Pos2::new(row.left(), name.bottom()),
+        Pos2::new(row.right(), (row.bottom() - EXPORT_ROW_GAP).max(name.bottom())),
+    );
+    (name, well)
+}
+
+/// The words on the export window's top line.
+///
+/// **The host's cover is SAID here, not painted over the wave.** It used
+/// to be mirrored into this window whole, scrim and card, centred on the
+/// window - which is the middle of the wave. A stems pass ends on the
+/// longest "Writing files" block in the app (one file per stem through the
+/// format pass), so the picture the owner was left looking at when the
+/// render finished was the announcement sitting in the waveform: "the
+/// initial helper message is shown behind the waveform draw". The line
+/// above the wave is where this window already says what it is doing, and
+/// a cover is one more thing it is doing.
+fn export_line(p: &crate::ports::ExportProgress, cover: Option<&crate::busy::Busy>) -> String {
+    match cover.filter(|b| b.is_visible()) {
+        Some(b) => match b.detail.as_deref() {
+            Some(d) if !d.is_empty() => format!("{}  {d}", b.label),
+            _ => b.label.clone(),
+        },
+        None => format!("{}  {:.0}%", p.label, p.fraction * 100.0),
+    }
+}
+
+/// **One wave, into its well**: the ground, the hairline, the zero line,
+/// the columns heard so far, and the playhead at `x`. The single export's
+/// one well and every stem's are drawn by this, so a row can never look
+/// different from the window it replaced.
+fn paint_export_wave(
+    painter: &egui::Painter,
+    well: Rect,
+    peaks: &[(f32, f32)],
+    x: f32,
+    t: &DialogTheme,
+) {
+    let wave = painter.with_clip_rect(well);
+    wave.rect_filled(well, 2.0, t.field_bg);
+    // **A hairline round the well**, because on three of the seventy-six
+    // dressings the well and the window's ground are within 1.1:1 of
+    // each other (Porcelain light, Phosphor dark and Silverface dark,
+    // each on the strip face) and the waveform was floating in a
+    // rectangle with no findable edge. Another twelve sit under 1.15:1,
+    // so this is not one theme being awkward. The
+    // surface cannot move (it is the ground the wave is measured
+    // against), so the box gets a line instead, in the theme's own edge
+    // shade. See `every_theme_dresses_the_export_window`.
+    wave.rect_stroke(
+        well,
+        2.0,
+        Stroke::new(1.0_f32, t.button_border),
+        egui::StrokeKind::Inside,
+    );
+    let mid = well.center().y;
+    // The zero line, so a silent passage still reads as rendered rather
+    // than as nothing drawn yet.
+    wave.line_segment(
+        [Pos2::new(well.left(), mid), Pos2::new(well.right(), mid)],
+        Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
+    );
+    let cols = peaks.len().max(1);
+    let half = (well.height() * 0.5 - 2.0).max(0.5);
+    // **A column is as wide as its share of the wave**, not one point.
+    // The feed is a fixed 480 columns (`ports::EXPORT_PEAKS`), which was
+    // about one point each in the 496-point wave this window used to
+    // have; across a wave three times that wide, one-point strokes draw
+    // a comb with two points of ground showing between every pair of
+    // samples. Floored at a point so a narrow window still draws
+    // something rather than hairlines with gaps.
+    let col_w = (well.width() / cols as f32).max(1.0);
+    for (i, (lo, hi)) in peaks.iter().enumerate() {
+        if *lo == 0.0 && *hi == 0.0 {
+            continue;
+        }
+        let cx = well.left() + well.width() * (i as f32 + 0.5) / cols as f32;
+        let top = mid - hi.clamp(-1.0, 1.0) * half;
+        let bot = mid - lo.clamp(-1.0, 1.0) * half;
+        wave.line_segment(
+            [Pos2::new(cx, top), Pos2::new(cx, bot.max(top + 1.0))],
+            Stroke::new(col_w, t.text),
+        );
+    }
+    // The playhead: where the render has got to.
+    wave.line_segment(
+        [Pos2::new(x, well.top()), Pos2::new(x, well.bottom())],
+        Stroke::new(1.0_f32, playhead_ink(t.field_bg)),
+    );
+}
+
+/// The id the stem list's scroll offset is kept under.
+fn export_rows_scroll_id() -> egui::Id {
+    egui::Id::new((EXPORT_ID, "rows"))
+}
+
+/// **Every stem's wave, one named row each, scrolling when they outgrow
+/// the area.** Only the rows in view are painted (`show_rows`), so a pass
+/// of a hundred stems costs what the dozen on screen cost.
+///
+/// Wheel and drag both scroll it, as every list in this app does, and the
+/// bar is hidden like theirs. A new export opens at the top: egui keeps a
+/// scroll offset for the life of the process, and a render that opened
+/// halfway down the last one's list would hide its first stems.
+fn show_export_rows(
+    ui: &mut egui::Ui,
+    l: &ExportLayout,
+    rows: &[crate::ports::ExportRow],
+    fraction: f32,
+    fresh: bool,
+    t: &DialogTheme,
+) {
+    let pitch = export_row_pitch(l.wave.height(), rows.len());
+    let x = l.playhead(fraction);
+    let name_font = FontId::new(11.0, fonts::courier_bold());
+    ui.scope_builder(egui::UiBuilder::new().max_rect(l.wave), |ui| {
+        ui.set_clip_rect(l.wave.intersect(ui.clip_rect()));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt(export_rows_scroll_id())
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .auto_shrink([false, false])
+            .max_height(l.wave.height());
+        if fresh {
+            area = area.vertical_scroll_offset(0.0);
+        }
+        area.show_rows(ui, pitch, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                let (r, _) = ui.allocate_exact_size(
+                    Vec2::new(l.wave.width(), pitch),
+                    egui::Sense::hover(),
+                );
+                let (name, well) = export_row_parts(r);
+                ui.painter().with_clip_rect(name).text(
+                    name.left_center(),
+                    Align2::LEFT_CENTER,
+                    &row.name,
+                    name_font.clone(),
+                    t.text,
+                );
+                paint_export_wave(ui.painter(), well, &row.peaks, x, t);
+            }
+        });
+    });
+}
+
 /// **The playhead's red, kept findable on the well it is drawn on.**
 ///
 /// `#E83A4E` has a relative luminance of 0.207 — inside the 0.12–0.22 dead
@@ -6270,87 +6445,44 @@ pub fn show_export_progress(
     // still running with nothing on screen saying so is exactly what this
     // window exists to prevent. That was its contract before and it is its
     // contract now.
+    // **A new export opens its stem list at the top.** The window is drawn
+    // on every pass while a render runs, so a gap of more than one pass is a
+    // window that went away and has come back.
+    let seen = egui::Id::new((EXPORT_ID, "rows-seen"));
+    let pass = ctx.cumulative_pass_nr();
+    let fresh = ctx
+        .memory(|m| m.data.get_temp::<u64>(seen))
+        .is_none_or(|last| pass.saturating_sub(last) > 1);
+    ctx.memory_mut(|m| m.data.insert_temp(seen, pass));
     let _ = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, _want_close| {
         apply_theme(ui.style_mut(), &t);
-        // **The host's cover, over THIS window too.** This window is
-        // `Uncovered` and AlwaysOnTop, so the cover painted in the main
-        // viewport sat behind it and the user saw a render window over an
-        // app that seemed frozen. On the cover's own layer, which is above
-        // everything drawn below whatever order the calls come in.
-        if let Some(b) = cover {
-            let vc = ui.ctx().clone();
-            let painter = vc.layer_painter(crate::busy::cover_layer("tangent-busy-export"));
-            b.paint_over(&painter, vc.content_rect(), live_face(&vc), vc.input(|i| i.time));
-        }
         let rect = ui.max_rect();
         let painter = ui.painter_at(rect);
         // Rounded inline, where there is no window edge to tell the surface
         // apart from the app behind it; square in a window of its own.
         painter.rect_filled(rect, if inline { 4.0 } else { 0.0 }, t.bg);
         let l = export_layout(rect);
-        painter.text(
+        // **The host's cover is said on this line, never painted over the
+        // waves.** This window is `Uncovered` and AlwaysOnTop, so the cover
+        // painted in the main viewport sits behind it, and a window that
+        // said nothing of it looked like a render over a frozen app. It
+        // was mirrored in here whole once, scrim and card, and the card
+        // landed in the middle of the wave. See `export_line`.
+        painter.with_clip_rect(l.label).text(
             l.label.left_center(),
             Align2::LEFT_CENTER,
-            format!("{}  {:.0}%", p.label, p.fraction * 100.0),
+            export_line(p, cover),
             bold(13.0),
             t.text,
         );
-        // ── the wave ──────────────────────────────────────────────────────
-        let wave = painter.with_clip_rect(l.wave);
-        wave.rect_filled(l.wave, 2.0, t.field_bg);
-        // **A hairline round the well**, because on three of the seventy-six
-        // dressings the well and the window's ground are within 1.1:1 of
-        // each other (Porcelain light, Phosphor dark and Silverface dark,
-        // each on the strip face) and the waveform was floating in a
-        // rectangle with no findable edge. Another twelve sit under 1.15:1,
-        // so this is not one theme being awkward. The
-        // surface cannot move — it is the ground the wave is measured
-        // against — so the box gets a line instead, in the theme's own edge
-        // shade. See `every_theme_dresses_the_export_window`.
-        wave.rect_stroke(
-            l.wave,
-            2.0,
-            Stroke::new(1.0_f32, t.button_border),
-            egui::StrokeKind::Inside,
-        );
-        let mid = l.wave.center().y;
-        // The zero line, so a silent passage still reads as rendered rather
-        // than as nothing drawn yet.
-        wave.line_segment(
-            [
-                Pos2::new(l.wave.left(), mid),
-                Pos2::new(l.wave.right(), mid),
-            ],
-            Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
-        );
-        let cols = p.peaks.len().max(1);
-        let half = l.wave.height() * 0.5 - 2.0;
-        // **A column is as wide as its share of the wave**, not one point.
-        // The feed is a fixed 480 columns (`ports::EXPORT_PEAKS`), which was
-        // about one point each in the 496-point wave this window used to
-        // have; across a wave three times that wide, one-point strokes draw
-        // a comb with two points of ground showing between every pair of
-        // samples. Floored at a point so a narrow window still draws
-        // something rather than hairlines with gaps.
-        let col_w = (l.wave.width() / cols as f32).max(1.0);
-        for (i, (lo, hi)) in p.peaks.iter().enumerate() {
-            if *lo == 0.0 && *hi == 0.0 {
-                continue;
-            }
-            let x = l.wave.left() + l.wave.width() * (i as f32 + 0.5) / cols as f32;
-            let top = mid - hi.clamp(-1.0, 1.0) * half;
-            let bot = mid - lo.clamp(-1.0, 1.0) * half;
-            wave.line_segment(
-                [Pos2::new(x, top), Pos2::new(x, bot.max(top + 1.0))],
-                Stroke::new(col_w, t.text),
-            );
+        // ── the waves ─────────────────────────────────────────────────────
+        // One, unnamed, for a single file - the window as it always was -
+        // or one named row per file a stems pass writes.
+        if p.rows.is_empty() {
+            paint_export_wave(&painter, l.wave, &p.peaks, l.playhead(p.fraction), &t);
+        } else {
+            show_export_rows(ui, &l, &p.rows, p.fraction, fresh, &t);
         }
-        // The playhead: where the render has got to.
-        let x = l.playhead(p.fraction);
-        wave.line_segment(
-            [Pos2::new(x, l.wave.top()), Pos2::new(x, l.wave.bottom())],
-            Stroke::new(1.0_f32, playhead_ink(t.field_bg)),
-        );
         // ── the bar ───────────────────────────────────────────────────────
         // Filled to the SAME x the playhead stands at — the bar and the wave
         // share a left edge and a width, so the two read as one measurement
@@ -17436,48 +17568,367 @@ at: None,
     /// OS window and the ladder is `shell::SurfaceTier`'s, which
     /// `a_cover_is_painted_above_every_surface_this_app_can_open` reads from
     /// the other end.
-    /// **The export window paints the cover it is handed.** The cover is
-    /// painted in the main viewport, and this window is a child window the
-    /// operating system keeps in front of it, so a decode or a write that
+    /// **The export window SAYS the cover it is handed, on its top line,
+    /// and paints nothing over its waves.**
+    ///
+    /// The cover is painted in the main viewport, and this window is a child
+    /// window the operating system keeps in front of it, so a write that
     /// started under a render showed the render over an app that seemed
-    /// frozen — "the loading splash loads behind the export menu". Handed
-    /// the host's cover, the window paints it over itself; handed none, it
-    /// paints what it always did.
+    /// frozen: "the loading splash loads behind the export menu". The first
+    /// fix mirrored the cover in here whole, scrim and card, and the card sat
+    /// in the middle of the wave: when a stems pass finished, its long
+    /// "Writing files" block was the announcement painted in the waveform,
+    /// the owner's "the initial helper message is shown behind the waveform
+    /// draw". So the words go on the line the window already speaks on.
+    ///
+    /// Revert-check: paint `b.paint_over(..)` over the window again (as the
+    /// closure did before) and the card's "Writing files" lands on the waves
+    /// and the scrim spills past the window - both asserts below go red.
     #[test]
-    fn the_export_window_paints_the_cover_it_is_handed() {
-        let ctx = egui::Context::default();
-        fonts::install(&ctx, fonts::FontChoice::default(), None);
-        let progress = crate::ports::ExportProgress {
-            fraction: 0.4,
-            label: "Rendering".into(),
-            peaks: vec![(0.0, 0.0); crate::ports::EXPORT_PEAKS],
-        };
-        let input = || egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
-            ..Default::default()
-        };
-        let mut busy = crate::busy::Busy::new("Loading audio");
+    fn the_export_window_says_the_cover_on_its_line_and_paints_nothing_over_its_waves() {
+        let ctx = export_ctx();
+        let p = stems_progress(1.0, "Writing files", &["Kick", "Snare", "Bass"], true);
+        let mut busy = crate::busy::Busy::new("Writing files").with_detail("wav");
         busy.delay = std::time::Duration::ZERO;
         // Shown once, so the mirror has something to mirror.
-        let _ = ctx.run(input(), |ctx| {
-            let p = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
-            busy.draw(&p, ctx.content_rect(), FALLBACK_FACE, 0.0);
+        let _ = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+            busy.draw(&painter, ctx.content_rect(), FALLBACK_FACE, 0.0);
         });
         assert!(busy.is_visible(), "the cover never became visible; the test proves nothing");
-        let count = |cover: Option<&crate::busy::Busy>| {
-            let mut n = 0;
-            // Two passes: an `Area` places itself from what it measured last time.
-            for _ in 0..2 {
-                n = ctx
-                    .run(input(), |ctx| show_export_progress(ctx, &progress, cover_placement(), cover))
-                    .shapes
-                    .len();
+        let shapes = export_frame(&ctx, &p, Some(&busy), Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let wells = export_wells(&l, p.rows.len(), 0.0);
+        let texts = painted_texts(&shapes);
+        let said = texts
+            .iter()
+            .find(|(s, _)| s == "Writing files  wav")
+            .unwrap_or_else(|| panic!("the cover's words are not on the window's line: {texts:?}"));
+        assert!(
+            l.label.expand(1.0).contains_rect(said.1),
+            "the cover's words were painted at {:?}, off the line at {:?}",
+            said.1,
+            l.label
+        );
+        for (text, at) in &texts {
+            for well in &wells {
+                assert!(
+                    !well.intersects(*at),
+                    "{text:?} is painted at {at:?}, over the wave in {well:?}"
+                );
             }
-            n
+        }
+        // And nothing else of the cover's: no scrim, no card, nothing past
+        // the window's own edge.
+        for s in &shapes {
+            let r = s.shape.visual_bounding_rect();
+            assert!(
+                !r.is_positive() || window.expand(1.5).contains_rect(r),
+                "a shape at {r:?} spills past the window at {window:?} - the cover's scrim"
+            );
+        }
+    }
+
+    /// **Every stem gets its own named wave, in desk order.** The owner:
+    /// "we need to show all waveforms being drawn, not just the one". Each
+    /// name sits on its own line ABOVE its well, so no word is ever under a
+    /// wave, and each row draws what its own peaks say.
+    ///
+    /// Revert-check: draw `p.peaks` alone whatever `p.rows` holds (the old
+    /// window) and no name is painted at all.
+    #[test]
+    fn a_stems_export_draws_one_named_wave_per_stem_in_desk_order() {
+        let ctx = export_ctx();
+        let names = ["Master", "Kick", "Snare", "Bass"];
+        let p = stems_progress(0.5, "Rendering", &names, false);
+        let shapes = export_frame(&ctx, &p, None, Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let wells = export_wells(&l, names.len(), 0.0);
+        let texts = painted_texts(&shapes);
+        let mut last_y = f32::NEG_INFINITY;
+        for (i, name) in names.iter().enumerate() {
+            let hits: Vec<_> = texts.iter().filter(|(s, _)| s == name).collect();
+            assert_eq!(hits.len(), 1, "{name:?} was painted {} times: {texts:?}", hits.len());
+            let at = hits[0].1;
+            assert!(at.top() > last_y, "{name:?} is out of desk order");
+            last_y = at.top();
+            assert!(
+                at.bottom() <= wells[i].top() + 0.5 && at.top() >= l.wave.top() - 0.5,
+                "{name:?} at {at:?} is not on the line above its well {:?}",
+                wells[i]
+            );
+            assert!(wells[i].height() >= EXPORT_ROW_MIN_WELL - 0.5, "row {i}'s well is a sliver");
+        }
+        // Every well painted: its ground, exactly where the rows put it.
+        let grounds = painted_rects(&shapes);
+        for (i, well) in wells.iter().enumerate() {
+            assert!(
+                grounds.iter().any(|r| (r.min - well.min).length() < 0.5 && (r.max - well.max).length() < 0.5),
+                "row {i}'s well {well:?} was never painted: {grounds:?}"
+            );
+        }
+        // And each row its OWN wave: the stems' peaks differ, so their
+        // strokes do too (row i's columns reach i-dependent heights).
+        let strokes = wave_strokes(&shapes);
+        for (i, well) in wells.iter().enumerate() {
+            assert!(
+                strokes.iter().any(|seg| well.contains(seg[0]) && well.contains(seg[1]) && (seg[1].y - seg[0].y).abs() > 2.0),
+                "row {i} drew no wave of its own"
+            );
+        }
+    }
+
+    /// **A single-file export looks as it always did**: one unnamed wave
+    /// filling the area between the line and the bar.
+    #[test]
+    fn a_single_file_export_still_draws_one_unnamed_wave() {
+        let ctx = export_ctx();
+        let p = crate::ports::ExportProgress {
+            fraction: 0.5,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.5, 0.5); crate::ports::EXPORT_PEAKS],
+            rows: Vec::new(),
         };
-        let bare = count(None);
-        let with = count(Some(&busy));
-        assert!(with > bare, "the cover added nothing to the export window ({bare} -> {with} shapes)");
+        let shapes = export_frame(&ctx, &p, None, Vec::new());
+        let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+        let l = export_layout(window);
+        let texts = painted_texts(&shapes);
+        assert_eq!(
+            texts.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["Rendering  50%"],
+            "a single file names no rows"
+        );
+        let grounds = painted_rects(&shapes);
+        assert!(grounds.contains(&l.wave), "the one well is not the whole wave area: {grounds:?}");
+    }
+
+    /// **More stems than fit scroll, and every one is reachable by wheel
+    /// and by drag.** Rows keep a readable floor rather than shrinking to
+    /// lines; only the rows in view are painted.
+    ///
+    /// Revert-check: lay the rows out as plain allocations with no
+    /// `ScrollArea` round them and the last stems are never painted.
+    #[test]
+    fn more_stems_than_fit_scroll_and_every_row_is_reachable() {
+        let names: Vec<String> = (1..=20).map(|i| format!("Stem {i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let p = stems_progress(0.3, "Rendering", &refs, false);
+        for by_drag in [false, true] {
+            let ctx = export_ctx();
+            let first = export_frame(&ctx, &p, None, Vec::new());
+            let window = inline_export_rect(&ctx).expect("the export window was not drawn inline");
+            let l = export_layout(window);
+            let pitch = export_row_pitch(l.wave.height(), names.len());
+            assert!(
+                pitch * names.len() as f32 > l.wave.height() + 1.0,
+                "twenty rows fit a {}pt area; the test proves nothing",
+                l.wave.height()
+            );
+            assert!(
+                pitch >= EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP - 0.01,
+                "rows shrank under their floor instead of scrolling"
+            );
+            let seen_first: Vec<String> = painted_texts(&first).into_iter().map(|(s, _)| s).collect();
+            assert!(seen_first.contains(&names[0]), "the first stem is not in view at the start");
+            assert!(!seen_first.contains(&names[19]), "the last stem is painted though it cannot be in view");
+            let mut seen = std::collections::BTreeSet::new();
+            let at = l.wave.center();
+            let mut t = 0.0;
+            for frame in 0..400 {
+                let events = if by_drag {
+                    // Press, pull up a row's height, let go: one flick a frame-group.
+                    match frame % 4 {
+                        0 => vec![egui::Event::PointerMoved(at), egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        }],
+                        1 => vec![egui::Event::PointerMoved(at - Vec2::new(0.0, 30.0))],
+                        2 => vec![egui::Event::PointerMoved(at - Vec2::new(0.0, 60.0))],
+                        _ => vec![egui::Event::PointerButton {
+                            pos: at - Vec2::new(0.0, 60.0),
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                    }
+                } else {
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, -20.0),
+                            modifiers: Default::default(),
+                        },
+                    ]
+                };
+                t += 1.0 / 30.0;
+                let shapes = export_frame_at(&ctx, &p, events, t);
+                for (s, r) in painted_texts(&shapes) {
+                    if s.starts_with("Stem ") && l.wave.intersects(r) {
+                        seen.insert(s);
+                    }
+                }
+                if seen.len() == names.len() {
+                    break;
+                }
+            }
+            let how = if by_drag { "drag" } else { "wheel" };
+            let missing: Vec<_> = names.iter().filter(|n| !seen.contains(*n)).collect();
+            assert!(missing.is_empty(), "by {how}, these rows were never reached: {missing:?}");
+        }
+    }
+
+    /// The rows' pitch: an even share while it clears the floor, the floor
+    /// once it does not.
+    #[test]
+    fn a_row_takes_its_share_of_the_area_down_to_a_readable_floor() {
+        let floor = EXPORT_ROW_NAME_H + EXPORT_ROW_MIN_WELL + EXPORT_ROW_GAP;
+        assert_eq!(export_row_pitch(400.0, 2), 200.0);
+        assert_eq!(export_row_pitch(400.0, 40), floor);
+        let (name, well) = export_row_parts(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 100.0)));
+        assert!(name.bottom() <= well.top(), "the name line runs into its well");
+        assert_eq!(well.height(), 100.0 - EXPORT_ROW_NAME_H - EXPORT_ROW_GAP);
+    }
+
+    fn export_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        ctx
+    }
+
+    /// A stems pass's progress: `names` in order, each with a wave whose
+    /// height depends on its row so the rows can be told apart.
+    fn stems_progress(fraction: f32, label: &str, names: &[&str], silent: bool) -> crate::ports::ExportProgress {
+        crate::ports::ExportProgress {
+            fraction,
+            label: label.to_owned(),
+            peaks: Vec::new(),
+            rows: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let a = if silent { 0.6 } else { 0.2 + 0.15 * (i % 5) as f32 };
+                    crate::ports::ExportRow {
+                        name: (*n).to_owned(),
+                        peaks: vec![(-a, a); crate::ports::EXPORT_PEAKS],
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Settle the window (an `Area` places itself from what it measured last
+    /// time) and hand back the last frame's shapes.
+    fn export_frame(
+        ctx: &egui::Context,
+        p: &crate::ports::ExportProgress,
+        cover: Option<&crate::busy::Busy>,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(Vec::new()), |ctx| show_export_progress(ctx, p, cover_placement(), cover));
+        ctx.run(input(events), |ctx| show_export_progress(ctx, p, cover_placement(), cover)).shapes
+    }
+
+    /// One frame at time `t`, for the tests that move the pointer.
+    fn export_frame_at(
+        ctx: &egui::Context,
+        p: &crate::ports::ExportProgress,
+        events: Vec<egui::Event>,
+        t: f64,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            events,
+            time: Some(t),
+            predicted_dt: 1.0 / 30.0,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| show_export_progress(ctx, p, cover_placement(), None)).shapes
+    }
+
+    /// Where the rows' wells are, scrolled `offset` points down.
+    fn export_wells(l: &ExportLayout, rows: usize, offset: f32) -> Vec<Rect> {
+        let pitch = export_row_pitch(l.wave.height(), rows);
+        (0..rows)
+            .map(|i| {
+                let top = l.wave.top() + i as f32 * pitch - offset;
+                export_row_parts(Rect::from_min_size(
+                    Pos2::new(l.wave.left(), top),
+                    Vec2::new(l.wave.width(), pitch),
+                ))
+                .1
+            })
+            .collect()
+    }
+
+    fn flat_shapes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::epaint::Shape> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+            match shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Every string painted, with where it landed - clipped to what was
+    /// visible, so a row scrolled out of view does not count as shown.
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        for c in shapes {
+            let mut flat = Vec::new();
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+                match shape {
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    s => out.push(s.clone()),
+                }
+            }
+            walk(&c.shape, &mut flat);
+            for s in flat {
+                if let egui::epaint::Shape::Text(t) = &s {
+                    let r = t.visual_bounding_rect().intersect(c.clip_rect);
+                    if r.is_positive() {
+                        out.push((t.galley.job.text.clone(), r));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every filled rectangle, by where it is. Matched by geometry and not
+    /// by colour: the window fades in, so its fills carry the fade's alpha.
+    fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<Rect> {
+        flat_shapes(shapes)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::Rect(r) if r.fill.a() > 0 => Some(r.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wave_strokes(shapes: &[egui::epaint::ClippedShape]) -> Vec<[Pos2; 2]> {
+        flat_shapes(shapes)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::LineSegment { points, .. } => Some(points),
+                _ => None,
+            })
+            .collect()
     }
 
     fn cover_placement() -> Placement {
@@ -17631,6 +18082,7 @@ at: None,
             fraction: 1.0,
             label: "Rendering".to_owned(),
             peaks: vec![(0.0, 0.0); 8],
+            rows: Vec::new(),
         };
         let (bare, with) = frame_with_and_without_cover("Writing files", |ctx| {
             show_export_progress(ctx, &progress, cover_placement(), None);
@@ -18878,6 +19330,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.4, 0.4); 16],
+            rows: Vec::new(),
         };
         // Three frames for the same reason `run_picker` runs three: the
         // sizing pass paints nothing.
@@ -19482,6 +19935,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.5, 0.5); 32],
+            rows: Vec::new(),
         };
         let level = |id: &str| {
             ctx.memory(|m| {
@@ -19577,6 +20031,7 @@ at: None,
             fraction: 0.5,
             label: "Rendering".to_owned(),
             peaks: vec![(-0.4, 0.4); 16],
+            rows: Vec::new(),
         };
         let mut over_middle = false;
         let mut over_corner = false;
