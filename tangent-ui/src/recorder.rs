@@ -856,11 +856,11 @@ impl MidiInputSel {
 ///
 /// The shape is a SPARSE object keyed by channel index, the `strip_inserts`
 /// tail's shape and for its reason: thirty-two rows that nearly all say
-/// "everything" would be a hundred near-empty lines in every settings file
-/// and in every DAW project the plugin saves. Inside a row, `devices` absent
-/// means every device and `channel` absent means every channel — **absent
-/// rather than null**, which is the rule `custom_font_path` set: a key
-/// written as null is a key an older build has to know to ignore.
+/// "everything" would be a hundred near-empty lines in every settings file.
+/// Inside a row, `devices` absent means every device and `channel` absent
+/// means every channel, and **absent rather than null** is the rule
+/// `custom_font_path` set: a key written as null is a key an older build has
+/// to know to ignore.
 pub fn read_midi_inputs(stored: Option<&Value>) -> Vec<MidiInputSel> {
     let mut out: Vec<MidiInputSel> = Vec::new();
     let Some(Value::Object(o)) = stored else {
@@ -1704,8 +1704,8 @@ impl Default for Gains {
 /// painter reads. Keeping them separate is what stops the panel from acquiring
 /// a `String` field it would then be tempted to mutate mid-draw.
 ///
-/// Every field is inert in a plugin: `Caps::capture_devices` is false there, the
-/// band takes zero height, and nothing ever writes to this.
+/// Every field is inert where `Caps::capture_devices` is false (a Minimal
+/// build): the band takes zero height, and nothing ever writes to this.
 /// One input of the interface, as the desk needs to draw it.
 ///
 /// **Filled by the host every frame, like the slots.** Which inputs are open
@@ -2305,7 +2305,7 @@ impl Default for Knobs {
 ///
 /// The **request pattern**, for the same reason the directory picker uses it:
 /// creating a take directory and opening a device must not happen halfway
-/// through painting a frame. The plugin refuses simply by never draining.
+/// through painting a frame. A host refuses simply by never draining.
 ///
 /// Deliberately short. Everything else a click in the band can do — choosing a
 /// folder, choosing a device, changing the count-in, opening the Export dialog
@@ -2392,8 +2392,8 @@ pub enum RecorderRequest {
     /// track, two or more clips or one that repeats, not on a frozen track)
     /// and sends nothing otherwise; the host keeps only the audio clips among
     /// the ids and re-checks the track. Where `caps.capture_devices` is false
-    /// (a plugin, the Minimal build) `request_recorder` drops it, and nothing
-    /// is said unless the app says it.
+    /// (the Minimal build) `request_recorder` drops it, and nothing is said
+    /// unless the app says it.
     GlueAudio(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///

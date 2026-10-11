@@ -6,7 +6,7 @@
 //! Every instrument surface in this app is a free function — `draw(painter,
 //! rect, view)` paired with `hit_test(rect, view, pos)` — and not a single
 //! `egui::Widget` among them. That is a deliberate and good decision: it is
-//! what lets the same code paint a desktop window, a plugin editor and an
+//! what lets the same code paint a desktop window, an inline surface and an
 //! offscreen video frame. It also means egui knows nothing is there. No
 //! focus, no tab order, and — with AccessKit switched on — a window a screen
 //! reader reads as one empty rectangle.

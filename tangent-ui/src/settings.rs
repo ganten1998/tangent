@@ -2044,8 +2044,9 @@ pub struct Settings {
     /// rises within a session: a minted id is never handed out twice.
     pub next_track_id: u64,
     /// **A format-2 desk this read refused**, kept whole for the caller: the
-    /// file road puts it in `settings.desk-refused.json`, the DAW blob road
-    /// under `extra["desk_refused"]`. Never serialized; taken once.
+    /// file road puts it in `settings.desk-refused.json`, the JSON road
+    /// (`from_json`) under `extra["desk_refused"]`. Never serialized; taken
+    /// once.
     pub desk_refused: Option<crate::desk_format::DeskRefused>,
     /// **What the desk reader dropped or refused, as one line** for the
     /// first frame's notice, the `unreadable` bargain: said where somebody
@@ -2062,8 +2063,8 @@ pub struct Settings {
     /// to load a plugin, pick a device or export.
     ///
     /// `tangent-ui` already knows how to draw them in the canvas: it is what
-    /// the plugin build does, where there are no child windows to have. This
-    /// switches the desktop onto that same path.
+    /// `Caps::child_windows` off means, and this switches the desktop onto
+    /// that path.
     ///
     /// Off by default, because native child windows are worth keeping — four
     /// years of X11 window-type hints, i3 floating, OS focus and the
@@ -2782,10 +2783,10 @@ impl Settings {
 
     /// Load without an OS answer about screen readers.
     ///
-    /// The road in for the plugin and for tests, where nobody asked the OS
-    /// anything: `false` is the conservative reading — "no reader is provably
-    /// attached" — under which the pre-v20 one-shot behaves exactly as it
-    /// always has. The desktop binary, which CAN ask, comes in through
+    /// The road in for tests, where nobody asked the OS anything: `false` is
+    /// the conservative reading ("no reader is provably attached"), under
+    /// which the pre-v20 one-shot behaves exactly as it always has. The
+    /// desktop binary, which CAN ask, comes in through
     /// [`Self::load_with_reader`] instead.
     pub fn load() -> Self {
         Self::load_with_reader(false)
@@ -2992,28 +2993,26 @@ impl Settings {
 
     /// Round-trip through the same JSON the settings file holds.
     ///
-    /// A plugin instance does NOT own `~/.config/tangent/settings.json` — it is
-    /// shared with the standalone and with every other instance — so its
-    /// settings live in the DAW project instead, and this is how they get
-    /// there and back. Deliberately the same text as the file, so a project
-    /// saved by the plugin and a settings file written by the app say exactly
-    /// the same thing, unknown keys and all.
+    /// Deliberately the same text as the file, unknown keys and all, so a
+    /// round trip proves what the file would keep without touching a file:
+    /// the tests' road. It was also the road the retired VST3 kept its
+    /// settings by, inside a DAW project, and the era corpus still reads the
+    /// blobs it saved.
     pub fn to_json(&self) -> String {
         Value::Object(self.to_map()).to_string()
     }
 
     /// The inverse, forgiving in the same way the file loader is: anything
-    /// unreadable yields defaults rather than an error, because a plugin that
-    /// refuses to open a project over a settings blob is worse than one that
-    /// opens it looking wrong.
+    /// unreadable yields defaults rather than an error.
     pub fn from_json(text: &str) -> Self {
         match parse_object(text) {
             Ok(map) => {
                 let mut s = Self::from_map(map);
-                // **A refused desk rides the blob** (design 6.3): the DAW
-                // session is the only copy, so it is kept under a stranger's
-                // key, which every later save writes back untouched, rather
-                // than in a side file no project would carry.
+                // **A refused desk rides the text** (design 6.3): this road
+                // has no side file to put it in, so it is kept under a
+                // stranger's key, which every later write carries back
+                // untouched. (The retired VST3's DAW session was the only
+                // copy of the text it saved.)
                 if let Some(refused) = s.desk_refused.take() {
                     s.desk_notice = Some(format!(
                         "The desk saved with this project could not be read ({}). It is kept \
@@ -4041,8 +4040,7 @@ impl Settings {
         // written at the end.** A sparse object keyed by channel index, the
         // `strip_inserts_tail` shape and for its reason: writing thirty-two
         // objects that nearly all say "everything" would put a hundred
-        // near-empty rows in every settings file and in every DAW project the
-        // plugin saves.
+        // near-empty rows in every settings file.
         //
         // **Reconciled against `channel_inputs` immediately, never trusted on
         // its own.** A build without this feature carries this key through
@@ -5129,8 +5127,7 @@ impl Settings {
         // keeps a valid desk (the head), carries the tail through its own
         // saves as a stranger's key, and loses at most the far seats it never
         // knew about; a bare object here would have read on that build as no
-        // desk at all and put the shipped instruments back — and the plugin
-        // is a separately built binary sharing this file. The head is
+        // desk at all and put the shipped instruments back. The head is
         // written whole rather than trimmed so its length can never be one
         // of the era lengths `adopt_desk`'s lifts key on (84 is the
         // sixteen-pad era). See `crate::arrangement::V7_SPARSE_SEATS` for the
@@ -5749,9 +5746,8 @@ impl Settings {
             // the wreckage. One torn write costs every colour, size and
             // remembered position the user ever chose.
             //
-            // Rare with one writer. The plugin makes it routine: several
-            // instances plus the standalone can all be saving this file, and
-            // this is what stops one of them catching another mid-write.
+            // Rare with one writer, and what the rare case costs is every
+            // setting at once.
             //
             // The temp file sits beside the target so the rename stays within
             // one filesystem, which is what makes it atomic. Errors remain
@@ -8597,12 +8593,12 @@ mod tests {
         s
     }
 
-    /// The settings a plugin carries in its project file are the same text the
-    /// standalone writes, unknown keys included. Anything else and a project
-    /// saved by the plugin would quietly drop whatever a newer build knew
-    /// about — which is the failure `extra` exists to prevent in the file.
+    /// The JSON road is the same text the settings file holds, unknown keys
+    /// included. Anything else and a round trip would quietly drop whatever a
+    /// newer build knew about, which is the failure `extra` exists to prevent
+    /// in the file.
     #[test]
-    fn json_round_trips_through_a_project_file() {
+    fn json_round_trips_unknown_keys_and_all() {
         let mut s = Settings::default();
         s.dark_mode = true;
         s.window_size_percent = 150;
@@ -8632,14 +8628,14 @@ mod tests {
         assert_eq!(
             back.extra.get("a_key_from_a_later_build"),
             Some(&Value::String("kept".into())),
-            "the plugin dropped a key it did not understand"
+            "the round trip dropped a key it did not understand"
         );
     }
 
-    /// Garbage in a project file yields defaults, not a panic and not a
-    /// refusal to open. Same rule as the settings file (spec §8).
+    /// Garbage on the JSON road yields defaults, not a panic and not a
+    /// refusal. Same rule as the settings file (spec §8).
     #[test]
-    fn unreadable_project_settings_fall_back_to_defaults() {
+    fn unreadable_json_settings_fall_back_to_defaults() {
         for junk in ["", "null", "[]", "{", "not json at all", "42"] {
             assert_eq!(
                 Settings::from_json(junk),
@@ -8664,7 +8660,7 @@ mod tests {
 
     /// A torn write costs the user every setting they ever chose, because
     /// `load_from` answers a parse error with all-defaults and then saves those
-    /// over the wreckage. The plugin turns "rare" into "routine".
+    /// over the wreckage.
     #[test]
     fn saving_is_atomic_and_leaves_no_debris() {
         let dir = std::env::temp_dir().join(format!("tangent-settings-{}", std::process::id()));
@@ -8978,11 +8974,9 @@ mod tests {
         };
         assert!(says_the_sets(&Settings::from_map(s.to_map())), "format 2 lost a device set");
 
-        // Through the PLUGIN's road too — the same text, and the same
-        // constraint: a project saved by the plugin and a settings file
-        // written by the app say the same thing.
+        // Through the JSON road too: the same text, and the same constraint.
         let json = Settings::from_json(&s.to_json());
-        assert!(says_the_sets(&json), "the plugin's road lost a device set");
+        assert!(says_the_sets(&json), "the JSON road lost a device set");
 
         // A file with sets AND an unknown future key keeps both.
         let s2 = Settings::from_map(map_of(

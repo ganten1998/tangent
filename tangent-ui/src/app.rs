@@ -11,9 +11,7 @@
 //! the engine's side (`DesktopApp::host_frame_due`). It used to be a
 //! 50 ms tick regardless, which egui delivered as 33 ms: an idle desk paid
 //! the whole per-frame bill thirty times a second for nothing. That tick is
-//! one variable away — `IVORY_PACE=tick` — and it is still what a plugin
-//! editor gets, because a plugin's host drives its window on a cadence of
-//! its own.
+//! one variable away: `IVORY_PACE=tick`.
 //!
 //! `IVORY_PACE=gesture` will instead pace the window to the DISPLAY while a
 //! gesture is in flight — a bare `request_repaint`, which puts eframe's loop
@@ -453,9 +451,7 @@ const MIDI_PORT_KEY: &str = "midi-port-failed";
 ///
 /// Pulled out of `TangentApp` so it can be TESTED: the rules here have four
 /// interacting branches and had no coverage at all, while being the thing every
-/// other display in the app reads from. It is also the piece the plugin build
-/// needs, since a plugin receives note events from the host rather than from a
-/// `midir` channel, and only this half is shared.
+/// other display in the app reads from.
 ///
 /// Velocity and press time used to be stored per note and were read by nothing
 /// (both were `#[allow(dead_code)]`). They are gone rather than carried: arrival
@@ -648,13 +644,14 @@ pub struct TangentApp {
 
     midi_tx: mpsc::Sender<MidiEvent>,
     midi_rx: mpsc::Receiver<MidiEvent>,
-    /// Where notes come from when the app picks for itself. `None` in a
-    /// plugin, which is handed its notes and has no device list to offer.
-    /// The CHANNEL above is not optional: a plugin uses the same one, filled
-    /// from `process()` instead of from a `midir` callback thread.
+    /// Where notes come from when the app picks for itself. `None` until the
+    /// host hands its ports over, and in a test that never does. The CHANNEL
+    /// above is not optional: it is filled from `midir`'s callback thread, or
+    /// by a test through `feed`.
     ports: Option<Box<dyn MidiPorts>>,
     /// Who can enumerate and select an audio input, and a camera. `None` in a
-    /// plugin and in a Minimal build, where the code to do it is not linked.
+    /// Minimal build, where the code to do it is not linked, and in a test
+    /// that hands none over.
     audio_devices: Option<Box<dyn CaptureDevices>>,
     /// What the audio system itself can be asked. Consulted when Setup opens
     /// and never per frame — `rates()` re-enumerates hardware.
@@ -664,9 +661,6 @@ pub struct TangentApp {
     /// against a host name, and captured once at construction so a frame
     /// cannot be half-drawn under one set of rules and half under another.
     caps: Caps,
-    /// A size the user asked for that the host has not been told about yet.
-    /// Only ever set when the host owns the window.
-    pending_resize: Option<Vec2>,
     /// Which lanes have their automation row open, and which parameter each
     /// is showing.
     ///
@@ -819,7 +813,7 @@ pub struct TangentApp {
     /// Deferred rather than done on the spot because
     /// [`Self::apply_dialog_action`] has no `egui::Context` — it is public so
     /// the host's editor hook can drive it — and putting the font back needs
-    /// one. The same shape as `pending_resize` beside it.
+    /// one.
     pending_reset: Option<crate::settings::ResetScope>,
     /// The Undo on the box a reset leaves behind was pressed, for a reset of
     /// this scope.
@@ -881,7 +875,7 @@ pub struct TangentApp {
     voicing: VoicingSession,
     last_voicing: Option<Instant>,
     /// Everything the band shows, written each frame by whoever is hosting us.
-    /// Inert in a plugin, where nothing ever writes to it.
+    /// Inert in a test that writes nothing to it.
     recorder: recorder::RecorderState,
     /// One pending request for the host to perform after the frame. `Option`
     /// rather than a queue on purpose: these are all user gestures, at most one
@@ -1107,8 +1101,8 @@ pub struct TangentApp {
     /// mark a device that has gone away, and the MIDI Inputs dialog needs it
     /// to say which rows are live; both would otherwise ask per frame.
     ///
-    /// Empty on a plugin, which has no ports to enumerate: a track's set is
-    /// still remembered and still shown, just with nothing plugged in.
+    /// Empty where there are no ports to enumerate: a track's set is still
+    /// remembered and still shown, just with nothing plugged in.
     midi_ports_seen: Vec<String>,
     /// When `midi_ports_seen` was last asked. `None` = never.
     midi_ports_at: Option<Instant>,
@@ -1662,9 +1656,9 @@ pub struct TangentApp {
     /// A folder the app has asked the host to show in the file manager.
     ///
     /// The request pattern again, and for a sharper reason than the picker's:
-    /// showing a folder means starting another process, which a plugin inside
-    /// somebody's DAW has no business doing. A host refuses by never draining
-    /// it, and `Caps` decides whether it is ever set in the first place.
+    /// showing a folder means starting another process, which is the host's
+    /// business and not this crate's. A host refuses by never draining it, and
+    /// `Caps` decides whether it is ever set in the first place.
     reveal_request: Option<std::path::PathBuf>,
     /// An export spec chosen without ticking "use these settings for every
     /// take": it governs every take **for the rest of this session** and is
@@ -2038,10 +2032,8 @@ pub struct TangentApp {
     /// A size the APP is asking for: a percentage preset, or the natural size
     /// for a window nobody has dragged yet. Cleared when it is sent.
     ///
-    /// Distinct from `pending_resize`, which is the PLUGIN's road: an editor
-    /// cannot set its own size and has to ask its host. This one is the
-    /// desktop's, and it exists because the window is no longer pinned, so
-    /// "make it the right size" is now a request rather than a standing fact.
+    /// It exists because the window is no longer pinned, so "make it the
+    /// right size" is now a request rather than a standing fact.
     pending_window_size: Option<Vec2>,
     /// When the un-cover for the pending request went out, and nothing else.
     ///
@@ -3081,10 +3073,9 @@ fn edge_scroll_pps(zone: Rect, p: Pos2) -> Vec2 {
 /// stall, a plugin scan, the first frame after the window was left alone —
 /// must not fling a clip a quarter of a second's worth of scroll across the
 /// song. Capping makes a hitch look like a stutter; not capping makes it look
-/// like a lost clip. Where a host gives no honest clock at all (the plugin
-/// build's baseview backend is unverified on this point) the fallback is the
-/// frame budget, which is exactly the behaviour that shipped before this
-/// existed — worse, but not a regression.
+/// like a lost clip. Where a host gives no honest clock at all the fallback
+/// is the frame budget, which is exactly the behaviour that shipped before
+/// this existed: worse, but not a regression.
 ///
 /// SECOND, the repaint, and it is the whole reason this function exists rather
 /// than a bare multiply at each call site. A hand HELD at an edge emits no
@@ -4351,15 +4342,15 @@ impl TangentApp {
         let analyzer_cfg = crate::analyzer::Config::from_key(&settings.analyzer);
         // **A screen reader takes the dialogs into the canvas.** eframe 0.33
         // adapts the ROOT viewport only, so a dialog in a child window is a
-        // dialog a reader cannot see; drawing it inline is the road the
-        // plugin build already takes. See `Settings::screen_reader_mode`.
+        // dialog a reader cannot see; with `child_windows` off it is drawn
+        // inline instead. See `Settings::screen_reader_mode`.
         let mut caps = caps;
         if settings.screen_reader_mode {
             caps.child_windows = false;
         }
         // **The recorder band, for a host that cannot open a device.**
         //
-        // The band is 200 points tall; a plugin editor whose settings file says
+        // The band is 200 points tall; a Minimal build whose settings file says
         // `show_recorder: true` would lay out 200 points of transport it can
         // never populate, shrinking the piano to make room for a camera preview
         // that will never arrive. `fit_bands` cannot tell the difference
@@ -4418,7 +4409,6 @@ impl TangentApp {
             audio_setup: None,
             cameras: None,
             caps,
-            pending_resize: None,
             pending_reset: None,
             pending_undo_reset: None,
             scratch_warning: None,
@@ -4766,9 +4756,8 @@ impl TangentApp {
 
     /// The channel every note arrives on, whoever is sending.
     ///
-    /// `midir`'s callback thread holds one of these on the desktop; a VST3
-    /// `process()` holds one in the plugin. Neither knows about the other, and
-    /// `process_midi_events` cannot tell them apart, which is the point.
+    /// Every `midir` callback thread the desktop opens holds one of these,
+    /// and `process_midi_events` cannot tell them apart, which is the point.
     pub fn midi_sender(&self) -> mpsc::Sender<MidiEvent> {
         self.midi_tx.clone()
     }
@@ -4776,9 +4765,9 @@ impl TangentApp {
     /// Attach the thing that enumerates and opens MIDI devices.
     ///
     /// Separate from `new` because the source needs the sender, and the sender
-    /// is made here. A host that is given its notes never calls this, which is
-    /// also what makes the MIDI menu row and the picker dialog inert rather
-    /// than merely hidden.
+    /// is made here. A host with no ports never calls this, which is also what
+    /// makes the MIDI menu row and the picker dialog inert rather than merely
+    /// hidden.
     /// Run the MIDI priority chain now. Called once, after the first frame is
     /// on screen — see `MidiPorts::auto_connect`.
     /// Open a named MIDI port — the `-p NAME` path, deferred with the rest.
@@ -4852,8 +4841,7 @@ impl TangentApp {
     /// open_set` closes what is no longer wanted and opens what is new, and a
     /// device already open and still wanted keeps the connection it has.
     ///
-    /// A no-op in the plugin, which has no ports of its own — the host hands
-    /// it notes.
+    /// A no-op where no ports were handed over (`set_ports`).
     ///
     /// The failure is a **CONDITION and not an event**: a port either opens or
     /// it does not, so a message stands while it holds and goes when it stops,
@@ -4982,9 +4970,10 @@ impl TangentApp {
     /// Attach the thing that enumerates audio inputs.
     ///
     /// The same shape as `set_ports` and for the same reason: `cpal` may not be
-    /// reachable from this crate, so what arrives is a trait object. A plugin
-    /// never calls this, which is what makes the device rows inert rather than
-    /// merely hidden — and `Caps::capture_devices` is what makes them absent.
+    /// reachable from this crate, so what arrives is a trait object. A host
+    /// with no capture devices never calls this, which is what makes the
+    /// device rows inert rather than merely hidden, and
+    /// `Caps::capture_devices` is what makes them absent.
     /// Hand over the audio system's own questions. `None` in a build that has
     /// no audio at all, exactly like the two above.
     pub fn set_audio_setup(&mut self, setup: Option<Box<dyn crate::ports::AudioSetup>>) {
@@ -5012,21 +5001,12 @@ impl TangentApp {
         self.cameras.as_ref().map(|d| d.list()).unwrap_or_default()
     }
 
-    /// A size the user picked that the host has not been told about, if any.
-    ///
-    /// Taken, not read: the request goes out once. A host that refuses it will
-    /// simply not resize, and the layout fits whatever rect it ends up with,
-    /// so a refusal costs nothing but the size the user asked for.
-    pub fn take_pending_resize(&mut self) -> Option<Vec2> {
-        self.pending_resize.take()
-    }
-
     /// Put the typeface back on a context that has never seen it.
     ///
-    /// A plugin editor is a window the host opens and closes at will, and each
-    /// time it opens there is a new GL context and a new, empty font atlas.
-    /// The app is not rebuilt — reopening a window must not reset the tuning —
-    /// so the faces have to be reinstalled without it.
+    /// A second context, the compositor's offscreen one that paints a take's
+    /// video, starts with an empty font atlas, and every chord name in it
+    /// would render in egui's default face. The app is not rebuilt for it, so
+    /// the faces are installed from the app's settings instead.
     pub fn install_fonts(&self, ctx: &egui::Context) {
         crate::fonts::install(
             ctx,
@@ -5036,53 +5016,20 @@ impl TangentApp {
         crate::fonts::apply_text_styles(ctx);
     }
 
-    /// The current settings as the same JSON the settings file holds.
+    /// Feed one event in directly, without the channel.
     ///
-    /// For a host that persists state itself rather than sharing the file.
-    pub fn settings_json(&self) -> String {
-        self.settings.to_json()
-    }
-
-    /// Feed one event in directly, for a host that has no channel to spare.
-    ///
-    /// The plugin uses the sender instead; this exists so a test can drive the
-    /// app without one.
+    /// The host's notes arrive through [`Self::midi_sender`]; this exists so a
+    /// test can drive the app without one.
     pub fn feed(&mut self, ev: MidiEvent) {
         self.notes.apply(ev);
     }
 
-    /// Ask the host for the height this band stack needs, keeping the width.
-    ///
-    /// On the desktop the window simply follows `band_sizes()` on the next
-    /// frame. A plugin's editor cannot: nothing resizes it unless it asks, and
-    /// `SetSizePercent` was the only thing that ever did. So turning the
-    /// guitar view on inside a DAW did not make the editor taller — it made
-    /// the whole layout SMALLER to fit the height it already had, and the
-    /// piano lost 40% of its width to black bars either side. Every action
-    /// that adds or removes a band routes through here.
-    fn request_natural_size(&mut self) {
-        if self.caps.window_sizing {
-            return; // the window follows the layout by itself
-        }
-        // Keep the width the editor already has; only the stack height
-        // changed. Falling back to the settings width covers the first frame,
-        // before anything has been laid out.
-        let w = if self.last_pane.x > 1.0 {
-            self.last_pane.x
-        } else {
-            main_width(&self.settings)
-        };
-        self.pending_resize = Some(natural_size(&self.settings, w));
-    }
-
     /// Persist, if this host owns the settings file.
     ///
-    /// One gate instead of twenty-four call sites each remembering to check.
-    /// `~/.config/tangent/settings.json` is shared by the standalone and by
-    /// EVERY plugin instance, so without this the last editor window you
-    /// happened to touch would decide everyone's colours — and a DAW project
-    /// reopened tomorrow would silently pick up whatever the standalone was
-    /// set to. A plugin's state belongs in its own project file.
+    /// One gate instead of twenty-four call sites each remembering to check,
+    /// and the one that keeps an app a test builds with
+    /// `persist_global_settings` off (`Caps::NONE`, the tests' `QUIET` sets)
+    /// away from a person's own `~/.config/tangent/settings.json`.
     fn save_settings(&self) {
         // **A single-shot desk edit ends here**: a kind, a folder flag, a
         // route, a key. Most single-shot edits that move a fact the desk
@@ -8590,8 +8537,8 @@ impl TangentApp {
             // Drawn INLINE, the menu is in this very context, so this handler
             // sees the press that is landing on the item — and closed the menu
             // before `menu::show` ran, which is later in the frame. The button
-            // was never clicked and the menu simply vanished. Every row in a
-            // plugin was dead for exactly this reason. `menu::show` closes it
+            // was never clicked and the menu simply vanished. Every inline
+            // row was dead for exactly this reason. `menu::show` closes it
             // on a press outside its own rect instead, which it can tell and
             // this cannot.
             //
@@ -9168,8 +9115,8 @@ impl TangentApp {
                         return;
                     }
                 }
-                // Dragging moves OUR window. A plugin's window is the
-                // host's, and borderless_mode is not even offered there.
+                // Dragging moves OUR window, and only where it is ours:
+                // without `window_sizing` borderless_mode is not even offered.
                 if self.settings.borderless_mode && self.caps.window_sizing {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
@@ -9190,7 +9137,7 @@ impl TangentApp {
 
     /// Take whatever the band asked for, if anything.
     ///
-    /// Drained by the host AFTER `frame()` returns. A plugin refuses simply by
+    /// Drained by the host AFTER `frame()` returns. A host refuses simply by
     /// never calling this, which is why refusal needs no code of its own.
     /// Start and stop the held audition, once per frame.
     ///
@@ -9402,10 +9349,11 @@ impl TangentApp {
     ///
     /// **Not in `Settings::load` and not in `TangentApp::new`**, which is why
     /// it is a method the host calls rather than something that happens on
-    /// its own: the VST3 loads settings too, and a plugin scanned by some
-    /// other DAW's background scanner must not create folders in the user's
-    /// Documents. `create_dir_all` succeeds on a directory already there, so
-    /// this is a no-op on every launch after the first.
+    /// its own: loading settings and building an app are what every test and
+    /// probe does, and neither may create folders in somebody's Documents;
+    /// the binary calls this once, launching. `create_dir_all` succeeds on a
+    /// directory already there, so this is a no-op on every launch after the
+    /// first.
     pub fn make_media_folders(&self) {
         for root in self.settings.media_roots() {
             let _ = std::fs::create_dir_all(&root);
@@ -14951,7 +14899,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The save panel the app is waiting on, if any. Same drain-once pattern
-    /// as the file request; a plugin refuses by never draining.
+    /// as the file request; a host refuses by never draining.
     pub fn take_save_request(&mut self) -> Option<crate::ports::SaveRequest> {
         self.save_request.take()
     }
@@ -18995,8 +18943,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return true;
         }
         // **Said, where no host will weld.** `request_recorder` drops what
-        // a host cannot take - a build with no recorder, the plugin - and
-        // the key did nothing and said nothing.
+        // a host cannot take - a build with no recorder - and the key did
+        // nothing and said nothing.
         if !self.caps.capture_devices {
             self.notify(
                 crate::notify::Kind::Info,
@@ -19599,8 +19547,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the host's one `commit_undo_moment` after the quantize takes knobs
         // and warp together, however many frames its cover waits. Only where
         // a host takes the request - the gate `request_recorder` uses: a
-        // plugin never drains it, and there the knobs are the whole press
-        // and keep their own moment.
+        // build with no recorder never drains it, and there the knobs are
+        // the whole press and keep their own moment.
         if self.caps.capture_devices {
             // As `commit_view_change` will read them at the end of this
             // frame: the view, the editor's feel and the view on show.
@@ -19642,8 +19590,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         // **Said, where no host will measure.** `request_recorder` drops
-        // what a host cannot take - a build with no recorder, the plugin -
-        // and the key did nothing and said nothing, as glue's did.
+        // what a host cannot take - a build with no recorder - and the key
+        // did nothing and said nothing, as glue's did.
         if !self.caps.capture_devices {
             self.notify(
                 crate::notify::Kind::Info,
@@ -23893,9 +23841,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// editor's and the arrangement's frame of input, because the drumpad
     /// floats over both.
     fn drumpad_input(&mut self, ctx: &egui::Context) {
-        // A dialog too: in the PLUGIN build dialogs draw inline in this
-        // same context, and only `handle_main_interaction` checked — the
-        // pads under the dialog kept striking, and Esc meant for the
+        // A dialog too: inline (reader mode, fullscreen) dialogs draw in
+        // this same context, and only `handle_main_interaction` checked:
+        // the pads under the dialog kept striking, and Esc meant for the
         // dialog closed the panel.
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             return;
@@ -24590,8 +24538,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// host once at startup.
     ///
     /// It has to come from outside: the answer lives behind Win32 and AppKit,
-    /// and this crate is linked into a plugin that may not reach the window
-    /// server (see `scripts/check-firewall.sh`). Out-of-band values are
+    /// and this crate may not reach the window server (see
+    /// `scripts/check-firewall.sh`). Out-of-band values are
     /// ignored rather than clamped — a number that failed its own sanity
     /// check upstream is not evidence about anything.
     pub fn set_display_usable_fraction(&mut self, fraction: f32) {
@@ -25566,8 +25514,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer — and the press that dismissed it
             // is spent, exactly as on the arrangement. A dialog owns it
-            // too: inline (plugin build) it draws in this same context,
-            // and its OK button must not double as a press on the roll.
+            // too: inline (reader mode, fullscreen) it draws in this same
+            // context, and its OK button must not double as a press on the
+            // roll.
             return;
         }
         // A drag that STARTED on the roll keeps its pointer across the
@@ -27267,8 +27216,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer; a press elsewhere dismisses it in
             // `menu::show` without also locating the playhead underneath.
-            // A dialog the same — inline in the plugin build it floats
-            // OVER the lanes, and its buttons must not locate the
+            // A dialog the same: inline (reader mode, fullscreen) it
+            // floats OVER the lanes, and its buttons must not locate the
             // playhead or start a clip drag through it.
             return;
         }
@@ -30045,18 +29994,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// **Gated on the host being able to raise a panel at all**, like
     /// `ask_for_a_media_folder`, `open_plugin_folder_picker` and the
-    /// cartridge picker before it. `Caps::PLUGIN` sets `native_file_dialogs`
-    /// false, and the plugin editor drains neither `take_save_request` nor
-    /// `take_file_request` — so in the plugin this chip took the press, set a
-    /// field nobody ever read, and said nothing. A control that lies about
-    /// being a control is worse than one that is missing, because the user
-    /// spends the next minute wondering which of the two things they did
-    /// wrong.
+    /// cartridge picker before it. A host without `native_file_dialogs`
+    /// drains neither `take_save_request` nor `take_file_request`, so there
+    /// this chip would take the press, set a field nobody ever read, and say
+    /// nothing. A control that lies about being a control is worse than one
+    /// that is missing, because the user spends the next minute wondering
+    /// which of the two things they did wrong.
     ///
     /// Unlike those three, this one SAYS SO rather than returning in silence.
-    /// They sit behind menus and cog rows a plugin build does not draw; the
-    /// drumpad's SAVE and LOAD are painted unconditionally, right there on
-    /// the strip, so the press has to be answered.
+    /// They sit behind menus and cog rows; the drumpad's SAVE and LOAD are
+    /// painted unconditionally, right there on the strip, so the press has
+    /// to be answered.
     fn save_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error = "there is no file panel here to save this kit with".to_owned();
@@ -30145,12 +30093,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// **Capability-gated on `native_file_dialogs`**, the same guard
     /// [`Self::ask_for_a_media_folder`] states: that flag is what says this
-    /// host may raise an OS panel, and a plugin editor may not. Without it
-    /// the request would be parked in a host that never drains it —
-    /// `desktop::take_save_panel` is the only drain there is — leaving
-    /// `native_panel_up` stuck true for the rest of the session and a stale
-    /// id list behind it. The menu rows are hidden on the same test, so this
-    /// is the second lock on a door that should already be shut.
+    /// host may raise an OS panel at all. Without it the request would be
+    /// parked in a host that never drains it (`desktop::take_save_panel` is
+    /// the only drain there is), leaving `native_panel_up` stuck true for the
+    /// rest of the session and a stale id list behind it. The menu rows are
+    /// hidden on the same test, so this is the second lock on a door that
+    /// should already be shut.
     ///
     /// The row is still a no-op on a Linux box with no portal and no zenity,
     /// where `take_save_panel` bails because the in-app browser can only pick
@@ -30384,10 +30332,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// The sentence deliberately does NOT offer "drag it onto the pads
     /// instead", tempting as that is: the drop road reads
-    /// `raw.dropped_files`, and whether a plugin editor ever fills that in is
-    /// the host's and `baseview`'s business, not ours. Telling somebody to
-    /// try a gesture that may quietly do nothing is a second dead control
-    /// wearing the first one's apology.
+    /// `raw.dropped_files`, and whether a host that cannot raise a panel
+    /// fills that in is its business, not ours. Telling somebody to try a
+    /// gesture that may quietly do nothing is a second dead control wearing
+    /// the first one's apology.
     fn load_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error = "there is no file panel here to load a kit with".to_owned();
@@ -31469,8 +31417,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .or_else(|| self.fx_defaults.values.get(key))
             .and_then(serde_json::Value::as_f64)
             // Half, for a key nothing has an opinion about. Only reachable
-            // before the host has said anything, which on the desktop is never
-            // and in a plugin is always — and a plugin has no effects panel.
+            // before the host has said anything, which on the desktop is
+            // never.
             .map_or(0.5, |v| v as f32)
     }
 
@@ -31659,7 +31607,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// path exactly as a plugin dialog is, and `shell::surface` makes it
     /// swallow what lands on it at egui's own hit test — which shields every
     /// widget in the app and none of the handlers that read `i.pointer`
-    /// straight off the input. So in the plugin a press in the middle of the
+    /// straight off the input. So inline a press in the middle of the
     /// render's waveform sounded a piano note through it. The render lane
     /// fixed the window's own click handling and could not reach this
     /// function; `dialogs::pointer_over_export` is the same question about
@@ -34034,17 +33982,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **The window the two auto counts are measured against.**
     ///
-    /// `last_pane` is what the app was handed to draw in on the frame before —
-    /// the window's content on the desktop, the editor's canvas in a plugin —
-    /// and `paint` writes it BEFORE it builds either view, so a window the
-    /// owner maximises mid-session is answered on that very frame rather than
-    /// at the next launch. That is the whole of requirement "it must respond at
-    /// runtime": there is no monitor reading, no relaunch, and no flag to be
-    /// wrong about — the pane changed, so the count changed.
+    /// `last_pane` is what the app was handed to draw in on the frame before
+    /// (the window's content) and `paint` writes it BEFORE it builds either
+    /// view, so a window the owner maximises mid-session is answered on that
+    /// very frame rather than at the next launch. That is the whole of
+    /// requirement "it must respond at runtime": there is no monitor reading,
+    /// no relaunch, and no flag to be wrong about. The pane changed, so the
+    /// count changed.
     ///
     /// Zero until the first frame has been laid out, and there the size the
-    /// window is about to open at is the honest stand-in — the same fallback
-    /// `request_natural_size` makes for the same reason.
+    /// window is about to open at is the honest stand-in.
     fn count_pane(&self) -> Vec2 {
         if self.last_pane.x > 1.0 && self.last_pane.y > 1.0 {
             self.last_pane
@@ -34615,8 +34562,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Everything that changes a SETTING happens here and now; everything that
     /// touches a device or the filesystem becomes a request for the host. That
-    /// split is the same one `Caps` draws, and it is why a plugin could paint
-    /// this band harmlessly if it ever had reason to.
+    /// split is the same one `Caps` draws, and it is why a host that grants
+    /// none of those could paint this band harmlessly.
     fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
         use recorder_panel::Hit;
         use recorder::RecorderRequest as R;
@@ -35014,7 +34961,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     // Deliberately narrow. The host does not get `&mut Settings`: every one of
     // these is a specific question with a specific answer, and a general
     // accessor is how the desktop binary would end up quietly owning settings
-    // policy that the plugin also has to obey.
+    // policy that belongs beside the settings, in this crate.
 
     /// The Recorder band is showing, so the host should have an input open.
     pub fn recorder_band_open(&self) -> bool {
@@ -37069,10 +37016,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn request_recorder(&mut self, request: recorder::RecorderRequest) {
-        // Refused rather than queued where the host cannot honour it. A plugin
-        // never drains, so an ungated request would sit here forever and the
-        // first thing a Toggle did after somebody added draining would be to
-        // start an arrangement record nobody asked for.
+        // Refused rather than queued where the host cannot honour it. A build
+        // with no recorder never drains, so an ungated request would sit here
+        // forever and the first thing a Toggle did after somebody added
+        // draining would be to start an arrangement record nobody asked for.
         if !self.caps.capture_devices {
             return;
         }
@@ -37111,8 +37058,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// empty directory named after a take that is no longer there would be a
     /// lie about what is on the disk.
     ///
-    /// Capability-gated like every other host errand: in the VST3 there is no
-    /// file manager to open and nothing here may write into Documents.
+    /// Capability-gated like every other host errand: without capture or
+    /// native panels there is no take folder to show, and nothing here may
+    /// write into Documents.
     fn reveal_folder(&mut self, path: std::path::PathBuf, make: bool) {
         if !self.caps.capture_devices || !self.caps.native_file_dialogs {
             return;
@@ -37131,7 +37079,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// **The takes' guard applies to all three**, and it is not about
     /// recording: `native_file_dialogs` is what says this host may raise an
-    /// OS panel at all, and a plugin editor may not.
+    /// OS panel at all.
     fn ask_for_a_media_folder(&mut self, purpose: crate::ports::DirPurpose) {
         use crate::ports::DirPurpose as P;
         if !self.caps.native_file_dialogs {
@@ -37506,10 +37454,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             MenuAction::SetSizePercent(p) => {
                 self.settings.window_size_percent = p;
                 self.save_settings();
-                // A host that owns the window has to be ASKED. The app cannot
-                // do that itself — the request goes out over the plugin API,
-                // which `tangent-ui` has never heard of — so it records what it
-                // wants and the binary that does know picks it up.
                 if self.caps.window_sizing {
                     // **The presets still mean something after free resize.**
                     // They are the way to say "make the window the size these
@@ -37520,13 +37464,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // window goes there and stays draggable.
                     self.pending_window_size =
                         Some(initial_window_size(&self.settings));
-                } else {
-                    // A host that owns the window has to be ASKED. The app
-                    // cannot do that itself — the request goes out over the
-                    // plugin API, which `tangent-ui` has never heard of — so it
-                    // records what it wants and the binary that does know
-                    // picks it up.
-                    self.pending_resize = Some(initial_window_size(&self.settings));
                 }
             }
             MenuAction::ToggleBorderless => {
@@ -37679,7 +37616,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 self.save_settings();
                 // Window resize follows from band_sizes() on the next pass.
-                self.request_natural_size();
             }
             MenuAction::TeachChordName => self.open_teach_dialog(),
             MenuAction::ManageTaughtChords => self.open_manage_dialog(),
@@ -37696,26 +37632,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             MenuAction::ToggleTheoryView(v) => {
                 self.settings.toggle_theory_view(v);
                 self.save_settings();
-                // The band's HEIGHT does not change with the count — the cells
-                // divide its width — but it goes to zero when the last element
-                // leaves and comes back when the first one returns, so the
-                // window still has to be re-measured.
-                self.request_natural_size();
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
                 self.save_settings();
                 // The window height follows from band_sizes() next pass.
                 self.voicing_tick(true);
-                self.request_natural_size();
             }
             MenuAction::ToggleCameraPane => {
                 self.settings.show_camera_pane = !self.settings.show_camera_pane;
                 self.save_settings();
-                // The theory band's width changes with it, so its height does
-                // too — the window has to be asked for a new size or the
-                // diagrams draw into a row that is the wrong shape for them.
-                self.request_natural_size();
             }
             MenuAction::CycleClef => {
                 // Turning the clef on a band you cannot see is the one thing
@@ -37724,9 +37650,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.set_staff_set(&next);
                 self.show_the_staff();
                 self.save_settings();
-                // The staff count changes with the set — one staff or two — so
-                // the window has to be asked for a new height.
-                self.request_natural_size();
             }
             MenuAction::SetStaffSet(key) => {
                 self.settings.staff_set = if key == "__custom__" {
@@ -37741,7 +37664,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 };
                 self.show_the_staff();
                 self.save_settings();
-                self.request_natural_size();
             }
             MenuAction::SetStave(key) => {
                 // Exclusive by construction: the whole set is REPLACED.
@@ -37753,7 +37675,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.staff_key = k.clamp(-staff::MAX_KEY, staff::MAX_KEY);
                 self.show_the_staff();
                 self.save_settings();
-                self.request_natural_size();
                 self.undo_commit();
             }
             MenuAction::ToggleGuitarIntervals => {
@@ -37809,7 +37730,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // reconciles that after the frame by watching this flag, so
                 // there is nothing to send from here.
                 self.save_settings();
-                self.request_natural_size();
             }
             MenuAction::EditCustomTuning => {
                 // Seeded from whatever tuning is LIVE, because almost every
@@ -38000,8 +37920,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **The copy comes first, and from memory.** See
         // `Settings::write_backup`: the file on disk can be one edit behind
         // the desk being destroyed. Gated on the same capability as every
-        // other write to the settings file, because a plugin instance must
-        // not touch it.
+        // other write to the settings file.
         let undoable = self.caps.persist_global_settings && self.settings.write_backup();
         self.settings.reset(scope);
         gate_to_caps(&mut self.settings, &self.caps);
@@ -38103,20 +38022,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // nothing either - and the geometry write-back then wrote the
             // live size straight back over the reset one.
             //
-            // The same two slots `MenuAction::SetSizePercent` uses, and for
-            // the same reason: a host that owns the window has to be asked,
-            // and the ask is recorded here for the binary that knows how.
-            //
-            // **The right way round.** The two branches were swapped against
-            // `SetSizePercent`'s: a desktop build (`window_sizing`) put its
-            // request in `pending_resize`, which only the plugin drains, so
-            // the reset changed nothing on screen until the next launch -
-            // and the next launch is where the window then opened at a size
-            // nobody had chosen.
+            // The same slot `MenuAction::SetSizePercent` uses: the ask is
+            // recorded here for the binary, which knows how to send it.
             if self.caps.window_sizing {
                 self.pending_window_size = Some(initial_window_size(&self.settings));
-            } else {
-                self.pending_resize = Some(initial_window_size(&self.settings));
             }
         }
 
@@ -38185,14 +38094,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .set_note_preference(self.settings.prefer_flats);
         crate::fonts::install(ctx, font, custom.as_deref());
         self.rebuild_voicing();
-        self.request_natural_size();
         // **And the window goes back too - after the two resets that moved
         // it.** Layout and Everything resize it to 100% on the spot now, so
         // an Undo that restored the settings alone would leave a window
         // whose size the file no longer names - and the geometry write-back
         // would then overwrite the restored size with the reset one. The
         // size it had, or the size its restored percent asks for, through
-        // the same two slots the reset used.
+        // the same slot the reset used.
         //
         // **Only there.** No other scope touches the window, and a size
         // request is honoured wherever the window is: undoing a Colours
@@ -38208,8 +38116,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .unwrap_or_else(|| initial_window_size(&self.settings));
             if self.caps.window_sizing {
                 self.pending_window_size = Some(size);
-            } else {
-                self.pending_resize = Some(size);
             }
         }
         self.save_settings();
@@ -39659,8 +39565,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SaveBank { slot } => {
                 // **Gated on the host being able to raise a panel at all**,
                 // and SAYING SO when it cannot, for the drumpad's reason: the
-                // button is painted in the plugin too, and a control that
-                // takes a press in silence is worse than one that is missing.
+                // button is painted whatever the host can do, and a control
+                // that takes a press in silence is worse than one that is
+                // missing.
                 if !self.caps.native_file_dialogs {
                     self.set_bank_note(
                         "there is no file panel here to save this bank with".to_owned(),
@@ -39855,12 +39762,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // The dialog's OK, so a moment: the tuning is hashed.
                 self.undo_commit();
                 self.rebuild_voicing();
-                // A different string count changes the fretboard band's height,
-                // so the window has to be re-measured. `SetTuning` never needed
-                // this because every preset was six strings; with 4- to
-                // 12-string tunings it is the difference between the neck
-                // fitting and the piano being clipped.
-                self.request_natural_size();
             }
             // **The MIDI Inputs dialog's checkbox and its channel row.**
             //
@@ -40321,15 +40222,14 @@ fn default_mixer_visible(pane: Vec2) -> usize {
 }
 /// **What a host without capture devices can never show**, turned off.
 ///
-/// A plugin editor and the minimal host have no recorder band to populate
-/// and no camera to open, and both are laid out from these flags alone with
-/// no caps term - so a flag left on gives the window a band it cannot fill,
-/// and the only menu rows that turn them off are themselves inside the
-/// capture-devices gate, so there would be no way back.
+/// A Minimal build has no recorder band to populate and no camera to open,
+/// and it is laid out from these flags alone with no caps term - so a flag
+/// left on gives the window a band it cannot fill, and the only menu rows
+/// that turn them off are themselves inside the capture-devices gate, so
+/// there would be no way back.
 ///
 /// Asked at construction AND after a reset: `Settings::reset` takes the
-/// layout from `first_launch`, which turns the recorder back on, and a Reset
-/// Everything in a plugin then asked the DAW to grow the editor to hold it.
+/// layout from `first_launch`, which turns the recorder back on.
 fn gate_to_caps(settings: &mut Settings, caps: &Caps) {
     if !caps.capture_devices {
         settings.show_recorder = false;
@@ -40398,9 +40298,10 @@ fn band_sizes(settings: &Settings) -> Bands {
 
 /// The same bands, for a window that is `w` wide.
 ///
-/// Split out because a plugin does not choose its own width: the host does,
-/// and every band's height is a fixed fraction of the width, so laying out
-/// into a given rect is the same arithmetic with a different starting number.
+/// Split out because a dragged window, or a screen the app has been given
+/// all of, does not have the width the size percentage names; every band's
+/// height is a fixed fraction of the width, so laying out into a given rect
+/// is the same arithmetic with a different starting number.
 fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     let piano_h = if settings.show_piano {
         (w as f64 / (1300.0 / 150.0)).trunc() as f32
@@ -40523,23 +40424,12 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
 /// the pane instead — see `fit_preview` — so nothing is cropped away either.
 pub const CAMERA_PANE_ASPECT: f32 = 16.0 / 9.0;
 
-/// The natural size of the whole layout at a given width.
-///
-/// What a plugin editor should OPEN at. `initial_window_size` is the
-/// desktop's answer and bakes in the size percentage, which a plugin does not
-/// have; this takes the width as an argument and returns the height that goes
-/// with it, so an editor opens showing every band the user has turned on
-/// rather than a slice of them.
-pub fn natural_size(settings: &Settings, width: f32) -> Vec2 {
-    band_sizes_at(settings, width).total()
-}
-
-/// The biggest layout that fits inside `avail`, for a host that hands over a
-/// rect rather than being asked for one.
+/// The biggest layout that fits inside `avail`, for a window whose size the
+/// app did not choose: a dragged edge, a tiler's slot.
 ///
 /// Every band's height is a fixed fraction of the width, so the whole layout
 /// is described by one number and fitting it is a matter of picking that
-/// number. Width alone is not enough: a wide, short editor would get a layout
+/// number. Width alone is not enough: a wide, short window would get a layout
 /// far taller than it, and the piano would be cut in half.
 fn fit_bands(settings: &Settings, avail: Vec2) -> Bands {
     // Total height at a known width gives the ratio, whichever bands are on.
@@ -40713,11 +40603,11 @@ impl Bands {
 impl TangentApp {
     /// One frame, from a `Context`.
     ///
-    /// All three hosts hand over a context rather than a `Ui` — `eframe::App`
-    /// for the desktop window, `show_viewport_immediate` for a child window,
-    /// and `nih_plug_egui`'s editor callback for the VST3 build — so this is
-    /// the shape they share. `shell::viewport_ui` is the one bridge, and its
-    /// test is what proves the central panel never grew a margin.
+    /// Both hosts hand over a context rather than a `Ui` (`eframe::App` for
+    /// the desktop window, `show_viewport_immediate` for a child window), and
+    /// so does every test, so this is the shape they share.
+    /// `shell::viewport_ui` is the one bridge, and its test is what proves the
+    /// central panel never grew a margin.
     /// **A double-click that still works the fourth time.**
     ///
     /// egui counts a run of clicks in one place 1, 2, 3, 3, 3, 3… — from the
@@ -41036,22 +40926,12 @@ impl TangentApp {
         self.undo_commit();
     }
 
-    /// One frame into a `Ui` that somebody else made.
-    ///
-    /// `nih_plug_egui`'s `ResizableWindow` opens its OWN `CentralPanel` so it
-    /// can put a drag corner in it, and two central panels under the same id
-    /// is the exact silent-garbage failure `shell::surface` exists to avoid.
-    /// So the plugin uses this and skips the bridge.
-    pub fn paint_into(&mut self, ui: &mut egui::Ui) {
-        self.paint(ui);
-    }
-
     /// Paint the display bands into `rect`, for the video compositor.
     ///
     /// **`&self`, and that is the whole safety argument.** It must not be
     /// [`Self::paint`] called a second time: `paint` drains the MIDI channel,
     /// runs the voicing and detection ticks, and overwrites `last_pane` and
-    /// `last_drawn` — which dialog placement and `request_natural_size` read.
+    /// `last_drawn`, which dialog placement reads.
     /// A composite pass that did any of that would move the app's own dialogs
     /// to wherever the video frame is, and would consume MIDI events the window
     /// then never saw.
@@ -41483,9 +41363,9 @@ impl TangentApp {
         }
 
         // Dev hook, alongside IVORY_DEMO_NOTES: open the menu on the first
-        // frame so the in-canvas version can be photographed without anyone
-        // having to click, and therefore without taking focus from whatever
-        // else is being tested. Environment-gated; ships inert.
+        // frame so it can be photographed without anyone having to click,
+        // and therefore without taking focus from whatever else is being
+        // tested. Environment-gated; ships inert.
         //   IVORY_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("menu") {
             self.demo_menu_done = true;
@@ -41797,10 +41677,10 @@ impl TangentApp {
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
         //
-        // Gated on owning the window. Inside a plugin editor these reads do
-        // not fail — they return the ROOT viewport's values, which are the
-        // host's, so an unguarded version would quietly file the DAW's window
-        // position into the user's settings file as if it were the piano's.
+        // Gated on owning the window. Without it these reads do not fail:
+        // they return whatever the context's ROOT viewport says, which is not
+        // ours, so an unguarded version would quietly file somebody else's
+        // window position into the settings as if it were the piano's.
         let (inner_rect, outer_rect, monitor) = if self.caps.window_sizing {
             ctx.input(|i| {
                 (
@@ -41810,8 +41690,8 @@ impl TangentApp {
                 )
             })
         } else {
-            // The editor's own canvas IS its world: menus and dialogs position
-            // themselves inside it, and there is no monitor beyond it.
+            // The context's own canvas IS its world: menus and dialogs
+            // position themselves inside it, and there is no monitor beyond it.
             let r = ctx.content_rect();
             (Some(r), Some(r), Some(r.size()))
         };
@@ -41893,9 +41773,9 @@ impl TangentApp {
         // force. With the pin gone they are two questions, and only the pane
         // can answer the first.
         //
-        // **A dragged window is the question a plugin editor has always
-        // asked**, so it gets the same answer: `fit_bands`, which preserves
-        // every band's aspect and scales the whole stack as one unit. Drag an
+        // **A dragged window is a rect the app did not choose**, so it gets
+        // `fit_bands`, which preserves every band's aspect and scales the
+        // whole stack as one unit. Drag an
         // edge and the layout zooms; it never stretches. That matters because
         // this layout is aspect-locked by construction — every band's height
         // is a fixed fraction of the width — so filling a window taller than
@@ -41905,9 +41785,8 @@ impl TangentApp {
         // Fullscreen keeps `fill_bands`, for the reason written on it: bars
         // down both sides ARE the screen you asked for and did not get.
         //
-        // The PANE and not the context, in both arms: inside a host's
-        // resizable wrapper the two differ by its frame, and laying out to the
-        // context would put the bottom band under the resize corner.
+        // The PANE and not the context, in both arms: the pane is the rect
+        // `paint` was handed, and that is the rect the layout has to fit.
         //
         // **MAXIMISED counts as fullscreen here, and it is not a size preset.**
         // There is no menu row for it and there must not be: maximising is
@@ -42094,11 +41973,8 @@ impl TangentApp {
             fret_h,
         } = bands;
         let target = bands.total();
-        // GATED, not merely harmless. `egui-baseview` HONOURS
-        // `ViewportCommand::InnerSize` — it calls `window.resize()` — so an
-        // ungated triple would reach into the DAW and resize the editor behind
-        // the host's back on frame one. Min/Max are swallowed there, which
-        // would leave exactly the half of the mechanism that does damage.
+        // GATED on `window_sizing`: only a window that is ours is sent a
+        // size.
         //
         // AND NOT WHILE FULLSCREEN, which is the other half. This app pins the
         // window by setting Min and Max to the SAME size — that is what makes
@@ -42151,10 +42027,10 @@ impl TangentApp {
             //
             // The layout never needed the pin. Every band's height is a pure
             // function of the window's width (`band_sizes_at`), and two
-            // solvers for arbitrary rects have been in this file for as long
-            // as the plugin has existed: `fit_bands` letterboxes into a
-            // host's editor and `fill_bands` stretches into a fullscreen
-            // screen. A dragged window is the same question a third time.
+            // solvers for arbitrary rects were already in this file:
+            // `fit_bands` letterboxes into a rect it is handed and
+            // `fill_bands` stretches into a fullscreen screen. A dragged
+            // window is the same question a third time.
             //
             // So the only constraint sent now is the minimum, once, and it is
             // measured rather than picked — see `settings::MIN_WINDOW`. The
@@ -42360,17 +42236,16 @@ impl TangentApp {
         // (spec §3.1, D-UI-17). Each band's top is the sum of the ones above
         // it, and a hidden band is zero tall, so nothing needs a special case.
         let display = self.display_notes();
-        // Centred in whatever we were given. On the desktop the window IS the
-        // layout, so both terms are zero and no pixel moves; in a plugin it is
-        // what keeps the picture in the middle of an editor the user has
-        // resized to something else.
+        // Centred in whatever we were given. When the window IS the layout
+        // both terms are zero and no pixel moves; in a window dragged to some
+        // other shape it is what keeps the picture in the middle.
         let pane = ui.max_rect();
         // The app owns every pixel it is given, and it wears the THEME's own
         // ground rather than black.
         //
         // **It used to be black and it used to hardly matter.** The desktop
         // window was pinned to exactly the size of its bands, so the gap was
-        // always zero pixels wide and only a plugin editor ever saw it. A
+        // always zero pixels wide and nobody saw it. A
         // window somebody can drag is almost never at the layout's own aspect,
         // so the gap is now on screen most of the time — and a black frame
         // round a Porcelain or Centennial desk reads as a rendering fault
@@ -43385,9 +43260,9 @@ impl TangentApp {
                     // mixer honours it — and the press that dismissed it.
                     && self.menu_state.is_none()
                     && !self.menu_ate_press
-                    // And a dialog: inline (plugin build) it draws over
-                    // the desk in this same context, and a press on its
-                    // buttons was also toggling the mute underneath.
+                    // And a dialog: inline (reader mode, fullscreen) it
+                    // draws over the desk in this same context, and a press
+                    // on its buttons was also toggling the mute underneath.
                     && !self.dialog_blocks_pointer(&ctx)
                     && (!drumpad_owns
                         || self.mixer_grab.is_some()
@@ -44776,8 +44651,8 @@ impl TangentApp {
         //
         // Only while something is actually happening. A DAW that repaints at
         // 240 Hz with a stopped playhead is a laptop with its fans on for no
-        // reason, and `window_sizing` keeps a plugin editor from ever doing
-        // it inside somebody else's host.
+        // reason, and only a window that is ours (`window_sizing`) is ever
+        // paced to the display.
         let paced = match pace_mode() {
             Pace::Off | Pace::Tick => false,
             Pace::Always => self.caps.window_sizing,
@@ -44793,9 +44668,9 @@ impl TangentApp {
             ctx.request_repaint();
             self.debug_asked = Some(Duration::ZERO);
         } else if pace_mode() == Pace::Tick || !self.caps.window_sizing {
-            // The old 50 ms cadence: asked for by name, or a plugin editor,
-            // whose host owns the window's clock and has no ledger of ours
-            // to consult. MIDI events wake us sooner via request_repaint_of.
+            // The old 50 ms cadence: asked for by name, or where the window
+            // is not ours (`window_sizing` off), which never rests. MIDI
+            // events wake us sooner via request_repaint_of.
             ctx.request_repaint_after(GUI_TICK);
             self.debug_asked = Some(GUI_TICK);
         } else if let Some(due) = self.animation_due(Instant::now()) {
@@ -46098,17 +45973,6 @@ mod tests {
         assert_eq!(band_sizes_at(&s, 1300.0).chord_h, 0.0);
     }
 
-    /// `nih_plug_egui::create_egui_editor` requires its state to be
-    /// `'static + Send`. Asserted HERE rather than discovered in the plugin
-    /// crate, where the same mistake arrives as a wall of trait errors
-    /// pointing at a macro. Send only, NOT Sync: `mpsc::Receiver` is not Sync,
-    /// and the 0.7 adapter does not ask for it.
-    #[test]
-    fn the_app_can_be_handed_to_a_plugin_editor() {
-        fn assert_send<T: 'static + Send>() {}
-        assert_send::<TangentApp>();
-    }
-
     pub(super) fn headless(caps: Caps) -> (egui::Context, TangentApp) {
         headless_with(caps, Settings::default())
     }
@@ -46716,8 +46580,8 @@ mod tests {
     ///
     /// The line was refreshed inside `arrangement_input`, after its early
     /// returns, so every frame the hand spent on the MIDI editor - or on the
-    /// window itself, drawn inline over it in a plugin or with child windows
-    /// off - skipped it. Pick one note on the roll, move onto the window,
+    /// window itself, drawn inline over it with child windows off - skipped
+    /// it. Pick one note on the roll, move onto the window,
     /// and it still said "all 3 notes" while Apply quantized one. Driven
     /// through whole frames on the inline path, with the hand on the roll.
     #[test]
@@ -46796,7 +46660,7 @@ mod tests {
                 _ => {}
             }
         }
-        let (ctx, mut app) = headless_with(Caps::PLUGIN, Settings::default());
+        let (ctx, mut app) = headless_with(Caps::NONE, Settings::default());
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         let frame = |app: &mut TangentApp| -> Vec<String> {
             let out = ctx.run(
@@ -46822,7 +46686,8 @@ mod tests {
         app.settings.record_time_signature = "3/4".to_owned();
         app.settings.record_export.tempo_bpm = 120.0;
         app.open_quantize_window();
-        // Inline in a plugin; three frames, because an Area's first is a sizing pass.
+        // Inline under `Caps::NONE`; three frames, because an Area's first
+        // is a sizing pass.
         let painted = (0..3).map(|_| frame(&mut app)).last().expect("three frames");
         assert_eq!(app.settings.time_signature().beats, 3, "a frame put the meter back - this test proves nothing");
         let chips = chips_of(&painted);
@@ -49239,8 +49104,8 @@ mod tests {
     /// the Apply's frame, the busy cover paints another, and the quantize
     /// lands at the top of the one after - so a guard that only waits while
     /// the request is still queued commits the knobs a frame later instead.
-    /// And in a plugin, where nothing ever takes the request, the knobs are
-    /// the whole press and still owe it a moment.
+    /// And in a build with no recorder, where nothing ever takes the request,
+    /// the knobs are the whole press and still owe it a moment.
     #[test]
     fn an_audio_apply_that_moves_a_knob_is_one_moment_in_the_hosts_frame_order() {
         let apply_at_80 = || DialogAction::ApplyQuantize {
@@ -49298,21 +49163,22 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
 
-        // **A plugin never takes the request**, so the knobs are all the
-        // Apply did there, and they are still a moment of their own.
-        let (_ctx, mut plugin) = headless(Caps::PLUGIN);
-        let a = plugin.arrangement.add_clip(take());
-        plugin.arr_selected = Some(a);
-        plugin.commit_undo_moment();
-        plugin.commit_view_change();
-        let before = plugin.hist_at;
-        plugin.apply_dialog_action(apply_at_80());
-        plugin.commit_view_change();
+        // **A host with no recorder never takes the request**, so the knobs
+        // are all the Apply did there, and they are still a moment of their
+        // own.
+        let (_ctx, mut bare) = headless(Caps::NONE);
+        let a = bare.arrangement.add_clip(take());
+        bare.arr_selected = Some(a);
+        bare.commit_undo_moment();
+        bare.commit_view_change();
+        let before = bare.hist_at;
+        bare.apply_dialog_action(apply_at_80());
+        bare.commit_view_change();
         assert_eq!(
-            plugin.hist_at,
+            bare.hist_at,
             before + 1,
-            "in a plugin the Apply's knobs left {} moments",
-            plugin.hist_at - before
+            "with no recorder the Apply's knobs left {} moments",
+            bare.hist_at - before
         );
     }
 
@@ -50556,7 +50422,7 @@ mod tests {
         // **Through the settings file and back**, because a setup that
         // survives the dialog and not the file is one somebody rebuilds every
         // launch.
-        let back = Settings::from_json(&app.settings_json());
+        let back = Settings::from_json(&app.settings.to_json());
         assert_eq!(back.rows[4].midi, app.channel_midi_sel(4));
 
         // Untick, and ALL comes back — the way out has to exist.
@@ -52915,7 +52781,7 @@ mod tests {
             std::thread::current().id()
         ));
         let doc = crate::arrangement::doc_in(&dir);
-        let (_ctx, app) = headless(Caps::PLUGIN);
+        let (_ctx, app) = headless(Caps::NONE);
 
         // Write a template holding the desk `shipped` describes, untouched.
         let write_stock = |shipped: &[(usize, &str)]| {
@@ -53040,7 +52906,7 @@ mod tests {
             .save_to(&crate::arrangement::doc_in(&template));
 
         let scratch = root.join("Untitled");
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.adopt_template(&template, &scratch);
 
         // The FINAL state, which is the easy half.
@@ -53157,7 +53023,7 @@ mod tests {
         let elsewhere = root.join("somewhere else");
         std::fs::create_dir_all(&elsewhere).expect("another folder");
 
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.settings.preset_dir = Some(root.to_string_lossy().into_owned());
 
         // (1) Nobody has chosen: a fresh open lands at HOME — and NOT in the
@@ -53242,7 +53108,7 @@ mod tests {
         crate::arrangement::Arrangement::default()
             .save_to(&crate::arrangement::doc_in(&template));
 
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         // The guard asks the RESOLVED project root, so the test has to be
         // standing in the same tree the app thinks it lives in.
         app.settings.project_dir = Some(root.to_string_lossy().into_owned());
@@ -53341,7 +53207,7 @@ mod tests {
         kit.save_beside(&crate::arrangement::doc_in(&template));
 
         let scratch = root.join("Untitled");
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.adopt_template(&template, &scratch);
         assert!(!scratch.exists(), "adopting a template must create nothing");
 
@@ -53429,7 +53295,7 @@ mod tests {
                 .collect()
         };
         let scratch = root.join("Untitled");
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.adopt_template(&template, &scratch);
         assert!(!scratch.exists(), "adopting a template must create nothing");
         assert_eq!(
@@ -53545,7 +53411,7 @@ mod tests {
             .save_to(&crate::arrangement::doc_in(&template));
 
         let scratch = root.join("Untitled");
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.adopt_template(&template, &scratch);
 
         // The guard `copy_states_to_project` asks, at the moment Save As
@@ -56217,23 +56083,22 @@ mod tests {
     /// **In a host with no file panels the kit chips answer instead of
     /// pretending.**
     ///
-    /// `Caps::PLUGIN` sets `native_file_dialogs` false and the plugin editor
-    /// drains neither `take_save_request` nor `take_file_request`, so both
-    /// chips used to set a field nobody would ever read and say nothing at
-    /// all. The press was swallowed whole.
+    /// Without `native_file_dialogs` nothing drains `take_save_request` or
+    /// `take_file_request`, so both chips used to set a field nobody would
+    /// ever read and say nothing at all. The press was swallowed whole.
     ///
-    /// Asserted from both ends, because a gate is only half a fix: the
-    /// plugin raises nothing and SAYS why, and the desktop still raises both
-    /// requests exactly as it did — a gate written against the wrong
-    /// capability would silently take the feature away from the app it works
-    /// in.
+    /// Asserted from both ends, because a gate is only half a fix: the host
+    /// with no panels raises nothing and SAYS why, and the desktop still
+    /// raises both requests exactly as it did: a gate written against the
+    /// wrong capability would silently take the feature away from the app it
+    /// works in.
     #[test]
     fn the_kit_chips_raise_nothing_in_a_host_that_has_no_panels() {
-        let (_ctx, mut app) = headless_with(Caps::PLUGIN, Settings::default());
+        let (_ctx, mut app) = headless_with(Caps::NONE, Settings::default());
         app.save_kit_preset();
         assert!(
             app.take_save_request().is_none(),
-            "the plugin raised a save panel it cannot answer"
+            "a host with no panels raised a save panel it cannot answer"
         );
         assert!(
             !app.track.error.is_empty(),
@@ -56243,7 +56108,7 @@ mod tests {
         app.load_kit_preset();
         assert!(
             app.take_file_request().is_none(),
-            "the plugin raised a file panel it cannot answer"
+            "a host with no panels raised a file panel it cannot answer"
         );
         assert!(
             !app.track.error.is_empty(),
@@ -58809,10 +58674,11 @@ mod tests {
         assert_eq!(app.take_recorder_request(), None);
     }
 
-    /// A plugin host never raises a file panel, so it never asks for one.
+    /// A host that cannot raise a file panel never asks for one; the desktop
+    /// asks for a `.syx`.
     #[test]
-    fn a_plugin_does_not_ask_for_a_cartridge_file() {
-        let (_, mut app) = headless(Caps::PLUGIN);
+    fn only_a_host_with_file_panels_asks_for_a_cartridge_file() {
+        let (_, mut app) = headless(Caps::NONE);
         app.apply_dialog_action(DialogAction::LoadCartridge { slot: 0 });
         assert!(app.take_file_request().is_none());
 
@@ -58907,14 +58773,14 @@ mod tests {
 
     /// Save bank raises the save panel on the desktop, suggesting the file
     /// the instrument opens on, and the answer goes to the host for the
-    /// strip that asked; in a plugin, which has no panel, the press is
-    /// answered in words rather than in silence.
+    /// strip that asked; in a host with no panel the press is answered in
+    /// words rather than in silence.
     #[test]
-    fn save_bank_asks_for_a_panel_on_the_desktop_and_says_so_in_a_plugin() {
-        let (_, mut app) = headless(Caps::PLUGIN);
+    fn save_bank_asks_for_a_panel_on_the_desktop_and_says_so_without_one() {
+        let (_, mut app) = headless(Caps::NONE);
         app.apply_dialog_action(DialogAction::ShowPatches { slot: 1 });
         app.apply_dialog_action(DialogAction::SaveBank { slot: 1 });
-        assert!(app.take_save_request().is_none(), "a plugin has no panel to raise");
+        assert!(app.take_save_request().is_none(), "a host with no panels has none to raise");
         let Some(Dialog::PatchPicker { note, .. }) = &app.dialog else {
             panic!("the picker closed")
         };
@@ -61790,24 +61656,25 @@ mod tests {
         );
     }
 
-    /// **A plugin editor is offered no MIDI export at all**, on either door.
+    /// **A host that cannot raise a save panel is offered no MIDI export at
+    /// all**, on either door.
     ///
-    /// The honest degradation for the risk this verb carries into a plugin:
-    /// `take_save_request` is drained in exactly one place — the desktop
-    /// host's `take_save_panel` — so a request parked inside a DAW is never
-    /// answered, `native_panel_up` stays true for the rest of the session,
-    /// and a frozen list of clip ids sits behind it forever. `ports.rs` does
-    /// bless a host refusing by never draining, but a row that appears to do
-    /// something and then wedges a flag is not a refusal, it is a fault.
+    /// `take_save_request` is drained in exactly one place, the desktop
+    /// host's `take_save_panel`, so a request parked where
+    /// `native_file_dialogs` is off is never answered, `native_panel_up`
+    /// stays true for the rest of the session, and a frozen list of clip ids
+    /// sits behind it forever. `ports.rs` does bless a host refusing by never
+    /// draining, but a row that appears to do something and then wedges a
+    /// flag is not a refusal, it is a fault.
     ///
-    /// So the gate is `Caps::native_file_dialogs` — the flag
+    /// So the gate is `Caps::native_file_dialogs`, the flag
     /// `ask_for_a_media_folder` already documents as "this host may raise an
-    /// OS panel at all" — and it is checked in all three places: the clip
+    /// OS panel at all", and it is checked in all three places: the clip
     /// menu's row, the track menu's row, and the verb itself, so that a
     /// fourth door added later cannot get in behind them.
     #[test]
-    fn a_plugin_editor_is_offered_no_midi_export() {
-        let (_, mut app) = headless(Caps::PLUGIN);
+    fn a_host_without_native_panels_is_offered_no_midi_export() {
+        let (_, mut app) = headless(Caps::NONE);
         three_clips_on_two_lanes(&mut app);
         app.arr_multi = vec![1, 2, 3];
 
@@ -61815,14 +61682,14 @@ mod tests {
             app.clip_menu_rows_for(1).into_iter().map(|(_, a, _)| a).collect();
         assert!(
             !rows.contains(&ClipMenuAction::ExportMidi),
-            "the clip menu offered an export a plugin cannot answer: {rows:?}"
+            "the clip menu offered an export this host cannot answer: {rows:?}"
         );
 
         app.open_track_dialog(recorder::StripRef::Row(1), true);
         let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
-        assert_eq!(midi_clips, 0, "the track menu offered the row in a plugin");
+        assert_eq!(midi_clips, 0, "the track menu offered the row without a panel");
 
         // And the verb itself refuses, so a door added later cannot get in
         // behind the two that are gated.
@@ -64228,8 +64095,8 @@ mod tests {
 
     /// **A press on the export window does not reach the desk under it.**
     ///
-    /// Inline — the plugin path — the render's waveform is a layer over the
-    /// canvas, and `shell::surface` makes it swallow what lands on it at
+    /// Inline (reader mode, fullscreen) the render's waveform is a layer over
+    /// the canvas, and `shell::surface` makes it swallow what lands on it at
     /// egui's own hit test. That shields every widget in the app and none of
     /// the handlers that read `i.pointer` straight off the input, so a click
     /// in the middle of the waveform sounded a piano note through it.
@@ -64237,7 +64104,7 @@ mod tests {
     /// ever answered about a `Dialog`, which an export deliberately is not.
     #[test]
     fn a_press_on_the_inline_export_window_does_not_reach_the_desk() {
-        let (ctx, mut app) = headless_with_band(Caps::PLUGIN);
+        let (ctx, mut app) = headless_with_band(Caps::NONE);
         app.set_export_progress(Some(crate::ports::ExportProgress {
             fraction: 0.4,
             label: "Rendering".to_owned(),
@@ -64694,9 +64561,9 @@ mod tests {
 
     /// **Where no host will weld, Cmd+G on audio says so.** Glue hands audio
     /// to the host, and `request_recorder` drops a request a host cannot
-    /// take - a build with no recorder, or the plugin - so the key did
-    /// nothing and said nothing, where an audio selection used to get the
-    /// MIDI road's refusal at least.
+    /// take - a build with no recorder - so the key did nothing and said
+    /// nothing, where an audio selection used to get the MIDI road's refusal
+    /// at least.
     #[test]
     fn audio_glue_says_why_where_the_host_cannot_weld() {
         use crate::arrangement::ClipKind;
@@ -64906,9 +64773,9 @@ mod tests {
 
     /// **Where no host will measure, normalise says so.** The peak is the
     /// host's to measure, and `request_recorder` drops a request a host
-    /// cannot take - a build with no recorder, or the plugin - so
-    /// Ctrl/Cmd+Shift+N on an audio clip did nothing and said nothing:
-    /// the shape glue's Cmd+G had before it learned to answer.
+    /// cannot take - a build with no recorder - so Ctrl/Cmd+Shift+N on an
+    /// audio clip did nothing and said nothing: the shape glue's Cmd+G had
+    /// before it learned to answer.
     #[test]
     fn normalise_says_why_where_the_host_cannot_measure() {
         use crate::arrangement::{ArrClip, ClipKind};
@@ -67761,17 +67628,17 @@ mod tests {
             .collect()
     }
 
-    /// The whole menu must fit the editor it is drawn in, at every size the
-    /// plugin can open at and with every band turned on.
+    /// The whole menu must fit the window it is drawn inside, short as that
+    /// window may be and with every band turned on.
     ///
     /// A menu taller than its canvas does not look scrollable, it looks CUT
-    /// OFF — the rows past the edge are simply absent and nothing on screen
-    /// says otherwise. On the desktop it cannot happen: the menu is its own
-    /// window and may be taller than the app. In a plugin editor, which is
-    /// often shorter than the ~550 points this menu wants, it happened the
-    /// moment the guitar view was turned on.
+    /// OFF: the rows past the edge are simply absent and nothing on screen
+    /// says otherwise. With child windows it cannot happen: the menu is its
+    /// own window and may be taller than the app. Drawn inside the window
+    /// (screen-reader mode, fullscreen), in a window shorter than the ~550
+    /// points this menu wants, it happens the moment the guitar view is on.
     #[test]
-    fn the_whole_menu_fits_a_short_editor() {
+    fn the_whole_inline_menu_fits_a_short_window() {
         for (fret, theory) in [(false, false), (true, false), (true, true)] {
             let settings = Settings {
                 show_welcome: false,
@@ -67783,12 +67650,12 @@ mod tests {
                 },
                 ..Settings::default()
             };
-            let (ctx, mut app) = headless_with(Caps::PLUGIN, settings.clone());
+            let (ctx, mut app) = headless_with(Caps::NONE, settings.clone());
             crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
 
-            // Every editor height the plugin realistically opens at, plus a
-            // deliberately cruel one.
-            for h in [natural_size(&settings, 900.0).y, 200.0, 137.0] {
+            // The layout's own height at 900 wide, plus two deliberately
+            // cruel ones.
+            for h in [band_sizes_at(&settings, 900.0).total().y, 200.0, 137.0] {
                 let pane = Vec2::new(900.0, h);
                 let _ = ctx.run(
                     egui::RawInput {
@@ -67821,7 +67688,7 @@ mod tests {
                     };
                     assert!(
                         row_h < roomy - 0.5,
-                        "menu is {}pt in a {}pt editor and its rows are still \
+                        "menu is {}pt in a {}pt window and its rows are still \
                          {row_h}pt, the same as the unconstrained {roomy}pt \
                          (fretboard {fret}, theory {theory}) - it did not \
                          squeeze at all, so the bottom rows are simply missing",
@@ -67920,7 +67787,7 @@ mod tests {
     /// but the HOST did: `main` measures the window it opens from the file
     /// before any app exists, so it measured one without those bands and the
     /// app then drew all of them into it. Now nothing reads the keys at all.
-    /// A plugin seeded from such a file gets the same answer, without the
+    /// A host with no capture devices gets the same answer, without the
     /// recorder it never has.
     #[test]
     fn a_settings_file_from_a_build_that_could_detach_opens_every_band_in_the_window() {
@@ -67959,7 +67826,7 @@ mod tests {
              had popped out"
         );
 
-        for caps in [Caps::DESKTOP, Caps::PLUGIN] {
+        for caps in [Caps::DESKTOP, Caps::NONE] {
             let (_, app) = headless_with(caps, old.clone());
             let b = band_sizes(&app.settings);
             assert!(b.chord_h > 0.0, "{caps:?}: the chord strip went to a window nothing opens");
@@ -67974,81 +67841,10 @@ mod tests {
         }
     }
 
-    /// Turning a band on must make the editor TALLER, not the picture smaller.
-    ///
-    /// On the desktop the window follows `band_sizes()` by itself. A plugin
-    /// editor cannot: nothing resizes it unless it asks, and only
-    /// `SetSizePercent` ever did. So "Show Fretboard" inside a DAW did not
-    /// grow the editor — it shrank the whole layout to fit the height it
-    /// already had, and the piano lost 40% of its width to black bars.
-    #[test]
-    fn a_plugin_asks_for_room_when_a_band_appears() {
-        let (ctx, mut app) = headless_with(
-            Caps::PLUGIN,
-            Settings {
-                show_welcome: false,
-                show_fretboard: false,
-                ..Settings::default()
-            },
-        );
-        let pane = Vec2::new(900.0, 137.0);
-        let run = |ctx: &egui::Context, app: &mut TangentApp| {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
-                    ..Default::default()
-                },
-                |ctx| app.frame(ctx),
-            );
-        };
-        run(&ctx, &mut app);
-        let before = fit_bands(&app.settings, pane).total();
-        app.take_pending_resize();
-
-        for action in [
-            MenuAction::ToggleFretboard,
-            MenuAction::ToggleTheoryView(theory_panel::View::Circle),
-            MenuAction::ToggleChordDetection,
-        ] {
-            app.apply_menu_action(&ctx, action.clone());
-            let asked = app.take_pending_resize().unwrap_or_else(|| {
-                panic!("{action:?} changed the band stack without asking for room")
-            });
-            // It asks for the height the new stack needs at the width it has,
-            // rather than squeezing the layout into the old height.
-            assert!(
-                (asked.x - pane.x).abs() < 1.5,
-                "{action:?} asked to change the WIDTH: {asked:?}"
-            );
-            let squeezed = fit_bands(&app.settings, pane).total();
-            assert!(
-                asked.y > squeezed.y || squeezed.x >= before.x - 1.0,
-                "{action:?}: squeezing into the old height gives {squeezed:?}, \
-                 which is narrower than the {before:?} it started at, and the \
-                 request {asked:?} would not fix it"
-            );
-            run(&ctx, &mut app);
-        }
-
-        // The desktop must NOT ask — its window follows the layout by itself,
-        // and a stray request there would be a viewport command in a plugin's
-        // clothing.
-        let (ctx, mut desk) = headless_with(
-            Caps::DESKTOP,
-            Settings {
-                show_welcome: false,
-                ..Settings::default()
-            },
-        );
-        let _ = &ctx;
-        desk.apply_menu_action(&ctx, MenuAction::ToggleFretboard);
-        assert_eq!(desk.take_pending_resize(), None);
-    }
-
-    /// A right-click must open the menu in a plugin, and a left-click on a row
+    /// A right-click must open the menu inline, and a left-click on a row
     /// must ACTIVATE it.
     ///
-    /// This is the test that was missing. Every row of the plugin's menu was
+    /// This is the test that was missing. Every row of the inline menu was
     /// dead, and nothing caught it, because `menu::show` was tested for what it
     /// DRAWS and the app was tested for what it SENDS — and the bug was in the
     /// order the two ran. `handle_main_interaction` closed the menu on any
@@ -68061,11 +67857,11 @@ mod tests {
     /// So this drives real pointer events at a real row position and asserts
     /// the setting changed.
     #[test]
-    fn a_plugin_menu_row_can_actually_be_clicked() {
+    fn an_inline_menu_row_can_actually_be_clicked() {
         // No welcome dialog: it is modal, and a modal correctly swallows every
         // click, so leaving it up would test the modal rather than the menu.
         let (ctx, mut app) = headless_with(
-            Caps::PLUGIN,
+            Caps::NONE,
             Settings {
                 show_welcome: false,
                 ..Settings::default()
@@ -68108,7 +67904,7 @@ mod tests {
         click(&ctx, &mut app, open_at, egui::PointerButton::Secondary);
         assert!(
             app.menu_state.is_some(),
-            "a right-click did not open the menu in a plugin"
+            "a right-click did not open the inline menu"
         );
 
         // Window is a submenu; the first ITEM row is what we can click without
@@ -68119,8 +67915,8 @@ mod tests {
         // flips one bool with no dialog and no device behind it, and it is
         // reached WITHOUT a hover. This used to be Dark Mode, which left the
         // menu when a row that only does what `D` does stopped earning its
-        // place; the test is about whether a plugin's menu rows are alive at
-        // all, so any such row will do — but it has to be one that exists.
+        // place; the test is about whether the inline menu's rows are alive
+        // at all, so any such row will do, but it has to be one that exists.
         let view = app.menu_view();
         let rows = menu::rows_for_test(view);
         let (idx, _, want) = rows
@@ -68137,7 +67933,7 @@ mod tests {
         click(&ctx, &mut app, row, egui::PointerButton::Primary);
         assert_ne!(
             app.settings.show_chord_strip, before,
-            "clicking a menu row in a plugin did nothing - the row is dead"
+            "clicking an inline menu row did nothing - the row is dead"
         );
         assert!(
             app.menu_state.is_none(),
@@ -68145,19 +67941,19 @@ mod tests {
         );
     }
 
-    /// A dialog and a menu must OPEN and DRAW inside a plugin, and still send
-    /// the host nothing.
+    /// A dialog and a menu must OPEN and DRAW inline, and still send the
+    /// window nothing.
     ///
     /// The two frame tests above run an idle app. This one drives it through
-    /// the paths that used to open OS windows — `A` raises the About box, `H`
-    /// the shortcut card — and keeps running frames while they are up. In a
-    /// plugin `show_viewport_immediate` does not fail, it opens a second
-    /// `CentralPanel` under the same id and paints garbage over the piano, so
-    /// "it did not crash" is not the assertion. The assertion is that the host
-    /// still receives no viewport command and the app is still standing.
+    /// the paths that used to open OS windows (`A` raises the About box, `H`
+    /// the shortcut card) and keeps running frames while they are up. In a
+    /// bare egui context `show_viewport_immediate` does not fail, it opens a
+    /// second `CentralPanel` under the same id and paints garbage over the
+    /// piano, so "it did not crash" is not the assertion. The assertion is
+    /// that no viewport command goes out and the app is still standing.
     #[test]
-    fn dialogs_and_menus_open_inside_a_plugin_without_reaching_the_host() {
-        let (ctx, mut app) = headless(Caps::PLUGIN);
+    fn dialogs_and_menus_open_inline_without_commanding_the_window() {
+        let (ctx, mut app) = headless(Caps::NONE);
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         let size = Vec2::new(900.0, 435.0);
 
@@ -68218,22 +68014,22 @@ mod tests {
         }
     }
 
-    /// A plugin is handed a rect and has to lay out inside it. `main_width`
-    /// is the desktop's answer — 1300 points times a size percentage — and
-    /// using it in an editor the host opened at 900 would run the piano off
-    /// the right-hand edge, with no window command available to fix it.
+    /// A window the app did not size is a rect it has to lay out inside.
+    /// `main_width` is the size percentage's answer (1300 points times the
+    /// percentage), and using it in a window dragged to 900 would run the
+    /// piano off the right-hand edge.
     ///
     /// Checked in both directions, because "it fits" is also satisfied by a
     /// layout that shrank to nothing.
     #[test]
-    fn a_plugin_lays_out_inside_the_rect_it_is_given() {
+    fn the_layout_fits_inside_the_rect_it_is_given() {
         let mut s = Settings::default();
         for (fret, theory) in [(false, false), (true, false), (true, true)] {
             s.show_fretboard = fret;
             s.theory_order = if theory { theory_panel::Views::all().keys() } else { String::new() };
             for avail in [
-                Vec2::new(900.0, 260.0),  // the editor's default
-                Vec2::new(400.0, 200.0),  // a narrow rack
+                Vec2::new(900.0, 260.0),  // short
+                Vec2::new(400.0, 200.0),  // narrow
                 Vec2::new(1800.0, 300.0), // wide and short: height decides
                 Vec2::new(600.0, 1200.0), // tall and narrow: width decides
             ] {
@@ -68260,8 +68056,8 @@ mod tests {
         }
     }
 
-    /// ...and the desktop is untouched by all of that. Its layout is still
-    /// decided by the size percentage and nothing else.
+    /// ...and a window the app DID size is untouched by all of that. Its
+    /// layout is still decided by the size percentage and nothing else.
     #[test]
     fn the_desktop_layout_is_unchanged() {
         let mut s = Settings::default();
@@ -68288,22 +68084,10 @@ mod tests {
     }
 
     /// The worst seeding failure, because the recorder is the one band a
-    /// plugin can never populate: `capture_devices` is false there, so there
-    /// is no camera, no input and no take directory. A settings file written
-    /// by the desktop with `show_recorder: true` would otherwise cost a DAW
-    /// editor 200 points of empty transport, taken out of the piano.
-    #[test]
-    fn a_plugin_never_starts_with_a_recorder_band() {
-        let ctx = egui::Context::default();
-        let mut s = Settings::default();
-        s.show_recorder = true;
-        let app = TangentApp::with_license(&ctx, s, Caps::PLUGIN, tiers::free("app"));
-        assert!(!app.settings.show_recorder, "no device, no band");
-        assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
-    }
-
-    /// A Minimal build is a desktop app with no recorder linked, so it has to
-    /// clear the band for exactly the same reason a plugin does — and it is the
+    /// Minimal build can never populate: `capture_devices` is false there, so
+    /// there is no camera, no input and no take directory. A settings file
+    /// written by a Full build with `show_recorder: true` would otherwise cost
+    /// it 200 points of empty transport, taken out of the piano. It is the
     /// case that would be missed, because a Minimal build DOES have windows.
     #[test]
     fn a_minimal_build_never_starts_with_a_recorder_band_either() {
@@ -68311,7 +68095,8 @@ mod tests {
         let mut s = Settings::default();
         s.show_recorder = true;
         let app = TangentApp::with_license(&ctx, s, Caps::MINIMAL, tiers::free("app"));
-        assert!(!app.settings.show_recorder);
+        assert!(!app.settings.show_recorder, "no device, no band");
+        assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
         assert!(
             app.settings.show_fretboard || !app.settings.show_fretboard,
             "and nothing else is disturbed"
@@ -68450,12 +68235,13 @@ mod tests {
         assert_eq!(space(&ctx, &mut app), Some(recorder::RecorderRequest::Play));
     }
 
-    /// A plugin drains nothing, so a request it can never honour must not be
-    /// recorded at all — otherwise the first thing draining would do, whenever
-    /// somebody added it, is start an arrangement record nobody asked for.
+    /// A host that cannot capture drains nothing, so a request it can never
+    /// honour must not be recorded at all: otherwise the first thing draining
+    /// would do, whenever somebody added it, is start an arrangement record
+    /// nobody asked for. Nor does a host with no panels park a folder ask.
     #[test]
-    fn a_plugin_records_no_recorder_requests() {
-        let (_ctx, mut app) = headless(Caps::PLUGIN);
+    fn a_host_that_drains_nothing_is_asked_for_nothing() {
+        let (_ctx, mut app) = headless(Caps::NONE);
         app.request_recorder(recorder::RecorderRequest::Toggle);
         app.request_recorder(recorder::RecorderRequest::Stop);
         assert_eq!(app.take_recorder_request(), None);
@@ -68720,7 +68506,6 @@ mod tests {
             };
             assert_eq!(undoes, scope, "the receipt's Undo names another scope");
             app.pending_window_size = None;
-            let _ = app.take_pending_resize();
             app.undo_the_reset(&ctx, undoes);
             assert_eq!(app.settings.theme_name, "Rhodes", "the {scope:?} undo did not run");
             assert_eq!(
@@ -68731,7 +68516,6 @@ mod tests {
                 if sized { "did not ask" } else { "asked" },
                 size_request_step(true, true, false, None)
             );
-            assert_eq!(app.take_pending_resize(), None, "the desktop request went to the plugin's slot");
         }
         let _ = std::fs::remove_file(Settings::backup_path());
     }
@@ -68742,23 +68526,24 @@ mod tests {
     /// It measures body, `faint` and the warning against the grounds this
     /// code picks, which is the right check for the class of bug this app has
     /// had seven times — but it says nothing about whether the words fit the
-    /// card. This runs the real dialog through a real egui pass, at the
-    /// PLUGIN caps where a dialog is drawn as a layer in the canvas, on the
+    /// card. This runs the real dialog through a real egui pass, at
+    /// `Caps::NONE`, where a dialog is drawn as a layer in the canvas, on the
     /// smallest pane the app will ever hand it and the largest.
     ///
     /// Note for anybody reaching for a picture instead: `shot::window` cannot
     /// take one. It photographs the composite — what the video records —
     /// straight from a `&TangentApp`, and never runs an egui pass at all. The
-    /// real binary under `IVORY_INLINE=menu` is the way to look at a dialog.
+    /// real binary in screen-reader mode (Window > Menus Inside the Window, or
+    /// J), which draws dialogs in the canvas, is the way to look at one.
     #[test]
     fn every_confirmation_draws_at_every_size() {
         for scope in crate::settings::ResetScope::ALL {
             for dark in [false, true] {
                 let settings = Settings { dark_mode: dark, show_welcome: false, ..Settings::default() };
-                let (ctx, mut app) = headless_with(Caps::PLUGIN, settings);
+                let (ctx, mut app) = headless_with(Caps::NONE, settings);
                 crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
                 app.apply_menu_action(&ctx, MenuAction::Reset(scope));
-                // A cruelly short editor, a plausible one, and a huge one.
+                // A cruelly short window, a plausible one, and a huge one.
                 for pane in [
                     Vec2::new(380.0, 140.0),
                     Vec2::new(900.0, 500.0),
@@ -69827,25 +69612,21 @@ mod tests {
         assert_eq!(wild.transpose, crate::settings::TRANSPOSE_MAX);
     }
 
-    /// A plugin editor's window belongs to the DAW. Not one frame may ask to
-    /// resize it, undecorate it, retitle it, move it, or start dragging it.
-    ///
-    /// This is not a theoretical guard. `egui-baseview` HONOURS
-    /// `ViewportCommand::InnerSize` (it calls `window.resize()`), so the
-    /// fixed-size triple, left ungated, would reach into the host and resize
-    /// the editor behind its back on the first frame. `MinInnerSize` and
-    /// `MaxInnerSize` are swallowed there, which would have left exactly the
-    /// one third of the mechanism that does damage.
+    /// **A frame that does not own the window sends it nothing.** With
+    /// `window_sizing` off, not one frame may ask to resize the window,
+    /// undecorate it, retitle it, move it, or start dragging it: every road
+    /// to a `ViewportCommand` is gated on owning the window, and a road added
+    /// without the gate is the one this catches.
     #[test]
-    fn a_plugin_frame_never_commands_the_hosts_window() {
-        let (ctx, mut app) = headless(Caps::PLUGIN);
+    fn a_frame_that_does_not_own_the_window_commands_nothing() {
+        let (ctx, mut app) = headless(Caps::NONE);
         // Several frames: the size latch and the decorations latch each fire
         // once, and "once" is easy to miss by looking at frame one alone.
         for i in 0..4 {
             let cmds = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
             assert!(
                 cmds.is_empty(),
-                "frame {i} sent the host {} viewport command(s): {cmds:?}",
+                "frame {i} sent {} viewport command(s) to a window it does not own: {cmds:?}",
                 cmds.len()
             );
         }
@@ -70315,20 +70096,21 @@ mod tests {
         }
     }
 
-    /// A plugin shares `~/.config/tangent/settings.json` with the standalone and
-    /// with every other instance, so it must never write it. Asserted through
-    /// the one gate every call site now goes through.
+    /// An app built without `persist_global_settings` must never write the
+    /// settings file: that is what keeps every test built on `Caps::NONE` (and
+    /// on the tests' `QUIET` sets) away from it. Asserted through the one gate
+    /// every call site now goes through.
     #[test]
-    fn a_plugin_does_not_write_the_shared_settings_file() {
+    fn an_app_that_may_not_persist_never_writes_the_settings_file() {
         let before = std::fs::read(Settings::path()).ok();
-        let (_ctx, app) = headless(Caps::PLUGIN);
+        let (_ctx, app) = headless(Caps::NONE);
         for _ in 0..3 {
             app.save_settings();
         }
         assert_eq!(
             std::fs::read(Settings::path()).ok(),
             before,
-            "a plugin wrote the shared settings file"
+            "an app without persist_global_settings wrote the settings file"
         );
     }
 
@@ -71007,15 +70789,15 @@ mod tests {").expect("the tests module")];
         }
     }
 
-    /// **A plugin editor keeps the old tick.** Its host owns the window's
-    /// clock and has no ledger of ours; the 50 ms cadence every version ran
-    /// on is what it still gets.
+    /// **Where the window is not ours, the old tick stays.** With
+    /// `window_sizing` off there is no window of ours for the ledger to rest,
+    /// and the 50 ms cadence every version ran on is what that host gets.
     #[test]
-    fn a_plugin_editor_keeps_the_old_tick() {
-        let (ctx, mut app) = headless(Caps::PLUGIN);
+    fn a_host_that_does_not_own_the_window_keeps_the_old_tick() {
+        let (ctx, mut app) = headless(Caps::NONE);
         app.dialog = None;
         let asked = settle(&ctx, &mut app);
-        assert!(asked <= GUI_TICK, "the plugin editor rested: {asked:?}");
+        assert!(asked <= GUI_TICK, "a host that does not own the window rested: {asked:?}");
     }
 
     /// **The old cadence is one variable away.** `IVORY_PACE=tick` is read
@@ -71615,14 +71397,15 @@ mod tests {").expect("the tests module")];
 
     /// **The shape this feature has to be tested in: ONE canvas.**
     ///
-    /// `child_windows: false` is a plugin editor, where both plugin windows
-    /// are `Area`s over the desk and a test can press either of them and the
-    /// desk between them. `capture_devices` stays on because the picker — an
-    /// empty chip's whole answer — is gated on it. On the desktop these are
-    /// two OS viewports, which a headless context never presents, so the
-    /// inline path is not a lesser version of the test: it is the only one
-    /// there is, and it is the build where the two windows and the desk
-    /// genuinely share a pointer and a keyboard.
+    /// `child_windows: false` is the inline shape (screen-reader mode,
+    /// fullscreen), where both plugin windows are `Area`s over the desk and a
+    /// test can press either of them and the desk between them.
+    /// `capture_devices` stays on because the picker, an empty chip's whole
+    /// answer, is gated on it. With child windows these are two OS
+    /// viewports, which a headless context never presents, so the inline path
+    /// is not a lesser version of the test: it is the only one there is, and
+    /// it is the shape where the two windows and the desk genuinely share a
+    /// pointer and a keyboard.
     fn a_desk_with_an_amp_face() -> (egui::Context, TangentApp) {
         let caps = Caps { child_windows: false, ..Caps::DESKTOP };
         let (ctx, mut app) = headless(caps);
@@ -72244,13 +72027,13 @@ mod tests {").expect("the tests module")];
     /// window both know the key; the window carries it back as
     /// `DialogAction::CycleTheme`, and the desk must not ALSO act on it.
     /// Two shapes: the desktop, where the face's window holds the keyboard
-    /// and the main window is unfocused — `focused: false` is what the OS
-    /// delivers to it then — and the plugin canvas, where there is one
+    /// and the main window is unfocused (`focused: false` is what the OS
+    /// delivers to it then), and the inline canvas, where there is one
     /// keyboard and the layer on top owns it.
     #[test]
     fn the_theme_key_inside_a_plugin_window_cycles_once() {
         for (label, caps, main_focused) in
-            [("desktop", Caps::DESKTOP, false), ("plugin", Caps::PLUGIN, true)]
+            [("desktop", Caps::DESKTOP, false), ("inline", Caps::NONE, true)]
         {
             let (ctx, mut app) = headless(caps);
             app.open_unit_face(app.row_bay(0, 0).expect("row 0's first bay"));
@@ -72293,9 +72076,9 @@ mod tests {").expect("the tests module")];
 
     /// **One key with a pedal window over the amp acts ONCE.**
     ///
-    /// Inline - a plugin, or the desktop with child windows off - both
-    /// windows wear a chrome bar, both bars read the one keyboard, and each
-    /// window's key belongs to it once either window is drawn inline. So T
+    /// Inline - the desktop with child windows off - both windows wear a
+    /// chrome bar, both bars read the one keyboard, and each window's key
+    /// belongs to it once either window is drawn inline. So T
     /// with a pedal window standing on an amp face cycled the theme twice
     /// (it skipped a theme), and Space queued two transport requests, a
     /// Play and then another. The face alone was always right, and that is
@@ -72363,13 +72146,13 @@ mod tests {").expect("the tests module")];
     /// the window both know the key, so exactly one of them must act. Two
     /// shapes, as the theme test has them - the desktop, where the face's
     /// window holds the keyboard and the main window is unfocused, and the
-    /// plugin canvas, where there is one keyboard and the layer on top owns
+    /// inline canvas, where there is one keyboard and the layer on top owns
     /// it. A Play followed by a Stop is a transport that looks broken
     /// rather than merely flickering.
     #[test]
     fn the_transport_key_inside_a_plugin_window_rolls_once() {
         for (label, caps, main_focused) in
-            [("desktop", Caps::DESKTOP, false), ("plugin", Caps::PLUGIN, true)]
+            [("desktop", Caps::DESKTOP, false), ("inline", Caps::NONE, true)]
         {
             let (ctx, mut app) = headless(caps);
             // The band has to be SHOWN - that is the consent the keymap
@@ -72399,9 +72182,9 @@ mod tests {").expect("the tests module")];
             // with its opposite - which is why the ASSERTION is that the
             // one taken is a Play and that nothing follows it.
             let first = app.take_recorder_request();
-            // **A plugin has no transport to roll.** `request_recorder`
+            // **`Caps::NONE` has no transport to roll.** `request_recorder`
             // refuses every request where `caps.capture_devices` is false,
-            // because a plugin never drains the queue - so the observable
+            // because nothing there drains the queue - so the observable
             // half of "exactly once" there is that the key reached the app
             // and left nothing behind, and the once-ness itself is pinned
             // structurally by
@@ -74064,43 +73847,30 @@ mod tests {").expect("the tests module")];
 
     /// **Reset Everything puts the DESKTOP window back to 100% on the spot.**
     ///
-    /// The two slots were the wrong way round against `SetSizePercent`: a
-    /// desktop build parked the request in `pending_resize`, which only the
-    /// plugin drains, so the window kept its size until the next launch - and
-    /// then opened at a size nobody had just chosen.
+    /// It once parked the request where the desktop never looked, so the
+    /// window kept its size until the next launch - and then opened at a
+    /// size nobody had just chosen.
     #[test]
     fn reset_everything_resizes_the_desktop_window_now() {
         let (ctx, mut app) = headless_with_band(Caps { persist_global_settings: false, ..Caps::DESKTOP });
         app.pending_window_size = None;
-        let _ = app.take_pending_resize();
         app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
         assert_eq!(
             app.pending_window_size,
             Some(initial_window_size(&app.settings)),
             "the reset asked nothing of the desktop window"
         );
-        assert_eq!(
-            app.take_pending_resize(),
-            None,
-            "the desktop request went to the plugin's slot"
-        );
 
-        let (ctx, mut plugin) = headless_with_band(Caps { persist_global_settings: false, ..Caps::PLUGIN });
-        plugin.pending_window_size = None;
-        let _ = plugin.take_pending_resize();
-        plugin.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        let (ctx, mut bare) = headless_with_band(Caps::NONE);
+        bare.pending_window_size = None;
+        bare.reset_settings(&ctx, crate::settings::ResetScope::Everything);
         // **And never for a band it cannot use.** The reset takes the layout
-        // from `first_launch`, which turns the recorder on; a plugin has no
-        // capture devices, and the DAW was then asked to grow the editor to
-        // hold an empty transport.
-        assert!(!plugin.settings.show_recorder, "the reset gave a plugin a recorder band");
-        assert!(!plugin.settings.show_camera_pane, "the reset gave a plugin a camera pane");
-        assert_eq!(
-            plugin.take_pending_resize(),
-            Some(initial_window_size(&plugin.settings)),
-            "a plugin's host still has to be asked"
-        );
-        assert_eq!(plugin.pending_window_size, None);
+        // from `first_launch`, which turns the recorder on, and a host with
+        // no capture devices would be laid out around an empty transport.
+        assert!(!bare.settings.show_recorder, "the reset gave a host with no devices a recorder band");
+        assert!(!bare.settings.show_camera_pane, "the reset gave a host with no devices a camera pane");
+        // Nor is a window that is not ours asked for a size.
+        assert_eq!(bare.pending_window_size, None);
     }
 
     /// **Reset Layout puts the DESKTOP window back to its opening size on
@@ -74118,7 +73888,6 @@ mod tests {").expect("the tests module")];
         app.settings.window_w = Some(1700);
         app.settings.window_h = Some(1040);
         app.pending_window_size = None;
-        let _ = app.take_pending_resize();
         app.reset_settings(&ctx, crate::settings::ResetScope::Layout);
         assert_eq!(app.settings.window_w, None, "the fixture's reset did not take the remembered size");
         assert_eq!(
@@ -74126,7 +73895,6 @@ mod tests {").expect("the tests module")];
             Some(initial_window_size(&app.settings)),
             "Reset Layout says it puts the window back to its opening size, and asked the window for nothing"
         );
-        assert_eq!(app.take_pending_resize(), None, "the desktop request went to the plugin's slot");
     }
 
     /// **Reset Everything never hands New a session to write back.** The
@@ -75497,7 +75265,7 @@ mod tests {").expect("the tests module")];
     ///
     /// **And a host that cannot tell must change nothing**, which is the
     /// third block. `mouse_down` is false by default everywhere that has no
-    /// answer — the plugin, Windows, Linux — so believing it there would end
+    /// answer (Windows, Linux), so believing it there would end
     /// every gesture the moment it began. `mouse_known` is the bit that says
     /// the answer is real.
     ///
@@ -75505,7 +75273,7 @@ mod tests {").expect("the tests module")];
     /// from the `ended` test and the first block goes red with a note still
     /// sounding; drop it from the `pressed_on` clear and the second does;
     /// make `hand_is_provably_up` ignore `mouse_known` and the third goes red
-    /// with a plugin that cannot hold a note down.
+    /// with a host that cannot hold a note down.
     #[test]
     fn a_release_appkit_swallowed_still_ends_the_gesture() {
         let gone = crate::host::Gesture {
@@ -75554,10 +75322,10 @@ mod tests {").expect("the tests module")];
         );
 
         // ── a host with no answer changes nothing ────────────────────────
-        // `Gesture::default()` is all-false, which is what the plugin and
-        // every non-macOS build hand over. Believing its "up" would end this
-        // gesture on the first frame.
-        let (ctx, mut app) = headless_with_band(Caps::PLUGIN);
+        // `Gesture::default()` is all-false, which is what every non-macOS
+        // build hands over. Believing its "up" would end this gesture on the
+        // first frame.
+        let (ctx, mut app) = headless_with_band(Caps::NONE);
         app.set_host_gesture(crate::host::Gesture::default());
         app.clicked.insert(60);
         hold_frame(&ctx, &mut app, 1.0 / 60.0);
@@ -77553,7 +77321,7 @@ mod folder_tests {
              (17 + grown_from(16)) * INSERTS, 18 + grown_from(16) as u64),
         ];
         for (era, sends, bays, at, bit, want_bay, want_bit) in eras {
-            let (_ctx, mut app) = headless(Caps::PLUGIN);
+            let (_ctx, mut app) = headless(Caps::NONE);
             let arr = crate::arrangement::Arrangement::from_json(&a_document_from_the_era(
                 sends, bays, at, bit,
             ));
@@ -83546,7 +83314,7 @@ mod sampler_road_tests {
         doc.add_clip(a_clip(ClipKind::Audio, "media/Loop.wav"));
         doc.save_to(&template.join(DOC_NAME));
 
-        let (ctx, mut app) = tests::headless(Caps::PLUGIN);
+        let (ctx, mut app) = tests::headless(Caps::NONE);
         app.adopt_template(&template, &root.join("Untitled"));
         let id = app.arrangement.clips[0].id;
         a_drag_in_flight(&ctx);

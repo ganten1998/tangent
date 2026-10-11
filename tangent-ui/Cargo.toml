@@ -1,15 +1,15 @@
 [package]
-# The shared GUI. MIT, like everything else in this repo.
+# The GUI. MIT, like everything else in this repo.
 #
-# It exists so the desktop binary and the VST3 plugin can render the SAME code
-# rather than forking into two lookalike GUIs, which is the failure the egui
-# 0.33 pin was chosen to prevent (docs/HANDOFF.md 2c).
+# It exists so that everything that draws is one crate: the binary links it,
+# the test suite drives it in a bare egui context, and the compositor paints
+# its panels into a video frame, all from the SAME code.
 #
 # WHAT IS NOT A DEPENDENCY HERE IS THE POINT. No eframe, no midir, no rfd, no
-# fd-lock: a plugin has no window to own, no MIDI device to open, no native file
-# dialog to raise, and above all no business calling `process::exit`, which
-# would take the host DAW down with it. Leaving those out makes all of it
-# UNREACHABLE from shared code rather than merely discouraged, enforced by the
+# fd-lock: the window, the MIDI device, the native file dialogs and the
+# single-instance lock are the binary's, and so is the process, which nothing
+# here may end with `process::exit`. Leaving those out makes all of it
+# UNREACHABLE from GUI code rather than merely discouraged, enforced by the
 # compiler instead of by review. `scripts/check-firewall.sh` asserts it.
 name = "tangent-ui"
 version.workspace = true
@@ -20,8 +20,10 @@ rust-version.workspace = true
 [dependencies]
 # `license` MUST be listed: without it tangent-core compiles the no-op
 # verification stub and every supporter key is silently rejected while every
-# test still passes. `tests/license_feature.rs` guards it here as well as in
-# the binary, because this crate is what the plugin will link.
+# test still passes. The supporter gate itself lives in this crate
+# (`TangentApp`'s `LicenseStore`), so a build of it alone, its own tests
+# included, has to verify a key the way the binary does;
+# `tangent/tests/license_feature.rs` guards the binary's line.
 tangent-core = { path = "../tangent-core", features = ["learning", "license"] }
 egui = { version = "0.33", default-features = false }
 serde = { version = "1", features = ["derive"] }
