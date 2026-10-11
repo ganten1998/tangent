@@ -28,6 +28,8 @@ pub const BITCRUSH_PATH: &str = "@tangent-bitcrush";
 pub const BITS_RANGE: (f32, f32) = (1.0, 24.0);
 /// The kernel's RATE sweep, restated; the top of the travel is "full".
 pub const RATE_HZ: (f32, f32) = (200.0, 48_000.0);
+/// The kernel's anti-alias cutoff, as a share of the crushed rate, restated.
+pub const AA_CUTOFF: f32 = 0.45;
 /// The kernel's DRIVE sweep, restated.
 pub const DRIVE_DB: (f32, f32) = (-24.0, 24.0);
 
@@ -36,6 +38,7 @@ const P_BITS: u32 = 0;
 const P_RATE: u32 = 1;
 const P_DRIVE: u32 = 2;
 const P_DITHER: u32 = 5;
+const P_AA: u32 = 6;
 
 /// The tone on the glass, the rate it is drawn at, and how much of it.
 const TONE_HZ: f32 = 440.0;
@@ -60,8 +63,12 @@ const GLASS_MIN_H: f32 = 36.0;
 /// full-scale units. The clock and the grid are the kernel's: a fractional
 /// phase accumulator that takes a sample whenever it reaches one, and a
 /// mid-tread round to `2^(1 − bits)`, out of circuit at the top of the BITS
-/// travel. Pure, so the picture can be tested without drawing it.
-pub fn staircase(bits_v: f32, rate_v: f32, drive_v: f32) -> (Vec<f32>, Vec<f32>) {
+/// travel. With the anti-alias switch on, the tone reaches the hold at the
+/// level the kernel's 8th-order Butterworth (cutoff 0.45 of the crushed
+/// rate) lets through; the picture shows that LEVEL and not the filter's
+/// phase, which a two-cycle sketch could not show honestly anyway. Pure, so
+/// the picture can be tested without drawing it.
+pub fn staircase(bits_v: f32, rate_v: f32, drive_v: f32, aa: bool) -> (Vec<f32>, Vec<f32>) {
     let n = (DRAW_RATE / TONE_HZ * CYCLES).round() as usize;
     let bits = BITS_RANGE.0 + (BITS_RANGE.1 - BITS_RANGE.0) * bits_v.clamp(0.0, 1.0);
     let grid = (bits < BITS_RANGE.1).then(|| (1.0 - bits).exp2());
@@ -70,6 +77,13 @@ pub fn staircase(bits_v: f32, rate_v: f32, drive_v: f32) -> (Vec<f32>, Vec<f32>)
     } else {
         let hz = RATE_HZ.0 * (RATE_HZ.1 / RATE_HZ.0).powf(rate_v.max(0.0));
         (hz / DRAW_RATE).min(1.0)
+    };
+    // The filter is out of circuit at "full", as it is in the kernel.
+    let through = if aa && step < 1.0 {
+        let fc = AA_CUTOFF * step * DRAW_RATE;
+        1.0 / (1.0 + (TONE_HZ / fc).powi(16)).sqrt()
+    } else {
+        1.0
     };
     let drive = 10f32.powf((DRIVE_DB.0 + (DRIVE_DB.1 - DRIVE_DB.0) * drive_v.clamp(0.0, 1.0)) / 20.0);
     let mut clean = Vec::with_capacity(n);
@@ -81,7 +95,7 @@ pub fn staircase(bits_v: f32, rate_v: f32, drive_v: f32) -> (Vec<f32>, Vec<f32>)
         let x = TONE_LEVEL * (std::f32::consts::TAU * TONE_HZ * t + START_PHASE).sin();
         if phase >= 1.0 - 1.0e-6 {
             phase -= 1.0;
-            let s = x * drive;
+            let s = x * drive * through;
             held = grid.map_or(s, |q| (s / q).round() * q);
         }
         phase += step;
@@ -115,6 +129,7 @@ fn paint_glass(painter: &egui::Painter, r: Rect, st: &FaceStyle, live: &FaceLive
         value(live, P_BITS).unwrap_or(1.0),
         value(live, P_RATE).unwrap_or(1.0),
         value(live, P_DRIVE).unwrap_or(0.5),
+        value(live, P_AA).is_some_and(|v| v >= 0.5),
     );
     let n = clean.len().max(2);
     let x_at = |i: usize| inner.left() + inner.width() * i as f32 / (n - 1) as f32;
@@ -165,7 +180,7 @@ pub fn draw_bitcrush(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> 
     paint_glass(ui.painter(), rect, st, live);
     ui.add_space(6.0);
     let mut out = None;
-    let ids: Vec<(u32, bool)> = live.face.params.iter().map(|p| (p.id, p.steps >= 2 || p.id == P_DITHER)).collect();
+    let ids: Vec<(u32, bool)> = live.face.params.iter().map(|p| (p.id, p.steps >= 2 || p.id == P_DITHER || p.id == P_AA)).collect();
     for (id, stepped) in ids {
         face::keep(
             &mut out,
@@ -190,12 +205,12 @@ mod tests {
     /// the 48 kHz drawing; and driving it up spreads it across more levels.
     #[test]
     fn the_stair_follows_the_bits_the_clock_and_the_drive() {
-        let (clean, wire) = staircase(1.0, 1.0, 0.5);
+        let (clean, wire) = staircase(1.0, 1.0, 0.5, false);
         assert_eq!(clean, wire, "the wire's stair is not the tone");
-        let (_, one) = staircase(0.0, 1.0, 0.5);
+        let (_, one) = staircase(0.0, 1.0, 0.5, false);
         assert!(one.iter().all(|v| [-1.0, 0.0, 1.0].contains(v)), "one bit drew a fourth level");
         let rate_12k = (12_000.0f32 / RATE_HZ.0).ln() / (RATE_HZ.1 / RATE_HZ.0).ln();
-        let (_, held) = staircase(1.0, rate_12k, 0.5);
+        let (_, held) = staircase(1.0, rate_12k, 0.5, false);
         let mut runs = Vec::new();
         let mut len = 1;
         for w in held.windows(2) {
@@ -208,7 +223,7 @@ mod tests {
         }
         assert!(runs.iter().all(|r| *r == 4), "a 12 kHz clock held for {runs:?}");
         let levels = |drive: f32| {
-            let (_, s) = staircase(3.0 / 23.0, 1.0, drive);
+            let (_, s) = staircase(3.0 / 23.0, 1.0, drive, false);
             let mut v: Vec<i64> = s.iter().map(|x| (x * 1_000.0).round() as i64).collect();
             v.sort_unstable();
             v.dedup();
@@ -216,8 +231,15 @@ mod tests {
         };
         assert!(levels(0.75) > levels(0.5), "driving the tone used no more of the grid");
         // A clock slower than the picture holds one non-zero value.
-        let (_, slow) = staircase(1.0, 0.0, 0.5);
+        let (_, slow) = staircase(1.0, 0.0, 0.5, false);
         assert!(slow.iter().all(|v| *v == slow[0]) && slow[0] != 0.0);
+        // The anti-alias switch: at a 200 Hz clock (cutoff 90 Hz) the
+        // 440 Hz tone never reaches the hold; at "full" the switch is out
+        // of circuit and the stair is the tone again.
+        let (_, filtered) = staircase(1.0, 0.0, 0.5, true);
+        assert!(filtered.iter().all(|v| v.abs() < 1.0e-4), "the filter let the tone through");
+        let (clean, wire) = staircase(1.0, 1.0, 0.5, true);
+        assert_eq!(clean, wire, "the switch touched the wire");
     }
 
     /// **The face paints inside the room it is given, at every width a
@@ -234,7 +256,7 @@ mod tests {
         let about = crate::faces::suite_unit(BITCRUSH_PATH).map(|(_, a)| a).expect("a suite unit");
         for w in [320.0f32, 400.0, 520.0, 640.0, 900.0] {
             for h in [440.0f32, 520.0, 704.0] {
-                let mut live = fit::a_worst_case_face(BITCRUSH_PATH, 6, &[5], false);
+                let mut live = fit::a_worst_case_face(BITCRUSH_PATH, 7, &[5, 6], false);
                 let (right, bottom) = fit::escape(&ctx, Vec2::new(w, h), about, &st.s, &mut |ui| {
                     let _ = crate::faces::draw(ui, &st, &mut live);
                 });
@@ -246,7 +268,7 @@ mod tests {
         // a glass squeezed at its own window is a floor set too low.
         for font in fit::FONTS {
             let ctx = fit::a_ctx(font);
-            let live = fit::a_worst_case_face(BITCRUSH_PATH, 6, &[5], false);
+            let live = fit::a_worst_case_face(BITCRUSH_PATH, 7, &[5, 6], false);
             let mut got = 0.0;
             let _ = fit::escape(&ctx, Vec2::new(400.0, 440.0), about, &st.s, &mut |ui| {
                 got = glass_height(ui, &live);

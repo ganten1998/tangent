@@ -4,7 +4,7 @@
 //! # The signal path
 //!
 //! ```text
-//!  in ─┬─ DRIVE ─ sample-and-hold (RATE) ─ quantizer (BITS, DITHER) ─┐
+//!  in ─┬─ DRIVE ─ [AA low-pass] ─ sample-and-hold (RATE) ─ quantizer (BITS, DITHER) ─┐
 //!      │                                                             MIX ─ OUTPUT ─ out
 //!      └─────────────────────────── dry ─────────────────────────────┘
 //! ```
@@ -37,7 +37,23 @@
 //!    gritty, signal-following distortion for a steady hiss: the textbook
 //!    cure, offered because sometimes the hiss is the sound wanted. Off is
 //!    the classic undithered crunch.
-//! 5. **MIX** blends the crushed path with the untouched dry, and **OUTPUT**
+//! 5. **ANTI-ALIAS**, a switch, OFF by default, so the classic folding is
+//!    what a fresh unit and every state saved before the switch existed
+//!    play. On, an 8th-order Butterworth low-pass (four cascaded
+//!    state-variable sections, the topology that stays stable while its
+//!    cutoff moves every sample) sits between DRIVE and the hold, its cutoff
+//!    at 0.45 of the crushed rate and gliding with RATE. It falls about 48 dB
+//!    per octave above the cutoff, so a tone that would fold is gone before
+//!    the hold can fold it: a tone 2.4 times the cutoff comes back more than
+//!    60 dB down. It is a PRE-filter only. The staircase the hold draws (its
+//!    images above the crushed rate, the buzz of a low sample rate) is left
+//!    alone, because that edge is the other half of the sound; the switch
+//!    takes away the folding and nothing else. IIR, so no latency. At RATE
+//!    "full" there is nothing to fold and the filter is out of circuit:
+//!    the switch fades it in and out over the same 20 ms glide as the
+//!    knobs, so neither the switch nor RATE reaching the top clicks, and the
+//!    wire stays bit-exact with the switch on.
+//! 6. **MIX** blends the crushed path with the untouched dry, and **OUTPUT**
 //!    (±24 dB) trims the sum.
 //!
 //! # The wire
@@ -171,6 +187,8 @@ pub struct BitcrushParams {
     pub output: f32,
     /// A toggle (≥ 0.5 is on): TPDF dither of ±1 step before the quantizer.
     pub dither: f32,
+    /// A toggle (≥ 0.5 is on): the anti-alias low-pass before the hold.
+    pub aa: f32,
 }
 
 /// **The shipped sound: 8 bits at about 12 kHz, fully wet, unity levels,
@@ -188,6 +206,7 @@ impl Default for BitcrushParams {
             mix: 1.0,
             output: 0.5,
             dither: 0.0,
+            aa: 0.0,
         }
     }
 }
@@ -229,6 +248,68 @@ impl Glide {
     }
 }
 
+// ── the anti-alias filter ───────────────────────────────────────────────────
+
+/// Where the anti-alias cutoff sits, as a share of the crushed rate: under
+/// its Nyquist (0.5) by enough that the filter's knee is past before the
+/// fold begins.
+pub const AA_CUTOFF: f32 = 0.45;
+
+/// The four sections' Q for an 8th-order Butterworth: `1 / (2 cos θ)` at
+/// θ = 11.25°, 33.75°, 56.25° and 78.75°.
+const AA_Q: [f32; 4] = [0.509_795_6, 0.601_344_9, 0.899_976_2, 2.562_915_4];
+
+/// Below this a filter state is on its way to a denormal and is zero.
+const TINY: f32 = 1.0e-20;
+
+/// One channel's four state-variable sections (Cytomic's trapezoidal SVF):
+/// two integrator states each. Stable for any cutoff sequence, which is why
+/// it is this topology and not a direct-form biquad.
+#[derive(Clone, Copy, Default)]
+struct AaChannel {
+    ic: [[f32; 2]; 4],
+}
+
+/// The coefficients all channels share for one frame.
+#[derive(Clone, Copy)]
+struct AaCoeffs {
+    a: [[f32; 3]; 4],
+}
+
+impl AaCoeffs {
+    fn at(g: f32) -> Self {
+        let mut a = [[0.0; 3]; 4];
+        for (row, q) in a.iter_mut().zip(AA_Q) {
+            let k = 1.0 / q;
+            let a1 = 1.0 / (1.0 + g * (g + k));
+            let a2 = g * a1;
+            *row = [a1, a2, g * a2];
+        }
+        Self { a }
+    }
+}
+
+impl AaChannel {
+    #[inline]
+    fn tick(&mut self, c: &AaCoeffs, x: f32) -> f32 {
+        let mut v0 = x;
+        for (st, [a1, a2, a3]) in self.ic.iter_mut().zip(c.a) {
+            let v3 = v0 - st[1];
+            let v1 = a1 * st[0] + a2 * v3;
+            let v2 = st[1] + a2 * st[0] + a3 * v3;
+            st[0] = 2.0 * v1 - st[0];
+            st[1] = 2.0 * v2 - st[1];
+            for s in st.iter_mut() {
+                if s.abs() < TINY || !s.is_finite() {
+                    *s = 0.0;
+                }
+            }
+            v0 = v2;
+        }
+        v0
+    }
+}
+
 // ── the crusher ─────────────────────────────────────────────────────────────
 
 /// How many channels the kernel keeps state for: one converter is a stereo
@@ -260,6 +341,16 @@ pub struct Bitcrush {
     /// Whether the glides have been handed their first targets since
     /// construction or the last clear. See the module header.
     primed: bool,
+    /// How much of the anti-alias filter is in the path, 0..1: the switch
+    /// and RATE's "full" fade it rather than cut it.
+    aa_mix: Glide,
+    aa: [AaChannel; CRUSH_CHANNELS],
+    /// Whether the sections hold anything, so an idle filter is reset once
+    /// rather than every sample.
+    aa_live: bool,
+    /// The clock step the coefficients were computed for.
+    aa_for: f64,
+    aa_coeffs: AaCoeffs,
     /// The bit depth [`Self::grid`] was computed for, so a settled depth
     /// costs no `exp2` per sample.
     grid_for: f32,
@@ -281,6 +372,11 @@ impl Bitcrush {
             held: [0.0; CRUSH_CHANNELS],
             rng: [0x9E37_79B9, 0x7F4A_7C15],
             primed: false,
+            aa_mix: Glide::new(1.0e-7),
+            aa: [AaChannel::default(); CRUSH_CHANNELS],
+            aa_live: false,
+            aa_for: f64::NAN,
+            aa_coeffs: AaCoeffs::at(1.0),
             grid_for: f32::NAN,
             grid: 1.0,
         }
@@ -297,8 +393,14 @@ impl Bitcrush {
         self.drive.target = f64::from(gain_at(dial(p.drive, rest.drive), DRIVE_DB));
         self.mix.target = f64::from(dial(p.mix, rest.mix));
         self.output.target = f64::from(gain_at(dial(p.output, rest.output), OUTPUT_DB));
+        // In the path only when switched on AND there is something to fold:
+        // at "full" the hold takes every sample and the filter would only
+        // colour the treble.
+        let aa_on = dial(p.aa, 0.0) >= 0.5 && self.step.target < 1.0;
+        self.aa_mix.target = if aa_on { 1.0 } else { 0.0 };
         if !self.primed {
             for g in [
+                &mut self.aa_mix,
                 &mut self.bits,
                 &mut self.step,
                 &mut self.drive,
@@ -335,6 +437,26 @@ impl Bitcrush {
         let drive = self.drive.tick(a) as f32;
         let mix = self.mix.tick(a) as f32;
         let output = self.output.tick(a) as f32;
+        let aa_mix = self.aa_mix.tick(a) as f32;
+        let aa = if aa_mix > 0.0 {
+            if step != self.aa_for {
+                self.aa_for = step;
+                // The cutoff follows the clock as it glides; the prewarp is
+                // capped just under Nyquist so a step near one stays finite.
+                let fc = (f64::from(AA_CUTOFF) * step).min(0.49);
+                self.aa_coeffs = AaCoeffs::at((std::f64::consts::PI * fc).tan() as f32);
+            }
+            self.aa_live = true;
+            Some((self.aa_coeffs, aa_mix))
+        } else {
+            // Out of circuit: forget the filter so the next time it fades in
+            // it starts from rest, not from a tail of some older signal.
+            if self.aa_live {
+                self.aa = [AaChannel::default(); CRUSH_CHANNELS];
+                self.aa_live = false;
+            }
+            None
+        };
         // The quantizer is out of circuit at the top of the BITS travel. The
         // step is recomputed only while the depth is moving.
         let grid = if bits < BITS_RANGE.1 {
@@ -362,11 +484,21 @@ impl Bitcrush {
 
         for (ch, x) in frame.iter_mut().enumerate().take(n) {
             let dry = if x.is_finite() { *x } else { 0.0 };
-            if take {
-                let mut s = dry * drive;
-                if !s.is_finite() {
-                    s = 0.0;
+            let mut driven = dry * drive;
+            if !driven.is_finite() {
+                driven = 0.0;
+            }
+            // The filter runs on EVERY sample, held or not: it is a filter
+            // on the signal, and the hold samples its output.
+            if let Some((c, m)) = &aa {
+                let lp = self.aa[ch].tick(c, driven);
+                driven = if *m >= 1.0 { lp } else { driven + m * (lp - driven) };
+                if !driven.is_finite() {
+                    driven = 0.0;
                 }
+            }
+            if take {
+                let mut s = driven;
                 if let Some(q) = grid {
                     if dither {
                         s += self.tpdf(ch) * q;
@@ -446,6 +578,7 @@ impl Bitcrush {
     pub fn clear(&mut self) {
         self.phase = 1.0;
         self.held = [0.0; CRUSH_CHANNELS];
+        self.aa = [AaChannel::default(); CRUSH_CHANNELS];
         self.primed = false;
     }
 }
@@ -465,6 +598,7 @@ mod tests {
             mix,
             output: 0.5,
             dither: 0.0,
+            aa: 0.0,
         }
     }
 
@@ -511,6 +645,9 @@ mod tests {
             wire(1.0),
             wire(0.0),
             wire(0.37),
+            // The anti-alias switch on changes nothing at "full".
+            BitcrushParams { aa: 1.0, ..wire(1.0) },
+            BitcrushParams { aa: 1.0, ..wire(0.37) },
             BitcrushParams { mix: 0.0, ..BitcrushParams::default() },
             BitcrushParams { mix: 0.0, bits: 0.0, rate: 0.0, dither: 1.0, ..BitcrushParams::default() },
         ] {
@@ -712,6 +849,7 @@ mod tests {
                 mix: d(3),
                 output: d(4),
                 dither: d(5),
+                aa: if bits % 3 == 0 { 1.0 } else { 0.0 },
             };
             let mut k = Bitcrush::new(SR);
             for _ in 0..3 {
@@ -723,7 +861,7 @@ mod tests {
         // A dial that is itself garbage reads as its rest.
         let mut k = Bitcrush::new(SR);
         let mut buf = input.clone();
-        let p = BitcrushParams { bits: f32::NAN, rate: f32::INFINITY, drive: -3.0, mix: f32::NAN, output: 9.0, dither: f32::NAN };
+        let p = BitcrushParams { bits: f32::NAN, rate: f32::INFINITY, drive: -3.0, mix: f32::NAN, output: 9.0, dither: f32::NAN, aa: f32::NAN };
         k.process(&mut buf, frames, 2, &p);
         assert!(buf.iter().all(|y| y.is_finite()));
     }
@@ -839,4 +977,141 @@ mod tests {
         assert_eq!(gain_at(0.5, DRIVE_DB), 1.0);
         assert_eq!(gain_at(0.5, OUTPUT_DB), 1.0);
     }
+
+    /// The plain classic crusher, settled, written the obvious way: hold at
+    /// a fractional clock, round to the grid, blend, trim. What the kernel
+    /// must still be, sample for sample, with the anti-alias switch off.
+    fn reference(p: &BitcrushParams, input: &[f32]) -> Vec<f32> {
+        let bits = f64::from(bits_at(p.bits));
+        let step = rate_at(p.rate).map_or(1.0, |hz| (f64::from(hz) / f64::from(SR)).min(1.0));
+        let (drive, mix, output) = (gain_at(p.drive, DRIVE_DB), p.mix, gain_at(p.output, OUTPUT_DB));
+        let mut phase = 1.0f64;
+        let mut held = [0.0f32; 2];
+        let mut out = input.to_vec();
+        for f in out.chunks_exact_mut(2) {
+            let take = phase >= 1.0 - CLOCK_SLACK;
+            if take {
+                phase -= 1.0;
+            }
+            phase += step;
+            for (ch, x) in f.iter_mut().enumerate() {
+                let dry = *x;
+                if take {
+                    let s = dry * drive;
+                    held[ch] = if bits < 24.0 { quantize(s, step_of(bits as f32)) } else { s };
+                }
+                let wet = held[ch];
+                let b = if mix >= 1.0 {
+                    wet
+                } else if mix <= 0.0 || wet == dry {
+                    dry
+                } else {
+                    dry + mix * (wet - dry)
+                };
+                *x = b * output;
+            }
+        }
+        out
+    }
+
+    /// **With the anti-alias switch off the crusher is the classic one, to
+    /// the bit**: the kernel against the plain reference above across the
+    /// panel's corners and its shipped rest.
+    #[test]
+    fn anti_alias_off_is_the_classic_crusher_to_the_bit() {
+        let input: Vec<f32> = (0..2 * 9_600).map(|i| ((i / 2) as f32 * 0.0731).sin() * 0.7 + (i % 2) as f32 * 0.01).collect();
+        for p in [
+            BitcrushParams::default(),
+            BitcrushParams { bits: 0.0, rate: 0.0, ..BitcrushParams::default() },
+            BitcrushParams { bits: 0.5, rate: 0.3, drive: 0.8, mix: 0.6, output: 0.2, ..BitcrushParams::default() },
+            BitcrushParams { rate: 1.0, ..BitcrushParams::default() },
+        ] {
+            assert_eq!(p.aa, 0.0);
+            let got = run(&p, &input);
+            let want = reference(&p, &input);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{p:?} sample {i}: {a} vs the classic {b}");
+            }
+        }
+    }
+
+    /// The level of `hz` in one channel of an interleaved block, by
+    /// projection onto a sine and a cosine (a single-bin DFT).
+    fn level_at(buf: &[f32], ch: usize, hz: f32) -> f32 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        let mut n = 0usize;
+        for (i, f) in buf.chunks_exact(2).enumerate() {
+            let w = std::f64::consts::TAU * f64::from(hz) * i as f64 / f64::from(SR);
+            re += f64::from(f[ch]) * w.cos();
+            im += f64::from(f[ch]) * w.sin();
+            n += 1;
+        }
+        (2.0 * (re * re + im * im).sqrt() / n as f64) as f32
+    }
+
+    /// **On, the anti-alias filter stops the fold**: at a 4 kHz clock a
+    /// 4.4 kHz tone folds to 400 Hz; with the switch on that alias comes
+    /// back more than 40 dB under where it sits with the switch off (the
+    /// 8th-order Butterworth at 1.8 kHz is about 62 dB down at 4.4 kHz),
+    /// while a 500 Hz tone, well inside the crushed band, loses under a dB.
+    #[test]
+    fn anti_alias_on_stops_a_tone_above_the_crushed_nyquist_from_folding() {
+        let frames = 48_000;
+        let tone = |hz: f32| -> Vec<f32> {
+            (0..frames * 2)
+                .map(|i| (std::f32::consts::TAU * hz * (i / 2) as f32 / SR).sin() * 0.5)
+                .collect()
+        };
+        let p = BitcrushParams { rate: rate_dial(4_000.0), ..wire(1.0) };
+        let alias = (rate_at(p.rate).unwrap() - 4_400.0).abs();
+        let skip = 2 * 4_800;
+        let high = tone(4_400.0);
+        let off = run(&p, &high);
+        let on = run(&BitcrushParams { aa: 1.0, ..p }, &high);
+        let (a_off, a_on) = (level_at(&off[skip..], 0, alias), level_at(&on[skip..], 0, alias));
+        let down = 20.0 * (a_off / a_on.max(1.0e-12)).log10();
+        assert!(a_off > 0.1, "the fold this test measures is not there: {a_off}");
+        assert!(down > 40.0, "the alias at {alias} Hz only fell {down:.1} dB");
+        let low = tone(500.0);
+        let off = run(&p, &low);
+        let on = run(&BitcrushParams { aa: 1.0, ..p }, &low);
+        let lost = 20.0 * (level_at(&off[skip..], 0, 500.0) / level_at(&on[skip..], 0, 500.0)).log10();
+        assert!(lost.abs() < 1.0, "a 500 Hz tone moved {lost:.2} dB through the filter");
+    }
+
+    /// **Sweeping RATE as fast as automation can, with the filter in,
+    /// never blows up**: the clock slammed between its ends every 64
+    /// samples, and every 7, against a full-scale tone with spikes in it.
+    /// Finite every sample and never far past full scale; then the switch
+    /// and RATE's top fade the filter out and the wire comes back exact.
+    #[test]
+    fn anti_alias_survives_the_fastest_rate_sweeps_and_leaves_cleanly() {
+        for every in [64usize, 7] {
+            let mut k = Bitcrush::new(SR);
+            let mut worst = 0.0f32;
+            for b in 0..2_000 {
+                let mut buf: Vec<f32> = (0..every * 2)
+                    .map(|i| if i % 97 == 0 { 1.0 } else { ((b * every + i / 2) as f32 * 0.9).sin() })
+                    .collect();
+                let p = BitcrushParams { aa: 1.0, rate: if b % 2 == 0 { 0.0 } else { 0.999 }, ..wire(1.0) };
+                k.process(&mut buf, every, 2, &p);
+                for y in &buf {
+                    assert!(y.is_finite(), "a sweep every {every} emitted {y}");
+                    worst = worst.max(y.abs());
+                }
+            }
+            assert!(worst < 4.0, "a sweep every {every} rang to {worst}");
+            // Back to the wire with the switch still on: once the fade has
+            // landed, every sample is its input again.
+            let mut settle = vec![0.3f32; 2 * 48_000];
+            k.process(&mut settle, 48_000, 2, &BitcrushParams { aa: 1.0, ..wire(1.0) });
+            let input = awkward(1_024);
+            let mut buf = input.clone();
+            k.process(&mut buf, 1_024, 2, &BitcrushParams { aa: 1.0, ..wire(1.0) });
+            for (a, b) in input.iter().zip(&buf) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
 }
+

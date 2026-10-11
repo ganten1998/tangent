@@ -34073,7 +34073,7 @@ mod tests {
             (PLATE_PATH, "Tangent Plate", 4),
             (WAH_PATH, "Tangent Wah", 4),
             (IR_PATH, "Tangent IR", 2),
-            (BITCRUSH_PATH, "Tangent Bitcrush", 6),
+            (BITCRUSH_PATH, "Tangent Bitcrush", 7),
             // Two trims, the mix and the polarity; the jacks are state, not
             // lanes.
             (HWINSERT_PATH, "Tangent Insert", 4),
@@ -34130,7 +34130,7 @@ mod tests {
     fn a_bitcrusher_at_its_wire_is_a_null_through_the_master_rack() {
         use crate::builtin_fx::{spec_for, state_text, BITCRUSH_PATH};
         let spec = spec_for(BITCRUSH_PATH).unwrap();
-        let wire = state_text(spec, &[1.0, 1.0, 0.5, 1.0, 0.5, 0.0], &[]).into_bytes();
+        let wire = state_text(spec, &[1.0, 1.0, 0.5, 1.0, 0.5, 0.0, 1.0], &[]).into_bytes();
         let flat = drums_through_master_bay(None);
         let through = drums_through_master_bay(Some((BITCRUSH_PATH, Some(wire))));
         assert!(flat.iter().any(|s| s.abs() > 0.001), "the fixture made no sound");
