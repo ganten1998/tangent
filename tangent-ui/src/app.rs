@@ -125,6 +125,9 @@ const GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(700);
 /// the SOUND waits: the note leaves `sounding` with the gesture, so the
 /// display — and the neck's solver — never see a note the hand let go of.
 const SELECTION_RING: Duration = Duration::from_millis(1500);
+/// How many bars the arrangement shows before anybody steers it: see
+/// `TangentApp::arr_default_len_s`. A song longer than this opens whole.
+const DEFAULT_VIEW_BARS: u32 = 32;
 /// How much of a restored window must be on-screen before it counts as visible.
 /// A window peeking a few pixels onto the desktop is not reachable in practice.
 const OFFSCREEN_SLACK: f32 = 40.0;
@@ -9960,6 +9963,7 @@ impl TangentApp {
         };
         self.project_doc = doc;
         self.arrangement = arr;
+        self.adopt_doc_viewport();
         self.note_doc_rows();
         self.say_desk_dropped();
         self.clips_dirty = true;
@@ -9990,6 +9994,7 @@ impl TangentApp {
         };
         self.project_doc = std::path::PathBuf::from(p);
         self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
+        self.adopt_doc_viewport();
         self.note_doc_rows();
         self.clips_dirty = true;
         self.desk_index_dirty();
@@ -10031,6 +10036,7 @@ impl TangentApp {
         }
         arr.save_to(&doc);
         self.arrangement = arr;
+        self.adopt_doc_viewport();
         self.project_doc = doc.clone();
         self.note_doc_rows();
         self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -10742,7 +10748,28 @@ impl TangentApp {
         // already holds, save after save, until the host's verified mirror
         // clears it (`forget_legacy_states`).
         d.legacy_states = crate::arrangement::Aside(self.doc_legacy_states());
+        // **And where the arrangement was left looking**, which the session
+        // owns and the settings never see (`DeskSnap::viewport`). Only a
+        // window somebody steered: the default is not a picture to keep,
+        // and a project saved at it opens at whatever the default is then.
+        d.viewport = crate::arrangement::Aside(
+            self.arr_window.and_then(|(start, len)| crate::arrangement::Viewport::sane(start, len)),
+        );
         d
+    }
+
+    /// **The arrangement's window becomes the one the open document says**,
+    /// or the default when it says none: called by every road that puts a
+    /// different document on screen, after the document is in place (the
+    /// clamp reads its span). Never by undo, which moves the document under
+    /// a window that stays where it is, and never by Save As, which is the
+    /// same session under another name.
+    fn adopt_doc_viewport(&mut self) {
+        let said = self.arrangement.desk.as_ref().and_then(|d| d.viewport.0);
+        self.arr_window = None;
+        if let Some(v) = said {
+            self.arr_steer(v.start_s, v.len_s);
+        }
     }
 
     /// The same snapshot, taken from ANY settings.
@@ -14164,6 +14191,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         };
         let on_shelf = inside_template_shelf(&template_doc, &self.project_root());
         self.inhabit_document(arr, read_doc, KeepPath::Leave, on_shelf);
+        // **A new session starts at the default window**, whatever the
+        // template was looking at when it was saved: the template is what a
+        // song is made FROM, and where somebody last scrolled in it is not.
+        self.arr_window = None;
         // **The kit's samples are still in the template**, and they stay
         // there until this scratch becomes real. See `media_source` for what
         // the repoint below does to a relative pad path without it.
@@ -14257,6 +14288,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let doc = crate::arrangement::doc_in(dir);
         let mut arr = self.arrangement.clone();
         arr.desk = Some(self.desk_snapshot());
+        // No window in a template: every session made from it starts at
+        // the default (`adopt_template`).
+        if let Some(d) = arr.desk.as_mut() {
+            d.viewport = crate::arrangement::Aside(None);
+        }
         arr.named = false;
         arr.save_to(&doc);
         if !doc.is_file() {
@@ -14439,6 +14475,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(desk) = self.arrangement.desk.clone() {
             self.apply_desk_snapshot(&desk);
         }
+        // And the window onto it: this document's, never the last one's.
+        self.adopt_doc_viewport();
         // The kit rides the project: whatever drumpad this directory
         // carries replaces the one in memory. Beside `project_doc`, which is
         // where every kit write goes: a stencil read here keeps the session's
@@ -15174,7 +15212,35 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn arr_window_now(&self) -> (f64, f64) {
         self.arr_window
-            .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
+            .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(self.arr_default_len_s())))
+    }
+
+    /// **How wide the window opens when nothing has steered it**: the first
+    /// [`DEFAULT_VIEW_BARS`] bars on the song's own tempo and meter maps, or
+    /// the whole song when that is longer (`arr_window_now`).
+    ///
+    /// It was thirty SECONDS, which is fifteen bars at 120 in 4/4 and under
+    /// eight at 60: the owner found it "so far zoomed in", and a new song in
+    /// the common DAWs opens on a few dozen bars rather than a handful. In
+    /// bars because that is what a musician reads the timeline in, so the
+    /// same session opens on the same music whatever its tempo. Read off the
+    /// document's maps by reference: this answers several times a frame.
+    fn arr_default_len_s(&self) -> f64 {
+        let quarters = if self.arrangement.meter.is_constant() {
+            let sig = self.time_signature();
+            f64::from(DEFAULT_VIEW_BARS)
+                * f64::from(sig.beats.max(1))
+                * (4.0 / f64::from(sig.unit.max(1)))
+        } else {
+            self.arrangement.meter.quarter_at_bar(DEFAULT_VIEW_BARS)
+        };
+        let secs = if self.arrangement.tempo.is_constant() {
+            quarters * 60.0 / self.tempo_bpm().max(1.0)
+        } else {
+            self.arrangement.tempo.seconds_at_beat(quarters)
+        };
+        // The steer's own floor and the hour it allows an empty project.
+        if secs.is_finite() { secs.clamp(1.0, 3_600.0) } else { 30.0 }
     }
 
     /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
@@ -51487,6 +51553,116 @@ mod tests {
         );
         assert!(!third.take_desk_reload());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The arrangement's window belongs to the session**: saved with the
+    /// document, put back by an explicit open and by the launch reopen, the
+    /// default for a document that never said one, and none of an undo's
+    /// business. The owner: "make it so that the viewport ... is session
+    /// bound". Take the window out of `desk_snapshot` or `adopt_doc_viewport`
+    /// out of the open roads and this goes red.
+    #[test]
+    fn the_arrangement_window_belongs_to_the_session() {
+        let root = project_scratch("viewport");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        assert_eq!(app.arr_window, None, "a fresh project opened at somebody's window");
+
+        // **A zoom is not an edit**: no asterisk, no undo moment.
+        let moments = app.history.len();
+        app.arr_steer(40.0, 120.0);
+        app.commit_view_change();
+        assert!(!app.project_dirty_exact(), "a scroll lit the asterisk");
+        assert_eq!(app.history.len(), moments, "a scroll became an undo moment");
+
+        app.save_project_doc();
+        let doc = app.project_doc().unwrap().to_path_buf();
+        let read = crate::arrangement::Arrangement::load_from(&doc);
+        assert_eq!(
+            read.desk.expect("the save left the desk out").viewport.0,
+            Some(crate::arrangement::Viewport { start_s: 40.0, len_s: 120.0 }),
+            "the save left the window out"
+        );
+
+        // **Undo moves the document, not the window.**
+        app.settings.arr_snap = !app.settings.arr_snap;
+        app.commit_view_change();
+        app.arr_steer(60.0, 30.0);
+        app.undo();
+        assert_eq!(app.arr_window, Some((60.0, 30.0)), "an undo moved the window");
+
+        // Another app, zoomed somewhere of its own, opens it: the
+        // document's window arrives and the last project's does not stay.
+        let (_ctx2, mut other) = headless_with(Caps::DESKTOP, Settings::default());
+        other.arr_steer(5.0, 10.0);
+        other.open_project(&doc);
+        assert_eq!(other.arr_window, Some((40.0, 120.0)), "the open kept the last project's window");
+
+        // A document from before the key opens at the DEFAULT, not at the
+        // window the session before it was left at.
+        let old = root.join("Old");
+        std::fs::create_dir_all(old.join("media")).expect("an old project");
+        let old_doc = crate::arrangement::doc_in(&old);
+        crate::arrangement::Arrangement::default().save_to(&old_doc);
+        other.open_project(&old_doc);
+        assert_eq!(other.arr_window, None, "an old document wore the last project's window");
+
+        // The launch reopen puts it back too.
+        let mut s3 = Settings::default();
+        s3.project_path = doc.to_string_lossy().into_owned();
+        let (_ctx3, mut third) = headless_with(Caps::DESKTOP, s3);
+        third.bootstrap_project(&root.join("Projects"));
+        assert_eq!(third.arr_window, Some((40.0, 120.0)), "the launch reopen lost the window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A new session starts at the default window**, whatever its
+    /// template was looking at: a template written from a zoomed session
+    /// carries no window, and one that somehow does is not obeyed.
+    #[test]
+    fn a_session_made_from_a_template_starts_at_the_default_window() {
+        let root = project_scratch("viewport-template");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_steer(30.0, 15.0);
+        let written = root.join("Written");
+        app.write_template_into(&written).expect("the template was written");
+        let read = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&written));
+        assert_eq!(read.desk.expect("a template carries its desk").viewport.0, None, "a template kept a window");
+
+        // A template that says one anyway (hand-made, or an older build).
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        let mut arr = crate::arrangement::Arrangement::default();
+        let mut desk = TangentApp::template_desk();
+        desk.viewport = crate::arrangement::Aside(Some(crate::arrangement::Viewport { start_s: 8.0, len_s: 4.0 }));
+        arr.desk = Some(desk);
+        arr.save_to(&crate::arrangement::doc_in(&template));
+        app.adopt_template(&template, &root.join("Untitled"));
+        assert_eq!(app.arr_window, None, "a new session opened at the template's window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An unsteered arrangement shows thirty-two bars**, on the song's own
+    /// tempo and meter, or the whole song when that is longer. It was a flat
+    /// thirty seconds, fifteen bars at 120: "so far zoomed in".
+    #[test]
+    fn the_default_window_is_thirty_two_bars_or_the_whole_song() {
+        let (_ctx, mut app) = headless(Caps::NONE);
+        app.settings.record_export.tempo_bpm = 120.0;
+        let sig = app.time_signature();
+        let bar_s = f64::from(sig.beats) * (4.0 / f64::from(sig.unit)) * 0.5;
+        let (start, len) = app.arr_window_now();
+        assert_eq!(start, 0.0);
+        assert!((len - 32.0 * bar_s).abs() < 1e-9, "an empty song opened {len} s wide, not 32 bars");
+        // Half the tempo, twice the seconds: the same bars.
+        app.settings.record_export.tempo_bpm = 60.0;
+        assert!((app.arr_window_now().1 - 64.0 * bar_s).abs() < 1e-9, "the default is not in bars");
+        // A song longer than that opens whole.
+        let mut clip = clip_at("media/long.wav", 0, 0.0);
+        clip.len_s = 600.0;
+        app.arrangement.add_clip(clip);
+        assert!((app.arr_window_now().1 - 630.0).abs() < 1e-9, "a long song did not open whole");
     }
 
     /// **A document's timeline grid lands on a rung the timeline has.** The
