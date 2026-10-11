@@ -274,7 +274,7 @@ Tests reach the format-2 writers through internal `*_as(Format::V2)` entry point
 - **Structural errors refuse the DESK only.** These are: more than `MAX_ROWS` rows, duplicate ids, a desk not of the documented shape.
   - **settings.json:** every other setting is kept. The desk becomes the default desk, and the raw desk JSON goes to `settings.desk-refused.json` (first free `-N`) with a notice. Never `Settings.unreadable`, never a first launch.
   - **document or template:** the open is refused with a message; nothing is written over it.
-  - **DAW blob (`Settings::from_json`):** every other setting is kept, the desk becomes the default desk, and the raw desk is kept under `extra["desk_refused"]`, so the DAW session keeps it across saves.
+  - ~~**DAW blob (`Settings::from_json`):** every other setting is kept, the desk becomes the default desk, and the raw desk is kept under `extra["desk_refused"]`, so the DAW session keeps it across saves.~~ Removed 2026-10-10 with the plugin crate (`lane/ul-w8-plugin-gone`): the DAW session was the only thing that kept a blob. `from_json` is a test road now; it keeps every other setting and the default desk, and leaves the refused desk in `desk_refused` for its caller.
 - Nothing is allocated by a key's numeric value. `LEGACY_MAX_STRIPS`, `INSERT_SPACE` and `TOTAL_SEATS` bound only the legacy reader.
 - **Writer side:** under cfg(test), `DeskModel::check()` runs after every structural edit and in the undo sentinel.
 
@@ -1277,7 +1277,7 @@ Also:
   - legacy keys are consumed with shift_remove;
   - `track_ids`, `next_track_id`;
   - a pre-write hook writes `settings.pre-v23.json` and `.shelf-v23.pending` before the first format-2 write;
-  - the desk refusal policy (default desk, raw desk to `settings.desk-refused.json`, a notice, never `unreadable`), and `from_json` keeps a refused desk under `extra.desk_refused`.
+  - the desk refusal policy (default desk, raw desk to `settings.desk-refused.json`, a notice, never `unreadable`), and `from_json` keeps a refused desk under `extra.desk_refused` (that half was removed on 2026-10-10 with the plugin crate; see 6.3).
 - `arrangement.rs`:
   - DeskSnap ids, `next_id`, `Says`, `legacy_states`;
   - `to_value` and `from_value` go through desk_format;
@@ -1312,7 +1312,7 @@ Also:
   - a second format-2 write makes no backup.
 - **Error policy:**
   - a v23 settings file, a v8 document and a DAW blob, each with one dangling plugin, bypass, route, key and send, open with those entries dropped, a notice, and everything else byte-identical;
-  - a structurally refused desk keeps every other setting (settings), refuses the open and leaves the file untouched (document), and keeps the raw desk across a save (DAW blob).
+  - a structurally refused desk keeps every other setting (settings), refuses the open and leaves the file untouched (document), and keeps the raw desk across a save (DAW blob; that case was removed on 2026-10-10 with the plugin crate).
 - **Ids:**
   - reorder, undo and redo keep every row's id;
   - add, paste and make_folder mint fresh ids;
@@ -2056,7 +2056,7 @@ All blockers were verified against the code at 624d78a. None was wrong. Five fix
 - *Resolution:* referential errors drop the entry with a notice; structural errors refuse only the desk.
   - settings: the default desk plus a `settings.desk-refused.json` side file;
   - document: the open is refused and the file untouched;
-  - DAW blob: the raw desk is kept under `extra.desk_refused`.
+  - ~~DAW blob: the raw desk is kept under `extra.desk_refused`.~~ Removed 2026-10-10 with the plugin crate (see 6.3).
   - It never routes to `unreadable` or to the defaults fallback.
   - `DeskModel::check` runs in the sentinel (6.3; W2, W3).
 
@@ -2286,7 +2286,7 @@ Examples: `t3-c0-b1`, `t12-n36-b2`, `t0-p4-b0`, `master-c1-b2`, `drums-c1-b2`. S
 7. **A licence ever hides or silences music.**
    - *Mitigations:* persistence, the engine and drawing are tier-blind (scan); a free app opens, plays and saves a 200-track project whole.
 8. **A dangling reference or a bad desk costs a whole file.**
-   - *Mitigations:* the 6.3 error policy; `DeskModel::check` in the sentinel; side files for refused desks; the DAW blob keeps the raw desk.
+   - *Mitigations:* the 6.3 error policy; `DeskModel::check` in the sentinel; side files for refused desks; ~~the DAW blob keeps the raw desk~~ (removed 2026-10-10 with the plugin crate).
 9. **Session state lands on the wrong track after a structural edit.**
    - *Mitigations:* TrackId/SeatBay keys; `on_desk_shape_change`; the classification scan; width tests per field.
 10. **Inputs: a wrong layout records the wrong device column with plausible audio.**

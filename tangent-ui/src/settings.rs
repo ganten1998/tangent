@@ -2044,9 +2044,9 @@ pub struct Settings {
     /// rises within a session: a minted id is never handed out twice.
     pub next_track_id: u64,
     /// **A format-2 desk this read refused**, kept whole for the caller: the
-    /// file road puts it in `settings.desk-refused.json`, the JSON road
-    /// (`from_json`) under `extra["desk_refused"]`. Never serialized; taken
-    /// once.
+    /// file road puts it in `settings.desk-refused.json`, and `from_json`,
+    /// which has no file to keep it beside, leaves it here. Never
+    /// serialized; taken once.
     pub desk_refused: Option<crate::desk_format::DeskRefused>,
     /// **What the desk reader dropped or refused, as one line** for the
     /// first frame's notice, the `unreadable` bargain: said where somebody
@@ -3003,27 +3003,12 @@ impl Settings {
     }
 
     /// The inverse, forgiving in the same way the file loader is: anything
-    /// unreadable yields defaults rather than an error.
+    /// unreadable yields defaults rather than an error. A desk the reader
+    /// refused is left in `desk_refused` for the caller, as `from_map`
+    /// leaves it for the file road's `keep_refused_desk`.
     pub fn from_json(text: &str) -> Self {
         match parse_object(text) {
-            Ok(map) => {
-                let mut s = Self::from_map(map);
-                // **A refused desk rides the text** (design 6.3): this road
-                // has no side file to put it in, so it is kept under a
-                // stranger's key, which every later write carries back
-                // untouched. (The retired VST3's DAW session was the only
-                // copy of the text it saved.)
-                if let Some(refused) = s.desk_refused.take() {
-                    s.desk_notice = Some(format!(
-                        "The desk saved with this project could not be read ({}). It is kept \
-                         in the project as it was, and a fresh desk opened; every other \
-                         setting is as you left it.",
-                        refused.why
-                    ));
-                    s.extra.insert("desk_refused".into(), refused.raw);
-                }
-                s
-            }
+            Ok(map) => Self::from_map(map),
             Err(_) => Self::default(),
         }
     }
@@ -4520,8 +4505,8 @@ impl Settings {
     /// error policy of design 6.3: dropped entries are listed in
     /// `desk_notice` and everything else reads; a refused desk leaves the
     /// default desk standing and is kept whole in `desk_refused` for the
-    /// caller to put somewhere (`keep_refused_desk`, or `from_json`'s
-    /// `extra`). Never `unreadable`: one bad desk costs the desk, not the
+    /// caller to put somewhere (`keep_refused_desk`, beside the settings
+    /// file). Never `unreadable`: one bad desk costs the desk, not the
     /// colours, the devices and the window somebody also chose.
     ///
     /// **Every row the file holds, as long as the desk is**: nothing is
