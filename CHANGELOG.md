@@ -535,6 +535,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   is told the song started or stopped in the buffer where it did, not a
   buffer before or after.
 
+- **Play sounds the note it starts on.** A MIDI note at the spot Play
+  started from, or a few milliseconds after it, never played: a note at
+  the very start of a part, played from the very start, stayed silent
+  while the notes after it sounded. It happened on every instrument but the
+  drum pads, from a spot just clicked to, from the start of a loop, after a
+  count-in and, now and then, at the head of a realtime export; the first
+  moment of an audio clip starting at that spot was silent too.
+
 - **Starting and stopping no longer, now and then, play a moment from the
   wrong place.** Stopping could play a moment from the start point and
   leave the playhead a little past it, and playing from a new place could
