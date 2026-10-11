@@ -75,6 +75,23 @@ pub struct ExportProgress {
     /// What is happening, in words: rendering, encoding, writing.
     pub label: String,
     pub peaks: Vec<(f32, f32)>,
+    /// **One named wave per file a stems pass writes**, in desk order, each
+    /// filled the same way as `peaks` from its own lane. Empty for a
+    /// single-file export, which draws `peaks` alone exactly as it always
+    /// has; when it is not empty the window draws THESE and not `peaks`, and
+    /// a pass that also writes the master mix says so with a row of its own
+    /// at the head of the list. The owner: "we need to show all waveforms
+    /// being drawn, not just the one".
+    pub rows: Vec<ExportRow>,
+}
+
+/// One file's wave in the export window: what it is called on the desk, and
+/// what it has heard so far. See [`ExportProgress::rows`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportRow {
+    pub name: String,
+    /// [`EXPORT_PEAKS`] (min, max) columns, filled as the render walks.
+    pub peaks: Vec<(f32, f32)>,
 }
 
 /// How many columns an export's waveform is drawn in.

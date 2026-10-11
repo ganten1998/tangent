@@ -557,6 +557,54 @@ struct Recorder {
     take_head_s: f64,
 }
 
+/// **Fold one block into a wave's columns**, by where the block sits in
+/// the whole render. `per` samples a frame, interleaved. Min and max rather
+/// than a mean: a peak that only exists for two samples is exactly what
+/// somebody watching an export is looking for. Written by position, so a
+/// block that spans two columns fills both and a stalled render leaves no
+/// gap.
+#[cfg(feature = "recorder")]
+fn fold_peaks(peaks: &mut [(f32, f32)], done: u64, until: u64, block: &[f32], per: usize) {
+    if until == 0 || peaks.is_empty() || per == 0 {
+        return;
+    }
+    let cols = peaks.len() as u64;
+    let last = peaks.len() - 1;
+    for (f, frame) in block.chunks_exact(per).enumerate() {
+        let at = ((done + f as u64) * cols / until) as usize;
+        let cell = &mut peaks[at.min(last)];
+        for &v in frame {
+            cell.0 = cell.0.min(v);
+            cell.1 = cell.1.max(v);
+        }
+    }
+}
+
+/// **What the export window is handed this frame.** A stems pass hands a
+/// named row per stem (and the master's at their head when it writes one);
+/// a single file and a freeze hand the one wave, as they always have.
+#[cfg(feature = "recorder")]
+fn export_progress_of(b: &OfflineBounce, fraction: f32, label: &str) -> tangent_ui::ports::ExportProgress {
+    if b.stem_rows.is_empty() {
+        return tangent_ui::ports::ExportProgress {
+            fraction,
+            label: label.to_owned(),
+            peaks: b.peaks.clone(),
+            rows: Vec::new(),
+        };
+    }
+    let master = b.master.is_some().then(|| tangent_ui::ports::ExportRow {
+        name: "Master".to_owned(),
+        peaks: b.peaks.clone(),
+    });
+    tangent_ui::ports::ExportProgress {
+        fraction,
+        label: label.to_owned(),
+        peaks: Vec::new(),
+        rows: master.into_iter().chain(b.stem_rows.iter().cloned()).collect(),
+    }
+}
+
 /// One bounce: where it stops, what it writes, and whether it is waiting
 /// for the files to close.
 /// A FULL-SPEED export: its own engine with no device, pulled by hand a
@@ -579,6 +627,10 @@ struct OfflineBounce {
     /// position rather than appended, so a block that spans two columns fills
     /// both and a render that stalls leaves no gap.
     peaks: Vec<(f32, f32)>,
+    /// **A wave per stem, beside `stems` and in its order** - desk order,
+    /// named for the track. Empty for a single file and for a freeze, which
+    /// draw `peaks` alone. See `ports::ExportProgress::rows`.
+    stem_rows: Vec<tangent_ui::ports::ExportRow>,
     /// The render is over and the FORMAT pass is what is left.
     ///
     /// A phase and not a bool anybody reads for fun: it is what keeps the
@@ -11463,6 +11515,7 @@ impl DesktopApp {
             None
         };
         let mut stems = Vec::new();
+        let mut stem_rows = Vec::new();
         let mut freeze_job = None;
         if let (Some(row), Some(id)) = (freeze, frozen_id) {
             let Some(lane) = mirror.lane_of(id).map(|l| l.slot.0 as usize) else {
@@ -11498,6 +11551,10 @@ impl DesktopApp {
                 let path = dir.join(file);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                     stems.push(StemWriter { lane, path, writer: w, loud: false });
+                    stem_rows.push(tangent_ui::ports::ExportRow {
+                        name: self.app.channel_display_name(row).to_string(),
+                        peaks: vec![(0.0, 0.0); tangent_ui::ports::EXPORT_PEAKS],
+                    });
                 }
             }
         }
@@ -11535,6 +11592,7 @@ impl DesktopApp {
             stem_scratch: Vec::new(),
             out_dir,
             peaks: vec![(0.0, 0.0); tangent_ui::ports::EXPORT_PEAKS],
+            stem_rows,
             freeze: freeze_job,
         });
     }
@@ -11622,7 +11680,7 @@ impl DesktopApp {
                 b.stem_scratch.clear();
                 b.e.drain_stems(&mut b.stem_scratch);
                 let frames = b.stem_scratch.len() / wide;
-                for s in &mut b.stems {
+                for (k, s) in b.stems.iter_mut().enumerate() {
                     // The lane's own column of the tap, which was armed for
                     // the stems this pass writes and no others.
                     let Some(col) = b.e.stem_column(crate::desk_plan::Slot(s.lane as u32)) else {
@@ -11640,6 +11698,11 @@ impl DesktopApp {
                         }
                     }
                     s.loud |= any_sound(&fold);
+                    // This stem's own wave, bucketed exactly as the master's
+                    // below, so every row's playhead stands on the same x.
+                    if let Some(row) = b.stem_rows.get_mut(k) {
+                        fold_peaks(&mut row.peaks, b.done, b.until, &fold, if b.spec.mono { 1 } else { 2 });
+                    }
                     // A freeze drops its latency lead off the front, once.
                     let mut drop = 0usize;
                     if let Some(job) = b.freeze.as_mut() {
@@ -11657,20 +11720,7 @@ impl DesktopApp {
             // render. Min and max rather than a mean: a peak that only
             // exists for two samples is exactly what somebody watching an
             // export is looking for.
-            if b.until > 0 {
-                let cols = tangent_ui::ports::EXPORT_PEAKS as u64;
-                for f in 0..n {
-                    let at = ((b.done + f as u64) * cols / b.until) as usize;
-                    let Some(cell) = b.peaks.get_mut(at.min(tangent_ui::ports::EXPORT_PEAKS - 1))
-                    else {
-                        break;
-                    };
-                    let l = out[f * 2];
-                    let r = out[f * 2 + 1];
-                    cell.0 = cell.0.min(l).min(r);
-                    cell.1 = cell.1.max(l).max(r);
-                }
-            }
+            fold_peaks(&mut b.peaks, b.done, b.until, out, 2);
             b.done += n as u64;
             if budget.elapsed() > std::time::Duration::from_millis(80) {
                 break;
@@ -11679,11 +11729,11 @@ impl DesktopApp {
         if b.done < b.until {
             let fraction = (b.done as f64 / b.until as f64) as f32;
             self.app
-                .set_export_progress(Some(tangent_ui::ports::ExportProgress {
+                .set_export_progress(Some(export_progress_of(
+                    &b,
                     fraction,
-                    label: if b.freeze.is_some() { "Freezing" } else { "Rendering" }.to_owned(),
-                    peaks: b.peaks.clone(),
-                }));
+                    if b.freeze.is_some() { "Freezing" } else { "Rendering" },
+                )));
             self.recorder.offline_bounce = Some(b);
             return;
         }
@@ -11702,11 +11752,7 @@ impl DesktopApp {
         // the cover as well as into the export window.
         b.writing = true;
         self.app
-            .set_export_progress(Some(tangent_ui::ports::ExportProgress {
-                fraction: 1.0,
-                label: "Writing files".to_owned(),
-                peaks: b.peaks.clone(),
-            }));
+            .set_export_progress(Some(export_progress_of(&b, 1.0, "Writing files")));
         // The second format is the slow one when there is one: a wav is
         // written as it renders, an mp3 is a whole encode after the fact.
         let detail = Some(match b.spec.secondary {
@@ -23384,8 +23430,9 @@ impl DesktopApp {
         // keeps in FRONT of this one. Painted here alone, the cover landed
         // behind the window the user was looking at — "when clicking export
         // button, the loading splash loads behind the export menu" — and
-        // the app looked frozen with nothing on screen saying why. See
-        // `Busy::paint_over` and `show_export_progress`.
+        // the app looked frozen with nothing on screen saying why. The
+        // export window says it on its own top line, clear of its waves:
+        // see `dialogs::export_line` in tangent-ui.
         let mirror = up.then(|| busy.clone());
         self.busy_up = up;
         self.app.set_surface_cover(mirror);
@@ -32131,6 +32178,29 @@ mod tests {").expect("the tests module")];
         // A take whose camera has died: the pictures are not coming, and the
         // take's own term on the ledger is what keeps the window live.
         assert!(!camera_frames_owed(FrameWant::Every, false));
+    }
+
+    /// **A block lands in the columns of the render it belongs to**, for a
+    /// stem's wave as for the master's: by position in the whole render,
+    /// min and max over every channel, mono or stereo. Each stem row's
+    /// playhead stands on the same x as the master's only because both
+    /// are bucketed by this one function.
+    #[test]
+    fn a_block_folds_into_the_columns_of_its_place_in_the_render() {
+        let mut peaks = vec![(0.0_f32, 0.0_f32); 4];
+        // Frames 4..8 of a 16-frame render: column 1 of 4, stereo.
+        let block = [0.1, -0.2, 0.3, 0.0, -0.5, 0.2, 0.0, 0.4];
+        fold_peaks(&mut peaks, 4, 16, &block, 2);
+        assert_eq!(peaks, vec![(0.0, 0.0), (-0.5, 0.4), (0.0, 0.0), (0.0, 0.0)]);
+        // Mono, straddling columns 2 and 3.
+        fold_peaks(&mut peaks, 10, 16, &[0.9, -0.1, 0.0, -0.7], 1);
+        assert_eq!(peaks[2], (-0.1, 0.9));
+        assert_eq!(peaks[3], (-0.7, 0.0));
+        // Past the end clamps to the last column; a zero-length render is a no-op.
+        fold_peaks(&mut peaks, 40, 16, &[0.95], 1);
+        assert_eq!(peaks[3], (-0.7, 0.95));
+        fold_peaks(&mut peaks, 0, 0, &[1.0], 1);
+        assert_eq!(peaks[0], (0.0, 0.0));
     }
 
     /// **Digital silence is not a stem, and one sample off it is.** The
