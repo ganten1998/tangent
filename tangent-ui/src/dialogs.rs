@@ -5928,6 +5928,10 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
+    // The comp's shape and for the comp's reason: a picture on top of the
+    // knob rows, here the stair over six rows where the comp has a needle
+    // over seven.
+    ("@tangent-bitcrush", Vec2::new(0.344, 0.582), Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
     // The insert: the glass, two routing rows, four knobs and the ping row
     // stacked over the footer. Taller than the knob panels by those rows.
     (
@@ -18512,6 +18516,7 @@ at: None,
                         "Tangent Plate",
                         "Tangent Wah",
                         "Tangent IR (Experimental)",
+                        "Tangent Bitcrush",
                         "Tangent Insert",
                         "analog lab v",
                         "the modelled piano",
@@ -18529,12 +18534,12 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Twenty, not one: the house shelf took the first
-                // nineteen rows, the five instruments and the fourteen-unit
-                // suite, and the number is derived from those two lists so
+                // Twenty-one, not one: the house shelf took the first
+                // twenty rows (the five instruments and the fifteen-unit
+                // suite) and the number is derived from those two lists so
                 // the next instrument moves it rather than breaking it.
                 let shelf = INSTRUMENT_ROWS.len() + crate::faces::SUITE_UNITS.len();
-                assert_eq!(shelf, 19);
+                assert_eq!(shelf, 20);
                 assert_eq!(*selected, Some(shelf + 1), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
@@ -19824,6 +19829,7 @@ at: None,
             ("@tangent-imager", Vec2::new(340.0, 480.0)),
             ("@tangent-comp", Vec2::new(400.0, 430.0)),
             ("@tangent-tape", Vec2::new(400.0, 360.0)),
+            ("@tangent-bitcrush", Vec2::new(400.0, 440.0)),
         ];
         for (unit, floor) in was {
             // No monitor is no guess: the floor, which is today's size.
@@ -21493,6 +21499,7 @@ at: None,
             "@tangent-imager",
             "@tangent-tape",
             "@tangent-ir",
+            "@tangent-bitcrush",
         ] {
             for (was, word) in [(false, "BYPASS"), (true, "BYPASSED")] {
                 let mut slot = Slot::new(a_unit_face(path, was));

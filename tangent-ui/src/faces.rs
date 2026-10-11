@@ -26,7 +26,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// panel, and the line under it. The engine's `builtin_fx::UNITS` is the
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
-pub const SUITE_UNITS: [(&str, &str, &str); 14] = [
+pub const SUITE_UNITS: [(&str, &str, &str); 15] = [
     ("@tangent-eq", "Tangent EQ", "5 bands - no more, no less"),
     (
         "@tangent-imager",
@@ -98,6 +98,13 @@ pub const SUITE_UNITS: [(&str, &str, &str); 14] = [
         // _the_same_list` compares the two up to this suffix.
         "Tangent IR (Experimental)",
         "plays any impulse response you can capture",
+    ),
+    // Asked for by name, after the shelf was full. Its face is its own
+    // (`faces_bitcrush`): a glass showing the stair over the knob rows.
+    (
+        crate::faces_bitcrush::BITCRUSH_PATH,
+        "Tangent Bitcrush",
+        "fewer bits, a slower clock, and no filter to hide the folds",
     ),
     // The hardware loop: the bay's signal out of the interface, through
     // whatever is patched there, and back. Spelled out of its own module
@@ -883,6 +890,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         crate::faces_analog::ANALOG_PATH => crate::faces_analog::draw_analog(ui, st, live),
         crate::faces_sampler::SAMPLER_PATH => crate::faces_sampler::draw_sampler(ui, st, live),
+        crate::faces_bitcrush::BITCRUSH_PATH => crate::faces_bitcrush::draw_bitcrush(ui, st, live),
         crate::faces_hwinsert::HWINSERT_PATH => crate::faces_hwinsert::draw_hwinsert(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
@@ -2984,6 +2992,7 @@ mod tests {
             ("@tangent-amp", 9),
             ("@tangent-ir", 2),
             ("@tangent-tape", 8),
+            ("@tangent-bitcrush", 6),
         ] {
             for w in [200.0f32, 296.0, 316.0, 376.0, 446.0, 516.0, 900.0, 1400.0] {
                 let mut live = a_full_face(path, n);
