@@ -42654,8 +42654,18 @@ impl TangentApp {
             // clearing every field here closed them one frame after they
             // opened whenever the band was hidden, before a letter could be
             // typed.
+            //
+            // **COMMITTED, not thrown away**: the band's own rule for looking
+            // away from a number (`commit_number_unless`), and the one this
+            // block already kept for the take's name just below. The band
+            // goes by its right-click menu, and the right-click leaves a field
+            // as it was, so "Hide Recorder Band" threw away a tempo, a level,
+            // the varispeed or an end of its range being typed, where a press
+            // anywhere else would have set it. A number the field cannot take
+            // is refused, as Enter refuses it. Escape is the one road that
+            // abandons a number, in `edit_number`.
             if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_band()) {
-                self.num_edit = None;
+                self.commit_number();
             }
             self.focus_take_name(false);
             self.grabbed = None;
@@ -44247,9 +44257,12 @@ impl TangentApp {
         // panel.** A press in the panel or away from it commits the end first
         // (`press_in_vari_panel`), but the panel also goes by roads that are
         // no press of its own: a right-click on another knob swaps it for
-        // that effect's panel, and a dial that stops being drawn takes it
-        // down. The end being typed was left open then, drawn nowhere and
-        // holding every key. Committed, by the same rule.
+        // that effect's panel, and a dial the band has no room to draw takes
+        // it down. The end being typed was left open then, drawn nowhere and
+        // holding every key. Committed, by the same rule. A band that is
+        // hidden takes its dial too, and the end with it: that one is
+        // committed earlier in this paint, where every number typed into the
+        // band is, before this guard is reached.
         if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_vari_range()) && !self.vari_open {
             self.commit_number();
         }
@@ -76173,6 +76186,90 @@ mod tests {").expect("the tests module")];
         assert!(!app.vari_open && app.num_edit.is_none(), "the press away left the panel or the tempo");
         assert!((app.tempo_bpm() - 97.0).abs() < 1e-9, "the press away threw the typed tempo away: {}", app.tempo_bpm());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A point on the band this app last drew that answers nothing, clear
+    /// of `avoid`: where a right-click opens the band's own menu.
+    fn bare_band_point(app: &TangentApp, avoid: Rect) -> Pos2 {
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band was never drawn");
+        let view = app.recorder_layout_view();
+        let mut y = band.top() + 1.0;
+        while y < band.bottom() - 1.0 {
+            let mut x = band.left() + 1.0;
+            while x < band.right() - 1.0 {
+                let p = Pos2::new(x, y);
+                if !avoid.contains(p) && recorder_panel::hit_test(band, &view, p).is_none() {
+                    return p;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        panic!("the band has no bare point");
+    }
+
+    /// **Hiding the band lands what was typed into it**, as a press away
+    /// from it does, over the timeline and over the desk: an end of the
+    /// varispeed's range, and the band's own tempo.
+    ///
+    /// The road is the band's right-click menu. The right-click leaves a
+    /// field as it was, and its "Hide Recorder Band" took the band and every
+    /// number typed into it: a MIN of 70 was thrown away while the guard
+    /// beside the metronome's said it was kept, and so was a tempo, while
+    /// the take's name in the same block was always kept.
+    ///
+    /// Revert-check, performed: put back the band-gone block's
+    /// `num_edit = None` and MIN stays 85 on both surfaces, and with MIN's
+    /// half taken out the tempo stays where it was.
+    #[test]
+    fn hiding_the_band_lands_what_was_typed_into_it_on_either_surface() {
+        use recorder::NumField as F;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, screen, anchor) = vari_panel_up("varihide", desk);
+            let bare = bare_band_point(&app, recorder_panel::vari_popup_rect(screen, anchor));
+            // The band's menu, by a right-click on it, and its row: the
+            // action `menu::show` hands back for the row pressed.
+            let hide = |ctx: &egui::Context, app: &mut TangentApp| {
+                right_click_at(ctx, app, bare);
+                assert!(app.menu_state.is_some(), "fixture: the right-click on {on} opened no menu");
+                app.menu_state = None;
+                app.apply_menu_action(ctx, MenuAction::ToggleRecorder);
+                pointer_frame(ctx, app, Vec::new());
+                assert!(!app.settings.show_recorder, "fixture: the band is still up over {on}");
+            };
+
+            click_with(
+                &ctx,
+                &mut app,
+                vari_point(screen, anchor, Some(recorder_panel::VariHit::Type(F::VariMin))),
+                egui::Modifiers::NONE,
+            );
+            type_keys(&ctx, &mut app, "70");
+            let before = app.hist_at;
+            hide(&ctx, &mut app);
+            assert!(!app.vari_open, "on {on} the range panel outlived the band");
+            assert!(app.num_edit.is_none(), "on {on} MIN outlived the band");
+            assert_eq!(app.settings.varispeed.min(), 70, "on {on} hiding the band threw the typed 70 away");
+            assert_eq!(app.hist_at, before + 1, "on {on} the typed MIN is not one moment");
+
+            // The band's own tempo.
+            app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
+            pointer_frame(&ctx, &mut app, Vec::new());
+            assert!(app.settings.show_recorder, "fixture: the band did not come back over {on}");
+            let tempo = band_point(&app, recorder_panel::Hit::Type(F::Tempo));
+            click_with(&ctx, &mut app, tempo, egui::Modifiers::NONE);
+            type_keys(&ctx, &mut app, "97");
+            hide(&ctx, &mut app);
+            assert!(app.num_edit.is_none(), "on {on} the tempo outlived the band");
+            assert!(
+                (app.tempo_bpm() - 97.0).abs() < 1e-9,
+                "on {on} hiding the band threw the typed tempo away: {}",
+                app.tempo_bpm()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// **The DONE press is spent on DONE.** The take panel hangs below the
