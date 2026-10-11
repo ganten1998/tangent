@@ -194,7 +194,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   darker of the two, so D read backwards and a pale theme further round
   looked like dark had been turned off; Sandstone's dark field was paler
   than its light one. Dark is now the darker field on every theme, and dark
-  by measurement.
+  by measurement. The arrangement now starts light until you press D; a
+  choice you have saved is kept.
 
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be

@@ -2440,9 +2440,11 @@ impl Default for Settings {
             // it changed from a lie to the truth.
             midi_grid_exp: -3,
             midi_swing: false,
-            // DARK ships as the default for the arrange field and the
-            // editor; the theory surfaces stay light.
-            arr_dark: true,
+            // The arrange field ships LIGHT (owner, 2026-10-11: "default
+            // should still be light until changed and or saved"); a saved
+            // choice wins. The editor still ships dark, the theory surfaces
+            // light.
+            arr_dark: false,
             media_default_dir: String::new(),
             drumpad_page: 2,
             // The editor SHIPPED dark — its warm browns are the dark face
@@ -8697,17 +8699,17 @@ mod tests {
     #[test]
     fn defaults_match_spec_table() {
         let s = Settings::default();
-        // **Light theory, dark arrange and editor, Centennial** — the owner's
+        // **Light theory and arrange, dark editor, Centennial**: the owner's
         // rulings. A settings file that names something else still wins,
         // which is what `theme_name` in the round-trip tests is for.
-        assert!(!s.dark_mode && s.arr_dark && s.me_dark);
+        assert!(!s.dark_mode && !s.arr_dark && s.me_dark);
         // The struct's own name matches the roles beside it; the SHIPPED
         // theme is Centennial and is applied in `first_launch`, which is
         // also what `reset` goes back to.
         assert_eq!(s.theme_name, "Default");
         let fresh = Settings::first_launch();
         assert_eq!(fresh.theme_name, "Default", "a fresh install wears the Default theme");
-        assert!(!fresh.dark_mode && fresh.arr_dark && fresh.me_dark);
+        assert!(!fresh.dark_mode && !fresh.arr_dark && fresh.me_dark);
         // **Reset everything goes back to Default, dark**, from a theme and
         // a mode somebody chose — driven, because "the defaults are right"
         // and "the reset reaches them" are two different claims.
