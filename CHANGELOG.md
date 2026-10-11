@@ -137,6 +137,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   of 32nds) are still too wide at 6.5 points and are cut at the box's
   edges.
 
+  A screen reader names every step as a note: whole note, dotted half
+  note, hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar"
+  for the whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted
+  half and "1/128 of a bar" and finer for the finest steps.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and
