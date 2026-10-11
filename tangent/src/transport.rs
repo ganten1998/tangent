@@ -103,6 +103,14 @@ impl Transport {
         self.locate_playhead(self.cursor_s);
     }
 
+    /// **The generation of the latest locate**, the one the next `push`
+    /// publishes: what a realtime pass ties its land to
+    /// (`Engine::land_gains_at`), so it lands the block that plays from
+    /// there and not whichever callback comes first.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Whether the audition is running.
     pub fn playing(&self) -> bool {
         self.playing
