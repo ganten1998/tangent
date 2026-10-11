@@ -37533,10 +37533,14 @@ pub fn denoise_test(arg: Option<String>) {
         if opt("learn").is_some() { " (named)" } else { " (quietest half-second)" },
     );
 
+    // Unnamed, the probe runs what a fresh insert opens on, since "what the
+    // insert would have written" is its whole claim; that is the Bank since
+    // 2026-10-11, so the studio kernel is now asked for by name.
     let kernel = match opt("kernel").as_deref() {
         Some("bank") => DenoiseKernel::Bank,
+        Some("studio") => DenoiseKernel::SpectralStudio,
         Some("live") => DenoiseKernel::SpectralLive,
-        _ => DenoiseKernel::SpectralStudio,
+        _ => DenoiseKernel::from_dial(DenoiseParams::default().kernel),
     };
     let reduce_db: f32 = opt("reduce")
         .and_then(|v| v.parse().ok())

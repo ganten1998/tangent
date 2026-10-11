@@ -3303,7 +3303,20 @@ fn rt_bench() {
     rows.push(measure("16 lanes x [EQ, comp, plate] @ 256 fr", &mut e, WARMUP, 256));
     drop(e);
 
-    let mut e = audio_desk(16, &[DENOISE_PATH]);
+    // Spectral Studio by name, as the row says: a fresh denoise opens on
+    // the Bank since 2026-10-11, and this row's history is the spectral one.
+    let mut e = audio_desk(16, &[]);
+    let studio = {
+        let spec = crate::builtin_fx::spec_for(DENOISE_PATH).expect("the denoise has a spec");
+        let mut v = spec.defaults();
+        v[6] = crate::units::denoise::DenoiseKernel::SpectralStudio.dial();
+        crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
+    };
+    for lane in 0..16 {
+        e.load_insert(lane, 0, Some(Path::new(DENOISE_PATH)), Some(&studio))
+            .unwrap_or_else(|err| panic!("the denoise did not load into lane {lane}: {err}"))
+            .unwrap_or_else(|| panic!("the denoise loaded but lane {lane} reports no tenant"));
+    }
     rows.push(measure("16 lanes x denoise (spectral studio)", &mut e, WARMUP, BLOCK));
     drop(e);
 
