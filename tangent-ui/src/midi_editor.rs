@@ -708,8 +708,8 @@ pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut
 /// selected at a glance, and two shades of the same hue would not do it.
 const LIT_KEY: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x3A);
 
-/// The gridbox's word: the arrangement's bars-as-a-power-of-two, with the
-/// grid's shape appended — `1/8T`, `1/8 sw`.
+/// The gridbox's word: the arrangement's ladder, with the grid's shape
+/// appended: `1/8T`, `1/8 sw`, and at the one-bar rung `BAR T` and `BAR sw`.
 pub fn grid_word(view: &MidiEditView<'_>) -> String {
     // The editor's own meter, so the word matches the magnet here too —
     // see `grid_label`, which now derives the name from the division.
@@ -733,7 +733,15 @@ pub fn grid_word(view: &MidiEditView<'_>) -> String {
         view.sig_bottom.clamp(1, 32) as u8,
     );
     if view.triplet {
-        format!("{base}T")
+        // **The bar's T stands apart**, as swing's "sw" always has. The bar
+        // rung is a word now (`arrangement_panel::GRID_BAR`), and a T run
+        // into it reads "BART", a name, where "1/8T" reads as an eighth's
+        // triplet because the T follows a number.
+        if base == crate::arrangement_panel::GRID_BAR {
+            format!("{base} T")
+        } else {
+            format!("{base}T")
+        }
     } else if view.swing {
         format!("{base} sw")
     } else {
@@ -3138,6 +3146,88 @@ mod tests {
         // And the glyph spelling still exists, unused by either chip today.
         // It is the record of the first decision; see `grid_word`.
         assert_eq!(crate::arrangement_panel::grid_label(-2, 4, 4), "\u{266a}");
+        // **The one-bar rung is BAR here too**, the word every surface uses
+        // for it in every meter (`arrangement_panel::GRID_BAR`); this chip
+        // reaches it, its exponent running -7 to 3. It read "1" in 4/4, the
+        // whole note's name, and "1T" with a triplet. A T run into the word
+        // would read "BART", so it stands apart, as swing's "sw" does.
+        v.grid_exp = 0;
+        v.swing = false;
+        assert_eq!(grid_word(&v), "BAR");
+        v.triplet = true;
+        assert_eq!(grid_word(&v), "BAR T");
+        v.triplet = false;
+        v.swing = true;
+        assert_eq!(grid_word(&v), "BAR sw");
+        // In 4/2, where it read "4/2", and the rungs either side of it keep
+        // their names: 2 bars above, the whole note below, whose T still
+        // runs on because it follows a number.
+        v.swing = false;
+        v.sig_top = 4;
+        v.sig_bottom = 2;
+        assert_eq!(grid_word(&v), "BAR");
+        v.grid_exp = 1;
+        assert_eq!(grid_word(&v), "2");
+        v.grid_exp = -1;
+        assert_eq!(grid_word(&v), "1");
+        v.triplet = true;
+        assert_eq!(grid_word(&v), "1T");
+    }
+
+    /// **The chip's words at the one-bar rung are laid out inside it, in
+    /// every bundled face.**
+    ///
+    /// "BAR sw" is the widest thing the chip prints at the bar, six
+    /// characters, and "BAR T" five. The chip is two and a fifth of the
+    /// strip's cells wide and draws at 0.55 of its height, so it is not the
+    /// arrange box and its room is measured here rather than assumed, off a
+    /// real paint, in each face the settings can choose. As drawn here it is
+    /// 39.6 points wide at 9.9-point type, and "BAR sw" takes 35 of them in
+    /// Courier Prime and JetBrains Mono, 29 in Terminess.
+    #[test]
+    fn the_chip_fits_its_words_at_the_bar() {
+        let n: [ArrNote; 0] = [];
+        let chip = Layout::new(rect()).tool_grid;
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            let _ = ctx.run(Default::default(), |_| {});
+            for (triplet, swing, want) in
+                [(false, false, "BAR"), (true, false, "BAR T"), (false, true, "BAR sw")]
+            {
+                let id = egui::Id::new(("bar", want));
+                let layer = egui::LayerId::new(egui::Order::Background, id);
+                let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+                let v = MidiEditView { grid_exp: 0, triplet, swing, ..view(&n) };
+                draw(&painter, rect(), &v);
+                let words: Vec<(String, Rect)> = ctx.graphics(|g| {
+                    g.get(layer)
+                        .map(|list| {
+                            list.all_entries()
+                                .filter_map(|c| match &c.shape {
+                                    egui::Shape::Text(t)
+                                        if chip.intersects(t.visual_bounding_rect()) =>
+                                    {
+                                        Some((
+                                            t.galley.text().to_owned(),
+                                            Rect::from_min_size(t.pos, t.galley.size()),
+                                        ))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+                let Some((_, laid)) = words.iter().find(|(t, _)| t == want) else {
+                    panic!("{face:?}: the chip painted {words:?}, not {want:?}");
+                };
+                assert!(
+                    laid.left() >= chip.left() - 0.01 && laid.right() <= chip.right() + 0.01,
+                    "{face:?}: {want:?} is laid out at {laid:?}, outside its chip {chip:?}"
+                );
+            }
+        }
     }
 
     /// **The loop bar is drawn where the pass ends, and it answers a press

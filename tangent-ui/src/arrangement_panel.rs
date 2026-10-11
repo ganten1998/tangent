@@ -4965,6 +4965,30 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     v
 }
 
+/// **The ONE-BAR rung's name, on every surface that prints the ladder: BAR,
+/// in every meter.**
+///
+/// Above it the ladder counts bars (2, 4, 8) and below it are note values
+/// (1, 1/2, 1/4 ...), so the bar is the one rung that is neither, and every
+/// spelling it had read as something it is not. In 4/4 it was "1", the name
+/// of a whole note; in 3/4 "1/2·", a dotted half; in a meter whose bar is no
+/// one note it was the time signature (2d292a27; a decimal like "8.000q"
+/// before that). The owner met the last of those in 4/2, whose ladder went
+/// 2, 4/2, 1: "why does the option between 1 and 2 = 4/2 in grid frequency
+/// and why is it even an option?" The rung is there because a grid of one
+/// bar is one every song wants (the magnet on the bar lines). What was wrong
+/// was its name: "4/2" is a fraction, and one that reads as twice the "1"
+/// under it. Of the spellings put to him, the owner chose this one.
+///
+/// A WORD, so it cannot be read as a count of bars or as a note value, and
+/// the same word in every meter, 4/4 included, so nobody has to know the
+/// meter to read it. Three letters, so it is exactly as wide as the
+/// three-character rungs (1/2, 1/4, 1/8) in all three bundled faces, which
+/// are monospaced: the twenty-point arrange box is sized for those, and
+/// `the_bar_rung_is_painted_bar_in_every_meter` measures it on the frame in
+/// each face. Aloud it is "1 bar", as it always was ([`grid_spoken`]).
+pub const GRID_BAR: &str = "BAR";
+
 /// **What the box prints, derived from what the magnet actually does** —
 /// in the spelling that keeps the note glyph at the quarter, which is now
 /// the MIDI EDITOR's chip and nothing else. The arrange gridbox takes
@@ -5013,14 +5037,16 @@ pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
 /// ARRANGE gridbox prints.
 ///
 /// The owner, on that box: "it's easier to spot at a glance for a beginner
-/// and realize that's what that button does." In 4/4 the ladder reads 1,
-/// 1/2, ♪, 1/8, 1/16 — the glyph is the ONE rung not written the way the
-/// rungs on either side of it are, and it sits at the division a beginner is
-/// most likely to be hunting for, because a quarter note is the first thing
-/// anyone is taught to count. `tool_grid` is at most 48 points wide and the
-/// label is drawn between 8 and 11 points, so ♪ arrives as a stem and a blob
-/// that has to be recognised before it can be read; "1/4" arrives as a
-/// fraction the two rungs under it have already taught the eye to parse.
+/// and realize that's what that button does." In 4/4 the glyph spelling
+/// reads BAR, 1/2, ♪, 1/8, 1/16. Under the bar, the glyph is the ONE note
+/// value not written the way the ones on either side of it are, and it sits
+/// at the division a beginner is most likely to be hunting for, because a
+/// quarter note is the first thing anyone is taught to count. `tool_grid`
+/// is a square of at most 20 points (it was 48 wide when this was written)
+/// and the label is drawn between 8 and 11 points, so ♪ arrives as a stem
+/// and a blob that has to be recognised before it can be read; "1/4"
+/// arrives as a fraction the two rungs under it have already taught the eye
+/// to parse.
 ///
 /// This supersedes the earlier ruling quoted on [`grid_label`], and only its
 /// second half: "there should exist a single state of that button that
@@ -5041,13 +5067,21 @@ pub fn grid_label_text(exp: i8, beats: u8, unit: u8) -> String {
 }
 
 /// The one ladder both public labels walk. Kept private and shared so the
-/// bar branch — the half of the label that has nothing to do with note
-/// glyphs — exists once; two copies of `1u32 << exp` is exactly the kind of
+/// bar branches (the multiples of a bar, counted, and the bar itself,
+/// [`GRID_BAR`]: the half of the label that has nothing to do with note
+/// glyphs) exist once; two copies of `1u32 << exp` is exactly the kind of
 /// duplicate that let the label disagree with the magnet in the first place.
 fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String {
     if exp > 0 {
         // Multiples of a BAR, and it says so by counting them.
         return format!("{}", 1u32 << exp.min(6) as u32);
+    }
+    if exp == 0 {
+        // One bar, by name, whatever the meter: see `GRID_BAR`. Not handed
+        // to `note_label`, which can only name the bar's LENGTH, as a note
+        // (4/4's "1", 3/4's "1/2·") or counted in beats (4/2's "4/2"), and
+        // every one of those reads as a note value.
+        return GRID_BAR.to_owned();
     }
     note_label(grid_quarters(exp, beats, unit), unit, quarter_glyph)
 }
@@ -5061,10 +5095,11 @@ fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String 
 /// **A length no note names is COUNTED, in the meter's own beats**: `n/unit`,
 /// n notes of 1/unit, the way a time signature counts its bar. Every rung
 /// [`grid_quarters`] walks is a whole number of beats or a power-of-two part
-/// of one, and a part of one always has a name, so the count is exact. At
-/// the BAR rung n is the top number, so a bar that is not one note reads as
-/// its own signature: 5/4, 7/8, 4/2. `unit` is read by this branch alone;
-/// the fallback it replaced is written up in the branch.
+/// of one, and a part of one always has a name, so the count is exact. The
+/// BAR rung never arrives here (it is [`GRID_BAR`], by name, from
+/// [`grid_label_with`]), so what is counted is a rung UNDER the bar that no
+/// note names: 10/8's half bar, five eighths, is 5/8. `unit` is read by this
+/// branch alone; the fallback it replaced is written up in the branch.
 ///
 /// **`quarter_glyph` decides one rung and one rung only**: whether q == 1
 /// comes back as `\u{266a}` or falls through into the plain-fraction branch,
@@ -5119,6 +5154,9 @@ fn note_label(q: f64, unit: u8, quarter_glyph: bool) -> String {
     // read. Nor was it one rare meter: 5/4, 7/8 and 9/8, three of the eight
     // in `TIME_SIGNATURES`, reached it at the same rung.
     // `no_rung_of_any_signature_is_spelled_as_a_decimal` sweeps them all.
+    // The bar rung has since been given a name of its own, `GRID_BAR`, and
+    // no longer comes here; what still does is a rung under the bar that no
+    // note names, like 10/8's five eighths.
     let (n, unit) = beats_counted(q, unit);
     format!("{n}/{unit}")
 }
@@ -5151,8 +5189,8 @@ fn note_word(unit: u8) -> Option<&'static str> {
 
 /// The same grid, in the words a person would say it in.
 ///
-/// The box prints "1" and "1/4" because it is a box the width of a thumb.
-/// A screen reader announcing "Grid, 1" has said nothing: the unit is the
+/// The box prints "8" and "1/4" because it is a box the width of a thumb.
+/// A screen reader announcing "Grid, 8" has said nothing: the unit is the
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
 fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
@@ -5166,6 +5204,8 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
         return format!("{} bars", 1u32 << exp.min(6) as u32);
     }
     if exp == 0 {
+        // The box prints BAR here (`GRID_BAR`); aloud it is one bar, in
+        // every meter, as it was before the box had a word for it.
         return "1 bar".to_owned();
     }
     let q = grid_quarters(exp, beats, unit);
@@ -12300,7 +12340,7 @@ selected: false,
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
         // **The ladder the owner asked for, in the meter he works in.**
-        // Going finer: 1, 1/2, 1/4, 1/8, 1/16 — one 1/4 state, sitting
+        // Going finer: BAR, 1/2, 1/4, 1/8, 1/16, with one 1/4 state, sitting
         // exactly between 1/8 and 1/2, and now written the way the rungs
         // either side of it are written. The middle rung used to assert
         // `\u{266a}`; the owner asked for the fraction back because "it's
@@ -12309,7 +12349,12 @@ selected: false,
         // glyph used to stand in for is asserted on its own terms by
         // `only_one_rung_of_the_arrange_ladder_is_a_quarter`, so nothing was
         // weakened by respelling it here.
-        assert_eq!(grid_label_text(0, 4, 4), "1");
+        //
+        // The top of it asserted "1" until the bar rung was named: "1" is a
+        // whole note, which in 4/4 is the bar's length, and in 4/2 it is the
+        // rung UNDER the bar. The owner ruled the bar reads BAR in every
+        // meter, this one included (see `GRID_BAR`).
+        assert_eq!(grid_label_text(0, 4, 4), "BAR");
         assert_eq!(grid_label_text(3, 4, 4), "8");
         assert_eq!(grid_label_text(-1, 4, 4), "1/2");
         assert_eq!(grid_label_text(-2, 4, 4), "1/4");
@@ -12444,123 +12489,182 @@ selected: false,
         assert_eq!(grid_label(-1, 6, 8), "1/4\u{00b7}");
     }
 
-    /// **No rung of any signature is printed as a decimal**, and no ladder
-    /// says one of its rungs twice.
+    /// **No rung of any signature is printed as a decimal**, no ladder says
+    /// one of its rungs twice, and the bar is BAR in every one of them.
     ///
-    /// Every signature `TimeSignature::is_valid` lets in, over the whole
-    /// exponent range `grid_quarters` takes. 247 of those (signature, rung)
-    /// pairs used to fall through `note_label` into `"{q:.3}q"`: the BAR rung
-    /// of every meter whose bar is not one note or one dotted note (5/4,
-    /// 7/8, 9/8, 4/2 ...), and the halves of a big bar that land on a length
-    /// no note names (10/8's five eighths). The sweep is what catches a fix
-    /// made for 4/2 alone.
+    /// Every signature `TimeSignature::is_valid` lets in, all 192 of them,
+    /// over the whole exponent range `grid_quarters` takes, in both
+    /// spellings. 247 of those (signature, rung) pairs used to fall through
+    /// `note_label` into `"{q:.3}q"`: the BAR rung of every meter whose bar
+    /// is not one note or one dotted note (5/4, 7/8, 9/8, 4/2 ...), and the
+    /// halves of a big bar that land on a length no note names (10/8's five
+    /// eighths). The sweep is what catches a fix made for 4/2 alone.
     ///
-    /// The spellings are pinned where the owner met them. In 4/2 the box
-    /// steps from 2 bars to one bar to a whole note, so the rung "between 1
-    /// and 2" is the bar, and it now reads 4/2: the bar's own length, in
-    /// the notation every rung under it is written in.
+    /// The bar rung then read as its signature, and the owner, in 4/2, asked
+    /// "why does the option between 1 and 2 = 4/2 in grid frequency and why
+    /// is it even an option?" In 4/2 the box steps from 2 bars to one bar to
+    /// a whole note, so the rung "between 1 and 2" is the bar. He ruled it
+    /// reads BAR in every meter, 4/4 included, where it read "1" (see
+    /// `GRID_BAR`). This holds all 192 to that, holds every other rung to
+    /// NOT reading BAR, so the word means one bar and nothing else, and
+    /// holds the reader to saying "1 bar" there.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// at the first signature it sweeps, 1/1, whose bar prints "1".
     #[test]
     fn no_rung_of_any_signature_is_spelled_as_a_decimal() {
-        for beats in 1u8..=32 {
-            for unit in [1u8, 2, 4, 8, 16, 32] {
-                let mut seen: Vec<(i8, String)> = Vec::new();
-                for e in -7i8..=6 {
-                    let w = grid_label_text(e, beats, unit);
-                    assert!(
-                        !w.contains('.') && !w.contains('q'),
-                        "{beats}/{unit} at exp {e} prints {w:?}"
-                    );
-                    if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
-                        panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
-                    }
-                    seen.push((e, w));
+        let spellings: [fn(i8, u8, u8) -> String; 2] = [grid_label_text, grid_label];
+        let mut swept = 0;
+        for beats in 0u8..=64 {
+            for unit in 0u8..=64 {
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                if !sig.is_valid() {
+                    continue;
                 }
+                swept += 1;
+                for spell in spellings {
+                    let mut seen: Vec<(i8, String)> = Vec::new();
+                    for e in -7i8..=6 {
+                        let w = spell(e, beats, unit);
+                        assert!(
+                            !w.contains('.') && !w.contains('q'),
+                            "{beats}/{unit} at exp {e} prints {w:?}"
+                        );
+                        if e == 0 {
+                            assert_eq!(w, GRID_BAR, "{beats}/{unit}: the bar rung prints {w:?}");
+                        } else {
+                            assert_ne!(w, GRID_BAR, "{beats}/{unit}: exp {e} is not one bar");
+                        }
+                        if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
+                            panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
+                        }
+                        seen.push((e, w));
+                    }
+                }
+                assert_eq!(grid_spoken(0, beats, unit), "1 bar", "{beats}/{unit}, said aloud");
             }
         }
-        // The owner's meter, coarse to fine over the arrange box's range.
+        assert_eq!(swept, 192, "the sweep no longer covers every valid signature");
+        // The owner's meter, coarse to fine over the arrange box's range: the
+        // rung he asked about is BAR, and the 1 under it is the whole note it
+        // always was.
         let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 2)).collect();
-        assert_eq!(ladder, ["8", "4", "2", "4/2", "1", "1/2", "1/4", "1/8", "1/16", "1/32"]);
-        // Three of the eight in `TIME_SIGNATURES`, at their bar rung.
-        assert_eq!(grid_label_text(0, 5, 4), "5/4");
-        assert_eq!(grid_label_text(0, 7, 8), "7/8");
-        assert_eq!(grid_label_text(0, 9, 8), "9/8");
-        // A rung under the bar that no note names is counted the same way,
-        // and a reader hears it as notes, not as a fraction of the bar: in
-        // 10/8 five eighths are HALF the bar, so "5/8 of a bar" would be a
-        // wrong number read aloud.
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1", "1/2", "1/4", "1/8", "1/16", "1/32"]);
+        // And 4/4's, whose bar read "1", the whole note's name.
+        let ladder: Vec<String> = (-6i8..=3).rev().map(|e| grid_label_text(e, 4, 4)).collect();
+        assert_eq!(ladder, ["8", "4", "2", "BAR", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64"]);
+        // A rung UNDER the bar that no note names is still counted in the
+        // meter's beats, and a reader hears it as notes, not as a fraction of
+        // the bar: in 10/8 five eighths are HALF the bar, so "5/8 of a bar"
+        // would be a wrong number read aloud.
         assert_eq!(grid_label_text(-1, 10, 8), "5/8");
         assert_eq!(grid_spoken(-1, 10, 8), "5 eighth notes");
         assert_eq!(grid_spoken(0, 4, 2), "1 bar");
     }
 
-    /// **An odd bar is painted as its own time signature, no wider than the
-    /// rungs beside it.**
+    /// **The bar rung is painted BAR in every meter: as narrow as the
+    /// three-character rungs, and inside its box, in every bundled face.**
     ///
-    /// The owner: "there's a '0 frequency on the grid frequency in arrange
-    /// mode reads as quite a lot of 0.000000s", and of where: "it's an option
-    /// between 1 and 2". His settings carried 4/2 with the grid on its 0
-    /// rung, one bar, which in 4/2 sits between 2 (bars) and 1 (a whole
-    /// note, half that bar). It painted "8.000q": six characters in a box
-    /// drawn for three, so the 8 spilled onto the tempo-lane switch, the
-    /// navigator (painted after it) covered the q, and what read was a run of
-    /// zeros. 5/4, 7/8 and 9/8 did the same at the same rung, as "5.000q",
-    /// "3.500q" and "4.500q".
+    /// The owner met this rung twice. First as "8.000q" in 4/2: "there's a
+    /// '0 frequency on the grid frequency in arrange mode reads as quite a
+    /// lot of 0.000000s", six characters in a box drawn for three, so the 8
+    /// spilled onto the tempo-lane switch and the navigator (painted after
+    /// it) covered the q. Then, once that was counted as the signature, as
+    /// "4/2": "why does the option between 1 and 2 = 4/2 in grid frequency
+    /// and why is it even an option?" It reads BAR now in every meter (see
+    /// `GRID_BAR`), and this reads it off the real frame, for the reason the
+    /// quarter's test above gives: the picture is what was wrong.
     ///
-    /// Read off the real frame, for the reason the quarter's test above gives:
-    /// the picture is what was wrong. The width bound is the 1/16 rung, the
-    /// widest the 4/4 ladder already prints at this size.
+    /// The width is held to two things on the same frame: the 1/2 rung, the
+    /// three-character label the box was drawn for, and the box itself,
+    /// which the label has to be laid out inside. It used to be held to the
+    /// 1/16 rung, the widest the 4/4 ladder prints, but that one is wider
+    /// than the box (25.6 points of its 20 in Courier Prime and JetBrains
+    /// Mono, 21.5 in Terminess), so the bound let a label spill and pass. In
+    /// every bundled face, since the box draws in whichever one the settings
+    /// chose and they are not one width: three characters at the box's
+    /// eleven points are 19.6 in Courier Prime and JetBrains Mono and 16.5
+    /// in Terminess. What is held is the laid-out width, not the glyphs'
+    /// quads, which round out to whole pixels and overhang their advance by
+    /// up to a pixel on every rung, 1/4 included.
+    ///
+    /// Revert check: hand the bar rung back to `note_label` and this fails
+    /// on 4/4 painting "1".
     #[test]
-    fn an_odd_bar_is_painted_as_its_own_time_signature() {
-        let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
-        crate::fonts::apply_text_styles(&ctx);
+    fn the_bar_rung_is_painted_bar_in_every_meter() {
         let r = rect();
-        let printed = |exp: i8, beats: u8, unit: u8| -> Vec<(String, f32)> {
-            let cs: Vec<ClipView<'_>> = Vec::new();
-            let mut v = a_view(&cs);
-            v.grid_exp = exp;
-            v.meter =
-                crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
-            let cell = Layout::new(r, &v).tool_grid;
-            let out = ctx.run(
-                egui::RawInput { screen_rect: Some(r), ..Default::default() },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.set_clip_rect(r);
-                        draw(ui.painter(), r, &v);
-                    });
-                },
-            );
-            out.shapes
-                .iter()
-                .filter_map(|s| match &s.shape {
-                    egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => {
-                        Some((t.galley.text().to_owned(), t.galley.size().x))
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let sixteenth = printed(-4, 4, 4);
-        let widest = sixteenth
-            .iter()
-            .find(|(t, _)| t == "1/16")
-            .map(|(_, w)| *w)
-            .unwrap_or_else(|| panic!("the 4/4 box stopped printing 1/16: {sixteenth:?}"));
-        let odd = [(4u8, 2u8, "4/2"), (5, 4, "5/4"), (7, 8, "7/8"), (9, 8, "9/8")];
-        for (beats, unit, want) in odd {
-            let got = printed(0, beats, unit);
-            assert!(
-                !got.iter().any(|(t, _)| t.contains('.') || t.contains('q')),
-                "{beats}/{unit}: the gridbox still paints a decimal: {got:?}"
-            );
-            let Some((_, w)) = got.iter().find(|(t, _)| t == want) else {
-                panic!("{beats}/{unit}: the bar rung painted {got:?}, not {want:?}");
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, face, None);
+            crate::fonts::apply_text_styles(&ctx);
+            // What the box paints at `exp` in `beats/unit`: the box, and each
+            // text that lands on it, with where it was laid out.
+            let printed = |exp: i8, beats: u8, unit: u8| -> (Rect, Vec<(String, Rect)>) {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                let sig = crate::recorder::TimeSignature { beats, unit };
+                v.meter = crate::tempo::MeterMap::constant(sig);
+                let cell = Layout::new(r, &v).tool_grid;
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => Some((
+                            t.galley.text().to_owned(),
+                            Rect::from_min_size(t.pos, t.galley.size()),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                (cell, texts)
             };
-            assert!(
-                *w <= widest + 0.01,
-                "{beats}/{unit}: {want:?} is {w}pt wide, wider than the 1/16 rung's {widest}pt"
-            );
+            // The three-character rung the box was drawn for, painted in it.
+            let (_, half) = printed(-1, 4, 4);
+            let three = half
+                .iter()
+                .find(|(t, _)| t == "1/2")
+                .map(|(_, laid)| laid.width())
+                .unwrap_or_else(|| panic!("{face:?}: the 4/4 box stopped printing 1/2: {half:?}"));
+            // The stock meters, whose bar read as a note value (4/4 "1", 3/4
+            // and 6/8 "1/2·", 2/4 "1/2", 12/8 "1·"), and odd ones, whose bar
+            // read as their own signature.
+            let meters = [
+                (4u8, 4u8),
+                (3, 4),
+                (6, 8),
+                (2, 4),
+                (12, 8),
+                (4, 2),
+                (5, 4),
+                (7, 8),
+                (9, 8),
+                (10, 8),
+            ];
+            for (beats, unit) in meters {
+                let (cell, got) = printed(0, beats, unit);
+                let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+                assert_eq!(names, [GRID_BAR], "{face:?} {beats}/{unit}: the bar painted {names:?}");
+                let laid = got[0].1;
+                assert!(
+                    laid.width() <= three + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is {}pt wide, the 1/2 rung {three}pt",
+                    laid.width()
+                );
+                assert!(
+                    laid.left() >= cell.left() - 0.01 && laid.right() <= cell.right() + 0.01,
+                    "{face:?} {beats}/{unit}: BAR is laid out at {laid:?}, outside its box {cell:?}"
+                );
+            }
         }
     }
 
