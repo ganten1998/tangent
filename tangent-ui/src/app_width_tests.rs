@@ -660,6 +660,169 @@ fn the_trailing_add_follows_the_last_track_and_locks_at_the_free_cap() {
     }
 }
 
+/// The window `painted` and `click` draw the app in: the one `frame` does.
+const WINDOW: Rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(1300.0, 900.0));
+
+/// One frame of the whole app, and what it painted.
+fn painted(ctx: &egui::Context, app: &mut TangentApp) -> Vec<egui::epaint::ClippedShape> {
+    ctx.run(egui::RawInput { screen_rect: Some(WINDOW), ..Default::default() }, |ctx| app.frame(ctx))
+        .shapes
+}
+
+/// **A whole click at `at`**: arrive, press, release, a frame each, as a
+/// hand does it.
+fn click(ctx: &egui::Context, app: &mut TangentApp, at: Pos2) {
+    let button = |pressed: bool| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+        let _ = ctx.run(
+            egui::RawInput { screen_rect: Some(WINDOW), events, ..Default::default() },
+            |ctx| app.frame(ctx),
+        );
+    }
+}
+
+/// **The ground the eye sees over `region`**: the last filled rect painted
+/// over all of it, that rect and its fill; `None` when a fill painted after
+/// it covers more of the region than a glyph does (the panels' own tests
+/// read a ground the same way).
+fn ground_over(shapes: &[egui::epaint::ClippedShape], region: Rect) -> Option<(Rect, egui::Color32)> {
+    let filled = |cs: &egui::epaint::ClippedShape| match &cs.shape {
+        egui::Shape::Rect(r) if r.fill.a() > 0 => Some((r.rect, r.fill)),
+        _ => None,
+    };
+    let k = shapes.iter().rposition(|cs| filled(cs).is_some_and(|(r, _)| r.contains_rect(region)))?;
+    let covered = shapes[k + 1..]
+        .iter()
+        .filter_map(filled)
+        .map(|(r, _)| r.intersect(region))
+        .any(|i| i.is_positive() && i.area() > 200.0);
+    if covered { None } else { filled(&shapes[k]) }
+}
+
+/// **A click in the trailing add's run selects nothing and makes nothing,
+/// in both views and both tiers.** The run is the add's own ground painted
+/// on past it, to the foot of the timeline and to the end of the desk's
+/// run (`EndlessGround` in the arrangement, `endless_ground` in the mixer):
+/// the owner's "can we make the draw just infinite?". On the shipped
+/// two-track desk the real frame paints it, under the add in the header
+/// column and across the field and beside the add on the desk, each the
+/// very rect that is the add's own ground there. A click anywhere in it
+/// leaves the selection, the rows, the history and the dialogs as they
+/// were, which is what a click on the bare wood there did; and the add's
+/// own plus still makes the next track, or at the free cap opens the
+/// Supporter Key dialog.
+#[test]
+fn a_click_in_the_trailing_adds_run_selects_nothing_and_makes_nothing() {
+    for locked in [false, true] {
+        let tag = if locked { "run-locked" } else { "run-open" };
+        let (ctx, mut app) = app_on(
+            Settings {
+                show_welcome: false,
+                ..Settings::default()
+            },
+            tiers::free(tag),
+        );
+        app.dialog = None;
+        if locked {
+            app.force_free_cap(2);
+        }
+        let plus = if locked { Plus::Locked } else { Plus::Trailing };
+        assert_eq!(app.trailing_plus(), plus, "fixture: the add is not {plus:?}");
+        app.select_track(0, egui::Modifiers::NONE);
+        frame(&ctx, &mut app);
+        // What a click must leave alone. Read after the frame that settles
+        // the selection, and again before every click.
+        let held = |app: &TangentApp| {
+            (app.selected_rows(), app.settings.rows.clone(), moments(app), app.dialog.is_some())
+        };
+        assert_eq!(held(&app).0, vec![0], "fixture: the first track is not the one selected");
+        let click_holds = |app: &mut TangentApp, at: Pos2, what: &str| {
+            let before = held(app);
+            click(&ctx, app, at);
+            assert_eq!(held(app), before, "{plus:?} {what}: a click at {at:?} in the run did something");
+        };
+        // Each run is the rect that is the add's own ground at `own`, a
+        // point on that ground clear of the plus.
+        let assert_run = |shapes: &[egui::epaint::ClippedShape], own: Pos2, run: Rect, what: &str| {
+            let (rect, fill) = ground_over(shapes, Rect::from_center_size(own, Vec2::splat(2.0)))
+                .unwrap_or_else(|| panic!("{plus:?} {what}: nothing painted on the add"));
+            assert_eq!(
+                ground_over(shapes, run),
+                Some((rect, fill)),
+                "{plus:?} {what}: the run is not the add's own ground carried on"
+            );
+            assert!(rect.contains_rect(run), "{plus:?} {what}: the add's ground {rect:?} stops short of {run:?}");
+        };
+
+        // The timeline: under the add, in the header column and the field.
+        app.mixer_open = false;
+        app.arrangement_open = true;
+        let shapes = painted(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the timeline drew nowhere");
+        let runs = {
+            let clips = app.arr_clip_views();
+            let v = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &v);
+            let g = crate::arrangement_panel::endless_ground(&l, &v)
+                .expect("the shipped desk's add has no run under it");
+            assert_eq!(v.lanes.get(g.row).map(|x| x.plus), Some(plus), "the timeline's run is not the add's");
+            let (panel, lane) = (l.header_rows[g.row].panel, l.lane_rows[g.row]);
+            let on_panel = Pos2::new(panel.right() - 6.0, panel.center().y);
+            [
+                ("timeline header", on_panel, Rect::from_min_max(panel.left_bottom(), g.header.max)),
+                ("timeline field", lane.center(), Rect::from_min_max(lane.left_bottom(), g.lane.max)),
+            ]
+        };
+        for (what, own, run) in runs {
+            assert_run(&shapes, own, run, what);
+        }
+        for (what, _, run) in runs {
+            for at in [run.center(), run.left_bottom() + Vec2::new(6.0, -6.0), run.right_top() + Vec2::new(-6.0, 6.0)] {
+                click_holds(&mut app, at, what);
+            }
+        }
+
+        // The desk: beside the add, to the end of its run.
+        app.arrangement_open = false;
+        app.mixer_open = true;
+        let shapes = painted(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the desk drew nowhere");
+        let (panel, run, plus_at) = {
+            let v = app.mixer_view_in(rect);
+            let l = crate::mixer_panel::Layout::new(rect, &v);
+            let (col, ground) = crate::mixer_panel::endless_ground(&l, &v)
+                .expect("the shipped desk's add has no run beside it");
+            assert_eq!(v.strips.get(col).map(|s| s.plus), Some(plus), "the desk's run is not the add's");
+            let s = &l.strips[col];
+            (s.panel, Rect::from_min_max(s.panel.right_top(), ground.max), s.add)
+        };
+        assert_run(&shapes, Pos2::new(panel.center().x, panel.bottom() - 8.0), run, "desk");
+        for at in [run.center(), run.left_bottom() + Vec2::new(6.0, -6.0), run.right_top() + Vec2::new(-6.0, 6.0)] {
+            click_holds(&mut app, at, "desk");
+        }
+        assert_eq!(held(&app).0, vec![0], "{plus:?}: the first track is no longer the one selected");
+
+        // And the add itself is what it was: its plus makes the next track,
+        // or at the cap opens the Supporter Key dialog and makes nothing.
+        click(&ctx, &mut app, plus_at.center());
+        if locked {
+            assert!(
+                matches!(app.dialog, Some(Dialog::SupporterKey { .. })),
+                "the padlock did not open the Supporter Key dialog"
+            );
+            assert_eq!(app.counted_tracks(), 2, "the padlock made a track");
+        } else {
+            assert_eq!(app.counted_tracks(), 3, "the add's plus made no track");
+        }
+        let _ = std::fs::remove_dir_all(tiers::dir(tag));
+    }
+}
+
 /// **A hidden row holding residue is never taken over** (design section
 /// 4): a pedalboard left on the first hidden row keeps it hidden and
 /// uncounted, and the next track is made on a row of its own past it.
