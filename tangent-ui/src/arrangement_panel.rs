@@ -4569,6 +4569,164 @@ fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink, size: 
     );
 }
 
+/// **The smallest a word that shrinks to its box is drawn: six and a half
+/// points.**
+///
+/// The floor of the other words in this app that shrink rather than cut:
+/// the INPUT chip's ([`input_chip`]) and the analog faces' own
+/// (`faces_analog::fit`, "the smallest legible"). Under it a grid step is a
+/// smudge, and a smudge in a grid box reads as a wrong number rather than a
+/// small one.
+pub const WORD_FLOOR: f32 = 6.5;
+
+/// **The air a word that had to shrink keeps from each side of its room**,
+/// in points.
+///
+/// Fitted with none, a word would fill its room to the last hundredth and
+/// its ink would meet the box's edge. A quarter of a point because the room
+/// is small: the arrange gridbox is twenty points, and a five-character step
+/// (1/128) at the floor is 18.9 to 19.4 of them in Courier Prime and
+/// JetBrains Mono, depending on the display's scale. Half a point a side
+/// would put that step under the floor on a Retina screen and not on a
+/// plain one.
+pub const WORD_AIR: f32 = 0.25;
+
+/// **The size a word is drawn at in a room `width` wide: shrunk to the
+/// width, never spilled.**
+///
+/// `ceiling` when the word is laid out inside the room at that size, so a
+/// word its box was drawn for keeps exactly the size it always had (BAR and
+/// 1/2 in the arrange gridbox, 11 points). Otherwise the largest half point
+/// under the ceiling at which it is laid out inside with [`WORD_AIR`] either
+/// side, measured in the face that is installed, and never under
+/// [`WORD_FLOOR`]. A word that does not fit even at the floor is given the
+/// floor and left to the clip in [`paint_fitted_word`]: past that point a
+/// smaller word is a smudge, and which words those are is a question for
+/// the box, not for the type.
+///
+/// This is the INPUT chip's rule ([`input_chip`]: the height names the
+/// ceiling and the width decides), except that it never truncates. A grid
+/// step cut to "1/1..." names a different step.
+///
+/// Half points rather than any size: each word gets one size that does not
+/// move from frame to frame, so the glyph atlas is not handed a new fraction
+/// every frame (why `fonts::px` rounds), and on a 2x display half a point is
+/// a whole pixel. Found by walking down rather than by scaling the width
+/// once, because glyphs land on pixels and a word's width is not quite in
+/// proportion to its size.
+pub fn fitted_word_size(
+    painter: &Painter,
+    word: &str,
+    family: &egui::FontFamily,
+    ceiling: f32,
+    width: f32,
+) -> f32 {
+    let wide = |size: f32| {
+        painter
+            .layout_no_wrap(word.to_owned(), FontId::new(size, family.clone()), Color32::WHITE)
+            .rect
+            .width()
+    };
+    if wide(ceiling) <= width {
+        return ceiling;
+    }
+    // A ceiling already under the floor is its own floor: shrinking stops
+    // there, and growing is not what this is for.
+    let floor = WORD_FLOOR.min(ceiling);
+    let room = width - 2.0 * WORD_AIR;
+    // The first half point under the ceiling (10.5 under 11, 9.5 under the
+    // MIDI chip's 9.9), then down by halves.
+    let mut size = (ceiling * 2.0).ceil() * 0.5 - 0.5;
+    while size > floor && wide(size) > room {
+        size -= 0.5;
+    }
+    size.max(floor)
+}
+
+/// **A word painted in its box at [`fitted_word_size`], and never outside
+/// it.**
+///
+/// `room` is where the word may be laid out: the box itself, or the part of
+/// it inside a border. `bx` is the box, and the word is clipped to it,
+/// within whatever clip the painter already has. The clip is the backstop
+/// and not the fit: every word a grid ladder can print fits its box above
+/// the floor except the few `fitted_word_size` cannot, and those are cut at
+/// the box's edge instead of painting over the next control. That is the
+/// class of fault behind the owner's "0.000000": a grid step six characters
+/// wide in the arrange gridbox, spilling onto the tempo lane's switch, with
+/// the navigator painted over its tail.
+///
+/// **Centred as `Align2::CENTER_CENTER` centres it, then held inside by
+/// whole pixels.** A word is laid out by its advances, but its glyphs are
+/// drawn as whole pixels rounded outward and the text is snapped to a pixel,
+/// so a word that fits by its advances can still put one column of ink past
+/// the room's edge: BAR in Courier Prime at 150%, 1/128 in JetBrains Mono at
+/// 100%. The clip would cut that column off a word that fits. So when the
+/// ink the snap is going to draw crosses an edge and the room is wide
+/// enough for it, the word moves in by the pixels it crosses by; otherwise
+/// it stays exactly where centring put it.
+pub fn paint_fitted_word(
+    painter: &Painter,
+    bx: Rect,
+    room: Rect,
+    word: &str,
+    family: egui::FontFamily,
+    ceiling: f32,
+    ink: Color32,
+) {
+    if !room.is_positive() || word.is_empty() {
+        return;
+    }
+    let size = fitted_word_size(painter, word, &family, ceiling, room.width());
+    let galley = painter.layout_no_wrap(word.to_owned(), FontId::new(size, family), ink);
+    let mut pos = room.center() - galley.size() * 0.5;
+    let drawn = galley.mesh_bounds;
+    if drawn.is_positive() && drawn.width() <= room.width() {
+        // Where the tessellator will put it (`round_text_to_pixels`), and
+        // the ink that lands there.
+        let ppp = painter.ctx().pixels_per_point();
+        let snapped = (pos.x * ppp).round() / ppp;
+        let (left, right) = (snapped + drawn.min.x, snapped + drawn.max.x);
+        // A thousandth of slack, so float noise is not a pixel.
+        if right > room.right() + 1.0e-3 {
+            pos.x = snapped - ((right - room.right()) * ppp).ceil() / ppp;
+        } else if left < room.left() - 1.0e-3 {
+            pos.x = snapped + ((room.left() - left) * ppp).ceil() / ppp;
+        }
+    }
+    painter
+        .with_clip_rect(bx.intersect(painter.clip_rect()))
+        .galley(pos, galley, ink);
+}
+
+/// **The size the arrange gridbox prints at**: 0.55 of the box's height,
+/// held to 8 to 11 points. Eleven in the twenty-point box the toolbar draws
+/// whenever the arrangement is tall enough for it. A word wider than the
+/// box shrinks from here ([`grid_box_word`]).
+fn grid_box_type(cell: Rect) -> f32 {
+    (cell.height() * 0.55).clamp(8.0, 11.0)
+}
+
+/// **The arrange gridbox's word, in its box**: [`grid_box_type`] when it
+/// fits, shrunk to the box's width when it does not, and clipped to the box.
+///
+/// The box is a twenty-point square at most, drawn for three characters
+/// (1/2, 1/4, BAR), and at eleven points a fourth is already too many: 1/16
+/// is 25.6 points wide in Courier Prime and JetBrains Mono and 21.5 in
+/// Terminess. The ladder prints five characters too (1/128, at the finest
+/// steps of meters as common as 3/4 and 7/8) and six (1/1024).
+fn grid_box_word(painter: &Painter, cell: Rect, word: &str, ink: Color32) {
+    paint_fitted_word(
+        painter,
+        cell,
+        cell,
+        word,
+        crate::fonts::courier_bold(),
+        grid_box_type(cell),
+        ink,
+    );
+}
+
 /// **The lane field**: the ground every clip in this view sits on.
 ///
 /// In light mode the timecode WELL is lifted toward the strip face so the
@@ -7815,14 +7973,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The MIDI editor's chip still calls `grid_label` and still shows
         // the glyph, so pointing this line back at `grid_label` would not
         // undo one decision, it would move two surfaces at once.
-        painter.text(
-            l.tool_grid.center(),
-            Align2::CENTER_CENTER,
-            grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
-            FontId::new(
-                (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
-                crate::fonts::courier_bold(),
-            ),
+        //
+        // **Shrunk to the box and clipped to it** (`grid_box_word`): the
+        // box is drawn for three characters and the ladder prints up to
+        // six. A step wider than the box spilled out of it, and the widest
+        // onto the tempo lane's switch and under the navigator.
+        grid_box_word(
+            painter,
+            l.tool_grid,
+            &grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
             on_ink(p.hdr_face),
         );
     }
@@ -8134,6 +8293,101 @@ pub(crate) fn cut_to_reference(painter: &Painter, width: f32, text: &str, font: 
         }
     }
     String::new()
+}
+
+/// **Every time signature the app accepts**, `(beats, unit)`, found by
+/// asking `TimeSignature::is_valid` over a range wider than it allows rather
+/// than by writing its rule out again: 1 to 32 beats over 1, 2, 4, 8, 16 or
+/// 32, which is 192. Test support for the sweeps that hold every grid ladder
+/// to something; each of them asserts the 192.
+#[cfg(test)]
+pub(crate) fn valid_signatures() -> Vec<(u8, u8)> {
+    let mut sigs = Vec::new();
+    for beats in 0u8..=64 {
+        for unit in 0u8..=64 {
+            if (crate::recorder::TimeSignature { beats, unit }).is_valid() {
+                sigs.push((beats, unit));
+            }
+        }
+    }
+    sigs
+}
+
+/// **A context dressed in `face`, at `ppp` pixels to the point**, the way
+/// the app's is: test support for measuring words as the screen gets them.
+/// The scale matters to a word's width (glyphs land on whole pixels) and to
+/// where its ink falls, so the fit sweeps run at 100% to 200%.
+#[cfg(test)]
+pub(crate) fn context_at(face: crate::fonts::FontChoice, ppp: f32) -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::fonts::install(&ctx, face, None);
+    crate::fonts::apply_text_styles(&ctx);
+    let mut raw = egui::RawInput::default();
+    raw.viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .native_pixels_per_point = Some(ppp);
+    // Twice: the first pass is what adopts the scale and the fonts.
+    let _ = ctx.run(raw.clone(), |_| {});
+    let _ = ctx.run(raw, |_| {});
+    assert_eq!(ctx.pixels_per_point(), ppp, "the context did not take the scale");
+    ctx
+}
+
+/// **A word as it reaches the screen**: its text and size, where it was laid
+/// out (its advances, from where it was placed), the ink the tessellator
+/// draws for it (every glyph's pixels, unclipped) and the clip it carries.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PaintedWord {
+    pub text: String,
+    pub size: f32,
+    pub laid: Rect,
+    pub ink: Rect,
+    pub clip: Rect,
+}
+
+#[cfg(test)]
+impl PaintedWord {
+    /// Every text `shapes` holds, measured. `ctx` tessellates them, at its
+    /// own scale, for the ink.
+    pub(crate) fn all(ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) -> Vec<Self> {
+        shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    let mut ink = Rect::NOTHING;
+                    for p in ctx.tessellate(vec![s.clone()], ctx.pixels_per_point()) {
+                        if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+                            ink = ink.union(m.calc_bounds());
+                        }
+                    }
+                    Some(Self {
+                        text: t.galley.text().to_owned(),
+                        size: t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                        laid: Rect::from_min_size(t.pos, t.galley.size()),
+                        ink,
+                        clip: s.clip_rect,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What `paint` paints on a layer of its own, keyed by `key`, measured.
+    pub(crate) fn painted_by(
+        ctx: &egui::Context,
+        key: impl std::hash::Hash,
+        paint: impl FnOnce(&Painter),
+    ) -> Vec<Self> {
+        let id = egui::Id::new(("painted word", key));
+        let layer = egui::LayerId::new(egui::Order::Foreground, id);
+        paint(&Painter::new(ctx.clone(), layer, Rect::EVERYTHING));
+        let shapes: Vec<egui::epaint::ClippedShape> =
+            ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().cloned().collect()).unwrap_or_default());
+        Self::all(ctx, &shapes)
+    }
 }
 
 #[cfg(test)]
@@ -12578,9 +12832,11 @@ selected: false,
     /// The width is held to two things on the same frame: the 1/2 rung, the
     /// three-character label the box was drawn for, and the box itself,
     /// which the label has to be laid out inside. It used to be held to the
-    /// 1/16 rung, the widest the 4/4 ladder prints, but that one is wider
-    /// than the box (25.6 points of its 20 in Courier Prime and JetBrains
-    /// Mono, 21.5 in Terminess), so the bound let a label spill and pass. In
+    /// 1/16 rung, the widest the 4/4 ladder prints, but at the box's eleven
+    /// points that one is wider than the box (25.6 points of its 20 in
+    /// Courier Prime and JetBrains Mono, 21.5 in Terminess), so the bound let
+    /// a label spill and pass. (It is drawn smaller now, to fit: see
+    /// `every_arrange_grid_step_is_painted_inside_its_box`.) In
     /// every bundled face, since the box draws in whichever one the settings
     /// chose and they are not one width: three characters at the box's
     /// eleven points are 19.6 in Courier Prime and JetBrains Mono and 16.5
@@ -12664,6 +12920,214 @@ selected: false,
                     laid.left() >= cell.left() - 0.01 && laid.right() <= cell.right() + 0.01,
                     "{face:?} {beats}/{unit}: BAR is laid out at {laid:?}, outside its box {cell:?}"
                 );
+            }
+        }
+    }
+
+    /// **Every step of every arrange ladder is painted inside its box: as it
+    /// always was when it fits, shrunk to the box when it does not, never
+    /// under the floor, and clipped to the box whatever happens.**
+    ///
+    /// The box is drawn for three characters and the ladder prints up to
+    /// six. At the box's eleven points 1/16 is 25.6 points wide in Courier
+    /// Prime and JetBrains Mono and 21.5 in Terminess, in a box of 20, and
+    /// every step of four characters or more spilled out of it; from five
+    /// on (1/128 is 32.6 points) it reached the tempo lane's switch on the
+    /// left and ran under the navigator on the right, the overflow behind
+    /// the owner's "0.000000".
+    ///
+    /// Swept over every word the box can print: all 192 signatures, every
+    /// step the box reaches (-6 to 3, the settings' clamp), in both
+    /// spellings. Each is painted by `grid_box_word`, the call `draw` makes
+    /// (`the_arrange_gridbox_paints_its_step_through_the_fit` holds `draw` to
+    /// it), into the real box, in every bundled face and at 100% to 200%
+    /// display scale, and read back as the tessellator draws it. Held:
+    ///
+    /// - a word that is laid out inside the box at eleven points is painted
+    ///   at exactly eleven: BAR and 1/2 are, by name, in every face;
+    /// - a word that is not is painted smaller, never under `WORD_FLOOR`,
+    ///   and laid out no wider than the box less `WORD_AIR` either side;
+    /// - every pixel of a word that fits is inside the box, so the clip cuts
+    ///   nothing from it (the pixel snap moves it in when it would);
+    /// - every word is clipped to the box, so nothing is ever painted on a
+    ///   neighbour.
+    ///
+    /// Two words do not fit above the floor, and only in two faces: 1/1024
+    /// and 1/2048 in Courier Prime and JetBrains Mono need 5.5 points or
+    /// less (at 6.5 they are 22.9 to 23.4 points wide). They are pinned here
+    /// by name, so a third cannot join them unnoticed, and so are the 19
+    /// (signature, step) pairs that print them: the signatures 1/16 and 2/32
+    /// at the box's finest step, 1/32 at its two finest, and 3/32, 5/32 and
+    /// every odd count of 32nds up to 31/32 at its finest. They are painted
+    /// at the floor and cut at the box's edges.
+    ///
+    /// Revert checks, all performed: paint at the box's own size again and
+    /// this fails on the first word it sweeps, 1/64 (the finest step of
+    /// 1/1), left at eleven points where it does not fit; take the clip away
+    /// and it fails on that same word, whose clip is then the whole screen;
+    /// take the pixel snap away and it fails on 1/128 in JetBrains Mono at
+    /// 100%, a column of whose ink lands past the box's right edge (BAR in
+    /// Courier Prime at 150% does the same).
+    #[test]
+    fn every_arrange_grid_step_is_painted_inside_its_box() {
+        let sigs = valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let mut words: Vec<String> = Vec::new();
+        let mut cut_pairs: std::collections::BTreeSet<(u8, u8, i8)> = Default::default();
+        for &(beats, unit) in &sigs {
+            for e in -6i8..=3 {
+                for spell in [grid_label_text as fn(i8, u8, u8) -> String, grid_label] {
+                    let w = spell(e, beats, unit);
+                    if w == "1/1024" || w == "1/2048" {
+                        cut_pairs.insert((beats, unit, e));
+                    }
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let cell = Layout::new(rect(), &a_view(&cs)).tool_grid;
+        assert!(
+            (cell.width() - 20.0).abs() < 1.0e-3,
+            "the box is not at its full twenty points here: {cell:?}"
+        );
+        // The size the twenty-point box prints at, and has always printed at.
+        let ceiling = 11.0;
+        assert_eq!(grid_box_type(cell), ceiling);
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let mut cut: Vec<&str> = Vec::new();
+                for (k, w) in words.iter().enumerate() {
+                    let at = format!("{face:?} at {ppp}x, {w:?}");
+                    let painted = PaintedWord::painted_by(&ctx, ("arrange", k), |p| {
+                        grid_box_word(p, cell, w, Color32::WHITE);
+                    });
+                    let [word] = painted.as_slice() else {
+                        panic!("{at}: painted {painted:?}, not one word");
+                    };
+                    assert_eq!(&word.text, w, "{at}");
+                    assert!(word.size >= WORD_FLOOR, "{at}: painted at {}, under the floor", word.size);
+                    assert!(
+                        cell.contains_rect(word.clip),
+                        "{at}: clipped to {:?}, not to its box {cell:?}",
+                        word.clip
+                    );
+                    let wide = measure
+                        .layout_no_wrap(w.clone(), FontId::new(ceiling, crate::fonts::courier_bold()), Color32::WHITE)
+                        .rect
+                        .width();
+                    if wide <= cell.width() {
+                        assert_eq!(
+                            word.size, ceiling,
+                            "{at}: fits the box at {ceiling} points ({wide} wide) and was painted at {}",
+                            word.size
+                        );
+                    } else if word.laid.width() > cell.width() - 2.0 * WORD_AIR + 1.0e-3 {
+                        // Too wide even at the floor: the clip holds it.
+                        assert_eq!(word.size, WORD_FLOOR, "{at}: does not fit, and is not at the floor");
+                        cut.push(w.as_str());
+                        continue;
+                    } else {
+                        // Shrunk, with the air either side. Held on its
+                        // width: where it lands is the ink's business, below,
+                        // since the pixel snap may move it by a pixel.
+                        assert!(word.size < ceiling, "{at}: {wide} wide at {ceiling} and not shrunk");
+                        assert!(
+                            word.laid.width() <= cell.width() - 2.0 * WORD_AIR + 1.0e-3,
+                            "{at}: shrunk to {} and {} wide, with less than {WORD_AIR} either side in {}",
+                            word.size,
+                            word.laid.width(),
+                            cell.width()
+                        );
+                    }
+                    assert!(
+                        word.ink.left() >= cell.left() - 1.0e-3
+                            && word.ink.right() <= cell.right() + 1.0e-3
+                            && word.ink.top() >= cell.top() - 1.0e-3
+                            && word.ink.bottom() <= cell.bottom() + 1.0e-3,
+                        "{at}: at {} points its ink is at {:?}, outside its box {cell:?}",
+                        word.size,
+                        word.ink
+                    );
+                    if w == GRID_BAR || w == "1/2" {
+                        assert_eq!(word.size, ceiling, "{at}: the box was drawn for this one");
+                    }
+                }
+                let want: &[&str] = match face {
+                    crate::fonts::FontChoice::Terminess => &[],
+                    _ => &["1/1024", "1/2048"],
+                };
+                cut.sort_unstable();
+                assert_eq!(cut, want, "{face:?} at {ppp}x: the words that do not fit above the floor");
+            }
+        }
+        assert_eq!(cut_pairs.len(), 19, "the steps that print 1/1024 and 1/2048: {cut_pairs:?}");
+    }
+
+    /// **The arrange gridbox paints its step through the fit**, read off the
+    /// real frame: the same word, the same size and the same place that
+    /// `grid_box_word` gives it, clipped to the box. The sweep above holds
+    /// `grid_box_word` to every word; this holds `draw` to `grid_box_word`,
+    /// at steps three to six characters wide, in every bundled face.
+    ///
+    /// Revert check, performed: hand the box back to `painter.text` at its
+    /// own size and this fails on its first step, BAR, which is no longer
+    /// clipped to its box.
+    #[test]
+    fn the_arrange_gridbox_paints_its_step_through_the_fit() {
+        let r = rect();
+        let steps = [
+            (4u8, 4u8, 0i8, GRID_BAR),
+            (4, 4, -1, "1/2"),
+            (4, 4, -4, "1/16"),
+            (6, 8, -1, "1/4\u{00b7}"),
+            (3, 4, -6, "1/128"),
+            (22, 16, -1, "11/16"),
+            (1, 16, -6, "1/1024"),
+        ];
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = context_at(face, 1.0);
+            // The word alone is painted on a context of its own: a shape
+            // painted between frames is handed out with the next frame's,
+            // and the next frame is the real one.
+            let apart = context_at(face, 1.0);
+            for (k, (beats, unit, exp, want)) in steps.into_iter().enumerate() {
+                let cs: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&cs);
+                v.grid_exp = exp;
+                v.meter = crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats, unit });
+                let cell = Layout::new(r, &v).tool_grid;
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_clip_rect(r);
+                            draw(ui.painter(), r, &v);
+                        });
+                    },
+                );
+                let on_box: Vec<PaintedWord> = PaintedWord::all(&ctx, &out.shapes)
+                    .into_iter()
+                    .filter(|w| cell.intersects(w.laid))
+                    .collect();
+                let at = format!("{face:?} {beats}/{unit} step {exp}");
+                let [drawn] = on_box.as_slice() else {
+                    panic!("{at}: the box painted {on_box:?}");
+                };
+                let alone = PaintedWord::painted_by(&apart, ("arrange draw", k), |p| {
+                    grid_box_word(p, cell, want, Color32::WHITE);
+                });
+                let [alone] = alone.as_slice() else {
+                    panic!("{at}: grid_box_word painted {alone:?}");
+                };
+                assert_eq!(drawn.text, want, "{at}");
+                assert_eq!(drawn.size, alone.size, "{at}: {want} is not painted at its fitted size");
+                assert_eq!(drawn.laid, alone.laid, "{at}: {want} is not where the fit puts it");
+                assert_eq!(drawn.clip, cell, "{at}: {want} is not clipped to its box");
             }
         }
     }
