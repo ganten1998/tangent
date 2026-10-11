@@ -4020,10 +4020,59 @@ mod tests {
         }
     }
 
-    /// The shipped dials with one kernel selected — every test that is not
-    /// ABOUT the selector says which engine it means, because the two
-    /// answer differently on purpose and a test that does not name one is
-    /// a test whose meaning changes when the default does.
+    /// **The kernel the offline harness renders on.** Named in the
+    /// environment, it is that. Rendering a bay's saved blob without one
+    /// named, it is the kernel THAT BAY plays, decoded the way the host
+    /// decodes it (`values_from_state`, so a blob with no `kernel=` line is
+    /// [`DenoiseKernel::UNWRITTEN`]); the harness's claim is "what the saved
+    /// bay sounds like", and the fresh default moved under it on 2026-10-11.
+    /// Neither, it is the fresh default. `blob` may carry the sidecar's
+    /// `<bundle>\0` tag, which is skipped as the shelf skips it.
+    fn harness_kernel(named: Option<f32>, blob: Option<&[u8]>) -> f32 {
+        if let Some(k) = named {
+            return k;
+        }
+        let Some(raw) = blob else {
+            return DenoiseParams::default().kernel;
+        };
+        let body = raw.iter().position(|b| *b == 0).map_or(raw, |at| &raw[at + 1..]);
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::DENOISE_PATH).expect("the denoise has a spec");
+        let at = spec.params.iter().position(|p| p.symbol == "kernel").expect("a kernel knob");
+        crate::builtin_fx::values_from_state(spec, body).expect("the state blob is not a built-in effect's state")[at]
+    }
+
+    /// **The offline harness renders a saved bay on the kernel that bay
+    /// plays**, not on whatever a fresh bay opens on. A Spectral Studio
+    /// blob re-rendered with no kernel named ran on Studio while Studio was
+    /// the default; after the default moved to the Bank the same command
+    /// would have rendered the Studio print through the Bank.
+    ///
+    /// Revert-check: return the fresh default for a blob too and the Studio
+    /// and pre-selector cases go red.
+    #[test]
+    fn the_render_harness_plays_a_saved_bay_on_its_own_kernel() {
+        let studio = DenoiseKernel::SpectralStudio.dial();
+        let live = DenoiseKernel::SpectralLive.dial();
+        let bank = DenoiseKernel::Bank.dial();
+        let tagged = |body: &str| format!("@tangent-denoise\0{body}").into_bytes();
+        let kernel_of = |named: Option<f32>, blob: Option<&[u8]>| DenoiseKernel::from_dial(harness_kernel(named, blob));
+
+        // A blob that names its kernel renders on it, tagged or bare.
+        let saved_studio = tagged(&format!("tangentfx 1\nlearn=0\nkernel={studio}\nt0=0.4\n"));
+        assert_eq!(kernel_of(None, Some(&saved_studio)), DenoiseKernel::SpectralStudio);
+        let saved_live = format!("tangentfx 1\nkernel={live}\n").into_bytes();
+        assert_eq!(kernel_of(None, Some(&saved_live)), DenoiseKernel::SpectralLive);
+        let saved_bank = tagged(&format!("tangentfx 1\nkernel={bank}\n"));
+        assert_eq!(kernel_of(None, Some(&saved_bank)), DenoiseKernel::Bank);
+        // One written before the selector plays what the host plays it on.
+        let pre_selector = tagged("tangentfx 1\nlearn=0\nreduce=0.5\n");
+        assert_eq!(kernel_of(None, Some(&pre_selector)), DenoiseKernel::UNWRITTEN);
+        // A kernel named in the environment wins over the blob.
+        assert_eq!(kernel_of(Some(bank), Some(&saved_studio)), DenoiseKernel::Bank);
+        // No blob, no name: the fresh default.
+        assert_eq!(harness_kernel(None, None), DenoiseParams::default().kernel);
+    }
+
     /// **Render a real recording through the unit, offline**, so a change
     /// to the kernel is measured against a reference on the owner's own
     /// take rather than felt. Ignored: it reads paths from the environment.
@@ -4032,9 +4081,13 @@ mod tests {
     /// TANGENT_DN_IN=/path/control.wav TANGENT_DN_OUT=/path/out.wav \
     /// TANGENT_DN_LEARN=26.95,28.85 [TANGENT_DN_REDUCE=0.5] \
     /// [TANGENT_DN_ATTACK=..] [TANGENT_DN_RELEASE=..] [TANGENT_DN_SMOOTH=..] \
-    /// [TANGENT_DN_TREBLE=..] [TANGENT_DN_KERNEL=0.5] \
+    /// [TANGENT_DN_TREBLE=..] [TANGENT_DN_KERNEL=0.5] [TANGENT_DN_STATE=..] \
     /// cargo test -p tangent --bin tangent -- render_a_take_through_the_denoiser --ignored --nocapture
     /// ```
+    ///
+    /// The kernel is `TANGENT_DN_KERNEL` when it is named; otherwise, with
+    /// `TANGENT_DN_STATE`, the one that bay plays (see [`harness_kernel`]);
+    /// otherwise the fresh default.
     ///
     /// The learn pass is the named stretch of the SAME file, played once
     /// with the toggle up; then the whole file goes through in 512-frame
@@ -4060,11 +4113,12 @@ mod tests {
         let right = wav.channels.get(1).unwrap_or(left);
         let frames = left.len().min(right.len());
         let mut dn = Denoise::new(sr);
+        let blob = var("TANGENT_DN_STATE").map(|state| std::fs::read(&state).expect("read state blob"));
         let mut params = DenoiseParams {
             reduce: dial("TANGENT_DN_REDUCE", 0.5),
             release: dial("TANGENT_DN_RELEASE", DenoiseParams::default().release),
             smooth: dial("TANGENT_DN_SMOOTH", DenoiseParams::default().smooth),
-            kernel: dial("TANGENT_DN_KERNEL", DenoiseParams::default().kernel),
+            kernel: harness_kernel(var("TANGENT_DN_KERNEL").and_then(|v| v.parse().ok()), blob.as_deref()),
             ..DenoiseParams::default()
         };
         // Every knob a newer build may have grown is read the same way, so
@@ -4072,13 +4126,15 @@ mod tests {
         params.apply_env_overrides(&dial);
         // The print: either the bay's own saved state — `TANGENT_DN_STATE`
         // names an `insert-state-<seat>-<bay>.bin`, the text blob the host
-        // writes, and its `t0..t31` lines ARE the thresholds — or the named
-        // stretch of this file, toggle up, then the toggle down.
+        // writes, and its `t0..t31` lines ARE the thresholds and its
+        // `k0..k31` lines the bank's knees, laid as the host lays them — or
+        // the named stretch of this file, toggle up, then the toggle down.
         let mut tiny = [0.0_f32; 8];
-        if let Some(state) = var("TANGENT_DN_STATE") {
-            let text = std::fs::read_to_string(&state).expect("read state blob");
+        if let Some(raw) = blob.as_deref() {
+            let text = String::from_utf8_lossy(raw);
             let mut thr = [0.0_f32; DENOISE_BANDS];
-            let mut found = 0;
+            let mut knees = [0.0_f32; DENOISE_BANDS];
+            let (mut found, mut any_k) = (0, false);
             for line in text.lines() {
                 if let Some((k, v)) = line.split_once('=') {
                     if let Some(i) = k.strip_prefix('t').and_then(|n| n.parse::<usize>().ok()) {
@@ -4087,12 +4143,26 @@ mod tests {
                             found += 1;
                         }
                     }
+                    if let Some(i) = k.strip_prefix('k').and_then(|n| n.parse::<usize>().ok()) {
+                        if i < DENOISE_BANDS {
+                            knees[i] = v.trim().parse().unwrap_or(0.0);
+                            any_k = true;
+                        }
+                    }
                 }
             }
             assert_eq!(found, DENOISE_BANDS, "the blob carried {found} thresholds");
             dn.process(&mut tiny, 4, 2, &params);
             dn.set_thresholds(&thr);
-            eprintln!("thresholds from {state}; latency {} frames", dn.latency());
+            if any_k {
+                dn.set_knees(&knees);
+            }
+            eprintln!(
+                "print from {}; {}; latency {} frames",
+                var("TANGENT_DN_STATE").unwrap_or_default(),
+                DenoiseKernel::from_dial(params.kernel).label(),
+                dn.latency()
+            );
         } else {
             let (a, b) = (((l0 * sr) as usize).min(frames), ((l1 * sr) as usize).min(frames));
             let mut seg: Vec<f32> = (a..b).flat_map(|i| [left[i], right[i]]).collect();
@@ -4302,6 +4372,10 @@ mod tests {
         assert!(sig0.abs() < 0.8, "with the boost off the tone read {sig0:.2} dB");
     }
 
+    /// The shipped dials with one kernel selected — every test that is not
+    /// ABOUT the selector says which engine it means, because the two
+    /// answer differently on purpose and a test that does not name one is
+    /// a test whose meaning changes when the default does.
     fn on(kernel: DenoiseKernel) -> DenoiseParams {
         DenoiseParams {
             kernel: kernel.dial(),
