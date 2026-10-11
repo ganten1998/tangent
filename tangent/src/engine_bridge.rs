@@ -566,10 +566,8 @@ pub fn row_instrument(app: &TangentApp, row: usize) -> Option<&str> {
 /// `instrument::Layer` for the rule), so every question of the form "does
 /// this track carry the DX7, the keyboard, the drumpad" is this one.
 pub fn track_holds(app: &TangentApp, id: TrackId, sentinel: &str) -> Option<u8> {
-    let bays = u8::try_from(tangent_ui::desk_id::BAYS).unwrap_or(u8::MAX);
-    (0..2u16)
-        .flat_map(|chain| (0..bays).map(move |bay| (chain, bay)))
-        .position(|(chain, bay)| track_bay(app, id, Rack::Chain(chain), bay) == Some(sentinel))
+    tangent_ui::desk_id::chain_bays()
+        .position(|(rack, bay)| track_bay(app, id, rack, bay) == Some(sentinel))
         .and_then(|at| u8::try_from(at).ok())
 }
 
