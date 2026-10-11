@@ -9966,6 +9966,18 @@ fn run_rack(
             .seat_cell(SeatKind::Bypass, seat * INSERTS + bay)
             .is_some_and(|c| c.load(Ordering::Relaxed) != 0)
         {
+            // **A bypassed Tangent Insert keeps its loop's delay** (the
+            // owner's ruling): the dry signal, as late as the latency the bay
+            // reports, so an A/B against bypass lines up and toggling it
+            // mid-play does not jump. No send, no ping. Every other unit's
+            // bypass is the untouched signal, as above.
+            if let Backend::Builtin(crate::builtin_fx::BuiltinUnit::HwInsert(u)) = &mut p.backend {
+                u.bypassed(planar, frames, out);
+                for (dst, src) in planar.iter_mut().zip(out.iter()).take(TAP_CHANNELS) {
+                    let n = frames.min(dst.len()).min(src.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                }
+            }
             // **An armed tap still shows the truth**: what leaves a bypassed
             // bay is what entered it, and an analyzer that froze on the last
             // block the plugin managed would be drawing a signal nobody is
@@ -48073,6 +48085,108 @@ mod hw_insert_road {
         let moved = on_master.live(MASTER_SEAT);
         assert!(moved.measured, "a measured bay opened unmeasured on another rack");
         assert_eq!(moved.latency, a.latency);
+    }
+
+    /// **A bypassed Tangent Insert keeps its loop's delay and refuses a
+    /// ping** (the owner's ruling): its output is the input as late as the
+    /// latency it reports, so switching bypass mid-note leaves the note
+    /// where it was (the loop here is a wire at unity); and a ping asked
+    /// while it is out is refused, or, asked a moment before, answered as
+    /// not running rather than fired later.
+    #[test]
+    fn a_bypassed_insert_keeps_its_delay_and_refuses_a_ping() {
+        let note = |rig: &mut Rig, flip_at: Option<usize>| -> Vec<f32> {
+            rig.e.set_pad_kit(5, {
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+                    samples: vec![0.05; 24_000 * 2],
+                    rate: 48_000,
+                    source: PathBuf::new(),
+                }));
+                kit
+            });
+            rig.e.set_channel_gain(5, 1.0);
+            rig.e.set_drum_strips(1 << 5);
+            for _ in 0..8 {
+                rig.block();
+            }
+            rig.e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: 5,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 20_000, key: PAD_BASE, vel: 100 }]),
+            }]);
+            rig.e.set_transport(1, 0);
+            rig.e.set_rolling(true);
+            let from = rig.tape.len();
+            for k in 0..60 {
+                if Some(k) == flip_at {
+                    rig.e.set_insert_bypass(&[]);
+                }
+                rig.block();
+            }
+            rig.tape[from..].iter().step_by(WIDE).copied().collect()
+        };
+        let onset = |t: &[f32]| t.iter().position(|v| v.abs() > 1e-3).expect("a sound");
+        // The reference: the loop in circuit.
+        let mut live = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            live.block();
+        }
+        let latency = live.ping(MASTER_SEAT).latency as usize;
+        let through = note(&mut live, None);
+        assert_eq!(onset(&through), latency, "the loop did not land at its latency");
+        // Bypassed from the start: the same onset, the same level.
+        let mut out = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            out.block();
+        }
+        let pinged = out.ping(MASTER_SEAT);
+        assert_eq!(pinged.latency as usize, latency);
+        out.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        assert!(out.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0).is_err(), "a bypassed bay took a ping");
+        let bypassed = note(&mut out, None);
+        assert_eq!(onset(&bypassed), onset(&through), "bypass moved the track");
+        assert!((bypassed[onset(&bypassed) + 500] - through[onset(&through) + 500]).abs() < 1e-4);
+        // Back in circuit mid-note: no jump, no gap.
+        let mut flip = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            flip.block();
+        }
+        flip.ping(MASTER_SEAT);
+        flip.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        let flipped = note(&mut flip, Some(20));
+        let at = onset(&flipped);
+        let level = flipped[at + 200];
+        for (k, v) in flipped[at + 200..at + 13_000].iter().enumerate() {
+            assert!((v - level).abs() < 1e-4, "frame {k} after the onset jumped to {v} from {level}");
+        }
+        // Asked, then bypassed a moment later: answered at once as not
+        // running, never fired when the bay comes back.
+        let mut late = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            late.block();
+        }
+        late.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0).expect("a port");
+        late.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        let start = late.tape.len();
+        for _ in 0..4 {
+            late.block();
+        }
+        assert!(!late.live(MASTER_SEAT).pinging, "a bypassed bay held its ping");
+        late.e.set_insert_bypass(&[]);
+        for _ in 0..400 {
+            late.block();
+        }
+        assert_eq!(
+            late.live(MASTER_SEAT).answer,
+            Some(Err(crate::units::hwinsert::PingFail::Expired.sentence().to_owned()))
+        );
+        assert!(
+            late.tape[start..].iter().skip(2).step_by(WIDE).all(|v| v.abs() < 0.4),
+            "the ping fired after the bay came back"
+        );
     }
 
     /// **A ping is refused on a bypassed bay, and one that waited out a
