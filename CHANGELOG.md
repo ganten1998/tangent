@@ -132,10 +132,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   grid chip (1/16 sw, 1/1024T), never under 6.5 points. Nothing is drawn
   outside a grid box any more, so a long step no longer runs onto the
   tempo lane's switch or under the navigator, and steps that already fit
-  keep their size. In Courier Prime and JetBrains Mono the arrangement's
-  1/1024 and 1/2048 (the finest steps of 1/16, 1/32, 2/32 and odd counts
-  of 32nds) are still too wide at 6.5 points and are cut at the box's
-  edges.
+  keep their size. A step still too wide at 6.5 points is cut at the box's
+  edges. The arrangement's grid box is 20 points square only while the
+  arrangement is at least 383 points tall; a shorter arrangement draws it
+  smaller, down to 7 points, so what is cut depends on the arrangement's
+  height and the font:
+
+  - Courier Prime and JetBrains Mono: 1/1024 and 1/2048 (the finest steps
+    of 1/16, 1/32, 2/32 and odd counts of 32nds) at every height. In an
+    arrangement shorter than 381 points (383 in JetBrains Mono),
+    five-character steps such as 1/128 and 11/16 as well; shorter than
+    327, four-character ones such as 1/16, 1/4· and 10/8; shorter than
+    257, three-character ones, BAR and 1/2 among them; shorter than 181,
+    the dotted whole, 1·.
+  - Terminess: shorter than 383 points, 1/1024 and 1/2048; shorter than
+    327, five characters; 276, four; 222, three; 159, 1·.
+
+  Just under each of those heights the cut comes and goes from one point
+  of height to the next, as the box's edges land on whole pixels or
+  between them.
 
   A screen reader names every step as a note: whole note, dotted half
   note, hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar"
