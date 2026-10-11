@@ -8,10 +8,9 @@
 //! neither happens is to have one source. Adding a binding is one line and the
 //! card updates itself.
 //!
-//! And the card is drawn IN THE CANVAS rather than in a child window. Every
-//! other surface in this app is an OS viewport, which a VST3 editor cannot
-//! create — so this is the first piece of UI that already works in both hosts,
-//! and the shape the rest will move to (docs/PLUGIN-PLAN.md).
+//! And the card is drawn IN THE CANVAS rather than in a child window, so it is
+//! the same card whether the menus and dialogs are OS windows or drawn inline,
+//! and no window manager can move it, hide it or size it into nothing.
 
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
@@ -85,8 +84,8 @@ pub enum KeyAction {
     /// Fill the screen, and come back.
     ///
     /// Gated on [`Gates::window_sizing`] for the same reason every other
-    /// window action is: a plugin editor lives inside somebody's DAW and has no
-    /// business taking their display.
+    /// window action is: only a window that is ours may be made to fill the
+    /// screen.
     ToggleFullscreen,
     /// Menus and dialogs inline, for a screen reader — the same switch as
     /// the menu row, reachable without a mouse.
@@ -97,7 +96,7 @@ pub enum KeyAction {
     ///
     /// Gated on [`Gates::window_sizing`] because the handler follows the
     /// menu row's semantics, and those hand back `child_windows` when the
-    /// mode goes off — a grant a plugin editor must never receive.
+    /// mode goes off, a grant only a host that owns its window may receive.
     ToggleReaderMode,
     TransposeUp,
     TransposeDown,
@@ -135,13 +134,13 @@ pub struct Gates {
     /// This host can record at all — `Caps::capture_devices`.
     ///
     /// Gates the key that OPENS the band, which obviously cannot be gated on
-    /// the band being open. False in a plugin and in a Minimal build, where
-    /// there is no recorder to show and the menu category is absent too.
+    /// the band being open. False in a Minimal build, where there is no
+    /// recorder to show and the menu category is absent too.
     pub recorder_available: bool,
     /// This host owns its window — `Caps::window_sizing`.
     ///
-    /// Gates fullscreen. A plugin editor lives inside somebody's DAW and has
-    /// no business taking their display.
+    /// Gates fullscreen and the reader-mode key: only a window that is ours
+    /// may fill the screen or be handed child windows back.
     pub window_sizing: bool,
     /// This session is being read out loud — `TangentApp::reader_mode()`,
     /// whoever decided so, the saved setting or this session's detection.
@@ -167,8 +166,8 @@ fn available(action: KeyAction, gates: Gates) -> bool {
         KeyAction::ToggleRecorder => gates.recorder_available,
         KeyAction::ToggleFullscreen => gates.window_sizing,
         // The same gate as the menu row it mirrors — critical, because the
-        // handler grants `child_windows` back when the mode turns off, and a
-        // plugin editor must never receive that grant.
+        // handler grants `child_windows` back when the mode turns off, and
+        // only a host that owns its window may receive that grant.
         KeyAction::ToggleReaderMode => gates.window_sizing,
         _ => true,
     }
@@ -903,7 +902,7 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
 ///
 /// Centred, sized to its own content, and painted directly rather than through
 /// a `Window` so it cannot be dragged off, cannot be resized into nothing, and
-/// looks identical in a plugin editor where there is no window manager at all.
+/// looks identical inline, where there is no window manager at all.
 ///
 /// `gates` reaches the card for one reason only: a shortcut the app would
 /// ignore must not be advertised. It goes through the same `available` the
@@ -1713,7 +1712,7 @@ mod tests {
     /// gesture the person this switch exists for is least able to aim — so
     /// J is the keyboard door. Gated on `window_sizing` because the
     /// handler hands `child_windows` back when the mode turns off, a grant
-    /// a plugin editor must never receive.
+    /// only a host that owns its window may receive.
     #[test]
     fn j_toggles_reader_mode_only_where_the_window_is_ours() {
         let ours = Gates { window_sizing: true, ..Gates::default() };

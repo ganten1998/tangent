@@ -2086,11 +2086,11 @@ mod tests {
         dir
     }
 
-    /// The app under test: a free install, and `Caps::PLUGIN` so nothing it
+    /// The app under test: a free install, and `Caps::NONE` so nothing it
     /// does writes a settings file (`persist_global_settings` is off).
     fn app_with(settings: Settings) -> TangentApp {
         let ctx = egui::Context::default();
-        TangentApp::with_license(&ctx, settings, Caps::PLUGIN, crate::composite::tiers::free("bridge"))
+        TangentApp::with_license(&ctx, settings, Caps::NONE, crate::composite::tiers::free("bridge"))
     }
 
     /// The shipped desk with every channel emptied, so each desk below says

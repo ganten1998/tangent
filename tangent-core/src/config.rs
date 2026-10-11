@@ -15,8 +15,8 @@
 //! What the old directory held, so that nobody is surprised by what goes:
 //! `license.key`, `settings.json`, `overrides.json`, `my-patches.syx`.
 //!
-//! The deletion is [`purge_pre_5_0`], and only the HOST calls it — a VST3
-//! scanned in the background by somebody else's DAW must not be deleting
+//! The deletion is [`purge_pre_5_0`], and only the HOST calls it: a library
+//! function that every test and probe can reach must not be deleting
 //! directories in the user's home.
 //!
 //! **`TANGENT_CONFIG_DIR` points a build anywhere**, a developer's switch:

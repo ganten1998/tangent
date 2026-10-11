@@ -17,9 +17,9 @@
 //! observation below is a plain-text picture of what a fixture opened as,
 //! and each fixture's picture is pinned as written.
 //!
-//! The DAW blobs ride the same road (`Settings::from_json` is the plugin's
-//! `#[persist = "settings"]` reader), here rather than in the plugin crate,
-//! whose tests the gate does not run.
+//! The DAW blobs are what the retired VST3 saved into a DAW project (its
+//! `#[persist = "settings"]` field, written by `Settings::to_json`), kept as
+//! fixtures because `Settings::from_json` still reads that text.
 //!
 //! `TANGENT_ERA_DUMP=/some/dir cargo test -p tangent-ui --lib
 //! era_corpus::write_observations -- --ignored` writes each fixture's
@@ -360,8 +360,9 @@ fn the_24_channel_window_opens_to_its_lifted_picture_under_the_switch() {
 
 /// **Opened once, every fixture is a fixed point**: written by this build
 /// and read back, it writes the same bytes and opens to the same picture.
-/// The DAW blobs are the plugin's whole persistence, so a blob that drifted
-/// on each save would drift in every project that holds it.
+/// A DAW blob was the retired VST3's whole persistence, so a blob that
+/// drifted on each save drifted in every project that held it; the JSON
+/// road keeps the same promise.
 #[test]
 fn every_fixture_round_trips_once_opened() {
     round_trips();
@@ -1127,8 +1128,9 @@ const DEFAULT_V2_BYTES: (u64, usize) = (0x2b4e_95dd_5375_0895, 29341);
 #[test]
 fn production_writes_the_format_2_bytes() {
     assert!(crate::desk_format::WRITE_V8, "the switch is off: production writes the legacy desk");
-    // `to_json` is the DAW blob's text (compact); the file is the same map
-    // pretty-printed, which `FORMAT2_BYTES` pins through `settings_v2`.
+    // `to_json` is the JSON road's text (compact, a DAW blob's shape); the
+    // file is the same map pretty-printed, which `FORMAT2_BYTES` pins
+    // through `settings_v2`.
     let compact = |s: &Settings| Value::Object(s.to_map_as(Format::V2)).to_string();
     for (name, text) in SETTINGS {
         let s = Settings::from_json(text);

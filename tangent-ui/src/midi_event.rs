@@ -5,11 +5,12 @@
 //! rules (spec §10) fold channels together, treat a note-on with velocity 0 as
 //! a note-off, and read CC64 as the only controller that matters.
 //!
-//! It lives here rather than beside the `midir` connection because a VST3 build
-//! has no `midir`: the host hands it note events directly, and it needs to say
-//! the same three things about them. `parse_message` comes along because a
-//! plugin still has to read raw bytes for anything the host passes through
-//! verbatim, and because its rules ARE the parity rules.
+//! It lives here rather than beside the `midir` connection because the app
+//! reads it and this crate cannot see `midir` at all (the firewall): the
+//! binary turns the wire into these and sends them across the channel.
+//! `parse_message` comes along because its rules ARE the parity rules, so
+//! they are written and tested beside the alphabet they produce, and the
+//! binary's callback (`tangent/src/midi.rs`) calls it from there.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidiEvent {

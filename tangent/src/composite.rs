@@ -1803,8 +1803,10 @@ mod shot {
     /// child viewports on the desktop besides, which an offscreen compositor
     /// does not run at all.
     ///
-    /// To look at a DIALOG, run the real binary with the inline caps, where
-    /// they are drawn as a layer over the canvas:
+    /// To look at a DIALOG, run the real binary in screen-reader mode
+    /// (Window > Menus Inside the Window, or J), where dialogs are drawn as a
+    /// layer over the canvas; `IVORY_INLINE=menu` opens the menu on the first
+    /// frame:
     ///
     ///   IVORY_INLINE=menu ./target/debug/tangent
     #[test]

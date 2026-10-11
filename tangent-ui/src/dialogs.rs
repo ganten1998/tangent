@@ -3,8 +3,9 @@
 //! custom tuning editor for the guitar view (D-UI-15), and the recorder's
 //! Export dialog (RECORDER-PLAN §5).
 //! Each dialog is its own immediate viewport, like Qt's top-level dialogs
-//! (the fixed-size main window is too small to host them) — or, in a plugin,
-//! a layer in the canvas. `show_dialog_viewport` is the funnel that makes
+//! (the fixed-size main window is too small to host them) or, with child
+//! windows off (screen-reader mode, fullscreen), a layer in the canvas.
+//! `show_dialog_viewport` is the funnel that makes
 //! that the same code, and nothing here may open a window by itself. A
 //! QUESTION wears the OS's chrome and freezes the desk; a PLUGIN window (a
 //! face, the Keys panel, the pickers they open) wears the in-house bar from
@@ -4255,10 +4256,9 @@ fn vst3_locations() -> &'static str {
 ///
 /// * **Whether this build records and hosts plugins at all.** Both arrive
 ///   with the recorder, so `Caps::capture_devices` answers for both: the
-///   same gate the menu's plugin-folder rows use. It is false in a plugin
-///   editor and in a Minimal build, which link neither the recorder nor the
-///   plugin host, and have no audio engine either; what they are is the
-///   chord display.
+///   same gate the menu's plugin-folder rows use. It is false in a Minimal
+///   build, which links neither the recorder nor the plugin host, and has
+///   no audio engine either; what it is is the chord display.
 /// * **Which plugin formats**, by TARGET platform. LV2 is compiled only on
 ///   Linux and FreeBSD (`tangent-host`'s Cargo.toml gates `livi`, `lilv` and
 ///   `lv2-sys` there; `about_lists_lv2_exactly_where_the_host_compiles_it`
@@ -5853,9 +5853,9 @@ const EXPORT_MAX: Vec2 = Vec2::new(1200.0, 620.0);
 
 /// The export window's size on this display — see [`EXPORT_SHARE`].
 ///
-/// `monitor` is whatever [`Placement`] was handed: the screen on the
-/// desktop, the plugin editor's own canvas inline, and the same share is
-/// the right answer to both.
+/// `monitor` is whatever [`Placement`] was handed: the screen with child
+/// windows, the app's own canvas inline, and the same share is the right
+/// answer to both.
 ///
 /// The rule itself is [`crate::shell::share_of_screen`] and lives there
 /// rather than here: a share of the display with a floor, a ceiling and a
@@ -5957,8 +5957,8 @@ const FACE_IR: (Vec2, Vec2, Vec2) = (
 
 /// The face window for `unit` on this display. See [`FACE_SIZES`].
 ///
-/// `monitor` is whatever [`Placement`] was handed — the screen on the
-/// desktop, the plugin editor's own canvas inline — and `None` on the frames
+/// `monitor` is whatever [`Placement`] was handed (the screen with child
+/// windows, the app's own canvas inline) and `None` on the frames
 /// before anything has been measured, where `share_of_screen` answers with
 /// the floor, which is the size these faces opened at for their whole life so
 /// far.
@@ -6193,21 +6193,21 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 ///    click going nowhere.
 /// 6. **Close Setup.** The export window is back in front of everything
 ///    within a frame or two, still drawing.
-/// 7. **The plugin path.** Open the suite plugin in a host, start an export
-///    from it, and check the same things in the canvas: the window is drawn
-///    over the piano and the recorder band, the canvas behind it is NOT
-///    dimmed (it is reporting, not asking), a click on the window's face
-///    does not operate a control underneath it, a message raised mid-render
-///    appears in the corner column rather than as a second window, and a
-///    dialog opened from the menu paints OVER it and can be used — including
-///    its dropdowns and its hover text, which is what keeps a question in the
-///    band its own popups are drawn in.
+/// 7. **The inline path.** Turn screen-reader mode on (Window > Menus Inside
+///    the Window, or J), start an export, and check the same things in the
+///    canvas: the window is drawn over the piano and the recorder band, the
+///    canvas behind it is NOT dimmed (it is reporting, not asking), a click
+///    on the window's face does not operate a control underneath it, a
+///    message raised mid-render appears in the corner column rather than as
+///    a second window, and a dialog opened from the menu paints OVER it and
+///    can be used, its dropdowns and its hover text included, which is
+///    what keeps a question in the band its own popups are drawn in.
 /// 7a. **The raw-pointer hole, now closed.** Inline, `shell` swallows what
 ///    lands on a surface at egui's hit test, which covers every widget and
 ///    the main background's own response. The handlers that read `i.pointer`
 ///    directly — the piano's note press, the recorder band's hit test — are
 ///    gated by `App::dialog_blocks_pointer`, which used to answer only about
-///    a `Dialog`, so a click on the waveform sounded a note in the plugin.
+///    a `Dialog`, so a click on the waveform sounded a note inline.
 ///    That function now asks [`pointer_over_export`] first. Press the middle
 ///    of the window and listen: nothing.
 /// 8. **A native file panel beats everything.** Start an export, then open
@@ -6243,9 +6243,9 @@ pub fn show_export_progress(
         // **Not modal.** It blocks nothing and dims nothing: the desk stays
         // live under a render, which is the whole reason this is not a
         // `Dialog`. It went through `show_dialog_viewport` before, which
-        // decides modality from `chrome` and therefore made it modal inline
-        // — a plugin canvas greyed out behind a window that was reporting,
-        // not asking.
+        // decides modality from `chrome` and therefore made it modal inline:
+        // a canvas greyed out behind a window that was reporting, not
+        // asking.
         //
         // Not modal is not the same as transparent to a press: `shell`
         // swallows what lands on any inline surface whether or not it dims,
@@ -15868,14 +15868,14 @@ mod tests {
         );
     }
 
-    /// The editor has to draw where there is no window manager at all: in a
-    /// plugin it is an `Area` in the DAW's canvas, and `show` is the only
-    /// funnel that knows the difference. This runs a whole frame of it inline —
-    /// text fields, a wrapped row of preset buttons, a scroll area and twelve
-    /// spinners sharing one `Area` id — and asserts the editor does nothing on
+    /// The editor has to draw where there is no window manager at all: inline
+    /// it is an `Area` in the app's own canvas, and `show` is the only funnel
+    /// that knows the difference. This runs a whole frame of it inline (text
+    /// fields, a wrapped row of preset buttons, a scroll area and twelve
+    /// spinners sharing one `Area` id) and asserts the editor does nothing on
     /// its own until it is confirmed.
     #[test]
-    fn the_editor_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+    fn the_editor_draws_inline_and_says_nothing_until_it_is_confirmed() {
         let ctx = egui::Context::default();
         // The dialogs name Courier Prime explicitly and epaint PANICS on a
         // font family that is not bound, so the fonts have to be installed
@@ -15890,7 +15890,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -17133,13 +17133,13 @@ at: None,
     }
 
     /// Like the tuning editor, this dialog has to draw where there is no window
-    /// manager at all — in a plugin it is an `Area` in the DAW's canvas, and
+    /// manager at all: inline it is an `Area` in the app's own canvas, and
     /// `show` is the only funnel that knows the difference. This runs a whole
     /// frame of it inline (a text field, four radio groups, eleven checkboxes
     /// and a scroll area sharing one `Area` id) and asserts it does nothing on
     /// its own until it is confirmed.
     #[test]
-    fn the_export_dialog_draws_inline_in_a_plugin_and_says_nothing_until_it_is_confirmed() {
+    fn the_export_dialog_draws_inline_and_says_nothing_until_it_is_confirmed() {
         let ctx = egui::Context::default();
         // The dialogs name Courier Prime explicitly and epaint PANICS on a
         // font family that is not bound.
@@ -17154,7 +17154,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -17279,8 +17279,8 @@ at: None,
     /// went in below the floor and could not be clicked at all, which is why
     /// the size argument at the arm is written the way it is.
     ///
-    /// So the frame is run for real, inline (the plugin path, where the
-    /// dialog is an `Area` in a canvas), and the question put to it is the
+    /// So the frame is run for real, inline (where the dialog is an `Area` in
+    /// a canvas), and the question put to it is the
     /// user's own: **is the word "Export" on the screen, inside the window,
     /// where it can be clicked?** The button's own painted glyphs are found
     /// among the frame's shapes and their rectangle is compared with the
@@ -17333,7 +17333,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -17398,8 +17398,8 @@ at: None,
 
     // ── the busy cover, and what it has to be over ──────────────────────────
 
-    /// The placement the two cover guards below draw against: the PLUGIN
-    /// caps, where every surface is an `Area` in one canvas and the paint
+    /// The placement the two cover guards below draw against: `Caps::NONE`,
+    /// where every surface is an `Area` in one canvas and the paint
     /// order is the whole of the z-order. On the desktop each of these is an
     /// OS window and the ladder is `shell::SurfaceTier`'s, which
     /// `a_cover_is_painted_above_every_surface_this_app_can_open` reads from
@@ -17455,7 +17455,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         }
@@ -17666,8 +17666,8 @@ at: None,
         out
     }
 
-    /// The picker drawn inline, the way a plugin editor draws it: what ended up
-    /// on the screen, and anything it asked the app to do.
+    /// The picker drawn inline, the way reader mode draws it: what ended up on
+    /// the screen, and anything it asked the app to do.
     ///
     /// Three frames, not one. An `egui::Area` whose size is not known yet runs a
     /// SIZING PASS — it lays the whole dialog out and paints none of it
@@ -17676,10 +17676,10 @@ at: None,
     /// shapes would find a blank screen and conclude the dialog draws nothing,
     /// which is the wrong answer to the right question.
     fn run_picker(dialog: &mut Option<Dialog>) -> (String, Option<DialogAction>) {
-        run_picker_with(dialog, crate::host::Caps::PLUGIN)
+        run_picker_with(dialog, crate::host::Caps::NONE)
     }
 
-    /// [`run_picker`] for a host other than the plugin's. `caps` must keep
+    /// [`run_picker`] for a host other than `Caps::NONE`. `caps` must keep
     /// `child_windows` off, which is what draws the dialog in the canvas
     /// where the test can read it.
     fn run_picker_with(
@@ -17901,7 +17901,7 @@ at: None,
     /// I playing through" by reading 112 rows. The loaded bundle is preselected
     /// and marked, and — because it may be ninety rows down — the mark is only
     /// worth anything if the list opens on it, which is what the `focus` flag
-    /// also does. This runs the frame inline, the way a plugin editor draws it.
+    /// also does. This runs the frame inline, the way reader mode draws it.
     /// **A folded capture SAYS SO on the page that offers to save it.**
     ///
     /// The fault it announces: a device sampling lower than the interface
@@ -18088,7 +18088,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -18296,9 +18296,9 @@ at: None,
     }
 
     /// **A build with no recorder claims neither recording nor hosting.** A
-    /// plugin editor and a Minimal build link neither the recorder nor the
-    /// plugin host and have no audio engine, so their card describes the
-    /// chord display. It said "Recorder ... LV2/VST3" in both.
+    /// Minimal build links neither the recorder nor the plugin host and has
+    /// no audio engine, so its card describes the chord display. It said
+    /// "Recorder ... LV2/VST3".
     #[test]
     fn about_in_a_build_without_the_recorder_claims_neither_recording_nor_hosting() {
         let mut dialog = Some(Dialog::About { supporter: false });
@@ -18308,18 +18308,19 @@ at: None,
             "{painted}"
         );
         for claim in ["recording DAW", "Recorder", "VST3", "LV2"] {
-            assert!(!painted.contains(claim), "the plugin's card says {claim:?}: {painted}");
+            assert!(!painted.contains(claim), "the card without a recorder says {claim:?}: {painted}");
         }
         assert!(painted.contains("tangentdaw@gmail.com"), "{painted}");
-        // Minimal gives up the same two capabilities, so it gets the same card.
+        // The card above was painted at `Caps::NONE`; Minimal gives up the
+        // same two capabilities that decide it, so it gets the same card.
         assert_eq!(
             about_lines(crate::host::Caps::MINIMAL, false),
-            about_lines(crate::host::Caps::PLUGIN, false)
+            about_lines(crate::host::Caps::NONE, false)
         );
         // **And the standing changes neither.** A chord display has no desk,
-        // so a supporter's Minimal or plugin card keeps the chord-display
-        // line rather than claiming tracks it cannot record.
-        for caps in [crate::host::Caps::MINIMAL, crate::host::Caps::PLUGIN] {
+        // so a supporter's Minimal card keeps the chord-display line rather
+        // than claiming tracks it cannot record.
+        for caps in [crate::host::Caps::MINIMAL, crate::host::Caps::NONE] {
             assert_eq!(about_lines(caps, true), about_lines(caps, false));
         }
     }
@@ -18540,11 +18541,11 @@ at: None,
             "the floor never engages"
         );
 
-        // And a canvas too small even for the floor — a plugin editor, where
-        // `monitor` is the editor's own pane. The window comes down to fit,
-        // and the minimum it may be dragged to comes down with it, because a
-        // minimum larger than the size just asked for is a window that
-        // cannot be placed.
+        // And a canvas too small even for the floor: a short window drawing
+        // inline, where `monitor` is the app's own pane. The window comes
+        // down to fit, and the minimum it may be dragged to comes down with
+        // it, because a minimum larger than the size just asked for is a
+        // window that cannot be placed.
         let tiny = Vec2::new(400.0, 300.0);
         let size = export_window_size(Some(tiny));
         assert!(size.x < EXPORT_MIN.x && size.y < EXPORT_MIN.y, "{size:?}");
@@ -18635,8 +18636,8 @@ at: None,
             assert!((l.playhead(9.0) - l.wave.right()).abs() < 0.01);
         }
 
-        // Squeezed under its own minimum — which the inline shell can do on a
-        // very short plugin editor. Nothing inverts and nothing escapes.
+        // Squeezed under its own minimum, which the inline shell can do in a
+        // very short window. Nothing inverts and nothing escapes.
         for h in [90.0_f32, 40.0, 10.0, 0.0] {
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, h));
             let l = export_layout(rect);
@@ -18837,7 +18838,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -19536,7 +19537,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: Some(screen.size()),
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -19974,8 +19975,8 @@ at: None,
     /// as (rect, colour) and (rect, colour, words).
     ///
     /// `painted_text` above reads the words; this reads the picture. Three
-    /// frames for the reason that one spells out — an `egui::Area` whose size
-    /// is not known yet runs an invisible sizing pass — and `Caps::PLUGIN` so
+    /// frames for the reason that one spells out (an `egui::Area` whose size
+    /// is not known yet runs an invisible sizing pass), and `Caps::NONE` so
     /// the dialog is drawn INLINE rather than into a viewport a headless
     /// context never presents.
     #[allow(clippy::type_complexity)]
@@ -19992,7 +19993,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -20098,7 +20099,7 @@ at: None,
                 monitor: None,
                 // Inline rather than into a viewport, which a headless
                 // context never presents.
-                caps: crate::host::Caps::PLUGIN,
+                caps: crate::host::Caps::NONE,
                 chrome: None,
                 surface: None,
             }
@@ -21135,7 +21136,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22466,7 +22467,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22580,7 +22581,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };
@@ -22683,7 +22684,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps: crate::host::Caps::NONE,
             chrome: None,
             surface: None,
         };

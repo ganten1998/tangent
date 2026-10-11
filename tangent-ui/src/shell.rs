@@ -1,20 +1,19 @@
 //! The seam between "something hands us a window" and "we draw into it".
 //!
-//! Three different hosts call into this app and all three hand over an
+//! Two different hosts call into this app, and both hand over an
 //! `egui::Context` rather than a `Ui`:
 //!
-//!   * `eframe::App::update` for the desktop window,
-//!   * `Context::show_viewport_immediate` for each child window, and
-//!   * `nih_plug_egui`'s editor callback for the VST3 build.
+//!   * `eframe::App::update` for the desktop window, and
+//!   * `Context::show_viewport_immediate` for each child window.
 //!
 //! Every drawing surface here paints absolutely into `max_rect` and owns its
-//! whole window, so the bridge is the same in all three cases and costs
-//! nothing: one central panel with no frame, no margin and no fill.
+//! whole window, so the bridge is the same in both cases and costs nothing:
+//! one central panel with no frame, no margin and no fill.
 //!
-//! Keeping it in one place matters more than it looks. The desktop and plugin
-//! builds have to render identically, and the fastest way to end up with two
-//! subtly different GUIs is to let each entry point grow its own idea of what
-//! the root panel should be.
+//! Keeping it in one place matters more than it looks. A window, a child
+//! window and every test's bare context have to render identically, and the
+//! fastest way to end up with subtly different GUIs is to let each entry
+//! point grow its own idea of what the root panel should be.
 
 use crate::host::Caps;
 use crate::recorder_panel::{legible_surface, surface_of};
@@ -38,8 +37,8 @@ pub fn viewport_ui<R>(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui) -> R)
 /// thing on screen the theme cannot reach — thirty-two themes on the desk and
 /// one grey Aqua strip over every face. A bar of our own follows the theme
 /// on the same frame the desk does, is the same bar on every platform, and
-/// is the same bar in the plugin build's canvas, where there is no OS bar
-/// to borrow at all.
+/// is the same bar drawn inline in the canvas, where there is no OS bar to
+/// borrow at all.
 ///
 /// Three colours, each MEASURED. The bar is the body's raised shade made
 /// able to carry ink of its own (`legible_surface`); the ink is what
@@ -502,7 +501,7 @@ pub fn share_of_screen(monitor: Option<Vec2>, share: Vec2, floor: Vec2, ceiling:
     crate::settings::clamp_size_to_monitor(want, Some(m))
 }
 
-/// A pane that is an OS window on the desktop and a floating layer in a plugin.
+/// A pane that is an OS window on the desktop and a floating layer inline.
 ///
 /// The fields are exactly the union of what the real callers set on a
 /// `ViewportBuilder`; nothing is here speculatively. `id` is used for BOTH the
@@ -627,8 +626,8 @@ impl Default for SurfaceSpec<'_> {
 pub struct SurfaceReport {
     pub close: bool,
     /// `None` inline: there is no window, so there is no focus to lose. Callers
-    /// must not read absence as "unfocused" — that is what would make a plugin
-    /// menu close itself on the first frame.
+    /// must not read absence as "unfocused": that is what would make an
+    /// inline menu close itself on the first frame.
     pub focused: Option<bool>,
     /// A pointer press landed outside this surface's rect this frame. Only ever
     /// true inline; on the desktop, a click elsewhere shows up as focus loss.
@@ -662,12 +661,13 @@ fn viewport_id(id: &str) -> egui::ViewportId {
 /// Draw `add` into a surface, as an OS window or in the canvas.
 ///
 /// **This is the only place in `tangent-ui` that decides between the two.** The
-/// plugin path is not a fallback for calls that fail: in a plugin
-/// `show_viewport_immediate` still RUNS, because the context is built with
-/// `embed_viewports: true`, so it invokes the closure inline and opens a second
-/// `CentralPanel` under the same id as the first — painting garbage over the
-/// piano rather than erroring. A hard error would have been kinder. That is why
-/// the branch sits ABOVE `viewport_ui` rather than inside it.
+/// inline path is not a fallback for calls that fail: where a context embeds
+/// its viewports (`embed_viewports: true`, which a bare `egui::Context` is)
+/// `show_viewport_immediate` still RUNS, invoking the closure inline and
+/// opening a second `CentralPanel` under the same id as the first, which
+/// paints garbage over the piano rather than erroring. A hard error would
+/// have been kinder. That is why the branch sits ABOVE `viewport_ui` rather
+/// than inside it.
 ///
 /// `add` receives the `Ui` and a `&mut bool` it sets to ask for the surface to
 /// close (a Cancel button, a menu item chosen). Every other reason to close is
@@ -684,8 +684,8 @@ pub fn surface(
     // **The tier, settled once for both paths.** Read before anything is
     // drawn, because the answer decides the level this surface is BORN at as
     // well as the one it is told to hold — and because the claim has to be
-    // stamped whether this surface ends up a window or a layer, or a plugin
-    // editor would leave a stale claim holding every desktop dialog down.
+    // stamped whether this surface ends up a window or a layer, or the inline
+    // path would leave a stale claim holding every windowed dialog down.
     let pass = ctx.cumulative_pass_nr();
     let me = egui::Id::new(spec.id);
     let standing = standing_claim(ctx, pass);
@@ -903,7 +903,7 @@ pub fn surface(
             .max(least.y.min(screen.height())),
     );
     // Clamped rather than trusted: a right-click near the bottom of a short
-    // editor would otherwise put the menu mostly off the canvas, and unlike
+    // window would otherwise put the menu mostly off the canvas, and unlike
     // a window there is no desktop for it to hang over. A dragged bar is
     // held to the same rule, for the same reason.
     let clamp_in = |p: Pos2| {
@@ -922,8 +922,8 @@ pub fn surface(
     };
 
     if spec.modal {
-        // Dim the app behind it. Without this the piano behind a plugin dialog
-        // looks live when it is not.
+        // Dim the app behind it. Without this the piano behind an inline
+        // dialog looks live when it is not.
         //
         // **`Middle`, which is also where a stood-down render lands** — see
         // [`SurfaceTier::inline_order`] — and the render is drawn after the
@@ -993,8 +993,9 @@ pub fn surface(
                 // it a rect smaller than it asked for does not make it smaller
                 // — it makes it CUT OFF, with the rows past the bottom edge
                 // drawn and unreachable. The menu is about 460 points tall and
-                // a plugin editor is often shorter than that, so the last third
-                // of it, Reset and About included, simply could not be clicked.
+                // a window drawing it inline is often shorter than that, so the
+                // last third of it, Reset and About included, simply could not
+                // be clicked.
                 //
                 // On the desktop, and inline whenever the surface fits, this
                 // branch is not taken and not one pixel moves.
@@ -1104,7 +1105,7 @@ mod tests {
         let mut visible = Rect::NOTHING;
         let mut report = SurfaceReport::default();
         let _ = ctx.run(input, |ctx| {
-            report = surface(ctx, Caps::PLUGIN, spec, &mut |ui, _close| {
+            report = surface(ctx, Caps::NONE, spec, &mut |ui, _close| {
                 got = ui.max_rect();
                 visible = ui.clip_rect();
             });
@@ -1114,9 +1115,9 @@ mod tests {
 
     /// The inline surface must land inside the canvas whatever position it is
     /// asked for. A menu opened by a right-click near the bottom edge of a
-    /// short plugin editor is the real case: on the desktop it may hang over
-    /// the rest of the screen, inline there is nothing to hang over, and an
-    /// unclamped menu is one whose lower rows cannot be clicked.
+    /// short window drawing inline is the real case: as a window it may hang
+    /// over the rest of the screen, inline there is nothing to hang over, and
+    /// an unclamped menu is one whose lower rows cannot be clicked.
     #[test]
     fn an_inline_surface_stays_inside_the_canvas() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0));
@@ -1140,15 +1141,15 @@ mod tests {
         }
     }
 
-    /// A surface bigger than the editor SCROLLS. It must not be shrunk, and it
+    /// A surface bigger than the canvas SCROLLS. It must not be shrunk, and it
     /// must not be clipped.
     ///
     /// This test used to assert the opposite — that the body is handed a rect
     /// that fits — and that assertion was the bug. Every body here paints
     /// absolutely into `max_rect`, so a smaller rect does not make a smaller
     /// menu; it makes one whose bottom rows are drawn past the edge and cannot
-    /// be clicked. The menu is ~460pt tall and a plugin editor is often less,
-    /// so Reset, About and Theory were all unreachable in a plugin.
+    /// be clicked. The menu is ~460pt tall and a short window is often less,
+    /// so Reset, About and Theory were all unreachable inline.
     #[test]
     fn an_oversized_inline_surface_scrolls_rather_than_clipping() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0));
@@ -1175,7 +1176,7 @@ mod tests {
 
     /// ...and a surface that DOES fit is handed exactly its rect, with no
     /// scroll area in the way. This is every dialog on the desktop and most of
-    /// them in a plugin, so it is the path that must not change.
+    /// them inline, so it is the path that must not change.
     #[test]
     fn a_surface_that_fits_is_not_wrapped_in_anything() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
@@ -1218,7 +1219,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                    surface(ctx, Caps::NONE, &spec, &mut |ui, _| {
                         body_top = ui.max_rect().min.y;
                     });
                 },
@@ -1281,7 +1282,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                report = surface(ctx, Caps::PLUGIN, &spec, &mut |_ui, close| *close = true);
+                report = surface(ctx, Caps::NONE, &spec, &mut |_ui, close| *close = true);
             },
         );
         assert!(report.close, "the body asked to close and was ignored");
@@ -1685,8 +1686,8 @@ mod tests {
     /// **The same answer in the canvas: a question is on top, the render is
     /// over the announcement, and nothing falls through.**
     ///
-    /// The plugin path has no window levels at all — a surface is an `Area`
-    /// and its height is its paint order — so the ladder has to be checked
+    /// The inline path has no window levels at all (a surface is an `Area`
+    /// and its height is its paint order), so the ladder has to be checked
     /// separately here. The order the app draws them in is the trap: the
     /// dialog goes first and the export window last, so "whoever is drawn
     /// last is on top" gets exactly the wrong answer, which is the bug this
@@ -1727,10 +1728,10 @@ mod tests {
                     // `App::update`'s order: the dialog, then the message,
                     // then the export window.
                     if ask {
-                        surface(ctx, Caps::PLUGIN, &question, &mut |_ui, _c| {});
+                        surface(ctx, Caps::NONE, &question, &mut |_ui, _c| {});
                     }
-                    surface(ctx, Caps::PLUGIN, &notice, &mut |_ui, _c| {});
-                    surface(ctx, Caps::PLUGIN, &render, &mut |_ui, _c| {});
+                    surface(ctx, Caps::NONE, &notice, &mut |_ui, _c| {});
+                    surface(ctx, Caps::NONE, &render, &mut |_ui, _c| {});
                     *top = ctx.layer_id_at(screen.center());
                 },
             );
@@ -1807,8 +1808,8 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                surface(ctx, Caps::PLUGIN, &one, &mut |_ui, _c| {});
-                surface(ctx, Caps::PLUGIN, &two, &mut |_ui, _c| {});
+                surface(ctx, Caps::NONE, &one, &mut |_ui, _c| {});
+                surface(ctx, Caps::NONE, &two, &mut |_ui, _c| {});
             },
         );
     }
@@ -1934,7 +1935,7 @@ mod tests {
                             egui::Sense::click_and_drag(),
                         );
                     });
-                    surface(ctx, Caps::PLUGIN, &spec, &mut |_ui, _close| {});
+                    surface(ctx, Caps::NONE, &spec, &mut |_ui, _close| {});
                     middle = ctx.layer_id_at(screen.center());
                     corner = ctx.layer_id_at(screen.min + Vec2::splat(4.0));
                 },
@@ -1967,8 +1968,9 @@ mod tests {
     /// window that happens to use it first. All four parts have to bite:
     /// the share on an ordinary display, the floor on a small one, the
     /// ceiling on a big one, and the clamp on a display so small the floor
-    /// itself does not fit — which is not a hypothetical, it is a plugin
-    /// editor's canvas.
+    /// itself does not fit, which is not a hypothetical: inline, the
+    /// "display" is the app's own canvas, and a short window makes it that
+    /// small.
     #[test]
     fn a_window_takes_its_share_of_the_screen_between_a_floor_and_a_ceiling() {
         let share = Vec2::new(0.46, 0.40);
@@ -2138,7 +2140,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    report = surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                    report = surface(ctx, Caps::NONE, &spec, &mut |ui, _| {
                         body_rect.set(ui.max_rect());
                     });
                 },
@@ -2223,7 +2225,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    report = surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                    report = surface(ctx, Caps::NONE, &spec, &mut |ui, _| {
                         let r = ui.text_edit_singleline(&mut text);
                         r.request_focus();
                     });
@@ -2249,7 +2251,7 @@ mod tests {
         }
 
         // **Both chrome paths carry it.** The harness above runs on
-        // `Caps::PLUGIN`, which has no child windows and so exercises only
+        // `Caps::NONE`, which has no child windows and so exercises only
         // the INLINE bar; the desktop's child-window path is the one the
         // quantize window actually takes. A source scan, because driving a
         // real child viewport needs a window server.
