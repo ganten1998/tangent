@@ -55,6 +55,14 @@ pub enum Kind {
     /// blind student cannot read the notes from has been made operable and
     /// not useful.
     Readout,
+    /// Something to TYPE into: a field holding a number, which a press opens
+    /// for the keys.
+    ///
+    /// Said as editable text - the role a screen reader has words for ("edit
+    /// text") - with what it holds as its value. A `Readout` says the number
+    /// and never that it can be changed, which for a field is half of what
+    /// it is. Appended at the END.
+    Field,
 }
 
 /// One thing on a painted surface that a keyboard can reach and a screen
@@ -177,6 +185,20 @@ impl Node {
         }
     }
 
+    /// A typed field. `holds` is what is in it: the value, or the text being
+    /// typed while it is open.
+    pub fn field(id: Id, rect: Rect, label: impl Into<String>, holds: impl Into<String>) -> Self {
+        Self {
+            id,
+            rect,
+            kind: Kind::Field,
+            label: label.into(),
+            value: Some(holds.into()),
+            enabled: true,
+            travel: None,
+        }
+    }
+
     #[must_use]
     pub fn enabled(mut self, yes: bool) -> Self {
         self.enabled = yes;
@@ -197,7 +219,7 @@ impl Node {
             Kind::Toggle(on) => {
                 out.push_str(if on { ", on" } else { ", off" });
             }
-            Kind::Button | Kind::Slider { .. } | Kind::Readout => {}
+            Kind::Button | Kind::Slider { .. } | Kind::Readout | Kind::Field => {}
         }
         if !self.enabled {
             out.push_str(", unavailable");
@@ -237,6 +259,16 @@ fn info(node: &Node) -> egui::WidgetInfo {
         // let the user step it, and one that does not still reads the words.
         Kind::Slider { now, .. } => WidgetInfo::slider(node.enabled, now, node.spoken()),
         Kind::Readout => WidgetInfo::labeled(WidgetType::Label, node.enabled, node.spoken()),
+        // **Editable text, named and holding its value.** The NAME is the
+        // label and what it holds is the text - not `spoken()` as the label,
+        // which would have a reader say the number twice. The role is what
+        // says it can be typed into.
+        Kind::Field => WidgetInfo {
+            enabled: node.enabled,
+            label: Some(node.label.clone()),
+            current_text_value: Some(node.value.clone().unwrap_or_default()),
+            ..WidgetInfo::new(WidgetType::TextEdit)
+        },
     }
 }
 
@@ -417,6 +449,28 @@ mod tests {
             Node::button(id, r(), "Undo").enabled(false).spoken(),
             "Undo, unavailable"
         );
+    }
+
+    /// **A field goes out as editable text, named, holding its value** -
+    /// what a screen reader turns into "Beats, 7, edit text". As a label it
+    /// would say the number and never that it can be typed into.
+    ///
+    /// Revert-check, performed: send `Kind::Field` through the `Readout`
+    /// arm and the widget type comes back a label with no text value.
+    #[test]
+    fn a_field_is_said_as_editable_text_holding_its_value() {
+        let node = Node::field(Id::new("beats"), r(), "Beats", "7");
+        assert_eq!(node.kind, Kind::Field);
+        assert_eq!(node.spoken(), "Beats, 7");
+        let said = info(&node);
+        assert_eq!(said.typ, egui::WidgetType::TextEdit, "a field is not said as editable");
+        assert_eq!(said.label.as_deref(), Some("Beats"));
+        assert_eq!(said.current_text_value.as_deref(), Some("7"), "a field does not say what it holds");
+        assert!(said.enabled);
+        // Nothing typed yet is still a field, holding nothing.
+        let empty = info(&Node::field(Id::new("note"), r(), "Note value", ""));
+        assert_eq!(empty.typ, egui::WidgetType::TextEdit);
+        assert_eq!(empty.current_text_value.as_deref(), Some(""));
     }
 
     /// Both axes move the value the same way.

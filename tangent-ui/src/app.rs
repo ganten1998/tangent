@@ -161,6 +161,15 @@ enum Focused {
         hit: crate::arrangement_panel::Hit,
         travel: Option<crate::a11y::Travel>,
     },
+    /// The metronome's panel, on whichever surface it hangs: pressed by a
+    /// point, through its own `met_hit_test`, as the band's nodes are.
+    Met {
+        /// The surface the panel is laid out on (`met_stage`).
+        stage: Rect,
+        /// The control inside it.
+        rect: Rect,
+        travel: Option<crate::a11y::Travel>,
+    },
 }
 
 /// Lay the nodes over a painted panel and answer whichever one has focus.
@@ -209,7 +218,8 @@ impl Focused {
         match self {
             Self::Band { travel, .. }
             | Self::Desk { travel, .. }
-            | Self::Arrange { travel, .. } => travel,
+            | Self::Arrange { travel, .. }
+            | Self::Met { travel, .. } => travel,
         }
     }
 }
@@ -8903,7 +8913,14 @@ impl TangentApp {
                 // Clicking anywhere else also drops the field's focus, or the
                 // next letter typed at the piano would go into the take name.
                 self.focus_take_name(false);
-                self.commit_number_unless(None);
+                // **Except a press on the metronome's panel, which keeps the
+                // rule itself** (`met_menu_press`): it commits for any press
+                // but one back into its own open field, and committing here
+                // first would take that one away - a click to fix a typo in
+                // BEATS would commit the typo.
+                if !self.met_panel_at(pos) {
+                    self.commit_number_unless(None);
+                }
                 // **The mixer and the arrangement cover everything below the
                 // band while they are up — and the piano is still THERE.**
                 // `piano_rect` is computed every frame whichever view is
@@ -20249,28 +20266,99 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// What the metronome's panel shows: one view for the painter and the
+    /// keyboard's nodes, so the two cannot read different numbers.
+    fn met_view(&self) -> recorder_panel::MetView<'_> {
+        let sig = self.time_signature();
+        recorder_panel::MetView {
+            count_in_bars: self.settings.record_count_in_bars.clamp(0, 8),
+            count_in_in_take: self.settings.record_count_in_in_take,
+            bpm: self.tempo_bpm(),
+            beats: sig.beats,
+            unit: sig.unit,
+            div: self.settings.metronome_div,
+            sample: &self.settings.click_sample,
+            held: self.recorder.tempo_held(),
+            // Its own two fields only: a field open anywhere else draws
+            // nothing here (the panel filters by field).
+            typing: self.num_edit.as_ref(),
+        }
+    }
+
     /// Draw the metronome's panel, when it is up.
     fn draw_met_menu(&self, painter: &egui::Painter, rect: Rect) {
         if self.met_menu.is_none() {
             return;
         }
-        let sig = self.time_signature();
         recorder_panel::draw_met(
             painter,
             rect,
             self.met_anchor(rect),
-            recorder_panel::MetView {
-                count_in_bars: self.settings.record_count_in_bars.clamp(0, 8),
-                count_in_in_take: self.settings.record_count_in_in_take,
-                bpm: self.tempo_bpm(),
-                beats: sig.beats,
-                unit: sig.unit,
-                div: self.settings.metronome_div,
-                sample: &self.settings.click_sample,
-                held: self.recorder.tempo_held(),
-            },
+            self.met_view(),
             &self.settings,
         );
+    }
+
+    /// **The metronome panel's controls, for a keyboard and a screen
+    /// reader**, laid over the panel just painted on `stage`. Reader mode's
+    /// alone, as every surface's nodes are (`offer_nodes`): a sighted
+    /// session builds none.
+    fn offer_met_to_keyboard(&mut self, ui: &egui::Ui, stage: Rect) {
+        if self.met_menu.is_none() || !self.reader_mode() {
+            return;
+        }
+        let nodes = recorder_panel::met_a11y_nodes(stage, self.met_anchor(stage), self.met_view());
+        self.offer_to_keyboard(ui, &nodes, |node| {
+            Some(Focused::Met { stage, rect: node.rect, travel: node.travel })
+        });
+    }
+
+    /// Whether `pos` is on the metronome panel, while it is up.
+    fn met_panel_at(&self, pos: Pos2) -> bool {
+        self.met_menu.is_some()
+            && self.met_stage().is_some_and(|stage| {
+                recorder_panel::met_popup_rect(stage, self.met_anchor(stage)).contains(pos)
+            })
+    }
+
+    /// **Take the metronome panel down, and its field with it.**
+    ///
+    /// A number being typed into BEATS or NOTE is COMMITTED as the panel
+    /// goes - the band's rule for looking away from a number, the one
+    /// `close_setup` keeps for the signature typed into SIG. Escape is the
+    /// one road that abandons it, in `edit_number`. A tempo drag the panel
+    /// is closed under still ends at its own release (`met_drag` is left
+    /// alone; see `met_menu_owns_press`).
+    fn close_met_menu(&mut self) {
+        self.commit_met_field();
+        self.met_menu = None;
+        // **The summon point dies with the panel**, or the next press on the
+        // icon would open it at a stale cursor.
+        self.met_at = None;
+    }
+
+    /// Commit BEATS or NOTE if one is open, and nothing else.
+    fn commit_met_field(&mut self) {
+        if self
+            .num_edit
+            .as_ref()
+            .is_some_and(|e| e.field.lives_in_metronome())
+        {
+            self.commit_number();
+        }
+    }
+
+    /// **Set the song's signature from the metronome panel, as one moment.**
+    ///
+    /// Every road the panel has to the signature comes through here - BEATS
+    /// minus and plus, NOTE minus and plus, and the two typed fields - and so
+    /// does the band's typed SIG, so a typed 7/8 and a stepped one cannot
+    /// land differently: the same setter (which keeps the count-in's beats in
+    /// step), then the moment, since a press is a gesture and the setter
+    /// only saves.
+    fn commit_time_signature(&mut self, sig: recorder::TimeSignature) {
+        self.set_time_signature(sig);
+        self.undo_commit();
     }
 
     /// **While the metronome's panel is up it owns every press**, on
@@ -20304,10 +20392,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let inside =
                 recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
             if down && !inside && !self.met_drag {
-                self.met_menu = None;
-                // **The summon point dies with the panel**, or the next
-                // press on the icon would open it at a stale cursor.
-                self.met_at = None;
+                // A field open in it goes with it, committed.
+                self.close_met_menu();
                 self.met_drag = false;
                 self.menu_ate_press = true;
                 return true;
@@ -20344,11 +20430,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the lanes under it do not hover.
             return recorder_panel::met_popup_rect(rect, anchor).contains(pos);
         }
+        // **The band's focus rule, in this panel too.** A press on anything
+        // but the open field commits it - a half-typed number that vanished
+        // when you looked away would be a field people learn not to trust -
+        // and a press back INTO it keeps what was typed, so a typo can be
+        // reached without the click committing it out from under the hand
+        // (`commit_number_unless`, on the band). Before the press acts, so
+        // BEATS typed and then NOTE plus pressed is the typed beats, then
+        // the step. `handle_main_interaction` leaves presses on this panel
+        // to this, for the second half of the rule.
+        if self
+            .num_edit
+            .as_ref()
+            .is_some_and(|e| hit != Some(MetHit::Type(e.field)))
+        {
+            self.commit_number();
+        }
         match hit {
-            Some(MetHit::Close) => {
-                self.met_menu = None;
-                self.met_at = None;
-            }
+            Some(MetHit::Close) => self.close_met_menu(),
             // A held tempo grabs nothing, as the band's knob does - or a drag
             // begun during a count-in would jump the tempo to the pointer the
             // moment the count ended.
@@ -20360,13 +20459,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Some(MetHit::Beats(d)) => {
                 let sig = self.time_signature();
                 let beats = (i32::from(sig.beats) + i32::from(d)).clamp(1, 32) as u8;
-                self.set_time_signature(recorder::TimeSignature { beats, unit: sig.unit });
-                self.undo_commit();
+                self.commit_time_signature(recorder::TimeSignature { beats, unit: sig.unit });
             }
-            Some(MetHit::Unit(unit)) => {
+            Some(MetHit::Unit(d)) => {
                 let sig = self.time_signature();
-                self.set_time_signature(recorder::TimeSignature { beats: sig.beats, unit });
-                self.undo_commit();
+                let unit = recorder_panel::met_unit_step(sig.unit, d);
+                self.commit_time_signature(recorder::TimeSignature { beats: sig.beats, unit });
+            }
+            // **BEATS or NOTE, opened for typing**, looking exactly like the
+            // number it held - the owner's rule for every field - with the
+            // first digit typed replacing it. A press back into the one
+            // already open keeps what was typed, as SIG's does.
+            Some(MetHit::Type(field)) => {
+                if !self.num_edit.as_ref().is_some_and(|e| e.field == field) {
+                    self.num_edit =
+                        Some(recorder::NumEdit::prefilled(field, self.field_seed(field)));
+                }
+                self.focus_take_name(false);
             }
             Some(MetHit::Div(div)) => {
                 self.settings.metronome_div = div.clamp(0, 8);
@@ -27070,7 +27179,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Before the bay menu and before the lanes, because it is drawn in
         // front of both — a panel that is painted over something it does not
         // take presses from is a panel you can click through.
-        if self.met_menu_owns_press(ctx) {
+        //
+        // **Pressed ONCE a frame.** This pass runs whichever surface is up,
+        // and on the desk the mixer's pass has already handed the frame's
+        // press to the panel (`met_owns`) - `met_stage` answers the mixer
+        // for both while the timeline is shut. Asking again pressed every
+        // row of the desk's panel twice: BEATS plus stepped two beats, NOTE
+        // plus skipped a note value, IN TAKE flipped and flipped back. On the
+        // desk this only stands down for the panel.
+        if self.arrangement_rect.is_none() && self.mixer_rect.is_some() {
+            if self.met_menu.is_some() {
+                return;
+            }
+        } else if self.met_menu_owns_press(ctx) {
             return;
         }
         // The BAY's FX menu: while it is up it owns every press.
@@ -29431,8 +29552,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if self.met_menu.is_some() {
                 // A second press closes it, which is what a summon chord
                 // should do - otherwise the only way out is the mouse.
-                self.met_menu = None;
-                self.met_at = None;
+                self.close_met_menu();
             } else {
                 // **CENTRED, not at the pointer.** It opened where the hand
                 // was, on the reasoning that a summon should not make you
@@ -34410,6 +34530,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Focused::Arrange { hit, .. } => {
                 self.apply_arrange_key(hit, want);
             }
+            Focused::Met { stage, rect, .. } => {
+                // The panel's road: a point, then `met_menu_press`, the same
+                // press a click makes. A tempo nudge grabs the track as a
+                // press does, and the next frame - with no button down -
+                // lets it go, one moment at its release like the mouse's.
+                let point = match (travel, want) {
+                    (Some(t), Some(v)) => t.point(rect, v),
+                    _ => rect.center(),
+                };
+                let _ = self.met_menu_press(stage, point, true);
+            }
         }
         // The key was ours; nobody else gets it. Without this an arrow over a
         // focused fader also scrolls whatever is behind it.
@@ -36782,8 +36913,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // click away), the signature is hashed, and the setter only saves.
         if edit.field == F::Meter {
             if let Some(sig) = recorder::TimeSignature::parse(&edit.text) {
-                self.set_time_signature(sig);
-                self.undo_commit();
+                self.commit_time_signature(sig);
+            }
+            return;
+        }
+        // **The metronome's BEATS and NOTE: one side of the signature each**,
+        // landed by the road the panel's minus and plus take, so the meter
+        // map, the click, the grid and the ruler follow a typed 11/16
+        // exactly as they follow a stepped one. A number the signature
+        // cannot carry (0, 33, a 3 under the line) is REFUSED, never
+        // clamped: the field closes on the reading it opened with - see
+        // `TimeSignature::with_typed_beats`.
+        if edit.field.lives_in_metronome() {
+            let now = self.time_signature();
+            let typed = if edit.field == F::MetUnit {
+                now.with_typed_unit(&edit.text)
+            } else {
+                now.with_typed_beats(&edit.text)
+            };
+            if let Some(sig) = typed {
+                self.commit_time_signature(sig);
             }
             return;
         }
@@ -36802,6 +36951,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             F::Meter => None,
             // Answered above, before this table: its value is a word.
             F::MarkerName(_) => None,
+            // Answered above: half a signature, not a control's value.
+            F::MetBeats | F::MetUnit => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
             // The setter takes a FADER POSITION, not a gain, so a typed dB
             // has to go back through the same curve the drag uses. Doing it
@@ -36882,6 +37033,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let sig = self.time_signature();
                 format!("{}/{}", sig.beats, sig.unit)
             }
+            F::MetBeats => format!("{}", self.time_signature().beats),
+            F::MetUnit => format!("{}", self.time_signature().unit),
             F::Master => {
                 let g = self.settings.master_gain;
                 if g <= 0.001 {
@@ -36980,6 +37133,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 _ => {}
             }
+        }
+        // **The keys a field took are not the focused node's too.** The
+        // keyboard's focus (`nudge_focused`) reads this frame's keys AFTER
+        // the paint, by which time an Enter has committed the field and
+        // closed it - so in reader mode the same Enter came round again as a
+        // press on the focused field's node and opened it straight back up,
+        // and typing never ended. Only while a node HAS that focus, the one
+        // reader of these keys after the paint: a sighted session's frame is
+        // left exactly as it was. `nudge_focused` keeps the same rule for
+        // the keys it takes.
+        if self.a11y_on.is_some() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Enter
+                                | egui::Key::Tab
+                                | egui::Key::Escape
+                                | egui::Key::Backspace
+                                | egui::Key::ArrowLeft
+                                | egui::Key::ArrowRight,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                });
+            });
         }
     }
 
@@ -42540,7 +42721,13 @@ impl TangentApp {
             // identical (`on_desk` was `None` on those frames before and is
             // `None` now); in reader mode one Layout replaces two and the
             // node ids are unchanged, so focus continuity is kept.
-            let on_desk = if !self.reader_mode() {
+            //
+            // **Not under the metronome's panel**, which takes every press
+            // on this surface while it is up: a strip focused through its
+            // scrim would be pressed by Enter where the mouse cannot reach
+            // it, and Tab would walk every strip before reaching the panel.
+            // The panel offers its own nodes (`offer_met_to_keyboard`).
+            let on_desk = if !self.reader_mode() || self.met_menu.is_some() {
                 None
             } else {
                 let hits = crate::mixer_panel::Layout::new(rect, &view).targets();
@@ -42652,6 +42839,7 @@ impl TangentApp {
             // button opens it, so this surface has to be able to draw it.
             if let Some(rect) = self.mixer_rect {
                 self.draw_met_menu(ui.painter(), rect);
+                self.offer_met_to_keyboard(ui, rect);
             }
         } else if let Some(rect) = arrangement_rect {
             let clips = self.arr_clip_views();
@@ -42683,7 +42871,14 @@ impl TangentApp {
             // the feature that could answer one, and not a flag of this
             // fn's own, because two flags for one question is how they
             // come apart.
-            let on_arr = if self.midi_edit.is_some() || !self.reader_mode() {
+            //
+            // **Nor under the metronome's panel**, for the editor's reason:
+            // it owns every press here while it is up, and offers its own
+            // nodes once the view's borrow is done (below).
+            let on_arr = if self.midi_edit.is_some()
+                || self.met_menu.is_some()
+                || !self.reader_mode()
+            {
                 None
             } else {
                 let hits = crate::arrangement_panel::targets(rect, &view);
@@ -42802,6 +42997,9 @@ impl TangentApp {
             if on_arr.is_some() {
                 self.a11y_on = on_arr;
             }
+            // The metronome panel's own nodes, painted above (it is drawn
+            // over the lanes): offered here, once `view` is let go.
+            self.offer_met_to_keyboard(ui, rect);
             // The right-drag selection band, while a hand draws one.
             if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
                 if let Some((a, b)) = self.arr_band {
@@ -43951,6 +44149,18 @@ impl TangentApp {
         // Only the two fields this block services: a mixer or drumpad field
         // left open under the panel is not this block's to end, and counting
         // it made Escape dead for as long as it stayed open.
+        //
+        // **A metronome field lives exactly as long as its panel.** Every
+        // road that closes the panel commits it on the way (`close_met_menu`,
+        // and the press that dismisses it), but a panel can also stop being
+        // DRAWN - the surface it hangs on gone - and a field left open then
+        // is invisible and still eats every key. Committed, as looking away
+        // from a number is everywhere else.
+        if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_metronome())
+            && (self.met_menu.is_none() || self.met_stage().is_none())
+        {
+            self.commit_number();
+        }
         let typing_before = self.name_focused || self.num_edit.is_some();
         if self.name_focused {
             self.edit_take_name(&ctx);
@@ -74750,8 +74960,8 @@ mod tests {").expect("the tests module")];
         assert_eq!(app.time_signature(), Sig { beats: 7, unit: 8 }, "the typed signature did not land");
         assert_eq!(app.hist_at, before + 1, "a typed signature left no moment of its own");
 
-        // The metronome panel's BEATS + and a UNIT, found by asking the
-        // panel where they are.
+        // The metronome panel's BEATS + and NOTE -, found by asking the
+        // panel where they are. NOTE's minus walks 8 down to 4.
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
         app.met_menu = Some(());
         app.met_at = Some(screen.center());
@@ -74774,7 +74984,7 @@ mod tests {").expect("the tests module")];
         };
         for (what, hit, sig) in [
             ("BEATS +", MetHit::Beats(1), Sig { beats: 8, unit: 8 }),
-            ("UNIT 4", MetHit::Unit(4), Sig { beats: 8, unit: 4 }),
+            ("NOTE -", MetHit::Unit(-1), Sig { beats: 8, unit: 4 }),
         ] {
             let at = find(hit).unwrap_or_else(|| panic!("the panel has no {what}"));
             let before = app.hist_at;
@@ -74844,6 +75054,480 @@ mod tests {").expect("the tests module")];
         app.set_count_in_bars(6);
         app.apply_recorder_hit(recorder_panel::Hit::CycleCountIn);
         assert_eq!(app.settings.count_in_bars(), 0, "a 6-bar count did not wrap round to off");
+    }
+
+    // ── the metronome panel's typed BEATS and NOTE ──────────────────────────
+    //
+    // The owner: "can you in the meantime make it so that the beats and note
+    // fields in the metronome menu are typed fields so they can accomodate
+    // odd signatures?" Every test here drives the panel as a hand does -
+    // pointer events, key events, typed characters - through whole frames.
+
+    /// The metronome's panel up on a song with a history to count moments
+    /// in: over the timeline by Cmd+M, the chord's own road, or over the
+    /// desk as the click strip's chip leaves it. Answers the surface it
+    /// hangs on and its anchor.
+    fn met_panel_up(
+        tag: &str,
+        desk: bool,
+    ) -> (egui::Context, TangentApp, std::path::PathBuf, Rect, Rect) {
+        let root = project_scratch(tag);
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("Projects"));
+        app.arrangement_open = !desk;
+        app.mixer_open = desk;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.arr_save_edits();
+        app.commit_view_change();
+        if desk {
+            // `H::MetFile`, the chip's press: the flag the frame reads.
+            app.met_menu = Some(());
+        } else {
+            key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        }
+        assert!(app.met_menu.is_some(), "the metronome panel did not come up");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let stage = app.met_stage().expect("the panel's surface is not laid out");
+        let anchor = app.met_anchor(stage);
+        assert!(
+            recorder_panel::met_popup_rect(stage, anchor).is_positive(),
+            "the panel has no room"
+        );
+        (ctx, app, root, stage, anchor)
+    }
+
+    /// Where `want` is on the metronome panel, asked of the panel itself:
+    /// the middle of every point that answers it.
+    fn met_point(stage: Rect, anchor: Rect, want: recorder_panel::MetHit) -> Pos2 {
+        let panel = recorder_panel::met_popup_rect(stage, anchor);
+        let mut found: Option<Rect> = None;
+        let mut y = panel.top();
+        while y <= panel.bottom() {
+            let mut x = panel.left();
+            while x <= panel.right() {
+                let p = Pos2::new(x, y);
+                if recorder_panel::met_hit_test(stage, anchor, p) == Some(want) {
+                    let dot = Rect::from_min_max(p, p);
+                    found = Some(found.map_or(dot, |r| r.union(dot)));
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        found.unwrap_or_else(|| panic!("the panel has no {want:?}")).center()
+    }
+
+    /// Type `text` as a keyboard does: each character its key and its text,
+    /// a frame each.
+    fn type_keys(ctx: &egui::Context, app: &mut TangentApp, text: &str) {
+        for ch in text.chars() {
+            let mut events = Vec::new();
+            if let Some(key) = egui::Key::from_name(&ch.to_string()) {
+                events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            events.push(egui::Event::Text(ch.to_string()));
+            pointer_frame(ctx, app, events);
+        }
+    }
+
+    /// **Press BEATS, type, Enter; press NOTE, type, Enter** - on the
+    /// timeline and on the desk, the panel's two surfaces.
+    ///
+    /// A press opens the field looking like the number it held; the first
+    /// digit replaces that; nothing applies until Enter; Enter lands the
+    /// signature as ONE moment, leaves the panel up, and the meter follows -
+    /// 7/8's bar is three and a half quarters long. One Ctrl+Z takes back one
+    /// field.
+    ///
+    /// Revert-checks, all three performed: make the middle box a readout
+    /// again (`met_hit_test` answering `None` there) and there is no field
+    /// to press; drop the `lives_in_metronome` arm from `commit_number` and
+    /// Enter lands nothing; land it with the setter alone and the moment
+    /// count goes red.
+    #[test]
+    fn the_metronomes_beats_and_note_are_typed_and_entered() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        for desk in [false, true] {
+            let (ctx, mut app, root, stage, anchor) = met_panel_up("mettyped", desk);
+            let on = if desk { "the desk" } else { "the timeline" };
+            assert_eq!(app.time_signature(), Sig { beats: 4, unit: 4 }, "fixture: not 4/4");
+            let beats_at = met_point(stage, anchor, MetHit::Type(F::MetBeats));
+            let note_at = met_point(stage, anchor, MetHit::Type(F::MetUnit));
+
+            let before = app.hist_at;
+            click_with(&ctx, &mut app, beats_at, egui::Modifiers::NONE);
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+                Some((F::MetBeats, "4".to_owned())),
+                "on {on} a press on BEATS did not open it on the number it held"
+            );
+            assert!(app.met_menu.is_some(), "on {on} the press closed the panel");
+            type_keys(&ctx, &mut app, "7");
+            assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("7"), "on {on} typing appended");
+            assert_eq!(app.time_signature(), Sig { beats: 4, unit: 4 }, "on {on} typing applied before Enter");
+            assert_eq!(app.hist_at, before, "on {on} opening and typing left a moment");
+            key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+            assert!(app.num_edit.is_none(), "on {on} Enter left BEATS open");
+            assert_eq!(app.time_signature(), Sig { beats: 7, unit: 4 }, "on {on} BEATS did not land");
+            assert_eq!(app.hist_at, before + 1, "on {on} BEATS is not one moment");
+            assert!(app.met_menu.is_some(), "on {on} Enter closed the panel");
+
+            click_with(&ctx, &mut app, note_at, egui::Modifiers::NONE);
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+                Some((F::MetUnit, "4".to_owned())),
+                "on {on} a press on NOTE did not open it on the number it held"
+            );
+            type_keys(&ctx, &mut app, "8");
+            key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+            let sig = Sig { beats: 7, unit: 8 };
+            assert_eq!(app.time_signature(), sig, "on {on} NOTE did not land");
+            assert_eq!(app.hist_at, before + 2, "on {on} NOTE is not one moment");
+            assert_eq!(app.live_meter_map().sig_at_bar(0), sig, "on {on} the meter did not follow");
+            assert!(
+                (app.live_meter_map().quarters_in_bar(0) - 3.5).abs() < 1e-9,
+                "on {on} a bar of 7/8 is {} quarters",
+                app.live_meter_map().quarters_in_bar(0)
+            );
+
+            app.undo();
+            assert_eq!(app.time_signature(), Sig { beats: 7, unit: 4 }, "on {on} one Ctrl+Z took both fields");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **Escape abandons the field and only the field**: the number it held
+    /// stays, nothing is a moment, and the panel stays up - one layer at a
+    /// time, the setup panel's rule.
+    ///
+    /// Revert-check, performed: send Escape through `commit_number` and the
+    /// typed 9 lands.
+    #[test]
+    fn escape_abandons_a_metronome_field_and_leaves_the_panel_up() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metescape", false);
+        for (field, typed) in [(F::MetBeats, "9"), (F::MetUnit, "16")] {
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(field)), egui::Modifiers::NONE);
+            type_keys(&ctx, &mut app, typed);
+            assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some(typed), "fixture: {field:?}");
+            let before = app.hist_at;
+            key_with(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+            assert!(app.num_edit.is_none(), "Escape left {field:?} open");
+            assert_eq!(app.time_signature(), Sig { beats: 4, unit: 4 }, "Escape on {field:?} applied it");
+            assert_eq!(app.hist_at, before, "Escape on {field:?} left a moment");
+            assert!(app.met_menu.is_some(), "one Escape took the field and the panel");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A number the signature cannot carry is refused, never clamped.**
+    ///
+    /// 0 and 33 beats, a note of 3, 12, 0 or 64, an emptied field: each
+    /// closes the field on the signature somebody was looking at, with no
+    /// moment - the rule every typed field here keeps (`commit_number`:
+    /// "Text that is not a number simply closes without changing
+    /// anything"). Not 32 for 33, not 4 for 3. And letters never reach the
+    /// field at all - nor the shortcuts they are, A's About box among them.
+    ///
+    /// Revert-checks, both performed: clamp in `with_typed_beats` and a
+    /// typed 0 lands as 1/4; round the unit up to a power of two and a
+    /// typed 12 lands as 4/16.
+    #[test]
+    fn a_number_the_signature_cannot_carry_is_refused_not_clamped() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metrefuse", false);
+        let start = Sig { beats: 4, unit: 4 };
+        for (field, junk) in [
+            (F::MetBeats, "0"),
+            (F::MetBeats, "33"),
+            (F::MetBeats, "300"),
+            (F::MetUnit, "3"),
+            (F::MetUnit, "12"),
+            (F::MetUnit, "0"),
+            (F::MetUnit, "64"),
+        ] {
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(field)), egui::Modifiers::NONE);
+            type_keys(&ctx, &mut app, junk);
+            assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some(junk), "fixture: {junk}");
+            let before = app.hist_at;
+            key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+            assert!(app.num_edit.is_none(), "{junk:?} in {field:?} left the field open");
+            assert_eq!(app.time_signature(), start, "{junk:?} in {field:?} was accepted as something");
+            assert_eq!(app.hist_at, before, "{junk:?} in {field:?} left a moment");
+        }
+        // Emptied with backspace, then Enter.
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+        key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some(""), "fixture: backspace");
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.time_signature(), start, "an emptied BEATS was accepted");
+        // Letters: dropped at the field, and no shortcut fires under it.
+        let borderless = app.settings.borderless_mode;
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetUnit)), egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "abc");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("4"), "a letter reached NOTE");
+        assert!(app.dialog.is_none(), "A opened a dialog through the field");
+        assert_eq!(app.settings.borderless_mode, borderless, "B reached the window through the field");
+        let before = app.hist_at;
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.time_signature(), start);
+        assert_eq!(app.hist_at, before, "the reading committed back as a moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Odd signatures, typed, land by the road the steps take**: 7/8, 5/4,
+    /// 11/16, 15/32 and 3/1, each half its own moment, the meter map, the
+    /// timeline's view (the ruler and the gridbox) and the count-in's beats
+    /// all following.
+    ///
+    /// The count-in is the witness to the ROAD: `set_time_signature` keeps
+    /// the legacy beats key at the count's bars times the new beats, and a
+    /// commit that wrote the signature string itself would leave it behind.
+    /// 15/32 and 3/1 are the two the old NOTE presets (2 to 16) could not
+    /// reach at all.
+    ///
+    /// Revert-checks, both performed: commit by writing
+    /// `record_time_signature` directly and the count-in assertion goes red
+    /// at 7/8; land it with the setter alone and the history count does.
+    #[test]
+    fn odd_signatures_typed_into_the_metronome_land_by_the_steps_road() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metodd", false);
+        app.set_count_in_bars(2);
+        let beats_at = met_point(stage, anchor, MetHit::Type(F::MetBeats));
+        let note_at = met_point(stage, anchor, MetHit::Type(F::MetUnit));
+        for (beats, unit) in [(7u8, 8u8), (5, 4), (11, 16), (15, 32), (3, 1)] {
+            let before = app.hist_at;
+            for (at, typed) in [(beats_at, beats), (note_at, unit)] {
+                click_with(&ctx, &mut app, at, egui::Modifiers::NONE);
+                type_keys(&ctx, &mut app, &typed.to_string());
+                key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+            }
+            let sig = Sig { beats, unit };
+            assert_eq!(app.time_signature(), sig, "{beats}/{unit} did not land");
+            assert_eq!(app.hist_at, before + 2, "{beats}/{unit}: each half is not its own moment");
+            let meter = app.live_meter_map();
+            assert_eq!(meter.sig_at_bar(0), sig, "{beats}/{unit}: the meter map");
+            let quarters = 4.0 * f64::from(beats) / f64::from(unit);
+            assert!(
+                (meter.quarters_in_bar(0) - quarters).abs() < 1e-9 && (meter.quarter_at_bar(2) - 2.0 * quarters).abs() < 1e-9,
+                "{beats}/{unit}: the bar lines did not move"
+            );
+            {
+                let clips = app.arrange_clips_for_shot();
+                let view = app.arrange_view_for_shot(&clips);
+                assert_eq!(view.meter.sig_at_bar(0), sig, "{beats}/{unit}: the timeline still draws the old meter");
+            }
+            assert_eq!(
+                app.settings.record_count_in_beats,
+                i64::from(sig.beats_in(2)),
+                "{beats}/{unit}: the count-in's beats were left behind - not the steps' road"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Pressing away commits; pressing back keeps typing** - the band's
+    /// focus rule, in the panel.
+    ///
+    /// Back into the field it is: the typed text stays, nothing applies. On
+    /// NOTE's plus: the typed beats land first, then the step - two
+    /// gestures, two moments. Outside the panel: the panel goes and the
+    /// number stays. The X: the same.
+    ///
+    /// Revert-checks, both performed: let `handle_main_interaction` commit
+    /// presses on the panel and the press back commits the 5; drop the
+    /// commit at the top of `met_menu_press` and NOTE's plus leaves BEATS
+    /// open. The X is kept by that same commit - `close_met_menu`'s own is
+    /// a backstop no press reaches first, and dropping it alone turns
+    /// nothing here red.
+    #[test]
+    fn a_press_away_from_a_metronome_field_commits_it_and_a_press_back_keeps_it() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metfocus", false);
+        let beats_at = met_point(stage, anchor, MetHit::Type(F::MetBeats));
+        click_with(&ctx, &mut app, beats_at, egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "5");
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, beats_at, egui::Modifiers::NONE);
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+            Some((F::MetBeats, "5".to_owned())),
+            "a press back into BEATS lost what was typed"
+        );
+        assert_eq!(app.time_signature(), Sig { beats: 4, unit: 4 }, "a press back into BEATS committed it");
+        assert_eq!(app.hist_at, before);
+
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Unit(1)), egui::Modifiers::NONE);
+        assert!(app.num_edit.is_none(), "a press on NOTE + left BEATS open");
+        assert_eq!(app.time_signature(), Sig { beats: 5, unit: 8 }, "the typed beats and the step");
+        assert_eq!(app.hist_at, before + 2, "the commit and the step are not a moment each");
+
+        // A press outside the panel: it goes, the number stays.
+        click_with(&ctx, &mut app, beats_at, egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "6");
+        let outside = Pos2::new(stage.left() + 6.0, stage.bottom() - 6.0);
+        assert!(stage.contains(outside));
+        assert!(!recorder_panel::met_popup_rect(stage, anchor).contains(outside));
+        click_with(&ctx, &mut app, outside, egui::Modifiers::NONE);
+        assert!(app.met_menu.is_none(), "the press outside did not close the panel");
+        assert!(app.num_edit.is_none(), "the field outlived its panel");
+        assert_eq!(app.time_signature(), Sig { beats: 6, unit: 8 }, "the click-away threw the typed 6 away");
+
+        // The X: the same.
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let anchor = app.met_anchor(stage);
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetUnit)), egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "16");
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Close), egui::Modifiers::NONE);
+        assert!(app.met_menu.is_none() && app.num_edit.is_none(), "the X left the panel or the field");
+        assert_eq!(app.time_signature(), Sig { beats: 6, unit: 16 }, "the X threw the typed 16 away");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Digits typed into a field reach no shortcut, and Space no
+    /// transport** - while the song plays, which is when the owner reaches
+    /// for the metronome.
+    ///
+    /// 1 to 4 are the theory band's keys and Space is play and stop; with
+    /// BEATS open every one of them is the field's. Backspace takes the last
+    /// two digits back and Enter lands 12 - typed while playing.
+    ///
+    /// Revert-check, performed: take `num_edit` out of `text_entry_active`
+    /// and the theory band changes under the typing.
+    #[test]
+    fn digits_typed_into_a_metronome_field_reach_no_shortcut_while_it_plays() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metkeys", false);
+        app.recorder.playing = true;
+        let theory = app.settings.theory_order.clone();
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+        while app.take_recorder_request().is_some() {}
+        type_keys(&ctx, &mut app, "1234 ");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("1234"));
+        assert_eq!(app.settings.theory_order, theory, "a digit typed into BEATS toggled the theory band");
+        assert!(app.take_recorder_request().is_none(), "Space typed into BEATS reached the transport");
+        key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
+        key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(app.recorder.playing, "fixture: the song stopped");
+        assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "a field typed while playing did not land");
+        assert_eq!(app.settings.theory_order, theory);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A metronome field lives exactly as long as its panel.** The panel
+    /// can stop being drawn - its surface gone from under it - and a field
+    /// left open then would be invisible and eat every key. It is committed
+    /// on the way out, as looking away from a number is.
+    ///
+    /// Revert-check, performed: drop the guard in `paint` and the field
+    /// stays open.
+    #[test]
+    fn a_metronome_field_goes_with_its_panel() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metgone", false);
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "3");
+        // The theory view: no timeline and no desk, so nowhere to draw it.
+        app.arrangement_open = false;
+        app.mixer_open = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.met_stage().is_none(), "fixture: the panel still has a surface");
+        assert!(app.num_edit.is_none(), "an undrawn panel's field is still taking keys");
+        assert_eq!(app.time_signature(), Sig { beats: 3, unit: 4 }, "the field was thrown away, not committed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **One click on the metronome panel is one press, on the desk as on
+    /// the timeline.**
+    ///
+    /// Over the mixer the panel took every press twice: the mixer's pass
+    /// handed the frame's press to it, and `arrangement_input`, which runs
+    /// on every surface, asked again - `met_stage` answers the mixer for
+    /// both while the timeline is shut. BEATS plus stepped two beats, NOTE
+    /// plus skipped a note value, and IN TAKE flipped and flipped back.
+    ///
+    /// Revert-check: put `met_menu_owns_press` back in `arrangement_input`
+    /// for the desk and BEATS lands on 6.
+    #[test]
+    fn a_click_on_the_metronome_panel_presses_once_on_either_surface() {
+        use crate::recorder_panel::MetHit;
+        use recorder::TimeSignature as Sig;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, stage, anchor) = met_panel_up("metonce", desk);
+            let in_take = app.settings.record_count_in_in_take;
+            let before = app.hist_at;
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Beats(1)), egui::Modifiers::NONE);
+            assert_eq!(app.time_signature(), Sig { beats: 5, unit: 4 }, "on {on} one BEATS + was not one beat");
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Unit(1)), egui::Modifiers::NONE);
+            assert_eq!(app.time_signature(), Sig { beats: 5, unit: 8 }, "on {on} one NOTE + was not one note value");
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::CountInInTake), egui::Modifiers::NONE);
+            assert_ne!(app.settings.record_count_in_in_take, in_take, "on {on} IN TAKE flipped and flipped back");
+            assert_eq!(app.hist_at, before + 3, "on {on} three presses are not three moments");
+            assert!(app.met_menu.is_some(), "on {on} a press inside closed the panel");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **A screen reader reaches BEATS, opens it with Enter, types, and
+    /// Enter leaves it** - and does not open it again.
+    ///
+    /// The node says it is editable text holding its number (see
+    /// `recorder_panel::met_a11y_nodes`). Enter on it is the press a click
+    /// makes; Enter in it commits. Both readers of that key ran in one frame
+    /// - the field's in the paint, the focused node's after it - so the
+    /// committing Enter came round again as a press on the node and opened
+    /// the field straight back up.
+    ///
+    /// Revert-checks, both performed: drop the key consumption at the end of
+    /// `edit_number` and the field reopens; stop offering the panel's nodes
+    /// and BEATS never takes the focus.
+    #[test]
+    fn a_reader_types_a_metronome_field_from_the_keyboard() {
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, _stage, _anchor) = met_panel_up("metreader", false);
+        app.settings.screen_reader_mode = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let beats = egui::Id::new(("met", "beats"));
+        ctx.memory_mut(|m| m.request_focus(beats));
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            matches!(app.a11y_on, Some(Focused::Met { .. })),
+            "the BEATS node did not take the keyboard's focus"
+        );
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::MetBeats), "Enter on BEATS did not open it");
+        type_keys(&ctx, &mut app, "7");
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.time_signature(), Sig { beats: 7, unit: 4 }, "the reader's BEATS did not land");
+        assert!(app.num_edit.is_none(), "the Enter that committed BEATS opened it again");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.num_edit.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The DONE press is spent on DONE.** The take panel hangs below the
