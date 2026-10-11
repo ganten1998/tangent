@@ -117,6 +117,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Each change is one step of undo, and the timeline's bars, the click and
   the count-in follow it, while the song plays too.
 
+- **The grid's one-bar step is called BAR, in every meter.** The step
+  between 2 bars and the note values read 1 in 4/4, which is also a whole
+  note's name, and 1/2· in 3/4 and 6/8; in 5/4, 7/8 and 9/8 it printed a
+  decimal too wide for its box (5.000q, 3.500q, 4.500q). It reads BAR now
+  in the grid boxes of the arrangement and the MIDI editor (BAR T with
+  triplets on) and in the Quantize window's GRID row. Steps above it still
+  count bars (2, 4, 8) and steps below it are note values (1, 1/2, 1/4 and
+  finer); one that no single note names is counted in the meter's own
+  beats, so half a bar of 10/8 reads 5/8.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and

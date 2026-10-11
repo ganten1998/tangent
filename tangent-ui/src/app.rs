@@ -46902,7 +46902,14 @@ mod tests {
         assert_eq!(app.settings.time_signature().beats, 3, "a frame put the meter back - this test proves nothing");
         let chips = chips_of(&painted);
         assert_eq!(chips.len(), 8, "the GRID row is not rungs 0 down to -7: {chips:?}");
-        // Painted coarse to fine: rung 0 first.
+        // Painted coarse to fine: rung 0 first, and rung 0 is one bar, which
+        // reads BAR on this row as on every surface that prints the ladder
+        // (`arrangement_panel::GRID_BAR`). In 3/4 it read "1/2·".
+        assert_eq!(
+            chips.first().map(String::as_str),
+            Some(crate::arrangement_panel::GRID_BAR),
+            "the one-bar chip: {chips:?}"
+        );
         let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16");
         let e = -i8::try_from(rung).expect("eight chips");
         let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
@@ -46916,6 +46923,12 @@ mod tests {
         app.settings.record_time_signature = "4/4".to_owned();
         let painted = (0..2).map(|_| frame(&mut app)).last().expect("two frames");
         let chips = chips_of(&painted);
+        // 4/4's bar read "1", the whole note's name, until it was named.
+        assert_eq!(
+            chips.first().map(String::as_str),
+            Some(crate::arrangement_panel::GRID_BAR),
+            "the one-bar chip in 4/4: {chips:?}"
+        );
         let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16 in 4/4");
         let e = -i8::try_from(rung).expect("eight chips");
         let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
