@@ -12,6 +12,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Tangent Bitcrush, a bitcrusher.** In the insert picker with the rest of
+  the house effects. BITS takes the signal down from 24 bits to 1, smoothly,
+  fractions of a bit included; RATE holds each sample for longer, from the
+  session's own rate down to 200 Hz, and by default with no filter in front
+  of it, so the treble folds back down as the metallic overtones a
+  bitcrusher is for.
+  DRIVE sets how hard the signal hits the converter (more drive spends more
+  of the levels; OUTPUT brings it back down), MIX blends in the dry signal,
+  and DITHER, off unless you switch it on, trades the gritty crunch for an
+  even hiss. ANTI-ALIAS, also off unless you switch it on, puts a steep
+  low-pass in front of the hold that follows RATE, so treble above the
+  slower rate is removed instead of folding back down; the stepped edge
+  of the slower rate stays. Every knob glides rather than stepping, so
+  automating any of them does not click, and it adds no latency. It opens on 8 bits at about
+  12 kHz, fully wet: obviously crushed, still musical. With BITS and RATE
+  both turned all the way up and the two levels at noon it passes audio
+  through untouched, bit for bit, with ANTI-ALIAS on or off. Mono tracks are crushed too. The window
+  draws the stair it is making out of a tone above the knobs.
+
 - **Tangent Insert: outboard gear in an insert bay.** Pick it from the
   plugin shelf like any built-in effect, then choose the outputs it sends
   on and the inputs it comes back on, each mono or stereo, from the
