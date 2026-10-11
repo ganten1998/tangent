@@ -653,8 +653,9 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("Q", "the quantize window - grid, strength, window, feel"),
             // **C-M is the metronome now** and the master row took shift
             // with it - the owner's call, and the card is where a moved
-            // shortcut has to be said or it is simply lost.
-            ("C-M", "the metronome panel, in the middle of the view"),
+            // shortcut has to be said or it is simply lost. A second press
+            // puts the panel away, and the row says so now that it does.
+            ("C-M", "the metronome panel, in the middle of the view - again to close it"),
             ("C-S-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
@@ -1580,7 +1581,8 @@ mod tests {
     /// the panel in the MIDDLE of the timeline - the owner's call, since a
     /// panel that opens wherever the hand happens to be has to be found -
     /// and the card went on saying "at the pointer" after the centring
-    /// shipped.
+    /// shipped. A second press closes it, which the row never said while
+    /// the close never ran.
     #[test]
     fn the_metronome_chord_is_described_as_it_behaves() {
         let rows = card_rows(Gates::default(), HelpView::Arrange);
@@ -1591,6 +1593,10 @@ mod tests {
         assert!(
             !said.contains("pointer"),
             "the card says Cmd+M opens at the pointer; it opens in the middle of the timeline: {said}"
+        );
+        assert!(
+            said.contains("again to close"),
+            "the card does not say a second Cmd+M closes the panel: {said}"
         );
     }
 
