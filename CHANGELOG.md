@@ -37,6 +37,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   through one is refused with a message rather than rendered dry. A
   bypassed insert is passed over everywhere.
 
+  Bypassed, the insert keeps the loop's delay, so comparing against bypass
+  lines up. The insert refuses a loop it cannot keep in time: an input on a
+  different device from the output (an aggregate device is fine), clocks
+  found drifting, or a round trip longer than delay compensation can absorb
+  (8192 samples). A realtime export starts only when every insert's loop is
+  connected, and says so if one comes apart during the pass. PING is not
+  offered while recording or exporting, and it refuses an answer it cannot
+  trust (a return that was not quiet before the click).
+
 - **Send to Device: the master out on a second output device too.** While
   Tangent plays through your interface, the same mix can also go to a
   virtual cable (VB-Audio's CABLE Input on Windows, BlackHole or Loopback on
@@ -204,6 +213,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   yet, its grid chip included.
 
 ### Fixed
+
+- **The IR wizard measured the wrong input when inputs were picked.** With
+  the desk's inputs picked (say In 3 alone), a wizard return on In 3 read
+  input 1. It reads the input it names now.
 
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be
