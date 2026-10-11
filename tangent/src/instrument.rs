@@ -13420,6 +13420,10 @@ impl Renderer {
             in_block: u32::try_from(self.monitor_block).unwrap_or(u32::MAX),
             rate: self.rate as u32,
             varispeed: self.varispeed_ratio().is_some(),
+            in_backlog: self
+                .monitor
+                .as_ref()
+                .map_or(0, |r| r.slots() / self.monitor_channels.max(1)),
         };
         let ch_in = self.monitor_channels.max(1);
         self.shared.hw.begin_chunk(dev, |want| hw_ring_col(want, ch_in));
@@ -25075,14 +25079,41 @@ impl Engine {
     /// **Ask a Tangent Insert bay to ping its loop.** The answer lands on
     /// the bay's face and, when it is a number, in its state
     /// ([`Engine::adopt_hw_ping_at`]). False for a bay with no port.
-    pub fn ping_hw_insert_at(&self, addr: RackAddr, bay: usize) -> bool {
-        match self.hw_port_at(addr, bay) {
-            Some(p) => {
-                p.ask_ping();
-                true
-            }
-            None => false,
+    ///
+    /// Refused, with the sentence to show, for a bay with no port and for a
+    /// BYPASSED bay: a bypassed bay never runs, so the ask would wait and
+    /// fire the moment it came back (the unit drops an ask that waited
+    /// longer than `PING_EXPIRE_S` as well, for the race).
+    pub fn ping_hw_insert_at(&self, addr: RackAddr, bay: usize) -> Result<(), String> {
+        let Some(p) = self.hw_port_at(addr, bay) else {
+            return Err("That Tangent Insert has no hardware port to ping through.".to_owned());
+        };
+        let bypassed = addr.seat().is_some_and(|seat| {
+            self.shared
+                .seat_cell(SeatKind::Bypass, seat * INSERTS + bay)
+                .is_some_and(|c| c.load(Ordering::Relaxed) != 0)
+        });
+        if bypassed {
+            return Err("That Tangent Insert is bypassed: put it back in circuit to ping it.".to_owned());
         }
+        p.ask_ping(self.shared.hw.clocks().out_clock.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// Tell the loops whether the input is a different device from the
+    /// output (see `units::hwinsert::one_device`).
+    pub fn set_hw_separate_input(&self, separate: bool) {
+        self.shared.hw.clocks().separate.store(separate, Ordering::Relaxed);
+    }
+
+    /// Whether a bay has a hardware insert port to play through.
+    pub fn hw_insert_has_port_at(&self, addr: RackAddr, bay: usize) -> bool {
+        self.hw_port_at(addr, bay).is_some()
+    }
+
+    /// How many hardware insert ports no bay holds.
+    pub fn hw_free_ports(&self) -> usize {
+        self.shared.hw.free_ports()
     }
 
     /// **A finished ping, into the bay's durable ledger**: the measured
@@ -47859,7 +47890,7 @@ mod hw_insert_road {
         }
 
         fn ping(&mut self, seat: usize) -> tangent_ui::faces_hwinsert::HwLive {
-            assert!(self.e.ping_hw_insert_at(Self::addr(seat), 0), "no port to ping through");
+            self.e.ping_hw_insert_at(Self::addr(seat), 0).expect("a port to ping through");
             let mut n = 0;
             while {
                 self.block();
@@ -47893,7 +47924,7 @@ mod hw_insert_road {
             let live = rig.ping(MASTER_SEAT);
             assert_eq!(live.answer, Some(Ok(cable as u32)), "cable {cable}: {:?}", live.answer);
             assert!(live.measured);
-            assert_eq!(live.latency, (cable + BLOCK + BLOCK) as u32);
+            assert_eq!(live.latency, (cable + BLOCK + 2 * BLOCK) as u32);
             // The click left on outputs 3/4, once, and never on the mix.
             let tape = &rig.tape[start..];
             let clicks: Vec<usize> = (0..tape.len() / WIDE)
@@ -47997,7 +48028,7 @@ mod hw_insert_road {
                 }
             }
         };
-        assert!(rig.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0));
+        rig.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0).expect("a port");
         let ((), counted) = crate::rt_alloc::least_of(3, || {
             // 240 blocks of 256 is past the ping's settle and its whole
             // second of listening, so its detector runs inside the window.
@@ -48009,6 +48040,108 @@ mod hw_insert_road {
         // The ping ran its whole course inside the window, and answered.
         assert!(!rig.live(MASTER_SEAT).pinging, "the window ended before the ping did");
         assert_eq!(rig.live(MASTER_SEAT).answer, Some(Ok(64)));
+    }
+
+    /// **A bay on a lane and the same bay on the master measure one loop**:
+    /// a lane's rack runs before the chunk's input is read and the master's
+    /// after it, and the loop and the latency do not care which.
+    #[test]
+    fn a_lane_and_the_master_measure_the_same_loop() {
+        let lane = lane_seat(1, CHAIN_OWN);
+        let mut on_lane = Rig::new(120, lane, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            on_lane.block();
+        }
+        let a = on_lane.ping(lane);
+        let mut on_master = Rig::new(120, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            on_master.block();
+        }
+        let b = on_master.ping(MASTER_SEAT);
+        assert!(a.connected && b.connected);
+        assert_eq!(a.answer, b.answer, "the loop moved with the rack");
+        assert_eq!(a.latency, b.latency);
+        // And a bay moved across with its saved measurement keeps it.
+        on_lane.e.adopt_hw_ping_at(Rig::addr(lane), 0).expect("the lane's answer to adopt");
+        let saved = on_lane.e.save_insert_state(lane, 0).expect("state");
+        on_master.e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&saved))
+            .unwrap()
+            .unwrap();
+        for _ in 0..4 {
+            on_master.block();
+        }
+        let moved = on_master.live(MASTER_SEAT);
+        assert!(moved.measured, "a measured bay opened unmeasured on another rack");
+        assert_eq!(moved.latency, a.latency);
+    }
+
+    /// **A ping is refused on a bypassed bay, and one that waited out a
+    /// bypass is dropped, not fired**: a bypassed bay never runs, so an ask
+    /// left standing would fire the click into the box the moment it came
+    /// back, possibly mid-take.
+    #[test]
+    fn a_ping_is_refused_on_a_bypassed_bay_and_a_waiting_one_expires() {
+        let mut rig = Rig::new(40, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..8 {
+            rig.block();
+        }
+        rig.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        assert!(rig.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0).is_err(), "a bypassed bay took a ping");
+        rig.e.set_insert_bypass(&[]);
+        rig.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0).expect("back in circuit, a ping is taken");
+        rig.e.set_insert_bypass(&[(MASTER_SEAT, 0)]);
+        // Three seconds out of circuit, then back.
+        for _ in 0..(48_000 * 3 / BLOCK) {
+            rig.block();
+        }
+        rig.e.set_insert_bypass(&[]);
+        let start = rig.tape.len();
+        for _ in 0..400 {
+            rig.block();
+        }
+        assert_eq!(
+            rig.live(MASTER_SEAT).answer,
+            Some(Err(crate::units::hwinsert::PingFail::Expired.sentence().to_owned()))
+        );
+        assert!(
+            rig.tape[start..].iter().skip(2).step_by(WIDE).all(|v| v.abs() < 0.4),
+            "the stale ping fired"
+        );
+    }
+
+    /// **Sixteen loops reload without running out of ports**: each reload
+    /// hands the bay's port to its new tenant.
+    #[test]
+    fn sixteen_loops_reload_without_running_out_of_ports() {
+        let mut rig = Rig::new(10, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::HWINSERT_PATH).unwrap();
+        let state = crate::builtin_fx::state_text(spec, &spec.defaults(), &state_lines(Some(Jacks::pair(2)), Some(Jacks::pair(4)), None))
+            .into_bytes();
+        // The master holds one; fifteen lanes the rest.
+        let seats: Vec<usize> = std::iter::once(MASTER_SEAT).chain((0..15).map(|l| lane_seat(l, CHAIN_OWN))).collect();
+        for &seat in &seats[1..] {
+            rig.e.load_insert(seat, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&state)).unwrap();
+        }
+        assert_eq!(rig.e.hw_free_ports(), 0);
+        for round in 0..3 {
+            for &seat in &seats {
+                rig.e.load_insert(seat, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&state)).unwrap();
+                rig.block();
+            }
+            for _ in 0..4 {
+                rig.block();
+            }
+            for &seat in &seats {
+                assert!(rig.e.hw_insert_has_port_at(Rig::addr(seat), 0), "round {round}: seat {seat} lost its port");
+                assert!(rig.live(seat).connected, "round {round}: seat {seat}: {}", rig.live(seat).status);
+            }
+        }
+    }
+
+    /// The PDC limit the loop refuses past is the desk's own.
+    #[test]
+    fn the_loops_limit_is_the_compensation_limit() {
+        assert_eq!(crate::units::hwinsert::PDC_LIMIT as usize, MAX_PDC_FRAMES);
     }
 
     /// **A lane holding a loop renders in device time**: it is pinned out of

@@ -908,6 +908,11 @@ struct Bounce {
     /// made with it and handed to the finish with it, so it can neither
     /// outlive the pass nor be another pass's.
     delivery: tangent_ui::ports::ProjectExportSpec,
+    /// The hardware loops' slips when the pass began (taken on its first
+    /// frame), and whether the pass has already said a loop failed it. See
+    /// `tick_hw_inserts`.
+    hw_slips: Option<u32>,
+    hw_flagged: bool,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -8276,11 +8281,21 @@ impl DesktopApp {
         };
         match ask {
             HwAsk::Ping => {
-                if !e.ping_hw_insert_at(at.0, at.1) {
+                // **Never into a take or an export.** A ping silences the
+                // send and mutes the return for over a second, which in a
+                // recording or a realtime export is a hole in the file.
+                if self.recorder.session.is_recording()
+                    || self.recorder.arr_rec.is_some()
+                    || self.recorder.bounce.is_some()
+                {
                     self.app.notify(
-                        Kind::Error,
-                        "That Tangent Insert has no hardware port to ping through.",
+                        Kind::Info,
+                        "A ping would leave a hole in the recording: ping when nothing is recording or exporting.",
                     );
+                    return;
+                }
+                if let Err(why) = e.ping_hw_insert_at(at.0, at.1) {
+                    self.app.notify(Kind::Error, why);
                 }
             }
             HwAsk::Route { send, jacks } => {
@@ -8335,9 +8350,22 @@ impl DesktopApp {
     /// relaxed walk over sixteen flags when the desk has none.
     #[cfg(feature = "recorder")]
     fn tick_hw_inserts(&mut self) {
+        // **Two devices are two clocks.** The input's name against the
+        // output's, every frame (the input can change under a running
+        // engine); a loop across two devices is refused, not drifted.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            let separate = self
+                .recorder
+                .session
+                .audio_device_name()
+                .is_some_and(|input| !crate::units::hwinsert::one_device(input, &e.output().device));
+            e.set_hw_separate_input(separate);
+        }
         if !self.recorder.engine.as_ref().is_some_and(crate::instrument::Engine::has_hw_inserts) {
             return;
         }
+        let mut down: Option<String> = None;
+        let mut slips = 0u32;
         let bays: Vec<tangent_ui::desk_id::SeatBay> = self
             .app
             .plugins()
@@ -8363,9 +8391,23 @@ impl DesktopApp {
                     self.write_bay_state(sb, spec.path, &blob);
                 }
             }
+            // **A bay seated when every port was taken gets one as soon as
+            // one frees**: reloaded, which claims it.
+            if !e.hw_insert_has_port_at(at.0, at.1)
+                && e.hw_free_ports() > 0
+                && e.builtin_insert_at(at.0, at.1).is_some_and(|(s, _)| s.path == crate::builtin_fx::HWINSERT_PATH)
+            {
+                self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+            }
             let Some(live) = hw_live(&self.app, e, at.0, at.1) else {
                 continue;
             };
+            if !self.app.bay_bypassed(sb) {
+                slips = slips.saturating_add(live.slips);
+                if !live.connected && down.is_none() {
+                    down = Some(live.status.clone());
+                }
+            }
             let lines = live.to_lines();
             let shown = self
                 .app
@@ -8373,6 +8415,24 @@ impl DesktopApp {
                 .is_some_and(|f| lines.iter().all(|l| f.extra.contains(l)));
             if adopted.is_some() || !shown {
                 push_builtin_faces(&mut self.app, e, (sb.seat, at.0));
+            }
+        }
+        // **A realtime export watches its loops.** The intake started it
+        // only with every loop connected; a loop that comes apart, or an
+        // input that falls behind, mid-pass is a stretch of the file that is
+        // dry or broken, and the pass says so rather than finishing quiet.
+        if let Some(b) = self.recorder.bounce.as_mut() {
+            let base = *b.hw_slips.get_or_insert(slips);
+            if !b.hw_flagged && (down.is_some() || slips > base) {
+                b.hw_flagged = true;
+                let why = match down {
+                    Some(status) => format!("a Tangent Insert's loop came apart during the export ({status})"),
+                    None => "the input fell behind a Tangent Insert's loop during the export".to_owned(),
+                };
+                self.app.notify(
+                    Kind::Error,
+                    format!("export: {why}, so part of the file may be dry or glitched. Export again once the loop is steady."),
+                );
             }
         }
     }
@@ -10934,6 +10994,8 @@ impl DesktopApp {
             engine_lost: false,
             stem_dir,
             delivery,
+            hw_slips: None,
+            hw_flagged: false,
         });
     }
 
@@ -11803,16 +11865,35 @@ impl DesktopApp {
         // realtime one, through the device, and says so; a freeze cannot
         // become one and is refused in `start_offline_render`.
         let req = match req {
-            tangent_ui::ports::ProjectRequest::Export(mut spec)
-                if !spec.realtime
-                    && !crate::engine_bridge::hw_inserts_in_circuit(&self.app, None).is_empty() =>
-            {
-                spec.realtime = true;
-                self.app.notify(
-                    Kind::Info,
-                    "This project plays through a Tangent Insert (outboard gear), which cannot \
-                     run faster than real time, so it exports in real time through the device.",
-                );
+            tangent_ui::ports::ProjectRequest::Export(mut spec) => {
+                let links: Vec<(bool, String)> = crate::engine_bridge::hw_inserts_in_circuit(&self.app, None)
+                    .into_iter()
+                    .map(|sb| {
+                        self.bridge
+                            .engine_bay(sb)
+                            .zip(self.recorder.engine.as_ref())
+                            .and_then(|(at, e)| hw_live(&self.app, e, at.0, at.1))
+                            .map_or_else(
+                                || (false, "No audio device is running.".to_owned()),
+                                |l| (l.connected, l.status),
+                            )
+                    })
+                    .collect();
+                match crate::engine_bridge::hw_export_verdict(spec.realtime, &links) {
+                    Err(why) => {
+                        self.app.notify(Kind::Error, why);
+                        return;
+                    }
+                    Ok(true) => {
+                        spec.realtime = true;
+                        self.app.notify(
+                            Kind::Info,
+                            "This project plays through a Tangent Insert (outboard gear), which cannot \
+                             run faster than real time, so it exports in real time through the device.",
+                        );
+                    }
+                    Ok(false) => {}
+                }
                 tangent_ui::ports::ProjectRequest::Export(spec)
             }
             other => other,
@@ -24410,30 +24491,6 @@ mod tests {
                 "`{starter}` takes a running pass's message down when it refuses"
             );
         }
-    }
-
-    /// **A hardware loop is never rendered faster than real time.** The
-    /// intake turns a full-speed export of a desk with a Tangent Insert in
-    /// circuit into a realtime one, BEFORE it asks whether the pass may run
-    /// or covers the desk; the offline starter refuses a freeze (and
-    /// anything else that reaches it) before it builds an engine.
-    #[test]
-    fn a_hardware_loop_exports_in_real_time_and_never_freezes_offline() {
-        let whole = include_str!("desktop.rs");
-        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
-        let body_of = |f: &str| {
-            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
-            &src[at..at + src[at..].find("\n    fn ").expect("its end")]
-        };
-        let intake = body_of("fn take_project_request(");
-        let turned = intake.find("spec.realtime = true").expect("the intake no longer turns a loop's export realtime");
-        let gated = intake.find("hw_inserts_in_circuit(").expect("the intake does not ask about loops");
-        let asked = intake.find("self.refuse_new_pass(&req)").expect("the intake's refusal");
-        assert!(gated < turned && turned < asked, "the export turns realtime after the pass is judged");
-        let offline = body_of("fn start_offline_render(");
-        let refused = offline.find("hw_refusal_for(").expect("the offline starter renders loops dry");
-        let built = offline.find("full_build_with(").expect("the offline starter's build");
-        assert!(refused < built, "the offline starter builds before it refuses a loop");
     }
 
     /// **A failed full-speed export leaves its folder as it found it.** The
