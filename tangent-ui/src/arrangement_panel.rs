@@ -5641,11 +5641,12 @@ fn wave_band(
 /// So the add's two grounds are painted TALLER, each to the foot of its
 /// own column: `header` is its header panel run down to the bottom of the
 /// header column (it wears `empty_ground` there), `lane` is its lane run
-/// down to the bottom of the lanes (it wears the add's own stripe). One
-/// rect a column however much room is left, and each IS the add's own
-/// ground, so the add and the room under it read as one surface: the seam
-/// under the add is not drawn, and its slot box closes round the whole run
-/// rather than across the add's foot.
+/// down to the bottom of the lanes (it wears `lane`, the field's own
+/// ground, whatever row the add stands on: see `field_ground`). One rect a
+/// column however much room is left, and each IS the add's own ground, so
+/// the add and the room under it read as one surface: the seam under the
+/// add is not drawn, and its slot box closes round the whole run rather
+/// than across the add's foot.
 ///
 /// **Paint, and nothing else.** The add's cells (its `HeaderRow::panel`,
 /// its lane row, its plus) are what a press is tested against and they are
@@ -5671,8 +5672,7 @@ pub fn endless_ground(l: &Layout, view: &ArrangeView<'_>) -> Option<EndlessGroun
     let RowKind::Track(row) = last.kind else {
         return None;
     };
-    let lane = view.lanes.get(row)?;
-    if lane.used || lane.plus == crate::mixer_panel::Plus::Row {
+    if !view.lanes.get(row).is_some_and(is_trailing_add) {
         return None;
     }
     let panel = l.header_rows.get(row)?.panel;
@@ -5689,6 +5689,35 @@ pub fn endless_ground(l: &Layout, view: &ArrangeView<'_>) -> Option<EndlessGroun
             Pos2::new(last.lane.right(), l.lanes_area.bottom()),
         ),
     })
+}
+
+/// Whether `lane` is the desk's trailing add, open or locked: no track,
+/// and not a row's own empty plus. What the add wears in the field and
+/// where its ground runs on are both read off this, so the two cannot
+/// disagree about which row is the add.
+fn is_trailing_add(lane: &LaneView<'_>) -> bool {
+    !lane.used && lane.plus != crate::mixer_panel::Plus::Row
+}
+
+/// **The ground row `row` wears in the field.**
+///
+/// A track's row wears one of the two stripes by its row, so eight rows
+/// read as eight. The trailing add wears `lane`, the field's own ground,
+/// whatever row it stands on. It is no row yet (it wears no number
+/// either), and its row is the desk's length, which a removal, a track
+/// opened between two others and a track that grows the desk all change.
+/// Striped by that row, the add took the other stripe whenever the length
+/// changed by an odd count, and since its ground runs on to the foot of
+/// the lanes (`EndlessGround`), the largest surface on the timeline
+/// changed shade with it: the colour the owner asked to carry on held only
+/// until the desk changed length. `lane` is the stripe the add wore on the
+/// shipped desk and on an empty one, so those look as they did.
+fn field_ground(p: &Ink, view: &ArrangeView<'_>, row: usize) -> Color32 {
+    if row % 2 == 0 || view.lanes.get(row).is_some_and(is_trailing_add) {
+        p.lane
+    } else {
+        p.lane_alt
+    }
 }
 
 /// Paint the whole view into `rect`.
@@ -5708,9 +5737,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
 
     // ── the lanes' field, striped so eight rows read as eight ─────────────
     for (i, row) in l.lane_rows.iter() {
-        // The trailing add's stripe runs on to the foot of the lanes.
+        // The trailing add's ground runs on to the foot of the lanes, and
+        // is the field's own ground whatever row the add stands on (see
+        // `field_ground`).
         let ground = endless_at(i).map_or(*row, |g| g.lane);
-        painter.rect_filled(ground, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
+        painter.rect_filled(ground, 0.0, field_ground(&p, view, i));
     }
     // **An automation row takes the ground of the track it belongs to**, a
     // shade recessed. Its own stripe colour would read as a ninth track;
@@ -10655,9 +10686,10 @@ ArrangeView {
     ///
     /// Under the add, each column's last fill is ONE rect from the add's
     /// own top to the foot of that column, as wide as the add, in what the
-    /// add wears there: `ink`'s `empty_ground` in the header column, the
-    /// add's own stripe across the field; and it is the only rect of that
-    /// colour there, so the run costs a rect a column however far it goes.
+    /// add wears there: `ink`'s `empty_ground` in the header column, and
+    /// across the field `lane`, the field's own ground, on an odd row as on
+    /// an even one (`field_ground`); and it is the only rect of that colour
+    /// there, so the run costs a rect a column however far it goes.
     /// Nothing is drawn ACROSS the add's foot, neither the seam a boundary
     /// between rows wears nor a box edge, and the add's slot box closes
     /// round the whole run. Returns the two runs under the add: the header
@@ -10682,9 +10714,8 @@ ArrangeView {
             header_run.is_positive() && lane_run.is_positive(),
             "{what}: no room under the add {lane:?} to run on into"
         );
-        let stripe = if g.row % 2 == 0 { p.lane } else { p.lane_alt };
         for (column, run, own, want) in
-            [("header column", header_run, panel, p.empty_ground), ("field", lane_run, lane, stripe)]
+            [("header column", header_run, panel, p.empty_ground), ("field", lane_run, lane, p.lane)]
         {
             let (rect, fill) = ground_over(shapes, run)
                 .unwrap_or_else(|| panic!("{what}: nothing is painted under the add in the {column}"));
@@ -10847,10 +10878,11 @@ ArrangeView {
 
     /// **On every theme, in both modes, the run wears the add's own
     /// grounds**, which are the theme's: `empty_ground` in the header column
-    /// (the token every empty row's header wears) and the add's stripe in
-    /// the field, an even row's and an odd row's. Read off the painted frame
-    /// against `ink`, so no colour is written down here and a theme that
-    /// moves its grounds moves the run with them.
+    /// (the token every empty row's header wears) and `lane`, the field's
+    /// own ground, in the field, with the add on an even row and on an odd
+    /// one. Read off the painted frame against `ink`, so no colour is
+    /// written down here and a theme that moves its grounds moves the run
+    /// with them.
     #[test]
     fn every_theme_runs_the_add_on_in_its_own_grounds() {
         use crate::mixer_panel::Plus;
@@ -10884,6 +10916,103 @@ ArrangeView {
             }
         }
         assert!(seen >= 64, "only {seen} theme frames were painted");
+    }
+
+    /// **The add wears one ground in the field however long the desk is.**
+    ///
+    /// The add's row is the desk's length, so removing a track, opening one
+    /// between two others and adding one that grows the desk each stand it
+    /// on a row of the other parity. Striped by that row, the add and the
+    /// run under it (the largest surface on the timeline) swapped between
+    /// the two stripes at every one of those edits, so the colour the owner
+    /// asked to carry on held only until the desk changed length. Held on
+    /// desks of none to nine tracks, so the add stands on even rows and odd
+    /// ones, in both tiers, at three window sizes, with automation rows open
+    /// and a shut folder above it, scrolled to the top and to the end: the
+    /// add's own lane and the run under it, where there is one, are `lane`,
+    /// the field's own ground, and one rect; a desk ending flush at its add
+    /// wears it too; and every track above keeps its stripe by row, so
+    /// nothing but the add changed.
+    ///
+    /// Revert-check: stripe the add by its row again (`field_ground`) and
+    /// every desk whose add stands on an odd row goes red.
+    #[test]
+    fn the_trailing_adds_ground_is_one_colour_however_long_the_desk_is() {
+        use crate::mixer_panel::Plus;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let none: Vec<ClipView<'_>> = Vec::new();
+        // The fill the eye sees at `at`: a speck, so nothing painted beside
+        // it (a scrollbar, a neighbour) is read as its ground.
+        let fill_at = |shapes: &[egui::epaint::ClippedShape], at: Pos2| {
+            ground_over(shapes, Rect::from_center_size(at, Vec2::splat(4.0)))
+        };
+        let (mut odd_run, mut odd_flush, mut striped) = (0usize, 0usize, 0usize);
+        for (w, h) in [(1300.0_f32, 420.0_f32), (900.0, 673.0), (640.0, 300.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for plus in [Plus::Trailing, Plus::Locked] {
+                // (automation rows open on the first lane, lanes 1..=k shut
+                // away in a folder), each on the desks that have the tracks
+                // to carry it
+                for (opened, shut, least) in [(0usize, 0usize, 0usize), (2, 0, 1), (0, 2, 3)] {
+                    for used in least..=9 {
+                        for scroll in [0usize, usize::MAX] {
+                            let mut v = ending_at_the_add(&none, used, plus);
+                            v.visible_lanes = 6;
+                            v.lane_scroll = scroll;
+                            if opened > 0 {
+                                v.lanes[0].automation = (0..opened).map(|_| an_open_row()).collect();
+                            }
+                            for k in 1..=shut {
+                                v.lanes[k].hidden = true;
+                            }
+                            v.active = used + 1 - shut;
+                            let what = format!(
+                                "{w}x{h}, {plus:?}, the add on row {used} ({shut} shut away, \
+                                 {opened} automation rows), scroll {scroll}"
+                            );
+                            let l = Layout::new(r, &v);
+                            let Some(add) = l.lane_rows.get(used).copied().filter(|a| a.height() > 8.0) else {
+                                continue;
+                            };
+                            let p = ink(&v);
+                            let shapes = paint_in(&ctx, &v, r);
+                            let at = Pos2::new(add.left() + add.width() * 0.3, add.center().y);
+                            let (own, fill) =
+                                fill_at(&shapes, at).unwrap_or_else(|| panic!("{what}: nothing painted on the add"));
+                            assert_eq!(fill, p.lane, "{what}: the add does not wear the field's own ground");
+                            match endless_ground(&l, &v) {
+                                Some(g) => {
+                                    let under = Pos2::new(at.x, (add.bottom() + g.lane.bottom()) * 0.5);
+                                    assert_eq!(
+                                        fill_at(&shapes, under),
+                                        Some((own, p.lane)),
+                                        "{what}: the run under the add is not the add's own ground"
+                                    );
+                                    odd_run += used % 2;
+                                }
+                                None => odd_flush += used % 2,
+                            }
+                            for (i, row) in l.lane_rows.iter().filter(|(i, x)| *i < used && x.height() > 8.0) {
+                                let stripe = if i % 2 == 0 { p.lane } else { p.lane_alt };
+                                let at = Pos2::new(row.left() + row.width() * 0.3, row.center().y);
+                                assert_eq!(
+                                    fill_at(&shapes, at).map(|(_, c)| c),
+                                    Some(stripe),
+                                    "{what}: track row {i} lost its stripe"
+                                );
+                                striped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            odd_run >= 40 && odd_flush >= 8 && striped >= 300,
+            "{odd_run} runs and {odd_flush} flush adds on odd rows, {striped} tracks' stripes read"
+        );
     }
 
     /// **The run under the add is paint, and answers nothing.**
