@@ -7460,6 +7460,31 @@ pub fn set_export_stem_mode(spec: &mut crate::ports::ProjectExportSpec, chip: us
 }
 
 
+/// **The Quantize window's GRID row**: one chip per step, BAR (step 0) down
+/// to the finest the window offers (step -7), each named in the song's
+/// `meter` by the same ladder the gridboxes print, and a press sets
+/// `grid_exp`. Returns the chips, coarse to fine.
+///
+/// Its own function so the row can be drawn alone: each chip sizes itself
+/// to its word (a selectable label), which is why this row needed no fit
+/// when the gridboxes did, and `every_quantize_grid_chip_holds_its_word`
+/// holds it to that for every word in every meter and face.
+fn quantize_grid_row(ui: &mut egui::Ui, grid_exp: &mut i8, meter: (u8, u8)) -> Vec<egui::Response> {
+    ui.horizontal_wrapped(|ui| {
+        let mut chips = Vec::new();
+        for e in (-7_i8..=0).rev() {
+            let label = crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
+            let chip = ui.selectable_label(*grid_exp == e, label);
+            if chip.clicked() {
+                *grid_exp = e;
+            }
+            chips.push(chip);
+        }
+        chips
+    })
+    .inner
+}
+
 /// **The desk's own dialog window**, in the one slot the app has always had.
 ///
 /// A thin wrapper since the amp grew a stacked pedal window: `show_on` below
@@ -13103,15 +13128,7 @@ fn show_on(
 
                             // ── the grid ──────────────────────────────────
                             head(ui, "GRID");
-                            ui.horizontal_wrapped(|ui| {
-                                for e in (-7_i8..=0).rev() {
-                                    let label =
-                                        crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
-                                    if ui.selectable_label(*grid_exp == e, label).clicked() {
-                                        *grid_exp = e;
-                                    }
-                                }
-                            });
+                            quantize_grid_row(ui, grid_exp, *meter);
                             ui.horizontal(|ui| {
                                 ui.checkbox(triplet, RichText::new("triplet").color(t.text));
                                 ui.add_space(10.0);
@@ -22740,6 +22757,74 @@ at: None,
                 let _ = show(ctx, &mut dialog, face, placement);
             },
         );
+    }
+
+    /// **Every Quantize GRID chip holds its word, in every meter and face.**
+    ///
+    /// The gridboxes had to be taught to shrink a word to their box
+    /// (`arrangement_panel::grid_box_word`, `midi_editor::chip_word`): their
+    /// steps of four characters and more spilled out of it. This row did not
+    /// need it: each chip is a selectable label and sizes itself to its
+    /// word. Held here all the same, so that a chip of fixed width would be
+    /// caught the day one is drawn: the eight chips of every one of the 192
+    /// signatures, painted by `quantize_grid_row` in the window's own style,
+    /// in every bundled face at 100% and 200%, and each word laid out inside
+    /// its own chip, every pixel of its ink too.
+    ///
+    /// There is no fix on this row to revert, so this has no revert check:
+    /// it passes on the code from before the gridboxes' fit as well.
+    #[test]
+    fn every_quantize_grid_chip_holds_its_word() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let t = theme(Color32::from_rgb(0x4A, 0x3B, 0x2C));
+        for ppp in [1.0f32, 2.0] {
+            for face in fonts::FontChoice::ALL {
+                let ctx = crate::arrangement_panel::context_at(face, ppp);
+                for &(beats, unit) in &sigs {
+                    let mut raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0))),
+                        ..Default::default()
+                    };
+                    raw.viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .native_pixels_per_point = Some(ppp);
+                    let mut chips: Vec<egui::Response> = Vec::new();
+                    let out = ctx.run(raw, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            apply_theme(ui.style_mut(), &t);
+                            let mut grid_exp = -3;
+                            chips = quantize_grid_row(ui, &mut grid_exp, (beats, unit));
+                        });
+                    });
+                    let words = crate::arrangement_panel::PaintedWord::all(&ctx, &out.shapes);
+                    let at = format!("{face:?} at {ppp}x in {beats}/{unit}");
+                    assert_eq!(chips.len(), 8, "{at}: the row is not steps 0 down to -7");
+                    assert_eq!(words.len(), 8, "{at}: the row painted {words:?}");
+                    for (k, (chip, word)) in chips.iter().zip(&words).enumerate() {
+                        let e = -i8::try_from(k).expect("eight chips");
+                        assert_eq!(word.text, crate::arrangement_panel::grid_label_text(e, beats, unit), "{at}");
+                        let r = chip.rect;
+                        assert!(
+                            r.contains_rect(word.laid),
+                            "{at}: {:?} is laid out at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.laid
+                        );
+                        assert!(
+                            word.ink.left() >= r.left() - 1.0e-3
+                                && word.ink.right() <= r.right() + 1.0e-3
+                                && word.ink.top() >= r.top() - 1.0e-3
+                                && word.ink.bottom() <= r.bottom() + 1.0e-3,
+                            "{at}: {:?} has ink at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

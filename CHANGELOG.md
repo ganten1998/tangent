@@ -127,6 +127,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   finer); one that no single note names is counted in the meter's own
   beats, so half a bar of 10/8 reads 5/8.
 
+  A step too wide for its box is printed smaller now, until it fits, in
+  the arrangement's grid box (1/16, 1/4·, 1/128) and the MIDI editor's
+  grid chip (1/16 sw, 1/1024T), never under 6.5 points. Nothing is drawn
+  outside a grid box any more, so a long step no longer runs onto the
+  tempo lane's switch or under the navigator, and steps that already fit
+  keep their size. In Courier Prime and JetBrains Mono the arrangement's
+  1/1024 and 1/2048 (the finest steps of 1/16, 1/32, 2/32 and odd counts
+  of 32nds) are still too wide at 6.5 points and are cut at the box's
+  edges.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and

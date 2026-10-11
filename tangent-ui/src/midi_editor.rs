@@ -749,6 +749,36 @@ pub fn grid_word(view: &MidiEditView<'_>) -> String {
     }
 }
 
+/// **The outline a strip chip is drawn in**, inside its rect. Its word is
+/// fitted inside the outline ([`chip_word`]), so the two read one number.
+const CHIP_STROKE: f32 = 1.0;
+
+/// **A strip chip's word: inside the chip's outline, shrunk rather than
+/// spilled, and clipped to the chip.**
+///
+/// The chip prints at 0.55 of its height, and a word that fits inside the
+/// outline there keeps that size, as SNAP, PED, SWG, TRP and every grid word
+/// up to six characters do: the gridbox chip is 39.6 points wide, which is
+/// 37.6 inside its outline, and "BAR sw" takes 35 of it in Courier Prime and
+/// JetBrains Mono. The grid chip prints more than that. Its ladder runs to
+/// 1/4096 and carries the grid's shape on its end, so "1/1024T" is seven
+/// characters and "1/128 sw" eight, 41 and 47 points at the chip's 9.9; and
+/// in Terminess, the narrowest face, an eight-character word (39 points) ran
+/// onto the outline itself. Those shrink to the room inside the outline
+/// (`arrangement_panel::fitted_word_size`), never under the floor, and every
+/// one of them fits there at or above it in all three bundled faces.
+fn chip_word(painter: &Painter, r: Rect, word: &str, ink: Color32) {
+    crate::arrangement_panel::paint_fitted_word(
+        painter,
+        r,
+        r.shrink(CHIP_STROKE),
+        word,
+        crate::fonts::courier(),
+        r.height() * 0.55,
+        ink,
+    );
+}
+
 // ── drawing ────────────────────────────────────────────────────────────────
 
 /// Lift a colour toward white by `t`, keeping its hue — how a near-black
@@ -1002,16 +1032,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             3.0,
-            Stroke::new(1.0_f32, ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
+            Stroke::new(CHIP_STROKE, ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
             egui::StrokeKind::Inside,
         );
-        painter.text(
-            r.center(),
-            Align2::CENTER_CENTER,
-            word,
-            font(r.height() * 0.55),
-            if lit { face } else { ink.gamma_multiply(0.7) },
-        );
+        chip_word(painter, r, word, if lit { face } else { ink.gamma_multiply(0.7) });
     };
     // **The pencil: draw mode's own switch**, left of SWG. Drawn rather
     // than lettered because it is a MODE and not a setting — the chips
@@ -3226,6 +3250,178 @@ mod tests {
                     laid.left() >= chip.left() - 0.01 && laid.right() <= chip.right() + 0.01,
                     "{face:?}: {want:?} is laid out at {laid:?}, outside its chip {chip:?}"
                 );
+            }
+        }
+    }
+
+    /// **Every word the grid chip can print is painted inside the chip's
+    /// outline: as it always was when it fits, shrunk when it does not,
+    /// never under the floor, and clipped to the chip whatever happens.**
+    ///
+    /// The chip is 39.6 points wide and prints at 9.9, which holds six
+    /// characters inside its outline in every bundled face. Its ladder runs
+    /// from 8 bars to a 4096th note (exp 3 to -7) and carries the grid's
+    /// shape on its end, so it prints up to nine: "1/1024T" is 41 points at
+    /// 9.9 in Courier Prime and JetBrains Mono, "1/4096 sw" 53, past both
+    /// ends of the chip; and Terminess's eight-character words (39) ran onto
+    /// the outline.
+    ///
+    /// Swept over every word `grid_word` can return: all 192 signatures,
+    /// every step the chip reaches, plain, triplet and swing, and the glyph
+    /// spelling's quarter with each shape too. Each is painted by
+    /// `chip_word`, the call the chip makes, into the real chip, in every
+    /// bundled face at 100% to 200% display scale, and read back as the
+    /// tessellator draws it. Held: a word laid out inside the outline at
+    /// 9.9 is painted at exactly 9.9 (BAR, BAR T, BAR sw, 1/8T, 1/8 sw and
+    /// 1/16T are, by name); any other is shrunk until it is no wider than
+    /// the outline's room less `WORD_AIR` either side, never under
+    /// `WORD_FLOOR`, and every one of them gets there; every pixel of every
+    /// word is inside the outline; and every word is clipped to the chip.
+    ///
+    /// Revert checks, all performed: paint at the chip's own size again and
+    /// this fails on the first word wider than the chip, "1/128 sw" (1/1's
+    /// finest step, swung), left at 9.9; fit to the whole chip rather than
+    /// inside its outline and it fails on that same word, which then
+    /// shrinks only to 8 and is wider than the room inside the outline; take
+    /// the clip away and it fails on the first word it sweeps.
+    #[test]
+    fn every_grid_word_is_painted_inside_its_chip() {
+        let n: [ArrNote; 0] = [];
+        let chip = Layout::new(rect()).tool_grid;
+        let inner = chip.shrink(CHIP_STROKE);
+        let ceiling = chip.height() * 0.55;
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let mut words: Vec<String> = Vec::new();
+        for &(beats, unit) in &sigs {
+            for grid_exp in -7i8..=3 {
+                for (triplet, swing) in [(false, false), (true, false), (false, true)] {
+                    let v = MidiEditView {
+                        grid_exp,
+                        triplet,
+                        swing,
+                        sig_top: u32::from(beats),
+                        sig_bottom: u32::from(unit),
+                        ..view(&n)
+                    };
+                    let w = grid_word(&v);
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+            }
+        }
+        for w in ["\u{266a}", "\u{266a}T", "\u{266a} sw"] {
+            words.push(w.to_owned());
+        }
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for face in crate::fonts::FontChoice::ALL {
+                let ctx = crate::arrangement_panel::context_at(face, ppp);
+                let measure = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                for (k, w) in words.iter().enumerate() {
+                    let at = format!("{face:?} at {ppp}x, {w:?}");
+                    let painted = crate::arrangement_panel::PaintedWord::painted_by(&ctx, ("chip", k), |p| {
+                        chip_word(p, chip, w, Color32::WHITE);
+                    });
+                    let [word] = painted.as_slice() else {
+                        panic!("{at}: painted {painted:?}, not one word");
+                    };
+                    assert_eq!(&word.text, w, "{at}");
+                    assert!(
+                        word.size >= crate::arrangement_panel::WORD_FLOOR,
+                        "{at}: painted at {}, under the floor",
+                        word.size
+                    );
+                    assert!(
+                        chip.contains_rect(word.clip),
+                        "{at}: clipped to {:?}, not to its chip {chip:?}",
+                        word.clip
+                    );
+                    let wide = measure
+                        .layout_no_wrap(w.clone(), FontId::new(ceiling, crate::fonts::courier()), Color32::WHITE)
+                        .rect
+                        .width();
+                    if wide <= inner.width() {
+                        assert_eq!(
+                            word.size, ceiling,
+                            "{at}: fits inside the outline at {ceiling} ({wide} wide) and was painted at {}",
+                            word.size
+                        );
+                    } else {
+                        // Shrunk, with the air either side, held on its width
+                        // (the pixel snap may move it by a pixel; the ink is
+                        // held below).
+                        let air = crate::arrangement_panel::WORD_AIR;
+                        assert!(word.size < ceiling, "{at}: {wide} wide at {ceiling} and not shrunk");
+                        assert!(
+                            word.laid.width() <= inner.width() - 2.0 * air + 1.0e-3,
+                            "{at}: shrunk to {} and {} wide, with less than {air} either side in {}",
+                            word.size,
+                            word.laid.width(),
+                            inner.width()
+                        );
+                    }
+                    assert!(
+                        word.ink.left() >= inner.left() - 1.0e-3
+                            && word.ink.right() <= inner.right() + 1.0e-3
+                            && word.ink.top() >= chip.top() - 1.0e-3
+                            && word.ink.bottom() <= chip.bottom() + 1.0e-3,
+                        "{at}: at {} points its ink is at {:?}, outside the outline {inner:?}",
+                        word.size,
+                        word.ink
+                    );
+                    if ["BAR", "BAR T", "BAR sw", "1/8T", "1/8 sw", "1/16T"].contains(&w.as_str()) {
+                        assert_eq!(word.size, ceiling, "{at}: the chip already held this one");
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The editor paints its grid chip through that fit**, read off the
+    /// real paint: the same word, the same size and the same place that
+    /// `chip_word` gives it, clipped to the chip. The sweep above holds
+    /// `chip_word` to every word; this holds `draw` to `chip_word`, from a
+    /// word that fits to the widest the chip prints, in every bundled face.
+    ///
+    /// Revert check, performed: hand the chip back to `painter.text` at 0.55
+    /// of its height and this fails on its first word, 1/8, which is no
+    /// longer clipped to the chip.
+    #[test]
+    fn the_editor_paints_its_grid_chip_through_the_fit() {
+        let n: [ArrNote; 0] = [];
+        let chip = Layout::new(rect()).tool_grid;
+        let words = [
+            (4u32, 4u32, -3i8, false, false, "1/8"),
+            (4, 4, 0, false, true, "BAR sw"),
+            (4, 4, -7, true, false, "1/128T"),
+            (1, 16, -7, true, false, "1/2048T"),
+            (4, 4, -7, false, true, "1/128 sw"),
+            (1, 32, -7, false, true, "1/4096 sw"),
+        ];
+        for face in crate::fonts::FontChoice::ALL {
+            let ctx = crate::arrangement_panel::context_at(face, 1.0);
+            for (k, (sig_top, sig_bottom, grid_exp, triplet, swing, want)) in words.into_iter().enumerate() {
+                let at = format!("{face:?} {sig_top}/{sig_bottom} step {grid_exp}");
+                let v = MidiEditView { grid_exp, triplet, swing, sig_top, sig_bottom, ..view(&n) };
+                assert_eq!(grid_word(&v), want, "{at}");
+                let drawn = crate::arrangement_panel::PaintedWord::painted_by(&ctx, ("editor", k), |p| {
+                    draw(p, rect(), &v);
+                });
+                let on_chip: Vec<_> = drawn.iter().filter(|w| chip.intersects(w.laid)).collect();
+                let [drawn] = on_chip.as_slice() else {
+                    panic!("{at}: the chip painted {on_chip:?}");
+                };
+                let alone = crate::arrangement_panel::PaintedWord::painted_by(&ctx, ("chip alone", k), |p| {
+                    chip_word(p, chip, want, Color32::WHITE);
+                });
+                let [alone] = alone.as_slice() else {
+                    panic!("{at}: chip_word painted {alone:?}");
+                };
+                assert_eq!(drawn.text, want, "{at}");
+                assert_eq!(drawn.size, alone.size, "{at}: {want} is not painted at its fitted size");
+                assert_eq!(drawn.laid, alone.laid, "{at}: {want} is not where the fit puts it");
+                assert_eq!(drawn.clip, chip, "{at}: {want} is not clipped to its chip");
             }
         }
     }
