@@ -8705,7 +8705,8 @@ impl LaneGrains {
         true
     }
 
-    /// Forget everything. A locate, a transport stop, a varispeed change.
+    /// Forget everything. A locate, a transport stop or start, a varispeed
+    /// change.
     fn clear(&mut self) {
         self.keys = [GrainKey::default(); GRAIN_SLOTS];
         self.next = 0;
@@ -10435,7 +10436,9 @@ struct Renderer {
     seen_req: u64,
     /// Whether the last chunk rolled, for the note flush on a falling edge —
     /// renderer-local, because nothing OUTSIDE the callback keys off edges any
-    /// more; this one exists so a stop can end the notes it strands.
+    /// more; this one exists so a stop can end the notes it strands. And for
+    /// the rising edge, where `run_transport` empties the grain rings of what
+    /// the stopped chunks stamped into them.
     was_rolling: bool,
     /// A loop just wrapped `pos` backward; the NEXT block must flush so the
     /// MIDI clip cursors rewind. Set on the wrap block, consumed on the one
@@ -14870,6 +14873,28 @@ impl Renderer {
         // Only a level read between two loads of ONE generation: a locate
         // that landed mid-read holds this chunk on its place, stopped.
         let rolling = level && req == first;
+        // **And the transport STARTING empties them, the third edge.**
+        //
+        // A stopped chunk renders too, at the parked position, and its
+        // render stamps every lane's ring with the span it made: `plan_grains`
+        // clears the rings at the top of each stopped chunk, and the chunk's
+        // own render then fills them again. So the first chunk to roll from
+        // where the playhead stood found its span already in the ring, was
+        // served the STOPPED render, and skipped its walk (`LaneBody::skip`):
+        // no note due in that span ever reached its instrument, and the
+        // clips' audio in it was a stopped desk's silence. The owner's "midi
+        // note at start not sounded but subsequent notes are" is that span
+        // holding the note at 0:00 when Play is pressed with the playhead
+        // home. A locate hid it everywhere else, because a locate empties the
+        // rings in the chunk that applies it - and a locate the callback
+        // meets mid-push holds that chunk stopped, which brought it back.
+        // `was_rolling` is still the LAST chunk's here: `render_program`
+        // moves it on after this returns.
+        if rolling && !self.was_rolling {
+            for l in self.spine.lanes.iter_mut().flatten() {
+                l.body_mut().grain.clear();
+            }
+        }
         let at = self.pos;
         if rolling {
             self.pos += frames as u64;
@@ -16149,6 +16174,13 @@ impl Renderer {
         // break the contract the ring's key is written against. Clearing
         // costs one catch-up on the way back in, which is the same catch-up
         // starting the transport already pays.
+        //
+        // **This clear does not outlive the chunk**: the chunk's own render
+        // stamps the rings again after it, with the span the fold is about
+        // to read. A stopped one stamps the parked position, so the chunk
+        // that rolls from there would be served a stopped desk's render;
+        // `run_transport` empties the rings once more on the edge where the
+        // transport starts, and that is the catch-up the start pays.
         if !rolling || self.stems_live || self.varispeed_ratio().is_some() {
             for l in self.spine.lanes.iter_mut().flatten() {
                 l.body_mut().grain.clear();
@@ -47144,6 +47176,369 @@ mod memory_inputs {
             assert_eq!(e.capture_ring_bytes(), 0, "{lanes}: a ring stayed");
             assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0, "{lanes}: an op was refused");
             assert_eq!(e.capture_dropped(), 0);
+        }
+    }
+}
+
+/// **A transport starting from a standstill owes its first chunk.**
+///
+/// The owner: "make a midi clip, input a note at the very start, play from
+/// the very start: the midi note at the start is not sounded but the
+/// subsequent notes are."
+///
+/// A stopped desk renders too, at the parked position, and each lane's
+/// render stamps its grain ring with the span it made. The first chunk to
+/// roll from where the playhead stood found that span in the ring, was
+/// served the STOPPED render, and skipped its walk (`LaneBody::skip`): no
+/// note due in it ever reached its instrument. Only a Play that did not
+/// move the playhead met it, because a locate empties the rings in the
+/// chunk that applies it, and every test that located and rolled in one
+/// breath passed.
+///
+/// Each test here starts the transport the way the app does, a
+/// [`Transport`] reconciled before every callback, over a part built by the
+/// schedule the live reload and the export share (`midi_clip_notes`, through
+/// `export_clip_placement`) from a clip drawn the way the arrangement draws
+/// one. The voices are every kind a lane plays: the DX7 and the Keys, the
+/// analog and the sampler in a bay (the rack road a hosted instrument takes
+/// too), and the drum lane, which strikes its pads from the walk and never
+/// rendered through the ring, as the control. And each holds the note to
+/// two things: its instrument is told in the first chunk that rolls, and
+/// the whole render is the one the same Play makes with a locate to the same
+/// frame in its push, which is the road that was always right. Equal is
+/// ONCE: a second strike, or a lost one, would each be a different render.
+#[cfg(test)]
+mod rolling_from_a_standstill {
+    use super::*;
+    use crate::transport::Transport;
+    use tangent_ui::arrangement::{ArrClip, ArrNote, Arrangement, ClipKind};
+
+    const RATE: u32 = 48_000;
+    /// A live callback, and the span a stopped one leaves in the ring.
+    const BLOCK: usize = 128;
+    /// Not lane 0, so nothing about the first lane stands in for the rule.
+    const LANE: usize = 2;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Voice {
+        Dx7,
+        Keys,
+        Analog,
+        Sampler,
+        Drums,
+    }
+
+    const VOICES: [Voice; 5] = [Voice::Dx7, Voice::Keys, Voice::Analog, Voice::Sampler, Voice::Drums];
+
+    /// A second of a constant tone at the sampler's root, which the kit
+    /// takes as its pad 0 too.
+    fn tone() -> SamplerSample {
+        SamplerSample {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.5; RATE as usize * 2],
+                rate: RATE,
+                source: PathBuf::from("tone.wav"),
+            }),
+            name: "tone.wav".to_owned(),
+            source: PathBuf::from("tone.wav"),
+            root_key: SAMPLER_ROOT_KEY,
+        }
+    }
+
+    /// An offline desk with `voice` on [`LANE`], rendering ahead as the app
+    /// ships (`render_ahead_ms` is AUTO).
+    fn desk(voice: Voice) -> Engine {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        match voice {
+            Voice::Dx7 => {
+                e.set_builtin_strips(1 << LANE);
+                e.sync_instrument_lanes(1 << LANE, 0);
+            }
+            Voice::Keys => {
+                e.set_keys_strips(1 << LANE);
+                e.sync_instrument_lanes(0, 1 << LANE);
+            }
+            Voice::Analog => {
+                e.load_insert(LANE, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                    .expect("the analog loads")
+                    .expect("and is seated");
+            }
+            Voice::Sampler => {
+                e.load_insert(LANE, 0, Some(Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+                    .expect("the sampler loads")
+                    .expect("and is seated");
+                assert!(e.set_sampler_sample(Slot(LANE as u32), Some(tone())), "the sample did not land");
+            }
+            Voice::Drums => {
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(tone().clip);
+                e.set_pad_kit(LANE, kit);
+                e.set_drum_strips(1 << LANE);
+            }
+        }
+        e.set_grain_ms(-1.0);
+        e.set_channel_gain(LANE, 0.5);
+        e.set_master_gain(1.0);
+        e
+    }
+
+    /// The key the `i`th strike plays: a chord tone for a pitched voice, the
+    /// sampler's root, the kit's pad 0.
+    fn key(voice: Voice, i: usize) -> u8 {
+        match voice {
+            Voice::Sampler => SAMPLER_ROOT_KEY,
+            Voice::Drums => PAD_BASE,
+            _ => 60 + 4 * i as u8,
+        }
+    }
+
+    /// **A MIDI item drawn on [`LANE`] from 0:00, `len_s` long and looping
+    /// at that length as a drawn item is born, with a quarter-second note at
+    /// each of `at_s`**, scheduled for the engine by the live reload's and
+    /// the export's own expansion.
+    fn part(voice: Voice, len_s: f64, at_s: &[f64]) -> Vec<PlacedMidi> {
+        let mut doc = Arrangement::default();
+        doc.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            lane: LANE,
+            len_s,
+            loop_s: len_s,
+            name: "MIDI".to_owned(),
+            notes: at_s
+                .iter()
+                .enumerate()
+                .map(|(i, &at_s)| ArrNote { at_s, dur_s: 0.25, key: key(voice, i), vel: 110, muted: false })
+                .collect(),
+            ..Default::default()
+        });
+        let (_, midi, unread) = crate::desktop::export_clip_placement(&doc, &[], RATE, |rel: &str| PathBuf::from(rel));
+        assert!(unread.is_empty(), "{unread:?}");
+        assert_eq!(midi.len(), 1, "the item was not scheduled");
+        midi
+    }
+
+    /// `blocks` callbacks, the transport reconciled before each as the app
+    /// reconciles it once a frame, and what came out of them.
+    fn run(e: &mut Engine, t: &mut Transport, blocks: usize) -> Vec<f32> {
+        let mut heard = Vec::with_capacity(blocks * BLOCK * 2);
+        let mut out = vec![0.0f32; BLOCK * 2];
+        for _ in 0..blocks {
+            t.push(Some(e));
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard.extend_from_slice(&out);
+        }
+        heard
+    }
+
+    /// What [`LANE`]'s instrument has been told is sounding.
+    fn told(e: &Engine) -> Vec<u8> {
+        e.offline.as_ref().map_or_else(Vec::new, |r| {
+            r.sounding_notes().into_iter().filter(|(l, _)| *l == LANE).map(|(_, k)| k).collect()
+        })
+    }
+
+    /// The loudest sample of `frames` frames from frame `from` of `heard`.
+    fn peak(heard: &[f32], from: usize, frames: usize) -> f32 {
+        heard
+            .get(from * 2..((from + frames) * 2).min(heard.len()))
+            .unwrap_or(&[])
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// **Play from wherever `wait` left the playhead**, and with a locate to
+    /// that same frame in Play's own push when `relocate`: what the
+    /// instrument had been told after the first chunk that rolled, and
+    /// everything heard from that chunk on.
+    fn play(
+        voice: Voice,
+        relocate: bool,
+        wait: &dyn Fn(&mut Engine, &mut Transport),
+        blocks: usize,
+    ) -> (Vec<u8>, Vec<f32>) {
+        let mut e = desk(voice);
+        let mut t = Transport::new();
+        wait(&mut e, &mut t);
+        if relocate {
+            let here = t.position_s(Some(&e), f64::from(RATE));
+            t.locate(here);
+        }
+        t.toggle_play();
+        let mut heard = run(&mut e, &mut t, 1);
+        let first = told(&e);
+        heard.extend(run(&mut e, &mut t, blocks - 1));
+        (first, heard)
+    }
+
+    /// Both roads for every voice, held to the module's two terms: the
+    /// `strike`th note is told in the first chunk, and the render is the
+    /// located one. `heard_at` lists the frames the located render has to be
+    /// loud from, so neither road can pass by being silent.
+    fn both_roads(
+        what: &str,
+        wait: &dyn Fn(Voice, &mut Engine, &mut Transport),
+        strike: usize,
+        heard_at: &[usize],
+        blocks: usize,
+    ) {
+        for voice in VOICES {
+            let (first, plain) = play(voice, false, &|e, t| wait(voice, e, t), blocks);
+            let (_, located) = play(voice, true, &|e, t| wait(voice, e, t), blocks);
+            for &at in heard_at {
+                let p = peak(&located, at, 6_000);
+                assert!(
+                    p > 0.01,
+                    "{what}, {voice:?}: the located road is silent at frame {at} ({p}), so this proves nothing"
+                );
+            }
+            assert!(
+                first.contains(&key(voice, strike)),
+                "{what}, {voice:?}: the note under the playhead never reached its instrument in the first \
+                 chunk that rolled (told {first:?}, wanted {})",
+                key(voice, strike)
+            );
+            if let Some(f) = plain.iter().zip(&located).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                panic!(
+                    "{what}, {voice:?}: Play from where the playhead stood is not what a locate there and \
+                     Play renders, from frame {} (loudest at the start {} against {})",
+                    f / 2,
+                    peak(&plain, 0, 6_000),
+                    peak(&located, 0, 6_000)
+                );
+            }
+        }
+    }
+
+    /// **The owner's: a note at the very start, played from the very
+    /// start.** The playhead is home, as a session opens and as Stop leaves
+    /// it, so Play stores the level and nothing else.
+    #[test]
+    fn play_from_the_very_start_sounds_the_note_at_the_very_start() {
+        both_roads(
+            "from the very start",
+            &|voice, e, t| {
+                e.set_midi_clips(part(voice, 2.0, &[0.0, 0.5, 1.0]));
+                run(e, t, 40);
+            },
+            0,
+            &[0, 24_000, 48_000],
+            600,
+        );
+    }
+
+    /// **A locate onto a note's own frame mid-song, and Play after it.** The
+    /// ruler click is applied by a stopped callback, which renders the new
+    /// place and stamps it; the Play that follows moves nothing.
+    #[test]
+    fn play_after_a_locate_onto_a_notes_own_frame_sounds_that_note_once() {
+        both_roads(
+            "after a locate onto a note",
+            &|voice, e, t| {
+                e.set_midi_clips(part(voice, 4.0, &[0.0, 1.5, 2.0]));
+                run(e, t, 10);
+                t.locate(1.5);
+                run(e, t, 30);
+            },
+            1,
+            &[0, 24_000],
+            400,
+        );
+    }
+
+    /// **A loop played from its head, which is a note.** Three laps: the
+    /// head is owed in the first chunk and again after every wrap, once.
+    /// 48 000 frames is a whole number of callbacks, so each lap's head lands
+    /// where the one before it did.
+    #[test]
+    fn a_loop_played_from_its_head_sounds_the_head_note_once_a_lap() {
+        both_roads(
+            "a loop from its head",
+            &|voice, e, t| {
+                e.set_midi_clips(part(voice, 4.0, &[1.0, 1.5]));
+                e.set_loop(48_000, 96_000);
+                t.locate(1.0);
+                run(e, t, 30);
+            },
+            0,
+            &[0, 48_000, 96_000],
+            3 * 48_000 / BLOCK,
+        );
+    }
+
+    /// **A count-in into a note at the very start.** The count clicks over a
+    /// stopped desk, and the song comes in on its downbeat the way the host
+    /// brings it in (`play_on_go`): Play, with the playhead where it was.
+    #[test]
+    fn a_count_in_into_a_note_at_the_very_start_sounds_it_once() {
+        both_roads(
+            "a count-in",
+            &|voice, e, t| {
+                e.set_midi_clips(part(voice, 2.0, &[0.0, 0.5]));
+                run(e, t, 4);
+                e.start_count_in(2, 240.0);
+                let mut left = 2_000;
+                while !e.count_in_done() {
+                    run(e, t, 1);
+                    left -= 1;
+                    assert!(left > 0, "the count-in never reached its downbeat");
+                }
+            },
+            0,
+            &[0, 24_000],
+            400,
+        );
+    }
+
+    /// **The clips' audio is owed the same chunk.** The walk the stale grain
+    /// skipped pulls a lane's audio as well as its notes, so an audio clip
+    /// played from its own first frame came in a callback late, on a hard
+    /// edge: the stopped render's silence, then the clip already running.
+    #[test]
+    fn play_from_the_very_start_plays_an_audio_clips_first_frames() {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        e.set_grain_ms(-1.0);
+        e.set_clips(vec![Placed {
+            clip: tone().clip,
+            strip: LANE,
+            start: 0,
+            offset: 0,
+            len: u64::from(RATE),
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        }]);
+        let mut t = Transport::new();
+        run(&mut e, &mut t, 40);
+        t.toggle_play();
+        let first = run(&mut e, &mut t, 1);
+        let p = peak(&first, 0, BLOCK);
+        assert!(p > 0.25, "the first callback of a clip played from its first frame was silent ({p})");
+    }
+
+    /// **An export from the very start sounds the note at the very start**,
+    /// told in its first chunk. It always did, and this is the guard that
+    /// says so rather than the bug: an export places and rolls its own
+    /// fresh engine before the first block (`start_offline_bounce`), a
+    /// locate in the same breath, so no stopped chunk is ever rendered into
+    /// its rings. The schedule is the same expansion the live tests play.
+    #[test]
+    fn an_export_from_the_very_start_sounds_the_note_at_the_very_start() {
+        for voice in VOICES {
+            let mut e = desk(voice);
+            e.set_midi_clips(part(voice, 2.0, &[0.0, 0.5]));
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; 1024 * 2];
+            e.render_offline(&mut out);
+            assert!(told(&e).contains(&key(voice, 0)), "{voice:?}: the export's first block never told the first note");
+            let mut heard = out.clone();
+            for _ in 0..12 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+            }
+            assert!(peak(&heard, 0, 6_000) > 0.01, "{voice:?}: the export's first note is silent");
         }
     }
 }
