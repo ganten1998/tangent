@@ -605,6 +605,45 @@ fn export_progress_of(b: &OfflineBounce, fraction: f32, label: &str) -> tangent_
     }
 }
 
+/// **The ring-out every export renders past its END**, in song seconds:
+/// the reverbs' and delays' tails are part of the track. Both roads add it
+/// after whatever span the TIME row chose.
+#[cfg(feature = "recorder")]
+pub(crate) const EXPORT_TAIL_S: f64 = 2.0;
+
+/// **The song seconds an export renders, before its tail**: the TIME row's
+/// span when it names one with an end after its start, else the whole song
+/// from 0:00. A start before 0:00 starts at 0:00. Both export roads ask
+/// this, so a span means the same thing realtime and at full speed.
+#[cfg(feature = "recorder")]
+pub(crate) fn export_bounds(span: Option<(f64, f64)>, song_s: f64) -> (f64, f64) {
+    match span {
+        Some((a, b)) if b > a && b > 0.0 => (a.max(0.0), b),
+        _ => (0.0, song_s.max(0.0)),
+    }
+}
+
+/// **The frames a full-speed export renders**: where its transport starts
+/// (`from` at the export's rate, program time) and how many device frames
+/// it pulls, the span plus [`EXPORT_TAIL_S`], divided by the varispeed
+/// ratio because a span is PROGRAM time and the count is of DEVICE frames
+/// (at 115% the piece is over in 87% of its written length).
+#[cfg(feature = "recorder")]
+pub(crate) fn export_frames(span: Option<(f64, f64)>, song_s: f64, rate: u32, ratio: f64) -> (u64, u64) {
+    let (from, to) = export_bounds(span, song_s);
+    let rate = f64::from(rate);
+    let first = (from * rate).round() as u64;
+    let count = if to > from { (((to - from + EXPORT_TAIL_S) / ratio) * rate).ceil() as u64 } else { 0 };
+    (first, count)
+}
+
+/// **What the export window calls a stem's row**: its file's name without
+/// the `.wav`, so the window and the folder agree.
+#[cfg(feature = "recorder")]
+fn export_row_name(file: &str) -> String {
+    file.strip_suffix(".wav").unwrap_or(file).to_owned()
+}
+
 /// One bounce: where it stops, what it writes, and whether it is waiting
 /// for the files to close.
 /// A FULL-SPEED export: its own engine with no device, pulled by hand a
@@ -10904,16 +10943,27 @@ impl DesktopApp {
                 .notify(Kind::Error, "Open the band to export: the audio path is closed.");
             refuse!();
         }
-        let (from_s, until_s) = match span {
-            Some((a, b)) if b > a => (a.max(0.0), b + 2.0),
-            _ => (0.0, self.app.arr_span_s() + 2.0),
-        };
-        if until_s <= from_s + 2.0 && self.app.arr_span_s() <= 0.0 {
+        // The same span the full-speed pass renders (`export_bounds`), and
+        // the same tail after its end.
+        let (from_s, to_s) = export_bounds(span, self.app.arr_span_s());
+        let until_s = to_s + EXPORT_TAIL_S;
+        if to_s <= from_s {
             self.app
                 .notify(Kind::Error, "Nothing to export: the timeline is empty.");
             refuse!();
         }
         let root = self.app.record_root();
+        // **The selected tracks alone, before the first block rolls.** The
+        // frame's push keeps this for the length of the pass (it reads the
+        // pass's own spec); published here as well so the head of the take
+        // is not the whole desk for the frame it takes the push to come
+        // round. See `engine_bridge::export_left_out`.
+        if let Some(out) = crate::engine_bridge::export_left_out(&self.app, &delivery) {
+            self.bridge.set_left_out(Some(out));
+            if let Some(e) = self.recorder.engine.as_mut() {
+                let _ = self.bridge.sync(&self.app, e);
+            }
+        }
         // From the span's head, rolling before the take opens — the same
         // press-order the transport itself keeps.
         self.recorder.transport.stop();
@@ -10976,44 +11026,20 @@ impl DesktopApp {
                     channels: 2,
                     format: tangent_record::wav::SampleFormat::Float32,
                 };
-                let doc = self.app.arrangement().clone();
-                let rows = self.app.track_ids().len();
-                for row in 0..rows {
-                    // Only lanes with something to say — see the offline
-                    // twin below for the reasoning.
-                    // **A stem is worth writing when something REACHES the
-                    // lane, not when something is loaded on it.**
-                    //
-                    // This used to keep any lane with an insert in a bay,
-                    // which writes a silent file for every instrument track
-                    // that has no part yet — the shipped desk alone has one,
-                    // so a fresh session exported a stem of nothing every
-                    // time. The owner: "export stems either way should
-                    // ignore tracks with no clips or sends going to them."
-                    //
-                    // Two ways to be reached, and a folder is the second
-                    // one: it carries its children's audio and has no clips
-                    // of its own, so counting only clips would drop exactly
-                    // the buses somebody grouped in order to bounce them.
-                    let has_clips = doc.clips.iter().any(|c| c.lane == row);
-                    let collects = self.app.is_folder(row)
-                        && (0..rows).any(|c| self.app.folder_of(c) == Some(row));
-                    if !has_clips && !collects {
-                        continue;
-                    }
+                // **The same stems, under the same names, as the full-speed
+                // pass** (`engine_bridge::stem_files`): never a folder, a
+                // bus as its own mix, only the checked tracks, each file
+                // named for its track. This road used to keep its own rule
+                // (clips, or a folder collecting children) and its own
+                // names, and wrote every folder's children twice.
+                for (row, file) in crate::engine_bridge::stem_files(&self.app, &delivery) {
                     // **Bound to the row's lane at the press** (design 7.13:
                     // stems bind `(slot, gen)` at the press): the tap's column
                     // is the lane's, and the name is the row's as it reads now.
                     let Some(lane) = self.bridge.lane(row).map(|l| l.slot.0 as usize) else {
                         continue;
                     };
-                    let name: String = self
-                        .app
-                        .channel_display_name(row)
-                        .chars()
-                        .map(|c| if std::path::is_separator(c) { '-' } else { c })
-                        .collect();
-                    let path = stage.join(stem_file_name(row, &name));
+                    let path = stage.join(&file);
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
@@ -11378,12 +11404,10 @@ impl DesktopApp {
             self.app.notify(Kind::Error, why);
             refuse!();
         }
-        // The whole project, or the arrange view's TIME SELECTION.
-        let (from_s, span) = match spec.span {
-            Some((a, b)) if b > a => (a.max(0.0), b - a),
-            _ => (0.0, self.app.arr_span_s()),
-        };
-        if span <= 0.0 {
+        // The whole project, or the TIME row's span: the loop/selection or
+        // a START and END typed in. See `export_bounds`.
+        let (from_s, to_s) = export_bounds(spec.span, self.app.arr_span_s());
+        if to_s <= from_s {
             self.app
                 .notify(Kind::Error, "Nothing to export: the timeline is empty.");
             refuse!();
@@ -11478,7 +11502,9 @@ impl DesktopApp {
         for why in unread {
             self.app.notify(Kind::Error, format!("export: {why}"));
         }
-        e.set_transport(1, (from_s * f64::from(rate)).round() as u64);
+        let ratio = f64::from(self.app.varispeed_ratio()).clamp(0.5, 2.0);
+        let (first_frame, until) = export_frames(spec.span, self.app.arr_span_s(), rate, ratio);
+        e.set_transport(1, first_frame);
         e.set_rolling(true);
         // ── the files ──
         let wav_spec = tangent_record::wav::WavSpec {
@@ -11542,17 +11568,20 @@ impl DesktopApp {
                 self.app
                     .notify(Kind::Error, format!("export: stems dir: {e}"));
             }
-            // **Only lanes with something to SAY get a stem** - see
+            // **Only lanes with something to SAY get a stem**, never a
+            // folder, and only the checked tracks - see
             // `engine_bridge::stem_files`, which the export goldens name too.
-            for (row, file) in crate::engine_bridge::stem_files(&self.app) {
+            for (row, file) in crate::engine_bridge::stem_files(&self.app, &spec) {
                 let Some(lane) = mirror.lane(row).map(|l| l.slot.0 as usize) else {
                     continue;
                 };
-                let path = dir.join(file);
+                let path = dir.join(&file);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                     stems.push(StemWriter { lane, path, writer: w, loud: false });
+                    // The row says what the FILE is called, so two tracks of
+                    // one name read "Bass" and "Bass 2" here as on disk.
                     stem_rows.push(tangent_ui::ports::ExportRow {
-                        name: self.app.channel_display_name(row).to_string(),
+                        name: export_row_name(&file),
                         peaks: vec![(0.0, 0.0); tangent_ui::ports::EXPORT_PEAKS],
                     });
                 }
@@ -11568,8 +11597,7 @@ impl DesktopApp {
         // by the written length would simply stop before the end of the
         // music. Both are silent failures in a file somebody sends
         // somewhere.
-        let ratio = f64::from(self.app.varispeed_ratio()).clamp(0.5, 2.0);
-        let until = (((span + 2.0) / ratio) * f64::from(rate)).ceil() as u64;
+        // (`until` is `export_frames`' count, above.)
         // The render is a condition too, and this one really does run for
         // minutes. Lowered wherever the pass ends — see `write_export`.
         self.app.notify_raise(
@@ -16228,6 +16256,17 @@ impl DesktopApp {
                 // reads a new track's slot as loaded. See `forget_lane`.
                 let ledger = &mut self.recorder.inserts_loaded;
                 let shelf = crate::shelf::global_dir();
+                // **A realtime export of selected tracks hears those alone**,
+                // for exactly as long as its pass runs: the tracks it leaves
+                // out are asked of the pass's own spec every frame, and with
+                // no pass the desk plays as it is. Never a mute written on the
+                // desk - see `engine_bridge::export_left_out`.
+                self.bridge.set_left_out(
+                    self.recorder
+                        .bounce
+                        .as_ref()
+                        .and_then(|b| crate::engine_bridge::export_left_out(&self.app, &b.delivery)),
+                );
                 synced = self.bridge.sync_with(&self.app, e, &mut |e, id, lane| {
                     Self::forget_lane(ledger, &shelf, e, id, lane)
                 });
@@ -17796,6 +17835,12 @@ fn render_placed_span(
 /// ([`is_windows_device_name`]).
 #[cfg(feature = "recorder")]
 pub(crate) fn sanitize_file_stem(name: &str) -> String {
+    sanitize_file_stem_or(name, "mix")
+}
+
+/// [`sanitize_file_stem`], with what an empty name falls back to named.
+#[cfg(feature = "recorder")]
+fn sanitize_file_stem_or(name: &str, fallback: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
@@ -17811,7 +17856,7 @@ pub(crate) fn sanitize_file_stem(name: &str) -> String {
         .collect();
     let s = s.trim().trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if s.is_empty() {
-        "mix".to_owned()
+        fallback.to_owned()
     } else if is_windows_device_name(s) {
         format!("_{s}")
     } else {
@@ -18407,15 +18452,69 @@ fn live_punches(
     punches
 }
 
-/// **A stem's file name**: the row's number, three digits, then the track's
-/// name, `001-Vocal.wav`. Three digits so a folder of them sorts in desk
-/// order however a file browser sorts: at two, the hundredth stem was
-/// `100-...` and sorted between `10-...` and `11-...`. A desk past 999
-/// rows still writes every stem; past there the numbers widen and the
-/// folder sorts by name. Both export roads name their stems through here.
-pub(crate) fn stem_file_name(row: usize, name: &str) -> String {
-    format!("{:03}-{}.wav", row + 1, name.trim())
+/// **Each stem's file name, from its track's name**: `<track name>.wav`,
+/// in the order the names are given. The owner: "I'd like to see the stems
+/// be named after the track, not the project". The project already names
+/// the folder they land in (`Exports/<project>/stems`), so the file is the
+/// track's alone. It was `001-<track>.wav`, the row's number first.
+///
+/// - **Safe on every system** the project folder travels to, through
+///   [`sanitize_file_stem`]'s rules (separators and `< > : " | ? *` and
+///   control characters out, trailing dots and spaces gone, a Windows
+///   device name given a `_`), and no longer than [`STEM_NAME_MAX`] bytes,
+///   cut on a character.
+/// - **Never empty**: a name with nothing left is `Track`.
+/// - **Unique, as a case-blind file system sees it** (macOS and Windows
+///   both): the first of two tracks called "Bass" is `Bass.wav`, the second
+///   `Bass 2.wav`, and a number already taken by a track of that name is
+///   stepped over, so no stem is ever written over another.
+#[cfg(feature = "recorder")]
+pub(crate) fn stem_file_names<S: AsRef<str>>(names: &[S]) -> Vec<String> {
+    let bases: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let mut b = sanitize_file_stem_or(n.as_ref(), "Track");
+            if b.len() > STEM_NAME_MAX {
+                let mut cut = STEM_NAME_MAX;
+                while !b.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                b.truncate(cut);
+                let kept = b.trim_end_matches(|c: char| c == '.' || c.is_whitespace()).len();
+                b.truncate(kept);
+            }
+            b
+        })
+        .collect();
+    // Every name somebody gave a track is reserved before any number is
+    // handed out, so "Bass 2" the track keeps its name over the second
+    // "Bass".
+    let mut taken: std::collections::BTreeSet<String> = bases.iter().map(|b| b.to_lowercase()).collect();
+    let mut first: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    bases
+        .into_iter()
+        .map(|base| {
+            let key = base.to_lowercase();
+            if first.insert(key) {
+                return format!("{base}.wav");
+            }
+            let mut n = 2usize;
+            loop {
+                let cand = format!("{base} {n}");
+                if taken.insert(cand.to_lowercase()) {
+                    return format!("{cand}.wav");
+                }
+                n += 1;
+            }
+        })
+        .collect()
 }
+
+/// The longest a stem's name may be before `.wav`, in bytes: well inside
+/// the 255 every file system here allows, with room for a ` 99` and the
+/// extension.
+#[cfg(feature = "recorder")]
+const STEM_NAME_MAX: usize = 200;
 
 /// **Arm a pass's stem tap from the two bools the Export dialog filled in.**
 ///
@@ -24299,7 +24398,7 @@ mod tests {
         let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         assert!(
             start.contains("let stage = open_stems_stage(&dir);")
-                && start.contains("let path = stage.join(stem_file_name(")
+                && start.contains("let path = stage.join(&file);")
                 && start.contains("stem_dir = Some(dir);"),
             "the realtime pass writes its stems straight into the export's folder again"
         );
@@ -28276,6 +28375,86 @@ mod tests {
         for name in ["console", "com10", "lpt", "auxiliary"] {
             assert_eq!(sanitize_file_stem(name), name);
         }
+    }
+
+    /// **A stem is named for its TRACK, safe on every system, and never
+    /// over another stem.** The owner: "I'd like to see the stems be named
+    /// after the track, not the project". Two tracks of one name (in any
+    /// case, since macOS and Windows file systems are case-blind) are two
+    /// files; a track already called "Bass 2" keeps that name over the
+    /// second "Bass"; a name with nothing left is `Track`; a Windows device
+    /// name gets its `_`; a very long name is cut on a character.
+    #[test]
+    fn a_stem_is_named_for_its_track_safely_and_never_over_another() {
+        let got = stem_file_names(&["Bass", "Kick / Snare", "bass", "Bass 2", "Bass", "", " ...", "con", "Vox?*"]);
+        assert_eq!(
+            got,
+            vec![
+                "Bass.wav",
+                "Kick - Snare.wav",
+                "bass 3.wav",
+                "Bass 2.wav",
+                "Bass 4.wav",
+                "Track.wav",
+                "Track 2.wav",
+                "_con.wav",
+                "Vox--.wav",
+            ]
+        );
+        let lower: std::collections::BTreeSet<String> = got.iter().map(|n| n.to_lowercase()).collect();
+        assert_eq!(lower.len(), got.len(), "two stems would land on one file on a case-blind disk");
+        let long = stem_file_names(&["é".repeat(400)]);
+        assert!(long[0].len() <= STEM_NAME_MAX + ".wav".len(), "a {}-byte name", long[0].len());
+        assert!(long[0].ends_with("é.wav"), "the cut split a character: {:?}", &long[0][long[0].len() - 8..]);
+    }
+
+    /// **The span an export renders, by TIME choice, and its frames**: the
+    /// whole song from 0:00, a span from its START, both to their END plus
+    /// the tail, divided by the varispeed; an END not after its START is no
+    /// span (the whole song), and a START before 0:00 starts at 0:00.
+    #[test]
+    fn an_export_renders_its_span_plus_the_tail_and_nothing_else() {
+        assert_eq!(export_bounds(None, 30.0), (0.0, 30.0));
+        assert_eq!(export_bounds(Some((4.0, 12.0)), 30.0), (4.0, 12.0));
+        assert_eq!(export_bounds(Some((12.0, 4.0)), 30.0), (0.0, 30.0));
+        assert_eq!(export_bounds(Some((-1.0, 2.0)), 30.0), (0.0, 2.0));
+        assert_eq!(export_frames(None, 30.0, 48_000, 1.0), (0, 32 * 48_000));
+        assert_eq!(export_frames(Some((4.0, 12.0)), 30.0, 48_000, 1.0), (4 * 48_000, 10 * 48_000));
+        assert_eq!(export_frames(Some((1.5, 2.5)), 30.0, 44_100, 1.0), (66_150, 3 * 44_100));
+        // At 125% the span is over in 80% of its written length.
+        assert_eq!(export_frames(Some((4.0, 12.0)), 30.0, 48_000, 1.25), (4 * 48_000, 8 * 48_000));
+        // Nothing to render is nothing rendered.
+        assert_eq!(export_frames(None, 0.0, 48_000, 1.0).1, 0);
+    }
+
+    /// **The realtime pass renders the same span as the full-speed one and
+    /// hears the same tracks** - the road a Tangent Insert forces every
+    /// export onto. A source scan, because `DesktopApp` cannot be built in
+    /// a test: `start_bounce` reads its span through `export_bounds` and
+    /// stops at its END plus `EXPORT_TAIL_S`, publishes the left-out tracks
+    /// before it rolls, and the frame's push keeps them for exactly as long
+    /// as the pass runs. What those three answer is held by
+    /// `an_export_renders_its_span_plus_the_tail_and_nothing_else` and
+    /// `engine_bridge`'s live-plan test.
+    #[test]
+    fn the_realtime_pass_renders_the_span_and_hears_the_tracks_the_dialog_chose() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let bounds = start.find("export_bounds(span, self.app.arr_span_s())").expect("the realtime pass reads its own span");
+        assert!(start.contains("let until_s = to_s + EXPORT_TAIL_S;"), "the realtime pass stops somewhere else");
+        let left = start.find("self.bridge.set_left_out(Some(out));").expect("the pass does not publish its left-out tracks");
+        let rolls = start.find("self.recorder.transport.toggle_play();").expect("the pass rolls");
+        assert!(bounds < rolls && left < rolls, "the pass rolls before its span or its tracks are set");
+        assert!(
+            start.contains("crate::engine_bridge::stem_files(&self.app, &delivery)"),
+            "the realtime pass names its stems by a rule of its own"
+        );
+        assert!(
+            src.contains(".and_then(|b| crate::engine_bridge::export_left_out(&self.app, &b.delivery))"),
+            "the frame's push does not keep the pass's tracks"
+        );
     }
 
     /// **A staged template takes the shelf's place, and a failure leaves one

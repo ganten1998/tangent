@@ -46,11 +46,12 @@ pub struct PickId(pub u32);
 
 /// Per-lane switches, one bit each, in place of the desk-wide masks.
 ///
-/// A `u16` because there are twelve inputs and four derived bits, and a lane
-/// carries one copy in the plan; the masks they replace were one word for the
-/// whole desk, and that word is what filled at 32 and 64.
+/// A `u32` because there are thirteen inputs and four derived bits, and a
+/// lane carries one copy in the plan; the masks they replace were one word
+/// for the whole desk, and that word is what filled at 32 and 64. It was a
+/// `u16` until [`LaneFlags::LEFT_OUT`] needed the seventeenth bit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct LaneFlags(pub u16);
+pub struct LaneFlags(pub u32);
 
 impl LaneFlags {
     pub const ARMED: Self = Self(1 << 0);
@@ -94,6 +95,14 @@ impl LaneFlags {
     /// ([`PostTable::row_quiet`]), and its other children answer to the solo
     /// as they always did. A desk with no bus never sets it.
     pub const SOLO_CARRY: Self = Self(1 << 15);
+    /// **Left out of this EXPORT's mix**: an export of selected tracks
+    /// (`ProjectExportSpec::tracks`) hears none of what this lane makes or
+    /// sends, whatever its mute button, its Mute curve or a solo says. Not a
+    /// mute: the desk's own mute is the person's and is never written by an
+    /// export, so the export asks for silence with a bit of its own, set
+    /// only on the plan of the pass (`engine_bridge::export_left_out`). It
+    /// silences what stands below it as a muted folder does.
+    pub const LEFT_OUT: Self = Self(1 << 16);
 
     pub const fn contains(self, f: Self) -> bool {
         self.0 & f.0 == f.0
@@ -1850,12 +1859,15 @@ pub fn resolve_heard(
     let n = plan.lanes.len().min(out.len());
     let any_solo = plan.any_solo;
     let lanes = &plan.lanes;
+    // A lane LEFT OUT of an export is silent before any curve or button is
+    // asked, and its children with it: see `LaneFlags::LEFT_OUT`.
     let muted = |r: usize| {
-        auto_mute
-            .get(r)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| lanes[r].flags.contains(LaneFlags::MUTED))
+        lanes[r].flags.contains(LaneFlags::LEFT_OUT)
+            || auto_mute
+                .get(r)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| lanes[r].flags.contains(LaneFlags::MUTED))
     };
     // Down: `out[r]` = a strict ancestor is muted. Checked before solo, and
     // deliberately: an explicit solo overrides the channel's OWN mute, but
@@ -1868,7 +1880,8 @@ pub fn resolve_heard(
     }
     for r in 0..n {
         let flags = lanes[r].flags;
-        out[r] = if out[r] {
+        // Left out of an export beats even a solo naming the lane.
+        out[r] = if out[r] || flags.contains(LaneFlags::LEFT_OUT) {
             false
         } else if !any_solo {
             !muted(r)
@@ -1920,6 +1933,9 @@ pub fn resolve_heard(
 /// with its curve folded in.
 pub fn lane_heard_flat(plan: &DeskPlan, rank: usize, muted: bool) -> bool {
     let flags = plan.lanes.get(rank).map_or(LaneFlags::default(), |l| l.flags);
+    if flags.contains(LaneFlags::LEFT_OUT) {
+        return false;
+    }
     let soloed = flags.contains(LaneFlags::SOLOED);
     // A bus, and a soloed bus's feeder, is no SOURCE to a solo: see
     // `resolve_heard`. A folder that only CARRIES is one: this question is
@@ -3579,6 +3595,44 @@ mod tests {
         resolve_heard(&plan, &[], &mut out);
         assert!(out.iter().all(|h| *h));
         assert!(plan.post.row_quiet.is_empty());
+    }
+
+    /// **A lane LEFT OUT of an export is silent whatever its own switches
+    /// say**, and so is what stands under it; nothing else moves. An export
+    /// of selected tracks asks for this bit instead of writing the desk's
+    /// mutes, so it has to beat the three things that would otherwise let a
+    /// lane through: an unmuted button, a Mute curve holding it open, and a
+    /// solo naming it.
+    #[test]
+    fn a_lane_left_out_of_an_export_is_silent_whatever_its_mute_curve_or_solo_say() {
+        let mut lanes = vec![
+            lane(0, LaneFlags::default(), None),
+            lane(1, LaneFlags::LEFT_OUT, None),
+            lane(2, LaneFlags::LEFT_OUT, None),
+            lane(3, LaneFlags::default(), Some(2)),
+        ];
+        let inputs = |lanes: &[InLane]| PlanInputs { lanes: lanes.to_vec(), ..PlanInputs::default() };
+        let plan = build_plan(&inputs(&lanes), None);
+        let mut out = vec![false; lanes.len()];
+        resolve_heard(&plan, &[], &mut out);
+        assert_eq!(out, vec![true, false, false, false], "left out, or under a lane left out, and heard");
+        // A Mute curve holding the lane OPEN does not bring it back.
+        resolve_heard(&plan, &[None, Some(false), Some(false), None], &mut out);
+        assert_eq!(out, vec![true, false, false, false], "a curve let a left-out lane through");
+        assert!(!lane_heard_flat(&plan, 1, false), "the lane's own row was heard");
+        assert!(lane_heard_flat(&plan, 0, false));
+        // Nor does a solo on it.
+        lanes[1].flags = LaneFlags::LEFT_OUT | LaneFlags::SOLOED;
+        let plan = build_plan(&inputs(&lanes), None);
+        resolve_heard(&plan, &[], &mut out);
+        assert!(!out[1], "a solo let a left-out lane through");
+        // And the bit off, the desk is the desk again.
+        for l in &mut lanes {
+            l.flags = LaneFlags::default();
+        }
+        let plan = build_plan(&inputs(&lanes), None);
+        resolve_heard(&plan, &[], &mut out);
+        assert!(out.iter().all(|h| *h));
     }
 
     // ── identity, gains, the rest ───────────────────────────────────────

@@ -156,6 +156,30 @@ pub struct ProjectExportSpec {
     /// false and mean "processed" — the behaviour every project saved
     /// before today already had.
     pub stems_dry: bool,
+    /// **APPENDED - which tracks the export takes.** `None` is everything,
+    /// the behaviour every export had before the TRACKS row. `Some` names
+    /// the checked tracks by identity, so a reorder between the press and
+    /// the render moves nothing: a stems pass writes a file for these alone,
+    /// and a mixdown hears these alone (the rest left out of the export's
+    /// mix only - the desk's own mutes and solos are never touched, see
+    /// `engine_bridge::export_left_out`). Folders are never in it: a folder's
+    /// stem would be its children twice over.
+    pub tracks: Option<Vec<crate::desk_id::TrackId>>,
+    /// **APPENDED - which TIME chip the dialog last ran with**, remembered
+    /// with the rest of the spec for the session. `span` is what the host
+    /// renders; this is only what the row comes back showing.
+    pub time: ExportTime,
+}
+
+/// **The TIME row's choice**: the whole song, the time selection (which in
+/// this app IS the loop region - `TangentApp::loop_region` reads it), or a
+/// START and END typed into the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportTime {
+    #[default]
+    Whole,
+    Selection,
+    Custom,
 }
 
 /// The subfolder name for a stems pass, from the mode alone.
@@ -220,6 +244,8 @@ impl Default for ProjectExportSpec {
             span: None,
             depth: ExportDepth::Pcm24,
             stems_dry: false,
+            tracks: None,
+            time: ExportTime::Whole,
         }
     }
 }
