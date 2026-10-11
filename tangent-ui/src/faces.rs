@@ -26,7 +26,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// panel, and the line under it. The engine's `builtin_fx::UNITS` is the
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
-pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
+pub const SUITE_UNITS: [(&str, &str, &str); 14] = [
     ("@tangent-eq", "Tangent EQ", "5 bands - no more, no less"),
     (
         "@tangent-imager",
@@ -98,6 +98,14 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
         // _the_same_list` compares the two up to this suffix.
         "Tangent IR (Experimental)",
         "plays any impulse response you can capture",
+    ),
+    // The hardware loop: the bay's signal out of the interface, through
+    // whatever is patched there, and back. Spelled out of its own module
+    // so the face and the picker share one sentinel and one name.
+    (
+        crate::faces_hwinsert::HWINSERT_PATH,
+        crate::faces_hwinsert::HWINSERT_NAME,
+        crate::faces_hwinsert::HWINSERT_ABOUT,
     ),
 ];
 
@@ -522,6 +530,11 @@ pub enum FaceAction {
     /// readings are printed there and only there. The face never guesses a
     /// scale. See `face::SliderAsk::Type`.
     Type { id: u32, text: String },
+    /// **The hardware insert's routing and its ping.** Appended at the END,
+    /// this enum's law. The face asks; the host checks the jacks against the
+    /// device, writes the bay's state and answers on the pushed lines. See
+    /// `faces_hwinsert`.
+    HwInsert(crate::faces_hwinsert::HwAsk),
 }
 
 /// What a slider row asked for, as the action the face raises: a value is
@@ -539,7 +552,7 @@ fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
 }
 
 /// One continuous parameter as a kit row. Returns the ask.
-fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option<FaceAction> {
+pub(crate) fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option<FaceAction> {
     let p = param(face, id)?;
     slider_row(ui, st, &p.name, &p.reading, p.value, p.default)
         .map(|ask| ask_to_action(id, ask))
@@ -549,7 +562,7 @@ fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option
 /// stepping wraps, and a double-click lands on the position the DSP calls
 /// home — `p.default`, pushed with the parameter, never a number spelled
 /// here.
-fn step_row(
+pub(crate) fn step_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
     face: &BuiltinFace,
@@ -870,6 +883,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         crate::faces_analog::ANALOG_PATH => crate::faces_analog::draw_analog(ui, st, live),
         crate::faces_sampler::SAMPLER_PATH => crate::faces_sampler::draw_sampler(ui, st, live),
+        crate::faces_hwinsert::HWINSERT_PATH => crate::faces_hwinsert::draw_hwinsert(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
         // continuous ones, the cycling button for anything stepped, so a

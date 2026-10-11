@@ -35,6 +35,7 @@ pub mod face;
 pub mod faces;
 pub mod faces_amp;
 pub mod faces_analog;
+pub mod faces_hwinsert;
 pub mod faces_sampler;
 /// The drumpad's document: the kit, saved beside the arrangement.
 pub mod drumpad;

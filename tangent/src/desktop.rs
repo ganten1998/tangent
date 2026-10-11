@@ -908,6 +908,11 @@ struct Bounce {
     /// made with it and handed to the finish with it, so it can neither
     /// outlive the pass nor be another pass's.
     delivery: tangent_ui::ports::ProjectExportSpec,
+    /// The hardware loops' slips when the pass began (taken on its first
+    /// frame), and whether the pass has already said a loop failed it. See
+    /// `tick_hw_inserts`.
+    hw_slips: Option<u32>,
+    hw_flagged: bool,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -2562,12 +2567,46 @@ pub(crate) fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
-                extra: engine.builtin_extra_at(rack, slot).to_vec(),
+                extra: {
+                    let mut extra = engine.builtin_extra_at(rack, slot).to_vec();
+                    // **A hardware insert's live picture rides along**, on
+                    // lines the face reads and the state never keeps (see
+                    // `faces_hwinsert::LIVE`).
+                    if let Some(live) = hw_live(app, engine, rack, slot) {
+                        extra.extend(live.to_lines());
+                    }
+                    extra
+                },
             },
             None => tangent_ui::ports::BuiltinFace::default(),
         };
         app.set_bay_face(tangent_ui::desk_id::SeatBay { seat: key, bay }, face);
     }
+}
+
+/// **A hardware insert bay's live picture**, the engine's half and the
+/// desk's: the outputs the desk's hardware routes play tracks on, which the
+/// face warns a send would land on top of.
+#[cfg(feature = "recorder")]
+fn hw_live(
+    app: &TangentApp,
+    engine: &crate::instrument::Engine,
+    rack: crate::instrument::RackAddr,
+    slot: usize,
+) -> Option<tangent_ui::faces_hwinsert::HwLive> {
+    let mut live = engine.hw_insert_live_at(rack, slot)?;
+    live.routed = app
+        .routes()
+        .0
+        .iter()
+        .filter_map(|r| match r.target {
+            tangent_ui::routing::Target::Hardware { first, stereo } => {
+                u16::try_from(first).ok().map(|f| (f, stereo))
+            }
+            tangent_ui::routing::Target::Node(_) => None,
+        })
+        .collect();
+    Some(live)
 }
 
 /// **The EQ's picture, drawn by the audio path's own math on the UI's own
@@ -5599,6 +5638,9 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_mut() {
             e.adopt_learned_thresholds();
         }
+        // The hardware inserts: a finished ping into the bay's state, and the
+        // live picture (link, latency, ping) onto any face that shows one.
+        self.tick_hw_inserts();
         // **The INSERT tap, drained dry once a frame — but only while a face
         // has it armed.** Disarmed, the engine pushes nothing and this skips
         // even the empty pop-loop, so an idle session pays nothing at all.
@@ -7673,6 +7715,7 @@ impl DesktopApp {
                     // that happened this session is on it for certain.
                     self.push_ir_rows();
                 }
+                R::HwInsert { bay, ask } => self.hw_insert_ask(bay, ask),
                 R::SetInsertIr { bay, path } => {
                     // **Decoded, never tested against.** Four of the five
                     // things this ask can be are sentinels riding the path
@@ -8214,6 +8257,184 @@ impl DesktopApp {
     fn push_ir_rows(&mut self) {
         let rows = scan_ir_rows(&self.app.irs_root());
         self.app.set_ir_rows(rows);
+    }
+
+    /// **A Tangent Insert face's ask**: a jack for one side of the loop, or
+    /// a ping.
+    ///
+    /// A route is checked against the device the engine is playing on (a
+    /// send on the master's own jacks, or past the outputs it has, is
+    /// refused with a sentence), then written the way an IR is bound: the
+    /// engine's ledger, the bay's sidecar, and a reload so the unit is built
+    /// on the new jacks. **A new jack is a new loop**, possibly through a
+    /// different box, so the measured latency goes with it and the face
+    /// reads "unmeasured" until the next ping.
+    #[cfg(feature = "recorder")]
+    fn hw_insert_ask(&mut self, sb: tangent_ui::desk_id::SeatBay, ask: tangent_ui::faces_hwinsert::HwAsk) {
+        use crate::units::hwinsert::{parse_lines, state_lines, takes_main_outs, Jacks};
+        use tangent_ui::faces_hwinsert::HwAsk;
+        let Some(at) = self.bridge.engine_bay(sb) else {
+            return;
+        };
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return;
+        };
+        match ask {
+            HwAsk::Ping => {
+                // **Never into a take or an export.** A ping silences the
+                // send and mutes the return for over a second, which in a
+                // recording or a realtime export is a hole in the file.
+                if self.recorder.session.is_recording()
+                    || self.recorder.arr_rec.is_some()
+                    || self.recorder.bounce.is_some()
+                {
+                    self.app.notify(
+                        Kind::Info,
+                        "A ping would leave a hole in the recording: ping when nothing is recording or exporting.",
+                    );
+                    return;
+                }
+                if let Err(why) = e.ping_hw_insert_at(at.0, at.1) {
+                    self.app.notify(Kind::Error, why);
+                }
+            }
+            HwAsk::Route { send, jacks } => {
+                let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
+                    return;
+                };
+                if spec.path != crate::builtin_fx::HWINSERT_PATH {
+                    return;
+                }
+                let jacks = jacks.map(|(first, stereo)| Jacks { first, stereo });
+                let outs = usize::from(e.output().channels);
+                if let (true, Some(j)) = (send, jacks) {
+                    let refusal = if takes_main_outs(j, outs) {
+                        Some(format!(
+                            "Out {} carries the main mix, so a Tangent Insert cannot send there.",
+                            j.label()
+                        ))
+                    } else if !j.fits(outs) {
+                        Some(format!("This device has no output {}.", j.label()))
+                    } else {
+                        None
+                    };
+                    if let Some(why) = refusal {
+                        self.app.notify(Kind::Error, why);
+                        return;
+                    }
+                }
+                let (mut s, mut r, _) = parse_lines(e.builtin_extra_at(at.0, at.1));
+                if send {
+                    s = jacks;
+                } else {
+                    r = jacks;
+                }
+                let extra = state_lines(s, r, None);
+                let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
+                self.write_bay_state(sb, crate::builtin_fx::HWINSERT_PATH, &blob);
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_builtin_extra_at(at.0, at.1, extra);
+                }
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    push_builtin_faces(&mut self.app, e, (sb.seat, at.0));
+                }
+                self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+            }
+        }
+    }
+
+    /// **The hardware inserts' frame work.** A ping that finished goes into
+    /// the bay's ledger and its sidecar, so the project saves compensated;
+    /// and every hardware insert bay whose live picture moved (the link, the
+    /// latency, a ping starting or ending) gets its face pushed again. One
+    /// relaxed walk over sixteen flags when the desk has none.
+    #[cfg(feature = "recorder")]
+    fn tick_hw_inserts(&mut self) {
+        // **Two devices are two clocks.** The input's name against the
+        // output's, every frame (the input can change under a running
+        // engine); a loop across two devices is refused, not drifted.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            let separate = self
+                .recorder
+                .session
+                .audio_device_name()
+                .is_some_and(|input| !crate::units::hwinsert::one_device(input, &e.output().device));
+            e.set_hw_separate_input(separate);
+        }
+        if !self.recorder.engine.as_ref().is_some_and(crate::instrument::Engine::has_hw_inserts) {
+            return;
+        }
+        let mut down: Option<String> = None;
+        let mut slips = 0u32;
+        let bays: Vec<tangent_ui::desk_id::SeatBay> = self
+            .app
+            .plugins()
+            .iter()
+            .filter(|(_, p)| p.as_str() == crate::builtin_fx::HWINSERT_PATH)
+            .map(|(sb, _)| *sb)
+            .collect();
+        for sb in bays {
+            let Some(at) = self.bridge.engine_bay(sb) else {
+                continue;
+            };
+            let adopted = self
+                .recorder
+                .engine
+                .as_mut()
+                .and_then(|e| e.adopt_hw_ping_at(at.0, at.1));
+            let Some(e) = self.recorder.engine.as_ref() else {
+                return;
+            };
+            if let Some(extra) = &adopted {
+                if let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) {
+                    let blob = crate::builtin_fx::state_text(spec, values, extra).into_bytes();
+                    self.write_bay_state(sb, spec.path, &blob);
+                }
+            }
+            // **A bay seated when every port was taken gets one as soon as
+            // one frees**: reloaded, which claims it.
+            if !e.hw_insert_has_port_at(at.0, at.1)
+                && e.hw_free_ports() > 0
+                && e.builtin_insert_at(at.0, at.1).is_some_and(|(s, _)| s.path == crate::builtin_fx::HWINSERT_PATH)
+            {
+                self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+            }
+            let Some(live) = hw_live(&self.app, e, at.0, at.1) else {
+                continue;
+            };
+            if !self.app.bay_bypassed(sb) {
+                slips = slips.saturating_add(live.slips);
+                if !live.connected && down.is_none() {
+                    down = Some(live.status.clone());
+                }
+            }
+            let lines = live.to_lines();
+            let shown = self
+                .app
+                .bay_face(sb)
+                .is_some_and(|f| lines.iter().all(|l| f.extra.contains(l)));
+            if adopted.is_some() || !shown {
+                push_builtin_faces(&mut self.app, e, (sb.seat, at.0));
+            }
+        }
+        // **A realtime export watches its loops.** The intake started it
+        // only with every loop connected; a loop that comes apart, or an
+        // input that falls behind, mid-pass is a stretch of the file that is
+        // dry or broken, and the pass says so rather than finishing quiet.
+        if let Some(b) = self.recorder.bounce.as_mut() {
+            let base = *b.hw_slips.get_or_insert(slips);
+            if !b.hw_flagged && (down.is_some() || slips > base) {
+                b.hw_flagged = true;
+                let why = match down {
+                    Some(status) => format!("a Tangent Insert's loop came apart during the export ({status})"),
+                    None => "the input fell behind a Tangent Insert's loop during the export".to_owned(),
+                };
+                self.app.notify(
+                    Kind::Error,
+                    format!("export: {why}, so part of the file may be dry or glitched. Export again once the loop is steady."),
+                );
+            }
+        }
     }
 
     /// Point one IR bay at an impulse file.
@@ -10773,6 +10994,8 @@ impl DesktopApp {
             engine_lost: false,
             stem_dir,
             delivery,
+            hw_slips: None,
+            hw_flagged: false,
         });
     }
 
@@ -11095,6 +11318,12 @@ impl DesktopApp {
         let asked = if freeze.is_some() { NewPass::Freeze } else { NewPass::FullSpeed };
         if pass_refusal(self.running(), asked).is_some() {
             return;
+        }
+        // **No hardware loop renders faster than real time**: refused, never
+        // rendered dry or silent. See `engine_bridge::hw_refusal_for`.
+        if let Some(why) = crate::engine_bridge::hw_refusal_for(&self.app, freeze) {
+            self.app.notify(Kind::Error, why);
+            refuse!();
         }
         // The whole project, or the arrange view's TIME SELECTION.
         let (from_s, span) = match spec.span {
@@ -11631,6 +11860,44 @@ impl DesktopApp {
     fn take_project_request(&mut self, ctx: &egui::Context) {
         let Some(req) = self.app.take_project_request() else {
             return;
+        };
+        // **A hardware loop runs in real time or not at all.** A full-speed
+        // export of a project with a Tangent Insert in circuit becomes a
+        // realtime one, through the device, and says so; a freeze cannot
+        // become one and is refused in `start_offline_render`.
+        let req = match req {
+            tangent_ui::ports::ProjectRequest::Export(mut spec) => {
+                let links: Vec<(bool, String)> = crate::engine_bridge::hw_inserts_in_circuit(&self.app, None)
+                    .into_iter()
+                    .map(|sb| {
+                        self.bridge
+                            .engine_bay(sb)
+                            .zip(self.recorder.engine.as_ref())
+                            .and_then(|(at, e)| hw_live(&self.app, e, at.0, at.1))
+                            .map_or_else(
+                                || (false, "No audio device is running.".to_owned()),
+                                |l| (l.connected, l.status),
+                            )
+                    })
+                    .collect();
+                match crate::engine_bridge::hw_export_verdict(spec.realtime, &links) {
+                    Err(why) => {
+                        self.app.notify(Kind::Error, why);
+                        return;
+                    }
+                    Ok(true) => {
+                        spec.realtime = true;
+                        self.app.notify(
+                            Kind::Info,
+                            "This project plays through a Tangent Insert (outboard gear), which cannot \
+                             run faster than real time, so it exports in real time through the device.",
+                        );
+                    }
+                    Ok(false) => {}
+                }
+                tangent_ui::ports::ProjectRequest::Export(spec)
+            }
+            other => other,
         };
         // A pass that cannot start says so here, before the overlay covers
         // anything for it - see `refuse_new_pass`.

@@ -38845,6 +38845,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // By the bay itself, as the face names it.
                 self.request_recorder(recorder::RecorderRequest::SetInsertIr { bay, path });
             }
+            DialogAction::HwInsert { bay, ask } => {
+                self.request_recorder(recorder::RecorderRequest::HwInsert { bay, ask });
+            }
             // **The sampler's load, refused out loud when it cannot be
             // one.** A MIDI clip is not a sample and neither is a kit or a
             // project file: the decoder cannot open them, so a bay that

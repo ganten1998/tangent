@@ -12,6 +12,40 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Tangent Insert: outboard gear in an insert bay.** Pick it from the
+  plugin shelf like any built-in effect, then choose the outputs it sends
+  on and the inputs it comes back on, each mono or stereo, from the
+  interface Tangent is playing through. The bay's signal goes out of those
+  jacks, through whatever is patched there, and back into the track. A
+  mono send carries the sum of both sides at -6 dB; a mono return feeds
+  both sides. The face has Send and Return trims, a Mix (fully wet to
+  start) and a Return Polarity switch.
+
+  PING fires a click round the loop and measures where it comes back, and
+  the insert reports that round trip to delay compensation so the rest of
+  the session lines up with it. The measurement is saved with the project.
+  Until you ping, the insert assumes the interface's own round trip (input
+  buffer plus twice the output buffer) and the face says it is unmeasured;
+  it also says so again if the rate or the buffer changes. Outputs 1/2
+  carry the main mix and are not offered. If the device changes or the
+  jacks are missing, the insert passes the signal dry, in time, says it is
+  disconnected, and keeps your choice for when the device comes back.
+
+  A hardware loop cannot run faster than real time, so a full-speed export
+  of a project with a Tangent Insert in circuit runs as a realtime export
+  through the device instead, and says so; a freeze of a track that plays
+  through one is refused with a message rather than rendered dry. A
+  bypassed insert is passed over everywhere.
+
+  Bypassed, the insert keeps the loop's delay, so comparing against bypass
+  lines up. The insert refuses a loop it cannot keep in time: an input on a
+  different device from the output (an aggregate device is fine), clocks
+  found drifting, or a round trip longer than delay compensation can absorb
+  (8192 samples). A realtime export starts only when every insert's loop is
+  connected, and says so if one comes apart during the pass. PING is not
+  offered while recording or exporting, and it refuses an answer it cannot
+  trust (a return that was not quiet before the click).
+
 - **Send to Device: the master out on a second output device too.** While
   Tangent plays through your interface, the same mix can also go to a
   virtual cable (VB-Audio's CABLE Input on Windows, BlackHole or Loopback on
@@ -216,6 +250,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   together, dry stems included. A drum kit layered with other instruments
   enters at the head of its track's chain and goes through it once with
   them. A track with one instrument sounds exactly as it did.
+
+- **The IR wizard measured the wrong input when inputs were picked.** With
+  the desk's inputs picked (say In 3 alone), a wizard return on In 3 read
+  input 1. It reads the input it names now.
 
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be
