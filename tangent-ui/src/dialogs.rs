@@ -7460,6 +7460,46 @@ pub fn set_export_stem_mode(spec: &mut crate::ports::ProjectExportSpec, chip: us
 }
 
 
+/// **The Quantize window's GRID row**: one chip per step, BAR (step 0) down
+/// to the finest the window offers (step -7), each named in the song's
+/// `meter` by the same ladder the gridboxes print, and a press sets
+/// `grid_exp`. Returns the chips, coarse to fine.
+///
+/// Its own function so the row can be drawn alone: each chip sizes itself
+/// to its word (a selectable label), which is why this row needed no fit
+/// when the gridboxes did, and `every_quantize_grid_chip_holds_its_word`
+/// holds it to that for every word in every meter and face.
+///
+/// **Each chip is SAID as the note it is** (`arrangement_panel::grid_spoken`),
+/// and as chosen or not. egui names a selectable label by its text and
+/// leaves its state out, so a screen reader heard the box's shorthand,
+/// "1/2·" for 12/8's dotted half with the dot read aloud and "1/128" for
+/// 4/4's finest, and never which chip was the grid. The name a reader is
+/// given is the last one handed to the chip, so this one, given after the
+/// label's own, is the one it keeps.
+/// `every_quantize_grid_chip_is_said_as_a_note` holds every chip of every
+/// meter to it.
+fn quantize_grid_row(ui: &mut egui::Ui, grid_exp: &mut i8, meter: (u8, u8)) -> Vec<egui::Response> {
+    ui.horizontal_wrapped(|ui| {
+        let mut chips = Vec::new();
+        for e in (-7_i8..=0).rev() {
+            let label = crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
+            let chosen = *grid_exp == e;
+            let chip = ui.selectable_label(chosen, label);
+            let said = crate::arrangement_panel::grid_spoken(e, meter.0, meter.1);
+            chip.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, chip.enabled(), chosen, &said)
+            });
+            if chip.clicked() {
+                *grid_exp = e;
+            }
+            chips.push(chip);
+        }
+        chips
+    })
+    .inner
+}
+
 /// **The desk's own dialog window**, in the one slot the app has always had.
 ///
 /// A thin wrapper since the amp grew a stacked pedal window: `show_on` below
@@ -13103,15 +13143,7 @@ fn show_on(
 
                             // ── the grid ──────────────────────────────────
                             head(ui, "GRID");
-                            ui.horizontal_wrapped(|ui| {
-                                for e in (-7_i8..=0).rev() {
-                                    let label =
-                                        crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
-                                    if ui.selectable_label(*grid_exp == e, label).clicked() {
-                                        *grid_exp = e;
-                                    }
-                                }
-                            });
+                            quantize_grid_row(ui, grid_exp, *meter);
                             ui.horizontal(|ui| {
                                 ui.checkbox(triplet, RichText::new("triplet").color(t.text));
                                 ui.add_space(10.0);
@@ -22740,6 +22772,152 @@ at: None,
                 let _ = show(ctx, &mut dialog, face, placement);
             },
         );
+    }
+
+    /// **Every Quantize GRID chip holds its word, in every meter and face.**
+    ///
+    /// The gridboxes had to be taught to shrink a word to their box
+    /// (`arrangement_panel::grid_box_word`, `midi_editor::chip_word`): their
+    /// steps of four characters and more spilled out of it. This row did not
+    /// need it: each chip is a selectable label and sizes itself to its
+    /// word. Held here all the same, so that a chip of fixed width would be
+    /// caught the day one is drawn: the eight chips of every one of the 192
+    /// signatures, painted by `quantize_grid_row` in the window's own style,
+    /// in every bundled face at 100% and 200%, and each word laid out inside
+    /// its own chip, every pixel of its ink too.
+    ///
+    /// There is no fix on this row to revert, so this has no revert check:
+    /// it passes on the code from before the gridboxes' fit as well.
+    #[test]
+    fn every_quantize_grid_chip_holds_its_word() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let t = theme(Color32::from_rgb(0x4A, 0x3B, 0x2C));
+        for ppp in [1.0f32, 2.0] {
+            for face in fonts::FontChoice::ALL {
+                let ctx = crate::arrangement_panel::context_at(face, ppp);
+                for &(beats, unit) in &sigs {
+                    let mut raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0))),
+                        ..Default::default()
+                    };
+                    raw.viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .native_pixels_per_point = Some(ppp);
+                    let mut chips: Vec<egui::Response> = Vec::new();
+                    let out = ctx.run(raw, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            apply_theme(ui.style_mut(), &t);
+                            let mut grid_exp = -3;
+                            chips = quantize_grid_row(ui, &mut grid_exp, (beats, unit));
+                        });
+                    });
+                    let words = crate::arrangement_panel::PaintedWord::all(&ctx, &out.shapes);
+                    let at = format!("{face:?} at {ppp}x in {beats}/{unit}");
+                    assert_eq!(chips.len(), 8, "{at}: the row is not steps 0 down to -7");
+                    assert_eq!(words.len(), 8, "{at}: the row painted {words:?}");
+                    for (k, (chip, word)) in chips.iter().zip(&words).enumerate() {
+                        let e = -i8::try_from(k).expect("eight chips");
+                        assert_eq!(word.text, crate::arrangement_panel::grid_label_text(e, beats, unit), "{at}");
+                        let r = chip.rect;
+                        assert!(
+                            r.contains_rect(word.laid),
+                            "{at}: {:?} is laid out at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.laid
+                        );
+                        assert!(
+                            word.ink.left() >= r.left() - 1.0e-3
+                                && word.ink.right() <= r.right() + 1.0e-3
+                                && word.ink.top() >= r.top() - 1.0e-3
+                                && word.ink.bottom() <= r.bottom() + 1.0e-3,
+                            "{at}: {:?} has ink at {:?}, outside its chip {r:?}",
+                            word.text,
+                            word.ink
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Every Quantize GRID chip is said as the note it is, and as chosen
+    /// or not.**
+    ///
+    /// The chips print the gridboxes' shorthand, and a selectable label is
+    /// named by its text, so a screen reader was given the shorthand: 12/8's
+    /// dotted half as "1/2·", the dot read aloud, 6/8's dotted quarter as
+    /// "1/4·", 4/4's finest chip as "1/128", "one slash one hundred
+    /// twenty-eight". And egui leaves a selectable label's state out of its
+    /// name, so nothing said which chip was the grid. This is the one other
+    /// surface a reader reaches the ladder on, after the arrange gridbox, and
+    /// it says the steps the way that one does (`grid_spoken`).
+    ///
+    /// Read where a reader gets it: what each chip hands egui when the focus
+    /// lands on it, every chip of every one of the 192 signatures, with a
+    /// different chip chosen as the meters go by. A chip is handed its
+    /// label's own name first and then this one, and a reader keeps the
+    /// last; so the last is what is held. Held: it is `grid_spoken` of the
+    /// chip's step, which says no fraction (no slash, no dot); it is a
+    /// selectable label; and it is chosen exactly when its step is the grid.
+    ///
+    /// Revert check, performed: take the chip's own `widget_info` away and
+    /// this fails on the first chip it reads, 1/1's BAR, said "BAR" where
+    /// "1 bar" was due.
+    #[test]
+    fn every_quantize_grid_chip_is_said_as_a_note() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0));
+        // One frame of the row: its chips, and the names they handed egui
+        // as the focus landed. The focus is moved inside the frame, before
+        // the row, which is what makes this the frame a chip GAINS it in (a
+        // request between frames is already the focus the frame begins
+        // with, and nothing is said).
+        let frame = |meter: (u8, u8), chosen: i8, focus: Option<egui::Id>| {
+            let mut chips: Vec<egui::Response> = Vec::new();
+            let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                if let Some(id) = focus {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut grid_exp = chosen;
+                    chips = quantize_grid_row(ui, &mut grid_exp, meter);
+                });
+            });
+            let named: Vec<egui::WidgetInfo> = out
+                .platform_output
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::output::OutputEvent::FocusGained(info) => Some(info.clone()),
+                    _ => None,
+                })
+                .collect();
+            (chips, named)
+        };
+        for (i, &(beats, unit)) in sigs.iter().enumerate() {
+            let chosen = -i8::try_from(i % 8).expect("eight chips");
+            let (chips, _) = frame((beats, unit), chosen, None);
+            assert_eq!(chips.len(), 8, "{beats}/{unit}: the row is not steps 0 down to -7");
+            for (k, id) in chips.iter().map(|c| c.id).enumerate() {
+                let e = -i8::try_from(k).expect("eight chips");
+                let printed = crate::arrangement_panel::grid_label_text(e, beats, unit);
+                let at = format!("{beats}/{unit}, step {e} (printed {printed:?})");
+                let (_, named) = frame((beats, unit), chosen, Some(id));
+                let kept = named.last().unwrap_or_else(|| panic!("{at}: the chip named nothing as it took the focus"));
+                let want = crate::arrangement_panel::grid_spoken(e, beats, unit);
+                assert_eq!(kept.label.as_deref(), Some(want.as_str()), "{at}: a reader is told this");
+                assert!(
+                    !want.contains('/') && !want.contains('\u{00b7}'),
+                    "{at} is said with a fraction, {want:?}"
+                );
+                assert_eq!(kept.typ, egui::WidgetType::SelectableLabel, "{at}");
+                assert_eq!(kept.selected, Some(e == chosen), "{at}: chosen is {chosen}");
+            }
+        }
     }
 }
 

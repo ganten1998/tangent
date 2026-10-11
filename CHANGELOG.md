@@ -117,6 +117,53 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Each change is one step of undo, and the timeline's bars, the click and
   the count-in follow it, while the song plays too.
 
+- **The grid's one-bar step is called BAR, in every meter.** The step
+  between 2 bars and the note values read 1 in 4/4, which is also a whole
+  note's name, and 1/2· in 3/4 and 6/8; in 5/4, 7/8 and 9/8 it printed a
+  decimal too wide for its box (5.000q, 3.500q, 4.500q). It reads BAR now
+  in the grid boxes of the arrangement and the MIDI editor (BAR T with
+  triplets on) and in the Quantize window's GRID row. Steps above it still
+  count bars (2, 4, 8) and steps below it are note values (1, 1/2, 1/4 and
+  finer); one that no single note names is counted in the meter's own
+  beats, so half a bar of 10/8 reads 5/8.
+
+  A step too wide for its box is printed smaller now, until it fits, in
+  the arrangement's grid box (1/16, 1/4·, 1/128) and the MIDI editor's
+  grid chip (1/16 sw, 1/1024T), never under 6.5 points. Nothing is drawn
+  outside a grid box any more, so a long step no longer runs onto the
+  tempo lane's switch or under the navigator, and steps that already fit
+  keep their size. A step still too wide at 6.5 points is cut at the box's
+  edges. The arrangement's grid box is 20 points square only while the
+  arrangement is at least 383 points tall; a shorter arrangement draws it
+  smaller, down to 7 points, so what is cut depends on the arrangement's
+  height and the font:
+
+  - Courier Prime and JetBrains Mono: 1/1024 and 1/2048 (the finest steps
+    of 1/16, 1/32, 2/32 and odd counts of 32nds) at every height. In an
+    arrangement shorter than 381 points (383 in JetBrains Mono),
+    five-character steps such as 1/128 and 11/16 as well; shorter than
+    327, four-character ones such as 1/16, 1/4· and 10/8; shorter than
+    257, three-character ones, BAR and 1/2 among them; shorter than 181,
+    the dotted whole, 1·.
+  - Terminess: shorter than 383 points, 1/1024 and 1/2048; shorter than
+    327, five characters; 276, four; 222, three; 159, 1·.
+
+  Just under each of those heights the cut comes and goes from one point
+  of height to the next, as the box's edges land on whole pixels or
+  between them.
+
+  A screen reader names every step as a note, in the arrangement's grid
+  box and in the Quantize window's GRID row: whole note, dotted half note,
+  hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar" for the
+  whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted half and
+  "1/128 of a bar" and finer for the finest steps, and it read the
+  Quantize chips as their printed shorthand ("1/2·", "1/128") without
+  saying which one was chosen; it says which now. With the reader on, the
+  arrow keys move the arrangement's grid box a step each way, which they
+  never did, and Home and End reach both of its ends, the finest step
+  (1/64 in 4/4) included. The MIDI editor is not read by a screen reader
+  yet, its grid chip included.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and
