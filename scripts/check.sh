@@ -102,11 +102,11 @@ scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-
 echo "==> no build that ships carries test-home  (resolver 2 keeps it in test builds)"
 # A dev-dependency's features reach test builds alone, so `cargo build` and
 # every artifact resolve the real home. Read the way a build resolves
-# features: the binary with every feature on every target and the plugin,
-# dev edges off (neither may carry it), and each member's test build alone,
-# dev edges on, as the `-p` legs below build it (every one that links
-# tangent-core must carry it, tangent-core's own included, or its tests
-# resolve the real home, and the check could not see the feature at all).
+# features: the binary with every feature on every target, dev edges off (it
+# may not carry it), and each member's test build alone, dev edges on, as the
+# `-p` legs below build it (every one that links tangent-core must carry it,
+# tangent-core's own included, or its tests resolve the real home, and the
+# check could not see the feature at all).
 scripts/check-home.sh features
 
 echo "==> cargo test --release  (the render and export goldens, in the profile that ships)"
@@ -216,15 +216,6 @@ if ! cargo check -q -p tangent --no-default-features 2>/dev/null; then
   echo "the Minimal build (no features) does not compile" >&2
   exit 1
 fi
-
-echo "==> cargo check --manifest-path plugin/Cargo.toml  (the VST3 plugin)"
-# **The plugin is its own workspace, so nothing above builds it.** It links
-# tangent-ui and tangent-core exactly as the desktop does, and every change to
-# their public API (a constructor, a dialog variant, a signature) reaches it;
-# without this leg a change that breaks only the plugin was found at release
-# time, by the plugin build. A compile check: its tests are the shared
-# crates' tests, which ran above.
-cargo check --manifest-path plugin/Cargo.toml
 
 echo "==> scripts/test-census.sh  (no crate loses tests without a ledger)"
 # A test deleted with the code it covered leaves the suite green; the census

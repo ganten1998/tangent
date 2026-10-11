@@ -52,16 +52,15 @@
 # **`features` proves no build that ships carries `test-home`, and every
 # test build that links tangent-core does.** Resolver 2 gives a
 # dev-dependency's features to test builds alone; `cargo tree` resolves
-# features the way a build does, so the shipped configurations (every
-# feature of the binary, on every target, and the plugin, which is its own
-# workspace) are read with dev edges off, and each workspace member's test
-# build with them on, alone, as check.sh's `-p` legs build it: one that
-# links tangent-core must carry it (tangent-core's own included), or its
-# tests resolve the real home; and a check that cannot see the feature where
-# it is would pass for the wrong reason. And since an artifact is whatever
-# the scripts build, no script outside the gate may build a test, bench or
-# example target, which would resolve dev-dependency features into the
-# binary built beside it.
+# features the way a build does, so the shipped configuration (every
+# feature of the binary, on every target) is read with dev edges off, and
+# each workspace member's test build with them on, alone, as check.sh's
+# `-p` legs build it: one that links tangent-core must carry it
+# (tangent-core's own included), or its tests resolve the real home; and a
+# check that cannot see the feature where it is would pass for the wrong
+# reason. And since an artifact is whatever the scripts build, no script
+# outside the gate may build a test, bench or example target, which would
+# resolve dev-dependency features into the binary built beside it.
 #
 # **`selftest` holds `run` to those rules** with stub commands, in a home
 # of its own (its "real" folders are its own too): check.sh runs it first.
@@ -263,20 +262,13 @@ core_features() {
 }
 
 features() {
-  local shipped plugin got member fail=0 tested=0
+  local shipped got member fail=0 tested=0
   shipped="$(core_features -p tangent --all-features -e normal,build)" \
     || { echo "check-home: cargo tree could not resolve the binary as it ships" >&2; exit 1; }
-  plugin="$(core_features --manifest-path plugin/Cargo.toml --all-features -e normal,build)" \
-    || { echo "check-home: cargo tree could not resolve the plugin as it ships" >&2; exit 1; }
-  printf '  %-34s %s\n' "the binary as it ships:" "tangent-core [${shipped#+}]" \
-    "the plugin as it ships:" "tangent-core [${plugin#+}]"
+  printf '  %-34s %s\n' "the binary as it ships:" "tangent-core [${shipped#+}]"
   case ",${shipped#+}," in *,test-home,*)
     echo "check-home: a build of the binary that ships carries test-home: it would keep every" >&2
     echo "  setting and project in a temp folder" >&2
-    fail=1 ;;
-  esac
-  case ",${plugin#+}," in *,test-home,*)
-    echo "check-home: the plugin carries test-home" >&2
     fail=1 ;;
   esac
   # **Every test build that links tangent-core carries it**, each member

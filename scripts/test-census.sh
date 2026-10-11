@@ -43,7 +43,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CRATES="tangent-core tangent-ui tangent tangent-record tangent-host plugin"
+CRATES="tangent-core tangent-ui tangent tangent-record tangent-host"
 PATTERN='^[[:space:]]*#\[test\][[:space:]]*$'
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {

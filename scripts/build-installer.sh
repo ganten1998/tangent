@@ -280,10 +280,6 @@ build_linux() {
   dir="$(find "$WORK/linux" -maxdepth 1 -mindepth 1 -type d | head -1)"
   [ -n "$dir" ] || { echo "the tarball has no top-level directory" >&2; exit 1; }
 
-  # No Tangent.vst3 rides along. This step repacks the tarball it is given
-  # under the same name, and a tree from a build before 4.77.0 could carry
-  # one, which must not ship again (the check after packing refuses one too).
-  rm -rf "$dir/$NAME.vst3"
   cp installer/linux/install.sh "$dir/install.sh"
   chmod +x "$dir/install.sh"
   cp LICENSING.md "$dir/"

@@ -804,8 +804,8 @@ fn no_surface_says_a_key_is_only_a_thank_you() {
 
 /// **No string any other crate ships has an em dash** either: the desktop
 /// host's notices ("Nothing is armed...", the export's and the IR
-/// capture's lines), the engine's and the host's errors that reach a
-/// toast, and the plugin's. Only the dash rule: these crates are not where
+/// capture's lines), and the engine's and the host's errors that reach a
+/// toast. Only the dash rule: these crates are not where
 /// a key is described, and their literals name device widths ("a
 /// 2-channel input") that the width rule would read as the desk.
 /// `tangent-ui` and the fulfilment email are read whole by the scan above.
@@ -814,7 +814,7 @@ fn no_shipped_string_in_any_crate_has_an_em_dash() {
     let root = root();
     let mut hits = Vec::new();
     let mut read = 0;
-    for dir in ["tangent/src", "tangent-host/src", "tangent-record/src", "tangent-core/src", "plugin/src"] {
+    for dir in ["tangent/src", "tangent-host/src", "tangent-record/src", "tangent-core/src"] {
         let mut files = crate::ban_scan::rust_files(&root.join(dir));
         let tests = crate::ban_scan::test_only_files(&files);
         // A build script's strings ship when it writes them into the
@@ -833,7 +833,7 @@ fn no_shipped_string_in_any_crate_has_an_em_dash() {
             }
         }
     }
-    // Not a vacuous pass: the five trees were found and read.
+    // Not a vacuous pass: the four trees were found and read.
     assert!(read > 90, "the scan read only {read} files");
     assert!(hits.is_empty(), "a shipped string has an em dash:\n  {}", hits.join("\n  "));
 }

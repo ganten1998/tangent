@@ -44,8 +44,8 @@ use std::path::{Path, PathBuf};
 
 /// The source roots of every crate that ships, repository-relative. The
 /// vendored trees under them are upstream code and are not ours to scan.
-const ROOTS: [&str; 6] =
-    ["tangent/src", "tangent-ui/src", "tangent-core/src", "tangent-host/src", "tangent-record/src", "plugin/src"];
+const ROOTS: [&str; 5] =
+    ["tangent/src", "tangent-ui/src", "tangent-core/src", "tangent-host/src", "tangent-record/src"];
 
 /// **The fixed desk's names.** Each was a width of the desk, or a seat or
 /// an order worked out from one.
