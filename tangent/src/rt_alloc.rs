@@ -386,6 +386,68 @@ mod tests {
         );
     }
 
+    /// **Several instruments on one track allocate nothing either** (see
+    /// `instrument::Layer`): a DX7 at the head, an analog layered over it,
+    /// the keyboard entering at the third bay, a sampler in the extra rack,
+    /// and a kit with an analog beside it, every one of them playing a note
+    /// on the fork. Their alignment lines and the keyboard's inlet were all
+    /// built on the host; the callback only steps through them.
+    #[test]
+    fn layered_instruments_allocate_nothing_on_the_callback() {
+        use crate::desk_plan::Slot;
+        use crate::instrument::{ClipNote, PadKit, PlacedMidi, SamplerSample, SAMPLER_ROOT_KEY};
+        const LANE: usize = 3;
+        const KIT: usize = 6;
+        let mut e = offline();
+        e.set_builtin_strips(1 << LANE);
+        e.set_keys_strips(1 << LANE);
+        e.sync_instrument_lanes(1 << LANE, 1 << LANE);
+        e.set_inlets(Slot(LANE as u32), 0, 2);
+        let seat = |e: &mut Engine, seat: usize, bay: usize, unit: &str| {
+            e.load_insert(seat, bay, Some(Path::new(unit)), None)
+                .expect("the unit loads")
+                .expect("the bay reports it");
+        };
+        seat(&mut e, LANE, 1, crate::builtin_fx::ANALOG_PATH);
+        seat(&mut e, tangent_ui::desk_legacy::folder_extra_seat(LANE), 0, crate::builtin_fx::SAMPLER_PATH);
+        assert!(e.set_sampler_sample(
+            Slot(LANE as u32),
+            Some(SamplerSample {
+                clip: noise(0.5, 0x5a5c),
+                name: "alloc.wav".to_owned(),
+                source: std::path::PathBuf::from("alloc.wav"),
+                root_key: SAMPLER_ROOT_KEY,
+            })
+        ));
+        let mut kit = PadKit::default();
+        kit.pads[0] = Some(noise(0.1, 0xd00e));
+        assert!(e.set_pad_kit(KIT, kit));
+        e.set_drum_strips(1 << KIT);
+        seat(&mut e, KIT, 1, crate::builtin_fx::ANALOG_PATH);
+        let notes = |strip: usize, key: u8| PlacedMidi {
+            strip,
+            start: 0,
+            len: 48_000 * 4,
+            notes: Arc::new((0..16).map(|i| ClipNote { at: i * 6_000, dur: 4_000, key, vel: 100 }).collect()),
+            pedal: Arc::new(Vec::new()),
+        };
+        e.set_midi_clips(vec![notes(LANE, SAMPLER_ROOT_KEY), notes(KIT, tangent_ui::recorder::DRUM_PAD_BASE)]);
+        e.set_offline_fanout(true);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..16 {
+            e.render_offline(&mut out);
+        }
+        let (_, steady) = least_of(5, || {
+            for _ in 0..8 {
+                e.render_offline(&mut out);
+            }
+        });
+        assert_eq!(steady, Counted::default(), "a layered desk allocated on the callback");
+        assert!(out.iter().any(|s| *s != 0.0), "the layered desk rendered silence");
+    }
+
     /// One render of the alias desk: two lanes playing two different
     /// signals, a loud trim on each (so freezing a lane audibly changes it),
     /// stems on, and `switch` applied to the engine before the roll. Returns
