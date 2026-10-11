@@ -19,8 +19,8 @@
 //! a desk at all ([`Structural`]: too many rows, two rows with one id, the
 //! wrong shape) is refused, and then the refusal carries the raw JSON so the
 //! caller can keep it beside the file rather than lose it. What the caller
-//! does with a refusal (a side file, `extra["desk_refused"]`, a refused open)
-//! is the persistence lane's; this module never touches the disk.
+//! does with a refusal (a side file, a refused open) is the persistence
+//! lane's; this module never touches the disk.
 //!
 //! **Nothing is allocated by a value.** A key's number (`t4000000000`,
 //! `c65535`, a hardware jack) is parsed and compared, never used as a size;
