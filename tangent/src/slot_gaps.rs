@@ -1686,3 +1686,137 @@ fn the_frame_runs_the_roads_this_suite_drives() {
     assert!(body_of("fn reload_sampler(&mut self)").contains("Self::deliver_samples("), "the sampler reload goes another road");
     assert!(body_of("fn reload_pads(&mut self)").contains("Self::deliver_kits("), "the kits' reload goes another road");
 }
+
+// ── several instruments on one track ────────────────────────────────────────
+
+/// **Each of `rows`' stems** on an engine whose bridge is `p`: a third of a
+/// second rolled from zero with the stem tap armed for their lanes, in
+/// `rows`' order.
+fn stems_of(e: &mut Engine, p: &Bridge, rows: &[usize]) -> Vec<Vec<f32>> {
+    let slots: Vec<Slot> = rows.iter().map(|r| p.lane(*r).expect("a row's lane").slot).collect();
+    e.arm_stems(&slots);
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    let mut out = vec![0.0f32; 1024 * 2];
+    let mut stems = Vec::new();
+    for _ in 0..(RATE as usize / 3).div_ceil(1024) {
+        e.render_offline(&mut out);
+        e.drain_stems(&mut stems);
+    }
+    let width = e.stem_frame_width();
+    (0..rows.len())
+        .map(|at| stems.chunks_exact(width).flat_map(|f| [f[at * 2], f[at * 2 + 1]]).collect())
+        .collect()
+}
+
+/// **How far `got` is from the sum of `parts`**, each later by its own frame
+/// count, as a share of `got`'s peak.
+fn misfit(got: &[f32], parts: &[(&[f32], usize)]) -> f32 {
+    let peak = got.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+    (0..got.len())
+        .map(|i| {
+            let want: f32 = parts.iter().map(|(p, k)| i.checked_sub(2 * k).and_then(|j| p.get(j)).copied().unwrap_or(0.0)).sum();
+            (got[i] - want).abs()
+        })
+        .fold(0.0f32, f32::max)
+        / peak
+}
+
+/// **Three instruments on one track all play its clip, past slot 31 as on
+/// row 1, live and in the export, wherever their bays are** (the owner's
+/// "two or more instruments on channel inserts receiving midi simultaneously
+/// and playing back on that channel"). Rows 1 and 40 hold the analog in
+/// their first bay, the modelled keyboard in their third and the DX7 in
+/// their fourth (the extra rack's first); rows 3, 4 and 5 hold each of the
+/// three alone, in the same bay. Every row has one note. Before the layering
+/// only a first bay's DX7 or keyboard was ever played (the bridge asked the
+/// first bay alone), so rows 4 and 5 were silent and rows 1 and 40 were the
+/// analog alone; now each subject's stem is the three solo rows summed, the
+/// two that enter after the analog held by its delay (or, where the desk's
+/// compensation has already held the solo rows by as much, not), and row
+/// 40's is row 1's.
+///
+/// And a kit layered with a voice: row 6 holds the drumpad in its first bay
+/// and the analog in its second, row 7 the drumpad alone and row 8 the
+/// analog alone in its second bay; the kit's pad 36 and the analog both
+/// play row 6's note. A kit alone stopped the lane's walk, rack and all.
+#[test]
+fn every_instrument_on_a_track_plays_its_notes_past_slot_31_as_on_row_1_live_and_in_the_export() {
+    use crate::builtin_fx::ANALOG_PATH;
+    use tangent_ui::dialogs::BUILTIN_PATH;
+    const TAG: &str = "gaps-multi-inst";
+    let dir = scratch("multi-inst");
+    wav(&dir.join("media").join("pad.wav"), 0.25, false);
+    let mut s = wide_desk();
+    let mut doc = Arrangement::default();
+    let layered = [1usize, 40];
+    let solo = [(3usize, Rack::Chain(0), 0u8, ANALOG_PATH), (4, Rack::Chain(0), 2, KEYS_PATH), (5, Rack::Chain(1), 0, BUILTIN_PATH)];
+    let (kit_and_voice, kit, voice) = (6usize, 7usize, 8usize);
+    for row in layered.into_iter().chain(solo.iter().map(|x| x.0)).chain([kit_and_voice, kit, voice]) {
+        s.rows[row].kind = Some(RowKind::Midi);
+        doc.add_clip(notes(row, DRUM_PAD_BASE + 36));
+    }
+    for row in layered {
+        for &(_, rack, bay, path) in &solo {
+            s.plugins.insert(bay_of(&s, row, rack, bay), path.to_owned());
+        }
+    }
+    for &(row, rack, bay, path) in &solo {
+        s.plugins.insert(bay_of(&s, row, rack, bay), path.to_owned());
+    }
+    s.plugins.insert(bay_of(&s, kit_and_voice, Rack::Chain(0), 0), DRUMPAD_PATH.to_owned());
+    s.plugins.insert(bay_of(&s, kit_and_voice, Rack::Chain(0), 1), ANALOG_PATH.to_owned());
+    s.plugins.insert(bay_of(&s, kit, Rack::Chain(0), 0), DRUMPAD_PATH.to_owned());
+    s.plugins.insert(bay_of(&s, voice, Rack::Chain(0), 1), ANALOG_PATH.to_owned());
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    save_kits(&s, &[kit_and_voice, kit], &path);
+    let mut host = Host::at(&dir);
+    let mut app = open_saved(TAG, s, &path);
+    let (mut e, p) = live(&mut app, &mut host);
+    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+    let lat = {
+        let spec = crate::builtin_fx::spec_for(ANALOG_PATH).expect("the analog");
+        spec.create(RATE as f32, &spec.defaults()).latency() as usize
+    };
+    let rows = [1usize, 40, 3, 4, 5, kit_and_voice, kit, voice];
+    for (road, got) in [("live", stems_of(&mut e, &p, &rows)), ("export", stems_of(&mut x, &xb, &rows))] {
+        let peak = |xs: &[f32]| xs.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (row, stem) in rows.iter().zip(&got) {
+            assert!(peak(stem) > 1e-3, "{road}: row {row} is silent");
+        }
+        let (analog, keys, dx7) = (&got[2][..], &got[3][..], &got[4][..]);
+        for (i, row) in layered.iter().enumerate() {
+            // The solo keyboard and DX7 rows are held by the desk's
+            // compensation exactly as much as the layered row holds them,
+            // or not at all; either way the sum fits.
+            let err = [0, lat]
+                .into_iter()
+                .map(|k| misfit(&got[i], &[(analog, 0), (keys, k), (dx7, k)]))
+                .fold(f32::MAX, f32::min);
+            assert!(err < 1e-4, "{road}: row {row} is not its three instruments summed (off by {err} of its peak)");
+        }
+        let err = [0, lat]
+            .into_iter()
+            .map(|k| misfit(&got[5], &[(&got[6], k), (&got[7], 0)]))
+            .fold(f32::MAX, f32::min);
+        assert!(err < 1e-4, "{road}: the kit and the voice on row {kit_and_voice} are not the two summed (off by {err})");
+    }
+    // **And a freeze of row 40 is its export**: the freeze renders through
+    // the export's builder, so the three instruments land in its file as
+    // they play in the export.
+    let mut ctx = Furnish {
+        live: Some((&e, &p)),
+        ..Furnish::default()
+    };
+    let id = app.track_ids()[40];
+    let Built { engine: mut f, bridge: fb } =
+        full_build_with(&app, RATE, Timebase::new(), BuildFor::Freeze(id), &mut ctx).expect("a freeze engine");
+    assert!(ctx.refused.is_empty(), "the freeze refused {:?}", ctx.refused);
+    let frozen = stems_of(&mut f, &fb, &[40]).remove(0);
+    let Built { engine: mut x2, bridge: xb2 } = export(&app, (&e, &p));
+    let exported = stems_of(&mut x2, &xb2, &[40]).remove(0);
+    let err = misfit(&frozen, &[(&exported, 0)]);
+    assert!(err < 1e-4, "the freeze of row 40 is not its export (off by {err})");
+    cleanup(&dir, &[TAG]);
+}

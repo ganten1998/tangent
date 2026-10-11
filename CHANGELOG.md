@@ -180,6 +180,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Two or more instruments on one track all play.** A track's insert rack
+  can hold several instruments (the DX7, Keys, Analog, Sampler, the drum
+  pads, hosted VST3 and LV2 instruments), and every one of them now hears
+  the same MIDI, live while the track is armed and from its clips on
+  playback, in exports and in freezes, and they sum on the track's channel.
+  Before, a later instrument replaced everything ahead of it, and the DX7,
+  Keys and the drum pads only played from the track's first bay. The rule
+  for a chain: an effect processes what reaches its bay, so an effect
+  between two instruments processes only the first, and one after both
+  processes their sum; delay compensation keeps the layered instruments
+  together. A track with one instrument sounds exactly as it did.
+
 - **Routes follow their tracks.** Moving a track left every route to and
   from it on the row it came from, so after a reorder a track could be
   routed into somebody else's audio, and removing a track left routes aimed

@@ -559,6 +559,25 @@ pub fn row_instrument(app: &TangentApp, row: usize) -> Option<&str> {
     track_bay(app, app.track_at(row)?, Rack::Chain(0), 0)
 }
 
+/// **Where in its chain a track holds `sentinel`**, if it does: the first of
+/// its six bays (its own rack's three, then its extra rack's) holding it, as
+/// a chain position `0..6`. A track's instruments are wherever its bays put
+/// them, not only in the first: two or more on one track all play (see
+/// `instrument::Layer` for the rule), so every question of the form "does
+/// this track carry the DX7, the keyboard, the drumpad" is this one.
+pub fn track_holds(app: &TangentApp, id: TrackId, sentinel: &str) -> Option<u8> {
+    let bays = u8::try_from(tangent_ui::desk_id::BAYS).unwrap_or(u8::MAX);
+    (0..2u16)
+        .flat_map(|chain| (0..bays).map(move |bay| (chain, bay)))
+        .position(|(chain, bay)| track_bay(app, id, Rack::Chain(chain), bay) == Some(sentinel))
+        .and_then(|at| u8::try_from(at).ok())
+}
+
+/// [`track_holds`] for the track on row `row`, as a yes or no.
+pub fn row_holds(app: &TangentApp, row: usize, sentinel: &str) -> bool {
+    app.track_at(row).is_some_and(|id| track_holds(app, id, sentinel).is_some())
+}
+
 /// **The plugin path in a bay, by identity**, off the app's map.
 pub fn bay_path(app: &TangentApp, sb: SeatBay) -> Option<&str> {
     app.plugin(sb)
@@ -849,13 +868,13 @@ impl Bridge {
         sb.is_valid().then_some(sb)
     }
 
-    /// Every row whose first bay holds `sentinel`, with its lane: the drum,
-    /// DX7 and keyboard lanes by the bay-1 sentinel rule.
+    /// Every row whose track holds `sentinel` in any of its bays
+    /// ([`track_holds`]), with its lane: the drum, DX7 and keyboard lanes.
     pub fn lanes_holding(&self, app: &TangentApp, sentinel: &str) -> Vec<(usize, LaneAt)> {
         self.rows
             .iter()
             .enumerate()
-            .filter(|(_, (id, _))| track_bay(app, *id, Rack::Chain(0), 0) == Some(sentinel))
+            .filter(|(_, (id, _))| track_holds(app, *id, sentinel).is_some())
             .filter_map(|(row, (_, at))| at.map(|a| (row, a)))
             .collect()
     }
@@ -1140,6 +1159,19 @@ impl Bridge {
         // lanes keep theirs (the host keeps them, so thawing is instant), and
         // their strip flags in the plan stand them down instead.
         let live_rule = matches!(shape, Shape::Live);
+        // **And where each enters its chain**, restated every frame: a
+        // level, so a bay moved, emptied or refilled is followed without a
+        // diff to keep. Zero (the head) for a track holding neither.
+        for (id, at) in &self.rows {
+            if let Some(at) = at {
+                let pos = |sentinel: &str| track_holds(app, *id, sentinel).unwrap_or(0);
+                e.set_inlets(
+                    at.slot,
+                    pos(tangent_ui::dialogs::BUILTIN_PATH),
+                    pos(tangent_ui::dialogs::KEYS_PATH),
+                );
+            }
+        }
         let dx7: Vec<Slot> = self.instrument_lanes(app, tangent_ui::dialogs::BUILTIN_PATH, live_rule);
         let keys: Vec<Slot> = self.instrument_lanes(app, tangent_ui::dialogs::KEYS_PATH, live_rule);
         for slot in e.sync_instruments(&dx7, &keys) {
@@ -1237,7 +1269,7 @@ impl Bridge {
                 None if app.desk_index().is_folder(row) => LaneKind::Folder,
                 None => LaneKind::Empty,
             };
-            let drum = track_bay(app, *id, Rack::Chain(0), 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH);
+            let drum = track_holds(app, *id, tangent_ui::dialogs::DRUMPAD_PATH).is_some();
             batch.push((*id, slot, LaneSpec { kind, drum }));
         }
         if batch.is_empty() {
@@ -1269,7 +1301,7 @@ impl Bridge {
     fn attach_pads(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) {
         for (_, id) in rows {
             let Some(h) = self.lanes.get_mut(id) else { continue };
-            if h.pads || track_bay(app, *id, Rack::Chain(0), 0) != Some(tangent_ui::dialogs::DRUMPAD_PATH) {
+            if h.pads || track_holds(app, *id, tangent_ui::dialogs::DRUMPAD_PATH).is_none() {
                 continue;
             }
             if e.attach(h.at.slot, h.at.gen, LanePart::Pads(Box::new(PadBank::new()))).is_ok() {
@@ -1291,7 +1323,7 @@ impl Bridge {
             .iter()
             .map(|(_, id)| *id)
             .filter(|id| self.lanes.contains_key(id))
-            .filter(|id| track_bay(app, *id, Rack::Chain(0), 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .filter(|id| track_holds(app, *id, tangent_ui::dialogs::DRUMPAD_PATH).is_some())
             .collect();
         let drummed = now
             .difference(&self.drums)
@@ -1301,7 +1333,7 @@ impl Bridge {
         drummed
     }
 
-    /// The lanes whose row holds `sentinel` in its first bay: on the live
+    /// The lanes whose row holds `sentinel` in any bay: on the live
     /// engine only MIDI rows (the live rule), on an offline one any row (the
     /// export's) - the two have always differed in this, and both are kept.
     fn instrument_lanes(&self, app: &TangentApp, sentinel: &str, live_rule: bool) -> Vec<Slot> {
@@ -1379,16 +1411,20 @@ impl Bridge {
         let mut lanes = Vec::with_capacity(n + self.leaving.len());
         for (row, (id, at)) in self.rows.iter().enumerate() {
             let Some(at) = at else { continue };
-            let first = track_bay(app, *id, Rack::Chain(0), 0);
+            // **Every instrument the track holds, wherever its bay**: a DX7,
+            // a keyboard and a kit on one track all play from the same notes
+            // (`instrument::Layer`). This read the FIRST bay alone, so a
+            // second instrument after it was silence.
+            let holds = |sentinel: &str| track_holds(app, *id, sentinel).is_some();
             let is_frozen = frozen.contains(&row);
             let midi_ok = !live_rule || app.channel_kind(row) == Some(ChannelKind::Midi);
             let flags = F::default()
                 .with(F::ARMED, armed.get(row).copied().unwrap_or(false))
                 .with(F::MIDI_OFF, deaf.get(row).copied().unwrap_or(true) || is_frozen)
                 .with(F::FROZEN, is_frozen)
-                .with(F::DRUM, first == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-                .with(F::BUILTIN, midi_ok && first == Some(tangent_ui::dialogs::BUILTIN_PATH) && !is_frozen)
-                .with(F::KEYS, midi_ok && first == Some(tangent_ui::dialogs::KEYS_PATH) && !is_frozen)
+                .with(F::DRUM, holds(tangent_ui::dialogs::DRUMPAD_PATH))
+                .with(F::BUILTIN, midi_ok && holds(tangent_ui::dialogs::BUILTIN_PATH) && !is_frozen)
+                .with(F::KEYS, midi_ok && holds(tangent_ui::dialogs::KEYS_PATH) && !is_frozen)
                 .with(F::MUTED, muted(row))
                 .with(F::SOLOED, soloed(row))
                 .with(F::PHASE, app.strip_inverted(StripRef::Row(row)))
