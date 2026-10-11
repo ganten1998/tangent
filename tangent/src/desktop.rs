@@ -2562,12 +2562,46 @@ pub(crate) fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
-                extra: engine.builtin_extra_at(rack, slot).to_vec(),
+                extra: {
+                    let mut extra = engine.builtin_extra_at(rack, slot).to_vec();
+                    // **A hardware insert's live picture rides along**, on
+                    // lines the face reads and the state never keeps (see
+                    // `faces_hwinsert::LIVE`).
+                    if let Some(live) = hw_live(app, engine, rack, slot) {
+                        extra.extend(live.to_lines());
+                    }
+                    extra
+                },
             },
             None => tangent_ui::ports::BuiltinFace::default(),
         };
         app.set_bay_face(tangent_ui::desk_id::SeatBay { seat: key, bay }, face);
     }
+}
+
+/// **A hardware insert bay's live picture**, the engine's half and the
+/// desk's: the outputs the desk's hardware routes play tracks on, which the
+/// face warns a send would land on top of.
+#[cfg(feature = "recorder")]
+fn hw_live(
+    app: &TangentApp,
+    engine: &crate::instrument::Engine,
+    rack: crate::instrument::RackAddr,
+    slot: usize,
+) -> Option<tangent_ui::faces_hwinsert::HwLive> {
+    let mut live = engine.hw_insert_live_at(rack, slot)?;
+    live.routed = app
+        .routes()
+        .0
+        .iter()
+        .filter_map(|r| match r.target {
+            tangent_ui::routing::Target::Hardware { first, stereo } => {
+                u16::try_from(first).ok().map(|f| (f, stereo))
+            }
+            tangent_ui::routing::Target::Node(_) => None,
+        })
+        .collect();
+    Some(live)
 }
 
 /// **The EQ's picture, drawn by the audio path's own math on the UI's own
@@ -5599,6 +5633,9 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_mut() {
             e.adopt_learned_thresholds();
         }
+        // The hardware inserts: a finished ping into the bay's state, and the
+        // live picture (link, latency, ping) onto any face that shows one.
+        self.tick_hw_inserts();
         // **The INSERT tap, drained dry once a frame — but only while a face
         // has it armed.** Disarmed, the engine pushes nothing and this skips
         // even the empty pop-loop, so an idle session pays nothing at all.
@@ -7673,6 +7710,7 @@ impl DesktopApp {
                     // that happened this session is on it for certain.
                     self.push_ir_rows();
                 }
+                R::HwInsert { bay, ask } => self.hw_insert_ask(bay, ask),
                 R::SetInsertIr { bay, path } => {
                     // **Decoded, never tested against.** Four of the five
                     // things this ask can be are sentinels riding the path
@@ -8214,6 +8252,129 @@ impl DesktopApp {
     fn push_ir_rows(&mut self) {
         let rows = scan_ir_rows(&self.app.irs_root());
         self.app.set_ir_rows(rows);
+    }
+
+    /// **A Tangent Insert face's ask**: a jack for one side of the loop, or
+    /// a ping.
+    ///
+    /// A route is checked against the device the engine is playing on (a
+    /// send on the master's own jacks, or past the outputs it has, is
+    /// refused with a sentence), then written the way an IR is bound: the
+    /// engine's ledger, the bay's sidecar, and a reload so the unit is built
+    /// on the new jacks. **A new jack is a new loop**, possibly through a
+    /// different box, so the measured latency goes with it and the face
+    /// reads "unmeasured" until the next ping.
+    #[cfg(feature = "recorder")]
+    fn hw_insert_ask(&mut self, sb: tangent_ui::desk_id::SeatBay, ask: tangent_ui::faces_hwinsert::HwAsk) {
+        use crate::units::hwinsert::{parse_lines, state_lines, takes_main_outs, Jacks};
+        use tangent_ui::faces_hwinsert::HwAsk;
+        let Some(at) = self.bridge.engine_bay(sb) else {
+            return;
+        };
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return;
+        };
+        match ask {
+            HwAsk::Ping => {
+                if !e.ping_hw_insert_at(at.0, at.1) {
+                    self.app.notify(
+                        Kind::Error,
+                        "That Tangent Insert has no hardware port to ping through.",
+                    );
+                }
+            }
+            HwAsk::Route { send, jacks } => {
+                let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
+                    return;
+                };
+                if spec.path != crate::builtin_fx::HWINSERT_PATH {
+                    return;
+                }
+                let jacks = jacks.map(|(first, stereo)| Jacks { first, stereo });
+                let outs = usize::from(e.output().channels);
+                if let (true, Some(j)) = (send, jacks) {
+                    let refusal = if takes_main_outs(j, outs) {
+                        Some(format!(
+                            "Out {} carries the main mix, so a Tangent Insert cannot send there.",
+                            j.label()
+                        ))
+                    } else if !j.fits(outs) {
+                        Some(format!("This device has no output {}.", j.label()))
+                    } else {
+                        None
+                    };
+                    if let Some(why) = refusal {
+                        self.app.notify(Kind::Error, why);
+                        return;
+                    }
+                }
+                let (mut s, mut r, _) = parse_lines(e.builtin_extra_at(at.0, at.1));
+                if send {
+                    s = jacks;
+                } else {
+                    r = jacks;
+                }
+                let extra = state_lines(s, r, None);
+                let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
+                self.write_bay_state(sb, crate::builtin_fx::HWINSERT_PATH, &blob);
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_builtin_extra_at(at.0, at.1, extra);
+                }
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    push_builtin_faces(&mut self.app, e, (sb.seat, at.0));
+                }
+                self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
+            }
+        }
+    }
+
+    /// **The hardware inserts' frame work.** A ping that finished goes into
+    /// the bay's ledger and its sidecar, so the project saves compensated;
+    /// and every hardware insert bay whose live picture moved (the link, the
+    /// latency, a ping starting or ending) gets its face pushed again. One
+    /// relaxed walk over sixteen flags when the desk has none.
+    #[cfg(feature = "recorder")]
+    fn tick_hw_inserts(&mut self) {
+        if !self.recorder.engine.as_ref().is_some_and(crate::instrument::Engine::has_hw_inserts) {
+            return;
+        }
+        let bays: Vec<tangent_ui::desk_id::SeatBay> = self
+            .app
+            .plugins()
+            .iter()
+            .filter(|(_, p)| p.as_str() == crate::builtin_fx::HWINSERT_PATH)
+            .map(|(sb, _)| *sb)
+            .collect();
+        for sb in bays {
+            let Some(at) = self.bridge.engine_bay(sb) else {
+                continue;
+            };
+            let adopted = self
+                .recorder
+                .engine
+                .as_mut()
+                .and_then(|e| e.adopt_hw_ping_at(at.0, at.1));
+            let Some(e) = self.recorder.engine.as_ref() else {
+                return;
+            };
+            if let Some(extra) = &adopted {
+                if let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) {
+                    let blob = crate::builtin_fx::state_text(spec, values, extra).into_bytes();
+                    self.write_bay_state(sb, spec.path, &blob);
+                }
+            }
+            let Some(live) = hw_live(&self.app, e, at.0, at.1) else {
+                continue;
+            };
+            let lines = live.to_lines();
+            let shown = self
+                .app
+                .bay_face(sb)
+                .is_some_and(|f| lines.iter().all(|l| f.extra.contains(l)));
+            if adopted.is_some() || !shown {
+                push_builtin_faces(&mut self.app, e, (sb.seat, at.0));
+            }
+        }
     }
 
     /// Point one IR bay at an impulse file.

@@ -2595,6 +2595,10 @@ impl LaneStore {
 
 #[derive(Debug)]
 struct Shared {
+    /// **The hardware loops** (`Tangent Insert`): the ports the bays claim,
+    /// the two device counters they align by, and the device facts the face
+    /// prints. See `units::hwinsert`.
+    hw: crate::units::hwinsert::HwHub,
     /// **Every lane's own numbers**, by slot: the fader, the pan, the send,
     /// the meters, the kit, the punch, each rack's latency and keys. What
     /// were `[_; CHANNELS]` columns here. See [`LaneStore`].
@@ -3678,6 +3682,7 @@ fn probe_on() -> bool {
 impl Shared {
     fn new() -> Self {
         Self {
+            hw: crate::units::hwinsert::HwHub::new(),
             lanes: LaneStore::new(),
             plan_refused: AtomicU32::new(0),
             #[cfg(test)]
@@ -6486,6 +6491,14 @@ fn pinned_lanes(
         for ch in set.iter() {
             pinned.insert(ch);
         }
+    }
+    // **A lane holding a hardware loop is pinned**: its rack sends and
+    // reads in device time, so a span rendered ahead would send early and
+    // read a return that has not arrived.
+    let mut hw = [0u32; crate::units::hwinsert::HW_PORTS];
+    let held = shared.hw.held_lanes(&mut hw);
+    for &ch in &hw[..held] {
+        pinned.insert(ch as usize);
     }
     // The tap names one seat; the lane that owns it is pinned.
     if let Some(ch) = unpack_tap(shared.insert_tap_route.load(Ordering::Relaxed))
@@ -10338,6 +10351,39 @@ fn ir_ring_col(picks: &tangent_record::audio::Picks, want: usize, ch_in: usize) 
     want.min(ch_in.saturating_sub(1))
 }
 
+/// **Which column of the monitor ring carries device input `want`**, or
+/// `None` when the stream does not have it.
+///
+/// The ring carries WHOLE DEVICE FRAMES whatever is picked (see
+/// `tangent_record::audio::capture_channel_monitored`), so a device input's
+/// column is its own number and the picks, which say which inputs the desk
+/// binds, do not enter into it. A channel past the stream's width is `None`
+/// rather than a clamp: a hardware insert must say it is disconnected, not
+/// read a neighbour's microphone.
+fn hw_ring_col(want: usize, ch_in: usize) -> Option<usize> {
+    (want < ch_in).then_some(want)
+}
+
+/// How many channels an offline engine renders: two, and wider only in a
+/// test that needs outputs past the main pair (a hardware insert's jacks).
+fn offline_width() -> u16 {
+    #[cfg(test)]
+    {
+        OFFLINE_WIDTH.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        2
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`offline_width`]. Per thread, so a test that widens it widens
+    /// only its own engines.
+    pub(crate) static OFFLINE_WIDTH: Cell<u16> = const { Cell::new(2) };
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The renderer: everything that runs on the audio thread
 // ───────────────────────────────────────────────────────────────────────────
@@ -10883,6 +10929,13 @@ struct Renderer {
     /// The picks the stream itself honours, in its own order: what the IR
     /// wizard turns a device input into a ring column through.
     monitor_columns: tangent_record::audio::Picks,
+    /// Which input stream the monitor ring is: bumped each time a new ring
+    /// arrives, so the hardware loops re-base their counters on it.
+    hw_input_gen: u64,
+    /// The lanes holding a hardware loop this chunk, `hw_lane_n` of them:
+    /// pinned to device time (never rendered ahead, rested or parked).
+    hw_lanes: [u32; crate::units::hwinsert::HW_PORTS],
+    hw_lane_n: usize,
     /// **Each pick's `[gain, room]`**, slewed. The gain is so switching
     /// monitoring on is a fade rather than a bang; the room is **whether the
     /// ROOM may hear the pick**, multiplied into the room's share of it,
@@ -12135,6 +12188,9 @@ impl Renderer {
             // reads one.** `collect_notes` is the first reader. See
             // `DeskLanes`.
             self.read_desk();
+            // **The hardware loops' view of the device**, before any rack
+            // runs: the links the bays read, and the lanes that hold one.
+            self.hw_begin_chunk();
 
             // Each chunk gets its own window in the host timeline, so an event
             // stamped inside the second half of a 1024-frame callback lands in
@@ -13076,6 +13132,14 @@ impl Renderer {
                     }
                 }
             }
+            // **The hardware inserts' sends, onto their jacks**: after the
+            // meters, ADDED, the hardware-route idiom, and only after every
+            // rack of the chunk has run, so a bay's send leaves in the chunk
+            // it was rendered for. The output counter the loops align by
+            // moves past the chunk here, and only here.
+            if let Some(seg) = out.get_mut(done * dev_ch..(done + n) * dev_ch) {
+                self.shared.hw.fold(seg, dev_ch, n);
+            }
             done += n;
         }
 
@@ -13341,6 +13405,32 @@ impl Renderer {
     /// the time this runs, so deriving a position here would give the room
     /// the next block of the take against the current block of the live
     /// input, a whole buffer of lead on the one path a player is listening to.
+    /// **The hardware loops' first word each chunk** (`units::hwinsert`):
+    /// the device as the renderer has it, every claimed port's link, and
+    /// the lanes that hold one. Sixteen flags and a few atomics when nothing
+    /// is claimed.
+    fn hw_begin_chunk(&mut self) {
+        let dev = crate::units::hwinsert::DeviceView {
+            out_channels: self.dev_channels,
+            input: self
+                .monitor
+                .is_some()
+                .then(|| (self.hw_input_gen, self.monitor_channels.max(1))),
+            out_block: self.shared.out_block_seen.load(Ordering::Relaxed),
+            in_block: u32::try_from(self.monitor_block).unwrap_or(u32::MAX),
+            rate: self.rate as u32,
+            varispeed: self.varispeed_ratio().is_some(),
+        };
+        let ch_in = self.monitor_channels.max(1);
+        self.shared.hw.begin_chunk(dev, |want| hw_ring_col(want, ch_in));
+        self.hw_lane_n = self.shared.hw.held_lanes(&mut self.hw_lanes);
+    }
+
+    /// Whether lane `ch` holds a hardware loop this chunk.
+    fn hw_holds(&self, ch: usize) -> bool {
+        self.hw_lane_n > 0 && self.hw_lanes[..self.hw_lane_n].contains(&(ch as u32))
+    }
+
     fn mix_monitor(&mut self, frames: usize, at: u64, rolling: bool) {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
@@ -13398,6 +13488,7 @@ impl Renderer {
                 }
             } else {
                 std::mem::swap(&mut self.monitor, &mut plan.ring);
+                self.hw_input_gen = self.hw_input_gen.wrapping_add(1);
                 // The ring's own scratch, sized for its device, when it
                 // brought one (see `MonitorPlan::scratch`).
                 if !plan.scratch.is_empty() {
@@ -13482,6 +13573,11 @@ impl Renderer {
             let stale = ((backlog - in_flight) / ch_in) * ch_in;
             if stale > 0 {
                 if let Ok(chunk) = ring.read_chunk(stale) {
+                    // **The hardware loops still count them**: a frame the
+                    // monitor throws away is a frame the device delivered,
+                    // and the loops align by the device's count.
+                    let (a, b) = chunk.as_slices();
+                    self.shared.hw.feed(a, b, ch_in);
                     chunk.commit_all();
                 }
                 self.shared
@@ -13530,6 +13626,9 @@ impl Renderer {
                 Err(_) => 0,
             }
         };
+        // **The hardware inserts' returns**, raw device frames like the IR
+        // tap below, before any fader or pick binding touches them.
+        self.shared.hw.feed(&self.monitor_scratch[..got], &[], ch_in);
         // **The IR wizard's capture tap — RAW device frames, right here.**
         //
         // Before the varispeed stretch, before pick-to-strip binding, before
@@ -16690,6 +16789,7 @@ impl Renderer {
             || d.keys.contains(ch)
             || d.frozen.contains(ch)
             || self.rest_tap == Some(ch)
+            || self.hw_holds(ch)
             || (self.keys_live
                 && [lane_seat(ch, CHAIN_OWN), lane_seat(ch, CHAIN_EXTRA)].iter().any(|seat| {
                     (0..INSERTS).any(|b| {
@@ -17786,7 +17886,11 @@ impl Renderer {
                     // project keep the new value while the instance keeps the
                     // old. See `param_lanes`.
                     || self.spine.ext.param_lanes.contains(ch)
-                    || self.spine.ext.desk.armed.contains(ch);
+                    || self.spine.ext.desk.armed.contains(ch)
+                    // **A hardware loop never parks**: its box's tail is
+                    // still coming back, and a ping has to be answered on a
+                    // stopped desk.
+                    || self.hw_holds(ch);
                 let rate = self.rate;
                 let parked = park_lane(
                     Some(&mut lane.quiet),
@@ -22632,7 +22736,7 @@ impl Engine {
         // out holding the last frame over and over. The exporter hands over a
         // kilo-frame at a time so this never bites today; it is here because
         // the day it changes, the symptom is a stutter in a finished file.
-        let ch = 2usize;
+        let ch = r.dev_channels.max(1);
         let mut done = 0usize;
         while done + ch <= out.len() {
             let cap = r.max_callback_frames();
@@ -22684,7 +22788,7 @@ impl Engine {
                 })?;
             Some((device, name, supported, host_rule))
         };
-        let channels = dev.as_ref().map_or(2, |(_, _, c, _)| c.channels());
+        let channels = dev.as_ref().map_or_else(offline_width, |(_, _, c, _)| c.channels());
         // **What the device was FOUND at, read before the narrowing below
         // replaces it with what was asked for.** This is
         // `default_output_config`'s rate — the same property
@@ -22783,6 +22887,10 @@ impl Engine {
 
         let shared = Arc::new(Shared::new());
         shared.rate.store(rate as u32, Ordering::Relaxed);
+        // **Only a device can carry a hardware loop.** An offline engine's
+        // Tangent Inserts pass dry and say why; the export and the freeze
+        // refuse before they get here (`engine_bridge::hw_refusal_for`).
+        shared.hw.set_live(!offline);
         // What was actually asked of the host, recorded once, **taken from the
         // plan rather than re-derived from it** — see `Shared::out_ring_asked`.
         //
@@ -23109,6 +23217,9 @@ impl Engine {
             monitor_channels: 0,
             monitor_picks: Box::new([]),
             monitor_columns: tangent_record::audio::Picks::EVERYTHING,
+            hw_input_gen: 0,
+            hw_lanes: [0; crate::units::hwinsert::HW_PORTS],
+            hw_lane_n: 0,
             monitor_fades: Box::new([]),
             monitor_block: 0,
             monitor_scratch: vec![0.0; widest * MONITOR_SCRATCH_FRAMES],
@@ -23746,7 +23857,7 @@ impl Engine {
             None => self.prepare_vst3(bundle, state)?,
         };
         let Prepared {
-            backend,
+            mut backend,
             voice,
             channels,
             loaded,
@@ -23767,6 +23878,14 @@ impl Engine {
         // and dropping it terminates the controller the old handle points
         // at. A new tenant's ports are not the old one's, so the whole record
         // goes rather than just the identity.
+        // **A hardware insert takes its port here**, on this thread, where
+        // the port's rings may be sized: the bay's identity, and the lane
+        // that must then render in device time. `None` (every port taken)
+        // seats it disconnected, and its face says so.
+        if let Backend::Builtin(crate::builtin_fx::BuiltinUnit::HwInsert(u)) = &mut backend {
+            let key = u32::try_from(seat * INSERTS + bay).unwrap_or(u32::MAX);
+            u.attach(self.shared.hw.claim(key, lane_of_seat(seat)));
+        }
         self.close_seat_editor(seat, bay);
         if let Some(b) = self.host_bay_mut(seat, bay) {
             b.editor_handle = None;
@@ -24877,6 +24996,109 @@ impl Engine {
 
     pub fn output(&self) -> &OutputInfo {
         &self.output
+    }
+
+    // ── the hardware loops (`Tangent Insert`) ───────────────────────────────
+
+    /// Whether any bay on this engine holds a hardware loop's port: the
+    /// host's early out for its frame work.
+    pub fn has_hw_inserts(&self) -> bool {
+        self.shared.hw.claimed_ports().next().is_some()
+    }
+
+    /// The port a hardware insert bay answers through, by rack identity.
+    fn hw_port_at(&self, addr: RackAddr, bay: usize) -> Option<&crate::units::hwinsert::HwPort> {
+        let seat = addr.seat()?;
+        self.shared.hw.port_for(u32::try_from(seat * INSERTS + bay).ok()?)
+    }
+
+    /// **What a Tangent Insert bay's face shows this frame**: the link, the
+    /// latency it reports and whether a ping measured it, a ping under way
+    /// or the last one's answer, the device's widths, and every OTHER loop's
+    /// jacks (the face warns about a shared jack). `None` for a bay that is
+    /// not a seated hardware insert.
+    pub fn hw_insert_live_at(&self, addr: RackAddr, bay: usize) -> Option<tangent_ui::faces_hwinsert::HwLive> {
+        use crate::units::hwinsert::{Link, PingFail};
+        let (spec, _) = self.builtin_insert_at(addr, bay)?;
+        if spec.path != crate::builtin_fx::HWINSERT_PATH {
+            return None;
+        }
+        let clocks = self.shared.hw.clocks();
+        let port = self.hw_port_at(addr, bay);
+        let (latency, loop_frames, measured, link, pinging, slips, answer) = match port {
+            Some(p) => {
+                let (loop_frames, measured) = p.loop_frames();
+                let (seq, result) = p.ping_answer();
+                let answer = (seq > 0).then(|| match PingFail::from_code(result) {
+                    Some(why) => Err(why.sentence().to_owned()),
+                    None => Ok(u32::try_from(result).unwrap_or(0)),
+                });
+                (p.latency(), loop_frames, measured, p.link(), p.pinging(), p.slips(), answer)
+            }
+            None => (0, 0, false, Link::NoPort, false, 0, None),
+        };
+        let mine = port.map(|p| p as *const _);
+        let others = self
+            .shared
+            .hw
+            .claimed_ports()
+            .filter(|p| Some(*p as *const _) != mine && p.key() != u32::MAX)
+            .map(|p| {
+                let (s, r) = p.routes();
+                (s.map(|j| (j.first, j.stereo)), r.map(|j| (j.first, j.stereo)))
+            })
+            .collect();
+        Some(tangent_ui::faces_hwinsert::HwLive {
+            connected: link.connected(),
+            status: link.sentence().to_owned(),
+            latency,
+            loop_frames,
+            measured,
+            pinging,
+            slips,
+            answer,
+            // The renderer's word once a chunk has run, the open's before.
+            rate: match clocks.rate.load(Ordering::Relaxed) {
+                0 => self.output.sample_rate,
+                r => r,
+            },
+            out_channels: match clocks.out_channels.load(Ordering::Relaxed) {
+                0 => u32::from(self.output.channels),
+                n => n,
+            },
+            in_channels: clocks.in_channels.load(Ordering::Relaxed),
+            others,
+            routed: Vec::new(),
+        })
+    }
+
+    /// **Ask a Tangent Insert bay to ping its loop.** The answer lands on
+    /// the bay's face and, when it is a number, in its state
+    /// ([`Engine::adopt_hw_ping_at`]). False for a bay with no port.
+    pub fn ping_hw_insert_at(&self, addr: RackAddr, bay: usize) -> bool {
+        match self.hw_port_at(addr, bay) {
+            Some(p) => {
+                p.ask_ping();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **A finished ping, into the bay's durable ledger**: the measured
+    /// loop and the rate and buffers it was measured at, so a saved project
+    /// opens compensated. Answers the new extra lines when there was a new
+    /// answer to adopt, for the caller to write to the bay's sidecar.
+    pub fn adopt_hw_ping_at(&mut self, addr: RackAddr, bay: usize) -> Option<Vec<(String, String)>> {
+        let seat = addr.seat()?;
+        let m = self.hw_port_at(addr, bay)?.take_measurement()?;
+        let b = self.host_bay_mut(seat, bay)?.builtin.as_mut()?;
+        if b.spec.path != crate::builtin_fx::HWINSERT_PATH {
+            return None;
+        }
+        let (send, ret, _) = crate::units::hwinsert::parse_lines(&b.extra);
+        b.extra = crate::units::hwinsert::state_lines(send, ret, Some(m));
+        Some(b.extra.clone())
     }
 
     // ── MIDI in ─────────────────────────────────────────────────────────────
@@ -29879,6 +30101,9 @@ mod tests {
             monitor_channels: 0,
             monitor_picks: Box::new([]),
             monitor_columns: tangent_record::audio::Picks::EVERYTHING,
+            hw_input_gen: 0,
+            hw_lanes: [0; crate::units::hwinsert::HW_PORTS],
+            hw_lane_n: 0,
             monitor_fades: Box::new([]),
             monitor_block: 0,
             monitor_scratch: Vec::new(),
@@ -33052,10 +33277,10 @@ mod tests {
     fn every_suite_unit_loads_into_a_bay_and_answers_its_lanes() {
         use crate::builtin_fx::{
             AMP_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH,
-            IMAGER_PATH, IR_PATH, PLATE_PATH, TAPE_PATH, TREM_PATH, WAH_PATH,
+            HWINSERT_PATH, IMAGER_PATH, IR_PATH, PLATE_PATH, TAPE_PATH, TREM_PATH, WAH_PATH,
         };
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let cases: [(&str, &str, usize); 13] = [
+        let cases: [(&str, &str, usize); 14] = [
             // Five bands of five knobs. Was 15 when the face showed three;
             // the two extra bands were APPENDED at ids 15..25, so this number
             // going UP is the whole change and this number going DOWN would
@@ -33073,6 +33298,9 @@ mod tests {
             (PLATE_PATH, "Tangent Plate", 4),
             (WAH_PATH, "Tangent Wah", 4),
             (IR_PATH, "Tangent IR", 2),
+            // Two trims, the mix and the polarity; the jacks are state, not
+            // lanes.
+            (HWINSERT_PATH, "Tangent Insert", 4),
         ];
         for (i, (path, class, lanes)) in cases.iter().enumerate() {
             // One per seat, bay 0 — four different racks holding the whole
@@ -47540,5 +47768,333 @@ mod rolling_from_a_standstill {
             }
             assert!(peak(&heard, 0, 6_000) > 0.01, "{voice:?}: the export's first note is silent");
         }
+    }
+}
+
+// ── the hardware insert's road, through the engine's own device buffers ─────
+#[cfg(test)]
+mod hw_insert_road {
+    use super::*;
+    use crate::units::hwinsert::{state_lines, Jacks};
+
+    const BLOCK: usize = 256;
+    const WIDE: usize = 6;
+
+    /// **A fake interface six channels wide, both ways, one clock**: an
+    /// offline engine six outputs wide whose monitor ring is fed, after each
+    /// block, the block it just rendered, with outputs 3/4 patched to
+    /// inputs 5/6 through `cable` frames of delay. The engine renders its
+    /// device buffer exactly as the callback does (`render_offline` is the
+    /// callback's render), so this is the send landing in the output buffer
+    /// and the return read out of the input ring, with nothing faked but the
+    /// cable.
+    struct Rig {
+        e: Engine,
+        tx: Producer<f32>,
+        cable: std::collections::VecDeque<[f32; 2]>,
+        out: Vec<f32>,
+        /// Every rendered device frame, all six channels.
+        tape: Vec<f32>,
+    }
+
+    impl Rig {
+        fn new(cable: usize, insert_seat: usize, send: Jacks, ret: Jacks, mix: f32) -> Self {
+            let mut e = OFFLINE_WIDTH.with(|w| {
+                w.set(WIDE as u16);
+                let e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+                w.set(2);
+                e
+            });
+            // The offline engine says it has no device; this one has a fake.
+            e.shared.hw.set_live(true);
+            let (tx, rx) = RingBuffer::<f32>::new(48_000 * WIDE);
+            e.set_monitor(Some((
+                rx,
+                WIDE as u16,
+                vec![WIDE as u8].into_boxed_slice(),
+                BLOCK as u32,
+                tangent_record::audio::Picks::EVERYTHING,
+            )));
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::HWINSERT_PATH).expect("registered");
+            let mut values = spec.defaults();
+            values[2] = mix;
+            let state =
+                crate::builtin_fx::state_text(spec, &values, &state_lines(Some(send), Some(ret), None)).into_bytes();
+            e.load_insert(insert_seat, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&state))
+                .expect("the insert loads")
+                .expect("the bay reports it");
+            Self {
+                e,
+                tx,
+                cable: std::iter::repeat_n([0.0; 2], cable).collect(),
+                out: vec![0.0; BLOCK * WIDE],
+                tape: Vec::new(),
+            }
+        }
+
+        fn block(&mut self) {
+            self.out.fill(0.0);
+            self.e.render_offline(&mut self.out);
+            self.tape.extend_from_slice(&self.out);
+            for f in 0..BLOCK {
+                self.cable.push_back([self.out[f * WIDE + 2], self.out[f * WIDE + 3]]);
+                let [l, r] = self.cable.pop_front().unwrap_or_default();
+                for c in 0..WIDE {
+                    let v = match c {
+                        4 => l,
+                        5 => r,
+                        _ => 0.0,
+                    };
+                    let _ = self.tx.push(v);
+                }
+            }
+        }
+
+        fn addr(seat: usize) -> RackAddr {
+            seat_addr(seat).expect("a rack")
+        }
+
+        fn live(&self, seat: usize) -> tangent_ui::faces_hwinsert::HwLive {
+            self.e.hw_insert_live_at(Self::addr(seat), 0).expect("a hardware insert")
+        }
+
+        fn ping(&mut self, seat: usize) -> tangent_ui::faces_hwinsert::HwLive {
+            assert!(self.e.ping_hw_insert_at(Self::addr(seat), 0), "no port to ping through");
+            let mut n = 0;
+            while {
+                self.block();
+                n += 1;
+                assert!(n < 1_000, "the ping never finished");
+                self.live(seat).pinging
+            } {}
+            self.live(seat)
+        }
+    }
+
+    /// **A ping through the engine finds the cable**, the click leaves on
+    /// the send's jacks and nowhere else, and the figure the bay reports is
+    /// the one the compensation graph is handed. On the master, whose rack
+    /// runs after the input is read, the loop IS the cable: the engine's
+    /// own buffering is the chunk and input block the latency adds on top.
+    #[test]
+    fn a_ping_through_the_engine_finds_the_cable_and_reaches_compensation() {
+        for cable in [0usize, 37, 700] {
+            let mut rig = Rig::new(cable, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+            for _ in 0..8 {
+                rig.block();
+            }
+            let live = rig.live(MASTER_SEAT);
+            assert!(live.connected, "the loop is not up: {}", live.status);
+            assert!(!live.measured);
+            // Unpinged: the round-trip law, input plus twice the output.
+            assert_eq!(live.latency, (BLOCK + 2 * BLOCK) as u32);
+            assert_eq!((live.out_channels, live.in_channels), (WIDE as u32, WIDE as u32));
+            let start = rig.tape.len();
+            let live = rig.ping(MASTER_SEAT);
+            assert_eq!(live.answer, Some(Ok(cable as u32)), "cable {cable}: {:?}", live.answer);
+            assert!(live.measured);
+            assert_eq!(live.latency, (cable + BLOCK + BLOCK) as u32);
+            // The click left on outputs 3/4, once, and never on the mix.
+            let tape = &rig.tape[start..];
+            let clicks: Vec<usize> = (0..tape.len() / WIDE)
+                .filter(|f| tape[f * WIDE + 2] > 0.4)
+                .collect();
+            assert_eq!(clicks.len(), 1, "the click went out {} times", clicks.len());
+            let f = clicks[0];
+            assert!((tape[f * WIDE + 3] - tape[f * WIDE + 2]).abs() < 1e-6, "a stereo send carries it on both");
+            for c in [0, 1, 4, 5] {
+                assert!(tape.iter().skip(c).step_by(WIDE).all(|v| v.abs() < 1e-6), "output {c} heard the ping");
+            }
+            // The bay's figure reached the compensation graph's cell.
+            rig.block();
+            let cell = rig
+                .e
+                .shared
+                .seat_cell(SeatKind::Latency, MASTER_SEAT * INSERTS)
+                .expect("the master's cell")
+                .load(Ordering::Relaxed);
+            assert_eq!(cell, live.latency, "the compensation graph was told {cell}");
+        }
+    }
+
+    /// **The programme goes round the loop and comes back exactly as late
+    /// as the bay says**: a drum hit through the master, with the insert in
+    /// circuit, lands on the main outs `latency` frames after the same hit
+    /// with no insert at all, at the same level (a wire for a cable, unity
+    /// trims, fully wet).
+    #[test]
+    fn the_programme_comes_back_on_the_main_outs_at_the_reported_latency() {
+        let onset = |tape: &[f32]| (0..tape.len() / WIDE).find(|f| tape[f * WIDE].abs() > 1e-3);
+        let hit = |rig: &mut Rig| -> Vec<f32> {
+            rig.e.set_pad_kit(5, {
+                let mut kit = PadKit::default();
+                let clip = Arc::new(tangent_record::decode::Clip {
+                    samples: vec![0.05; 4_800 * 2],
+                    rate: 48_000,
+                    source: PathBuf::new(),
+                });
+                kit.pads[0] = Some(clip);
+                kit
+            });
+            rig.e.set_channel_gain(5, 1.0);
+            rig.e.set_drum_strips(1 << 5);
+            for _ in 0..8 {
+                rig.block();
+            }
+            rig.e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: 5,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            rig.e.set_transport(1, 0);
+            rig.e.set_rolling(true);
+            let from = rig.tape.len();
+            for _ in 0..16 {
+                rig.block();
+            }
+            rig.tape[from..].to_vec()
+        };
+        // The dry reference: the same desk, the bay holding a trim at rest.
+        let mut dry = Rig::new(50, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        dry.e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None).unwrap();
+        let reference = hit(&mut dry);
+        let at_dry = onset(&reference).expect("the fixture made a sound");
+
+        let mut wet = Rig::new(50, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..4 {
+            wet.block();
+        }
+        let latency = wet.ping(MASTER_SEAT).latency as usize;
+        let through = hit(&mut wet);
+        let at_wet = onset(&through).expect("nothing came back round the loop");
+        assert_eq!(at_wet - at_dry, latency, "the loop landed {} frames late against a reported {latency}", at_wet - at_dry);
+        let (a, b) = (reference[at_dry * WIDE + 1000 * WIDE], through[at_wet * WIDE + 1000 * WIDE]);
+        assert!((a - b).abs() < 1e-4, "the loop changed the level: {a} dry, {b} through");
+        // And the send carried the programme out on 3/4.
+        assert!(through.iter().skip(2).step_by(WIDE).any(|v| v.abs() > 1e-3));
+    }
+
+    /// **The engine with a loop running allocates nothing on the
+    /// callback**: the hub's three calls, the bay's block and a whole ping,
+    /// through the real render, on top of the steady desk's zero.
+    #[test]
+    fn a_running_loop_and_its_ping_allocate_nothing_on_the_callback() {
+        let mut rig = Rig::new(64, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 0.5);
+        for _ in 0..16 {
+            rig.block();
+        }
+        let mut out = vec![0.0f32; BLOCK * WIDE];
+        let mut quiet = |rig: &mut Rig| {
+            out.fill(0.0);
+            rig.e.render_offline(&mut out);
+            for f in 0..BLOCK {
+                rig.cable.push_back([out[f * WIDE + 2], out[f * WIDE + 3]]);
+                let [l, r] = rig.cable.pop_front().unwrap_or_default();
+                for c in 0..WIDE {
+                    let _ = rig.tx.push(if c == 4 { l } else if c == 5 { r } else { 0.0 });
+                }
+            }
+        };
+        assert!(rig.e.ping_hw_insert_at(Rig::addr(MASTER_SEAT), 0));
+        let ((), counted) = crate::rt_alloc::least_of(3, || {
+            // 240 blocks of 256 is past the ping's settle and its whole
+            // second of listening, so its detector runs inside the window.
+            for _ in 0..240 {
+                quiet(&mut rig);
+            }
+        });
+        assert_eq!(counted.total(), 0, "the loop allocated on the callback: {counted:?}");
+        // The ping ran its whole course inside the window, and answered.
+        assert!(!rig.live(MASTER_SEAT).pinging, "the window ended before the ping did");
+        assert_eq!(rig.live(MASTER_SEAT).answer, Some(Ok(64)));
+    }
+
+    /// **A lane holding a loop renders in device time**: it is pinned out of
+    /// the look-ahead, which would send a span early and read a return that
+    /// has not arrived, and the pin goes with the port.
+    #[test]
+    fn a_lane_holding_a_loop_is_never_rendered_ahead() {
+        let shared = Shared::new();
+        let folders = vec![false; LEGACY_LANES];
+        let punch = vec![u64::MAX; LEGACY_LANES];
+        let mut out = LaneSet::with_capacity(LEGACY_LANES);
+        let pinned = |shared: &Shared, out: &mut LaneSet| {
+            pinned_lanes(
+                shared,
+                &DeskLanes::read(shared),
+                &folders,
+                &punch,
+                &LaneSet::with_capacity(LEGACY_LANES),
+                &[],
+                false,
+                out,
+            );
+            out.contains(5)
+        };
+        shared.armed.store(0, Ordering::Relaxed);
+        shared.midi_off.store(u64::MAX, Ordering::Relaxed);
+        assert!(!pinned(&shared, &mut out));
+        let claim = shared.hw.claim(77, Some(5)).expect("a port");
+        assert!(pinned(&shared, &mut out), "a lane with a hardware loop was offered to the look-ahead");
+        drop(claim);
+        assert!(!pinned(&shared, &mut out));
+    }
+
+    /// **Without a device the bay says so and passes dry**: an offline
+    /// engine (the mirror an export or a freeze would build) gives every
+    /// Tangent Insert the Offline link, and the bay's audio is the dry
+    /// signal, in time.
+    #[test]
+    fn an_offline_engine_runs_no_loop() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::HWINSERT_PATH).expect("registered");
+        let state = crate::builtin_fx::state_text(
+            spec,
+            &spec.defaults(),
+            &state_lines(Some(Jacks::pair(2)), Some(Jacks::pair(2)), None),
+        )
+        .into_bytes();
+        e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&state))
+            .unwrap()
+            .unwrap();
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        let live = e.hw_insert_live_at(seat_addr(MASTER_SEAT).unwrap(), 0).unwrap();
+        assert!(!live.connected);
+        assert_eq!(live.status, crate::units::hwinsert::Link::Offline.sentence());
+    }
+
+    /// **A finished ping is adopted into the bay's state**, so the project
+    /// saves compensated and a reloaded bay opens measured.
+    #[test]
+    fn a_ping_lands_in_the_saved_state_and_a_reload_opens_measured() {
+        let mut rig = Rig::new(90, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+        for _ in 0..4 {
+            rig.block();
+        }
+        let live = rig.ping(MASTER_SEAT);
+        let addr = Rig::addr(MASTER_SEAT);
+        let extra = rig.e.adopt_hw_ping_at(addr, 0).expect("a fresh answer to adopt");
+        assert!(rig.e.adopt_hw_ping_at(addr, 0).is_none(), "the same answer was adopted twice");
+        let (s, r, m) = crate::units::hwinsert::parse_lines(&extra);
+        assert_eq!((s, r), (Some(Jacks::pair(2)), Some(Jacks::pair(4))));
+        let m = m.expect("the measurement");
+        assert_eq!(m.loop_frames, 90);
+        assert_eq!((m.rate, m.out_block, m.in_block), (48_000, BLOCK as u32, BLOCK as u32));
+        let saved = rig.e.save_insert_state(MASTER_SEAT, 0).expect("a built-in bay answers");
+        // Reloaded from that blob, the bay is measured from its first block.
+        rig.e.load_insert(MASTER_SEAT, 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&saved))
+            .unwrap()
+            .unwrap();
+        for _ in 0..4 {
+            rig.block();
+        }
+        let again = rig.live(MASTER_SEAT);
+        assert!(again.measured && again.connected);
+        assert_eq!(again.latency, live.latency);
     }
 }

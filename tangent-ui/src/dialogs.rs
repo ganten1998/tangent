@@ -2270,6 +2270,12 @@ pub enum DialogAction {
     /// longer overwrites a live one, so the two variants are now "into" and
     /// "below" rather than "destroy" and "refuse".
     TrackPasteBelow(usize),
+    /// **A Tangent Insert face's ask**, for the bay it was opened over.
+    /// Appended at the END, this enum's law.
+    HwInsert {
+        bay: crate::desk_id::SeatBay,
+        ask: crate::faces_hwinsert::HwAsk,
+    },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -5922,6 +5928,14 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
+    // The insert: the glass, two routing rows, four knobs and the ping row
+    // stacked over the footer. Taller than the knob panels by those rows.
+    (
+        crate::faces_hwinsert::HWINSERT_PATH,
+        Vec2::new(0.38, 0.64),
+        Vec2::new(440.0, 480.0),
+        Vec2::new(704.0, 768.0),
+    ),
 ];
 
 /// Every other face: the shape the knob rows were laid out in.
@@ -8009,6 +8023,9 @@ fn show_on(
                                     }
                                     crate::faces::FaceAction::PickSample { path } => {
                                         Some(DialogAction::PickSample { bay, path })
+                                    }
+                                    crate::faces::FaceAction::HwInsert(ask) => {
+                                        Some(DialogAction::HwInsert { bay, ask })
                                     }
                                     // No bay: one default folder
                                     // for the app, shared with the drumpad's
@@ -18043,6 +18060,7 @@ at: None,
                         "Tangent Plate",
                         "Tangent Wah",
                         "Tangent IR (Experimental)",
+                        "Tangent Insert",
                         "analog lab v",
                         "Pianoteq 8",
                         "Vital"
@@ -18059,12 +18077,12 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Nineteen, not one: the house shelf took the first
-                // eighteen rows — the five instruments and the thirteen-unit
-                // suite — and the number is derived from those two lists so
+                // Twenty, not one: the house shelf took the first
+                // nineteen rows, the five instruments and the fourteen-unit
+                // suite, and the number is derived from those two lists so
                 // the next instrument moves it rather than breaking it.
                 let shelf = INSTRUMENT_ROWS.len() + crate::faces::SUITE_UNITS.len();
-                assert_eq!(shelf, 18);
+                assert_eq!(shelf, 19);
                 assert_eq!(*selected, Some(shelf + 1), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
@@ -20910,6 +20928,58 @@ at: None,
     }
 
 
+    /// **The Tangent Insert's face asks for its jacks and its ping**, by the
+    /// words on its buttons, over the bay it was opened on; and it says when
+    /// the loop is down.
+    #[test]
+    fn the_insert_face_asks_for_jacks_and_a_ping() {
+        use crate::faces_hwinsert::{HwAsk, HwLive, HWINSERT_PATH};
+        let face = |connected: bool| {
+            let mut live = crate::faces::FaceLive::default();
+            live.face.path = HWINSERT_PATH.to_owned();
+            live.face.extra = HwLive {
+                connected,
+                status: if connected { "Connected." } else { "Disconnected: choose the outputs to send on." }
+                    .to_owned(),
+                latency: 384,
+                rate: 48_000,
+                out_channels: 8,
+                in_channels: 8,
+                ..Default::default()
+            }
+            .to_lines();
+            if connected {
+                live.face.extra.extend([
+                    ("send_first".to_owned(), "2".to_owned()),
+                    ("send_width".to_owned(), "2".to_owned()),
+                    ("ret_first".to_owned(), "4".to_owned()),
+                    ("ret_width".to_owned(), "1".to_owned()),
+                ]);
+            }
+            Dialog::InsertFace { bay: tb(0, 0), live: Box::new(live) }
+        };
+        let mut slot = Slot::new(face(true));
+        assert!(slot.says("CONNECTED"));
+        assert!(slot.says("Out 3/4") && slot.says("In 5"));
+        let asked = |a: Option<DialogAction>| match a {
+            Some(DialogAction::HwInsert { bay, ask }) => {
+                assert_eq!(bay, tb(0, 0), "the ask named another bay");
+                ask
+            }
+            _ => panic!("the face asked the host for nothing"),
+        };
+        assert_eq!(asked(slot.click("PING")), HwAsk::Ping);
+        assert_eq!(asked(slot.click("OUT >")), HwAsk::Route { send: true, jacks: Some((4, true)) });
+        assert_eq!(asked(slot.click("< OUT")), HwAsk::Route { send: true, jacks: None });
+        assert_eq!(asked(slot.click("SEND STEREO")), HwAsk::Route { send: true, jacks: Some((2, false)) });
+        assert_eq!(asked(slot.click("RETURN MONO")), HwAsk::Route { send: false, jacks: Some((4, true)) });
+        assert_eq!(asked(slot.click("IN >")), HwAsk::Route { send: false, jacks: Some((5, false)) });
+        // Down: it says so, and the ping is not offered.
+        let mut down = Slot::new(face(false));
+        assert!(down.says("DISCONNECTED - PASSING DRY"));
+        assert!(down.click("PING").is_none(), "a ping was asked of a loop that is not up");
+    }
+
     /// One suite unit's face over channel 0's first bay, switched in or out
     /// of circuit — a pedal's own stacked window, as the amp's chip opens
     /// it.
@@ -20956,6 +21026,7 @@ at: None,
         // Every unit the amp's board can be seeded with, plus the two the
         // sweep is really about at either end of the exemption.
         for path in [
+            "@tangent-insert",
             "@tangent-comp",
             "@tangent-wah",
             "@tangent-drive",
