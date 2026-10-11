@@ -941,7 +941,7 @@ fn add_return(
 ) -> [f32; 2] {
     let mut peak = [0.0f32; 2];
     for f in 0..frames {
-        *gain += (target - *gain) * coeff;
+        *gain = glide(*gain, target, coeff);
         let at = f * TAP_CHANNELS;
         for c in 0..TAP_CHANNELS {
             let (Some(v), Some(a)) = (mix.get_mut(at + c), aux.get(at + c)) else {
@@ -2619,10 +2619,11 @@ struct Shared {
     /// whole, and the previous plan keeps playing; the host shows the stall
     /// line, and every test asserts it stays zero.
     plan_refused: AtomicU32,
-    /// **The next chunk lands every slewed gain on its target**
-    /// (`Engine::land_gains`): raised by an export, a freeze or a realtime
-    /// pass at its start, taken by the first chunk of the next callback.
-    land_gains: AtomicBool,
+    /// **The transport generation whose first rolling chunk lands every
+    /// slewed gain on its target** (`Engine::land_gains_at`), zero for none:
+    /// raised by an export, a freeze or a realtime pass at its start, and
+    /// cleared by the chunk that lands.
+    land_at: AtomicU64,
     /// **A test's rack counter**: the seat it watches (`usize::MAX`, none)
     /// and how many times that seat's rack has run. What proves a bus's
     /// rack runs once a block, counted where every rack runs (`run_rack`),
@@ -3700,7 +3701,7 @@ impl Shared {
             hw: crate::units::hwinsert::HwHub::new(),
             lanes: LaneStore::new(),
             plan_refused: AtomicU32::new(0),
-            land_gains: AtomicBool::new(false),
+            land_at: AtomicU64::new(0),
             #[cfg(test)]
             rack_count_seat: AtomicUsize::new(usize::MAX),
             #[cfg(test)]
@@ -5047,6 +5048,22 @@ fn meter_source(armed: bool, heard: [f32; 2], input: [f32; 2]) -> [f32; 2] {
     }
 }
 
+/// **One frame of a level's one-pole slew**: `g` moved toward `target` by
+/// `coeff`, the same arithmetic every level here always did, or ON the
+/// target when `coeff` is one, which is what a land asks
+/// (`Engine::land_gains_at`). A step of one still rounds `g + (target - g)`
+/// by where `g` stood, so a level landed from 1.0 and the same level landed
+/// from a parked 0.46 were a bit apart, and a realtime pass's head was not
+/// the full-speed export's to the bit.
+#[inline(always)]
+fn glide(g: f32, target: f32, coeff: f32) -> f32 {
+    if coeff >= 1.0 {
+        target
+    } else {
+        g + (target - g) * coeff
+    }
+}
+
 /// **`frames` steps of a fader's one-pole slew, or none when a step would
 /// move nothing.**
 ///
@@ -5069,6 +5086,14 @@ fn meter_source(armed: bool, heard: [f32; 2], input: [f32; 2]) -> [f32; 2] {
 /// fader has settled and the lane may rest (`Renderer::fill_active`).
 #[inline]
 fn slew(g: &mut f32, target: f32, coeff: f32, frames: usize) -> bool {
+    // **Landed** (`Engine::land_gains_at`): ON the target, not one rounding
+    // of a step away from it, so a land is the same bits whatever the level
+    // was before it.
+    if coeff >= 1.0 {
+        let moved = g.to_bits() != target.to_bits();
+        *g = target;
+        return moved;
+    }
     if (*g + (target - *g) * coeff).to_bits() == g.to_bits() {
         return false;
     }
@@ -12637,6 +12662,12 @@ impl Renderer {
         // 7.4): Grow, Install, Remove, Attach, Plan, Monitor, Capture, before
         // a frame is rendered, so no chunk ever sees half of a change. Moves
         // pointers and nothing else.
+        //
+        // **The land's generation is read FIRST**, Acquire against
+        // `land_gains_at`'s Release, so every op the host pushed before it
+        // asked for the land (an export's left-out plan) is in the drain
+        // below and the landed chunk lands on that plan's targets.
+        let land_at = self.shared.land_at.load(Ordering::Acquire);
         self.apply_queued_ops();
         self.take_stem_tap();
         // **The desk buffers' stride, read AFTER the ops.** A Grow that lands
@@ -12793,19 +12824,18 @@ impl Renderer {
         let mut lufs_moved = false;
 
         // **An export's head lands every level on its target**
-        // (`Engine::land_gains`): the first chunk of the callback that takes
-        // the flag slews with a coefficient of one, after the ops above (an
-        // export's plan is in), and every chunk after it with the desk's
-        // own. Restored after the loop, so nothing else ever sees the one.
+        // (`Engine::land_gains_at`): see `land_at` above and the chunk's
+        // `run_transport` below. Every chunk starts at the desk's own
+        // coefficient; restored after the loop, so nothing else ever sees
+        // the one.
         let desk_coeff = self.gain_coeff;
-        let mut land = self.shared.land_gains.load(Ordering::Relaxed)
-            && self.shared.land_gains.swap(false, Ordering::Acquire);
+        let mut land_at = land_at;
         let mut done = 0usize;
         while done < frames {
             let n = chunk.min(frames - done);
             self.chunks += 1;
-            self.gain_coeff = if land { 1.0 } else { desk_coeff };
-            land = false;
+            self.gain_coeff = desk_coeff;
+            let mut landed = false;
             // **The desk's lane words, once, before anything in the chunk
             // reads one.** `collect_notes` is the first reader. See
             // `DeskLanes`.
@@ -12848,6 +12878,18 @@ impl Renderer {
             // the channels know where the timeline stands — the MIDI clips
             // play from here.
             let (at, rolling, jumped, wrap_from) = self.run_transport(n);
+            // **The land, on the first chunk that ROLLS at its generation**
+            // or a later one (`Engine::land_gains_at`), never a parked chunk
+            // before the locate arrives: the host's transport push comes a
+            // UI frame after the press, and a land taken by whatever callback
+            // came next landed the parked levels, leaving the real head to
+            // slew. Cleared only if no newer land was asked for meanwhile.
+            if land_at != 0 && rolling && self.seen_req >= land_at {
+                self.gain_coeff = 1.0;
+                landed = true;
+                let _ = self.shared.land_at.compare_exchange(land_at, 0, Ordering::AcqRel, Ordering::Relaxed);
+                land_at = 0;
+            }
             // **Every automated control, resolved once for this chunk.** It
             // has to come after `run_transport` — the value depends on where
             // the playhead now is — and before anything that mixes, because
@@ -13202,7 +13244,7 @@ impl Renderer {
                 let counting_in = self.count_in_tail > 0;
                 self.count_in_tail = self.count_in_tail.saturating_sub(1);
 
-                self.metro_gain += (click_level - self.metro_gain) * self.gain_coeff;
+                self.metro_gain = glide(self.metro_gain, click_level, self.gain_coeff);
                 let click = self.voice.next(&self.click) * self.metro_gain;
                 self.click_out[i] = click;
                 // The click reaches the FILE when the performance is meant to
@@ -13451,6 +13493,10 @@ impl Renderer {
                 gain: 0.0,
                 limiter: 1.0,
             };
+            if landed {
+                // The bus's own knobs land with the desk's levels.
+                self.effects.land(sends);
+            }
             if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {
                 self.effects
                     .process(aux, n, TAP_CHANNELS, sends, &self.effect_params, bpm);
@@ -13481,6 +13527,11 @@ impl Renderer {
                 gain: Shared::f32_of(&self.shared.gain_mix),
                 limiter: Shared::f32_of(&self.shared.limiter_mix),
             };
+            if landed {
+                // And the master's, the file's and the speakers' copies.
+                self.master_effects.land(master_sends);
+                self.room_effects.land(master_sends);
+            }
             // **The room's mix is made here, one subtraction, while the sum
             // is still a sum.** Everything upstream of the master insert adds,
             // so the difference between the file's mix and the speakers' is
@@ -14691,7 +14742,7 @@ impl Renderer {
                 );
             }
             for i in 0..n {
-                self.monitor_fades[input][0] += (target - self.monitor_fades[input][0]) * self.gain_coeff;
+                self.monitor_fades[input][0] = glide(self.monitor_fades[input][0], target, self.gain_coeff);
                 for c in 0..TAP_CHANNELS {
                     let col = dev_col(c.min(width - 1));
                     let clip = if merge_clip {
@@ -14947,8 +14998,8 @@ impl Renderer {
                 // moves once per frame however many inputs are open, and
                 // recomputing it in this pass is exact because both passes
                 // walk the same frames in the same order.
-                room += (room_target - room) * self.gain_coeff;
-                room_in += (audible_to - room_in) * self.gain_coeff;
+                room = glide(room, room_target, self.gain_coeff);
+                room_in = glide(room_in, audible_to, self.gain_coeff);
                 // The room's share of THIS input: the monitoring switch and
                 // the strip's own mute, both slewed.
                 let heard_now = room * room_in;
@@ -15042,7 +15093,7 @@ impl Renderer {
                 };
                 let mut pg = gate_from;
                 for i in 0..n {
-                    pg += (gate_to - pg) * coeff;
+                    pg = glide(pg, gate_to, coeff);
                     let heard_now = self.fold_g.get(i).copied().unwrap_or(0.0);
                     for c in 0..TAP_CHANNELS {
                         let x = self.fx_in.get(c).map_or(0.0, |v| v[i]);
@@ -15922,7 +15973,7 @@ impl Renderer {
             self.drums_gate_from = self.drums_gate;
             let mut g = self.drums_gate;
             for _ in 0..frames {
-                g += (to - g) * self.gain_coeff;
+                g = glide(g, to, self.gain_coeff);
             }
             self.drums_gate = g;
         }
@@ -16027,7 +16078,7 @@ impl Renderer {
                 let bank = self.spine.lanes[ch].as_deref_mut().and_then(|l| l.body_mut().pads.as_deref_mut());
                 if let Some(bank) = bank {
                     for _ in 0..frames {
-                        bank.gain += (target - bank.gain) * coeff;
+                        bank.gain = glide(bank.gain, target, coeff);
                     }
                 }
             }
@@ -16728,7 +16779,7 @@ impl Renderer {
             // The fader still ADVANCES on a folder — it is this lane's own
             // smoothing state, and letting it stall would land the fader
             // late the moment the kit came out of the group again.
-            *pad_gain += (master - *pad_gain) * coeff;
+            *pad_gain = glide(*pad_gain, master, coeff);
             let g = if is_folder { 1.0 } else { *pad_gain };
             if sends {
                 if let Some(v) = self.fold_g.get_mut(f) {
@@ -16793,7 +16844,7 @@ impl Renderer {
             };
             let mut pg = gate_from;
             for f in 0..frames {
-                pg += (gate_to - pg) * coeff;
+                pg = glide(pg, gate_to, coeff);
                 let g = self.fold_g.get(f).copied().unwrap_or(0.0);
                 for c in 0..TAP_CHANNELS {
                     let x = self.fx_in.get(c).map_or(0.0, |b| b[f]);
@@ -19159,7 +19210,7 @@ impl Renderer {
                     let g = if is_folder {
                         1.0
                     } else {
-                        lane.channel_gain += (target - lane.channel_gain) * coeff;
+                        lane.channel_gain = glide(lane.channel_gain, target, coeff);
                         lane.channel_gain
                     };
                     if sends {
@@ -19226,7 +19277,7 @@ impl Renderer {
                     let src = if tapped { &self.fold_tap } else { &self.lane_stage };
                     let mut pg = lane.pre_gate_from;
                     for f in 0..frames {
-                        pg += (pre_target - pg) * coeff;
+                        pg = glide(pg, pre_target, coeff);
                         if sends {
                             let s0 = src.first().map_or(0.0, |b| b[f]);
                             let s1 = src.get(1).map_or(0.0, |b| b[f]);
@@ -19635,7 +19686,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
                 c[f] = r;
             }
             if prep.sends {
-                pg += (prep.pre_target - pg) * desk.coeff;
+                pg = glide(pg, prep.pre_target, desk.coeff);
                 send_pre[0][f] += x0 * pg;
                 send_pre[1][f] += x1 * pg;
                 send_post[0][f] += l;
@@ -19758,7 +19809,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     let mut pg = *pre_gate_from;
     let gated = prep.sends || prep.fx_pre != 0.0;
     for f in 0..frames {
-        *channel_gain += (target - *channel_gain) * desk.coeff;
+        *channel_gain = glide(*channel_gain, target, desk.coeff);
         let g = *channel_gain;
         let x0 = post[0][f];
         let x1 = post.get(1).map_or(0.0, |c| c[f]);
@@ -19779,7 +19830,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             }
         }
         if gated {
-            pg += (prep.pre_target - pg) * desk.coeff;
+            pg = glide(pg, prep.pre_target, desk.coeff);
         }
         if prep.sends {
             // Off the line's send read when the two ways out are apart;
@@ -20094,7 +20145,7 @@ impl Renderer {
                 None => &mut spare,
             };
             for f in 0..frames {
-                *fader += (target - *fader) * coeff;
+                *fader = glide(*fader, target, coeff);
                 let g = *fader;
                 let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
                 let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
@@ -21053,7 +21104,7 @@ impl Renderer {
                 } else if kind != K::Bus {
                     let mut g = *row_gate;
                     for f in 0..frames {
-                        g += (to - g) * coeff;
+                        g = glide(g, to, coeff);
                         for (c, dst) in post.iter_mut().enumerate().take(TAP_CHANNELS) {
                             dst[f] += at(slot, f, c) * g;
                         }
@@ -27413,7 +27464,8 @@ impl Engine {
         self.shared.set_track_gain(linear);
     }
 
-    /// **The next block starts with every fader, mute, solo, send gate and
+    /// **The first block that rolls at transport generation `generation`
+    /// (or a later one) starts with every fader, mute, solo, send gate and
     /// polarity where it is going, not on its way there.**
     ///
     /// Every strip's level is a one-pole slew toward its target
@@ -27423,25 +27475,33 @@ impl Engine {
     /// OUT over its first tenth of a second and that head was in the file,
     /// and a fader, a polarity or a master below unity faded in from it. So
     /// an export, a freeze and a realtime pass raise this at their start
-    /// and the first chunk of the next callback slews with a coefficient
-    /// of one: every level lands on its target at its first frame, and from
-    /// the second chunk on the desk's ramps are the desk's again, so a mute
-    /// curve that moves inside the song still ramps.
+    /// and the first chunk that applies their locate rolling slews with a
+    /// coefficient of one: every level lands on its target at the first
+    /// frame of the span, and from the next chunk on the desk's ramps are
+    /// the desk's again, so a mute curve that moves inside the song still
+    /// ramps.
     ///
-    /// On the live engine (a realtime pass) the levels have long since
-    /// settled where the desk has them, so landing them moves nothing
-    /// audible: it takes a muted track from the denormal its fade decays
-    /// into to an exact zero, and the transport's locate is the only
-    /// discontinuity at that press, as it always was.
-    pub fn land_gains(&self) {
-        self.shared.land_gains.store(true, Ordering::Release);
+    /// **Tied to the locate's generation, not to the next callback.** A
+    /// realtime pass edits the host's transport and the engine hears it a
+    /// UI frame later (`Transport::push`); callbacks in between are parked
+    /// at the old place, and landing one of them landed the PARKED levels
+    /// and left the span's head (a gain curve away from them, a mute curve
+    /// on at it) to slew. An offline build lands at generation 1, the one
+    /// its renderer's `set_transport(1, first)` names.
+    ///
+    /// On the live engine the landed chunk is the locate's, which jumps the
+    /// song anyway; levels the desk already had move nothing audible, and a
+    /// muted track goes from the denormal its fade decays into to an exact
+    /// zero.
+    pub fn land_gains_at(&self, generation: u64) {
+        self.shared.land_at.store(generation.max(1), Ordering::Release);
     }
 
-    /// [`Self::land_gains`] taken back before a block took it: one build
+    /// [`Self::land_gains_at`] taken back before a block took it: one build
     /// rendered both ways, so a test can tell what landing changed.
     #[cfg(test)]
     pub fn keep_slewing(&self) {
-        self.shared.land_gains.store(false, Ordering::Release);
+        self.shared.land_at.store(0, Ordering::Release);
     }
 
     /// Hear the live input, or stop hearing it.
