@@ -164,6 +164,57 @@ pub fn full_build(app: &TangentApp, rate: u32, timebase: Timebase, build: BuildF
 ///
 /// The transport is left where a fresh engine has it: the caller places and
 /// rolls it, because where the render starts is the caller's span.
+/// **The Tangent Inserts in circuit**: every bay holding one that is not
+/// bypassed (a bypassed bay is passed over, so it renders anywhere). With
+/// `row`, only the ones a freeze of that row would render: the row's own
+/// racks, and a folder's children's, whose audio the folder's stem sums.
+pub fn hw_inserts_in_circuit(app: &TangentApp, row: Option<usize>) -> Vec<SeatBay> {
+    let nodes: Option<Vec<Node>> = row.map(|r| {
+        std::iter::once(r)
+            .chain(app.folder_children(r))
+            .filter_map(|ch| app.track_ids().get(ch).copied())
+            .map(Node::Track)
+            .collect()
+    });
+    app.plugins()
+        .iter()
+        .filter(|(_, p)| p.as_str() == crate::builtin_fx::HWINSERT_PATH)
+        .map(|(sb, _)| *sb)
+        .filter(|sb| !app.bay_bypassed(*sb))
+        .filter(|sb| nodes.as_ref().is_none_or(|n| n.contains(&sb.seat.node)))
+        .collect()
+}
+
+/// **Why an offline render of this project cannot run**, or `None`. A
+/// hardware loop plays through the interface in real time; an export can
+/// follow it there (the realtime export), a freeze and the probe cannot,
+/// and rendering one dry or silent would be a file that lies. `freeze` is
+/// the row a freeze would render; `None` is the whole desk.
+pub fn hw_refusal_for(app: &TangentApp, freeze: Option<usize>) -> Option<String> {
+    let found = hw_inserts_in_circuit(app, freeze);
+    if found.is_empty() {
+        return None;
+    }
+    let n = found.len();
+    let what = if n == 1 {
+        "a Tangent Insert".to_owned()
+    } else {
+        format!("{n} Tangent Inserts")
+    };
+    Some(match freeze {
+        Some(row) => format!(
+            "{} plays through {what} (outboard gear), which cannot render faster than real \
+             time, so it cannot be frozen. Bypass the insert to freeze without it, or leave the \
+             track live.",
+            app.channel_display_name(row)
+        ),
+        None => format!(
+            "This project plays through {what} (outboard gear), which cannot render faster \
+             than real time. Export it in real time, through the device."
+        ),
+    })
+}
+
 pub fn full_build_with(
     app: &TangentApp,
     rate: u32,
@@ -171,6 +222,17 @@ pub fn full_build_with(
     build: BuildFor,
     ctx: &mut Furnish<'_>,
 ) -> Result<Built, String> {
+    // **The backstop**: every offline road comes through here, and none of
+    // them may render a hardware loop dry or silent. The export turns
+    // realtime and the freeze refuses before this (`desktop`); the probe and
+    // anything added later refuse here.
+    let scope = match &build {
+        BuildFor::Freeze(id) => Some(app.row_of(*id).ok_or_else(|| "the track to freeze is gone".to_owned())?),
+        BuildFor::Export(_) | BuildFor::Probe => None,
+    };
+    if let Some(why) = hw_refusal_for(app, scope) {
+        return Err(why);
+    }
     let probe = matches!(build, BuildFor::Probe);
     let freeze = match &build {
         BuildFor::Freeze(id) => Some(app.row_of(*id).ok_or_else(|| "the track to freeze is gone".to_owned())?),
@@ -2091,6 +2153,47 @@ mod tests {
     fn app_with(settings: Settings) -> TangentApp {
         let ctx = egui::Context::default();
         TangentApp::with_license(&ctx, settings, Caps::NONE, crate::composite::tiers::free("bridge"))
+    }
+
+    /// **No offline road renders a hardware loop dry or silent.** A Tangent
+    /// Insert in circuit refuses the probe and the full-speed builder (the
+    /// export goes realtime before it reaches it), and refuses a freeze of
+    /// its own track and of a folder whose stem sums it, but not a freeze of
+    /// an unrelated track; a bypassed one is passed over everywhere.
+    #[test]
+    fn a_tangent_insert_in_circuit_refuses_every_offline_road() {
+        use crate::builtin_fx::HWINSERT_PATH;
+        let mut s = blank();
+        kind(&mut s, &[0, 1, 2, 3], ChannelKind::Audio);
+        // Row 2 is a folder over row 3, which holds the loop.
+        s.rows[2].folder = true;
+        s.rows[3].in_folder = true;
+        let held = SeatBay::new(row(&s, 3), Rack::Chain(0), 0);
+        s.plugins.insert(held, HWINSERT_PATH.to_owned());
+        let mut app = app_with(s);
+        assert_eq!(hw_inserts_in_circuit(&app, None), vec![held]);
+        let why = hw_refusal_for(&app, None).expect("the export of a desk with a loop refuses");
+        assert!(why.contains("Tangent Insert") && why.contains("real time"), "{why}");
+        // The probe goes through the one builder and is refused there.
+        let mut furnish = Furnish::default();
+        match full_build_with(&app, RATE, Timebase::new(), BuildFor::Probe, &mut furnish) {
+            Err(e) => assert!(e.contains("Tangent Insert"), "{e}"),
+            Ok(_) => panic!("the probe rendered a hardware loop offline"),
+        }
+        // A freeze of the track, and of its folder, refuses; of another, not.
+        assert!(hw_refusal_for(&app, Some(3)).is_some_and(|w| w.contains("frozen")));
+        assert!(hw_refusal_for(&app, Some(2)).is_some(), "the folder's stem sums the loop");
+        assert!(hw_refusal_for(&app, Some(0)).is_none(), "an unrelated track could not be frozen");
+        let id = app.track_ids()[3];
+        match full_build_with(&app, RATE, Timebase::new(), BuildFor::Freeze(id), &mut Furnish::default()) {
+            Err(e) => assert!(e.contains("frozen"), "{e}"),
+            Ok(_) => panic!("a freeze rendered a hardware loop offline"),
+        }
+        // Bypassed, it is passed over: every road is open again.
+        app.toggle_bay_bypass(held);
+        assert!(hw_inserts_in_circuit(&app, None).is_empty());
+        assert!(hw_refusal_for(&app, None).is_none() && hw_refusal_for(&app, Some(3)).is_none());
+        assert!(full_build_with(&app, RATE, Timebase::new(), BuildFor::Probe, &mut Furnish::default()).is_ok());
     }
 
     /// The shipped desk with every channel emptied, so each desk below says

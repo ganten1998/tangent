@@ -11257,6 +11257,12 @@ impl DesktopApp {
         if pass_refusal(self.running(), asked).is_some() {
             return;
         }
+        // **No hardware loop renders faster than real time**: refused, never
+        // rendered dry or silent. See `engine_bridge::hw_refusal_for`.
+        if let Some(why) = crate::engine_bridge::hw_refusal_for(&self.app, freeze) {
+            self.app.notify(Kind::Error, why);
+            refuse!();
+        }
         // The whole project, or the arrange view's TIME SELECTION.
         let (from_s, span) = match spec.span {
             Some((a, b)) if b > a => (a.max(0.0), b - a),
@@ -11791,6 +11797,25 @@ impl DesktopApp {
     fn take_project_request(&mut self, ctx: &egui::Context) {
         let Some(req) = self.app.take_project_request() else {
             return;
+        };
+        // **A hardware loop runs in real time or not at all.** A full-speed
+        // export of a project with a Tangent Insert in circuit becomes a
+        // realtime one, through the device, and says so; a freeze cannot
+        // become one and is refused in `start_offline_render`.
+        let req = match req {
+            tangent_ui::ports::ProjectRequest::Export(mut spec)
+                if !spec.realtime
+                    && !crate::engine_bridge::hw_inserts_in_circuit(&self.app, None).is_empty() =>
+            {
+                spec.realtime = true;
+                self.app.notify(
+                    Kind::Info,
+                    "This project plays through a Tangent Insert (outboard gear), which cannot \
+                     run faster than real time, so it exports in real time through the device.",
+                );
+                tangent_ui::ports::ProjectRequest::Export(spec)
+            }
+            other => other,
         };
         // A pass that cannot start says so here, before the overlay covers
         // anything for it - see `refuse_new_pass`.
@@ -24385,6 +24410,30 @@ mod tests {
                 "`{starter}` takes a running pass's message down when it refuses"
             );
         }
+    }
+
+    /// **A hardware loop is never rendered faster than real time.** The
+    /// intake turns a full-speed export of a desk with a Tangent Insert in
+    /// circuit into a realtime one, BEFORE it asks whether the pass may run
+    /// or covers the desk; the offline starter refuses a freeze (and
+    /// anything else that reaches it) before it builds an engine.
+    #[test]
+    fn a_hardware_loop_exports_in_real_time_and_never_freezes_offline() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body_of = |f: &str| {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            &src[at..at + src[at..].find("\n    fn ").expect("its end")]
+        };
+        let intake = body_of("fn take_project_request(");
+        let turned = intake.find("spec.realtime = true").expect("the intake no longer turns a loop's export realtime");
+        let gated = intake.find("hw_inserts_in_circuit(").expect("the intake does not ask about loops");
+        let asked = intake.find("self.refuse_new_pass(&req)").expect("the intake's refusal");
+        assert!(gated < turned && turned < asked, "the export turns realtime after the pass is judged");
+        let offline = body_of("fn start_offline_render(");
+        let refused = offline.find("hw_refusal_for(").expect("the offline starter renders loops dry");
+        let built = offline.find("full_build_with(").expect("the offline starter's build");
+        assert!(refused < built, "the offline starter builds before it refuses a loop");
     }
 
     /// **A failed full-speed export leaves its folder as it found it.** The
