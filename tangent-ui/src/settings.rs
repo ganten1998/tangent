@@ -4065,7 +4065,7 @@ impl Settings {
             // Now the desk is the FILE's, migrations included — the badge
             // lands on the channel that really holds the drumpad.
             for i in 0..s.rows.len() {
-                let drum = s.row_plugin(i, 0) == Some(crate::dialogs::DRUMPAD_PATH);
+                let drum = s.row_holds(i, crate::dialogs::DRUMPAD_PATH);
                 s.rows[i].icon = u8::from(drum);
             }
         }
@@ -4238,6 +4238,16 @@ impl Settings {
     /// The plugin in [`Self::row_bay`], if any.
     pub fn row_plugin(&self, row: usize, bay: usize) -> Option<&str> {
         self.plugins.get(&self.row_bay(row, bay)?).map(String::as_str).filter(|p| !p.is_empty())
+    }
+
+    /// **Whether the track on `row` holds `path` in any of its six bays**
+    /// (`desk_id::chain_bays`): where an instrument may sit.
+    pub fn row_holds(&self, row: usize, path: &str) -> bool {
+        use crate::desk_id::{Node, SeatBay};
+        self.rows.get(row).is_some_and(|r| {
+            crate::desk_id::chain_bays()
+                .any(|(rack, bay)| self.plugins.get(&SeatBay::new(Node::Track(r.id), rack, bay)).is_some_and(|p| p == path))
+        })
     }
 
     /// **The bays as the frozen dense table** (`strip_inserts` as the legacy
@@ -4443,7 +4453,7 @@ impl Settings {
         if self.arm_unsaid {
             let kinds: Vec<u8> = model.rows.iter().map(|r| crate::desk_model::RowKind::byte(r.kind)).collect();
             let armed = crate::arrangement::armed_by_default(&kinds, |n| {
-                self.row_plugin(n, 0) == Some(crate::dialogs::BUILTIN_PATH)
+                self.row_holds(n, crate::dialogs::BUILTIN_PATH)
             });
             for (n, row) in model.rows.iter_mut().enumerate() {
                 row.arm = Some(n) == armed;
@@ -8570,7 +8580,7 @@ mod tests {
         if s.arm_unsaid {
             let kinds: Vec<u8> = s.rows.iter().map(|r| r.kind_byte()).collect();
             let armed = crate::arrangement::armed_by_default(&kinds, |n| {
-                s.row_plugin(n, 0) == Some(crate::dialogs::BUILTIN_PATH)
+                s.row_holds(n, crate::dialogs::BUILTIN_PATH)
             });
             for (n, row) in s.rows.iter_mut().enumerate() {
                 row.arm = Some(n) == armed;

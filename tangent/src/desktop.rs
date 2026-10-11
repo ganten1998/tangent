@@ -11142,11 +11142,12 @@ impl DesktopApp {
             Some(id) => crate::engine_bridge::BuildFor::Freeze(id),
             None => crate::engine_bridge::BuildFor::Export(spec.clone()),
         };
-        // Each row's own first bay (W7-slot-gaps: the row number was read as
-        // a seat, which past the thirty-second row names the drum bus, the
-        // click, the return and the master).
+        // Each row's own bays, any of them (W7-slot-gaps: the row number was
+        // read as a seat, which past the thirty-second row names the drum
+        // bus, the click, the return and the master; and a DX7 after another
+        // instrument plays too, see `instrument::Layer`).
         let dx7: std::collections::BTreeMap<usize, crate::dx7::Voice> = (0..self.app.track_ids().len())
-            .filter(|ch| crate::engine_bridge::row_instrument(&self.app, *ch) == Some(tangent_ui::dialogs::BUILTIN_PATH))
+            .filter(|ch| crate::engine_bridge::row_holds(&self.app, *ch, tangent_ui::dialogs::BUILTIN_PATH))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|ch| (ch, self.voice_for_strip(ch)))
@@ -13024,7 +13025,7 @@ impl DesktopApp {
             // walk `reload_pads` makes, and for the same reason.
             let lanes: Vec<usize> = (0..self.app.track_ids().len())
                 .filter(|row| {
-                    crate::engine_bridge::row_instrument(&self.app, *row) == Some(tangent_ui::dialogs::DRUMPAD_PATH)
+                    crate::engine_bridge::row_holds(&self.app, *row, tangent_ui::dialogs::DRUMPAD_PATH)
                 })
                 .collect();
             for lane in lanes {
@@ -13442,7 +13443,7 @@ impl DesktopApp {
             // borrows the app while `retain` borrows the set.
             let live_pads: Vec<std::path::PathBuf> = (0..self.app.track_ids().len())
                 .filter(|row| {
-                    crate::engine_bridge::row_instrument(&self.app, *row) == Some(tangent_ui::dialogs::DRUMPAD_PATH)
+                    crate::engine_bridge::row_holds(&self.app, *row, tangent_ui::dialogs::DRUMPAD_PATH)
                 })
                 .flat_map(|lane| self.app.drumpad_paths_of(lane))
                 .flatten()
@@ -16293,8 +16294,20 @@ impl DesktopApp {
         for ch in 0..self.app.desk_extent() {
             let strip = Strip::Channel(ch);
             let live = match self.app.channel_kind(ch) {
+                // A plugin in its first bay, or one of the house's
+                // instruments in any bay: a second instrument on a track
+                // plays, so one standing in its third bay is a loss too.
                 Some(tangent_ui::recorder::ChannelKind::Midi) => {
                     crate::engine_bridge::row_instrument(&self.app, ch).is_some()
+                        || [
+                            tangent_ui::dialogs::BUILTIN_PATH,
+                            tangent_ui::dialogs::KEYS_PATH,
+                            tangent_ui::dialogs::DRUMPAD_PATH,
+                            crate::builtin_fx::ANALOG_PATH,
+                            crate::builtin_fx::SAMPLER_PATH,
+                        ]
+                        .into_iter()
+                        .any(|path| self.app.row_holds(ch, path))
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => self
                     .app
@@ -32411,8 +32424,8 @@ mod tests {").expect("the tests module")];
             // nothing, and its built-ins stand down with its rack.
             ".with(F::FROZEN, is_frozen)",
             ".with(F::MIDI_OFF, deaf.get(row).copied().unwrap_or(true) || is_frozen)",
-            "first == Some(tangent_ui::dialogs::BUILTIN_PATH) && !is_frozen",
-            "first == Some(tangent_ui::dialogs::KEYS_PATH) && !is_frozen",
+            "holds(tangent_ui::dialogs::BUILTIN_PATH) && !is_frozen",
+            "holds(tangent_ui::dialogs::KEYS_PATH) && !is_frozen",
         ] {
             assert!(inputs.contains(needle), "the plan lost `{needle}`");
         }
