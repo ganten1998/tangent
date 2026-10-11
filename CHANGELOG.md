@@ -165,7 +165,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   track that went silent), and the numbered `001-...` stems from before the
   rename, into `older/<date and time>/` inside the stems folder. Files
   Tangent did not write are never touched. A track named "Café" typed on
-  one system and pasted from another is treated as one name.
+  one system and pasted from another is treated as one name, and so is a
+  name in any other script: Cyrillic or Greek letters with their marks, a
+  Korean syllable, a Japanese kana with its voicing marks. The file is
+  written in the composed form either way.
 
 - **Tangent Denoise opens on the Bank.** A freshly inserted denoiser, and a
   reset to defaults, now start on the Bank kernel instead of Spectral Studio,
@@ -283,6 +286,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   yet, its grid chip included.
 
 ### Fixed
+
+- **A muted track is silent from an export's first sample.** A track
+  muted on the desk, or silenced by a solo on another track, used to fade
+  out over the first tenth of a second of every export, so its start was
+  in the file. A fader, the master, a polarity switch or a gain curve set
+  away from unity likewise started at full level and slid to its setting.
+  An export now starts with every level already where the desk has it, at
+  full speed and in real time. Mute and solo changes during the song, by
+  hand or by a mute curve, still fade as they always did.
 
 - **The "Preparing export" message no longer hides behind the Export
   window.** Pressing Export closed the window, and the message about the
