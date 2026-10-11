@@ -3704,6 +3704,13 @@ impl NumField {
     pub fn lives_in_metronome(self) -> bool {
         matches!(self, NumField::MetBeats | NumField::MetUnit)
     }
+
+    /// **Whether the field is typed into the varispeed's RANGE panel**, and
+    /// so lives exactly as long as that panel does - the rule
+    /// [`NumField::lives_in_metronome`] keeps for the metronome's two.
+    pub fn lives_in_vari_range(self) -> bool {
+        matches!(self, NumField::VariMin | NumField::VariMax)
+    }
 }
 
 /// A time typed into a trim field, in seconds.
