@@ -404,10 +404,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a time and the count-in's "carries on" switch flipped and flipped back.
   The panel over the arrangement was not affected.
 
-- **A second Cmd/Ctrl+M closes the metronome panel.** In the arrangement
-  the chord opened the panel and pressing it again did nothing, so the
-  panel could only be closed with the mouse. A beat count or note value
-  being typed into the panel is set as it closes.
+- **A second Cmd/Ctrl+M closes the metronome panel, and the chord works
+  over the mixer.** In the arrangement the chord opened the panel and
+  pressing it again did nothing, so the panel could only be closed with
+  the mouse; over the mixer it did neither. Over the mixer it now opens the
+  panel where clicking the CLICK strip's sound chip opens it. A beat count
+  or note value being typed into the panel is set as it closes.
 
 - **The varispeed range keeps what you type into it.** Clicking outside
   the range panel, on its X, on RESET or on the other end threw away a

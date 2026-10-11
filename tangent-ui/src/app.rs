@@ -1304,13 +1304,14 @@ pub struct TangentApp {
     /// the keyboard rather than by pressing its icon.
     ///
     /// `None` means the icon, and the panel hangs off it. `Some` is Cmd+M's
-    /// point: the CENTRE of the surface the panel is drawn on (`met_stage`,
-    /// the timeline, since the chord is the arrangement's), never the
-    /// pointer. The owner's call after living with "wherever the hand is":
-    /// a panel that opens somewhere different every time has to be found.
-    /// `met_anchor` makes it a one-point anchor, which `MetLayout` centres
-    /// the panel on both ways. Cleared on every close, or the next press on
-    /// the icon would open at a stale point.
+    /// point over the timeline: its CENTRE, never the pointer. The owner's
+    /// call after living with "wherever the hand is": a panel that opens
+    /// somewhere different every time has to be found. `met_anchor` makes
+    /// it a one-point anchor, which `MetLayout` centres the panel on both
+    /// ways. Over the desk the chord leaves it `None`, so the panel hangs
+    /// off the click strip's sound chip, where a click on the chip opens it
+    /// (`met_chord_opens`). Cleared on every close, or the next press on the
+    /// icon would open at a stale point.
     met_at: Option<Pos2>,
     /// A drag along the panel's tempo track, once one has begun.
     met_drag: bool,
@@ -20193,8 +20194,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it opens rather than each caller deciding.
     fn met_anchor(&self, rect: Rect) -> Rect {
         // **A summoned panel beats hanging off a chip.** `met_at` is Cmd+M's
-        // point, and a one-point rect is what tells `MetLayout` to centre the
-        // panel ON it, both ways, rather than hang it below.
+        // point over the timeline, and a one-point rect is what tells
+        // `MetLayout` to centre the panel ON it, both ways, rather than hang
+        // it below. Over the desk the chord leaves it `None`, so the panel
+        // hangs off the click strip's chip below, as a click on the chip
+        // hangs it (`met_chord_opens`).
         if let Some(p) = self.met_at {
             return Rect::from_center_size(p, Vec2::splat(1.0));
         }
@@ -20372,6 +20376,67 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .is_some_and(|e| e.field.lives_in_metronome())
         {
             self.commit_number();
+        }
+    }
+
+    /// **Whether the metronome panel hangs on the desk**: the mixer up and
+    /// the timeline shut, `met_stage`'s own order.
+    fn met_on_desk(&self) -> bool {
+        self.arrangement_rect.is_none() && self.mixer_rect.is_some()
+    }
+
+    /// **Cmd/Ctrl+M's second press: the metronome panel goes**, on either
+    /// surface. Each surface asks BEFORE the panel takes its frame (the
+    /// timeline at the top of `arrangement_input`, the desk ahead of
+    /// `met_owns` in `paint`), and a press that closes the panel is the
+    /// panel's to the end of that frame: the surface's own open, among its
+    /// keys further on, must not hear it. Answers whether it closed.
+    ///
+    /// On the open's terms (`met_chord_opens`), with ONE key let through a
+    /// field: the panel's own BEATS or NOTE being typed does not stand the
+    /// chord down. A command chord is no character a number takes, and
+    /// `close_met_menu` commits the field on the way out, as every road that
+    /// closes the panel does. Digits, Space and every other key still wait
+    /// on the field, and a field anywhere else holds this chord too.
+    fn met_chord_closes(&mut self, ctx: &egui::Context, chord: bool) -> bool {
+        let close = chord
+            && self.met_menu.is_some()
+            && self.midi_edit.is_none()
+            && !self.dialog_blocks_keys(ctx)
+            && self.menu_state.is_none()
+            && !self.typing_outside_num_edit()
+            && self.num_edit.as_ref().is_none_or(|e| e.field.lives_in_metronome());
+        if close {
+            self.close_met_menu();
+        }
+        close
+    }
+
+    /// **Cmd/Ctrl+M's first press: the metronome panel comes up**, asked
+    /// from among a surface's own keys, behind every early return they have,
+    /// on the terms its other shortcuts keep: no dialog holding the keys, no
+    /// menu up, no field taking them, the MIDI editor shut. The panel is
+    /// never up on a frame that asks: while it is, it takes the frame, and
+    /// `met_chord_closes` is where a second press goes.
+    ///
+    /// **Where it opens is the surface's.** Over the timeline, in the MIDDLE
+    /// and not at the pointer. It opened where the hand was, on the reasoning
+    /// that a summon should not make you travel; the owner's answer after
+    /// living with it was to centre it. A panel that appears somewhere
+    /// different every time is one you have to FIND, and the eye goes to the
+    /// middle of the window on its own. Over the desk, off the click strip's
+    /// sound chip, exactly where a click on the chip opens it: that press
+    /// leaves no summon point, so neither does this one, and `met_anchor`
+    /// hangs the panel off the chip.
+    fn met_chord_opens(&mut self, ctx: &egui::Context, chord: bool) {
+        if chord
+            && self.midi_edit.is_none()
+            && !self.dialog_blocks_keys(ctx)
+            && self.menu_state.is_none()
+            && !self.text_entry_active()
+        {
+            self.met_at = self.arrangement_rect.map(|r| r.center());
+            self.met_menu = Some(());
         }
     }
 
@@ -27152,7 +27217,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    fn arrangement_input(&mut self, ctx: &egui::Context) {
+    /// **The timeline's frame of input**, called on every surface; most of
+    /// it stands down off the timeline. `met_chord` is this frame's
+    /// Cmd/Ctrl+M, read once in `paint` for every road the chord has on
+    /// either surface the metronome panel hangs on.
+    fn arrangement_input(&mut self, ctx: &egui::Context, met_chord: bool) {
         // **A release nobody saw still ends the gesture.** A dialog raised
         // mid-drag, a menu, a view that closed under the hand: every early
         // return below comes before the release block, and a gesture whose
@@ -27202,52 +27271,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
         }
-        // **Cmd/Ctrl+M, the metronome panel's chord**, read once for both of
-        // its roads: the close just below and the open among the view's keys
-        // further down. Shift with it is the master row's.
-        //
-        // **A fresh press only, never the OS's repeats of a held one** (the
-        // rule Delete keeps for the track it removes). `key_pressed` counts
-        // every repeat, and now that the chord both opens and closes, a press
-        // held past the repeat delay toggled the panel at the repeat rate and
-        // let go of it open or shut by chance: the press opened it, a repeat
-        // closed it here, the next opened it again below. A chord that closed
-        // the panel over BEATS or NOTE brought it straight back up.
-        let met_chord = ctx.input(|i| {
-            (i.modifiers.command || i.modifiers.ctrl)
-                && !i.modifiers.shift
-                && i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key { key: egui::Key::M, pressed: true, repeat: false, .. }
-                    )
-                })
-        });
-        // **A second press of the chord closes the panel the first one
-        // opened**, and it is read HERE, before the panel takes the frame
-        // below. It was written beside the open, after that `return`, and
-        // never ran once: while the panel is up it owns every frame, so a
-        // panel the chord summoned could only be put away with the mouse.
-        //
-        // On the open's own terms (the view's `keys_ok`, the MIDI editor
-        // shut), with ONE key let through a field: the panel's own BEATS or
-        // NOTE being typed does not stand the chord down. A command chord is
-        // no character a number takes, and `close_met_menu` commits the field
-        // on the way out, as every road that closes the panel does. Digits,
-        // Space and every other key still wait on the field, and a field
-        // anywhere else holds this chord too. The frame is the panel's to the
-        // end, as it would have been: the open below must not hear the same
+        // **A second Cmd/Ctrl+M closes the panel the first one opened**
+        // (`met_chord_closes`, which has the terms), asked HERE, before the
+        // panel takes the frame below. It was written beside the open, after
+        // that `return`, and never ran once: while the panel is up it owns
+        // every frame, so a panel the chord summoned could only be put away
+        // with the mouse. The frame is the panel's to the end, as it would
+        // have been: the open among the view's keys must not hear the same
         // press.
-        if met_chord
-            && self.met_menu.is_some()
-            && self.arrangement_rect.is_some()
-            && self.midi_edit.is_none()
-            && !self.dialog_blocks_keys(ctx)
-            && self.menu_state.is_none()
-            && !self.typing_outside_num_edit()
-            && self.num_edit.as_ref().is_none_or(|e| e.field.lives_in_metronome())
-        {
-            self.close_met_menu();
+        //
+        // **Over the timeline only.** Over the desk the mixer's pass asks
+        // before ITS panel takes the frame, and the desk's open runs between
+        // that and this: asked again here, the press that opened the panel
+        // there would shut it.
+        if self.arrangement_rect.is_some() && self.met_chord_closes(ctx, met_chord) {
             return;
         }
         // **The METRONOME's panel: while it is up it owns every press.**
@@ -27262,7 +27299,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // row of the desk's panel twice: BEATS plus stepped two beats, NOTE
         // plus skipped a note value, IN TAKE flipped and flipped back. On the
         // desk this only stands down for the panel.
-        if self.arrangement_rect.is_none() && self.mixer_rect.is_some() {
+        if self.met_on_desk() {
             if self.met_menu.is_some() {
                 return;
             }
@@ -29611,7 +29648,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **Ctrl/Cmd+M: the metronome panel, in the middle of the
         // timeline.** The owner's call: the click's own settings (tempo,
         // signature, count-in) one chord away rather than a reach for a chip
-        // in the corner; why the middle and not the pointer is below.
+        // in the corner. `met_chord_opens` has its terms and why the middle
+        // and not the pointer; the desk opens it by the same road, among the
+        // mixer's keys.
         //
         // It DISPLACED the master row, which had this chord and now has
         // shift with it. Said out loud because a shortcut that quietly
@@ -29622,15 +29661,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // of this pass, and that is where a second press closes it. The
         // repeats of a press still held after that close do not open it
         // again here, because `met_chord` is a fresh press only.
-        if keys_ok && self.midi_edit.is_none() && met_chord {
-            // **CENTRED, not at the pointer.** It opened where the hand was,
-            // on the reasoning that a summon should not make you travel; the
-            // owner's answer after living with it was to centre it. A panel
-            // that appears somewhere different every time is one you have to
-            // FIND, and the eye goes to the middle of the window on its own.
-            self.met_at = self.met_stage().map(|r| r.center());
-            self.met_menu = Some(());
-        }
+        self.met_chord_opens(ctx, met_chord);
         // **Ctrl/Cmd+Shift+M: show or hide the MASTER row.** It cannot be
         // removed the way a track can — a bus you can delete and not get
         // back is one people delete once and then go looking for — so this
@@ -43537,15 +43568,49 @@ impl TangentApp {
         // — every surface below stands down for the frame.
         let input_menu_owns = self.input_menu_frame(&ctx);
         let drumpad_owns = self.drumpad_claims_pointer(&ctx);
+        // **Cmd/Ctrl+M, the metronome panel's chord**, read ONCE a frame for
+        // every road it has on either surface: the desk's close and open
+        // here, and the timeline's in `arrangement_input`, which is handed
+        // it, so no two of them can disagree about which press it was. Shift
+        // with it is the master row's.
+        //
+        // **A fresh press only, never the OS's repeats of a held one** (the
+        // rule Delete keeps for the track it removes). `key_pressed` counts
+        // every repeat, and since the chord both opens and closes, a press
+        // held past the repeat delay toggled the panel at the repeat rate and
+        // let go of it open or shut by chance: the press opened it, a repeat
+        // closed it, the next opened it again. A chord that closed the panel
+        // over BEATS or NOTE brought it straight back up.
+        let met_chord = ctx.input(|i| {
+            (i.modifiers.command || i.modifiers.ctrl)
+                && !i.modifiers.shift
+                && i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { key: egui::Key::M, pressed: true, repeat: false, .. }
+                    )
+                })
+        });
+        // **Over the desk a second press closes the panel HERE**, before the
+        // panel takes the frame just below, as the timeline's does at the top
+        // of its own pass: `met_chord_closes`, behind the two owners that keep
+        // that pass from running at all (the input menu, a band popup). The
+        // frame is then the panel's to the end, so the mixer's keys, where
+        // the desk's open lives, do not hear the same press.
+        let met_shut = self.met_on_desk()
+            && !input_menu_owns
+            && !self.band_popup_owns()
+            && self.met_chord_closes(&ctx, met_chord);
         // **The metronome's panel owns every press while it is up, HERE
         // too.** The desk has painted it since the click strip grew its
         // sound chip and nothing on this surface ever took a press for it —
         // its rows were a picture. `met_stage` answers the mixer only when
         // the timeline is shut, so the two surfaces cannot both claim it.
-        let met_owns = self.mixer_rect.is_some()
-            && !input_menu_owns
-            && !self.dialog_blocks_pointer(&ctx)
-            && self.met_menu_owns_press(&ctx);
+        let met_owns = met_shut
+            || (self.mixer_rect.is_some()
+                && !input_menu_owns
+                && !self.dialog_blocks_pointer(&ctx)
+                && self.met_menu_owns_press(&ctx));
         if let Some(rect) = self
             .mixer_rect
             .filter(|_| {
@@ -43696,6 +43761,14 @@ impl TangentApp {
                     }
                 }
             }
+            // **Ctrl/Cmd+M: the metronome panel**, here as in the
+            // arrangement and by the same road (`met_chord_opens`, which has
+            // the terms), hung off the click strip's sound chip, where a click
+            // on the chip opens it. Over the desk the chord neither opened
+            // nor closed the panel, and the owner said yes to both. Only the
+            // open lives here: while the panel is up it takes the frame
+            // (`met_owns`, above), and that is where a second press closes it.
+            self.met_chord_opens(&ctx, met_chord);
             // **Delete: the SELECTED CHANNEL leaves the desk** — the Track
             // menu's Remove, on the key, as in the arrangement.
             if !self.dialog_blocks_keys(&ctx)
@@ -44230,7 +44303,7 @@ impl TangentApp {
         if !input_menu_owns && !self.band_popup_owns() {
             self.drumpad_input(&ctx);
             self.midi_editor_input(&ctx);
-            self.arrangement_input(&ctx);
+            self.arrangement_input(&ctx, met_chord);
         }
 
         // The take-name field, edited from raw input rather than with an egui
@@ -75296,14 +75369,13 @@ mod tests {").expect("the tests module")];
     // odd signatures?" Every test here drives the panel as a hand does -
     // pointer events, key events, typed characters - through whole frames.
 
-    /// The metronome's panel up on a song with a history to count moments
-    /// in: over the timeline by Cmd+M, the chord's own road, or over the
-    /// desk as the click strip's chip leaves it. Answers the surface it
-    /// hangs on and its anchor.
-    fn met_panel_up(
+    /// A song with a history to count moments in, and the surface the
+    /// metronome's panel hangs on laid out with the panel shut: the timeline,
+    /// or the desk. Answers the surface.
+    fn met_surface_up(
         tag: &str,
         desk: bool,
-    ) -> (egui::Context, TangentApp, std::path::PathBuf, Rect, Rect) {
+    ) -> (egui::Context, TangentApp, std::path::PathBuf, Rect) {
         let root = project_scratch(tag);
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.bootstrap_project(&root.join("Projects"));
@@ -75312,6 +75384,21 @@ mod tests {").expect("the tests module")];
         pointer_frame(&ctx, &mut app, Vec::new());
         app.arr_save_edits();
         app.commit_view_change();
+        assert!(app.met_menu.is_none(), "fixture: the metronome panel is already up");
+        assert_eq!(app.met_on_desk(), desk, "fixture: the panel would hang on the other surface");
+        let stage = app.met_stage().expect("the panel's surface is not laid out");
+        (ctx, app, root, stage)
+    }
+
+    /// The metronome's panel up on a song with a history to count moments
+    /// in: over the timeline by Cmd+M, the chord's own road, or over the
+    /// desk as the click strip's chip leaves it. Answers the surface it
+    /// hangs on and its anchor.
+    fn met_panel_up(
+        tag: &str,
+        desk: bool,
+    ) -> (egui::Context, TangentApp, std::path::PathBuf, Rect, Rect) {
+        let (ctx, mut app, root, _) = met_surface_up(tag, desk);
         if desk {
             // `H::MetFile`, the chip's press: the flag the frame reads.
             app.met_menu = Some(());
@@ -75767,6 +75854,24 @@ mod tests {").expect("the tests module")];
     //
     // The owner's "yes fix those please": the chord opened the metronome
     // panel over the timeline, and pressing it again did nothing at all.
+    // Then the owner's "yes" to the desk, where the chord did neither: it
+    // opens and closes the panel there by the timeline's own road now, and
+    // every test here with a road on both surfaces runs on both.
+
+    /// The middle of the click strip's sound chip on the desk this app last
+    /// laid out: the press that opens the metronome panel over the desk.
+    fn click_chip_at(app: &TangentApp) -> Pos2 {
+        let rect = app.mixer_rect.expect("the desk is not laid out");
+        let view = app.mixer_view_in(rect);
+        let col = recorder::Strip::Click.column_of().expect("the click has a column");
+        let chip = crate::mixer_panel::Layout::new(rect, &view)
+            .strips
+            .get(col)
+            .expect("the click has a strip")
+            .met;
+        assert!(chip.is_positive(), "the click strip has no sound chip");
+        chip.center()
+    }
 
     /// A whole right-click at `at`, as a hand makes one: arrive, press and
     /// let go, the secondary button.
@@ -75801,38 +75906,87 @@ mod tests {").expect("the tests module")];
     }
 
     /// **A second Cmd/Ctrl+M closes the metronome panel the first one
-    /// opened**, and a third opens it again in the middle of the timeline.
+    /// opened, over the timeline and over the desk**, and a third opens it
+    /// again where the first did: in the middle of the timeline, and over
+    /// the desk where a click on the click strip's sound chip opens it, which
+    /// a real click on the chip is asked.
     ///
     /// The close was written beside the chord's open, after the panel's own
     /// `return` in `arrangement_input`, and never ran: while the panel is up
     /// it owns every frame, so a panel the chord summoned could only be put
-    /// away with the mouse. Ctrl+M is the chord's other spelling; shift with
-    /// it is the master row's and leaves the panel be. Opening and closing it
-    /// change nothing in the song, so neither is a moment.
+    /// away with the mouse. Over the desk the chord did neither. Ctrl+M is
+    /// the chord's other spelling; shift with it is the master row's and
+    /// leaves the panel be. Opening and closing it change nothing in the
+    /// song, so neither is a moment.
     ///
-    /// Revert-check, performed: take the close out of the top of
-    /// `arrangement_input` and the second press leaves the panel up.
+    /// Revert-checks, all performed: take the close out of the top of
+    /// `arrangement_input` and the second press leaves the panel up on the
+    /// timeline. Over the desk: take out its close ahead of `met_owns` and
+    /// the second press leaves the panel up; take out its open among the
+    /// mixer's keys and the first press opens nothing; let that close leave
+    /// the frame to the mixer's keys and the open there hears the same press
+    /// and puts the panel straight back; ask the timeline's close over the
+    /// desk as well and it shuts the panel the mixer's open has just put up;
+    /// centre it as the timeline does and the chord leaves a summon point
+    /// where the chip's press leaves none.
     #[test]
     fn a_second_cmd_m_closes_the_metronome_panel_it_opened() {
-        let (ctx, mut app, root, stage, _anchor) = met_panel_up("metchord", false);
-        let before = app.hist_at;
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
-        assert!(app.met_menu.is_some(), "Cmd+Shift+M, the master row's chord, closed the metronome panel");
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(app.met_menu.is_none(), "a second Cmd+M left the metronome panel up");
-        assert!(app.met_at.is_none(), "the summon point outlived its panel");
-        pointer_frame(&ctx, &mut app, Vec::new());
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(app.met_menu.is_some(), "a third Cmd+M did not open the panel again");
-        assert_eq!(app.met_at, Some(stage.center()), "the panel did not open in the middle again");
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::CTRL);
-        assert!(app.met_menu.is_none(), "Ctrl+M left the metronome panel up");
-        assert_eq!(app.hist_at, before, "opening and closing the panel left moments");
-        let _ = std::fs::remove_dir_all(&root);
+        use crate::recorder_panel::MetHit;
+        let cmd = egui::Modifiers::COMMAND;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, stage) = met_surface_up("metchord", desk);
+            // Where the chord must open it, asked of the surface's own door:
+            // the middle of the timeline, or a click on the chip, whose panel
+            // its X then puts away.
+            let opens = if desk {
+                let chip = click_chip_at(&app);
+                click_with(&ctx, &mut app, chip, egui::Modifiers::NONE);
+                assert!(app.met_menu.is_some(), "fixture: a click on the chip did not open the panel");
+                let anchor = app.met_anchor(stage);
+                let at = recorder_panel::met_popup_rect(stage, anchor);
+                click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Close), egui::Modifiers::NONE);
+                assert!(app.met_menu.is_none(), "fixture: the X did not put the panel away");
+                at
+            } else {
+                let middle = Rect::from_center_size(stage.center(), Vec2::splat(1.0));
+                recorder_panel::met_popup_rect(stage, middle)
+            };
+            assert!(opens.is_positive(), "fixture: on {on} the panel has no room");
+            let summoned = if desk { None } else { Some(stage.center()) };
+            let before = app.hist_at;
+
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_some(), "on {on} Cmd+M did not open the metronome panel");
+            assert_eq!(app.met_at, summoned, "on {on} Cmd+M left the wrong summon point");
+            assert_eq!(
+                recorder_panel::met_popup_rect(stage, app.met_anchor(stage)),
+                opens,
+                "on {on} Cmd+M opened the panel somewhere else"
+            );
+            key_tap(&ctx, &mut app, egui::Key::M, cmd | egui::Modifiers::SHIFT);
+            assert!(app.met_menu.is_some(), "on {on} Cmd+Shift+M, the master row's chord, closed the panel");
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "on {on} a second Cmd+M left the metronome panel up");
+            assert!(app.met_at.is_none(), "on {on} the summon point outlived its panel");
+            pointer_frame(&ctx, &mut app, Vec::new());
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_some(), "on {on} a third Cmd+M did not open the panel again");
+            assert_eq!(
+                recorder_panel::met_popup_rect(stage, app.met_anchor(stage)),
+                opens,
+                "on {on} the third Cmd+M did not open the panel where the first did"
+            );
+            key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::CTRL);
+            assert!(app.met_menu.is_none(), "on {on} Ctrl+M left the metronome panel up");
+            assert_eq!(app.hist_at, before, "on {on} opening and closing the panel left moments");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// **Cmd+M closes the panel through its own BEATS or NOTE and lands
-    /// what was typed**, and nothing else typed reaches a shortcut.
+    /// what was typed**, over the timeline and over the desk, and nothing
+    /// else typed reaches a shortcut.
     ///
     /// A field holds every key, and the chord is the one the panel's own two
     /// let by: a command is no character a number takes. It leaves by the
@@ -75842,44 +75996,113 @@ mod tests {").expect("the tests module")];
     /// typed first, while the song plays, are the field's alone: the theory
     /// band does not change and the transport hears nothing.
     ///
-    /// Revert-check, performed: hold the chord for every open field (the
+    /// Revert-checks, all performed: hold the chord for every open field (the
     /// view's `keys_ok`, as the open asks) and the panel stays up with BEATS
-    /// open.
+    /// open on both surfaces; take the desk's close out and it stays up
+    /// there; drop the field as the chord shuts the panel, as the old press
+    /// away did, and the typed 12 is lost on both.
     #[test]
     fn cmd_m_lands_a_typed_metronome_field_as_it_closes_the_panel() {
         use crate::recorder_panel::MetHit;
         use recorder::NumField as F;
         use recorder::TimeSignature as Sig;
-        let (ctx, mut app, root, stage, anchor) = met_panel_up("metchordfield", false);
-        app.recorder.playing = true;
-        let theory = app.settings.theory_order.clone();
-        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
-        while app.take_recorder_request().is_some() {}
-        let before = app.hist_at;
-        type_keys(&ctx, &mut app, "12 ");
-        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("12"), "fixture: BEATS did not take the digits");
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(app.met_menu.is_none(), "Cmd+M did not close the panel through its own BEATS");
-        assert!(app.num_edit.is_none(), "BEATS outlived its panel");
-        assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "Cmd+M threw the typed 12 away");
-        assert_eq!(app.hist_at, before + 1, "the typed beats are not one moment");
-        assert_eq!(app.settings.theory_order, theory, "a digit typed into BEATS reached the theory band");
-        assert!(app.take_recorder_request().is_none(), "Space typed into BEATS reached the transport");
+        let cmd = egui::Modifiers::COMMAND;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, stage, anchor) = met_panel_up("metchordfield", desk);
+            app.recorder.playing = true;
+            let theory = app.settings.theory_order.clone();
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+            while app.take_recorder_request().is_some() {}
+            let before = app.hist_at;
+            type_keys(&ctx, &mut app, "12 ");
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| e.text.as_str()),
+                Some("12"),
+                "fixture: on {on} BEATS did not take the digits"
+            );
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "on {on} Cmd+M did not close the panel through its own BEATS");
+            assert!(app.num_edit.is_none(), "on {on} BEATS outlived its panel");
+            assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "on {on} Cmd+M threw the typed 12 away");
+            assert_eq!(app.hist_at, before + 1, "on {on} the typed beats are not one moment");
+            assert_eq!(app.settings.theory_order, theory, "on {on} a digit typed into BEATS reached the theory band");
+            assert!(app.take_recorder_request().is_none(), "on {on} Space typed into BEATS reached the transport");
 
-        // NOTE, refused: a 3 is no note value.
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(app.met_menu.is_some(), "fixture: the panel did not come back");
-        pointer_frame(&ctx, &mut app, Vec::new());
-        let anchor = app.met_anchor(stage);
-        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetUnit)), egui::Modifiers::NONE);
-        type_keys(&ctx, &mut app, "3");
-        let before = app.hist_at;
-        key_tap(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
-        assert!(app.met_menu.is_none(), "Cmd+M did not close the panel through its own NOTE");
-        assert!(app.num_edit.is_none(), "NOTE outlived its panel");
-        assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "a note value of 3 was not refused");
-        assert_eq!(app.hist_at, before, "a refused note value was a moment");
-        let _ = std::fs::remove_dir_all(&root);
+            // NOTE, refused: a 3 is no note value.
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_some(), "fixture: on {on} the panel did not come back");
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let anchor = app.met_anchor(stage);
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetUnit)), egui::Modifiers::NONE);
+            type_keys(&ctx, &mut app, "3");
+            let before = app.hist_at;
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "on {on} Cmd+M did not close the panel through its own NOTE");
+            assert!(app.num_edit.is_none(), "on {on} NOTE outlived its panel");
+            assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "on {on} a note value of 3 was not refused");
+            assert_eq!(app.hist_at, before, "on {on} a refused note value was a moment");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **A dialog or a field holds Cmd/Ctrl+M, over the desk as over the
+    /// timeline**, as they hold every key.
+    ///
+    /// The About box, raised by its own key with the panel up: the chord
+    /// leaves the panel up under it, and closes it once the box has gone.
+    /// With the panel shut and the box up, the chord opens nothing. The
+    /// band's tempo typed with the panel shut: the chord opens nothing, the
+    /// tempo stays open, and the digits typed next are the tempo's.
+    ///
+    /// A field outside the panel can never be open while it hangs over the
+    /// desk: it takes every press there, and the press on the chip that
+    /// opens it lands every field. So the close's own field rule is held on
+    /// the timeline (`a_field_outside_the_metronome_panel_holds_its_chord`),
+    /// through the one `met_chord_closes` both surfaces ask.
+    ///
+    /// Revert-checks, both performed: drop the dialog from
+    /// `met_chord_closes` and the chord shuts the panel under the box on both
+    /// surfaces; drop the open field from `met_chord_opens` and it opens the
+    /// panel over the tempo being typed on both.
+    #[test]
+    fn a_dialog_or_a_field_holds_cmd_m_on_either_surface() {
+        use recorder::NumField as F;
+        let cmd = egui::Modifiers::COMMAND;
+        let about = |app: &TangentApp| matches!(app.dialog, Some(Dialog::About { .. }));
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, _stage) = met_surface_up("metchordhold", desk);
+
+            // The panel up, and the About box raised over it by A.
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_some(), "fixture: on {on} Cmd+M did not open the panel");
+            key_tap(&ctx, &mut app, egui::Key::A, egui::Modifiers::NONE);
+            assert!(about(&app), "fixture: on {on} A did not raise the About box");
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_some(), "on {on} Cmd+M closed the panel under the About box");
+            app.dialog = None;
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "fixture: on {on} Cmd+M did not close the panel once the box was gone");
+
+            // The panel shut, and the box up: nothing opens.
+            key_tap(&ctx, &mut app, egui::Key::A, egui::Modifiers::NONE);
+            assert!(about(&app), "fixture: on {on} A did not raise the About box again");
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "on {on} Cmd+M opened the panel under the About box");
+            app.dialog = None;
+
+            // The tempo being typed: nothing opens, and the keys stay its.
+            let tempo = band_point(&app, recorder_panel::Hit::Type(F::Tempo));
+            click_with(&ctx, &mut app, tempo, egui::Modifiers::NONE);
+            assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "fixture: on {on} the tempo did not open");
+            key_tap(&ctx, &mut app, egui::Key::M, cmd);
+            assert!(app.met_menu.is_none(), "on {on} Cmd+M opened the panel over the tempo being typed");
+            assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "on {on} Cmd+M took the tempo's field away");
+            type_keys(&ctx, &mut app, "97");
+            assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("97"), "on {on} the tempo stopped taking keys");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// **A field outside the metronome panel holds its chord**, as it holds
@@ -75888,7 +76111,10 @@ mod tests {").expect("the tests module")];
     /// The tempo typed into the band and left open while the panel was
     /// right-clicked up from the toolbar: Cmd+M leaves the panel up and the
     /// tempo taking keys, and the digits typed next are the tempo's. Only
-    /// the panel's own BEATS and NOTE let the chord by.
+    /// the panel's own BEATS and NOTE let the chord by. The timeline's alone:
+    /// over the desk no hand can leave a field open under the panel (see
+    /// `a_dialog_or_a_field_holds_cmd_m_on_either_surface`), and the rule is
+    /// `met_chord_closes`, which both surfaces ask.
     ///
     /// Revert-check, performed: let the chord by whatever field is open and
     /// it closes the panel over the tempo being typed.
@@ -75921,8 +76147,9 @@ mod tests {").expect("the tests module")];
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **A held Cmd+M is one press**: the OS's repeats of the chord neither
-    /// close the panel the press opened nor open the one it closed.
+    /// **A held Cmd+M is one press, over the timeline and over the desk**:
+    /// the OS's repeats of the chord neither close the panel the press
+    /// opened nor open the one it closed.
     ///
     /// `key_pressed` counts every repeat. While the close never ran that
     /// did no harm, since the panel took every repeat after the press that
@@ -75931,67 +76158,70 @@ mod tests {").expect("the tests module")];
     /// chance, and a chord that closed the panel over BEATS opened it again
     /// on its first repeat. The beats typed there land once, one moment.
     ///
-    /// Revert-checks, both performed: read the chord with `key_pressed`
-    /// again and the first repeat closes the panel the press opened; with
-    /// the two holds before it cut, the first repeat of the chord that
-    /// closed the panel over BEATS opens it again.
+    /// Revert-checks, all performed: read the chord with `key_pressed` again
+    /// and the first repeat closes the panel the press opened, on both
+    /// surfaces; with the two holds before it cut, the first repeat of the
+    /// chord that closed the panel over BEATS opens it again, on both.
     #[test]
     fn a_held_cmd_m_opens_or_closes_the_metronome_panel_once() {
         use crate::recorder_panel::MetHit;
         use recorder::NumField as F;
         use recorder::TimeSignature as Sig;
-        let root = project_scratch("metchordheld");
-        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        app.bootstrap_project(&root.join("Projects"));
-        app.arrangement_open = true;
-        pointer_frame(&ctx, &mut app, Vec::new());
-        app.arr_save_edits();
-        app.commit_view_change();
         let cmd = egui::Modifiers::COMMAND;
         let m = egui::Key::M;
-        let before = app.hist_at;
+        for desk in [false, true] {
+            let on = if desk { "the desk" } else { "the timeline" };
+            let (ctx, mut app, root, stage) = met_surface_up("metchordheld", desk);
+            let before = app.hist_at;
 
-        // Held from shut: the press opens it and the repeats leave it up.
-        key_event(&ctx, &mut app, m, cmd, true, false);
-        assert!(app.met_menu.is_some(), "Cmd+M did not open the panel");
-        for n in 1..=6 {
-            key_event(&ctx, &mut app, m, cmd, true, true);
-            assert!(app.met_menu.is_some(), "repeat {n} of a held Cmd+M closed the panel it opened");
-        }
-        key_event(&ctx, &mut app, m, cmd, false, false);
-        assert!(app.met_menu.is_some(), "letting go of Cmd+M closed the panel");
+            // Held from shut: the press opens it and the repeats leave it up.
+            key_event(&ctx, &mut app, m, cmd, true, false);
+            assert!(app.met_menu.is_some(), "on {on} Cmd+M did not open the panel");
+            for n in 1..=6 {
+                key_event(&ctx, &mut app, m, cmd, true, true);
+                assert!(app.met_menu.is_some(), "on {on} repeat {n} of a held Cmd+M closed the panel it opened");
+            }
+            key_event(&ctx, &mut app, m, cmd, false, false);
+            assert!(app.met_menu.is_some(), "on {on} letting go of Cmd+M closed the panel");
 
-        // Held from open: the press closes it and the repeats leave it shut.
-        key_event(&ctx, &mut app, m, cmd, true, false);
-        assert!(app.met_menu.is_none(), "a fresh Cmd+M did not close the panel");
-        for n in 1..=6 {
-            key_event(&ctx, &mut app, m, cmd, true, true);
-            assert!(app.met_menu.is_none(), "repeat {n} of a held Cmd+M opened the panel it closed");
-        }
-        key_event(&ctx, &mut app, m, cmd, false, false);
-        assert_eq!(app.hist_at, before, "the held chord left moments");
+            // Held from open: the press closes it and the repeats leave it shut.
+            key_event(&ctx, &mut app, m, cmd, true, false);
+            assert!(app.met_menu.is_none(), "on {on} a fresh Cmd+M did not close the panel");
+            for n in 1..=6 {
+                key_event(&ctx, &mut app, m, cmd, true, true);
+                assert!(app.met_menu.is_none(), "on {on} repeat {n} of a held Cmd+M opened the panel it closed");
+            }
+            key_event(&ctx, &mut app, m, cmd, false, false);
+            assert_eq!(app.hist_at, before, "on {on} the held chord left moments");
 
-        // BEATS typed, and the chord held to close the panel over it.
-        key_tap(&ctx, &mut app, m, cmd);
-        assert!(app.met_menu.is_some(), "fixture: the panel did not come back");
-        pointer_frame(&ctx, &mut app, Vec::new());
-        let stage = app.met_stage().expect("the panel's surface is not laid out");
-        let anchor = app.met_anchor(stage);
-        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
-        type_keys(&ctx, &mut app, "7");
-        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("7"), "fixture: BEATS did not take the 7");
-        let before = app.hist_at;
-        key_event(&ctx, &mut app, m, cmd, true, false);
-        assert!(app.met_menu.is_none(), "Cmd+M did not close the panel over BEATS");
-        for n in 1..=6 {
-            key_event(&ctx, &mut app, m, cmd, true, true);
-            assert!(app.met_menu.is_none(), "repeat {n} of the chord opened again the panel it closed over BEATS");
+            // BEATS typed, and the chord held to close the panel over it.
+            key_tap(&ctx, &mut app, m, cmd);
+            assert!(app.met_menu.is_some(), "fixture: on {on} the panel did not come back");
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let anchor = app.met_anchor(stage);
+            click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+            type_keys(&ctx, &mut app, "7");
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| e.text.as_str()),
+                Some("7"),
+                "fixture: on {on} BEATS did not take the 7"
+            );
+            let before = app.hist_at;
+            key_event(&ctx, &mut app, m, cmd, true, false);
+            assert!(app.met_menu.is_none(), "on {on} Cmd+M did not close the panel over BEATS");
+            for n in 1..=6 {
+                key_event(&ctx, &mut app, m, cmd, true, true);
+                assert!(
+                    app.met_menu.is_none(),
+                    "on {on} repeat {n} of the chord opened again the panel it closed over BEATS"
+                );
+            }
+            key_event(&ctx, &mut app, m, cmd, false, false);
+            assert!(app.num_edit.is_none(), "on {on} BEATS outlived its panel");
+            assert_eq!(app.time_signature(), Sig { beats: 7, unit: 4 }, "on {on} the typed 7 did not land");
+            assert_eq!(app.hist_at, before + 1, "on {on} the typed beats are not one moment");
+            let _ = std::fs::remove_dir_all(&root);
         }
-        key_event(&ctx, &mut app, m, cmd, false, false);
-        assert!(app.num_edit.is_none(), "BEATS outlived its panel");
-        assert_eq!(app.time_signature(), Sig { beats: 7, unit: 4 }, "the typed 7 did not land");
-        assert_eq!(app.hist_at, before + 1, "the typed beats are not one moment");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── the varispeed range's typed ends ────────────────────────────────────
