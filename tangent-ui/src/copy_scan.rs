@@ -567,10 +567,10 @@ enum Reads {
 /// that puts it there is the authority if the two ever disagree.
 ///
 /// Not here, each for its reason: the licence texts nobody here wrote
-/// (`LICENSE`'s MIT grant, `LICENSE-GPL-3.0`, the fonts' `OFL.txt`, the
-/// ffmpeg licences fetched beside its binary), which are quoted law and not
-/// ours to reword; and the macOS package's `postinstall`, which prints
-/// nothing and is shown to no one.
+/// (`LICENSE`'s MIT grant, the fonts' `OFL.txt`, the ffmpeg licences
+/// fetched beside its binary), which are quoted law and not ours to reword;
+/// and the macOS package's `postinstall`, which prints nothing and is shown
+/// to no one.
 const SHIPPED: [(&str, Reads); 12] = [
     // The licence page of the macOS installer and of the Windows one (as
     // LICENSE.txt), and the Linux tarball (build-installer.sh).

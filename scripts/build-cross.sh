@@ -432,9 +432,7 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   #
   # `build-installer.sh` copied this in and this path never did, so every
   # tarball built here shipped a readme whose Linux section says
-  # `./install.sh` next to a directory that did not contain one. The script
-  # handles an app-only archive: the plugin is added by the installer path,
-  # and its absence here is a note rather than a failure.
+  # `./install.sh` next to a directory that did not contain one.
   cp installer/linux/install.sh "$stage/install.sh" || { rm -rf "$stage"; return 1; }
   chmod 0755 "$stage/install.sh" || { rm -rf "$stage"; return 1; }
   # **Everything the readme promises is actually here.** The readme is one

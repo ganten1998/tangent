@@ -97,6 +97,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the recording captures each track by its row, and the export writes each
   one by its row.
 
+- **The installers go straight to installing Tangent.** The macOS installer
+  no longer opens on a list of components with only Tangent in it, and the
+  Windows installer no longer has a components page. Their pages, and the
+  Linux `install.sh --help`, describe Tangent alone.
+
 ### Fixed
 
 - **Routes follow their tracks.** Moving a track left every route to and
@@ -489,9 +494,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   clip was measured over parts of its file it never plays, so a take could
   come up by almost nothing, or past the -1 dBFS normalize aims for.
 
-- **One key press with a pedal window open over an amp acts once.** In the
-  plugin, or with child windows off, T skipped a theme and Space sent the
-  transport two commands.
+- **One key press with a pedal window open over an amp acts once.** With
+  child windows off, T skipped a theme and Space sent the transport two
+  commands.
 
 - **The export and glue no longer stretch a clip past the length playback
   allows.** A clip whose stretch would make it longer than 20 minutes
@@ -642,8 +647,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   press.
 
 - **Normalising says why where it cannot.** In a build without the audio
-  engine, and in the plugin, Cmd/Ctrl+Shift+N on an audio clip did nothing
-  and said nothing.
+  engine, Cmd/Ctrl+Shift+N on an audio clip did nothing and said nothing.
 
 - **The quantize message counts the clip's own attacks.** "Quantized N of M
   attacks" counted every attack in the take's whole file, so a split or
@@ -772,7 +776,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **The Themes menu fits a short window.** A hover menu taller than the
   screen now shrinks its rows to fit, as the main menu already did,
-  instead of running off the bottom of a small plugin editor.
+  instead of running off the bottom.
 
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
   small one.** A new row in the audio setup panel, beside the buffer size,
@@ -1196,10 +1200,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   window's size back to 100% in the settings and left the window as it was
   until the next launch. It resizes it at once now, and undoing the reset
   puts the window back.
-
-- **In the plugin, Reset Everything no longer turns on a recorder band.**
-  The plugin has no recorder to fill one, and nothing in its menus could
-  turn the band off again.
 
 - **The settings panel behaves.** DONE no longer also places the playhead
   in the song under it, a signature typed into SIG is kept when you click

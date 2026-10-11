@@ -30059,10 +30059,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the strip, so the press has to be answered.
     fn save_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
-            self.track.error =
-                "there is no file panel in a plugin; save this kit from the \
-                 Tangent app"
-                    .to_owned();
+            self.track.error = "there is no file panel here to save this kit with".to_owned();
             return;
         }
         // The panel of a removed track has no track to be named for.
@@ -30393,10 +30390,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// wearing the first one's apology.
     fn load_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
-            self.track.error =
-                "there is no file panel in a plugin; load this kit from the \
-                 Tangent app"
-                    .to_owned();
+            self.track.error = "there is no file panel here to load a kit with".to_owned();
             return;
         }
         self.file_request = Some(crate::ports::FileRequest {
@@ -39669,9 +39663,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // takes a press in silence is worse than one that is missing.
                 if !self.caps.native_file_dialogs {
                     self.set_bank_note(
-                        "there is no file panel in a plugin; save this bank from \
-                         the Tangent app"
-                            .to_owned(),
+                        "there is no file panel here to save this bank with".to_owned(),
                     );
                     return;
                 }
@@ -58926,7 +58918,7 @@ mod tests {
         let Some(Dialog::PatchPicker { note, .. }) = &app.dialog else {
             panic!("the picker closed")
         };
-        assert!(note.contains("plugin"), "the press was taken in silence: {note:?}");
+        assert!(note.contains("no file panel"), "the press was taken in silence: {note:?}");
 
         let (_, mut app) = headless(Caps::DESKTOP);
         app.apply_dialog_action(DialogAction::SaveBank { slot: 2 });

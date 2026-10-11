@@ -3,13 +3,12 @@
 ; Built from macOS with `makensis` (brew install makensis); scripts/build-installer.sh
 ; passes SRCDIR, OUTFILE and VERSION on the command line.
 ;
-; One component, the application:
-;   Standalone -> $PROGRAMFILES64\Tangent
+; It installs the application, to $PROGRAMFILES64\Tangent.
 ;
-; The VST3 plugin was retired on 2026-08-24. Installers before that also
-; wrote $COMMONFILES64\VST3\Tangent.vst3 (C:\Program Files\Common Files\VST3,
-; where every host scans without being configured); this installer and its
-; uninstaller only remove that bundle, so no host keeps finding a stale build.
+; Installers before 4.77.0 could also write $COMMONFILES64\VST3\Tangent.vst3
+; (C:\Program Files\Common Files\VST3, which every program that loads VST3
+; scans without being told to). This installer and its uninstaller only
+; remove that leftover, so nothing keeps finding it.
 
 Unicode true
 !include "MUI2.nsh"
@@ -79,7 +78,6 @@ VIAddVersionKey "LegalCopyright" "MIT"
 !define MUI_UNICON "${ICON}"
 
 !define MUI_ABORTWARNING
-!define MUI_COMPONENTS_TEXT_TOP "Tangent installs as one application."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\tangent.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open Tangent now"
 !define MUI_FINISHPAGE_TEXT "Hold H in Tangent to see every keyboard shortcut."
@@ -89,7 +87,6 @@ VIAddVersionKey "LegalCopyright" "MIT"
 ; paths and keep their backslashes — the two are not the same thing and
 ; mixing them up produces "open failed" on a path with both.
 !insertmacro MUI_PAGE_LICENSE "${SRCDIR}/LICENSE.txt"
-!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -108,9 +105,10 @@ Section "Tangent application" SEC_APP
   SetOutPath "$INSTDIR"
   File /r "${SRCDIR}/app/*.*"
 
-  ; The VST3 plugin was retired 2026-08-24; old installers planted it in the
-  ; system VST3 directory and nothing ever cleaned it up, so other DAWs (and
-  ; Tangent's own scanner) kept finding a stale build. Upgrades remove it.
+  ; The Tangent.vst3 an installer before 4.77.0 could leave in the system
+  ; VST3 folder: nothing else ever removes it, so every program that scans
+  ; that folder (Tangent's own scanner too) kept finding it. Upgrades remove
+  ; it.
   RMDir /r "$COMMONFILES64\VST3\Tangent.vst3"
 
   CreateDirectory "$SMPROGRAMS\Tangent"
@@ -135,16 +133,11 @@ Section "Tangent application" SEC_APP
 SectionEnd
 
 Section -Uninstaller
-  ; Always written, so there is always a way back out. $INSTDIR exists
-  ; either way because SetOutPath created it.
+  ; Always written, so there is always a way back out. SetOutPath makes sure
+  ; $INSTDIR exists before the uninstaller is written into it.
   SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
-
-!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_APP} \
-    "The standalone app. Opens its own window and connects to a MIDI keyboard by itself."
-  !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; **${RunningX64} is a plug-in call.** x64.nsh spells it as System::Call, so
 ; the installer unpacks NSIS's System.dll into $PLUGINSDIR and loads it, and
@@ -188,7 +181,7 @@ SectionEnd
 
 !insertmacro MUI_UNFUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_APP} \
-    "The program and its shortcuts (and any VST3 plug-in an older installer left behind). Always removed."
+    "The program and its shortcuts, and a folder older Tangent installers left in Common Files. Always removed."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_SETTINGS} \
     "Everything under %USERPROFILE%\.config\tangent: settings, taught chord names, the supporter key, logs. Leave this off to keep them for the next install."
 !insertmacro MUI_UNFUNCTION_DESCRIPTION_END
