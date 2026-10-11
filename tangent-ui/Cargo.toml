@@ -51,7 +51,7 @@ ttf-parser = "0.25"
 # crate's `cfg(test)` cannot, since it does not reach the tangent-core these
 # tests link, which read the real `~/.config/tangent` (the taught chords, for
 # every app a test built). A dev-dependency's features reach test builds
-# alone (resolver 2), so the plugin, which links this crate, never carries
+# alone (resolver 2), so the binary, which links this crate, never carries
 # it; `scripts/check-home.sh features` proves that.
 tangent-core = { path = "../tangent-core", features = ["test-home"] }
 
