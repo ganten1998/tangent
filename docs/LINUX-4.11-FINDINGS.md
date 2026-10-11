@@ -196,7 +196,7 @@ what changed on dresden, and how to undo it
   
   |  | pipewire.conf.d/10-audio.conf | A/B-tested both rates, settled on 44100 / quantum 512 — matches Tangent's fixed 44.1k stream (zero resampling) and the Qtractor sessions. Verified: native 256/44100 stream, sound playing, 0 underruns. The stale "48000/1024" comment that drove the per-session flipping is rewritten; the ritual is obsolete — rate was never the lever.
   
-  |  | ~/.vst3/Tangent.vst3 | Left in place (Aug 18, 4.4.1-era). Delete or rebuild it when the 4.11 plugin ships; until finding 3 lands it will keep appearing as a dead "Tangent" row in the picker.
+  |  | ~/.vst3/Tangent.vst3 | Left in place (Aug 18, 4.4.1-era). Delete or rebuild it when the 4.11 plugin ships; until finding 3 lands it will keep appearing as a dead "Tangent" row in the picker. *(Later: the plugin was retired at 4.77.0 and its crate removed on 2026-10-10; the scanner diverts a stray `Tangent.vst3` and the Linux installer removes one, so delete it.)*
   
   |  | ~/tangent-build | Still at 4.4.1 — the 4.11.x source isn't on this machine. Sync it over if Linux-side debugging is expected again.
   

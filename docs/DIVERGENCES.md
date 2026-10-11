@@ -566,9 +566,9 @@ that it did not panic.
   keyboard are not ours to drop, and would return on the next frame anyway.
 - **The card is drawn in the CANVAS**, not in a child window: painted directly
   rather than via `egui::Window`, so it cannot be dragged off or resized into
-  nothing. It is also the first surface in this app that already works in a
-  VST3 editor, where no child viewport can exist, and it is the shape the rest
-  will move to (docs/PLUGIN-PLAN.md).
+  nothing. (It was written as the first surface that worked in a VST3 editor,
+  for the plugin build that stopped shipping at 4.77.0 and was removed on
+  2026-10-10.)
 
 **One finger per string.** Clicking a fret on a string that already holds a
 placed note MOVES that note rather than adding a second, because a string can
