@@ -48533,15 +48533,16 @@ mod memory_inputs {
         }
     }
 
-    /// **A hundred and twenty stems are written under names that sort in
-    /// desk order** (W5, done when: "a 120-stem export writes 3-digit names
-    /// that sort"). A hundred and twenty lanes, each with a clip, the tap
-    /// armed for every one through the export's own door, each stem written
-    /// by the WAV writer under `stem_file_name`, and the folder listed:
-    /// sorted by name it is the desk's order. At two digits the hundredth
-    /// sorted between the tenth and the eleventh.
+    /// **A hundred and twenty stems of one name are a hundred and twenty
+    /// files** (W5: "a 120-stem export" writes every stem). A hundred and
+    /// twenty lanes, each with a clip and every track called " Lane ", the
+    /// tap armed for every one through the export's own door, each stem
+    /// written by the WAV writer under the name `stem_file_names` gives it,
+    /// and the folder listed: every file is there, named for its track, and
+    /// none was written over another. The names used to be `001-Lane.wav`;
+    /// they are the track's now, a number telling two of one name apart.
     #[test]
-    fn a_hundred_and_twenty_stems_are_written_under_names_that_sort() {
+    fn a_hundred_and_twenty_stems_of_one_name_are_a_hundred_and_twenty_files() {
         const LANES: usize = 120;
         let mut e = engine_with(LANES, audio(), LaneFlags::MIDI_OFF);
         let clips = (0..LANES).map(|s| clip_on(&e, s, 0x100 + s as u32)).collect();
@@ -48559,8 +48560,8 @@ mod memory_inputs {
         };
         let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::from_unix(0, 0), spec);
         let mut written = Vec::new();
-        for row in 0..LANES {
-            let name = crate::desktop::stem_file_name(row, " Lane ");
+        let names = crate::desktop::stem_file_names(&vec![" Lane "; LANES]);
+        for (row, name) in names.into_iter().enumerate() {
             let mut w = tangent_record::wav::WavWriter::create(&dir.join(&name), spec, &bext).expect("a stem");
             let own = stem(&e, &stems, row);
             assert!(own.iter().any(|v| *v != 0.0), "row {row}'s stem is silent");
@@ -48574,8 +48575,10 @@ mod memory_inputs {
             .map(|f| f.file_name().to_string_lossy().into_owned())
             .collect();
         listed.sort();
-        assert_eq!(listed, written, "the stems do not sort in desk order");
-        assert_eq!((listed[0].as_str(), listed[99].as_str()), ("001-Lane.wav", "100-Lane.wav"));
+        written.sort();
+        assert_eq!(listed, written, "a stem was written over another, or under another name");
+        assert_eq!(listed.len(), LANES);
+        assert!(listed.contains(&"Lane.wav".to_owned()) && listed.contains(&"Lane 120.wav".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

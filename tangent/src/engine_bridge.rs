@@ -288,6 +288,10 @@ pub fn full_build_with(
     // and stores every fader, pan, send and keyboard knob by slot: the live
     // engine's own road, with the offline differences as a `Shape`.
     let mut bridge = Bridge::new();
+    // An export of selected tracks hears those alone, on this plan only.
+    if let BuildFor::Export(spec) = &build {
+        bridge.set_left_out(export_left_out(app, spec));
+    }
     let shape = Shape::Offline {
         freeze,
         probe: probe.then_some(&ctx.probe),
@@ -452,7 +456,7 @@ pub fn full_build_with(
     match &build {
         BuildFor::Export(spec) => {
             let slots: Vec<Slot> =
-                stem_files(app).iter().filter_map(|(row, _)| bridge.lane(*row)).map(|l| l.slot).collect();
+                stem_files(app, spec).iter().filter_map(|(row, _)| bridge.lane(*row)).map(|l| l.slot).collect();
             arm_stem_tap(&e, spec.stems, &slots, spec.stems_dry);
         }
         BuildFor::Freeze(_) => {
@@ -467,31 +471,88 @@ pub fn full_build_with(
     Ok(Built { engine: e, bridge })
 }
 
-/// **The stems an export writes, and what each file is called**, by ROW:
-/// only the rows with something to SAY - clips, or an instrument in a bay
-/// (the DX7, the drumpad, an SD3 following the transport). A kind with
-/// neither is an armed input that renders silence offline, and a folder of
-/// silent WAVs reads as a bug. `NNN-<track name>.wav` (`stem_file_name`),
-/// the name made safe for a file system. The caller binds each row to its lane through the bridge
-/// at the press (design 7.13: stems bind `(slot, gen)` at the press).
-pub fn stem_files(app: &TangentApp) -> Vec<(usize, String)> {
+/// **The stems an export writes, and what each file is called**, by ROW,
+/// in desk order: only the rows with something to SAY - clips, an
+/// instrument or any unit in a bay (the DX7, the drumpad, an SD3 following
+/// the transport), or a bus, which is a mix of what reaches it. A kind with
+/// none of those is an armed input that renders silence offline, and a
+/// folder of silent WAVs reads as a bug (a used lane that never sounds is
+/// still dropped at the finish, see `desktop::StemWriter`).
+///
+/// **Never a folder.** A folder's stem is its children summed, so a stems
+/// pass that wrote one shipped every child twice; the children are written
+/// on their own instead. A bus and a return are real mixes of their own
+/// (what is SENT to them, not what sits under them) and keep their stems.
+///
+/// **Only the checked tracks** when the export names some
+/// (`ProjectExportSpec::tracks`), by identity - named as they would be in
+/// an export of everything, so a track's file has one name.
+///
+/// Each file is named for its TRACK, `<track name>.wav`, through
+/// `desktop::stem_file_names`: made safe for every file system, and two
+/// tracks of one name are told apart by a number. Both export roads and
+/// the export window's rows read their names from here. The caller binds
+/// each row to its lane through the bridge at the press (design 7.13: stems
+/// bind `(slot, gen)` at the press).
+pub fn stem_files(app: &TangentApp, spec: &ExportSpec) -> Vec<(usize, String)> {
     let clips = &app.arrangement().clips;
-    (0..app.desk_extent())
+    let rows: Vec<usize> = (0..app.desk_extent())
+        .filter(|&row| !app.is_folder(row))
         .filter(|&row| {
             clips.iter().any(|c| c.lane == row)
+                || app.is_bus(row)
                 || app.track_at(row).is_some_and(|id| {
                     (0..tangent_ui::desk_id::BAYS as u8).any(|b| track_bay(app, id, Rack::Chain(0), b).is_some())
                 })
         })
-        .map(|row| {
-            let name: String = app
-                .channel_display_name(row)
-                .chars()
-                .map(|c| if std::path::is_separator(c) { '-' } else { c })
-                .collect();
-            (row, crate::desktop::stem_file_name(row, &name))
+        .collect();
+    let names: Vec<String> = rows
+        .iter()
+        .map(|&row| {
+            let shown = app.channel_display_name(row).trim();
+            if shown.is_empty() {
+                format!("Track {}", row + 1)
+            } else {
+                shown.to_owned()
+            }
         })
+        .collect();
+    // Named over every stem the desk has, THEN narrowed to the checked
+    // ones, so a track's file is called the same whichever tracks an export
+    // takes: the second "Gtr" is `Gtr 2.wav` alone or beside the first.
+    let checked = |row: usize| {
+        spec.tracks
+            .as_ref()
+            .is_none_or(|only| app.track_at(row).is_some_and(|id| only.contains(&id)))
+    };
+    rows.into_iter()
+        .zip(crate::desktop::stem_file_names(&names))
+        .filter(|(row, _)| checked(*row))
         .collect()
+}
+
+/// **The tracks an export of selected tracks leaves out of its MIX**, or
+/// `None` when it leaves out nothing: no selection (everything), or no
+/// master in the pass (a stems-only pass chooses which files it writes and
+/// renders the desk whole, so a bus's stem still carries what every track
+/// sends it).
+///
+/// Every unchecked track, and nothing else: a folder is never left out,
+/// because it is the road its checked children take to the master, and a
+/// bus is never left out, because a checked track routed into it reaches
+/// the master only through it - with the unchecked sources gone, a bus
+/// passes exactly the checked tracks' share. The desk is never written: the
+/// lanes are published [`crate::desk_plan::LaneFlags::LEFT_OUT`] on the
+/// pass's own plan (`Bridge::set_left_out`).
+pub fn export_left_out(app: &TangentApp, spec: &ExportSpec) -> Option<BTreeSet<TrackId>> {
+    let only = spec.tracks.as_ref().filter(|_| spec.master)?;
+    Some(
+        (0..app.desk_extent())
+            .filter(|&row| !app.is_folder(row) && !app.is_bus(row))
+            .filter_map(|row| app.track_at(row))
+            .filter(|id| !only.contains(id))
+            .collect(),
+    )
 }
 
 /// The patch strip `strip`'s DX7 plays, out of its own cartridge, read from
@@ -802,6 +863,14 @@ pub struct Bridge {
     /// two-phase road (RETIRING, then home), which an offline engine skips.
     #[cfg(test)]
     staged: bool,
+    /// **The tracks an export of selected tracks leaves out of its mix**
+    /// ([`export_left_out`]), or `None` for every other plan. Set on the
+    /// offline mirror when it is built and on the live bridge for the
+    /// length of a realtime pass; each of their lanes is published
+    /// [`LaneFlags::LEFT_OUT`] and the desk's solos stand down while it is
+    /// set. The desk itself, its mutes and solos and its undo, is never
+    /// written.
+    left_out: Option<BTreeSet<TrackId>>,
 }
 
 /// What a [`Bridge::sync`] did that the host has to follow.
@@ -849,6 +918,15 @@ impl Synced {
 impl Bridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// **The tracks an export leaves out of its mix**, from here until it is
+    /// set again ([`export_left_out`]): the next plan publishes each of
+    /// their lanes `LEFT_OUT` and the desk's solos stand down, and `None`
+    /// puts the desk back exactly as it plays. Nothing of the app's is
+    /// touched.
+    pub fn set_left_out(&mut self, out: Option<BTreeSet<TrackId>>) {
+        self.left_out = out;
     }
 
     /// A new engine is seated: everything it is told from here on is told
@@ -1491,8 +1569,14 @@ impl Bridge {
         // **The desk by what each strip is** (W5): a row's mute and solo as
         // the engine hears them (a folder's reaching its children), the
         // specials' their own, never an index into a strip-space desk.
+        // **An export of selected tracks**: the checklist is the solo, so
+        // the desk's own solos stand down for its plan (a solo on a track
+        // left out would otherwise silence every track that was checked),
+        // and each track left out is published LEFT_OUT.
+        let subset = self.left_out.as_ref();
         let soloed = |row: usize| {
             freeze.is_none()
+                && subset.is_none()
                 && (app.strip_heard_soloed(StripRef::Row(row)) || probe.is_some_and(|p| p.solo.contains(&row)))
         };
         let muted = |row: usize| freeze.is_none() && app.strip_heard_muted(StripRef::Row(row));
@@ -1515,6 +1599,7 @@ impl Bridge {
                 .with(F::KEYS, midi_ok && holds(tangent_ui::dialogs::KEYS_PATH) && !is_frozen)
                 .with(F::MUTED, muted(row))
                 .with(F::SOLOED, soloed(row))
+                .with(F::LEFT_OUT, subset.is_some_and(|out| out.contains(id)))
                 .with(F::PHASE, app.strip_inverted(StripRef::Row(row)))
                 .with(F::SUSPEND, app.auto_suspended(AutoLane::Row(row)))
                 // **A bus row** (design 9): its rack runs once over what is
@@ -1560,7 +1645,7 @@ impl Bridge {
             let desk_strip = s != StripRef::Master;
             F::default()
                 .with(F::MUTED, desk_strip && freeze.is_none() && app.strip_heard_muted(s))
-                .with(F::SOLOED, desk_strip && freeze.is_none() && app.strip_heard_soloed(s))
+                .with(F::SOLOED, desk_strip && freeze.is_none() && subset.is_none() && app.strip_heard_soloed(s))
                 .with(F::PHASE, app.strip_inverted(s))
                 .with(F::MIDI_OFF, !hears)
         };
@@ -2847,8 +2932,12 @@ mod tests {
         let Built { engine: mut e, bridge } = built;
         let lane = |row: usize| bridge.lane(row).map(|l| l.slot.0 as usize).expect("the row's lane");
         let rate = spec.rate;
-        let span = app.arr_span_s();
-        e.set_transport(1, 0);
+        // The frames `start_offline_render` pulls, from the one function it
+        // asks: the TIME row's span (or the song) plus the tail, at the
+        // varispeed.
+        let ratio = f64::from(app.varispeed_ratio()).clamp(0.5, 2.0);
+        let (first, until) = crate::desktop::export_frames(spec.span, app.arr_span_s(), rate, ratio);
+        e.set_transport(1, first);
         e.set_rolling(true);
         let wav_spec = WavSpec {
             sample_rate: rate,
@@ -2876,15 +2965,13 @@ mod tests {
             files.push((name, path.clone(), WavWriter::create(&path, wav_spec, &bext).expect("freeze"), lane(row), false));
         } else if spec.stems {
             std::fs::create_dir_all(dir.join(spec.stems_folder())).expect("stems dir");
-            for (row, file) in stem_files(app) {
+            for (row, file) in stem_files(app, spec) {
                 let name = format!("{}/{file}", spec.stems_folder());
                 let path = dir.join(&name);
                 files.push((name, path.clone(), WavWriter::create(&path, wav_spec, &bext).expect("stem"), lane(row), false));
             }
         }
         let freeze = freeze.map(lane);
-        let ratio = f64::from(app.varispeed_ratio()).clamp(0.5, 2.0);
-        let until = (((span + 2.0) / ratio) * f64::from(rate)).ceil() as u64;
         let mut block = vec![0.0f32; 1024 * 2];
         let mut scratch = Vec::new();
         let mut fold = Vec::new();
@@ -4275,6 +4362,183 @@ mod tests {
         assert_eq!(files.len(), CHANNELS, "a lane has no stem");
         let silent: Vec<&String> = files.iter().filter(|(_, _, loud)| !loud).map(|(n, ..)| n).collect();
         assert!(silent.is_empty(), "these lanes were not heard: {silent:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the export's TRACKS and TIME rows ───────────────────────────────────
+
+    /// A small desk for the export pickers: two tracks, a folder holding
+    /// two more (both named "Gtr"), and a bus. Every track has a clip;
+    /// `starts` says where each track's clip begins.
+    fn picker_desk(tag: &str, starts: [f64; 4], edit: impl FnOnce(&mut Settings)) -> (PathBuf, TangentApp) {
+        let mut s = blank();
+        kind(&mut s, &[0, 1, 3, 4], ChannelKind::Audio);
+        kind(&mut s, &[5], ChannelKind::Bus);
+        for (row, name) in [(0usize, "Kick"), (1, "Bass"), (2, "Guitars"), (3, "Gtr"), (4, "Gtr"), (5, "Room")] {
+            s.rows[row].name = name.to_owned();
+        }
+        s.rows[2].folder = true;
+        s.rows[3].in_folder = true;
+        s.rows[4].in_folder = true;
+        edit(&mut s);
+        let mut doc = Arrangement::default();
+        for (i, row) in [0usize, 1, 3, 4].into_iter().enumerate() {
+            doc.add_clip(audio(row, &format!("n{i}.wav"), starts[i]));
+        }
+        let c = Corpus { name: "pickers", settings: s, doc, live: vec![], kits: vec![], freeze: vec![] };
+        let dir = scratch(tag);
+        let app = open(&c, &dir);
+        (dir, app)
+    }
+
+    /// One export of `spec` off `app`, its files by name.
+    fn export_of(app: &TangentApp, spec: &ExportSpec, dir: &Path) -> BTreeMap<String, (Vec<u8>, bool)> {
+        let built = full_build(app, RATE, Timebase::new(), BuildFor::Export(spec.clone())).expect("an export");
+        render_files(built, app, spec, None, dir).into_iter().map(|(n, b, loud)| (n, (b, loud))).collect()
+    }
+
+    /// A float WAV's interleaved samples, read straight off its `data`
+    /// chunk.
+    fn wav_samples(bytes: &[u8]) -> Vec<f32> {
+        let at = bytes.windows(4).position(|w| w == b"data").expect("a data chunk");
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("its length")) as usize;
+        bytes[at + 8..at + 8 + len].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().expect("a sample"))).collect()
+    }
+
+    /// **Stems: never a folder, a bus as its own mix, only the checked
+    /// tracks, and each file named for its TRACK.** The owner: "folders
+    /// should not be exported" and "I'd like to see the stems be named
+    /// after the track, not the project". Two tracks of one name are two
+    /// files.
+    #[test]
+    fn stems_leave_out_folders_and_are_named_for_their_tracks() {
+        let (dir, app) = picker_desk("stem-names", [0.0; 4], |_| {});
+        let all = ExportSpec { master: false, stems: true, rate: RATE, ..Default::default() };
+        let files: Vec<(usize, String)> = stem_files(&app, &all);
+        assert_eq!(
+            files,
+            vec![
+                (0, "Kick.wav".to_owned()),
+                (1, "Bass.wav".to_owned()),
+                (3, "Gtr.wav".to_owned()),
+                (4, "Gtr 2.wav".to_owned()),
+                (5, "Room.wav".to_owned()),
+            ],
+            "the folder has a stem, the bus has none, or a name is not its track's"
+        );
+        // Only the checked tracks.
+        let some = ExportSpec { tracks: Some(vec![app.track_at(1).unwrap(), app.track_at(4).unwrap()]), ..all.clone() };
+        assert_eq!(stem_files(&app, &some), vec![(1, "Bass.wav".to_owned()), (4, "Gtr 2.wav".to_owned())]);
+        // And written so: the files a stems pass of those leaves on disk.
+        let out = export_of(&app, &some, &dir.join("out"));
+        let names: Vec<&String> = out.keys().collect();
+        assert_eq!(names, vec!["stems/Bass.wav", "stems/Gtr 2.wav"]);
+        assert!(out.values().all(|(_, loud)| *loud), "a checked stem is silent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A mixdown of selected tracks hears those alone, and touches
+    /// nothing of the desk's.** The master of "Kick" checked is the master
+    /// of the whole desk with every other track MUTED, sample for sample -
+    /// and a solo standing on a track left out does not silence the checked
+    /// one (the checklist is the solo), while the desk's own mutes and solos
+    /// are exactly what they were.
+    #[test]
+    fn a_mixdown_of_selected_tracks_hears_those_alone() {
+        let (dir, app) = picker_desk("subset-mix", [0.0; 4], |s| s.rows[1].solo = true);
+        let kick = app.track_at(0).unwrap();
+        let spec = ExportSpec { rate: RATE, depth: tangent_ui::ports::ExportDepth::Float32, tracks: Some(vec![kick]), ..Default::default() };
+        let left = export_left_out(&app, &spec).expect("something is left out");
+        let out: Vec<usize> = (0..6).filter(|r| left.contains(&app.track_at(*r).unwrap())).collect();
+        assert_eq!(out, vec![1, 3, 4], "the left-out set is not every unchecked track (the folder and the bus carry)");
+        let got = export_of(&app, &spec, &dir.join("subset"));
+        assert!(app.strip_heard_soloed(StripRef::Row(1)), "the export wrote the desk's solo");
+        assert!((0..6).all(|r| !app.strip_heard_muted(StripRef::Row(r))), "the export wrote a mute on the desk");
+        let (dir2, muted) = picker_desk("subset-ref", [0.0; 4], |s| {
+            for r in [1, 3, 4] {
+                s.rows[r].mute = true;
+            }
+        });
+        let all = ExportSpec { tracks: None, ..spec.clone() };
+        let reference = export_of(&muted, &all, &dir2.join("ref"));
+        let whole = export_of(&app, &ExportSpec { tracks: None, ..spec.clone() }, &dir.join("whole"));
+        let mix = |m: &BTreeMap<String, (Vec<u8>, bool)>| m.get("mix.wav").expect("the master").clone();
+        assert!(mix(&got).1, "the checked track was not heard");
+        assert!(mix(&got).0 == mix(&reference).0, "the subset is not the desk with the others muted");
+        assert!(mix(&got).0 != mix(&whole).0, "the subset is the whole desk");
+        // A stems-only pass leaves nothing out of the render: no master,
+        // nothing to leave out of.
+        assert_eq!(export_left_out(&app, &ExportSpec { master: false, stems: true, ..spec.clone() }), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// **The live bridge publishes an export's left-out tracks LEFT_OUT and
+    /// stands the desk's solos down, for as long as it is set** - the road a
+    /// realtime pass takes, through the live engine - and puts the desk back
+    /// exactly when it is cleared.
+    #[test]
+    fn the_live_plan_leaves_an_exports_unchecked_tracks_out_while_it_runs() {
+        let (dir, app) = picker_desk("live-left-out", [0.0; 4], |s| s.rows[1].solo = true);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an engine");
+        let mut b = Bridge::new();
+        b.sync(&app, &mut e);
+        let flags = |b: &Bridge, row: usize| {
+            let slot = b.lane(row).expect("the lane").slot;
+            b.published.as_ref().expect("a plan").lanes.iter().find(|l| l.slot == slot).expect("its lane").flags
+        };
+        assert!(flags(&b, 1).contains(LaneFlags::SOLOED) && !flags(&b, 1).contains(LaneFlags::LEFT_OUT));
+        let spec = ExportSpec { tracks: Some(vec![app.track_at(0).unwrap()]), ..Default::default() };
+        b.set_left_out(export_left_out(&app, &spec));
+        b.sync(&app, &mut e);
+        for row in [1, 3, 4] {
+            assert!(flags(&b, row).contains(LaneFlags::LEFT_OUT), "row {row} was not left out");
+        }
+        for row in [0, 2, 5] {
+            assert!(!flags(&b, row).contains(LaneFlags::LEFT_OUT), "row {row} was left out");
+        }
+        assert!(!flags(&b, 1).contains(LaneFlags::SOLOED), "the desk's solo stood over the checklist");
+        b.set_left_out(None);
+        b.sync(&app, &mut e);
+        assert!(flags(&b, 1).contains(LaneFlags::SOLOED) && !flags(&b, 1).contains(LaneFlags::LEFT_OUT), "the desk did not come back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Each TIME choice renders exactly its frames**: a span starts its
+    /// file at its START (the clip at 1.5 s lands half a second in when the
+    /// span opens at 1.0 s) and runs to its END plus the two-second tail,
+    /// to the frame, where the whole song runs from 0:00 to the song's end
+    /// plus the tail.
+    #[test]
+    fn each_time_choice_renders_exactly_its_frames() {
+        let (dir, app) = picker_desk("time-span", [1.5, 9.0, 9.0, 9.0], |_| {});
+        let base = ExportSpec {
+            rate: RATE,
+            depth: tangent_ui::ports::ExportDepth::Float32,
+            tracks: Some(vec![app.track_at(0).unwrap()]),
+            ..Default::default()
+        };
+        let first_sound = |s: &[f32]| s.chunks_exact(2).position(|f| f[0] != 0.0 || f[1] != 0.0).expect("a sound");
+        let whole = export_of(&app, &base, &dir.join("whole"));
+        let whole = wav_samples(&whole["mix.wav"].0);
+        let song = app.arr_span_s();
+        assert_eq!(whole.len() / 2, (((song + crate::desktop::EXPORT_TAIL_S) * f64::from(RATE)).ceil()) as usize);
+        let at = first_sound(&whole);
+        assert!(at.abs_diff(3 * RATE as usize / 2) <= 1, "the whole song's clip sounds at frame {at}");
+        for (span, from) in [((1.0, 2.0), 1.0), ((1.25, 4.0), 1.25)] {
+            let got = export_of(&app, &ExportSpec { span: Some(span), ..base.clone() }, &dir.join("span"));
+            let got = wav_samples(&got["mix.wav"].0);
+            let want = (((span.1 - span.0 + crate::desktop::EXPORT_TAIL_S) * f64::from(RATE)).ceil()) as usize;
+            assert_eq!(got.len() / 2, want, "{span:?} rendered {} frames", got.len() / 2);
+            let lands = ((1.5 - from) * f64::from(RATE)) as usize;
+            let at = first_sound(&got);
+            assert!(at.abs_diff(lands) <= 1, "{span:?}: the clip sounds at frame {at}, not {lands}");
+            // And it is the same sound the whole render has there.
+            assert!(
+                got[at * 2..at * 2 + 64] == whole[(at + (from * f64::from(RATE)) as usize) * 2..][..64],
+                "{span:?} is not the song from its START"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

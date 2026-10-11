@@ -116,6 +116,20 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Stems are named after their tracks.** Each stem is now
+  `<track name>.wav` in the stems folder of the project's export folder,
+  with no row number in front. Names are made safe for every system the
+  project might travel to, and two tracks with the same name (in any case)
+  are told apart with a number: `Bass.wav`, then `Bass 2.wav`. Both the
+  full-speed and the realtime export name their stems this way, and the
+  export window's rows show the same names as the files.
+
+- **A folder is never exported as a stem.** A folder's stem was its
+  children mixed together, so a stems export wrote every child twice. Now
+  only the tracks inside it get stems. Buses and returns still get their own
+  stems, since they are mixes of what is sent to them. The realtime export
+  now writes exactly the stems the full-speed one does.
+
 - **Tangent Denoise opens on the Bank.** A freshly inserted denoiser, and a
   reset to defaults, now start on the Bank kernel instead of Spectral Studio,
   with the other dials where they were. Saved projects keep the kernel they
