@@ -7469,12 +7469,27 @@ pub fn set_export_stem_mode(spec: &mut crate::ports::ProjectExportSpec, chip: us
 /// to its word (a selectable label), which is why this row needed no fit
 /// when the gridboxes did, and `every_quantize_grid_chip_holds_its_word`
 /// holds it to that for every word in every meter and face.
+///
+/// **Each chip is SAID as the note it is** (`arrangement_panel::grid_spoken`),
+/// and as chosen or not. egui names a selectable label by its text and
+/// leaves its state out, so a screen reader heard the box's shorthand,
+/// "1/2·" for 12/8's dotted half with the dot read aloud and "1/128" for
+/// 4/4's finest, and never which chip was the grid. The name a reader is
+/// given is the last one handed to the chip, so this one, given after the
+/// label's own, is the one it keeps.
+/// `every_quantize_grid_chip_is_said_as_a_note` holds every chip of every
+/// meter to it.
 fn quantize_grid_row(ui: &mut egui::Ui, grid_exp: &mut i8, meter: (u8, u8)) -> Vec<egui::Response> {
     ui.horizontal_wrapped(|ui| {
         let mut chips = Vec::new();
         for e in (-7_i8..=0).rev() {
             let label = crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
-            let chip = ui.selectable_label(*grid_exp == e, label);
+            let chosen = *grid_exp == e;
+            let chip = ui.selectable_label(chosen, label);
+            let said = crate::arrangement_panel::grid_spoken(e, meter.0, meter.1);
+            chip.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, chip.enabled(), chosen, &said)
+            });
             if chip.clicked() {
                 *grid_exp = e;
             }
@@ -22823,6 +22838,84 @@ at: None,
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// **Every Quantize GRID chip is said as the note it is, and as chosen
+    /// or not.**
+    ///
+    /// The chips print the gridboxes' shorthand, and a selectable label is
+    /// named by its text, so a screen reader was given the shorthand: 12/8's
+    /// dotted half as "1/2·", the dot read aloud, 6/8's dotted quarter as
+    /// "1/4·", 4/4's finest chip as "1/128", "one slash one hundred
+    /// twenty-eight". And egui leaves a selectable label's state out of its
+    /// name, so nothing said which chip was the grid. This is the one other
+    /// surface a reader reaches the ladder on, after the arrange gridbox, and
+    /// it says the steps the way that one does (`grid_spoken`).
+    ///
+    /// Read where a reader gets it: what each chip hands egui when the focus
+    /// lands on it, every chip of every one of the 192 signatures, with a
+    /// different chip chosen as the meters go by. A chip is handed its
+    /// label's own name first and then this one, and a reader keeps the
+    /// last; so the last is what is held. Held: it is `grid_spoken` of the
+    /// chip's step, which says no fraction (no slash, no dot); it is a
+    /// selectable label; and it is chosen exactly when its step is the grid.
+    ///
+    /// Revert check, performed: take the chip's own `widget_info` away and
+    /// this fails on the first chip it reads, 1/1's BAR, said "BAR" where
+    /// "1 bar" was due.
+    #[test]
+    fn every_quantize_grid_chip_is_said_as_a_note() {
+        let sigs = crate::arrangement_panel::valid_signatures();
+        assert_eq!(sigs.len(), 192, "the sweep no longer covers every valid signature");
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(430.0, 430.0));
+        // One frame of the row: its chips, and the names they handed egui
+        // as the focus landed. The focus is moved inside the frame, before
+        // the row, which is what makes this the frame a chip GAINS it in (a
+        // request between frames is already the focus the frame begins
+        // with, and nothing is said).
+        let frame = |meter: (u8, u8), chosen: i8, focus: Option<egui::Id>| {
+            let mut chips: Vec<egui::Response> = Vec::new();
+            let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                if let Some(id) = focus {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut grid_exp = chosen;
+                    chips = quantize_grid_row(ui, &mut grid_exp, meter);
+                });
+            });
+            let named: Vec<egui::WidgetInfo> = out
+                .platform_output
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::output::OutputEvent::FocusGained(info) => Some(info.clone()),
+                    _ => None,
+                })
+                .collect();
+            (chips, named)
+        };
+        for (i, &(beats, unit)) in sigs.iter().enumerate() {
+            let chosen = -i8::try_from(i % 8).expect("eight chips");
+            let (chips, _) = frame((beats, unit), chosen, None);
+            assert_eq!(chips.len(), 8, "{beats}/{unit}: the row is not steps 0 down to -7");
+            for (k, id) in chips.iter().map(|c| c.id).enumerate() {
+                let e = -i8::try_from(k).expect("eight chips");
+                let printed = crate::arrangement_panel::grid_label_text(e, beats, unit);
+                let at = format!("{beats}/{unit}, step {e} (printed {printed:?})");
+                let (_, named) = frame((beats, unit), chosen, Some(id));
+                let kept = named.last().unwrap_or_else(|| panic!("{at}: the chip named nothing as it took the focus"));
+                let want = crate::arrangement_panel::grid_spoken(e, beats, unit);
+                assert_eq!(kept.label.as_deref(), Some(want.as_str()), "{at}: a reader is told this");
+                assert!(
+                    !want.contains('/') && !want.contains('\u{00b7}'),
+                    "{at} is said with a fraction, {want:?}"
+                );
+                assert_eq!(kept.typ, egui::WidgetType::SelectableLabel, "{at}");
+                assert_eq!(kept.selected, Some(e == chosen), "{at}: chosen is {chosen}");
             }
         }
     }

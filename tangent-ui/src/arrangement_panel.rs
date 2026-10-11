@@ -5437,7 +5437,13 @@ fn note_word(d: u64) -> Option<&'static str> {
 /// A screen reader announcing "Grid, 8" has said nothing: the unit is the
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
-fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
+///
+/// **Every surface a reader reaches the ladder on says it this way**: the
+/// arrange gridbox's slider ([`a11y_nodes`]) and the Quantize window's GRID
+/// chips (`dialogs::quantize_grid_row`), whose own text is the box's
+/// shorthand. The MIDI editor has no reader nodes at all yet, its grid chip
+/// among them.
+pub(crate) fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
     // **Read off the same division the box prints and the magnet uses.**
     //
     // This carried its own third opinion, in BEATS, while the box counted in

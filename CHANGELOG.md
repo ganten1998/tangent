@@ -152,13 +152,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   of height to the next, as the box's edges land on whole pixels or
   between them.
 
-  A screen reader names every step as a note: whole note, dotted half
-  note, hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar"
-  for the whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted
-  half and "1/128 of a bar" and finer for the finest steps. With the
-  reader on, the arrow keys move the arrangement's grid box a step each
-  way, which they never did, and Home and End reach both of its ends, the
-  finest step (1/64 in 4/4) included.
+  A screen reader names every step as a note, in the arrangement's grid
+  box and in the Quantize window's GRID row: whole note, dotted half note,
+  hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar" for the
+  whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted half and
+  "1/128 of a bar" and finer for the finest steps, and it read the
+  Quantize chips as their printed shorthand ("1/2·", "1/128") without
+  saying which one was chosen; it says which now. With the reader on, the
+  arrow keys move the arrangement's grid box a step each way, which they
+  never did, and Home and End reach both of its ends, the finest step
+  (1/64 in 4/4) included. The MIDI editor is not read by a screen reader
+  yet, its grid chip included.
 
 ### Fixed
 
