@@ -27175,6 +27175,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
         }
+        // **Cmd/Ctrl+M, the metronome panel's chord**, read once for both of
+        // its roads: the close just below and the open among the view's keys
+        // further down. Shift with it is the master row's.
+        let met_chord = ctx.input(|i| {
+            (i.modifiers.command || i.modifiers.ctrl)
+                && !i.modifiers.shift
+                && i.key_pressed(egui::Key::M)
+        });
+        // **A second press of the chord closes the panel the first one
+        // opened**, and it is read HERE, before the panel takes the frame
+        // below. It was written beside the open, after that `return`, and
+        // never ran once: while the panel is up it owns every frame, so a
+        // panel the chord summoned could only be put away with the mouse.
+        //
+        // On the open's own terms (the view's `keys_ok`, the MIDI editor
+        // shut), with ONE key let through a field: the panel's own BEATS or
+        // NOTE being typed does not stand the chord down. A command chord is
+        // no character a number takes, and `close_met_menu` commits the field
+        // on the way out, as every road that closes the panel does. Digits,
+        // Space and every other key still wait on the field, and a field
+        // anywhere else holds this chord too. The frame is the panel's to the
+        // end, as it would have been: the open below must not hear the same
+        // press.
+        if met_chord
+            && self.met_menu.is_some()
+            && self.arrangement_rect.is_some()
+            && self.midi_edit.is_none()
+            && !self.dialog_blocks_keys(ctx)
+            && self.menu_state.is_none()
+            && !self.typing_outside_num_edit()
+            && self.num_edit.as_ref().is_none_or(|e| e.field.lives_in_metronome())
+        {
+            self.close_met_menu();
+            return;
+        }
         // **The METRONOME's panel: while it is up it owns every press.**
         // Before the bay menu and before the lanes, because it is drawn in
         // front of both — a panel that is painted over something it does not
@@ -29541,28 +29576,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // It DISPLACED the master row, which had this chord and now has
         // shift with it. Said out loud because a shortcut that quietly
         // changes what it does is worse than one that moves.
-        if keys_ok
-            && self.midi_edit.is_none()
-            && ctx.input(|i| {
-                (i.modifiers.command || i.modifiers.ctrl)
-                    && !i.modifiers.shift
-                    && i.key_pressed(egui::Key::M)
-            })
-        {
-            if self.met_menu.is_some() {
-                // A second press closes it, which is what a summon chord
-                // should do - otherwise the only way out is the mouse.
-                self.close_met_menu();
-            } else {
-                // **CENTRED, not at the pointer.** It opened where the hand
-                // was, on the reasoning that a summon should not make you
-                // travel; the owner's answer after living with it was to
-                // centre it. A panel that appears somewhere different every
-                // time is one you have to FIND, and the eye goes to the
-                // middle of the window on its own.
-                self.met_at = self.met_stage().map(|r| r.center());
-                self.met_menu = Some(());
-            }
+        //
+        // **Only the open lives here.** The panel is never up on a frame
+        // that reaches this far: while it is, it takes the frame at the top
+        // of this pass, and that is where a second press closes it.
+        if keys_ok && self.midi_edit.is_none() && met_chord {
+            // **CENTRED, not at the pointer.** It opened where the hand was,
+            // on the reasoning that a summon should not make you travel; the
+            // owner's answer after living with it was to centre it. A panel
+            // that appears somewhere different every time is one you have to
+            // FIND, and the eye goes to the middle of the window on its own.
+            self.met_at = self.met_stage().map(|r| r.center());
+            self.met_menu = Some(());
         }
         // **Ctrl/Cmd+Shift+M: show or hide the MASTER row.** It cannot be
         // removed the way a track can — a bus you can delete and not get
@@ -34292,8 +34317,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the frame's keys; only Enter, Escape and a mouse press act, and each
     /// of those is handled by the field itself.
     fn text_entry_active(&self) -> bool {
+        self.num_edit.is_some() || self.typing_outside_num_edit()
+    }
+
+    /// **Every field `text_entry_active` counts but `num_edit`**: the take's
+    /// name, a track's name, a desk number, a pad's number and its name.
+    /// Split out for the one key gate that asks WHICH number is open - the
+    /// metronome chord's close, which its panel's own BEATS or NOTE lets
+    /// through - so that gate and this one cannot list different fields.
+    fn typing_outside_num_edit(&self) -> bool {
         self.name_focused
-            || self.num_edit.is_some()
             || self.mixer_naming.is_some()
             || self.mixer_typing.is_some()
             || self.drumpad_num.is_some()
@@ -75527,6 +75560,164 @@ mod tests {").expect("the tests module")];
         assert!(app.num_edit.is_none(), "the Enter that committed BEATS opened it again");
         pointer_frame(&ctx, &mut app, Vec::new());
         assert!(app.num_edit.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Cmd/Ctrl+M, pressed again ───────────────────────────────────────────
+    //
+    // The owner's "yes fix those please": the chord opened the metronome
+    // panel over the timeline, and pressing it again did nothing at all.
+
+    /// A whole right-click at `at`, as a hand makes one: arrive, press and
+    /// let go, the secondary button.
+    fn right_click_at(ctx: &egui::Context, app: &mut TangentApp, at: Pos2) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        pointer_frame(ctx, app, vec![egui::Event::PointerMoved(at), button(true), button(false)]);
+    }
+
+    /// Where `want` is on the band this app last drew, asked of the band.
+    fn band_point(app: &TangentApp, want: recorder_panel::Hit) -> Pos2 {
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band was never drawn");
+        let view = app.recorder_layout_view();
+        let mut y = band.top();
+        while y < band.bottom() {
+            let mut x = band.left();
+            while x < band.right() {
+                let p = Pos2::new(x, y);
+                if recorder_panel::hit_test(band, &view, p) == Some(want) {
+                    return p;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        panic!("the band has no {want:?}");
+    }
+
+    /// **A second Cmd/Ctrl+M closes the metronome panel the first one
+    /// opened**, and a third opens it again in the middle of the timeline.
+    ///
+    /// The close was written beside the chord's open, after the panel's own
+    /// `return` in `arrangement_input`, and never ran: while the panel is up
+    /// it owns every frame, so a panel the chord summoned could only be put
+    /// away with the mouse. Ctrl+M is the chord's other spelling; shift with
+    /// it is the master row's and leaves the panel be. Opening and closing it
+    /// change nothing in the song, so neither is a moment.
+    ///
+    /// Revert-check, performed: take the close out of the top of
+    /// `arrangement_input` and the second press leaves the panel up.
+    #[test]
+    fn a_second_cmd_m_closes_the_metronome_panel_it_opened() {
+        let (ctx, mut app, root, stage, _anchor) = met_panel_up("metchord", false);
+        let before = app.hist_at;
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert!(app.met_menu.is_some(), "Cmd+Shift+M, the master row's chord, closed the metronome panel");
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_none(), "a second Cmd+M left the metronome panel up");
+        assert!(app.met_at.is_none(), "the summon point outlived its panel");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_some(), "a third Cmd+M did not open the panel again");
+        assert_eq!(app.met_at, Some(stage.center()), "the panel did not open in the middle again");
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::CTRL);
+        assert!(app.met_menu.is_none(), "Ctrl+M left the metronome panel up");
+        assert_eq!(app.hist_at, before, "opening and closing the panel left moments");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Cmd+M closes the panel through its own BEATS or NOTE and lands
+    /// what was typed**, and nothing else typed reaches a shortcut.
+    ///
+    /// A field holds every key, and the chord is the one the panel's own two
+    /// let by: a command is no character a number takes. It leaves by the
+    /// panel's road, `close_met_menu`, which commits the field on the way. A
+    /// typed 12 is set, one moment; a note value of 3 is refused, the
+    /// signature stays and nothing is a moment. The digits and the Space
+    /// typed first, while the song plays, are the field's alone: the theory
+    /// band does not change and the transport hears nothing.
+    ///
+    /// Revert-check, performed: hold the chord for every open field (the
+    /// view's `keys_ok`, as the open asks) and the panel stays up with BEATS
+    /// open.
+    #[test]
+    fn cmd_m_lands_a_typed_metronome_field_as_it_closes_the_panel() {
+        use crate::recorder_panel::MetHit;
+        use recorder::NumField as F;
+        use recorder::TimeSignature as Sig;
+        let (ctx, mut app, root, stage, anchor) = met_panel_up("metchordfield", false);
+        app.recorder.playing = true;
+        let theory = app.settings.theory_order.clone();
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetBeats)), egui::Modifiers::NONE);
+        while app.take_recorder_request().is_some() {}
+        let before = app.hist_at;
+        type_keys(&ctx, &mut app, "12 ");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("12"), "fixture: BEATS did not take the digits");
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_none(), "Cmd+M did not close the panel through its own BEATS");
+        assert!(app.num_edit.is_none(), "BEATS outlived its panel");
+        assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "Cmd+M threw the typed 12 away");
+        assert_eq!(app.hist_at, before + 1, "the typed beats are not one moment");
+        assert_eq!(app.settings.theory_order, theory, "a digit typed into BEATS reached the theory band");
+        assert!(app.take_recorder_request().is_none(), "Space typed into BEATS reached the transport");
+
+        // NOTE, refused: a 3 is no note value.
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_some(), "fixture: the panel did not come back");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let anchor = app.met_anchor(stage);
+        click_with(&ctx, &mut app, met_point(stage, anchor, MetHit::Type(F::MetUnit)), egui::Modifiers::NONE);
+        type_keys(&ctx, &mut app, "3");
+        let before = app.hist_at;
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_none(), "Cmd+M did not close the panel through its own NOTE");
+        assert!(app.num_edit.is_none(), "NOTE outlived its panel");
+        assert_eq!(app.time_signature(), Sig { beats: 12, unit: 4 }, "a note value of 3 was not refused");
+        assert_eq!(app.hist_at, before, "a refused note value was a moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A field outside the metronome panel holds its chord**, as it holds
+    /// every key.
+    ///
+    /// The tempo typed into the band and left open while the panel was
+    /// right-clicked up from the toolbar: Cmd+M leaves the panel up and the
+    /// tempo taking keys, and the digits typed next are the tempo's. Only
+    /// the panel's own BEATS and NOTE let the chord by.
+    ///
+    /// Revert-check, performed: let the chord by whatever field is open and
+    /// it closes the panel over the tempo being typed.
+    #[test]
+    fn a_field_outside_the_metronome_panel_holds_its_chord() {
+        use recorder::NumField as F;
+        let root = project_scratch("metchordelse");
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("Projects"));
+        app.arrangement_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let tempo = band_point(&app, recorder_panel::Hit::Type(F::Tempo));
+        click_with(&ctx, &mut app, tempo, egui::Modifiers::NONE);
+        assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "fixture: the tempo did not open");
+        let rect = app.arrangement_rect.expect("the timeline is not laid out");
+        let tool = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).tool_met
+        };
+        assert!(tool.is_positive(), "the toolbar has no metronome cell");
+        right_click_at(&ctx, &mut app, tool.center());
+        assert!(app.met_menu.is_some(), "fixture: the toolbar's right-press did not open the panel");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "fixture: the tempo closed");
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::COMMAND);
+        assert!(app.met_menu.is_some(), "Cmd+M reached through the tempo being typed");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::Tempo), "Cmd+M took the tempo's field away");
+        type_keys(&ctx, &mut app, "97");
+        assert_eq!(app.num_edit.as_ref().map(|e| e.text.as_str()), Some("97"), "the tempo stopped taking keys");
         let _ = std::fs::remove_dir_all(&root);
     }
 

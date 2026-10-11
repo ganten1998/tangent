@@ -357,6 +357,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a time and the count-in's "carries on" switch flipped and flipped back.
   The panel over the arrangement was not affected.
 
+- **A second Cmd/Ctrl+M closes the metronome panel.** In the arrangement
+  the chord opened the panel and pressing it again did nothing, so the
+  panel could only be closed with the mouse. A beat count or note value
+  being typed into the panel is set as it closes.
+
 - **An Analog track's dry stem lines up with the others.** In a dry stems
   export it came out 68 samples (1.4 ms at 48 kHz) behind every other stem
   and the mix, by the delay the Analog reports for its own sound. It now
