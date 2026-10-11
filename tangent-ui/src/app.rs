@@ -34649,10 +34649,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // **The grid box is the one control here the arrows move**, and
             // it is why it is a slider and not a button: a press that only
             // ever steps FINER walks a keyboard down to 1/32 and leaves it
-            // there. `want` is the exponent laid onto 0..1.
+            // there. `want` is the exponent laid onto 0..1
+            // (`arrangement_panel::grid_box_travel`), and an arrow is one
+            // step whichever way it pressed (`grid_box_step_for`). Rounded
+            // back to the nearest step on its own, as it was, a nudge of a
+            // twentieth landed on the step it started from: the arrows never
+            // moved the box, and at -6 the down arrow went up.
             A::ToolGrid => {
                 if let Some(w) = want {
-                    let exp = i64::from((w * 8.0).round() as i8) - 5;
+                    let now = self.settings.arr_grid_exp.clamp(-6, 3) as i8;
+                    let exp = i64::from(crate::arrangement_panel::grid_box_step_for(now, w));
                     self.settings.arr_grid_exp = exp.clamp(-6, 3);
                     // An arrow HELD on the grid box arrives once per key
                     // repeat, thirty a second: debounced.
@@ -62287,6 +62293,74 @@ mod tests {
             "one press moved the fader {moved} rather than {}",
             crate::a11y::STEP
         );
+    }
+
+    /// **A key on the arrange grid box moves it one step, and Home and End
+    /// reach both ends.**
+    ///
+    /// Driven the whole way: reader mode on, egui's focus on the box's node,
+    /// a key, `nudge_focused`, `apply_arrange_key`, the setting. The box is a
+    /// slider so that both arrows reach it, and neither did: an arrow nudges
+    /// the travel by a twentieth, a step was an eighth of it (a ninth now),
+    /// and the road read the nudge back as the NEAREST step, which was the
+    /// one it started on. Every step from -5 to 3 ignored both arrows. At -6,
+    /// below where the travel began (the node put it at -0.125), the down
+    /// arrow went up to -5, and Home went to -5 rather than to -6.
+    ///
+    /// Every step the box takes, -6 to 3: Up and Right one step coarser,
+    /// Down and Left one finer, Shift the same (a step is the smallest move
+    /// the box has), held at the ends; Home -6, End 3; Space nothing.
+    ///
+    /// Revert checks, performed: put the old road back whole (the node's
+    /// travel `(exp + 5) / 8` and `round(w * 8) - 5`) and this fails at the
+    /// finest step, where Down went UP to -5; read a key back as the nearest
+    /// step alone and it fails on the first press, Up at -6, which stays at
+    /// -6.
+    #[test]
+    fn a_key_on_the_grid_box_moves_it_one_step() {
+        use egui::Key;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.screen_reader_mode = true;
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let grid = egui::Id::new((
+            "arrangement",
+            format!("{:?}", crate::arrangement_panel::Hit::ToolGrid),
+        ));
+        let press = |key: Key, shift: bool| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE },
+        };
+        for from in -6i64..=3 {
+            for (what, key, shift, want) in [
+                ("Up", Key::ArrowUp, false, (from + 1).min(3)),
+                ("Right", Key::ArrowRight, false, (from + 1).min(3)),
+                ("Shift+Up", Key::ArrowUp, true, (from + 1).min(3)),
+                ("Down", Key::ArrowDown, false, (from - 1).max(-6)),
+                ("Left", Key::ArrowLeft, false, (from - 1).max(-6)),
+                ("Shift+Down", Key::ArrowDown, true, (from - 1).max(-6)),
+                ("Home", Key::Home, false, -6),
+                ("End", Key::End, false, 3),
+                ("Space", Key::Space, false, from),
+            ] {
+                app.settings.arr_grid_exp = from;
+                // A frame for the node to read the step, and the focus to
+                // land on it before the key arrives.
+                ctx.memory_mut(|m| m.request_focus(grid));
+                pointer_frame(&ctx, &mut app, Vec::new());
+                ctx.memory_mut(|m| m.request_focus(grid));
+                pointer_frame(&ctx, &mut app, vec![press(key, shift)]);
+                assert!(app.a11y_on.is_some(), "the grid box did not take the focus");
+                assert_eq!(
+                    app.settings.arr_grid_exp, want,
+                    "{what} on the grid box at step {from} went to {}",
+                    app.settings.arr_grid_exp
+                );
+            }
+        }
     }
 
     /// **A held tempo keeps no keys.** While a take holds the tempo the knob

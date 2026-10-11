@@ -155,7 +155,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   A screen reader names every step as a note: whole note, dotted half
   note, hundred twenty-eighth note, 5 eighth notes. It said "1 of a bar"
   for the whole note under 4/2's bar, "1/2· of a bar" for 12/8's dotted
-  half and "1/128 of a bar" and finer for the finest steps.
+  half and "1/128 of a bar" and finer for the finest steps. With the
+  reader on, the arrow keys move the arrangement's grid box a step each
+  way, which they never did, and Home and End reach both of its ends, the
+  finest step (1/64 in 4/4) included.
 
 ### Fixed
 
