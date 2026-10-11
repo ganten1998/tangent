@@ -50,6 +50,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The desk is as long as its tracks.** The mixer and the arrangement draw
   the tracks that exist and one place to add the next: a plus after the
   last strip in the mixer, and a row under the last lane in the arrangement.
+  The plus's own background carries on past it, across to the click in the
+  mixer and down to the bottom of the arrangement, and keeps its colour as
+  tracks come and go, so a desk shorter than the window never ends in bare
+  panel.
   Ctrl/Cmd+T, the header's plus and the mixer's plus add a track after the
   selection, or at the end with nothing selected, and dropping media below
   the last lane makes a track for it. Both views scroll, Shift+wheel zooms
