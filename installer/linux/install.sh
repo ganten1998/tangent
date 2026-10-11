@@ -1,10 +1,9 @@
 #!/bin/sh
-# Install Tangent: the application, the VST3 plugin, or both.
+# Install Tangent.
 #
-#   ./install.sh                 both, into your home directory (no root)
-#   ./install.sh --app           the application only
-#   ./install.sh --vst3          the plugin only
-#   ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
+#   ./install.sh                 into your home directory (no root)
+#   ./install.sh --system        for every user, under /usr/local and
+#                                /usr/share (needs root)
 #   ./install.sh --prefix DIR    somewhere else entirely
 #   ./install.sh --desktop       menu entry + icon, without being asked
 #   ./install.sh --deps          install missing video-acceleration packages
@@ -32,12 +31,11 @@ NAME="Tangent"
 # printed the usage AND the first half of an essay about .deb packages.
 usage() {
     cat <<'USAGE'
-Install Tangent: the application, the VST3 plugin, or both.
+Install Tangent.
 
-  ./install.sh                 both, into your home directory (no root)
-  ./install.sh --app           the application only
-  ./install.sh --vst3          the plugin only
-  ./install.sh --system        into /usr/local and /usr/lib/vst3 (needs root)
+  ./install.sh                 into your home directory (no root)
+  ./install.sh --system        for every user, under /usr/local and
+                               /usr/share (needs root)
   ./install.sh --prefix DIR    somewhere else entirely
   ./install.sh --desktop       menu entry + icon, without being asked
   ./install.sh --no-desktop    the binary only, no menu entry
@@ -47,9 +45,7 @@ Install Tangent: the application, the VST3 plugin, or both.
   ./install.sh --uninstall     take it all back out
   ./install.sh --dry-run       print what would happen and do nothing
 
-The default needs no root. It puts the application in ~/.local/bin and the
-plugin in ~/.vst3, which is one of the directories the VST3 specification
-tells hosts to scan.
+The default needs no root. It puts the application in ~/.local/bin.
 
 Desktop integration is the menu entry and the icon: it is what makes Tangent
 appear in your application menu and in launchers like rofi, wofi and dmenu.
@@ -65,15 +61,6 @@ Nothing here can fail the install.
 USAGE
 }
 
-WANT_APP=1
-WANT_VST3=1
-# Whether the plugin was ASKED for, as opposed to being on because the default
-# is "both". The two artifacts are not the same shape: the full release carries
-# `Tangent.vst3` beside this script, and the plain cross-built tarball is the
-# application on its own. Treating "no plugin in this archive" as a failure
-# made the default invocation exit 1 on the app-only tarball, which is the
-# tarball most people have.
-VST3_EXPLICIT=0
 # Desktop integration: the .desktop entry and the icon, which is what puts
 # Tangent in an application menu and in rofi/wofi/dmenu. Empty means "ask";
 # see the prompt below. Not a plain 1, because "install it" and "the user has
@@ -96,9 +83,9 @@ RT_GROUP=audio
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --app)       WANT_APP=1; WANT_VST3=0 ;;
-        --vst3)      WANT_APP=0; WANT_VST3=1; VST3_EXPLICIT=1 ;;
-        --both)      WANT_APP=1; WANT_VST3=1; VST3_EXPLICIT=1 ;;
+        # Still taken, so that a command line copied from an older page keeps
+        # working. Each installs what the default installs.
+        --app|--both) ;;
         --desktop)    WANT_DESKTOP=1 ;;
         --no-desktop) WANT_DESKTOP=0 ;;
         --deps)       WANT_DEPS=1 ;;
@@ -118,9 +105,8 @@ done
 
 # Where things go.
 #
-#   ~/.vst3 and /usr/lib/vst3 are the VST3 specification's own Linux search
-#   paths. A plugin anywhere else is one the host has to be told about, which
-#   is the same as one that does not work.
+#   VST3_DIR is where an install before 4.77.0 could put a Tangent.vst3. It is
+#   read only to take that leftover back out, here and by --uninstall.
 case "$MODE" in
     user)
         BIN_DIR="$HOME/.local/bin"
@@ -642,149 +628,121 @@ fi
 [ "$DRY" = "1" ] && echo "(dry run: nothing will be written)"
 echo "Installing $NAME"
 
-if [ "$WANT_APP" = "1" ]; then
-    if [ ! -f "$SELF_DIR/tangent" ]; then
-        echo "no 'tangent' binary next to this script" >&2
-        exit 1
-    fi
-    # The retired plugin: a modern tarball carries no Tangent.vst3, so any
-    # copy in the install prefix is an old installer's leftover that other
-    # DAWs will keep listing forever. Cleaned up here, loudly. A tarball
-    # that DOES carry the bundle is an old one whose --vst3 path still
-    # works, so it is left alone in that case.
-    if [ ! -d "$SELF_DIR/$NAME.vst3" ] && [ -d "$VST3_DIR/$NAME.vst3" ]; then
-        echo "  removing retired plugin $VST3_DIR/$NAME.vst3"
-        run rm -rf "$VST3_DIR/$NAME.vst3"
-    fi
-    echo "  application -> $BIN_DIR/tangent"
-    run mkdir -p "$BIN_DIR"
-    run cp "$SELF_DIR/tangent" "$BIN_DIR/tangent"
-    run chmod 755 "$BIN_DIR/tangent"
-
-    # The bundled video encoder. Prefixed `tangent-`, never plain `ffmpeg`:
-    # ~/.local/bin is on most users' PATH and an unprefixed copy there would
-    # shadow the system ffmpeg for every shell they own. Tangent looks for
-    # this name beside its own binary, so video works with nothing installed.
-    if [ -f "$SELF_DIR/tangent-ffmpeg" ]; then
-        echo "  encoder     -> $BIN_DIR/tangent-ffmpeg"
-        run cp "$SELF_DIR/tangent-ffmpeg" "$BIN_DIR/tangent-ffmpeg"
-        run chmod 755 "$BIN_DIR/tangent-ffmpeg"
-    fi
-
-    # ── desktop integration ────────────────────────────────────────────────
-    #
-    # The .desktop entry and the icon. Between them they are what makes Tangent
-    # appear in an application menu and, more to the point, in the launchers
-    # people actually use on a tiling desktop (rofi, wofi, dmenu), all of
-    # which read $XDG_DATA_HOME/applications and nothing else.
-    #
-    # ASKED FOR rather than assumed. It writes three files outside the one
-    # directory the rest of this script touches, and somebody installing a
-    # binary into ~/.local/bin on a machine they keep tidy is entitled to be
-    # asked before their menu gains an entry. --desktop / --no-desktop skip the
-    # question; with no terminal to ask in, it happens, because that is what
-    # every release before this one did and a silent behaviour change is worse
-    # than a default somebody disagrees with.
-    if [ -f "$SELF_DIR/tangent.desktop" ]; then
-        if [ -z "$WANT_DESKTOP" ]; then
-            if [ -t 0 ]; then
-                echo
-                echo "  Desktop integration puts Tangent in your application menu"
-                echo "  and in launchers like rofi, wofi and dmenu. It writes:"
-                echo "      $DESKTOP_DIR/tangent.desktop"
-                echo "      $ICON_DIR/tangent.png"
-                printf '  Install it? [Y/n] '
-                read -r reply || reply=""
-                case "$reply" in
-                    [Nn]*) WANT_DESKTOP=0 ;;
-                    *)     WANT_DESKTOP=1 ;;
-                esac
-                echo
-            else
-                WANT_DESKTOP=1
-            fi
-        fi
-    else
-        WANT_DESKTOP=0
-    fi
-
-    if [ "$WANT_DESKTOP" = "1" ]; then
-        echo "  menu entry  -> $DESKTOP_DIR/tangent.desktop"
-        run mkdir -p "$DESKTOP_DIR"
-        # **The absolute path, not the bare name.** The shipped entry says
-        # `Exec=tangent`, which needs $BIN_DIR to be on PATH, and a launcher
-        # does not run your shell's PATH anyway: rofi and wofi exec through a
-        # session environment that may never have sourced your profile. An
-        # entry that cannot start the program is worse than no entry, because
-        # it fails silently from a menu with nowhere to print an error.
-        if [ "$DRY" = "1" ]; then
-            printf '  would: write tangent.desktop with Exec=%s\n' "$BIN_DIR/tangent"
-        else
-            sed "s|^Exec=.*|Exec=$BIN_DIR/tangent|" \
-                "$SELF_DIR/tangent.desktop" > "$DESKTOP_DIR/tangent.desktop"
-            chmod 644 "$DESKTOP_DIR/tangent.desktop"
-        fi
-
-        if [ -f "$SELF_DIR/tangent.png" ]; then
-            echo "  icon        -> $ICON_DIR/tangent.png"
-            run mkdir -p "$ICON_DIR"
-            run cp "$SELF_DIR/tangent.png" "$ICON_DIR/tangent.png"
-            # 0644 explicitly: the build tarball has carried 0600 on this file
-            # before, which is unreadable by anyone else after a --system
-            # install and shows up as a menu entry with a missing icon.
-            run chmod 644 "$ICON_DIR/tangent.png"
-        fi
-
-        # Tell the desktop it changed. Both are best-effort and both are
-        # genuinely absent on minimal systems (a tiling-WM install often has
-        # neither), so a missing one is not a failure. rofi reads the .desktop
-        # files directly and will find Tangent either way; these are what make
-        # a full desktop environment and the icon cache notice inside a second
-        # rather than at the next login.
-        if [ "$DRY" = "0" ]; then
-            command -v update-desktop-database >/dev/null 2>&1 &&
-                update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
-            command -v gtk-update-icon-cache >/dev/null 2>&1 &&
-                gtk-update-icon-cache -qtf "$(dirname "$(dirname "$(dirname "$ICON_DIR")")")" \
-                    >/dev/null 2>&1 || true
-        fi
-    elif [ -f "$SELF_DIR/tangent.desktop" ]; then
-        echo "  menu entry  -> skipped (--no-desktop)"
-    fi
-
-    # Say so rather than leaving them to find out by typing `tangent`.
-    ON_PATH=1
-    case ":${PATH}:" in
-        *":$BIN_DIR:"*) ;;
-        *) ON_PATH=0
-           echo "  NOTE: $BIN_DIR is not on your PATH."
-           echo "        Add it, or use the full path below." ;;
-    esac
+if [ ! -f "$SELF_DIR/tangent" ]; then
+    echo "no 'tangent' binary next to this script" >&2
+    exit 1
 fi
-
-if [ "$WANT_VST3" = "1" ] && [ ! -d "$SELF_DIR/$NAME.vst3" ]; then
-    if [ "$VST3_EXPLICIT" = "1" ]; then
-        echo "no '$NAME.vst3' next to this script" >&2
-        exit 1
-    fi
-    # Asked for by the default rather than by name, and it is not here: say so
-    # once and carry on with the application. This archive is the app on its
-    # own, and refusing to install it because a thing it never contained is
-    # absent helps nobody.
-    echo "  plugin      -> not in this archive (application only)"
-    WANT_VST3=0
-fi
-
-if [ "$WANT_VST3" = "1" ]; then
-    echo "  plugin      -> $VST3_DIR/$NAME.vst3"
-    run mkdir -p "$VST3_DIR"
-    # Remove the old bundle first. Copying over it leaves behind any file that
-    # used to be in the bundle and is not any more, which is how a host ends up
-    # loading a mix of two versions.
+# A Tangent.vst3 in VST3_DIR is a leftover of an install before 4.77.0,
+# which every program that scans that folder would keep listing forever.
+# Taken out here, and said out loud.
+if [ -d "$VST3_DIR/$NAME.vst3" ]; then
+    echo "  removing $VST3_DIR/$NAME.vst3, left by an older install"
     run rm -rf "$VST3_DIR/$NAME.vst3"
-    run cp -R "$SELF_DIR/$NAME.vst3" "$VST3_DIR/$NAME.vst3"
-    run find "$VST3_DIR/$NAME.vst3" -name '*.so' -exec chmod 755 {} +
 fi
+echo "  application -> $BIN_DIR/tangent"
+run mkdir -p "$BIN_DIR"
+run cp "$SELF_DIR/tangent" "$BIN_DIR/tangent"
+run chmod 755 "$BIN_DIR/tangent"
+
+# The bundled video encoder. Prefixed `tangent-`, never plain `ffmpeg`:
+# ~/.local/bin is on most users' PATH and an unprefixed copy there would
+# shadow the system ffmpeg for every shell they own. Tangent looks for
+# this name beside its own binary, so video works with nothing installed.
+if [ -f "$SELF_DIR/tangent-ffmpeg" ]; then
+    echo "  encoder     -> $BIN_DIR/tangent-ffmpeg"
+    run cp "$SELF_DIR/tangent-ffmpeg" "$BIN_DIR/tangent-ffmpeg"
+    run chmod 755 "$BIN_DIR/tangent-ffmpeg"
+fi
+
+# ── desktop integration ─────────────────────────────────────────────────────
+#
+# The .desktop entry and the icon. Between them they are what makes Tangent
+# appear in an application menu and, more to the point, in the launchers
+# people actually use on a tiling desktop (rofi, wofi, dmenu), all of
+# which read $XDG_DATA_HOME/applications and nothing else.
+#
+# ASKED FOR rather than assumed. It writes three files outside the one
+# directory the rest of this script touches, and somebody installing a
+# binary into ~/.local/bin on a machine they keep tidy is entitled to be
+# asked before their menu gains an entry. --desktop / --no-desktop skip the
+# question; with no terminal to ask in, it happens, because that is what
+# every release before this one did and a silent behaviour change is worse
+# than a default somebody disagrees with.
+if [ -f "$SELF_DIR/tangent.desktop" ]; then
+    if [ -z "$WANT_DESKTOP" ]; then
+        if [ -t 0 ]; then
+            echo
+            echo "  Desktop integration puts Tangent in your application menu"
+            echo "  and in launchers like rofi, wofi and dmenu. It writes:"
+            echo "      $DESKTOP_DIR/tangent.desktop"
+            echo "      $ICON_DIR/tangent.png"
+            printf '  Install it? [Y/n] '
+            read -r reply || reply=""
+            case "$reply" in
+                [Nn]*) WANT_DESKTOP=0 ;;
+                *)     WANT_DESKTOP=1 ;;
+            esac
+            echo
+        else
+            WANT_DESKTOP=1
+        fi
+    fi
+else
+    WANT_DESKTOP=0
+fi
+
+if [ "$WANT_DESKTOP" = "1" ]; then
+    echo "  menu entry  -> $DESKTOP_DIR/tangent.desktop"
+    run mkdir -p "$DESKTOP_DIR"
+    # **The absolute path, not the bare name.** The shipped entry says
+    # `Exec=tangent`, which needs $BIN_DIR to be on PATH, and a launcher
+    # does not run your shell's PATH anyway: rofi and wofi exec through a
+    # session environment that may never have sourced your profile. An
+    # entry that cannot start the program is worse than no entry, because
+    # it fails silently from a menu with nowhere to print an error.
+    if [ "$DRY" = "1" ]; then
+        printf '  would: write tangent.desktop with Exec=%s\n' "$BIN_DIR/tangent"
+    else
+        sed "s|^Exec=.*|Exec=$BIN_DIR/tangent|" \
+            "$SELF_DIR/tangent.desktop" > "$DESKTOP_DIR/tangent.desktop"
+        chmod 644 "$DESKTOP_DIR/tangent.desktop"
+    fi
+
+    if [ -f "$SELF_DIR/tangent.png" ]; then
+        echo "  icon        -> $ICON_DIR/tangent.png"
+        run mkdir -p "$ICON_DIR"
+        run cp "$SELF_DIR/tangent.png" "$ICON_DIR/tangent.png"
+        # 0644 explicitly: the build tarball has carried 0600 on this file
+        # before, which is unreadable by anyone else after a --system
+        # install and shows up as a menu entry with a missing icon.
+        run chmod 644 "$ICON_DIR/tangent.png"
+    fi
+
+    # Tell the desktop it changed. Both are best-effort and both are
+    # genuinely absent on minimal systems (a tiling-WM install often has
+    # neither), so a missing one is not a failure. rofi reads the .desktop
+    # files directly and will find Tangent either way; these are what make
+    # a full desktop environment and the icon cache notice inside a second
+    # rather than at the next login.
+    if [ "$DRY" = "0" ]; then
+        command -v update-desktop-database >/dev/null 2>&1 &&
+            update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+        command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+            gtk-update-icon-cache -qtf "$(dirname "$(dirname "$(dirname "$ICON_DIR")")")" \
+                >/dev/null 2>&1 || true
+    fi
+elif [ -f "$SELF_DIR/tangent.desktop" ]; then
+    echo "  menu entry  -> skipped (--no-desktop)"
+fi
+
+# Say so rather than leaving them to find out by typing `tangent`.
+ON_PATH=1
+case ":${PATH}:" in
+    *":$BIN_DIR:"*) ;;
+    *) ON_PATH=0
+       echo "  NOTE: $BIN_DIR is not on your PATH."
+       echo "        Add it, or use the full path below." ;;
+esac
 
 echo
 # **Before the dry-run exit, on purpose.** `--dry-run` is what a careful person
@@ -792,7 +750,7 @@ echo
 # learn from it: everything else here degrades a feature, and this decides
 # whether the program starts. Saying it only on the real run tells them after
 # the moment they were asking.
-if [ "$WANT_APP" = "1" ] && ! have_lilv; then
+if ! have_lilv; then
     echo "  BEFORE YOU RUN IT: liblilv-0.so.0 is not installed, and Tangent"
     echo "        will not start without it - it is the LV2 plugin host, and"
     echo "        the program is linked against it. One command fixes it:"
@@ -833,51 +791,48 @@ fi
 # The full path when `tangent` would not resolve. Printing "Run it with:
 # tangent" four lines under "that directory is not on your PATH" is telling
 # someone to do the thing you just told them would not work.
-if [ "$WANT_APP" = "1" ]; then
-    if [ "${ON_PATH:-1}" = "1" ]; then
-        echo "Run it with:  tangent"
-    else
-        echo "Run it with:  $BIN_DIR/tangent"
-    fi
-    # Said out loud, because the whole point of answering yes to that question
-    # is being able to start it without a terminal, and a launcher that has
-    # not rescanned yet looks exactly like an entry that was never written.
-    if [ "${WANT_DESKTOP:-0}" = "1" ]; then
-        echo "Or from your application menu, rofi, wofi or dmenu, as \"Tangent\"."
-        echo "  (a launcher that caches its list may need one restart to see it)"
-    fi
-
-    # Filming a take composites on the GPU through Vulkan. Everything else in
-    # Tangent works without it, so a missing driver is a note with the exact
-    # command, not an error. ICD manifests are how the loader finds drivers;
-    # no manifest anywhere means takes will record audio and MIDI but no video.
-    have_vulkan=0
-    for d in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
-        if [ -d "$d" ] && [ -n "$(ls "$d"/*.json 2>/dev/null)" ]; then
-            have_vulkan=1
-            break
-        fi
-    done
-    if [ "$have_vulkan" = "0" ]; then
-        echo
-        echo "  NOTE: no Vulkan driver was found, so takes will record audio and"
-        echo "        MIDI but not video. Any Vulkan driver fixes it - mesa's"
-        echo "        lavapipe works on every GPU:"
-        # `distro_family` rather than a list of ID values: the list missed every
-        # derivative that does not name itself after its parent. Zorin, Mint and
-        # Pop all landed in the `*)` branch and were told to work it out
-        # themselves, which is precisely who the note is for.
-        case "$(distro_family)" in
-            debian) echo "          sudo apt install mesa-vulkan-drivers" ;;
-            fedora) echo "          sudo dnf install mesa-vulkan-drivers" ;;
-            arch)   echo "          sudo pacman -S vulkan-swrast" ;;
-            void)   echo "          sudo xbps-install mesa-vulkan-lavapipe" ;;
-            suse)   echo "          sudo zypper install libvulkan1 Mesa-vulkan-device-select" ;;
-            *)      echo "          (install your distribution's mesa Vulkan package)" ;;
-        esac
-    fi
-
-    media_prereqs
+if [ "${ON_PATH:-1}" = "1" ]; then
+    echo "Run it with:  tangent"
+else
+    echo "Run it with:  $BIN_DIR/tangent"
 fi
-[ "$WANT_VST3" = "1" ] && echo "Your DAW will find the plugin the next time it scans for plugins."
-echo "Hold H in either one to see every keyboard shortcut."
+# Said out loud, because the whole point of answering yes to that question
+# is being able to start it without a terminal, and a launcher that has
+# not rescanned yet looks exactly like an entry that was never written.
+if [ "${WANT_DESKTOP:-0}" = "1" ]; then
+    echo "Or from your application menu, rofi, wofi or dmenu, as \"Tangent\"."
+    echo "  (a launcher that caches its list may need one restart to see it)"
+fi
+
+# Filming a take composites on the GPU through Vulkan. Everything else in
+# Tangent works without it, so a missing driver is a note with the exact
+# command, not an error. ICD manifests are how the loader finds drivers;
+# no manifest anywhere means takes will record audio and MIDI but no video.
+have_vulkan=0
+for d in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
+    if [ -d "$d" ] && [ -n "$(ls "$d"/*.json 2>/dev/null)" ]; then
+        have_vulkan=1
+        break
+    fi
+done
+if [ "$have_vulkan" = "0" ]; then
+    echo
+    echo "  NOTE: no Vulkan driver was found, so takes will record audio and"
+    echo "        MIDI but not video. Any Vulkan driver fixes it - mesa's"
+    echo "        lavapipe works on every GPU:"
+    # `distro_family` rather than a list of ID values: the list missed every
+    # derivative that does not name itself after its parent. Zorin, Mint and
+    # Pop all landed in the `*)` branch and were told to work it out
+    # themselves, which is precisely who the note is for.
+    case "$(distro_family)" in
+        debian) echo "          sudo apt install mesa-vulkan-drivers" ;;
+        fedora) echo "          sudo dnf install mesa-vulkan-drivers" ;;
+        arch)   echo "          sudo pacman -S vulkan-swrast" ;;
+        void)   echo "          sudo xbps-install mesa-vulkan-lavapipe" ;;
+        suse)   echo "          sudo zypper install libvulkan1 Mesa-vulkan-device-select" ;;
+        *)      echo "          (install your distribution's mesa Vulkan package)" ;;
+    esac
+fi
+
+media_prereqs
+echo "Hold H in Tangent to see every keyboard shortcut."

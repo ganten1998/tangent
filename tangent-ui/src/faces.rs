@@ -3,11 +3,10 @@
 //! One `draw` for all of them: the path in the pushed [`BuiltinFace`] picks
 //! the layout, the kit supplies every part, and what a face returns is a
 //! wish (`FaceAction`) the app maps onto requests. Nothing here touches
-//! `Settings`, the engine, or a disk — a face is a picture of pushed data
-//! and a stream of small asks, which is what lets the same code sit in the
-//! desktop and (one day) the plugin build unchanged.
+//! `Settings`, the engine, or a disk: a face is a picture of pushed data
+//! and a stream of small asks.
 //!
-//! **That last clause is why the IR browser is shaped the way it is.** It
+//! **That is why the IR browser is shaped the way it is.** It
 //! walks folders, but it never opens one: the face writes where it wants to
 //! stand into `FaceLive::ir_dir` and the app lists it, exactly as the
 //! drumpad's media explorer is listed by `app::refresh_media`. Path

@@ -1,6 +1,6 @@
 #!/bin/sh
-# The VST3 plugin was retired 2026-08-24. Old Tangent packages installed it to
-# the system plugin directory; nothing ever removed it, so every DAW on the
-# machine kept finding a stale build. Upgrading the app cleans it up.
+# Packages before 4.77.0 could also put a Tangent.vst3 in the system VST3
+# folder, and nothing ever removed it, so every program that scans that folder
+# kept finding it. Installing this one takes it out.
 rm -rf "/Library/Audio/Plug-Ins/VST3/Tangent.vst3" 2>/dev/null || true
 exit 0

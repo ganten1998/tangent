@@ -145,10 +145,6 @@ fi
 echo "==> Building the standalone (first run compiles everything)"
 ssh_ "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
 
-# The VST3 is RETIRED (owner's ruling, 2026-08-24): Tangent is a DAW now,
-# and a DAW does not load through another. The plugin workspace stays in the
-# tree for a possible visualizer-only return; nothing builds or ships it.
-
 # ── Bring it home ────────────────────────────────────────────────────────────
 echo "==> Fetching the tarball"
 mkdir -p dist

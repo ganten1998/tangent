@@ -67,7 +67,7 @@ note (exact upstream URL and checksum) ship beside the binary in the
 ffmpeg-licenses/ folder of those artifacts. Source code for ffmpeg is
 available from https://ffmpeg.org/. Because it runs as a separate program,
 its GPL terms apply to that binary and do not extend to Tangent itself
-(see LICENSING.md for the same reasoning applied to the VST3 plugin).
+(LICENSING.md sets out why).
 The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.
 
 Rust crates
