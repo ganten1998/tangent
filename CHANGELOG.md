@@ -12,6 +12,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Middle-drag pans the arrangement and the MIDI editor** (experimental).
+  Hold the middle mouse button and drag to move the view like grabbing a
+  page: sideways scrolls time, up and down scrolls the tracks (whole tracks
+  at a time) or, in the MIDI editor, the notes. Over the track names or the
+  piano keys it scrolls up and down only. It changes only the view: nothing
+  is selected, moved or located, and it is not an undo step. A middle press
+  during a left drag does nothing, and its release no longer ends that
+  drag. Trackpads have no middle button and are unchanged.
 - **Export only some tracks, or only part of the song.** The Export window
   has a TRACKS row: Everything (as before) or Selected tracks, a checklist
   with All and None buttons. It opens with your current selection checked

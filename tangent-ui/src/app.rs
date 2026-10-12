@@ -923,6 +923,13 @@ pub struct TangentApp {
     mixer_bar_grab: Option<f32>,
     /// The same for the arrangement's lane scrollbar.
     arr_bar_grab: Option<f32>,
+    /// **A MIDDLE-button pan of the arrangement in flight**: the hand holds
+    /// the page. Its own field and never an `ArrDrag`: it is a second hand on
+    /// the view, not a gesture on the song, so it cannot end, arm or eat a
+    /// left drag. See [`MidPan`].
+    arr_mid_pan: Option<MidPan>,
+    /// The same for the MIDI editor's roll: time sideways, pitch up and down.
+    me_mid_pan: Option<MidPan>,
     /// The first lane the arrangement shows — the vertical twin of the
     /// mixer's scroll, moved by the wheel over the track headers — as its
     /// RANK among the drawn lanes (`ArrangeView::lane_scroll`). Still a
@@ -2376,6 +2383,51 @@ struct AutoDragFrom {
     /// a paste, an undo between two frames — the anchor is somebody else's
     /// past and the drag re-anchors on what is there now.
     produced: Vec<Vec<crate::automation::Point>>,
+}
+
+/// **A middle-button pan: the hand grabs the page and the content follows it
+/// one to one.** The owner's "middle click mouse drag to move the viewport in
+/// arrange and midi view".
+///
+/// Measured from an ANCHOR rather than frame by frame: the window that stood
+/// when the hand was at `from`, so a point grabbed stays under the hand for as
+/// long as the rails allow, and a hand brought back to where it pressed puts
+/// the view back exactly. Sideways is seconds of window per point, read off
+/// the panel's own axis; up and down is ROWS (whole lanes on the timeline,
+/// whose stack has no partial lane; fractional keys on the roll) per point.
+///
+/// A VIEW change and nothing else: no undo moment, no dirty mark, no
+/// selection, no playhead. The wheel's own rules, through the wheel's own
+/// clamps.
+#[derive(Debug, Clone, Copy)]
+struct MidPan {
+    /// Where the hand was when the view stood at the figures below.
+    from: Pos2,
+    /// The window's start and length at the anchor. A length changed under
+    /// the pan (a zoom, a take growing the window) re-anchors it.
+    start_s: f64,
+    len_s: f64,
+    /// Seconds per point along the time axis, at the anchor.
+    s_per_px: f64,
+    /// The vertical position at the anchor: the lane rank on the timeline,
+    /// `top_key` on the roll.
+    row: f32,
+    /// Points per row: a lane's height, or a key's.
+    row_h: f32,
+    /// False when the press landed on the header column (or the roll's
+    /// keyboard), which has no time axis to travel along.
+    sideways: bool,
+}
+
+/// **A release that is not the middle button's.** The timeline and the roll
+/// end their gestures on any release, so a middle pan let go during a held
+/// left drag ended the LEFT drag. The middle button's release belongs to the
+/// pan alone.
+fn released_not_middle(i: &egui::InputState) -> bool {
+    use egui::PointerButton as B;
+    [B::Primary, B::Secondary, B::Extra1, B::Extra2]
+        .into_iter()
+        .any(|b| i.pointer.button_released(b))
 }
 
 /// A gesture in flight on the arrangement. What the press grabbed, and the
@@ -4490,6 +4542,8 @@ impl TangentApp {
             mixer_scroll_px: 0.0,
             mixer_bar_grab: None,
             arr_bar_grab: None,
+            arr_mid_pan: None,
+            me_mid_pan: None,
             arr_lane_scroll: 0,
             arr_scroll_acc: 0.0,
             mixer_grab: None,
@@ -15647,6 +15701,90 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The middle button takes hold of the timeline** at `p`: the window,
+    /// the lane scroll and the two scales as they stand, see [`MidPan`].
+    /// Over the header column the pan is vertical only: a name has no time
+    /// to travel along.
+    fn arr_mid_pan_start(&mut self, rect: Rect, p: Pos2) {
+        let (s_per_px, sideways) = {
+            let clips = self.arr_clip_views();
+            let view = self.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            // The axis `time_at_in` draws on (the window across the field),
+            // in f64 and not as the difference of two of its answers, which
+            // are f32 fractions: one point's slope read that way is off by a
+            // few parts in ten thousand, and a long pan walks off the hand.
+            // A degenerate field pans nothing rather than dividing by it.
+            let s = if l.lanes_area.width() > 0.0 && view.view_len_s > 0.0 {
+                view.view_len_s / f64::from(l.lanes_area.width())
+            } else {
+                0.0
+            };
+            (s, !l.header.contains(p))
+        };
+        let (start_s, len_s) = self.arr_window_now();
+        let (_, lane_scroll, _) = self.arr_lane_window();
+        // Banked wheel intent is somebody else's gesture: the hand now says
+        // exactly where the stack stands.
+        self.arr_scroll_acc = 0.0;
+        self.arr_mid_pan = Some(MidPan {
+            from: p,
+            start_s,
+            len_s,
+            s_per_px,
+            row: lane_scroll as f32,
+            row_h: self.arr_lane_h(rect),
+            sideways,
+        });
+    }
+
+    /// **The page follows the hand** to `p`: the anchored window through
+    /// `arr_steer` (the one clamp the window has), and the anchored lane,
+    /// rounded to the nearest whole lane and held to the wheel's rails.
+    ///
+    /// **A rail owes the hand nothing.** Where a clamp stops the view, the
+    /// anchor moves up to the hand, so pushing past the song's start and
+    /// coming back moves the view again at once rather than after the
+    /// overshoot is paid back: the wheel's own rail-clear, on a drag.
+    fn arr_mid_pan_drag(&mut self, rect: Rect, p: Pos2) {
+        let Some(mut pan) = self.arr_mid_pan else {
+            return;
+        };
+        let (_, len) = self.arr_window_now();
+        // Something else changed the window's LENGTH under the pan: a
+        // wheel zoom, a take growing the view. The old scale no longer
+        // describes the picture, so the time axis takes hold again where it
+        // stands; the lanes keep their anchor.
+        if (len - pan.len_s).abs() > 1.0e-9 {
+            let (sideways, row, from_y) = (pan.sideways, pan.row, pan.from.y);
+            self.arr_mid_pan_start(rect, p);
+            if let Some(again) = self.arr_mid_pan.as_mut() {
+                again.sideways = sideways;
+                again.row = row;
+                again.from.y = from_y;
+            }
+            return;
+        }
+        if pan.sideways {
+            let want = pan.start_s - f64::from(p.x - pan.from.x) * pan.s_per_px;
+            self.arr_steer(want, len);
+            let (got, _) = self.arr_window_now();
+            if (got - want).abs() > 1.0e-9 {
+                pan.start_s = got;
+                pan.from.x = p.x;
+            }
+        }
+        let max = (self.desk_index().shown_len() + 1).saturating_sub(self.arr_visible());
+        let rows = (pan.row - (p.y - pan.from.y) / pan.row_h.max(1.0)).round();
+        let to = (rows.max(0.0) as usize).min(max);
+        if rows < 0.0 || rows as usize > max {
+            pan.row = to as f32;
+            pan.from.y = p.y;
+        }
+        self.arr_lane_scroll = to;
+        self.arr_mid_pan = Some(pan);
+    }
+
     /// Clamp a steered window into the song's neighbourhood and keep it.
     fn arr_steer(&mut self, start: f64, len: f64) {
         // An HOUR of viewport, empty project or not — the owner hit the old
@@ -25683,7 +25821,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.midi_edit.is_none() {
             return false;
         }
-        if self.midi_edit.as_ref().is_some_and(|m| m.drag.is_some()) {
+        if self.midi_edit.as_ref().is_some_and(|m| m.drag.is_some()) || self.me_mid_pan.is_some() {
             return true;
         }
         match (pointer, self.midi_edit_rect) {
@@ -25840,9 +25978,86 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The middle button takes hold of the roll** at `p` (see [`MidPan`]):
+    /// the window, `top_key` and the panel's own two scales as they stand.
+    /// Over the keyboard column the pan is pitch only, the timeline's header
+    /// rule: the keys have no time to travel along.
+    fn me_mid_pan_start(&mut self, rect: Rect, p: Pos2) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return;
+        };
+        let view = self.midi_edit_view(st, clip);
+        let l = crate::midi_editor::Layout::new(rect);
+        // The roll's own axis (`midi_editor::time_at`): the window across
+        // the roll's width.
+        let s_per_px = view.view_len_s.max(1.0e-9) / f64::from(l.roll.width().max(1.0));
+        let pan = MidPan {
+            from: p,
+            start_s: st.view_start_s,
+            len_s: st.view_len_s,
+            s_per_px,
+            row: st.top_key,
+            row_h: crate::midi_editor::key_h(&l, view.keys_shown),
+            sideways: !l.keys.contains(p),
+        };
+        self.me_mid_pan = Some(pan);
+    }
+
+    /// **The roll follows the hand** to `p`: time through the wheel's own
+    /// rail (the song has a start, and no far wall), pitch through the
+    /// wheel's own `(kv, 128)` rails, fractional keys so a point of hand is a
+    /// point of roll. A rail owes the hand nothing, as on the timeline.
+    fn me_mid_pan_drag(&mut self, rect: Rect, p: Pos2) {
+        let Some(mut pan) = self.me_mid_pan else {
+            return;
+        };
+        let kv = self.midi_keys_visible();
+        let Some(len) = self.midi_edit.as_ref().map(|st| st.view_len_s) else {
+            self.me_mid_pan = None;
+            return;
+        };
+        // A zoom under the pan, on either axis, re-anchors it where it is.
+        let kh = {
+            let l = crate::midi_editor::Layout::new(rect);
+            crate::midi_editor::key_h(&l, kv)
+        };
+        if (len - pan.len_s).abs() > 1.0e-9 || (kh - pan.row_h).abs() > 1.0e-4 {
+            let sideways = pan.sideways;
+            self.me_mid_pan_start(rect, p);
+            if let Some(again) = self.me_mid_pan.as_mut() {
+                again.sideways = sideways;
+            }
+            return;
+        }
+        let Some(st) = self.midi_edit.as_mut() else {
+            return;
+        };
+        if pan.sideways {
+            let want = pan.start_s - f64::from(p.x - pan.from.x) * pan.s_per_px;
+            st.view_start_s = want.max(0.0);
+            if want < 0.0 {
+                pan.start_s = 0.0;
+                pan.from.x = p.x;
+            }
+        }
+        // DOWN shows the higher notes: `top_key` counts upward, so the hand
+        // going down raises it by the keys it travelled.
+        let want = pan.row + (p.y - pan.from.y) / pan.row_h.max(1.0e-3);
+        st.top_key = want.clamp(kv, 128.0);
+        if (st.top_key - want).abs() > 1.0e-6 {
+            pan.row = st.top_key;
+            pan.from.y = p.y;
+        }
+        self.me_mid_pan = Some(pan);
+    }
+
     /// All of the editor's input: wheel grammar, presses, drags, keys.
     fn midi_editor_input(&mut self, ctx: &egui::Context) {
         if self.midi_edit.is_none() {
+            self.me_mid_pan = None;
             return;
         }
         // **A release nobody saw still ends the note gesture**, by the
@@ -25873,6 +26088,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // it — each of those used to return with the note still on.
         self.me_preview_tick(ctx);
         self.me_loop_bar_cursor(ctx);
+        // **The middle-button pan, ahead of every gate**, the timeline's
+        // rule (see `arrangement_input`): held, the frame is the pan's
+        // wherever the hand is; the first frame the button is not down ends
+        // it, seen or not.
+        if self.me_mid_pan.is_some() {
+            let (held, at) = ctx.input(|i| (i.pointer.middle_down(), i.pointer.interact_pos()));
+            match (held, self.midi_edit_rect) {
+                (true, Some(rect)) => {
+                    if let Some(p) = at {
+                        self.me_mid_pan_drag(rect, p);
+                    }
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                    return;
+                }
+                _ => self.me_mid_pan = None,
+            }
+        }
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer — and the press that dismissed it
             // is spent, exactly as on the arrangement. A dialog owns it
@@ -25937,7 +26169,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 i.pointer.primary_pressed(),
                 i.pointer.secondary_pressed(),
                 i.pointer.primary_down(),
-                i.pointer.any_released(),
+                // Not the middle button's: that one is the pan's alone.
+                released_not_middle(i),
                 i.pointer.interact_pos(),
             )
         });
@@ -25967,6 +26200,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.note_menu.is_some() {
             self.note_menu_frame(ctx, pressed, pointer);
             return;
+        }
+
+        // ── a MIDDLE press grabs the roll (see `MidPan`) ─────────────────
+        // Only one that starts a gesture: with a note, a marquee, a key or
+        // either other button already in the hand it does nothing, so the
+        // gesture in flight is the one that finishes. Nothing below reads
+        // the middle button, so no note, cell or ruler can claim it.
+        if over
+            && ctx.input(|i| {
+                i.pointer.button_pressed(egui::PointerButton::Middle)
+                    && !i.pointer.primary_down()
+                    && !i.pointer.secondary_down()
+            })
+            && self
+                .midi_edit
+                .as_ref()
+                .is_some_and(|st| st.drag.is_none() && st.down_key.is_none())
+        {
+            if let Some(p) = pointer {
+                self.me_mid_pan_start(rect, p);
+                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                return;
+            }
         }
 
         // ── the keys the editor owns while the hand is on it ─────────────
@@ -27432,6 +27688,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
         }
+        // **The middle-button pan, ahead of every gate.** Once the hand has
+        // hold of the page it keeps it until the button comes up, wherever
+        // the pointer wanders (over the MIDI editor, a menu, off the panel
+        // or out of the window), and a release nobody saw ends it the same
+        // as one somebody did: the first frame the button is not down.
+        // While it is held this frame is the pan's and nothing else's.
+        if self.arr_mid_pan.is_some() {
+            let (held, at) = ctx.input(|i| (i.pointer.middle_down(), i.pointer.interact_pos()));
+            match (held, self.arrangement_rect) {
+                (true, Some(rect)) => {
+                    if let Some(p) = at {
+                        self.arr_mid_pan_drag(rect, p);
+                    }
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                    return;
+                }
+                _ => self.arr_mid_pan = None,
+            }
+        }
         // **A second Cmd/Ctrl+M closes the panel the first one opened**
         // (`met_chord_closes`, which has the terms), asked HERE, before the
         // panel takes the frame below. It was written beside the open, after
@@ -27640,7 +27915,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
-                i.pointer.any_released(),
+                // Not the middle button's: that one is the pan's alone.
+                released_not_middle(i),
                 i.pointer.interact_pos(),
             )
         });
@@ -27654,6 +27930,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             && self.arr_drag.is_none()
         {
             return;
+        }
+        // **A MIDDLE press grabs the page** (see `MidPan`), and only a press
+        // that starts a gesture: during a left drag, a scrollbar hold, a bay
+        // being carried or with the other buttons down it does nothing at
+        // all, so the gesture already in the hand is the one that finishes.
+        // Before the scrollbar and the presses below, none of which read the
+        // middle button, so nothing on the lanes can claim it either.
+        if ctx.input(|i| {
+            i.pointer.button_pressed(egui::PointerButton::Middle)
+                && !i.pointer.primary_down()
+                && !i.pointer.secondary_down()
+        }) && self.arr_drag.is_none()
+            && self.arr_bar_grab.is_none()
+            && self.bay_carry.is_none()
+        {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                self.arr_mid_pan_start(rect, p);
+                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                return;
+            }
         }
         // **The lane scrollbar, before anything on the lanes can claim the
         // press.** A press on it moves the window to where it landed and a
@@ -78274,6 +78570,464 @@ mod tests {").expect("the tests module")];
         }
     }
 
+    // ── the middle-button pan ─────────────────────────────────────────────
+
+    /// One frame with the MIDDLE button going down (`true`) or up at `pos`,
+    /// and the cursor that frame asked for.
+    fn mid_button(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        pos: Pos2,
+        pressed: bool,
+    ) -> egui::CursorIcon {
+        mid_frame(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Middle,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+    }
+
+    /// A move to `pos`, and the cursor that frame asked for.
+    fn mid_move(ctx: &egui::Context, app: &mut TangentApp, pos: Pos2) -> egui::CursorIcon {
+        mid_frame(ctx, app, vec![egui::Event::PointerMoved(pos)])
+    }
+
+    fn mid_frame(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        events: Vec<egui::Event>,
+    ) -> egui::CursorIcon {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        )
+        .platform_output
+        .cursor_icon
+    }
+
+    /// Everything a pan must leave alone: the song, the selection, the
+    /// transport's position, the undo history and the dirty mark.
+    #[derive(Debug, PartialEq)]
+    struct Untouched {
+        clips: Vec<crate::arrangement::ArrClip>,
+        selected: Option<u64>,
+        multi: Vec<u64>,
+        me_selected: Option<Vec<usize>>,
+        playhead: f64,
+        history: usize,
+        hist_at: usize,
+        dirty: bool,
+    }
+
+    fn untouched(app: &TangentApp) -> Untouched {
+        Untouched {
+            clips: app.arrangement.clips.clone(),
+            selected: app.arr_selected,
+            multi: app.arr_multi.clone(),
+            me_selected: app.midi_edit.as_ref().map(|m| {
+                let mut v: Vec<usize> = m.selected.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }),
+            playhead: app.recorder.position_s,
+            history: app.history.len(),
+            hist_at: app.hist_at,
+            dirty: app.project_dirty(),
+        }
+    }
+
+    /// The tall stack with a clip on it, the window and the stack both
+    /// parked somewhere with room on every side, the clip selected.
+    fn arrangement_to_pan(ctx: &egui::Context, app: &mut TangentApp) -> (Rect, u64) {
+        let (_, id) = arrangement_with_a_clip(ctx, app);
+        let (rect, _) = arrangement_with_a_tall_stack(ctx, app);
+        app.arr_steer(10.0, 20.0);
+        app.arr_lane_scroll = 4;
+        app.arr_selected = Some(id);
+        app.arr_multi = vec![id];
+        let _ = run_frame(ctx, app);
+        let _ = app.take_recorder_request();
+        (rect, id)
+    }
+
+    fn arr_layout_numbers(app: &TangentApp, rect: Rect) -> (Rect, Rect) {
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        (l.lanes_area, l.header)
+    }
+
+    fn arr_time_at(app: &TangentApp, rect: Rect, x: f32) -> f64 {
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        crate::arrangement_panel::time_at_in(&l, &view, x)
+    }
+
+    /// **A middle drag holds the arrangement like a page.** The owner:
+    /// "middle click mouse drag to move the viewport in arrange and midi
+    /// view". The second under the press is under the hand where it lets go,
+    /// the stack moves by the lanes the hand travelled, the cursor says the
+    /// page is held, and nothing else in the session moves: no clip, no
+    /// selection, no playhead, no undo moment, no dirty mark.
+    #[test]
+    fn a_middle_drag_pans_the_arrangement_one_to_one() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_to_pan(&ctx, &mut app);
+        let before = untouched(&app);
+        let (lanes, _) = arr_layout_numbers(&app, rect);
+        let lane_h = app.arr_lane_h(rect);
+        let p0 = lanes.center();
+        let t0 = arr_time_at(&app, rect, p0.x);
+        let len0 = app.arr_window_now().1;
+        assert_eq!(mid_button(&ctx, &mut app, p0, true), egui::CursorIcon::Grabbing);
+        assert!(app.arr_mid_pan.is_some(), "the middle press took no hold");
+        // Left 120 points and up two lanes and a bit, in three steps.
+        let p1 = Pos2::new(p0.x - 120.0, p0.y - 2.4 * lane_h);
+        mid_move(&ctx, &mut app, Pos2::new(p0.x - 40.0, p0.y - lane_h));
+        mid_move(&ctx, &mut app, Pos2::new(p0.x - 80.0, p0.y - 2.0 * lane_h));
+        assert_eq!(mid_move(&ctx, &mut app, p1), egui::CursorIcon::Grabbing);
+        let t1 = arr_time_at(&app, rect, p1.x);
+        // Within the f32 the panel's axis is measured in: a ten-thousandth
+        // of a second is a few thousandths of a point here.
+        assert!(
+            (t1 - t0).abs() < 1.0e-4,
+            "the second under the press ({t0:.6}) is not under the hand ({t1:.6})"
+        );
+        assert!((app.arr_window_now().1 - len0).abs() < 1.0e-12, "the pan zoomed");
+        assert_eq!(app.arr_lane_scroll, 6, "two lanes and a bit up is two lanes");
+        mid_button(&ctx, &mut app, p1, false);
+        assert!(app.arr_mid_pan.is_none(), "the release did not end the pan");
+        // Let go, the hand moves on and the view stays where it was put.
+        let win = app.arr_window_now();
+        mid_move(&ctx, &mut app, p0);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.arr_window_now(), win, "the view moved after the release");
+        assert_eq!(app.arr_lane_scroll, 6);
+        assert_eq!(app.take_recorder_request(), None, "the pan asked the transport for something");
+        assert_eq!(untouched(&app), before, "a pan changed something that is not the view");
+    }
+
+    /// **The rails hold, and owe the hand nothing.** Past the song's start
+    /// and past the top of the stack the view stops; the hand coming back
+    /// moves it again at once rather than after the overshoot. Over the
+    /// header column the pan is up and down only.
+    #[test]
+    fn a_middle_drag_stops_at_the_rails_and_the_header_pans_lanes_only() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_to_pan(&ctx, &mut app);
+        let before = untouched(&app);
+        let (lanes, header) = arr_layout_numbers(&app, rect);
+        let lane_h = app.arr_lane_h(rect);
+        let len = app.arr_window_now().1;
+        let s_per_px = len / f64::from(lanes.width());
+        let p0 = lanes.center();
+        mid_button(&ctx, &mut app, p0, true);
+        // Far to the right and far down: the window's start and the first
+        // lane are both on their rails.
+        let far = Pos2::new(p0.x + 600.0, p0.y + 40.0 * lane_h);
+        mid_move(&ctx, &mut app, far);
+        assert_eq!(app.arr_window_now().0, 0.0, "the window went before the song");
+        assert_eq!(app.arr_lane_scroll, 0, "the stack went above its first lane");
+        // Thirty points back: thirty points of song, at once.
+        mid_move(&ctx, &mut app, Pos2::new(far.x - 30.0, far.y - lane_h));
+        let start = app.arr_window_now().0;
+        assert!(
+            (start - 30.0 * s_per_px).abs() < 1.0e-6,
+            "the rail banked the overshoot: 30 points back moved the window to {start}"
+        );
+        assert_eq!(app.arr_lane_scroll, 1, "the rail banked the vertical overshoot");
+        // The far wall of the stack.
+        mid_move(&ctx, &mut app, Pos2::new(far.x, far.y - 200.0 * lane_h));
+        let max = (app.desk_index().shown_len() + 1).saturating_sub(app.arr_visible());
+        assert_eq!(app.arr_lane_scroll, max, "the stack ran past its last lane");
+        mid_button(&ctx, &mut app, far, false);
+
+        // The header column: lanes only.
+        app.arr_lane_scroll = 4;
+        let win = app.arr_window_now();
+        let h0 = header.center();
+        mid_button(&ctx, &mut app, h0, true);
+        mid_move(&ctx, &mut app, Pos2::new(h0.x + 200.0, h0.y + 2.0 * lane_h));
+        assert_eq!(app.arr_window_now(), win, "the header pan moved time");
+        assert_eq!(app.arr_lane_scroll, 2, "the header pan did not move the lanes");
+        mid_button(&ctx, &mut app, h0, false);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.take_recorder_request(), None);
+        assert_eq!(untouched(&app), before);
+    }
+
+    /// **A release off the panel ends the pan**, and so does one nobody saw.
+    #[test]
+    fn a_middle_pan_ends_on_a_release_off_the_panel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_to_pan(&ctx, &mut app);
+        let (lanes, _) = arr_layout_numbers(&app, rect);
+        let p0 = lanes.center();
+        mid_button(&ctx, &mut app, p0, true);
+        // Up over the band, out of the panel altogether, still panning.
+        let off = Pos2::new(p0.x, rect.top() - 20.0);
+        assert!(!rect.contains(off));
+        mid_move(&ctx, &mut app, off);
+        assert!(app.arr_mid_pan.is_some(), "the pan let go when the hand left the panel");
+        mid_button(&ctx, &mut app, off, false);
+        assert!(app.arr_mid_pan.is_none(), "a release off the panel did not end the pan");
+        let win = (app.arr_window_now(), app.arr_lane_scroll);
+        mid_move(&ctx, &mut app, Pos2::new(p0.x - 100.0, p0.y));
+        assert_eq!((app.arr_window_now(), app.arr_lane_scroll), win, "the ended pan went on");
+        // A pan whose release never arrived (stood in by hand): the first
+        // frame with the button up ends it.
+        app.arr_mid_pan = Some(MidPan {
+            from: p0,
+            start_s: 0.0,
+            len_s: app.arr_window_now().1,
+            s_per_px: 1.0,
+            row: 0.0,
+            row_h: 1.0,
+            sideways: true,
+        });
+        mid_move(&ctx, &mut app, Pos2::new(p0.x - 300.0, p0.y));
+        assert!(app.arr_mid_pan.is_none(), "a pan with no button down went on");
+        assert_eq!((app.arr_window_now(), app.arr_lane_scroll), win);
+    }
+
+    /// **The middle button and a left drag keep out of each other's way.**
+    /// A middle press during a left drag does nothing, and its RELEASE does
+    /// not end the left drag (every release used to). A left press during a
+    /// middle pan does nothing either: no locate, no selection.
+    #[test]
+    fn a_middle_press_and_a_left_drag_keep_out_of_each_others_way() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        let grab = arr_clip_centre(&app, rect, id);
+        let start0 = app.arrangement.clips[0].start_s;
+        press(&ctx, &mut app, grab);
+        move_to(&ctx, &mut app, Pos2::new(grab.x + 10.0, grab.y));
+        assert!(matches!(app.arr_drag, Some(ArrDrag::Move { .. })), "no clip drag: {:?}", app.arr_drag);
+        let win = app.arr_window_now();
+        // The middle button, down and up, with the left still held.
+        let mid = Pos2::new(grab.x + 20.0, grab.y);
+        mid_button(&ctx, &mut app, mid, true);
+        assert!(app.arr_mid_pan.is_none(), "a middle press took hold during a left drag");
+        mid_move(&ctx, &mut app, Pos2::new(grab.x + 30.0, grab.y));
+        mid_button(&ctx, &mut app, Pos2::new(grab.x + 30.0, grab.y), false);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::Move { .. })),
+            "the middle release ended the left drag: {:?}",
+            app.arr_drag
+        );
+        assert_eq!(app.arr_window_now(), win, "the middle button moved the view during a left drag");
+        // The left drag finishes as its own.
+        move_to(&ctx, &mut app, Pos2::new(grab.x + 40.0, grab.y));
+        release(&ctx, &mut app, Pos2::new(grab.x + 40.0, grab.y));
+        assert!(app.arr_drag.is_none());
+        assert!(app.arrangement.clips[0].start_s > start0, "the left drag moved nothing");
+
+        // And the other way round: a left press during a pan.
+        let _ = run_frame(&ctx, &mut app);
+        let _ = app.take_recorder_request();
+        app.arr_selected = Some(id);
+        let before = untouched(&app);
+        let lanes = arr_layout_numbers(&app, rect).0;
+        let empty = Pos2::new(lanes.right() - 30.0, grab.y);
+        mid_button(&ctx, &mut app, empty, true);
+        assert!(app.arr_mid_pan.is_some());
+        press(&ctx, &mut app, empty);
+        assert_eq!(app.take_recorder_request(), None, "a left press during a pan located");
+        assert!(app.arr_drag.is_none(), "a left press during a pan armed {:?}", app.arr_drag);
+        release(&ctx, &mut app, empty);
+        mid_button(&ctx, &mut app, empty, false);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.take_recorder_request(), None);
+        assert_eq!(untouched(&app), before, "a left press during a pan changed something");
+    }
+
+    /// **While the transport plays, a pan stays where the hand put it.** The
+    /// timeline has no page-follow during playback (only a TAKE widens the
+    /// window, and only once it crosses the right edge), so the pan obeys the
+    /// wheel's rule: nothing takes the view back from it.
+    #[test]
+    fn a_middle_pan_holds_during_playback() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_to_pan(&ctx, &mut app);
+        app.recorder.playing = true;
+        app.recorder.position_s = 12.0;
+        let (lanes, _) = arr_layout_numbers(&app, rect);
+        let p0 = lanes.center();
+        let t0 = arr_time_at(&app, rect, p0.x);
+        mid_button(&ctx, &mut app, p0, true);
+        for k in 1..=4 {
+            app.recorder.position_s += 0.25;
+            mid_move(&ctx, &mut app, Pos2::new(p0.x - 50.0 * k as f32, p0.y));
+        }
+        let p1 = Pos2::new(p0.x - 200.0, p0.y);
+        assert!((arr_time_at(&app, rect, p1.x) - t0).abs() < 1.0e-4, "the pan was fought");
+        mid_button(&ctx, &mut app, p1, false);
+        let win = app.arr_window_now();
+        for _ in 0..5 {
+            app.recorder.position_s += 0.25;
+            let _ = run_frame(&ctx, &mut app);
+        }
+        assert_eq!(app.arr_window_now(), win, "playback took the view back from the pan");
+    }
+
+    /// **The MIDI editor pans the same way**: time sideways, pitch up and
+    /// down, one to one (the second and the key under the press are under
+    /// the hand where it lets go), and no note, selection, playhead, moment
+    /// or dirty mark moves.
+    #[test]
+    fn a_middle_drag_pans_the_midi_editor_one_to_one() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.top_key = 84.0;
+            st.selected = vec![0];
+        }
+        let _ = run_frame(&ctx, &mut app);
+        let _ = app.take_recorder_request();
+        let before = untouched(&app);
+        let under = |app: &TangentApp, p: Pos2| {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            (crate::midi_editor::time_at(&l, &view, p.x), crate::midi_editor::key_at(&l, &view, p.y))
+        };
+        let l = crate::midi_editor::Layout::new(rect);
+        // Empty roll, well away from the one note.
+        let p0 = Pos2::new(l.roll.center().x, l.roll.top() + 20.0);
+        let (t0, k0) = under(&app, p0);
+        let len0 = app.midi_edit.as_ref().unwrap().view_len_s;
+        assert_eq!(mid_button(&ctx, &mut app, p0, true), egui::CursorIcon::Grabbing);
+        assert!(app.me_mid_pan.is_some(), "the middle press took no hold of the roll");
+        let p1 = Pos2::new(p0.x - 90.0, p0.y + 37.0);
+        mid_move(&ctx, &mut app, Pos2::new(p0.x - 45.0, p0.y + 10.0));
+        assert_eq!(mid_move(&ctx, &mut app, p1), egui::CursorIcon::Grabbing);
+        let (t1, k1) = under(&app, p1);
+        assert!((t1 - t0).abs() < 1.0e-6, "the second under the press ({t0}) is not under the hand ({t1})");
+        assert!((k1 - k0).abs() < 1.0e-3, "the key under the press ({k0}) is not under the hand ({k1})");
+        assert!((app.midi_edit.as_ref().unwrap().view_len_s - len0).abs() < 1.0e-12, "the pan zoomed");
+        mid_button(&ctx, &mut app, p1, false);
+        assert!(app.me_mid_pan.is_none());
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.take_recorder_request(), None, "the pan asked the transport for something");
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_none(), "the pan left a note gesture behind");
+        assert_eq!(untouched(&app), before, "a pan changed something that is not the view");
+    }
+
+    /// **The roll's rails**: the song's start, and the top and bottom of the
+    /// keyboard, which owe the hand nothing either. Over the keyboard column
+    /// the pan is pitch only. A release off the roll ends it.
+    #[test]
+    fn a_middle_drag_on_the_roll_stops_at_its_rails() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        let before = untouched(&app);
+        let kv = app.midi_keys_visible();
+        let l = crate::midi_editor::Layout::new(rect);
+        let kh = crate::midi_editor::key_h(&l, kv);
+        let p0 = Pos2::new(l.roll.center().x, l.roll.top() + 20.0);
+        // Half a second from the song's start, so the rail is in reach.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.view_start_s = 0.5;
+        }
+        mid_button(&ctx, &mut app, p0, true);
+        // Far right and far down: the song's start, the top of the keyboard.
+        let far = Pos2::new(p0.x + 400.0, p0.y + 400.0 * kh);
+        mid_move(&ctx, &mut app, far);
+        {
+            let st = app.midi_edit.as_ref().unwrap();
+            assert_eq!(st.view_start_s, 0.0, "the roll went before the song");
+            assert_eq!(st.top_key, 128.0, "the roll went above the keyboard");
+        }
+        mid_move(&ctx, &mut app, Pos2::new(far.x, far.y - 2.0 * kh));
+        assert!(
+            (app.midi_edit.as_ref().unwrap().top_key - 126.0).abs() < 1.0e-3,
+            "the top rail banked the overshoot"
+        );
+        mid_move(&ctx, &mut app, Pos2::new(far.x, far.y - 1000.0 * kh));
+        assert_eq!(app.midi_edit.as_ref().unwrap().top_key, kv, "the roll went below the keyboard");
+        // Off the roll altogether, then let go there.
+        let off = Pos2::new(rect.left() + 5.0, rect.top() - 30.0);
+        assert!(!rect.contains(off));
+        mid_move(&ctx, &mut app, off);
+        assert!(app.me_mid_pan.is_some(), "the pan let go when the hand left the roll");
+        mid_button(&ctx, &mut app, off, false);
+        assert!(app.me_mid_pan.is_none(), "a release off the roll did not end the pan");
+        assert!(app.midi_edit.is_some(), "the middle button closed the editor");
+
+        // The keyboard column: pitch only.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.top_key = 84.0;
+            st.view_start_s = 4.0;
+        }
+        let keys = crate::midi_editor::Layout::new(rect).keys.center();
+        mid_button(&ctx, &mut app, keys, true);
+        mid_move(&ctx, &mut app, Pos2::new(keys.x + 150.0, keys.y + 3.0 * kh));
+        {
+            let st = app.midi_edit.as_ref().unwrap();
+            assert_eq!(st.view_start_s, 4.0, "the keyboard pan moved time");
+            assert!((st.top_key - 87.0).abs() < 1.0e-3, "the keyboard pan moved pitch to {}", st.top_key);
+        }
+        mid_button(&ctx, &mut app, keys, false);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.take_recorder_request(), None);
+        assert_eq!(untouched(&app), before);
+    }
+
+    /// **A middle press during a note drag does nothing**, and its release
+    /// does not end the note drag.
+    #[test]
+    fn a_middle_press_during_a_note_drag_does_nothing() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.top_key = 72.0;
+        }
+        let _ = run_frame(&ctx, &mut app);
+        // The note's body: 4.5..5.5 s at key 60.
+        let at = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            let kh = crate::midi_editor::key_h(&l, view.keys_shown);
+            Pos2::new(
+                crate::midi_editor::x_of(&l, &view, 5.0),
+                crate::midi_editor::y_of(&l, &view, 60.0) + kh * 0.5,
+            )
+        };
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, Pos2::new(at.x + 5.0, at.y));
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_some(), "no note drag to test against");
+        let (s0, k0) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.top_key)
+        };
+        mid_button(&ctx, &mut app, Pos2::new(at.x + 10.0, at.y), true);
+        assert!(app.me_mid_pan.is_none(), "a middle press took hold during a note drag");
+        mid_button(&ctx, &mut app, Pos2::new(at.x + 15.0, at.y), false);
+        {
+            let st = app.midi_edit.as_ref().unwrap();
+            assert!(st.drag.is_some(), "the middle release ended the note drag");
+            assert_eq!((st.view_start_s, st.top_key), (s0, k0), "the middle button moved the roll");
+        }
+        release(&ctx, &mut app, Pos2::new(at.x + 15.0, at.y));
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_none());
+    }
+
     /// A twelve-track arrangement whose stack is taller than its window, one
     /// frame drawn. Returns the panel's rectangle and which header rows were
     /// on screen at that moment.
@@ -88218,6 +88972,11 @@ mod lane_refs_tests {
             ),
         ),
         ("detector", Exempt("the chord detector: pitches")),
+        (
+            "arr_mid_pan",
+            Exempt("a view pan for one held button: a scroll position, never a lane, and re-clamped every frame"),
+        ),
+        ("me_mid_pan", Exempt("the roll's view pan for one held button: seconds and keys, no lane")),
         ("license", Exempt("the licence store")),
         ("forced_free_cap", Exempt("a count of tracks a test forces")),
         ("midi_tx", Exempt("note events: pitches and velocities")),
