@@ -25,20 +25,27 @@ screenshots are replaced, move retired files out of `media/` first and prune
 them with `bash prune-remote.sh <path>`, because Neocities uploads never
 delete.
 
-**Screenshot:** the card below keeps the two images already on the site.
-Neither shows the arrangement or the mixer, which is what the card now
-leads with. A shot of the arrangement with the mixer would serve it better;
-if one is taken, put it in `media/apps/` and swap it in for the first image.
+**Screenshots:** the card leads with two new shots and keeps the theory
+image already on the site. Before uploading, copy
+`docs/img/screenshot-arrangement.png` and `docs/img/screenshot-mixer.png`
+from this repository to `ganten-site/media/apps/tangent-arrangement.png` and
+`ganten-site/media/apps/tangent-mixer.png` (1600x900 PNGs). `upload.sh`
+sends them with the page; the card's `src` paths are
+`media/apps/tangent-arrangement.png` and `media/apps/tangent-mixer.png`.
+`media/apps/tangent-dark.png` is no longer used by the card: move it out of
+`media/` and prune it with `bash prune-remote.sh media/apps/tangent-dark.png`
+if nothing else on the site uses it.
 
 ---
 
 ## Short version (one paragraph, for a list or a social post)
 
-Tangent 5.0 is out, and Tangent is now a DAW. Record audio and MIDI, arrange
+Tangent 5.0: record, arrange and mix on macOS, Windows, Linux and FreeBSD.
+Tangent is now a DAW. Record audio and MIDI, arrange
 and edit it, and mix with buses, returns, sends, folders and automation,
 using your own VST3 or LV2 plugins or the instruments and effects it comes
-with. It still names the chord you are playing. Free for macOS, Windows,
-Linux and FreeBSD with up to 32 tracks; a supporter key removes the limit.
+with. It still names the chord you are playing. Free with up to 32 tracks;
+a supporter key removes the limit.
 
 ---
 
@@ -55,10 +62,14 @@ Linux and FreeBSD with up to 32 tracks; a supporter key removes the limit.
           </header>
           <div class="post__body">
             <p>
-              A DAW for recording, arranging and mixing. Tangent records
-              audio and MIDI, lays clips out on a timeline, edits notes in a
-              piano roll and mixes them on a desk with buses, returns, sends,
-              folders and automation. It hosts VST3 plugins everywhere and
+              Record, arrange and mix on macOS, Windows, Linux and FreeBSD.
+              Free with up to 32 tracks; a supporter key removes the limit.
+            </p>
+            <img src="media/apps/tangent-arrangement.png" alt="Tangent's arrangement: drum, piano and audio tracks with MIDI and audio clips and a volume automation lane, under the recorder band" loading="lazy">
+            <p>
+              Tangent is a DAW. It records audio and MIDI, lays clips out on
+              a timeline, edits notes in a piano roll and mixes them on a desk
+              with buses, returns, sends, folders and automation. It hosts VST3 plugins everywhere and
               LV2 on Linux and FreeBSD, and it ships its own instruments and
               effects: modelled keys, an FM synth, an analog-style synth, a
               sampler, a drum machine, and a shelf of effects from EQ and
@@ -73,13 +84,12 @@ Linux and FreeBSD with up to 32 tracks; a supporter key removes the limit.
               can sit in an insert slot, measured and in time with the rest
               of the session.
             </p>
-            <img src="media/apps/tangent-dark.png" alt="Tangent in dark mode naming an altered dominant chord, on an ebony fingerboard" loading="lazy">
+            <img src="media/apps/tangent-mixer.png" alt="Tangent's mixer: a strip per track with inserts, routing, sends and faders, a folder, a return and the master" loading="lazy">
             <p>
-              Written in Rust, MIT licensed, for macOS, Windows, Linux and
-              FreeBSD. It is free with up to 32 tracks, and a supporter key
-              removes the track limit; buses, returns, sends and routes have
-              no limit for anyone. It makes no network connections of its
-              own: no telemetry, no update check, no account.
+              Written in Rust and MIT licensed. Buses, returns, sends and
+              routes have no limit for anyone, free or not. It makes no
+              network connections of its own: no telemetry, no update check,
+              no account.
             </p>
             <p>
               <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/ivory" target="_blank" rel="noopener">Support it</a>

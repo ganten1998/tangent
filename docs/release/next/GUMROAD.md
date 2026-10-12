@@ -49,8 +49,9 @@ README, and the app's own Supporter Key dialog.
 
 ## Subtitle / tagline
 
-A DAW for recording, arranging and mixing. Free with up to 32 tracks; a
-supporter key removes the limit.
+Record, arrange and mix on macOS, Windows, Linux and FreeBSD.
+
+Free with up to 32 tracks; a supporter key removes the limit.
 
 ## Price
 
