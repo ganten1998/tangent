@@ -341,6 +341,14 @@ published.
 
 ### Fixed
 
+- **The chord name is readable on the light themes.** The chord strip is
+  black under every theme, but Centennial, Sandstone, Celadon and
+  Overprint wrote the chord name in their own near-black ink, so it all
+  but vanished (1.3:1 on Centennial). The strip now lifts any chord
+  colour that is too dark for it, yours or a theme's, until it reads, and
+  the transpose number beside the arrows is a step brighter for the same
+  reason. Colours that already read are left exactly as chosen.
+
 - **One loading splash during export, not two.** After pressing Export, the
   "Preparing export" splash showed in the Export window and a second,
   bigger copy showed behind it in the main window. The main window now

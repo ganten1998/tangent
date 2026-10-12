@@ -1257,6 +1257,63 @@ def parse_rust():
     return src, cols, pals
 
 
+THEME_RS = MIXER_RS.parent / "theme.rs"
+SETTINGS_RS = MIXER_RS.parent / "settings.rs"
+CHORD_STRIP_RS = MIXER_RS.parent / "chord_strip.rs"
+_HEX3 = r"0x([0-9a-fA-F]{2}),\s*0x([0-9a-fA-F]{2}),\s*0x([0-9a-fA-F]{2})"
+
+
+def parse_theme_text():
+    """Each factory theme's `text` role (the chord colour), in factory order,
+    straight out of theme.rs. A theme that names none keeps the Settings
+    default, which is what `Theme::apply` over fresh settings does."""
+    src = THEME_RS.read_text()
+    body = src[src.index("pub fn factory_default()"):src.index("#[cfg(test)]")]
+    dflt = re.search(r"chord_text_color: Rgb \{\s*r: 0x(\w\w),\s*g: 0x(\w\w),\s*b: 0x(\w\w)",
+                     SETTINGS_RS.read_text())
+    default = tuple(int(x, 16) for x in dflt.groups())
+    names = list(re.finditer(r'name: "([^"]+)"\.to_owned\(\)', body))
+    out = []
+    for i, m in enumerate(names):
+        end = names[i + 1].start() if i + 1 < len(names) else len(body)
+        t = re.search(r"\btext: c\(" + _HEX3 + r"\)", body[m.end():end])
+        out.append((m.group(1), tuple(int(x, 16) for x in t.groups()) if t else default))
+    return out
+
+
+# `chord_strip::GROUND` and `TRANSPOSE_COLOR`: the strip is black in BOTH
+# modes, under every theme, so the ink on it cannot be the theme's choice
+# unexamined. Read from the Rust so the gate measures the strip that ships.
+STRIP_GROUND = (0, 0, 0)
+
+
+def strip_ink(asked):
+    """`chord_strip::label_ink`: the asked-for colour, lifted off the strip's
+    black until it clears 4.5:1."""
+    return distinct_surface_at(asked, STRIP_GROUND, 4.5)
+
+
+def strip_errors():
+    """The chord strip, every factory theme, both modes (the strip does not
+    change with either). The chord name and the transpose offset are TEXT,
+    so 4.5:1 against the ground they are painted on."""
+    errs = []
+    src = CHORD_STRIP_RS.read_text()
+    if "pub const GROUND: Color32 = Color32::BLACK;" not in src:
+        errs.append("chord strip: GROUND is no longer black; update STRIP_GROUND")
+    tr = tuple(int(x, 16) for x in re.search(
+        r"const TRANSPOSE_COLOR: Color32 = Color32::from_rgb\(" + _HEX3, src).groups())
+    themes = parse_theme_text()
+    if [n for n, _ in themes] != MENU:
+        errs.append("chord strip: theme.rs factory names/order differ from MENU")
+    for name, text in themes:
+        for what, asked in (("the chord name", text), ("the transpose offset", tr)):
+            r = contrast(strip_ink(asked), STRIP_GROUND)
+            if r < 4.5:
+                errs.append(f"{name}: {what} on the chord strip {r:.2f}:1 < 4.5")
+    return errs
+
+
 def run_lines(name, base, p):
     """One palette's run, formatted EXACTLY as `mixer_panel.rs` holds it --
     the byte-for-byte claim `--check` makes is made against these lines."""
@@ -1469,6 +1526,11 @@ def check(verbose=True):
             continue
         if p["master"] in strips:
             errs.append(f"{name}: master {hexs(p['master'])} is a strip of {', '.join(strips[p['master']])}")
+
+    # The chord strip's ink, every theme. Not a palette question, but
+    # `--check` is the gate that runs, and this surface was only ever seen
+    # in a screenshot (Centennial, 1.28:1).
+    errs.extend(strip_errors())
 
     if verbose:
         # **Everything not already printed beside its palette**, which is

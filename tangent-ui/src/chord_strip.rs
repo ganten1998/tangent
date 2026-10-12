@@ -1,5 +1,5 @@
-//! Chord display strip (spec §5): always-black background, #E8DCC0 text in
-//! both modes, Courier Prime Regular, font size max(12, int(0.6*h)) with a
+//! Chord display strip (spec §5): always-black background, the theme's chord
+//! colour held to 4.5:1 on it in both modes, Courier Prime Regular, font size max(12, int(0.6*h)) with a
 //! single-pass shrink when the text exceeds 95% of the width.
 
 use crate::fonts;
@@ -418,6 +418,72 @@ mod thanks_tests {
         );
     }
 
+    /// **Every word on the strip reads on the strip, under every theme, in
+    /// both modes.** Measured from what `draw` PAINTS: the ground it fills
+    /// and the colour each piece of text carries, not from the theme table.
+    ///
+    /// Centennial in light mode wrote its chord name in `#1f1f23` on this
+    /// strip's black, 1.2:1, because its `text` role was chosen beside its
+    /// pale band and the strip never follows the theme. The transpose offset
+    /// was `#707070`, 4.2:1, on every theme.
+    #[test]
+    fn every_theme_writes_the_strip_in_ink_the_strip_can_carry() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 90.0));
+        let mut failures = Vec::new();
+        for t in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut s = crate::settings::Settings::default();
+                t.apply(&mut s);
+                s.dark_mode = dark;
+                let out = ctx.run(Default::default(), |ctx| {
+                    let p = ctx.layer_painter(egui::LayerId::background());
+                    draw(
+                        &p,
+                        rect,
+                        Some("Cmaj7 / E"),
+                        s.chord_text_color.to_color32(),
+                        None,
+                        None,
+                        Some(-3),
+                    );
+                });
+                let mut ground = None;
+                let mut texts = 0;
+                for clipped in &out.shapes {
+                    match &clipped.shape {
+                        egui::Shape::Rect(r) if ground.is_none() => ground = Some(r.fill),
+                        egui::Shape::Text(ts) => {
+                            texts += 1;
+                            let g = ground.expect("the ground is painted before any text");
+                            for sec in &ts.galley.job.sections {
+                                let ink = if sec.format.color == Color32::PLACEHOLDER {
+                                    ts.fallback_color
+                                } else {
+                                    sec.format.color
+                                };
+                                let r = crate::recorder_panel::contrast_ratio(ink, g);
+                                if r < 4.5 {
+                                    failures.push(format!(
+                                        "{} ({}): {:?} is {r:.2}:1 on {g:?}",
+                                        t.name,
+                                        if dark { "dark" } else { "light" },
+                                        ts.galley.job.text,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(texts, 2, "{}: the chord and the transpose offset", t.name);
+            }
+        }
+        assert!(failures.is_empty(), "text the strip cannot carry:\n{}", failures.join("\n"));
+    }
+
     /// The card stays on screen wherever the heart is, and says what it is for.
     #[test]
     fn the_thanks_card_names_everyone_and_stays_on_screen() {
@@ -518,6 +584,27 @@ fn layout_label(
     )
 }
 
+/// The strip's ground: black, in both modes, under every theme (spec §5).
+///
+/// Named so that the ink drawn on it can be measured against the thing it is
+/// actually drawn on, rather than against whatever a theme was designed for.
+pub const GROUND: Color32 = Color32::BLACK;
+
+/// The colour the strip writes in, given the colour somebody asked for.
+///
+/// **Ink is a property of the SURFACE.** The chord colour is a theme role
+/// (`text`) and a user setting (`Set Chord Color...`), and a theme picks it
+/// next to its own palette: Centennial, a light desk, named a near-black
+/// `#1f1f23` for it, which was 1.2:1 on this strip and a chord name nobody
+/// could read. The strip does not change colour with the theme, so the theme
+/// cannot be trusted to have chosen against it. The asked-for colour is kept
+/// whenever it already clears 4.5:1 on [`GROUND`], and otherwise lifted off
+/// the ground until it does, the walk every other derived ink in the app
+/// takes (`recorder_panel::distinct_surface_at`).
+pub fn label_ink(asked: Color32) -> Color32 {
+    crate::recorder_panel::distinct_surface_at(asked, GROUND, 4.5)
+}
+
 /// Paint the strip into `rect`. `chord` of None leaves a solid black strip.
 ///
 /// `color` is the chord label colour (user-settable, `Set Chord Color...`).
@@ -533,7 +620,8 @@ pub fn draw(
     // one you cannot explain the chord name with.
     transpose: Option<i32>,
 ) {
-    painter.rect_filled(rect, 0.0, Color32::BLACK);
+    painter.rect_filled(rect, 0.0, GROUND);
+    let color = label_ink(color);
     // Inside, so the outline is never clipped away at the window edge.
     if let Some(bc) = border {
         painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, bc), StrokeKind::Inside);
@@ -552,7 +640,9 @@ pub fn draw(
                 egui::Align2::LEFT_CENTER,
                 format!("{semitones:+}"),
                 FontId::new(size, fonts::courier()),
-                TRANSPOSE_COLOR,
+                // The arrows are a mark and may be quiet; the number is TEXT,
+                // and `#707070` is 4.2:1 on black.
+                label_ink(TRANSPOSE_COLOR),
             );
         }
     }
