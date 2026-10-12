@@ -847,8 +847,8 @@ fn ctrl_t(ctx: &egui::Context, app: &mut TangentApp) {
 
 /// **The ground under the trailing add keeps its colour while the desk
 /// changes length.** The add stands on the row after the desk's last
-/// (`desk_extent`), so Ctrl/Cmd+T under a track that is not the last (a
-/// row opened between two), a removal, and their undo and redo each stand
+/// (`desk_extent`), so Insert Track Below under a track that is not the
+/// last (a row opened between two), a removal, and their undo and redo each stand
 /// it on a row of the other parity. The field under it is the largest
 /// surface on the timeline and it wore the stripe of the add's row, so it
 /// swapped shade at every one of those: on the shipped desk, the first
@@ -901,13 +901,17 @@ fn the_ground_under_the_trailing_add_keeps_its_colour_as_the_desk_changes_length
         was = row;
     };
 
-    // Ctrl/Cmd+T with the first track selected opens a row between the two.
+    // Insert Track Below on the first track opens a row between the two.
+    // (It was Ctrl/Cmd+T with the first track selected, which since
+    // 2026-10-11 always adds at the end and so takes the first hidden row
+    // here, leaving the add where it stood.)
     app.select_track(0, egui::Modifiers::NONE);
     frame(&ctx, &mut app);
     let tracks = app.counted_tracks();
-    ctrl_t(&ctx, &mut app);
-    assert_eq!(app.counted_tracks(), tracks + 1, "Ctrl/Cmd+T made no track");
-    holds(&mut app, "Ctrl/Cmd+T under the first track");
+    app.apply_dialog_action(DialogAction::TrackInsert(0));
+    frame(&ctx, &mut app);
+    assert_eq!(app.counted_tracks(), tracks + 1, "Insert Track Below made no track");
+    holds(&mut app, "Insert Track Below under the first track");
     // Remove Track on the track it made (it is the one selected), then on
     // the first: a row shorter each time.
     app.apply_dialog_action(DialogAction::TrackRemove(1));
@@ -1389,4 +1393,148 @@ fn the_timelines_frame_is_its_layouts_whatever_rows_are_hidden() {
         assert_eq!(frame.lanes_area, l.lanes_area, "{what}: the frame's lanes are not the layout's");
     }
     let _ = std::fs::remove_dir_all(tiers::dir("frame"));
+}
+
+/// **Whether row `row` is in both views' windows as they stand**: the
+/// timeline's lane window and the desk's strip run, each laid out at the
+/// rect it was last drawn in.
+fn in_both_views(app: &mut TangentApp, row: usize) -> (bool, bool) {
+    let rank = app.desk_index().rank_of(row).expect("the row is not drawn");
+    let lane = rank >= app.arr_lane_scroll && rank < app.arr_lane_scroll + app.arr_visible();
+    let strip = app.mixer_rect.is_some_and(|rect| {
+        let v = app.mixer_view_in(rect);
+        crate::mixer_panel::Layout::new(rect, &v)
+            .strips
+            .get(Column::Track(row))
+            .is_some_and(|s| s.panel.is_positive())
+    });
+    (lane, strip)
+}
+
+/// **The new track button and Ctrl/Cmd+T always add at the END of the
+/// desk, whatever is selected** (the owner, 2026-10-11: "make the new
+/// track button always add a track at the last position"). Through real
+/// frames, with the middle track of five selected: Ctrl/Cmd+T, a click on
+/// the desk's trailing add and a click on the timeline's each make one
+/// track after the last, move no other track, select the new one, and are
+/// one undo moment. The menu's Insert Track Below, which names its place,
+/// still opens a row under the track it was asked on.
+#[test]
+fn the_new_track_button_and_ctrl_t_append_at_the_end_whatever_is_selected() {
+    let tag = "add-last";
+    let (ctx, mut app) = wide(5, tag);
+    app.dialog = None;
+    let ids = |app: &TangentApp| (0..app.desk_extent()).map(|r| app.track_id_at(r)).collect::<Vec<_>>();
+    // The three roads, each from a middle track selected, on the view
+    // (timeline or not) it is pressed in.
+    type Road = fn(&egui::Context, &mut TangentApp);
+    let roads: [(&str, bool, Road); 3] = [
+        ("Ctrl/Cmd+T", true, |ctx, app| ctrl_t(ctx, app)),
+        ("the desk's trailing add", false, |ctx, app| {
+            let rect = app.mixer_rect.expect("the desk drew nowhere");
+            let at = {
+                let v = app.mixer_view_in(rect);
+                let l = crate::mixer_panel::Layout::new(rect, &v);
+                let col = Column::Track(app.desk_extent());
+                assert_eq!(v.strips.get(col).map(|s| s.plus), Some(Plus::Trailing), "fixture: no trailing add on the desk");
+                l.strips[col].add.center()
+            };
+            click(ctx, app, at);
+        }),
+        ("the timeline's trailing add", true, |ctx, app| {
+            let rect = app.arrangement_rect.expect("the timeline drew nowhere");
+            let at = {
+                let clips = app.arr_clip_views();
+                let v = app.arrange_view(&clips);
+                let l = crate::arrangement_panel::Layout::new(rect, &v);
+                l.header_rows[app.desk_extent()].add.center()
+            };
+            click(ctx, app, at);
+        }),
+    ];
+    for (name, timeline, road) in roads {
+        app.mixer_open = !timeline;
+        app.arrangement_open = timeline;
+        frame(&ctx, &mut app);
+        app.select_track(2, egui::Modifiers::NONE);
+        frame(&ctx, &mut app);
+        assert_eq!(app.selected_row(), Some(2), "{name}: fixture, the middle track is not selected");
+        let (before, tracks, at) = (ids(&app), app.counted_tracks(), moments(&app));
+        road(&ctx, &mut app);
+        let after = ids(&app);
+        assert_eq!(app.counted_tracks(), tracks + 1, "{name}: no track was made");
+        assert_eq!(after.len(), before.len() + 1, "{name}: the desk did not grow by one row");
+        assert_eq!(after[..before.len()], before[..], "{name}: a track moved; the new one was not put last");
+        let last = before.len();
+        assert!(app.row_counted(last), "{name}: the last row is not the new track");
+        assert_eq!(app.selected_row(), Some(last), "{name}: the new track is not the one selected");
+        assert_eq!(moments(&app), at + 1, "{name}: not one undo moment");
+        app.undo();
+        assert_eq!(ids(&app), before, "{name}: one undo did not take the track back");
+        app.redo();
+    }
+    // The gesture that names its place keeps it: under the track it was
+    // asked on, between it and the next.
+    let before = ids(&app);
+    app.apply_dialog_action(DialogAction::TrackInsert(2));
+    let after = ids(&app);
+    assert_eq!(after.len(), before.len() + 1, "Insert Track Below made no row");
+    assert_eq!((&after[..3], &after[4..]), (&before[..3], &before[3..]), "Insert Track Below did not open row 3");
+    assert_eq!(app.selected_row(), Some(3), "Insert Track Below did not select its track");
+    let _ = std::fs::remove_dir_all(tiers::dir(tag));
+}
+
+/// **A folder standing last is not joined, the cap still holds, and the
+/// new track is scrolled into both views.** With the last two of forty
+/// tracks filed in a folder and the first track selected, both views
+/// scrolled to the top, Ctrl/Cmd+T makes a top-level track after the
+/// folder's run, selected and drawn in both views. A free desk at its cap
+/// with a middle track selected makes nothing on either road and the
+/// trailing add is the padlock.
+#[test]
+fn the_new_last_track_skips_a_last_folder_is_capped_and_comes_into_view() {
+    let tag = "add-last-folder";
+    let (ctx, mut app) = wide(40, tag);
+    app.dialog = None;
+    app.set_primary_row(Some(38));
+    app.set_selected_rows(&[38, 39]);
+    assert!(app.make_folder(), "fixture: no folder was made");
+    let header = (0..app.desk_extent()).find(|r| app.is_folder(*r)).expect("fixture: the folder");
+    let end = app.desk_extent();
+    assert!(app.in_folder(end - 1), "fixture: the folder's run is not last");
+    for (name, open) in [("the timeline", true), ("the desk", false)] {
+        app.arrangement_open = open;
+        app.mixer_open = !open;
+        app.arr_lane_scroll = 0;
+        app.mixer_scroll_px = 0.0;
+        app.select_track(0, egui::Modifiers::NONE);
+        frame(&ctx, &mut app);
+        let end = app.desk_extent();
+        ctrl_t(&ctx, &mut app);
+        assert_eq!(app.desk_extent(), end + 1, "{name}: no row at the end");
+        assert!(app.row_counted(end), "{name}: the end is not the new track");
+        assert!(!app.in_folder(end), "{name}: the new track joined the folder standing last");
+        assert_eq!(app.folder_of(end), None, "{name}: the new track is filed under {header}");
+        assert_eq!(app.selected_row(), Some(end), "{name}: the new track is not selected");
+        frame(&ctx, &mut app);
+        let (lane, strip) = in_both_views(&mut app, end);
+        assert!(lane, "{name}: the new track's lane is not in the timeline's window");
+        if !open {
+            assert!(strip, "{name}: the new track's strip is not in the desk's run");
+        }
+    }
+    let _ = std::fs::remove_dir_all(tiers::dir(tag));
+
+    // The cap: a free desk at thirty-two, the middle track selected.
+    let tag = "add-last-cap";
+    let (ctx, mut app) = app_on(desk(recorder::FREE_TRACKS), tiers::free(tag));
+    app.dialog = None;
+    app.select_track(16, egui::Modifiers::NONE);
+    frame(&ctx, &mut app);
+    let (rows, at) = (app.settings.rows.clone(), moments(&app));
+    ctrl_t(&ctx, &mut app);
+    assert_eq!((&app.settings.rows, moments(&app)), (&rows, at), "Ctrl/Cmd+T made something past the free cap");
+    assert_eq!(app.trailing_plus(), Plus::Locked, "the trailing add is not the padlock at the cap");
+    app.dialog = None;
+    let _ = std::fs::remove_dir_all(tiers::dir(tag));
 }

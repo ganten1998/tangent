@@ -1559,7 +1559,12 @@ pub const PALETTE_AUTO: i64 = -1;
 /// A constant rather than a literal because it is now one term of a sum —
 /// see [`track_export_row_h`] — and a magic number that is added to is a
 /// magic number somebody will change in one place.
-const TRACK_DIALOG_H: f32 = 700.0;
+///
+/// **Grown by exactly what the bigger icon picker takes**, over the 700 it
+/// was with the picker at four rows of 36: the palette well under the
+/// picker fills the room that is left (`room` at the dialog), so a picker
+/// that grew inside an unchanged window would have come out of that well.
+const TRACK_DIALOG_H: f32 = 700.0 + ICON_PICKER_H - OLD_ICON_PICKER_H;
 
 /// **The icon picker's grid**, in one place so its arithmetic cannot drift
 /// from the window that has to hold it.
@@ -1568,26 +1573,49 @@ const TRACK_DIALOG_H: f32 = 700.0;
 /// for the cells to be bigger with it — "resized such that the icons are more
 /// visible (10-15% bump in icon size in the chooser)". Twenty-eight points
 /// went to thirty-one, which is eleven per cent, and the row count went from
-/// three to four rather than the cells being squeezed to keep it at three:
-/// sixteen across would need 652 points of a frame that has 496.
+/// three to four rather than the cells being squeezed to keep it at three.
+///
+/// **And bigger again, by a third**, the owner, 2026-10-11: "make the
+/// Track right click menu with icons bigger -- the icons are hard to see".
+/// Thirty-one points went to forty-two (35 per cent, 84 device pixels on a
+/// 2x display, so the 192-pixel masks are minified about 2.3x, inside the
+/// 3x `icons.rs` says bilinear stays clean at) by going from twelve across
+/// to nine: the forty-five picks fill exactly five rows. Points, so the
+/// cells grow with the UI scale exactly as the menu's text does. Cell and
+/// drawing are both even, so the drawing's edges sit on whole points
+/// inside a cell that does, which is what keeps the mask crisp at 1x.
 ///
 /// `ICON_PICKER_FITS` is what holds this to the frame. It is a const
-/// assertion, so a thirteenth column or a wider cell fails to COMPILE rather
+/// assertion, so a tenth column or a wider cell fails to COMPILE rather
 /// than hanging the last icon off the edge where only a screenshot would find
 /// it.
-const ICON_CELL: Vec2 = Vec2::new(37.0, 36.0);
+const ICON_CELL: Vec2 = Vec2::new(50.0, 48.0);
 /// The drawing inside a cell. See [`ICON_CELL`].
-const ICON_SIDE: f32 = 31.0;
+const ICON_SIDE: f32 = 42.0;
 /// The gap between cells. egui's own default is eight, which does not fit.
 const ICON_GAP: f32 = 4.0;
+/// The gap between rows of cells: the dialog's own `item_spacing.y`
+/// (egui's default, which `apply_theme` leaves alone), set on the grid
+/// anyway so the height below is the height drawn.
+const ICON_ROW_GAP: f32 = 3.0;
 /// How many cells a row holds.
-const ICON_PER_ROW: usize = 12;
+const ICON_PER_ROW: usize = 9;
+/// How many rows the picker draws.
+const ICON_ROWS: usize = crate::recorder_panel::ICON_PICKS.len().div_ceil(ICON_PER_ROW);
+/// The picker's whole height, rows and the gaps between them.
+const ICON_PICKER_H: f32 = ICON_ROWS as f32 * ICON_CELL.y + (ICON_ROWS as f32 - 1.0) * ICON_ROW_GAP;
+/// The same, as it was: four rows of 36 at egui's 3-point row gap.
+const OLD_ICON_PICKER_H: f32 = 4.0 * 36.0 + 3.0 * 3.0;
 /// What the track menu's frame gives the picker, once its margins are taken.
 const ICON_FRAME_W: f32 = 496.0;
 const ICON_PICKER_FITS: () = assert!(
     ICON_CELL.x * ICON_PER_ROW as f32 + ICON_GAP * (ICON_PER_ROW as f32 - 1.0) <= ICON_FRAME_W,
     "the icon picker's row is wider than the track menu's frame"
 );
+/// Where the picker leaves its cells' rects each frame it draws, as
+/// `(cell, drawing)` pairs: what a test reads to measure the grid the
+/// window really laid out.
+const ICON_GRID_ID: &str = "tangent-track-icon-grid";
 
 /// The Export MIDI row's button height, and the gap under it.
 ///
@@ -12246,13 +12274,16 @@ fn show_on(
                                 // fails to compile if a row stops fitting.
                                 let all = crate::recorder_panel::ICON_PICKS;
                                 let () = ICON_PICKER_FITS;
+                                let mut grid: Vec<(Rect, Rect)> = Vec::with_capacity(all.len());
+                                let row_gap_was = ui.spacing().item_spacing.y;
+                                ui.spacing_mut().item_spacing.y = ICON_ROW_GAP;
                                 for row in all.chunks(ICON_PER_ROW) {
                                     ui.horizontal(|ui| {
-                                        // Twelve cells of 37 at the 4pt gap
-                                        // this row sets need 488pt and the
+                                        // Nine cells of 50 at the 4pt gap
+                                        // this row sets need 482pt and the
                                         // frame gives 496. The widths above
                                         // assume that gap: egui's default 8
-                                        // would need 532 and hang the last
+                                        // would need 514 and hang the last
                                         // cell off the edge, which is what
                                         // this line is here to stop.
                                         ui.spacing_mut().item_spacing.x = ICON_GAP;
@@ -12273,10 +12304,23 @@ fn show_on(
                                             );
                                             let ink = if chosen { t.bg } else { t.text };
                                             let cell_bg = if chosen { t.text } else { t.bg };
-                                            let b = Rect::from_center_size(
-                                                rect.center(),
-                                                Vec2::splat(ICON_SIDE),
-                                            );
+                                            // **On whole device pixels**: a
+                                            // cell's top can land on a half
+                                            // point (the heading above it is
+                                            // text), and a mask drawn across
+                                            // a pixel seam is a blurred one.
+                                            let b = {
+                                                use egui::emath::GuiRounding as _;
+                                                let c = Rect::from_center_size(
+                                                    rect.center(),
+                                                    Vec2::splat(ICON_SIDE),
+                                                );
+                                                Rect::from_min_size(
+                                                    c.min.round_to_pixels(ui.pixels_per_point()),
+                                                    c.size(),
+                                                )
+                                            };
+                                            grid.push((rect, b));
                                             if !crate::recorder_panel::draw_badge(
                                                 ui.painter(),
                                                 b,
@@ -12301,6 +12345,8 @@ fn show_on(
                                         }
                                     });
                                 }
+                                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(ICON_GRID_ID), grid));
+                                ui.spacing_mut().item_spacing.y = row_gap_was;
                                 ui.add_space(8.0);
                             }
                             ui.label(RichText::new("COLOUR").font(bold(10.0)).color(dim));
@@ -15724,6 +15770,152 @@ mod tests {
             !note.contains("Media Foundation"),
             "the note names Media Foundation, which nothing here encodes with"
         );
+    }
+
+    /// **The track menu's icons are big enough to see, on every theme, at
+    /// every scale, in the smallest window** (the owner, 2026-10-11: "make
+    /// the Track right click menu with icons bigger -- the icons are hard
+    /// to see"). The real menu is drawn inline, every factory theme in
+    /// light and dark, at 1x, 1.5x and 2x, in the smallest window the app
+    /// allows and a roomy one, and the grid it laid out is read back: every
+    /// pick drawn, each drawing 42 points square (a third past the 31 it
+    /// was) and inside its cell, rows that do not overlap, the row inside
+    /// the frame, edges on whole device pixels at 1x and 2x, and the ink
+    /// at 4.5:1 or better on both the plain and the chosen cell.
+    #[test]
+    fn the_track_menus_icons_are_big_on_every_theme_scale_and_window() {
+        let picks = crate::recorder_panel::ICON_PICKS.len();
+        let mut bad: Vec<String> = Vec::new();
+        let mut measured = 0usize;
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let mode = if dark { "dark" } else { "light" };
+                let name = &theme.name;
+                let face = set.dark_role("fx_strip").filter(|_| dark).map_or_else(
+                    || {
+                        let c = set.fx_strip_color.to_color32();
+                        if dark { crate::mixer_panel::shade_face(c, 0.88) } else { c }
+                    },
+                    |c| c.to_color32(),
+                );
+                let t = theme_of(face);
+                // The plain cell is the ground darkened by the black wash
+                // the picker lays on it; the chosen one is the ink itself.
+                let wash = 1.0 - 40.0 / 255.0;
+                let plain = Color32::from_rgb(
+                    (f32::from(t.bg.r()) * wash).round() as u8,
+                    (f32::from(t.bg.g()) * wash).round() as u8,
+                    (f32::from(t.bg.b()) * wash).round() as u8,
+                );
+                let on_plain = crate::recorder_panel::contrast_ratio(t.text, plain);
+                let on_chosen = crate::recorder_panel::contrast_ratio(t.bg, t.text);
+                if on_plain < 4.5 || on_chosen < 4.5 {
+                    bad.push(format!("{name} {mode}: ink {on_plain:.2}:1 plain, {on_chosen:.2}:1 chosen"));
+                }
+                // The layout is the theme's own frame; the scales and the
+                // windows are swept on two themes, which is where the
+                // arithmetic could differ (it does not read the colours).
+                let sweep = matches!(measured, 0 | 1);
+                let scales: &[f32] = if sweep { &[1.0, 1.5, 2.0] } else { &[1.0] };
+                let windows: &[Vec2] =
+                    if sweep { &[crate::settings::MIN_WINDOW, Vec2::new(1300.0, 1000.0)] } else { &[Vec2::new(1300.0, 1000.0)] };
+                measured += 1;
+                for &ppp in scales {
+                    for &win in windows {
+                        let at = format!("{name} {mode} at {ppp}x in {}x{}", win.x, win.y);
+                        let grid = track_icon_grid(face, ppp, win);
+                        if grid.len() != picks {
+                            bad.push(format!("{at}: {} of {picks} icons drawn", grid.len()));
+                            continue;
+                        }
+                        let left = grid.iter().map(|(c, _)| c.left()).fold(f32::MAX, f32::min);
+                        let right = grid.iter().map(|(c, _)| c.right()).fold(f32::MIN, f32::max);
+                        if right - left > ICON_FRAME_W + 0.01 {
+                            bad.push(format!("{at}: the grid is {}pt across a {ICON_FRAME_W}pt frame", right - left));
+                        }
+                        for (k, (cell, b)) in grid.iter().enumerate() {
+                            if (b.width() - 42.0).abs() > 0.01 || (b.height() - 42.0).abs() > 0.01 {
+                                bad.push(format!("{at}: icon {k} is {:?}", b.size()));
+                            }
+                            if !cell.contains_rect(*b) {
+                                bad.push(format!("{at}: icon {k} spills out of its cell"));
+                            }
+                            if ppp != 1.5 {
+                                let off = |v: f32| ((v * ppp) - (v * ppp).round()).abs();
+                                if off(b.left()) > 0.01 || off(b.top()) > 0.01 {
+                                    bad.push(format!("{at}: icon {k} sits off the pixel grid at {:?}", b.min));
+                                }
+                            }
+                            for (j, (other, _)) in grid.iter().enumerate().skip(k + 1) {
+                                if cell.intersects(*other) && cell.intersect(*other).area() > 0.0 {
+                                    bad.push(format!("{at}: cells {k} and {j} overlap"));
+                                }
+                            }
+                        }
+                        // Rows: one top per row, each a whole cell plus the gap
+                        // under the one before.
+                        let mut tops: Vec<f32> = grid.iter().map(|(c, _)| c.top()).collect();
+                        tops.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+                        if tops.len() != ICON_ROWS {
+                            bad.push(format!("{at}: {} rows, not {ICON_ROWS}", tops.len()));
+                        }
+                        for w in tops.windows(2) {
+                            if w[1] - w[0] < ICON_CELL.y + ICON_ROW_GAP - 0.01 {
+                                bad.push(format!("{at}: rows {} apart, under a cell of {}", w[1] - w[0], ICON_CELL.y));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ICON_SIDE >= 31.0 * 1.3, "the icons are no bigger than they were");
+        assert!(bad.is_empty(), "the track menu's icons:\n  {}", bad.join("\n  "));
+    }
+
+    /// **The track menu, drawn inline for one frame at `ppp` in a `win`
+    /// window**, on a live track's menu, and the icon grid it laid out.
+    fn track_icon_grid(face: Color32, ppp: f32, win: Vec2) -> Vec<(Rect, Rect)> {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let mut dialog = Some(Dialog::Track {
+            lane: 0,
+            removable: true,
+            icon: 1,
+            palette: 0,
+            palette_auto: true,
+            serial: 1,
+            can_paste: false,
+            midi_clips: 0,
+            frozen: false,
+            can_freeze: false,
+            strip: crate::recorder::StripRef::Row(0),
+        });
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::NONE,
+            chrome: None,
+            surface: None,
+        };
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, win)),
+            ..Default::default()
+        };
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        // Two frames: the first settles the area's size, as a window would.
+        for _ in 0..2 {
+            let _ = ctx.run(raw.clone(), |ctx| {
+                let _ = show(ctx, &mut dialog, face, placement);
+            });
+        }
+        ctx.data(|d| d.get_temp::<Vec<(Rect, Rect)>>(egui::Id::new(ICON_GRID_ID))).unwrap_or_default()
     }
 
     #[test]
