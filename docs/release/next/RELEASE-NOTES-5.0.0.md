@@ -161,11 +161,12 @@ without one (`desktop` for a machine that already runs a desktop,
 `complete` for one that has only Xorg).
 
 **Licences:** Tangent is MIT. The Windows and Linux downloads carry an
-unmodified GPL ffmpeg build as `tangent-ffmpeg`; its source is published as
+GPL ffmpeg build as `tangent-ffmpeg` (on Linux one we build from pinned
+sources, on Windows BtbN's); its source is published as
 the releases
 [`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22)
 (Windows) and
-[`third-party-src-ffmpeg-7.0.2`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2)
+[`third-party-src-ffmpeg-8.1.3-tangent-linux`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-8.1.3-tangent-linux)
 (Linux). The macOS and FreeBSD builds link LAME for MP3 export, and its LGPL
 texts ship beside the app in `lame-licenses/`.
 

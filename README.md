@@ -205,13 +205,14 @@ release uploads those alongside the current ones.
 ## Licensing
 
 Tangent and every crate in this repo are **MIT**. The Windows and Linux
-artifacts bundle an unmodified GPL build of ffmpeg as a separate program
-(`tangent-ffmpeg`), which is an aggregate, not a combined work; its licenses
+artifacts bundle a GPL build of ffmpeg as a separate program
+(`tangent-ffmpeg`; on Linux we build it ourselves, on Windows it is BtbN's),
+which is an aggregate, not a combined work; its licenses
 and provenance ship beside it in `ffmpeg-licenses/`. The source for those
 builds is published as releases of this repository:
 [`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22)
 for Windows and
-[`third-party-src-ffmpeg-7.0.2`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2)
+[`third-party-src-ffmpeg-8.1.3-tangent-linux`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-8.1.3-tangent-linux)
 for Linux. The macOS and FreeBSD builds link LAME (LGPL) for MP3 export; its
 licence texts ship beside the app in `lame-licenses/`. `LICENSING.md` records
 the reasoning.

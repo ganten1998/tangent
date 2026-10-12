@@ -104,18 +104,20 @@ The fonts above are not relicensed by it and remain under their own terms.
 
 Bundled video encoder (Linux and Windows artifacts)
 ---------------------------------------------------
-The Linux and Windows artifacts ship an unmodified ffmpeg build as
-`tangent-ffmpeg` (`tangent-ffmpeg.exe`), invoked by Tangent as a separate
-process to encode a take's video. In the Windows release artifacts it
-carries Tangent's Authenticode signature, which appends a certificate table
-and updates the PE checksum and certificate-table entry; the program code is
-still BtbN's build byte for byte. ffmpeg is a trademark of Fabrice Bellard;
-these builds are GPL-licensed and their full licence text plus a provenance
-note (exact upstream URL and checksum) ship beside the binary in the
-ffmpeg-licenses/ folder of those artifacts. The source for those builds is
-published as releases of the Tangent repository:
+The Linux and Windows artifacts ship an ffmpeg build as `tangent-ffmpeg`
+(`tangent-ffmpeg.exe`), invoked by Tangent as a separate process to encode a
+take's video, export MP3 and read imported audio. On Linux it is FFmpeg
+8.1.3 with x264 and LAME, built by Tangent's scripts/build-ffmpeg-linux.sh
+from pinned sources. On Windows it is BtbN's build, unmodified but for the
+Authenticode signature it carries in the release artifacts, which appends a
+certificate table and updates the PE checksum and certificate-table entry;
+the program code is still BtbN's build byte for byte. ffmpeg is a trademark
+of Fabrice Bellard; these builds are GPL-licensed and their full licence
+text plus a provenance note ship beside the binary in the ffmpeg-licenses/
+folder of those artifacts. The source for those builds is published as
+releases of the Tangent repository:
   Windows: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22
-  Linux:   https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2
+  Linux:   https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-8.1.3-tangent-linux
 Because it runs as a separate program, its GPL terms apply to that binary
 and do not extend to Tangent itself (LICENSING.md sets out why).
 The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.

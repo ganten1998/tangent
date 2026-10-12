@@ -422,6 +422,11 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # Both architectures now. The arm64 tarball shipped NO encoder for as long
   # as it existed — video silently depended on a distro ffmpeg a clean machine
   # does not have, which is the 4.11 hole all over again on the other arch.
+  #
+  # Built by us now, not downloaded: fetch-ffmpeg.sh runs
+  # build-ffmpeg-linux.sh (zig, glibc $GLIBC, pinned sources), which compiles
+  # once, caches the result per script version, and stages the GPL source
+  # release for exactly what it built.
   local vendor="linux"
   [ "$arch" = "x86_64" ] || vendor="linux-arm64"
   scripts/fetch-ffmpeg.sh "$vendor" || { rm -rf "$stage"; return 1; }
