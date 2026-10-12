@@ -1,40 +1,40 @@
-# Gumroad product page for the unlimited desk
+# Gumroad product page for Tangent 5.0.0
 
-Paste-ready copy for <https://ganten.gumroad.com/l/ivory>, for the first
-release with unlimited tracks. The folder is `next` because the version is
-`release.sh`'s to write; rename it to that release's number when it is cut.
+Paste-ready copy for <https://ganten.gumroad.com/l/ivory>, for 5.0.0, the
+first stable release with unlimited tracks. The folder is `next` because the
+version is `release.sh`'s to write; rename it to `5.0.0` when the release is
+cut (`copy_scan.rs` follows the rename and scans whichever folder is newest).
 The 4.2 and 4.4 pages beside it stay as the history of what each release's
 page said.
 
 NO EM DASHES anywhere in the pasted text. They read as machine-written and
-have drawn a real accusation before.
+have drawn a real accusation before. `copy_scan.rs` scans this file in the
+release gate: it refuses an em dash, the old "a key unlocks nothing" wording,
+the desk described by a width, and "folders are buses" without saying they
+count.
 
-## What changed, and why this page had to
+**Paste order (docs/RELEASE.md): publish, check, paste, deploy.** Paste this
+only after `scripts/publish-github.sh` has published 5.0.0 and
+`scripts/check-store-links.sh` is green from a machine that is NOT signed in
+to GitHub (the links must resolve for a stranger).
 
-The 4.4 page said the key gates nothing: "No features. That is not modesty, it
-is the specification." That stopped being true the day the free desk got a
-track limit. From this release:
+## What changed on this page since 4.4
 
-- **The free app holds 32 tracks.** That counts MIDI and audio tracks and
-  folders. It is the only thing a key changes.
-- **A supporter key takes the limit away.** Memory is the bound.
-- **Buses, returns, sends and routes have no limit for anyone.** They are not
-  tracks and they are never counted.
-- **Keys already sold do the same.** Every key ever issued is perpetual and
-  covers every version, so every existing supporter gets unlimited tracks with
-  nothing to do.
-- **The limit never takes anything away.** A project with more than 32 tracks
-  opens, plays, edits, exports and saves whole on a free install. Only adding
-  the next track asks for a key.
+- The 4.4 page said the key gates nothing. From 5.0 the free app holds 32
+  tracks (MIDI and audio tracks and folders count) and a key takes that limit
+  away. Keys already sold do the same, with nothing to do.
+- Buses, returns, sends and routes have no limit for anyone and are never
+  counted.
+- A project past 32 tracks still opens, plays, edits, exports and saves whole
+  on a free install; only adding the next track asks for a key.
+- The DAW paragraph names what 5.0 added.
+- Linux is glibc 2.30+ (it said 2.32), and FreeBSD is listed.
+- The app also mentions "a certain code" beside the key. This page does not
+  (owner call 9 in `docs/design/unlimited-tracks.md`).
 
-A page that kept the 4.4 wording would tell a buyer the key does nothing while
-the app tells them it lifts a limit. Every surface now says the same four
-facts: this page, the post-purchase page and the key email
-(`docs/STORE-CONTENT.md`, `tools/tangent-fulfil/src/main.rs`), the README, and
-the app's own Supporter Key dialog.
-
-The app also mentions "a certain code" beside the key. This page does not
-(owner call 9 in `docs/design/unlimited-tracks.md`).
+Every surface says the same facts: this page, the post-purchase page and the
+key email (`docs/STORE-CONTENT.md`, `tools/tangent-fulfil/src/main.rs`), the
+README, and the app's own Supporter Key dialog.
 
 ---
 
@@ -67,9 +67,24 @@ writes a `.wav`, a `.mid` and an `.mp4` of the window itself, with your camera
 already placed in it.
 
 Around that is a recording DAW: a mixer, an arrangement view, a MIDI editor,
-a drum machine, automation, folders that are real buses (each counts as a
-track), and VST3 plugin hosting on every platform (LV2 too on Linux and
-FreeBSD).
+a drum machine, automation that reaches plugins, folders that are real buses
+(each counts as a track), and VST3 plugin hosting on every platform (LV2 too
+on Linux and FreeBSD).
+
+### New in 5.0
+
+- **Buses and returns**, as many as you want, with sends at their own level,
+  pre or post fader.
+- **Tangent Insert**: your outboard gear in an insert bay, with a PING that
+  measures the loop and keeps the session in time with it.
+- **Layered instruments**: several instruments on one track, all playing.
+- **Plugins follow the song**: tempo, meter, position and transport reach
+  every VST3 and LV2 plugin, so drum machines and synced delays lock in.
+- **Export what you want**: pick tracks or stems, and the whole song, the
+  loop or a custom range. Stems are named after their tracks.
+- **Send to Device**: the master on a virtual cable too, for OBS or Discord.
+- **Tangent Bitcrush**, audio quantize, track freezing, rendering on every
+  core, and thirty-two themes.
 
 ### What is free, and what the key does
 
@@ -77,7 +92,7 @@ FreeBSD).
 
 - up to 32 tracks, folders included;
 - every feature: recording, video, the theory panels, the sheet music, the
-  guitar neck, plugins, automation and export;
+  guitar neck, plugins, hardware inserts, automation and export;
 - buses, returns, sends and routes, with no limit;
 - no trial, no time limit, no watermark, no account and no nag.
 
@@ -101,8 +116,9 @@ project already has 32 or more asks for a key.
 **It is offline.** No account, no telemetry, no phoning home. A key is checked
 on your own machine with a signature and is never sent anywhere.
 
-macOS 11+ (Apple Silicon and Intel, signed and notarized), Windows 10+, Linux
-(glibc 2.32+, ALSA, Wayland or X11).
+macOS 11+ (Apple Silicon and Intel, signed and notarized), Windows 10+ (every
+program signed), Linux x86_64 and aarch64 (glibc 2.30+, ALSA, Wayland or X11),
+and FreeBSD 15.
 
 **Download:** <https://github.com/ganten1998/tangent/releases/latest>
 
@@ -112,9 +128,14 @@ macOS 11+ (Apple Silicon and Intel, signed and notarized), Windows 10+, Linux
 
 The post-purchase page is `docs/STORE-CONTENT.md`'s "Post-purchase page"
 block, and the key itself arrives in the email `email_body()` writes. Both
-say what this page says; paste that block, not a copy of it here.
+say what this page says; paste that block, not a copy of it here. Its three
+stale lines (the "5.0.0 itself is not" signing sentence, "glibc 2.32", and the
+FFmpeg source sentence) are fixed; the FFmpeg source lines still must not be
+pasted until `scripts/publish-third-party-src.sh` has created both source
+releases and `scripts/check-store-links.sh` finds them.
 
 ## Tags
 
 `music education` `piano teaching` `midi` `music theory` `chord detection`
 `sheet music` `piano` `screen recording` `vst3` `daw` `content creation`
+`freebsd`
