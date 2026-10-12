@@ -1263,22 +1263,44 @@ CHORD_STRIP_RS = MIXER_RS.parent / "chord_strip.rs"
 _HEX3 = r"0x([0-9a-fA-F]{2}),\s*0x([0-9a-fA-F]{2}),\s*0x([0-9a-fA-F]{2})"
 
 
-def parse_theme_text():
-    """Each factory theme's `text` role (the chord colour), in factory order,
-    straight out of theme.rs. A theme that names none keeps the Settings
-    default, which is what `Theme::apply` over fresh settings does."""
+# Theme role -> the Settings field it lands in, for the roles the text
+# gates below read.
+_SETTING_OF = {
+    "text": "chord_text_color",
+    "interval_text": "interval_text_color",
+    "fretboard": "fretboard_color",
+}
+
+
+def _settings_default(field):
+    src = SETTINGS_RS.read_text()
+    m = re.search(field + r": Rgb \{\s*r: 0x(\w\w),\s*g: 0x(\w\w),\s*b: 0x(\w\w)", src) or \
+        re.search(field + r": Rgb::new\(" + _HEX3 + r"\)", src)
+    return tuple(int(x, 16) for x in m.groups())
+
+
+def parse_theme_roles(roles=("text",)):
+    """Each factory theme's named roles, in factory order, straight out of
+    theme.rs: [(name, {role: rgb})]. A role a theme names none of keeps the
+    Settings default, which is what `Theme::apply` over fresh settings does."""
     src = THEME_RS.read_text()
     body = src[src.index("pub fn factory_default()"):src.index("#[cfg(test)]")]
-    dflt = re.search(r"chord_text_color: Rgb \{\s*r: 0x(\w\w),\s*g: 0x(\w\w),\s*b: 0x(\w\w)",
-                     SETTINGS_RS.read_text())
-    default = tuple(int(x, 16) for x in dflt.groups())
+    defaults = {r: _settings_default(_SETTING_OF[r]) for r in roles}
     names = list(re.finditer(r'name: "([^"]+)"\.to_owned\(\)', body))
     out = []
     for i, m in enumerate(names):
         end = names[i + 1].start() if i + 1 < len(names) else len(body)
-        t = re.search(r"\btext: c\(" + _HEX3 + r"\)", body[m.end():end])
-        out.append((m.group(1), tuple(int(x, 16) for x in t.groups()) if t else default))
+        got = {}
+        for r in roles:
+            t = re.search(r"\b" + r + r": c\(" + _HEX3 + r"\)", body[m.end():end])
+            got[r] = tuple(int(x, 16) for x in t.groups()) if t else defaults[r]
+        out.append((m.group(1), got))
     return out
+
+
+def parse_theme_text():
+    """Each factory theme's `text` role (the chord colour), in factory order."""
+    return [(n, r["text"]) for n, r in parse_theme_roles(("text",))]
 
 
 # `chord_strip::GROUND` and `TRANSPOSE_COLOR`: the strip is black in BOTH
@@ -1311,6 +1333,63 @@ def strip_errors():
             r = contrast(strip_ink(asked), STRIP_GROUND)
             if r < 4.5:
                 errs.append(f"{name}: {what} on the chord strip {r:.2f}:1 < 4.5")
+    return errs
+
+
+# `fretboard_panel::palette`'s woods: (board, the ink written ON the board).
+# The inks are `gamma_multiply`'d in the Rust, so they are premultiplied
+# translucent colours, carried here as (rgb, alpha) and composited by `over`.
+def _gamma(c, k):
+    return tuple(int(x * k + 0.5) for x in c), int(255 * k + 0.5)
+
+
+WOODS = {
+    "Rosewood": ((0x4A, 0x2B, 0x22), _gamma((0xE8, 0xDC, 0xC0), 0.78)),
+    "Maple": ((0xD8, 0xB0, 0x72), ((0x3A, 0x2C, 0x1A), 255)),
+    "Ebony": ((0x18, 0x15, 0x13), _gamma((0xEC, 0xE6, 0xDA), 0.82)),
+}
+
+
+def over(premul, alpha, ground):
+    """`fretboard_panel::over`: a premultiplied colour as it lands."""
+    k = 1.0 - alpha / 255.0
+    return tuple(min(255, int(round(x + y * k))) for x, y in zip(premul, ground))
+
+
+def neck_ink(asked, ground):
+    """`fretboard_panel::ink_on`: kept if it reads, walked off the ground,
+    and the ground's own ink if a mid-tone ground stops the walk short."""
+    out = distinct_surface_at(asked, ground, 4.5)
+    if contrast(out, ground) >= 4.5:
+        return out
+    for ink in (INK_LIGHT, INK_DARK, (255, 255, 255), (0, 0, 0)):
+        if contrast(ink, ground) >= 4.5:
+            return ink
+    return (255, 255, 255)
+
+
+def neck_errors():
+    """The guitar neck's words, every factory theme and every wood: the
+    interval column's root (the chord colour) and other intervals
+    (`interval_text`), and the damped-string cross and caption (the wood's
+    own ink), each on the BOARD, which the theme paints except on Default.
+    The Rust test `every_theme_writes_the_neck_in_ink_its_ground_can_carry`
+    also covers the letters and arrows, which derive from the lit dot."""
+    errs = []
+    src = (MIXER_RS.parent / "fretboard_panel.rs").read_text()
+    if "fn ink_on(" not in src:
+        errs.append("neck: fretboard_panel::ink_on is gone; update neck_ink")
+    for name, roles in parse_theme_roles(("text", "interval_text", "fretboard")):
+        for wood, (wood_board, (mark, a)) in WOODS.items():
+            board = wood_board if name == "Default" else roles["fretboard"]
+            for what, asked in (
+                ("the root", roles["text"]),
+                ("an interval", roles["interval_text"]),
+                ("a damped string", over(mark, a, board)),
+            ):
+                r = contrast(neck_ink(asked, board), board)
+                if r < 4.5:
+                    errs.append(f"{name} ({wood}): {what} on the neck {r:.2f}:1 < 4.5")
     return errs
 
 
@@ -1531,6 +1610,8 @@ def check(verbose=True):
     # `--check` is the gate that runs, and this surface was only ever seen
     # in a screenshot (Centennial, 1.28:1).
     errs.extend(strip_errors())
+    # And the guitar neck's, every theme and wood (`neck_errors`).
+    errs.extend(neck_errors())
 
     if verbose:
         # **Everything not already printed beside its palette**, which is
