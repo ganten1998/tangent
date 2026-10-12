@@ -6034,7 +6034,7 @@ impl TangentApp {
             return;
         }
         // The ranked pass, but only while the staff panel is on screen to
-        // show it. It is the SAME detection — `detect_chord_debug` calls
+        // show it. It is the SAME detection — `detect_chord_alternates` calls
         // `detect_chord` and collects what the scorer already computed — so
         // the winner cannot disagree between the two paths; the only cost is
         // a string per scored candidate, which nothing else would read.
@@ -6043,13 +6043,11 @@ impl TangentApp {
             .theory_views()
             .contains(theory_panel::View::Staff)
         {
-            let (winner, ranked) = self.detector.detect_chord_debug(&notes, 8);
-            self.chord_alternates = ranked
-                .into_iter()
-                .map(|(name, _)| name)
-                .filter(|name| Some(name.as_str()) != winner.as_deref())
-                .take(2)
-                .collect();
+            // Only readings of EVERY sounding note: the scorer also rates
+            // partial ones (a triad inside a six-note chord), and one of those
+            // printed as an alternate is a lone "B" that reads as a fragment.
+            let (winner, alternates) = self.detector.detect_chord_alternates(&notes, 2);
+            self.chord_alternates = alternates;
             self.current_chord = winner;
         } else {
             self.current_chord = self.detector.detect_chord(&notes);
