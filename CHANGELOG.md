@@ -294,8 +294,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Every plugin block now carries the tempo from the tempo map (ramps
   included), the time signature, the position in samples, beats and bars,
   play and record state and the loop, for the exact stretch of the song
-  that block renders, in playback and in exports alike. LV2 plugins that
-  ask for the song position (Linux and FreeBSD) are now told it too.
+  that block renders, in playback and in exports alike. Plugins on folders,
+  buses and the master are told the position of the audio they are
+  actually hearing when a lookahead plugin elsewhere delays the mix, and a
+  track that is also a send destination tells its plugins each stretch of
+  the song once. LV2 plugins that ask for the song position (Linux and
+  FreeBSD) are now told it too, again after a tempo or meter edit.
 - **A muted track is silent from an export's first sample.** A track
   muted on the desk, or silenced by a solo on another track, used to fade
   out over the first tenth of a second of every export, so its start was

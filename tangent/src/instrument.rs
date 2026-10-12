@@ -2632,19 +2632,14 @@ struct Shared {
     rack_count_seat: AtomicUsize,
     #[cfg(test)]
     rack_count: AtomicU64,
-    /// **What the watched seat's rack last told a hosted plugin**: the
-    /// sample position and the quarter (`f64` bits) of `host_transport`,
-    /// the anchor of the chunk it ran in, and how many of its blocks sat
-    /// AWAY from that anchor (a span rendered ahead). Beside `rack_count`,
-    /// for the same reason.
+    /// **What the watched seat's rack FORWARDED to its plugins**: per bay
+    /// and per block, the chunk's anchor and the `Transport` handed to the
+    /// backend, exactly as `run_rack` passed it on (nothing for a repeat
+    /// run, which forwards nothing). Filled only while a test watches a seat
+    /// and only up to the capacity the test reserved, so the audio path
+    /// never grows it. Beside `rack_count`, for the same reason.
     #[cfg(test)]
-    rack_host_sample: AtomicU64,
-    #[cfg(test)]
-    rack_host_beat: AtomicU64,
-    #[cfg(test)]
-    rack_host_anchor: AtomicU64,
-    #[cfg(test)]
-    rack_host_ahead: AtomicU64,
+    rack_host_log: Mutex<Vec<(usize, u64, tangent_host::Transport)>>,
     /// Every other op the callback sent straight home: an Install over an
     /// occupied slot, an Attach for a lane that is not the one it was built
     /// for, a Grow smaller than the spine, a Capture while capturing.
@@ -2790,6 +2785,20 @@ struct Shared {
     /// before any rack runs, and read by `host_transport` for VST3's
     /// `kRecording`.
     transport_recording: AtomicBool,
+    /// **Which chunk this is**, bumped once per `run_transport`, so a rack
+    /// can tell a second run over the same chunk from a new block (see
+    /// `Rack::told`).
+    transport_chunk: AtomicU64,
+    /// **The loop in FRAMES as this chunk saw it**, beside the quarters
+    /// above, so `host_transport` can say whether a block starts INSIDE it
+    /// (`kCycleActive`).
+    transport_loop_a: AtomicU64,
+    transport_loop_b: AtomicU64,
+    /// **The version of the tempo and meter maps**, bumped when the
+    /// callback takes a new pair. An LV2 plugin is told the position only
+    /// when it moves, and an edit moves the music under a sample that does
+    /// not (`tangent_host::transport::TimeGate`).
+    transport_maps_gen: AtomicU64,
     /// **The engine's sample rate, for whoever on the audio thread needs
     /// to turn frames past `transport_anchor` into beats.** A built-in voice's
     /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
@@ -3741,13 +3750,7 @@ impl Shared {
             #[cfg(test)]
             rack_count: AtomicU64::new(0),
             #[cfg(test)]
-            rack_host_sample: AtomicU64::new(u64::MAX),
-            #[cfg(test)]
-            rack_host_beat: AtomicU64::new(0),
-            #[cfg(test)]
-            rack_host_anchor: AtomicU64::new(0),
-            #[cfg(test)]
-            rack_host_ahead: AtomicU64::new(0),
+            rack_host_log: Mutex::new(Vec::new()),
             op_refused: AtomicU32::new(0),
             plan_gen: AtomicU64::new(0),
             drum_strips: AtomicU32::new(0),
@@ -3778,6 +3781,10 @@ impl Shared {
             transport_cycle_a: AtomicU64::new(0.0f64.to_bits()),
             transport_cycle_b: AtomicU64::new(0.0f64.to_bits()),
             transport_recording: AtomicBool::new(false),
+            transport_chunk: AtomicU64::new(0),
+            transport_loop_a: AtomicU64::new(0),
+            transport_loop_b: AtomicU64::new(0),
+            transport_maps_gen: AtomicU64::new(0),
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
@@ -4143,8 +4150,10 @@ impl Backend {
         params: &[tangent_host::ParamPoint],
         transport: crate::analog::arp::Transport,
         // **The same block as a hosted plugin is told it** (`host_transport`):
-        // a VST3's `ProcessContext`, an LV2's `time:Position`.
-        host: &tangent_host::Transport,
+        // a VST3's `ProcessContext`, an LV2's `time:Position`. `None` on a
+        // rack's repeat run over a stretch it has already told: the plugin
+        // keeps what it was told.
+        host: Option<&tangent_host::Transport>,
         // **The lane's loaded sample**, borrowed for this block and ignored
         // by every backend but the built-in sampler. A hosted plugin brings
         // its own library; ours is handed one, and the hand-off is an
@@ -4156,7 +4165,9 @@ impl Backend {
     ) -> Result<(), String> {
         match self {
             Backend::Vst3 { inst, .. } => {
-                inst.set_transport(*host);
+                if let Some(h) = host {
+                    inst.set_transport(*h);
+                }
                 inst.process_with_controls(notes, controls, frames, bufs)
                     .map(|_| ())
             }
@@ -4167,7 +4178,10 @@ impl Backend {
                 // block's notes play again — which is exactly what a stuck note
                 // sounds like. `begin_block` clears, then puts the song's
                 // position first in the sequence for a plugin that asked.
-                inst.begin_block(host, frames);
+                match host {
+                    Some(h) => inst.begin_block(h, frames),
+                    None => inst.clear_midi(),
+                }
                 // **Back to wire MIDI, which is what LV2 speaks.** These
                 // structs are VST3's shape: a note's velocity is a float
                 // because VST3 made it one, and a pitch bend arrives as a
@@ -4252,14 +4266,17 @@ impl Backend {
         &mut self,
         planar: &mut [Vec<f32>],
         params: &[tangent_host::ParamPoint],
-        host: &tangent_host::Transport,
+        // See `process_voice`: `None` on a repeat run.
+        host: Option<&tangent_host::Transport>,
         frames: usize,
         out: &mut [Vec<f32>],
         key: Option<&[Vec<f32>]>,
     ) -> Result<(), String> {
         match self {
             Backend::Vst3 { inst, .. } => {
-                inst.set_transport(*host);
+                if let Some(h) = host {
+                    inst.set_transport(*h);
+                }
                 match key {
                     Some(k) => inst
                         .process_effect_keyed(planar, params, frames, out, k)
@@ -4280,8 +4297,12 @@ impl Backend {
                 for p in params {
                     let _ = inst.set_param(p.id as usize, p.value as f32);
                 }
-                // A tempo-synced delay asks for the song's position too.
-                inst.begin_block(host, frames);
+                // A tempo-synced delay asks for the song's position too,
+                // and a repeat run still empties last block's sequence.
+                match host {
+                    Some(h) => inst.begin_block(h, frames),
+                    None => inst.clear_midi(),
+                }
                 // No key path exists in this host's LV2 plumbing yet, so an
                 // armed key is IGNORED here rather than half-fed: the UI
                 // greys the option per backend (`insert_wants_key` answers
@@ -4932,6 +4953,14 @@ pub(crate) struct Rack {
     slots: [PluginBox; INSERTS],
     incoming: [Consumer<PluginBox>; INSERTS],
     retiring: [Producer<PluginBox>; INSERTS],
+    /// **The last block this rack's hosted plugins were told about**: the
+    /// chunk (`Shared::transport_chunk`) and the frame just past the block's
+    /// end. A second run in the same chunk that does not start past it is
+    /// the same stretch of song arriving again (a send destination, a drum
+    /// lane's kit pass), and its plugins are left on the context they have
+    /// rather than told the same or an earlier place a second time. See
+    /// `run_rack`.
+    told: (u64, u64),
 }
 
 impl Rack {
@@ -7517,6 +7546,10 @@ struct NodePrep {
     /// Its racks take the sidechain key (a bus runs its racks once a chunk,
     /// so it is the one pass that may feed them).
     keyed: bool,
+    /// **How late its input is**, frames behind the chunk's anchor
+    /// (`Renderer::node_lag`): what its racks' plugins are told they are
+    /// processing.
+    lag: u32,
     /// The run's meter reading.
     peak: [f32; 2],
 }
@@ -10099,6 +10132,7 @@ fn render_lane(
                 desk.frozen,
                 frames,
                 if armed { desk.controls } else { &[] },
+                at,
             );
         }
         // Taken AFTER the board rather than at the head of the
@@ -10273,13 +10307,15 @@ fn run_extra_rack(
     // **The absolute sample position this rack is rendering**, or
     // `u64::MAX` for "wherever the playhead is".
     //
-    // Only the LANE pass passes a real one, and it has to: a grained lane
+    // The LANE pass passes its span's own, and it has to: a grained lane
     // renders a span up to a grain ahead of the playhead, and an
     // arpeggiator handed the playhead's beat for a future block would run
-    // early by exactly that much. Every other caller - the room, the sends
-    // pass, the folders, the pedalboards, the pads, the click, the Fx bus
-    // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is that block's
+    // early by exactly that much (its pedalboard is handed the same). The
+    // racks AFTER delay compensation - the folders, the buses, the Fx bus
+    // and the master - pass the anchor less how long their input waited
+    // (`lagged`), because that is the song they are processing. The room,
+    // the pads and the click render the block the callback is on, pass the
+    // sentinel, and are handed the published anchor, which is that block's
     // first frame (see `rack_transport`).
     pos: u64,
     // The chain so far, carried on from the first rack: see `run_rack`.
@@ -10384,13 +10420,14 @@ fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
 ///   export tells them the frame it is exporting however fast it runs, and
 ///   in the chunk that wraps a loop the position jumps on the next chunk,
 ///   which is the one that starts at the loop's head.
-/// * **Delay compensation does not move it.** This engine compensates by
-///   DELAYING the early lanes after their racks (`run_lane_pdc`), never by
-///   rendering anything early, so a lane's rack processes the audio of its
-///   own `pos` and is told `pos`. A rack AFTER a compensation delay (a
-///   folder, the Fx bus, the master) is handed the anchor like every other
-///   sentinel caller: the block the callback is on, which is what REAPER
-///   and Live tell a bus plugin too.
+/// * **Delay compensation moves it only where the audio has waited.** This
+///   engine compensates by DELAYING the early lanes after their racks
+///   (`run_lane_pdc`), so a lane's rack processes the audio of its own
+///   `pos` and is told `pos`. A rack AFTER the compensation (a folder, a
+///   bus, the Fx bus, the master) processes the song from as long ago as
+///   its input waited, and its caller passes that frame (`lagged`,
+///   `Renderer::node_lag`). Inside a rack, an effect bay is told its input
+///   less the delay of the bays ahead of it (`run_rack`).
 /// * **The bar is walked forward** when a grained span has crossed a bar
 ///   line since the anchor, at the anchor bar's length. A meter change on
 ///   that very line inside one grain is the one case it gets wrong, for one
@@ -10400,6 +10437,13 @@ fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
 ///   (`crate::varispeed`), so a plugin is told the map's tempo against its
 ///   own samples, which is exactly what it renders against. What leaves the
 ///   speakers is faster and higher, plugins included, like tape.
+/// **The frame a rack after delay compensation is processing**: the
+/// chunk's anchor less `lag`, how late its input is. Never the sentinel:
+/// a lag of zero is the anchor itself, which is what the sentinel means.
+fn lagged(shared: &Shared, lag: u32) -> u64 {
+    shared.transport_anchor.load(Ordering::Relaxed).saturating_sub(u64::from(lag))
+}
+
 fn host_transport(shared: &Shared, pos: u64) -> tangent_host::Transport {
     let arp = rack_transport(shared, pos);
     let sample = if pos == u64::MAX {
@@ -10410,14 +10454,18 @@ fn host_transport(shared: &Shared, pos: u64) -> tangent_host::Transport {
     let mut bar_start = f64::from_bits(shared.transport_bar_q.load(Ordering::Relaxed));
     let len = f64::from_bits(shared.transport_bar_len.load(Ordering::Relaxed));
     let mut bar = shared.transport_bar.load(Ordering::Relaxed) as f64;
-    if len > 0.0 && arp.beat >= bar_start + len {
-        let crossed = ((arp.beat - bar_start) / len).floor();
+    // Forward past a line a span ahead has crossed, or BACK over one a
+    // rack after delay compensation sits behind.
+    if len > 0.0 && (arp.beat >= bar_start + len || arp.beat < bar_start) {
+        let crossed = ((arp.beat - bar_start) / len).floor().max(-bar);
         bar_start += crossed * len;
         bar += crossed;
     }
     let sig = shared.transport_sig.load(Ordering::Relaxed);
     let qa = f64::from_bits(shared.transport_cycle_a.load(Ordering::Relaxed));
     let qb = f64::from_bits(shared.transport_cycle_b.load(Ordering::Relaxed));
+    let la = shared.transport_loop_a.load(Ordering::Relaxed);
+    let lb = shared.transport_loop_b.load(Ordering::Relaxed);
     tangent_host::Transport {
         playing: arp.playing,
         recording: arp.playing && shared.transport_recording.load(Ordering::Relaxed),
@@ -10429,6 +10477,11 @@ fn host_transport(shared: &Shared, pos: u64) -> tangent_host::Transport {
         numerator: (sig >> 16) as i32,
         denominator: (sig & 0xFFFF) as i32,
         cycle: (qb > qa).then_some((qa, qb)),
+        // Inside the loop: the engine wraps only a playhead that runs INTO
+        // the loop's end from inside or before it, so one past it plays on
+        // and its loop is not active.
+        cycle_active: qb > qa && (la..lb).contains(&sample),
+        map_epoch: shared.transport_maps_gen.load(Ordering::Relaxed),
     }
 }
 
@@ -10496,13 +10549,15 @@ fn run_rack(
     // **The absolute sample position this rack is rendering**, or
     // `u64::MAX` for "wherever the playhead is".
     //
-    // Only the LANE pass passes a real one, and it has to: a grained lane
+    // The LANE pass passes its span's own, and it has to: a grained lane
     // renders a span up to a grain ahead of the playhead, and an
     // arpeggiator handed the playhead's beat for a future block would run
-    // early by exactly that much. Every other caller - the room, the sends
-    // pass, the folders, the pedalboards, the pads, the click, the Fx bus
-    // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is that block's
+    // early by exactly that much (its pedalboard is handed the same). The
+    // racks AFTER delay compensation - the folders, the buses, the Fx bus
+    // and the master - pass the anchor less how long their input waited
+    // (`lagged`), because that is the song they are processing. The room,
+    // the pads and the click render the block the callback is on, pass the
+    // sentinel, and are handed the published anchor, which is that block's
     // first frame (see `rack_transport`).
     pos: u64,
     // **What the chain has carried ahead of this rack** (see [`Layer`]):
@@ -10544,17 +10599,25 @@ fn run_rack(
     // See `rack_transport` for what the walk is exact for and what it is
     // not. Read once here so every bay in the rack sees the same block.
     let transport = rack_transport(shared, pos);
-    // And the same block as a hosted plugin is told it: `host_transport`.
-    let host = host_transport(shared, pos);
-    #[cfg(test)]
-    if shared.rack_count_seat.load(Ordering::Relaxed) == seat {
-        let anchor = shared.transport_anchor.load(Ordering::Relaxed);
-        shared.rack_host_sample.store(host.sample as u64, Ordering::Relaxed);
-        shared.rack_host_beat.store(host.quarters.to_bits(), Ordering::Relaxed);
-        shared.rack_host_anchor.store(anchor, Ordering::Relaxed);
-        if host.sample as u64 != anchor {
-            shared.rack_host_ahead.fetch_add(1, Ordering::Relaxed);
-        }
+    // **And where a HOSTED plugin is in the song** (`host_transport`): the
+    // frame of the audio at this rack's input, `pos`, or the chunk's anchor
+    // for the sentinel. Per bay below, less what the chain ahead of that bay
+    // has delayed the signal by.
+    //
+    // **Once per stretch of song.** A rack can run twice in a chunk over
+    // the same frames: a send destination's own rack over what is sent to
+    // it, after its lane pass; a drum lane's rack over its kit. A plugin
+    // told the same or an earlier place twice a chunk fires a step twice or
+    // resets on the backwards jump, so the second run forwards nothing and
+    // its plugins keep the context the first gave them. A grained lane's
+    // second span in one chunk starts where the first ended, and is a new
+    // block. See `Rack::told`.
+    let anchor = shared.transport_anchor.load(Ordering::Relaxed);
+    let base = if pos == u64::MAX { anchor } else { pos };
+    let chunk = shared.transport_chunk.load(Ordering::Relaxed);
+    let repeat = rack.told.0 == chunk && base < rack.told.1;
+    if !repeat {
+        rack.told = (chunk, base.saturating_add(frames as u64));
     }
     // **The scratch buffers are SHARED, and a hosted plugin SHRINKS them.**
     //
@@ -10692,6 +10755,22 @@ fn run_rack(
             continue;
         }
         let bay_params = params.get(bay).copied().unwrap_or(&[]);
+        // **Where this bay is in the song.** An effect hears the signal as
+        // late as the chain ahead of it in this rack has made it
+        // (`Layer::carried`, the pedalboard included on a lane's own rack);
+        // a voice makes its sound from this block's notes, at `base`.
+        let host = (!repeat).then(|| {
+            let lag = if p.voice { 0 } else { u64::from(layer.carried) };
+            host_transport(shared, base.saturating_sub(lag))
+        });
+        #[cfg(test)]
+        if shared.rack_count_seat.load(Ordering::Relaxed) == seat {
+            if let (Some(h), Ok(mut log)) = (host, shared.rack_host_log.lock()) {
+                if log.len() < log.capacity() {
+                    log.push((bay, anchor, h));
+                }
+            }
+        }
         // **This bay's key, de-interleaved on demand.** One relaxed load per
         // effect bay, and only on a pass that carries a feed at all. The
         // source is read out of the SNAPSHOT — post-rack, post-PDC,
@@ -10754,7 +10833,7 @@ fn run_rack(
                 }
             }
             if p.backend
-                .process_voice(notes, controls, bay_params, transport, &host, sample, frames, &mut p.bufs)
+                .process_voice(notes, controls, bay_params, transport, host.as_ref(), sample, frames, &mut p.bufs)
                 .is_err()
             {
                 if let Some(a) = p.align.as_deref_mut() {
@@ -10764,7 +10843,7 @@ fn run_rack(
             }
         } else if p
             .backend
-            .process_effect(planar, bay_params, &host, frames, out, keyed)
+            .process_effect(planar, bay_params, host.as_ref(), frames, out, keyed)
             .is_err()
         {
             // A refused block leaves the audio ALONE rather than replacing it
@@ -11878,7 +11957,19 @@ impl Renderer {
     /// `no_writer_runs_a_folders_rack_except_the_fold` is told as much here
     /// rather than guessing. A caller that ever passes a channel has to come
     /// and read this.
-    fn run_insert_chain(&mut self, at: usize, buf_is_aux: bool, frames: usize) {
+    fn run_insert_chain(
+        &mut self,
+        at: usize,
+        buf_is_aux: bool,
+        frames: usize,
+        // **How late the audio arriving here is**, frames: the lanes are
+        // aligned by DELAYING them after their racks, so what reaches the
+        // master and the Fx bus this chunk is the song from this much
+        // before the chunk's anchor. Its plugins are told that frame
+        // (`lagged`), so a position-synced gate on the master lands on the
+        // music it is gating and not a lookahead early.
+        lag: u32,
+    ) {
         // **The block's notes, gated by the channel's own arm bit.** A voice
         // in this rack is fed the same list every slot reads — see
         // `collect_notes`, drained once per block — unless the channel is
@@ -11960,7 +12051,7 @@ impl Renderer {
             }),
         
             None,
-            u64::MAX,
+            lagged(&self.shared, lag),
             &mut Layer::fresh(),
         );
         let dst = if buf_is_aux {
@@ -12893,6 +12984,7 @@ impl Renderer {
             if let Ok(next) = self.maps_incoming.pop() {
                 let old = std::mem::replace(&mut self.maps, next);
                 let _ = self.maps_retiring.push(old);
+                self.shared.transport_maps_gen.fetch_add(1, Ordering::Relaxed);
                 // The bar lines just moved. Whatever the clock was counting
                 // towards is a beat in a song that no longer exists.
                 self.bar_clock.armed = false;
@@ -13640,7 +13732,12 @@ impl Renderer {
             // **And then whatever the user put across the bus.** After the
             // built-in three, so somebody who loads a reverb and leaves the
             // knobs alone hears their reverb rather than theirs through ours.
-            self.run_insert_chain(Strip::Fx.index(), true, n);
+            // The Fx bus hears the lanes' sends after their compensation,
+            // as late as the alignment target; the master hears the mix at
+            // that target too, and its original rack hears it after the
+            // second one as well. See `run_insert_chain`'s `lag`.
+            let aligned = self.shared.max_latency.load(Ordering::Relaxed);
+            self.run_insert_chain(Strip::Fx.index(), true, n, aligned);
             // What comes back, at the bus's own fader.
             let return_target = level(Strip::Fx, &self.shared.fx_return);
             let fx_peak = add_return(
@@ -13705,8 +13802,10 @@ impl Renderer {
             // still in the seat they were in, in the same place in the
             // chain, with three empty bays added in front of them (and an
             // empty rack returns immediately).
-            self.run_insert_chain(MASTER_EXTRA_SEAT, false, n);
-            self.run_insert_chain(LEGACY_STRIPS, false, n);
+            let aligned = self.shared.max_latency.load(Ordering::Relaxed);
+            self.run_insert_chain(MASTER_EXTRA_SEAT, false, n, aligned);
+            let ahead = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, MASTER_EXTRA_SEAT);
+            self.run_insert_chain(LEGACY_STRIPS, false, n, aligned.saturating_add(ahead));
             // **A curve on the master overrides its fader**, exactly as a
             // channel's does — see `lane_gain_of`. The stored position is
             // what the hand left; the curve is what the song says.
@@ -14949,7 +15048,8 @@ impl Renderer {
             // makes the lane pass stand aside for it next chunk.
             if !is_folder && self.amp_board_arms(lane) {
                 self.spine.ext.board_live.insert(lane);
-                self.run_pedalboard(lane, n, armed, true);
+                // Live input: no timeline under it, so the chunk's anchor.
+                let _ = self.run_pedalboard(lane, n, armed, true, u64::MAX);
             }
             {
                 let notes: &[Note] = if armed { &self.notes } else { &[] };
@@ -15912,6 +16012,9 @@ impl Renderer {
         };
         self.shared.transport_cycle_a.store(qa.to_bits(), Ordering::Relaxed);
         self.shared.transport_cycle_b.store(qb.to_bits(), Ordering::Relaxed);
+        self.shared.transport_loop_a.store(a, Ordering::Relaxed);
+        self.shared.transport_loop_b.store(b, Ordering::Relaxed);
+        self.shared.transport_chunk.fetch_add(1, Ordering::Relaxed);
         (at, rolling, flush, wrap_from)
     }
 
@@ -19639,16 +19742,16 @@ impl Renderer {
         self.spine.ext.board_ran.insert(ch)
     }
 
-    fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool, live: bool) {
+    fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool, live: bool, pos: u64) -> u32 {
         // Rule 1 and rule 2, in the order they are argued above. See
         // `claim_board` for a lane the claim set cannot hold.
         if !self.claim_board(ch, live) {
-            return;
+            return 0;
         }
         let controls: &[Control] = if armed { &self.controls } else { &[] };
         let first = lane_seat(ch, 2);
         let Some(lane) = self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) else {
-            return;
+            return 0;
         };
         run_board(
             &mut lane.body_mut().board,
@@ -19660,7 +19763,26 @@ impl Renderer {
             &self.spine.ext.desk.frozen,
             frames,
             controls,
-        );
+            pos,
+        )
+    }
+
+    /// **How late the audio arriving at a folder's or a bus's racks is**,
+    /// frames behind the chunk's anchor: its feeders waited until, after
+    /// this node's racks and its way out, they reach the alignment target,
+    /// so they arrive the target less what the node and its way out still
+    /// add. The plan's `node_pay` and the shim's folder chain both come to
+    /// `folder_lat` (the way out) plus the node's racks, and a bus's armed
+    /// board.
+    fn node_lag(&self, slot: usize) -> u32 {
+        let frozen = &self.spine.ext.desk.frozen;
+        let mut pay = Rack::latency(&self.shared, frozen, lane_seat(slot, CHAIN_OWN))
+            .saturating_add(Rack::latency(&self.shared, frozen, lane_seat(slot, CHAIN_EXTRA)))
+            .saturating_add(self.spine.ext.folder_lat.get(slot).copied().unwrap_or(0));
+        if self.spine.ext.buses.contains(slot) {
+            pay = pay.saturating_add(self.pedal_latency(slot));
+        }
+        self.shared.max_latency.load(Ordering::Relaxed).saturating_sub(pay)
     }
 }
 
@@ -19725,7 +19847,16 @@ fn run_board(
     frozen: &LaneSet,
     frames: usize,
     controls: &[Control],
-) {
+    // **The frame at the board's input**, or `u64::MAX` for the chunk's
+    // anchor: `at` from a lane pass that may render a span ahead
+    // (`render_lane`), the node's lagged frame from a fold. Each pedal is
+    // told it less the pedals ahead of it, which run in series.
+    pos: u64,
+) -> u32 {
+    let base = if pos == u64::MAX { shared.transport_anchor.load(Ordering::Relaxed) } else { pos };
+    // What the pedals run so far have delayed the signal by: returned, so a
+    // fold can tell the rack after the board where ITS input is.
+    let mut paid = 0u32;
     for (pedal, rack) in board.iter_mut().enumerate() {
         let seat = first + pedal;
         {
@@ -19765,11 +19896,13 @@ fn run_board(
                 None,
             
             None,
-            u64::MAX,
+            base.saturating_sub(u64::from(paid)),
             &mut Layer::fresh(),
         );
+        paid = paid.saturating_add(Rack::latency(shared, frozen, seat));
         }
     }
+    paid
 }
 
 /// **What a post-fork node's run reads**, all of it read-only: the parts of
@@ -19838,7 +19971,10 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
                 // NOT a key pass: the lane pass fed this seat its key.
                 None,
                 None,
-                u64::MAX,
+                // The same stretch of song its lane pass already told this
+                // rack's plugins about, which `run_rack` sees and so tells
+                // them nothing again (`Rack::told`).
+                lagged(desk.shared, prep.lag),
                 &mut Layer::fresh(),
             );
         }
@@ -19885,8 +20021,13 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     // **THE-FOLD:** the group's (or the bus's) PEDALBOARD, before either
     // rack, over the sum: the board is the amp's input. Claimed in the
     // gather, which is serial.
+    // **Where the sum is in the song**: as late as its feeders waited
+    // (`NodePrep::lag`), then later again by the board and by the first
+    // rack for the racks after each.
+    let node_at = lagged(desk.shared, prep.lag);
+    let mut paid = 0u32;
     if prep.board {
-        run_board(
+        paid = run_board(
             &mut board[..],
             lane_seat(slot, 2),
             desk.auto_params,
@@ -19896,6 +20037,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             desk.frozen,
             frames,
             &[],
+            node_at,
         );
     }
     // **THE-FOLD:** the one place a folder's (and a bus's) racks run, own
@@ -19918,10 +20060,11 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             sample,
             node_key(prep.keyed, desk, key_io),
             None,
-            u64::MAX,
+            node_at.saturating_sub(u64::from(paid)),
             &mut Layer::fresh(),
         );
     }
+    let paid = paid.saturating_add(Rack::latency(desk.shared, desk.frozen, own_seat));
     // **THE-FOLD:** and bays 3..5, over what bays 0..2 just left: six bays
     // are one chain, run once over the sum.
     if !extra.is_empty() {
@@ -19941,7 +20084,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             None,
             node_key(prep.keyed, desk, key_io),
             None,
-            u64::MAX,
+            node_at.saturating_sub(u64::from(paid)),
             &mut Layer::fresh(),
         );
     }
@@ -20182,8 +20325,14 @@ impl Renderer {
             // `mix_monitor` puts a live input on a group into the bus raw
             // and runs neither its rack nor its board, so the fold is the
             // only pass that can claim a folder's.
+            // **Where the group's audio is in the song**: its children
+            // waited for the alignment target less what this folder and its
+            // way out add (`node_lag`). The board is told that, the first
+            // rack that less the board, the second that less the first.
+            let fold_at = lagged(&self.shared, self.node_lag(ch));
+            let mut fold_paid = 0u32;
             if self.amp_board_arms(ch) {
-                self.run_pedalboard(ch, frames, false, false);
+                fold_paid = self.run_pedalboard(ch, frames, false, false, fold_at);
             }
             // **THE-FOLD:** the one place a folder's rack runs.
             //
@@ -20234,7 +20383,7 @@ impl Renderer {
                         None,
                 
                 None,
-                u64::MAX,
+                fold_at.saturating_sub(u64::from(fold_paid)),
                 &mut Layer::fresh(),
             );
                 }
@@ -20275,7 +20424,7 @@ impl Renderer {
                             None,
                     
                 None,
-                u64::MAX,
+                fold_at.saturating_sub(u64::from(fold_paid)).saturating_sub(u64::from(Rack::latency(&self.shared, &self.spine.ext.desk.frozen, ch))),
                 &mut Layer::fresh(),
             );
                     }
@@ -21226,6 +21375,7 @@ impl Renderer {
             wait_main: send_lat.saturating_sub(main_lat),
             wait_send: main_lat.saturating_sub(send_lat),
             keyed: kind == K::Bus && self.keys_live,
+            lag: self.node_lag(slot),
             peak: [0.0; 2],
         };
         let coeff = self.gain_coeff;
@@ -22629,6 +22779,7 @@ fn new_rack() -> (Rack, [Handoff; INSERTS]) {
         slots: std::array::from_fn(|_| PluginBox(None)),
         incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
         retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+        told: (u64::MAX, 0),
     };
     (rack, std::array::from_fn(|_| ends.next().expect("one per insert")))
 }
@@ -24019,6 +24170,7 @@ impl Engine {
                 slots: std::array::from_fn(|_| PluginBox(None)),
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+                told: (u64::MAX, 0),
             }
         }).collect();
         let mut rack_ends = rack_ends.into_iter();
@@ -31222,6 +31374,7 @@ mod tests {
             slots: std::array::from_fn(|_| PluginBox(None)),
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            told: (u64::MAX, 0),
         }
     }
 
@@ -31253,6 +31406,7 @@ mod tests {
                 slots: std::array::from_fn(|_| PluginBox(None)),
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+                told: (u64::MAX, 0),
             }
         }).collect();
         let (racks, spine) = spine_from_bank(racks, LEGACY_GEN);
@@ -32061,6 +32215,7 @@ mod tests {
             slots: std::array::from_fn(|_| PluginBox(None)),
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            told: (u64::MAX, 0),
         };
 
         // Bay 0's retiring ring is full — the UI thread timed out and never
@@ -32123,6 +32278,7 @@ mod tests {
             slots: std::array::from_fn(|_| PluginBox(None)),
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            told: (u64::MAX, 0),
         };
         rack.retiring[0]
             .push(PluginBox(None))
@@ -47306,6 +47462,7 @@ mod sampler_road {
             slots,
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+            told: (u64::MAX, 0),
         }
     }
 
@@ -47905,36 +48062,84 @@ mod sampler_road {
         )
     }
 
+    /// Watch `seat`: from here on, every `Transport` its rack forwards to a
+    /// bay is logged (`Shared::rack_host_log`), and its runs are counted.
+    fn watch_host(e: &Engine, seat: usize) {
+        e.shared.rack_count_seat.store(seat, Ordering::Relaxed);
+        e.shared.rack_count.store(0, Ordering::Relaxed);
+        let mut log = e.shared.rack_host_log.lock().expect("the log");
+        log.clear();
+        log.reserve(16_384);
+    }
+
+    /// What the watched rack forwarded since the last call: `(bay, the
+    /// chunk's anchor, the transport)`, in order.
+    fn forwarded(e: &Engine) -> Vec<(usize, u64, tangent_host::Transport)> {
+        let mut log = e.shared.rack_host_log.lock().expect("the log");
+        let out = log.clone();
+        log.clear();
+        out
+    }
+
+    /// One built-in into `seat`'s bay `bay`.
+    fn seat_one(e: &mut Engine, seat: usize, bay: usize, path: &str) {
+        e.load_insert(seat, bay, Some(Path::new(path)), None)
+            .expect("the built-in loads")
+            .expect("and seats");
+    }
+
+    /// A held note on `strip` for the whole of a test.
+    fn held(strip: usize) -> PlacedMidi {
+        PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip,
+            start: 0,
+            len: 120 * 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 100 * 48_000, key: 60, vel: 100 }]),
+        }
+    }
+
+    /// The only entry `forwarded` should hold for a one-bay rack's block.
+    fn one_block(e: &Engine, what: &str) -> tangent_host::Transport {
+        let got = forwarded(e);
+        assert_eq!(got.len(), 1, "{what}: the rack forwarded {} transports this chunk", got.len());
+        got[0].2
+    }
+
     /// **A hosted plugin is told the song's real position, tempo, bar and
     /// signature for the block it renders, and the loop it is in.**
     ///
     /// Every VST3 `process` call used to carry a null `ProcessContext`, so
     /// Superior Drummer's "follow host", a synced delay and an arp all ran
-    /// at their own defaults. `host_transport` is what both formats are now
-    /// built from. Driven here through a real engine, rendering offline as
-    /// an export does (as fast as the machine goes, so "now" means nothing),
+    /// at their own defaults. Read here off what the MASTER's rack actually
+    /// forwarded to its bay, in a real engine rendering offline as an
+    /// export does (as fast as the machine goes, so "now" means nothing),
     /// over a tempo RAMP and two meter changes, with a loop whose end falls
-    /// mid-chunk: every chunk's figures must be the maps' at that chunk's
-    /// first frame, and the chunk after the wrap must say the loop's head.
+    /// mid-chunk: every chunk is told the maps' figures at its own first
+    /// frame, the chunk after the wrap is told the loop's head, and a
+    /// playhead past the loop is told the loop is set but not active.
     #[test]
     fn a_hosted_plugin_is_told_the_maps_position_bar_signature_and_loop() {
         let rate = 48_000u32;
         let maps = host_fixture_maps();
         let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
         e.set_maps(maps.clone());
+        seat_one(&mut e, LEGACY_STRIPS, 0, crate::builtin_fx::TRIM_PATH);
         // Bar 0 to the end of bar 4's 7/8: across both meter changes.
         let qb = maps.meter.quarter_at_bar(5);
         let b = (maps.tempo.seconds_at_beat(qb) * f64::from(rate)) as u64;
+        let want_b = maps.tempo.beat_at_seconds(b as f64 / f64::from(rate));
         e.set_loop(0, b);
         e.set_transport(1, 0);
         e.set_rolling(true);
+        watch_host(&e, LEGACY_STRIPS);
         let mut out = vec![0.0f32; 2 * 512];
         let (mut wraps, mut last, mut sigs) = (0, 0u64, std::collections::BTreeSet::new());
         for _ in 0..(b / 512 + 40) {
             let at = e.transport_position();
             out.fill(0.0);
             e.render_offline(&mut out);
-            let t = host_transport(&e.shared, u64::MAX);
+            let t = one_block(&e, "the master");
             let (q, bpm, bar_q, bar, sig) = host_expected(&maps, rate, at);
             assert_eq!(t.sample, at as i64, "the chunk at {at} told a plugin sample {}", t.sample);
             assert!(t.playing, "a rolling chunk said it was stopped");
@@ -47944,11 +48149,11 @@ mod sampler_road {
             assert!((t.bar_start - bar_q).abs() < 1e-9, "at {at}: bar starts at {} where the meter says {bar_q}", t.bar_start);
             assert_eq!(t.bar, i64::from(bar), "at {at}: bar index");
             assert_eq!((t.numerator, t.denominator), sig, "at {at}: signature");
-            let (ca, cb) = t.cycle.expect("the loop is on");
             // The loop's end is a whole FRAME, so its quarter is the map's at
             // that frame, a few microbeats short of the bar line.
-            let want_b = maps.tempo.beat_at_seconds(b as f64 / f64::from(rate));
+            let (ca, cb) = t.cycle.expect("the loop is set");
             assert!(ca.abs() < 1e-9 && (cb - want_b).abs() < 1e-9, "loop told as {ca}..{cb}, not 0..{want_b}");
+            assert!(t.cycle_active, "a block inside the loop was told it is not in it");
             if at < last {
                 wraps += 1;
                 assert!(at < 512 * 2, "the chunk after the wrap is at {at}, not the loop's head");
@@ -47959,33 +48164,46 @@ mod sampler_road {
         assert!(wraps >= 1, "the loop never wrapped, so the jump went untested");
         assert_eq!(sigs.len(), 3, "the fixture never crossed both meter changes: {sigs:?}");
 
+        // Play on from PAST the loop: the engine never wraps that playhead,
+        // so the loop is set (`kCycleValid`) and not active.
+        e.set_transport(2, b + 48_000);
+        for _ in 0..3 {
+            e.render_offline(&mut out);
+            let t = one_block(&e, "past the loop");
+            assert!(t.cycle.is_some(), "a set loop went unreported");
+            assert!(!t.cycle_active, "a playhead past the loop's end was told it is inside it");
+        }
+
         // No loop: no cycle.
         e.set_loop(0, 0);
         e.render_offline(&mut out);
-        assert_eq!(host_transport(&e.shared, u64::MAX).cycle, None, "a cleared loop is still reported");
+        let t = one_block(&e, "no loop");
+        assert_eq!((t.cycle, t.cycle_active), (None, false), "a cleared loop is still reported");
     }
 
     /// **A locate lands on the block it lands, and a stopped desk is still a
     /// desk with a tempo.** Stopped: not playing, the parked playhead, the
     /// map's tempo and bar at it, as a VST3 host must report (`kPlaying`
-    /// clear, `kTempoValid` set).
+    /// clear, `kTempoValid` set). Read off what the master forwarded.
     #[test]
     fn a_locate_and_a_stop_reach_a_hosted_plugin_on_their_own_block() {
         let rate = 48_000u32;
         let maps = host_fixture_maps();
         let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
         e.set_maps(maps.clone());
+        seat_one(&mut e, LEGACY_STRIPS, 0, crate::builtin_fx::TRIM_PATH);
         e.set_transport(1, 0);
         e.set_rolling(true);
         let mut out = vec![0.0f32; 2 * 512];
         for _ in 0..4 {
             e.render_offline(&mut out);
         }
+        watch_host(&e, LEGACY_STRIPS);
         // Locate to the middle of bar 3 (3/4), mid-roll.
         let to = (maps.tempo.seconds_at_beat(maps.meter.quarter_at_bar(3) + 1.5) * f64::from(rate)) as u64;
         e.set_transport(2, to);
         e.render_offline(&mut out);
-        let t = host_transport(&e.shared, u64::MAX);
+        let t = one_block(&e, "the block after a locate");
         let (q, _, bar_q, bar, sig) = host_expected(&maps, rate, to);
         assert_eq!(t.sample, to as i64, "the block after a locate did not start at it");
         assert!((t.quarters - q).abs() < 1e-6 && (t.bar_start - bar_q).abs() < 1e-9);
@@ -47994,10 +48212,11 @@ mod sampler_road {
 
         e.set_rolling(false);
         e.render_offline(&mut out);
+        let _ = forwarded(&e);
         let parked = e.transport_position();
         for _ in 0..3 {
             e.render_offline(&mut out);
-            let t = host_transport(&e.shared, u64::MAX);
+            let t = one_block(&e, "a stopped block");
             assert!(!t.playing, "a stopped desk told a plugin it was playing");
             assert_eq!(t.sample, parked as i64, "a stopped desk's position moved");
             let (q, bpm, ..) = host_expected(&maps, rate, parked);
@@ -48007,11 +48226,11 @@ mod sampler_road {
     }
 
     /// **A span rendered ahead of the playhead is told its OWN frame, and
-    /// its own bar when it has crossed a line.** A grained lane renders up
-    /// to a grain past the chunk's anchor; handing it the anchor would put
-    /// a synced plugin early by exactly that much.
+    /// its own bar when it has crossed a line; a rack BEHIND the anchor is
+    /// walked back over one.** The pure walk `run_rack` forwards from; the
+    /// engine tests below read what it forwarded.
     #[test]
-    fn a_span_rendered_ahead_is_told_its_own_frame_and_bar() {
+    fn a_span_away_from_the_anchor_is_told_its_own_frame_and_bar() {
         let shared = Shared::new();
         shared.rate.store(48_000, Ordering::Relaxed);
         shared.transport_rolling.store(true, Ordering::Relaxed);
@@ -48033,58 +48252,127 @@ mod sampler_road {
         assert_eq!(ahead.sample, 96_000 + 156, "a span ahead was told the anchor's frame");
         assert!((ahead.quarters - (4.0 + 156.0 / 24_000.0)).abs() < 1e-9, "quarter {}", ahead.quarters);
         assert_eq!((ahead.bar, ahead.bar_start), (1, 4.0), "a span past the bar line kept the old bar");
+
+        // Anchored just PAST a line, a rack a lookahead behind it is in the
+        // bar before.
+        shared.transport_anchor.store(96_000 + 100, Ordering::Relaxed);
+        shared.transport_beat.store((4.0 + 100.0 / 24_000.0f64).to_bits(), Ordering::Relaxed);
+        shared.transport_bar_q.store(4.0f64.to_bits(), Ordering::Relaxed);
+        shared.transport_bar.store(1, Ordering::Relaxed);
+        let behind = host_transport(&shared, 96_000 - 2_000);
+        assert_eq!((behind.bar, behind.bar_start), (0, 0.0), "a rack behind the line kept the anchor's bar");
+        // And never before bar 0.
+        let first = host_transport(&shared, 0);
+        assert_eq!((first.bar, first.bar_start), (0, 0.0));
     }
 
     /// **`kRecording` while the arrangement records, and only then**: a
-    /// punch live on a lane AND the transport rolling.
+    /// punch live on a lane AND the transport rolling, as the master's
+    /// rack forwarded it.
     #[test]
     fn recording_reaches_a_hosted_plugin_only_while_a_punch_rolls() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        seat_one(&mut e, LEGACY_STRIPS, 0, crate::builtin_fx::TRIM_PATH);
         let mut out = vec![0.0f32; 2 * 512];
         e.set_transport(1, 0);
         let mut punches = [None; LEGACY_LANES];
         punches[1] = Some(0);
         e.set_punches(punches);
+        watch_host(&e, LEGACY_STRIPS);
         e.render_offline(&mut out);
-        assert!(!host_transport(&e.shared, u64::MAX).recording, "a stopped desk was recording");
+        assert!(!one_block(&e, "stopped").recording, "a stopped desk was recording");
         e.set_rolling(true);
         e.render_offline(&mut out);
-        assert!(host_transport(&e.shared, u64::MAX).recording, "a rolling punch was not recording");
+        assert!(one_block(&e, "rolling").recording, "a rolling punch was not recording");
         e.set_punches([None; LEGACY_LANES]);
         e.render_offline(&mut out);
-        assert!(!host_transport(&e.shared, u64::MAX).recording, "recording outlived its punch");
+        assert!(!one_block(&e, "after").recording, "recording outlived its punch");
     }
 
-    /// **Delay compensation does not move what a lane's rack is told.**
-    ///
-    /// This engine aligns lanes by DELAYING the early ones after their
-    /// racks, so a lane with nothing to report still processes the audio of
-    /// its own frame and must be told that frame. Here the Analog's 68
-    /// frames on lane 2 make lane 3 wait; lane 3's rack is watched and must
-    /// be handed each chunk's own first frame, in a real engine, rendering
-    /// offline. Then with grains on, the Analog's lane may render ahead,
-    /// and every span it renders must be told a frame and quarter that
-    /// agree with the map at that frame.
+    /// **The master is told the song the master is hearing.** The lanes are
+    /// aligned by DELAYING the early ones after their racks, so with the
+    /// Analog's 68 frames on lane 2 every lane reaches the master 68 frames
+    /// after its timeline: a position-synced gate there, told the anchor,
+    /// would open 68 frames early. Its rack must forward the anchor less the
+    /// alignment target, every chunk.
     #[test]
-    fn a_lane_waiting_on_compensation_is_told_the_frame_its_rack_renders() {
+    fn the_master_is_told_the_frame_of_the_audio_it_processes() {
         let rate = 48_000u32;
         let maps = host_fixture_maps();
         let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
         e.set_maps(maps.clone());
-        e.load_insert(2, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
-            .expect("the analog loads")
-            .expect("and seats");
-        e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
-            .expect("the trim loads")
-            .expect("and seats");
-        let clip = |strip: usize| PlacedMidi {
-            pedal: Arc::new(Vec::new()),
-            strip,
-            start: 0,
-            len: 8 * u64::from(rate),
-            notes: Arc::new(vec![ClipNote { at: 0, dur: 6 * u64::from(rate), key: 60, vel: 100 }]),
-        };
-        e.set_midi_clips(vec![clip(2), clip(3)]);
+        seat_one(&mut e, 2, 0, crate::builtin_fx::ANALOG_PATH);
+        seat_one(&mut e, LEGACY_STRIPS, 0, crate::builtin_fx::TRIM_PATH);
+        e.set_midi_clips(vec![held(2)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..6 {
+            e.render_offline(&mut out);
+        }
+        let lag = u64::from(e.shared.max_latency.load(Ordering::Relaxed));
+        assert!(lag > 0, "the fixture has no delay compensation in it, so this proves nothing");
+        watch_host(&e, LEGACY_STRIPS);
+        for _ in 0..16 {
+            let at = e.transport_position();
+            e.render_offline(&mut out);
+            let t = one_block(&e, "the master");
+            assert_eq!(t.sample, (at - lag) as i64, "the master was told {} for audio from {}", t.sample, at - lag);
+            let (q, ..) = host_expected(&maps, rate, at - lag);
+            assert!((t.quarters - q).abs() < 1e-4, "the master was told quarter {}, the audio is at {q}", t.quarters);
+        }
+    }
+
+    /// **Inside one rack, an effect is told its input less the bays ahead
+    /// of it.** The Analog in bay 0 makes its sound from this block's notes
+    /// and sounds 68 frames late; the Trim in bay 1 processes that, so it is
+    /// told 68 frames earlier than the voice is.
+    #[test]
+    fn an_effect_after_a_latent_bay_is_told_the_frame_it_hears() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        seat_one(&mut e, 2, 0, crate::builtin_fx::ANALOG_PATH);
+        seat_one(&mut e, 2, 1, crate::builtin_fx::TRIM_PATH);
+        e.set_midi_clips(vec![held(2)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..6 {
+            e.render_offline(&mut out);
+        }
+        let own = Rack::latency(&e.shared, &DeskLanes::read(&e.shared).frozen, lane_seat(2, CHAIN_OWN));
+        assert!(own > 0, "the analog reported no latency, so this proves nothing");
+        watch_host(&e, lane_seat(2, CHAIN_OWN));
+        for _ in 0..8 {
+            let at = e.transport_position();
+            e.render_offline(&mut out);
+            let got = forwarded(&e);
+            let sample = |bay: usize| got.iter().find(|x| x.0 == bay).map(|x| x.2.sample);
+            assert_eq!(sample(0), Some(at as i64), "the voice was not told its own block: {got:?}");
+            assert_eq!(sample(1), Some(at as i64 - i64::from(own)), "the trim after it was not told what it hears");
+        }
+    }
+
+    /// **Delay compensation does not move what a LANE's rack is told**, and
+    /// a grained lane's spans, and its PEDALBOARD's, are told their own.
+    ///
+    /// A lane with nothing to report still processes the audio of its own
+    /// frame (it waits AFTER its rack), so lane 3, waiting on the Analog's
+    /// 68 frames on lane 2, is told each chunk's own first frame. Then with
+    /// grains on, the Analog's lane renders spans ahead of the anchor, and
+    /// every span, in its own rack and in the pedal rack ahead of its amp,
+    /// is told a frame and a quarter that agree with the map there.
+    #[test]
+    fn a_lane_and_its_board_are_told_the_frame_their_racks_render() {
+        let rate = 48_000u32;
+        let maps = host_fixture_maps();
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        e.set_maps(maps.clone());
+        seat_one(&mut e, 2, 0, crate::builtin_fx::ANALOG_PATH);
+        // An amp arms the lane's pedalboard; a trim on its first pedal.
+        seat_one(&mut e, 2, 1, crate::builtin_fx::AMP_PATH);
+        seat_one(&mut e, lane_seat(2, 2), 0, crate::builtin_fx::TRIM_PATH);
+        seat_one(&mut e, 3, 0, crate::builtin_fx::TRIM_PATH);
+        e.set_midi_clips(vec![held(2), held(3)]);
         e.set_transport(1, 0);
         e.set_rolling(true);
         let mut out = vec![0.0f32; 2 * 512];
@@ -48095,44 +48383,164 @@ mod sampler_road {
             e.shared.max_latency.load(Ordering::Relaxed) > 0,
             "the fixture has no delay compensation in it, so this proves nothing"
         );
-        e.shared.rack_count_seat.store(lane_seat(3, CHAIN_OWN), Ordering::Relaxed);
-        e.shared.rack_count.store(0, Ordering::Relaxed);
+        watch_host(&e, lane_seat(3, CHAIN_OWN));
         for _ in 0..16 {
             let at = e.transport_position();
-            e.shared.rack_host_sample.store(u64::MAX, Ordering::Relaxed);
             e.render_offline(&mut out);
-            let told = e.shared.rack_host_sample.load(Ordering::Relaxed);
-            assert_eq!(told, at, "lane 3's rack, compensated, was told {told} for the chunk at {at}");
+            let t = one_block(&e, "lane 3");
+            assert_eq!(t.sample, at as i64, "lane 3's rack, compensated, was told {} for the chunk at {at}", t.sample);
         }
-        assert!(e.shared.rack_count.load(Ordering::Relaxed) >= 16, "lane 3's rack never ran");
 
-        // Grains on: the Analog's lane now renders spans of its own. A
-        // grain is only used when it is longer than the chunk, so 128-frame
-        // chunks against a 480-frame grain: most spans start away from the
-        // chunk's anchor, up to a grain ahead of it. Nothing armed and nothing listening to
-        // live MIDI, or the lanes are pinned to the chunk (`pinned_lanes`).
+        // Grains on. A grain is only used when it is longer than the chunk,
+        // so 128-frame chunks against a 480-frame grain: most spans start
+        // away from the chunk's anchor, up to a grain ahead of it. Nothing
+        // armed and nothing listening to live MIDI, or the lanes are pinned
+        // to the chunk (`pinned_lanes`).
         e.set_armed(0);
         e.set_midi_off(u64::MAX);
         e.set_grain_ms(10.0);
-        e.shared.rack_count_seat.store(lane_seat(2, CHAIN_OWN), Ordering::Relaxed);
-        e.shared.rack_host_ahead.store(0, Ordering::Relaxed);
         let mut small = vec![0.0f32; 2 * 128];
-        for _ in 0..64 {
-            e.render_offline(&mut small);
-            let told = e.shared.rack_host_sample.load(Ordering::Relaxed);
-            let anchor = e.shared.rack_host_anchor.load(Ordering::Relaxed);
-            let beat = f64::from_bits(e.shared.rack_host_beat.load(Ordering::Relaxed));
-            assert!(
-                told >= anchor && told - anchor <= MAX_BLOCK as u64,
-                "a span was told frame {told} for a chunk anchored at {anchor}"
-            );
-            let (q, ..) = host_expected(&maps, rate, told);
-            // Walked from the anchor at the anchor's tempo across at most a
-            // grain of a ramp: within a thousandth of a quarter.
-            assert!((beat - q).abs() < 1e-3, "a span at {told} was told quarter {beat}, the map says {q}");
+        for (seat, what) in [(lane_seat(2, CHAIN_OWN), "the analog's rack"), (lane_seat(2, 2), "its first pedal")] {
+            watch_host(&e, seat);
+            let mut ahead = 0;
+            for _ in 0..64 {
+                e.render_offline(&mut small);
+                for (bay, anchor, t) in forwarded(&e) {
+                    if bay != 0 {
+                        continue;
+                    }
+                    let told = t.sample as u64;
+                    assert!(
+                        told >= anchor && told - anchor <= MAX_BLOCK as u64,
+                        "{what}: a span was told frame {told} for a chunk anchored at {anchor}"
+                    );
+                    if told != anchor {
+                        ahead += 1;
+                    }
+                    let (q, ..) = host_expected(&maps, rate, told);
+                    // Walked from the anchor at the anchor's tempo across at
+                    // most a grain of a ramp: within a thousandth of a quarter.
+                    assert!((t.quarters - q).abs() < 1e-3, "{what}: a span at {told} was told quarter {}, the map says {q}", t.quarters);
+                }
+            }
+            assert!(ahead > 0, "{what}: no span was ever told a frame ahead, so the grained half proves nothing");
         }
-        let ahead = e.shared.rack_host_ahead.load(Ordering::Relaxed);
-        assert!(ahead > 0, "no span was ever rendered ahead, so the grained half proves nothing");
+    }
+
+    /// **A send destination's plugins are told each stretch of song ONCE.**
+    ///
+    /// Its rack runs twice a chunk: its own lane pass, then again over what
+    /// is routed to it (the SEND-BARGAIN). Telling its plugins the same
+    /// place twice fires a step sequencer twice and makes a plugin that
+    /// resets on a backwards jump reset every chunk. The second run must
+    /// forward nothing, so the positions a plugin sees advance strictly,
+    /// one per chunk.
+    #[test]
+    fn a_send_destination_is_told_each_chunk_once() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        seat_one(&mut e, 1, 0, crate::builtin_fx::ANALOG_PATH);
+        seat_one(&mut e, 5, 0, crate::builtin_fx::TRIM_PATH);
+        e.set_midi_clips(vec![held(1), held(5)]);
+        // Channel 1 -> channel 5, full: the shim's route, as
+        // `a_send_arrives_at_the_destination_and_its_fader_rides_it` sets it.
+        e.shared.routes[0].store(pack_route(1, 5, false, false), Ordering::Relaxed);
+        e.shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        e.shared.route_count.store(1, Ordering::Release);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        watch_host(&e, lane_seat(5, CHAIN_OWN));
+        let mut last = -1i64;
+        const CHUNKS: u64 = 12;
+        for _ in 0..CHUNKS {
+            let at = e.transport_position();
+            e.render_offline(&mut out);
+            let t = one_block(&e, "the destination");
+            assert!(t.sample > last, "the destination was told {} after {last}", t.sample);
+            assert_eq!(t.sample, at as i64);
+            last = t.sample;
+        }
+        assert_eq!(
+            e.shared.rack_count.load(Ordering::Relaxed),
+            2 * CHUNKS,
+            "the destination's rack did not run twice a chunk, so the repeat went untested"
+        );
+    }
+
+    /// **A rack's second run over the same stretch forwards nothing; a new
+    /// stretch in the same chunk, or the same frames in the next chunk, is a
+    /// new block.** The rule `Rack::told` keeps, on the rack directly.
+    #[test]
+    fn a_racks_repeat_run_forwards_nothing_and_a_new_stretch_does() {
+        let shared = Shared::new();
+        shared.rack_count_seat.store(0, Ordering::Relaxed);
+        shared.rack_host_log.lock().expect("the log").reserve(64);
+        shared.transport_anchor.store(1000, Ordering::Relaxed);
+        shared.transport_chunk.store(5, Ordering::Relaxed);
+        let params: [&[tangent_host::ParamPoint]; INSERTS] = [&[], &[], &[]];
+        let mut rack = rack_with_a_trim();
+        let mut planar = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+        let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+        let frozen = DeskLanes::read(&shared).frozen;
+        let mut run = |rack: &mut Rack, pos: u64| {
+            // **NOT-A-CHANNEL:** a synthetic rack built by this test.
+            run_rack(rack, &mut planar, 256, &mut out, &[], &[], &params, &shared, &frozen, 0, None, None, None, pos, &mut Layer::fresh());
+            let mut log = shared.rack_host_log.lock().expect("the log");
+            let got: Vec<i64> = log.iter().map(|x| x.2.sample).collect();
+            log.clear();
+            got
+        };
+        assert_eq!(run(&mut rack, 1000), vec![1000], "the first run of a chunk");
+        assert!(run(&mut rack, u64::MAX).is_empty(), "the second run at the anchor was told again");
+        assert!(run(&mut rack, 1000 - 68).is_empty(), "a second run behind the first was told again");
+        assert_eq!(run(&mut rack, 1256), vec![1256], "a grained lane's next span is a new block");
+        shared.transport_chunk.store(6, Ordering::Relaxed);
+        assert_eq!(run(&mut rack, 1000), vec![1000], "the next chunk at a wrapped place is a new block");
+    }
+
+    /// **An edit to the maps reaches a plugin that is only told on a
+    /// change.** An LV2 plugin is sent `time:Position` when the block is
+    /// not where it could work out (`TimeGate`); moving a tempo point
+    /// EARLIER in the song while rolling moves the music under a sample
+    /// that moves on as usual. The forwarded transport carries the maps'
+    /// version, and the gate fires on the block after the edit.
+    #[test]
+    fn a_tempo_edit_while_rolling_is_told_on_the_next_block() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let maps = Maps { tempo: TempoMap::constant(120.0), meter: Default::default() };
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        e.set_maps(maps.clone());
+        seat_one(&mut e, LEGACY_STRIPS, 0, crate::builtin_fx::TRIM_PATH);
+        e.set_transport(1, 48_000 * 10);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        e.render_offline(&mut out);
+        watch_host(&e, LEGACY_STRIPS);
+        let mut gate = tangent_host::transport::TimeGate::default();
+        e.render_offline(&mut out);
+        assert!(gate.due(&one_block(&e, "warm"), 512), "the first block is told");
+        for _ in 0..3 {
+            e.render_offline(&mut out);
+            assert!(!gate.due(&one_block(&e, "steady"), 512), "a steady block was told again");
+        }
+        // One faster quarter at quarter 2, long behind the playhead: the
+        // tempo AT the playhead is still 120 and its sample moves on as
+        // usual, but the music under it is a little further along.
+        e.set_maps(Maps {
+            tempo: TempoMap::sanitised(vec![
+                TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+                TempoPoint { at_beat: 2.0, bpm: 130.0, ramp: false },
+                TempoPoint { at_beat: 3.0, bpm: 120.0, ramp: false },
+            ]),
+            ..maps
+        });
+        e.render_offline(&mut out);
+        let t = one_block(&e, "after the edit");
+        assert_eq!(t.tempo, 120.0, "the fixture moved the tempo at the playhead, so the gate would fire anyway");
+        assert!(gate.due(&t, 512), "the block after a tempo edit was not told");
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures
