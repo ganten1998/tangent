@@ -138,7 +138,7 @@ The order that keeps this honest, and the one that was got wrong twice:
 One more gate, same spirit: the post-purchase block below tells buyers the
 source for the bundled tangent-ffmpeg is published as two releases,
 `third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22` and
-`third-party-src-ffmpeg-7.0.2`. That sentence becomes true only once
+`third-party-src-ffmpeg-8.1.3-tangent-linux`. That sentence becomes true only once
 `scripts/publish-third-party-src.sh` has created both (LICENSING.md, "The
 source it is owed") and `scripts/check-store-links.sh` finds them. Do not
 paste it to Gumroad before then.
@@ -222,7 +222,7 @@ from FFmpeg, which films takes and exports MP3. FFmpeg is licensed under the
 GPL. Its licence text ships next to it, and the source for those builds is
 published here:
 Windows: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22
-Linux: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2
+Linux: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-8.1.3-tangent-linux
 
 Plug your MIDI keyboard in before you start Tangent. Everything in the app
 lives in the right-click menu, and holding H shows every keyboard shortcut.

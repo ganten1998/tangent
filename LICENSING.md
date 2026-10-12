@@ -89,11 +89,20 @@ source releases below. THIRD-PARTY-LICENSES has a LAME section
 
 ## ffmpeg: GPL binaries in the Linux and Windows artifacts
 
-`scripts/fetch-ffmpeg.sh` downloads prebuilt **GPL** ffmpeg binaries, pinned
-by sha256, and the Linux tarballs and the Windows artifact ship them as
-`tangent-ffmpeg(.exe)`:
+The Linux tarballs and the Windows artifact ship a **GPL** ffmpeg as
+`tangent-ffmpeg(.exe)`, put in place by `scripts/fetch-ffmpeg.sh`:
 
-* Linux x86_64 and arm64: johnvansickle.com static ffmpeg **7.0.2**.
+* Linux x86_64 and arm64: ffmpeg **8.1.3 built by us**, by
+  `scripts/build-ffmpeg-linux.sh`, from pinned sources: the FFmpeg release
+  tarball (signature checked), x264 at commit `b35605ace3dd` (its stable
+  branch), LAME 3.100, and NASM 3.02 as the x86_64 assembler. Configured
+  with only what Tangent calls it for (libx264, LAME, FFmpeg's own AAC and
+  the decoders of the import formats; no network, no hardware
+  acceleration), cross-compiled with zig for glibc 2.30, the libraries
+  linked statically. GPLv3 (`--enable-gpl --enable-version3`). Every Linux
+  artifact built before this change bundled johnvansickle.com's static
+  **7.0.2** instead (see the source list below for why it was
+  replaced).
 * Windows: BtbN autobuild ffmpeg **n8.1.3** (`ffmpeg-n8.1.3-win64-gpl-8.1.zip`),
   from the dated tag `autobuild-2026-09-22-13-18` of `BtbN/FFmpeg-Builds`.
   BtbN prunes dated tags after a few weeks, so the pin says which build, not
@@ -172,23 +181,33 @@ never become the Latest release the download links resolve against.
   Docker images (GPLv3 section 1 excludes general-purpose tools); the
   runtime pieces they link (libgcc, libstdc++, libatomic) are under the GCC
   Runtime Library Exception.
-* `third-party-src-ffmpeg-7.0.2`, for the Linux pins (x86_64 and aarch64).
-  **Incomplete.** It holds the FFmpeg 7.0.2 release tarball (signature
+* `third-party-src-ffmpeg-8.1.3-tangent-linux`, for the Linux builds
+  (x86_64 and aarch64). **Complete by construction**: it is staged by
+  `scripts/build-ffmpeg-linux.sh` on every run, from the very files that run
+  built from, and holds the FFmpeg 8.1.3 release tarball and its signature,
+  the x264, LAME and NASM source tarballs, and a copy of the build script
+  itself, which is the scripts used to control compilation and installation.
+  The script runs from inside that folder alone (zig 0.16.0 is the only
+  tool it needs that is not on an ordinary build machine; GPLv3 section 1
+  excludes compilers), and the same zig rebuilds the same bytes (checked:
+  two builds from different folders, one from the staged release, gave
+  identical binaries on both architectures).
+* `third-party-src-ffmpeg-7.0.2`, for the johnvansickle.com builds every
+  Linux artifact bundled before ours (x86_64 and aarch64). Not in
+  `publish-third-party-src.sh`'s list any more. **Incomplete.** It holds the FFmpeg 7.0.2 release tarball (signature
   verified) and the builder's readme, which names every library version
   the build links. It does not hold those libraries' source or the
   builder's build scripts and configure options, which GPLv3 counts as part
   of the complete corresponding source: johnvansickle.com publishes none
   for this build (its `release-source/` folder holds FFmpeg 4.1 from 2018),
   so there is nothing to mirror. A written offer (GPLv3 section 6(b)) does
-  not help either, because it promises source we do not have. The ways to
-  close it, an owner decision: ask the builder for the exact source of the
-  7.0.2 builds (he owes it to us as recipients); or replace the Linux pin
-  with a build whose source we can publish whole, either BtbN's linux64 and
-  linuxarm64 builds at the same `3e6685eda92f` commit (the Windows source
-  release then covers them too, but see `fetch-ffmpeg.sh` for why BtbN's
-  linux64 build was reverted: it aborts on libva older than 2.22) or an
-  ffmpeg built by our own script with only what Tangent uses (libx264 and
-  LAME), whose script then is the source release.
+  not help either, because it promises source we do not have. The owner's
+  decision was the last of the three ways out: an ffmpeg built by our own
+  script with only what Tangent uses, whose script and pinned tarballs are
+  the source release (the entry above). What stays open is the source owed
+  for 7.0.2 binaries already handed out, which only the builder can supply
+  (he owes it to us as recipients) or which stops mattering when those
+  artifacts stop being offered.
 * The Windows builds made from e5ae43b up to d6547f6 (4.4.1 through
   5.0.0-beta.13) bundled n8.1.2-44-g7c533d0f86 from
   `autobuild-2026-08-17-13-05`. No source release is staged for it: the
@@ -210,8 +229,9 @@ code" GPLv3 section 6(d) asks for.
 
 **The uploads are an owner action**: they need release credentials and the
 repository public (the script refuses a private one). Until both releases
-exist with their assets, and the Linux one is complete, distribution of the
-Linux and Windows artifacts is out of compliance on this point.
+exist with their assets, distribution of the Linux and Windows artifacts is
+out of compliance on this point. A Linux artifact that still carries the
+7.0.2 build stays out of compliance until it is withdrawn or rebuilt.
 
 ## Trademarks, which are separate from all of the above
 

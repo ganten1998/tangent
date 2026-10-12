@@ -1,0 +1,65 @@
+Source for the ffmpeg build in Tangent's Linux downloads
+========================================================
+
+Tangent's Linux tarballs (x86_64 and aarch64) carry tangent-ffmpeg, which is
+the ffmpeg program of FFmpeg 8.1.3, built by Tangent's own script from the
+files in this release and nothing else. It links libx264 and LAME
+statically, and is licensed under the GNU GPL version 3 (configured with
+--enable-gpl --enable-version3; x264 is GPLv2 or later and LAME is LGPLv2
+or later, both of which allow it).
+
+This release is the complete corresponding source of those binaries: the
+source of every part that goes into them, and the script that configures,
+builds and installs them. To rebuild, download every file into one folder
+and run, inside it,
+
+  bash build-ffmpeg-linux.sh x86_64      (or aarch64)
+
+The program lands in build-ffmpeg-linux/out/<arch>/ under your cache folder
+(the script says where). It takes every source from this folder, checks
+each against the pins written in the script, and downloads nothing else
+but the FFmpeg signing key. It needs zig 0.16.0, which is the C compiler
+and linker (it cross-compiles for glibc 2.30, from macOS or Linux), and
+make, pkg-config, gpg, gzip, xz and a C compiler for the build machine
+(for nasm). The same zig gives the same program; another zig gives a
+working one. The script is Tangent's scripts/build-ffmpeg-linux.sh, byte
+for byte the copy that made the binaries.
+
+Every file here, and where it came from (SHA256SUMS.txt lists the hashes):
+
+  build-ffmpeg-linux.sh
+      The build: the pins, the configure options of each part, and the
+      install steps. Tangent's scripts/build-ffmpeg-linux.sh.
+
+  ffmpeg-8.1.3.tar.xz, ffmpeg-8.1.3.tar.xz.asc
+      FFmpeg 8.1.3, the release tarball from https://ffmpeg.org/releases/,
+      with its detached signature. Verified: good signature from the FFmpeg
+      release signing key FCF986EA15E6E293A5644F10B4322F04D67658D8.
+
+  x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.gz
+      x264 (https://code.videolan.org/videolan/x264.git) at commit
+      b35605ace3ddf7c1a5d67a2eb553f034aef41d55, the head of its stable
+      branch (r3222), as `git archive` of that commit. The script pins the
+      sha256 of the uncompressed tar, which is
+      df62afece4eecef8ddf196f115dfec6e936a21b04ec2117a0f4e412de29b20e5.
+
+  lame-3.100.tar.gz
+      LAME 3.100, the release tarball from
+      https://sourceforge.net/projects/lame/files/lame/3.100/
+
+  nasm-3.02.tar.xz
+      NASM 3.02 from https://www.nasm.us/pub/nasm/releasebuilds/3.02/, the
+      assembler the x86_64 build uses for x264's and FFmpeg's assembly
+      code. A build tool, nothing of it is in the binary; it is here so the
+      build needs nothing that is not.
+
+Not included, and not owed: zig, the compiler (GPLv3 section 1 excludes
+general-purpose tools). The few pieces zig itself puts into every program
+it links are runtime support, not part of this work: glibc's start-up files
+and libc_nonshared (LGPL, with glibc's exception for exactly this use) and
+LLVM's compiler-rt (Apache 2.0 with the LLVM exception), all in zig's own
+source at https://github.com/ziglang/zig. The C library itself is not in
+the program: it uses the glibc of the system it runs on, dynamically.
+
+Tangent itself is MIT licensed and does not link ffmpeg; it starts it as a
+separate program. Tangent's own source: https://github.com/ganten1998/tangent

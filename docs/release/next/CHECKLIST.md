@@ -46,21 +46,21 @@ needed was done the same day (commits listed in section B).
   docs/STORE-CONTENT.md now list FreeBSD 15 and its package on the release
   page, which is true only once it is there.
 - [ ] **D6. FFmpeg source (licence). DECIDED: fix before release; staged,
-  one part still open.** Both source releases are staged under
-  `~/Library/Caches/tangent-dist/third-party-src/` by
-  `scripts/fetch-ffmpeg-sources.sh`, and `scripts/publish-third-party-src.sh`
-  creates them (step G0; `DRY_RUN=1` rehearsed). The Windows one
-  (`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`, 1.1 GB, 148 files) is
-  complete as far as BtbN's scripts define the build. **The Linux one
-  (`third-party-src-ffmpeg-7.0.2`) is NOT complete**: it has FFmpeg 7.0.2's
-  source and the builder's readme, but johnvansickle.com publishes no
-  library sources or build scripts for that build, so there is nothing to
-  mirror. OWNER: choose one before shipping the Linux tarballs (LICENSING.md,
-  "Where the source is"): ask the builder for the 7.0.2 sources; or re-pin
-  Linux to a build whose source can be published whole (BtbN linux64 /
-  linuxarm64 at commit 3e6685eda92f, after testing it against an old libva,
-  see fetch-ffmpeg.sh; or an ffmpeg built by our own script with libx264
-  and LAME only).
+  publishing still open.** Both source releases are staged under
+  `~/Library/Caches/tangent-dist/third-party-src/`, and
+  `scripts/publish-third-party-src.sh` creates them (step G0; `DRY_RUN=1`
+  rehearsed). The Windows one
+  (`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`, 1.1 GB, 148 files,
+  staged by `scripts/fetch-ffmpeg-sources.sh`) is complete as far as BtbN's
+  scripts define the build. **The Linux one is now complete**: the owner
+  chose to replace johnvansickle.com's 7.0.2 (whose library sources and
+  build scripts are published nowhere) with an ffmpeg built by our own
+  `scripts/build-ffmpeg-linux.sh` from pinned sources (FFmpeg 8.1.3, x264,
+  LAME, NASM), and every build stages its own source as
+  `third-party-src-ffmpeg-8.1.3-tangent-linux` (about 16 MB). Still open:
+  rebuild every Linux artifact with it before shipping (any tarball made
+  before carries 7.0.2), and the residual 7.0.2 question in LICENSING.md
+  for copies already handed out.
 - [x] **D7. LAME licence texts (licence). DONE.** `assets/lame-licenses/`
   (LAME's COPYING and LICENSE, LGPL-3.0, GPL-3.0, our NOTICE.txt) ships in
   the macOS app (zip, dmg, pkg), the FreeBSD package and both bundles, and
@@ -222,12 +222,12 @@ Expected in `dist/`: `Tangent-5.0.0-macos.pkg`,
   releases** (D1, D6). `gh repo edit ganten1998/tangent --visibility public
   --accept-visibility-change-consequences`, then
   `DRY_RUN=1 scripts/publish-third-party-src.sh` and the same without
-  `DRY_RUN`. It creates `third-party-src-ffmpeg-7.0.2` and
+  `DRY_RUN`. It creates `third-party-src-ffmpeg-8.1.3-tangent-linux` and
   `third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22` as pre-releases with
   `--latest=false` (they must never become Latest), uploads about 1.1 GB,
   and fails if Latest moved. Do this before G4: README.md, the release
   notes and the binaries' `ffmpeg-licenses/SOURCE.txt` link these
-  releases. The Linux one is incomplete until D6 is settled.
+  releases.
 - [ ] **G1. OWNER:** `gh auth status` is signed in with release rights.
 - [ ] **G2.** `git push github main v5.0.0`. Never `--tags` (docs/RELEASE.md
   step 8): it would put every old tag back after the wipe.
@@ -294,8 +294,9 @@ Keep `v5.0.0` and any `third-party-src-*`. Local and Codeberg tags are not
 touched. Consequences: old version-specific URLs (release pages and
 `/releases/download/<tag>/...`) 404, which nothing in the repo hands out;
 every permalink keeps working. Deleting the old releases also stops offering
-the old Windows builds that carried ffmpeg n8.1.2, so only the 7.0.2 and
-n8.1.3 source releases remain owed (D6; LICENSING.md notes the residual
+the old Windows builds that carried ffmpeg n8.1.2, so only the Linux 8.1.3
+(ours) and Windows n8.1.3 source releases remain owed, plus 7.0.2 for Linux
+copies already handed out (D6; LICENSING.md notes the residual
 question for copies already handed out).
 
 Unsafe meaning: delete and recreate the repository. It drops GitHub's

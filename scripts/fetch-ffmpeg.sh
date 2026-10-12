@@ -2,8 +2,15 @@
 # Fetch the video encoder Tangent BUNDLES, so the artifact works on a machine
 # with nothing installed.
 #
-#   scripts/fetch-ffmpeg.sh linux     -> dist/vendor/linux/tangent-ffmpeg
-#   scripts/fetch-ffmpeg.sh windows   -> dist/vendor/windows/tangent-ffmpeg.exe
+#   scripts/fetch-ffmpeg.sh linux        -> dist/vendor/linux/tangent-ffmpeg
+#   scripts/fetch-ffmpeg.sh linux-arm64  -> dist/vendor/linux-arm64/tangent-ffmpeg
+#   scripts/fetch-ffmpeg.sh windows      -> dist/vendor/windows/tangent-ffmpeg.exe
+#
+# Linux is not fetched but BUILT, by scripts/build-ffmpeg-linux.sh from
+# pinned sources (cached, so only the first run compiles, about two minutes
+# per architecture on an M-series Mac); Windows is BtbN's build, downloaded.
+# The Linux build needs zig: a Linux build box without it uses the binary
+# build-linux-remote.sh pushes into its dist/vendor/linux.
 #
 # macOS needs nothing here: its encoder is AVFoundation, in the OS.
 #
@@ -28,42 +35,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# ffmpeg 7.0.2, static, x86_64 glibc — johnvansickle.com, the long-standing
-# static-build source the ffmpeg project itself links to. When this release
-# rotates out, the same file appears under /ffmpeg/old-releases/.
+# Linux: OUR build, scripts/build-ffmpeg-linux.sh, FFmpeg 8.1.3 with libx264
+# and LAME and nothing else, both architectures, glibc 2.30 like the app.
+# It replaced johnvansickle.com's static 7.0.2 builds (every release before this change), whose
+# library sources and build scripts are published nowhere, which made the
+# complete corresponding source GPLv3 6(d) asks of us impossible to provide
+# (LICENSING.md, "The source it is owed"). Our pinned tarballs plus that
+# script are the complete source, and the script stages them as the release
+# named in LINUX_SRC below every time it builds.
 #
-# **THIS BUILD HAS NO VA-API IN IT**, and that is a known, measured cost rather
-# than an oversight: no `--enable-vaapi` in its configure line, no `h264_vaapi`
-# in the binary. Those builds are made for maximum portability and leave out
-# anything needing a runtime library. So a Linux machine with a perfectly good
-# hardware encoder encodes takes on the CPU unless the user installs a system
-# ffmpeg — 25.54 s of CPU per 10 s of 720p against VA-API's 0.70, measured.
+# **IT HAS NO VA-API IN IT**, like the build it replaced, and that is a
+# known, measured cost rather than an oversight. A Linux machine with a
+# perfectly good hardware encoder encodes takes on the CPU unless the user
+# installs a system ffmpeg: 25.54 s of CPU per 10 s of 720p against VA-API's
+# 0.70, measured with the old build (ours is a few percent faster on the CPU).
 #
 # **BtbN's linux64 build was tried instead and had to be reverted**, and the
 # reason is worth keeping because it is invisible from any static check.
 # BtbN links libva through `implib.so` trampolines rather than a plain dlopen,
-# and a trampoline whose symbol will not resolve does not degrade — it runs
+# and a trampoline whose symbol will not resolve does not degrade: it runs
 # `assert(0)` and the process ABORTS. Their build wants `vaMapBuffer2`, which
 # arrived in libva 2.22; Ubuntu 24.04 and every derivative of it ship 2.20.
 # Measured on Zorin OS 18.1: `exit=134`, SIGABRT, a zero-byte file, mid-encode.
 #
 # That is strictly worse than encoding on the CPU. A silent software fallback
-# costs processor; an aborting encoder costs the take. Anything that replaces
-# this pin has to be tested against an OLD libva on a real machine, not read.
-LINUX_FILE="ffmpeg-7.0.2-amd64-static.tar.xz"
-LINUX_URLS="https://johnvansickle.com/ffmpeg/releases/$LINUX_FILE
-https://johnvansickle.com/ffmpeg/old-releases/$LINUX_FILE"
-LINUX_SHA="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
-
-# The same release for aarch64, because until now there was NOTHING: the arm64
-# tarball shipped no encoder at all, so video silently depended on a distro
-# ffmpeg that a clean machine does not have — the exact hole the x86_64 tarball
-# fixed in 4.11 (docs/LINUX-4.11-FINDINGS.md, finding 2), still open on the
-# other architecture. Same source, same licence, same caveats as above.
-ARM64_FILE="ffmpeg-7.0.2-arm64-static.tar.xz"
-ARM64_URLS="https://johnvansickle.com/ffmpeg/releases/$ARM64_FILE
-https://johnvansickle.com/ffmpeg/old-releases/$ARM64_FILE"
-ARM64_SHA="f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1"
+# costs processor; an aborting encoder costs the take. Anything that adds
+# VA-API here has to be tested against an OLD libva on a real machine, not
+# read.
 
 # ffmpeg 8.1.3, win64, BtbN's autobuilds — a dated tag, never the rolling
 # `latest` release, whose assets are rebuilt in place. The clean n8.1.3 tag
@@ -101,6 +99,10 @@ sha_ok() { # sha_ok <file> <sha256>
         got="$(shasum -a 256 "$1" | awk '{print $1}')"
     fi
     [ "$got" = "$2" ]
+}
+sha_of() { # sha_of <file>
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+    else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
 # **The durable cache: `vendor/ffmpeg/`, beside the ASIO SDK.** `dist` is
@@ -179,15 +181,30 @@ keep() {
 # publish-third-party-src.sh creates it; LICENSING.md, "Where the source
 # is"). A new pin changes it in the same edit as the URL and the hash.
 SRC_BASE="https://github.com/ganten1998/tangent/releases/tag"
-LINUX_SRC="third-party-src-ffmpeg-7.0.2"
+# The release build-ffmpeg-linux.sh stages ($RELEASE there); the two change
+# together.
+LINUX_SRC="third-party-src-ffmpeg-8.1.3-tangent-linux"
 WIN_SRC="third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22"
 provenance() {
     local how="This ffmpeg build is bundled unmodified."
+    local from="The archive it came from, so the build can be identified after the link is
+gone (dated builds are pruned upstream):
+
+  $2
+  sha256 of the downloaded archive: $3"
     if [ "$PLATFORM" = windows ]; then
         how="This is BtbN's ffmpeg build, unmodified but for one thing: in a signed
 Tangent build (every Windows release is one) it carries Tangent's Authenticode
 signature, which appends a certificate table and updates the PE checksum and
 certificate-table entry. The program code is BtbN's, byte for byte."
+    else
+        how="This is FFmpeg 8.1.3's ffmpeg program, built for Tangent by Tangent's own
+script (scripts/build-ffmpeg-linux.sh) from pinned sources: FFmpeg, with
+x264 and LAME linked in, and nothing else."
+        from="That release holds every source file this program was built from and the
+script that built it, so it can be rebuilt from there alone.
+
+  sha256 of this program: $3"
     fi
     cat > "$1/SOURCE.txt" <<EOF
 $how
@@ -197,40 +214,18 @@ text beside this file). The source for this build is published at
 
   $SRC_BASE/$4
 
-The archive it came from, so the build can be identified after the link is
-gone (dated builds are pruned upstream):
-
-  $2
-  sha256 of the downloaded archive: $3
+$from
 EOF
 }
 
 case "$PLATFORM" in
-linux)
-    # Word-splitting the URL list is deliberate; the URLs contain no spaces.
-    # shellcheck disable=SC2086
-    fetch "$LINUX_FILE" "$LINUX_SHA" $LINUX_URLS
-    OUT="dist/vendor/linux"
-    rm -rf "$OUT"; mkdir -p "$OUT/ffmpeg-licenses"
-    tar -xJf "dist/vendor/$LINUX_FILE" -C "$OUT" --strip-components=1 \
-        "${LINUX_FILE%.tar.xz}/ffmpeg" "${LINUX_FILE%.tar.xz}/GPLv3.txt"
-    mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
-    chmod 755 "$OUT/tangent-ffmpeg"
-    mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
-    provenance "$OUT/ffmpeg-licenses" "${LINUX_URLS%%$'\n'*}" "$LINUX_SHA" "$LINUX_SRC"
-    echo "==> $OUT/tangent-ffmpeg"
-    ;;
-linux-arm64)
-    # shellcheck disable=SC2086
-    fetch "$ARM64_FILE" "$ARM64_SHA" $ARM64_URLS
-    OUT="dist/vendor/linux-arm64"
-    rm -rf "$OUT"; mkdir -p "$OUT/ffmpeg-licenses"
-    tar -xJf "dist/vendor/$ARM64_FILE" -C "$OUT" --strip-components=1 \
-        "${ARM64_FILE%.tar.xz}/ffmpeg" "${ARM64_FILE%.tar.xz}/GPLv3.txt"
-    mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
-    chmod 755 "$OUT/tangent-ffmpeg"
-    mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
-    provenance "$OUT/ffmpeg-licenses" "${ARM64_URLS%%$'\n'*}" "$ARM64_SHA" "$LINUX_SRC"
+linux|linux-arm64)
+    # Built, not fetched; a cached build made by the current script is reused.
+    OUT="dist/vendor/$PLATFORM"
+    arch=x86_64; [ "$PLATFORM" = linux-arm64 ] && arch=aarch64
+    rm -rf "$OUT"
+    scripts/build-ffmpeg-linux.sh "$arch" "$OUT"
+    provenance "$OUT/ffmpeg-licenses" "" "$(sha_of "$OUT/tangent-ffmpeg")" "$LINUX_SRC"
     echo "==> $OUT/tangent-ffmpeg"
     ;;
 windows)

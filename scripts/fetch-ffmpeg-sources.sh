@@ -2,9 +2,16 @@
 # Stage the SOURCE for the GPL ffmpeg builds Tangent bundles, one folder per
 # GitHub source release (LICENSING.md, "The source it is owed").
 #
-#   scripts/fetch-ffmpeg-sources.sh jvs-7.0.2     Linux pin (johnvansickle 7.0.2)
+#   scripts/fetch-ffmpeg-sources.sh tangent-linux Linux (our own build, 8.1.3)
 #   scripts/fetch-ffmpeg-sources.sh btbn-n8.1.3   Windows pin (BtbN n8.1.3)
-#   scripts/fetch-ffmpeg-sources.sh all
+#   scripts/fetch-ffmpeg-sources.sh all           both of the above
+#   scripts/fetch-ffmpeg-sources.sh jvs-7.0.2     the RETIRED Linux pin
+#                                                 (johnvansickle 7.0.2), whose
+#                                                 source can never be complete
+#
+# The Linux source is staged by scripts/build-ffmpeg-linux.sh itself (every
+# build stages what it built from, so the two cannot drift); `tangent-linux`
+# here only asks it to.
 #
 # Output: $THIRD_PARTY_SRC/<release-name>/ (default
 # ~/Library/Caches/tangent-dist/third-party-src), each with a SOURCE.txt that
@@ -30,7 +37,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_ROOT="${THIRD_PARTY_SRC:-$HOME/Library/Caches/tangent-dist/third-party-src}"
 JOBS="${JOBS:-6}"
 
-# Linux pin: fetch-ffmpeg.sh LINUX_FILE / ARM64_FILE.
+# The retired Linux pin (johnvansickle.com 7.0.2), bundled before Tangent
+# built its own; kept so its partial source can still be staged.
 JVS_RELEASE="third-party-src-ffmpeg-7.0.2"
 JVS_FFMPEG="ffmpeg-7.0.2.tar.xz"
 
@@ -269,8 +277,9 @@ manifest() {
 }
 
 case "${1:-}" in
+    tangent-linux) THIRD_PARTY_SRC="$OUT_ROOT" "$ROOT/scripts/build-ffmpeg-linux.sh" source ;;
     jvs-7.0.2) jvs ;;
     btbn-n8.1.3) btbn ;;
-    all) jvs; btbn ;;
-    *) echo "usage: scripts/fetch-ffmpeg-sources.sh <jvs-7.0.2|btbn-n8.1.3|all>" >&2; exit 2 ;;
+    all) THIRD_PARTY_SRC="$OUT_ROOT" "$ROOT/scripts/build-ffmpeg-linux.sh" source; btbn ;;
+    *) echo "usage: scripts/fetch-ffmpeg-sources.sh <tangent-linux|btbn-n8.1.3|all|jvs-7.0.2>" >&2; exit 2 ;;
 esac
