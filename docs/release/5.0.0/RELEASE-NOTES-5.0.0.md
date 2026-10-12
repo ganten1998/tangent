@@ -185,9 +185,9 @@ recordings were never in it and are not touched.
   you cannot find that email, reply to your Gumroad receipt and it will be
   sent again.
 - To keep chord names you taught 4.x, copy the `ivory` folder somewhere
-  safe **before you start 5.0 for the first time**. After 5.0 has started
-  once, quit it and copy `license.key` and `overrides.json` from your copy
-  into `~/.config/tangent/`.
+  safe **before you start 5.0 for the first time**; the file that holds
+  them is `overrides.json`. Bringing it back into 5.0 has not been tested
+  on every 4.x version, so keep the copy until you have checked.
 
 **Files saved by 5.0 do not open in older versions.** The first time 5.0
 saves over a settings file, a project or a template written by an earlier
