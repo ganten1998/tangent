@@ -79,6 +79,22 @@ fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
     }
 }
 
+/// What a diagram calls pitch class `pc`.
+///
+/// **A sounding note is named by the chord it is in.** When the detector has
+/// named the chord, every one of its notes has one right spelling (the third
+/// of D is F sharp, never G flat), and that is what `input.spelling` holds.
+/// The user's sharps-or-flats preference decides the rest: the notes that are
+/// not sounding, and everything when no chord is named.
+pub fn note_label(pc: u8, input: &Input, prefer_flats: bool) -> String {
+    if has(input.pcs, pc) {
+        if let Some(name) = input.spelling.and_then(|sp| sp.name(pc)) {
+            return name;
+        }
+    }
+    pc_name(pc, prefer_flats).to_owned()
+}
+
 /// The real accidental characters. JetBrains Mono carries both and sits at the
 /// bottom of every font chain, so they always render.
 const FLAT: char = '\u{266D}';
@@ -102,14 +118,12 @@ const SHARP: char = '\u{266F}';
 fn draw_note(
     painter: &Painter,
     center: Pos2,
-    pc: u8,
-    prefer_flats: bool,
+    name: &str,
     size: f32,
     color: Color32,
     lower: bool,
     suffix: &str,
 ) {
-    let name = pc_name(pc, prefer_flats);
     let letter = if lower {
         name[..1].to_lowercase()
     } else {
@@ -392,6 +406,9 @@ pub struct Input {
     /// Root and quality from the detected chord label, when there is one.
     pub root: Option<u8>,
     pub minor: bool,
+    /// How the detected chord spells its notes, when a chord is named and
+    /// its root is among the sounding notes. See [`note_label`].
+    pub spelling: Option<tangent_core::ChordSpelling>,
 }
 
 impl Input {
@@ -850,8 +867,7 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         draw_note(
             painter,
             at,
-            pc,
-            s.prefer_flats,
+            &note_label(pc, &input, s.prefer_flats),
             name_size,
             if sounding { p.lit_text } else { p.ink },
             false,
@@ -870,8 +886,7 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         draw_note(
             painter,
             c + dir * ((r_min + r_hub) * 0.5),
-            rel,
-            s.prefer_flats,
+            pc_name(rel, s.prefer_flats),
             r * 0.115,
             p.ink.gamma_multiply(0.8),
             true,
@@ -904,8 +919,7 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
         draw_note(
             painter,
             Pos2::new(c.x, c.y - r_hub * 0.28),
-            tonic,
-            s.prefer_flats,
+            &note_label(tonic, &input, s.prefer_flats),
             r * 0.19,
             p.ink,
             false,
@@ -1201,8 +1215,7 @@ fn draw_tonnetz(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Se
             draw_note(
                 painter,
                 c,
-                pc,
-                s.prefer_flats,
+                &note_label(pc, &input, s.prefer_flats),
                 node_r * 0.95,
                 if lit { p.lit_text } else { p.ink },
                 false,
@@ -1346,8 +1359,7 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
         draw_note(
             painter,
             Pos2::new(pos.x, pos.y - node_r * 0.22),
-            root,
-            flats,
+            pc_name(root, flats),
             node_r * 0.62,
             if lit { p.lit_text } else { p.ink },
             false,
@@ -1377,8 +1389,7 @@ fn draw_triangles(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &
     draw_note(
         painter,
         c,
-        tonic,
-        flats,
+        pc_name(tonic, flats),
         r * 0.24,
         p.ink.gamma_multiply(0.55),
         false,
@@ -1864,6 +1875,7 @@ mod tests {
                             bass: Some(note % 12),
                             root: None,
                             minor: false,
+                            spelling: None,
                         },
                         &notes,
                         None,
@@ -2122,6 +2134,7 @@ mod tests {
                 bass: Some(0),
                 root: Some(0),
                 minor: false,
+                spelling: None,
             };
             // THE REAL PANES, all three combinations, because a cell in the
             // middle of three is not the same rectangle as a band of one and
@@ -2395,6 +2408,7 @@ mod tests {
                         bass: (pcs != 0).then_some(0),
                         root: (pcs != 0).then_some(0),
                         minor: false,
+                        spelling: None,
                     };
                     let _ = ctx.run(Default::default(), |ctx| {
                         let painter = ctx.layer_painter(egui::LayerId::background());
@@ -2499,12 +2513,40 @@ mod tests {
 
     /// C major sounding, so the diagrams have something to light and the
     /// triangles have a tonic to orient themselves around.
+    /// **The diagrams name a sounding note by the chord it is in.** The
+    /// tonnetz and the circle used to print G flat for the third of D7 with
+    /// flats preferred, beside a readout that names a D chord.
+    #[test]
+    fn a_named_chord_names_its_sounding_notes_on_the_diagrams() {
+        let pcs = [2u8, 6, 0, 3, 8, 11].iter().fold(0u16, |m, pc| m | 1 << pc);
+        let input = Input {
+            pcs,
+            bass: Some(2),
+            root: Some(2),
+            minor: false,
+            spelling: tangent_core::ChordSpelling::from_label("D7(b9,#11)"),
+        };
+        for prefer_flats in [true, false] {
+            let named: Vec<String> =
+                [2u8, 6, 0, 3, 8, 11].iter().map(|&pc| note_label(pc, &input, prefer_flats)).collect();
+            assert_eq!(named, ["D", "F#", "C", "Eb", "G#", "B"], "prefer_flats={prefer_flats}");
+        }
+        // A note that is NOT sounding is the preference's to name.
+        assert_eq!(note_label(1, &input, true), "Db");
+        assert_eq!(note_label(1, &input, false), "C#");
+        // And with no chord named, the preference names everything.
+        let bare = Input { spelling: None, ..input };
+        assert_eq!(note_label(6, &bare, true), "Gb");
+        assert_eq!(note_label(6, &bare, false), "F#");
+    }
+
     fn c_major() -> Input {
         Input {
             pcs: major_triad(0),
             bass: Some(0),
             root: Some(0),
             minor: false,
+            spelling: None,
         }
     }
 
