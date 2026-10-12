@@ -112,10 +112,12 @@ and updates the PE checksum and certificate-table entry; the program code is
 still BtbN's build byte for byte. ffmpeg is a trademark of Fabrice Bellard;
 these builds are GPL-licensed and their full licence text plus a provenance
 note (exact upstream URL and checksum) ship beside the binary in the
-ffmpeg-licenses/ folder of those artifacts. Source code for ffmpeg is
-available from https://ffmpeg.org/. Because it runs as a separate program,
-its GPL terms apply to that binary and do not extend to Tangent itself
-(LICENSING.md sets out why).
+ffmpeg-licenses/ folder of those artifacts. The source for those builds is
+published as releases of the Tangent repository:
+  Windows: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22
+  Linux:   https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2
+Because it runs as a separate program, its GPL terms apply to that binary
+and do not extend to Tangent itself (LICENSING.md sets out why).
 The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.
 
 LAME (macOS and FreeBSD artifacts)

@@ -1,0 +1,78 @@
+Source for the ffmpeg build in Tangent's Windows download
+=========================================================
+
+Tangent's Windows download (the setup.exe and the portable zip) carries
+tangent-ffmpeg.exe, which is ffmpeg.exe from BtbN's build
+
+  ffmpeg-n8.1.3-win64-gpl-8.1.zip
+  sha256 ed885833e406f0f7a1ea0304dd170779117799b2fba8096abc3e2e4dd679cc20
+  from https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-09-22-13-18
+
+renamed and, in signed Tangent builds, carrying Tangent's Authenticode
+signature (appended; the program code is BtbN's, byte for byte). It is
+licensed under the GNU GPL version 3 (the build is configured with
+--enable-gpl --enable-version3). This release holds the source it was built
+from, so it stays available after BtbN prunes that dated release (the tag
+was already gone on 2026-10-12).
+
+Every file here, and where it came from. SHA256SUMS.txt lists each archive's
+sha256 and the exact commit or revision it was taken at.
+
+  ffmpeg-8.1.3.tar.xz, ffmpeg-8.1.3.tar.xz.asc
+      FFmpeg 8.1.3, the release tarball from https://ffmpeg.org/releases/,
+      with its detached signature. Verified: good signature from the FFmpeg
+      release signing key FCF986EA15E6E293A5644F10B4322F04D67658D8.
+
+  ffmpeg-n8.1.3-git.tar.xz
+      The same release as a git tree: https://git.ffmpeg.org/ffmpeg.git at
+      tag n8.1.3 (commit 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7), which is
+      what BtbN's build checks out (release/8.1 at n8.1.3, hence the build's
+      name "n8.1.3" with no commits after the tag).
+
+  FFmpeg-Builds-3e6685eda92f9288c15ac320139622dcedca09a4.tar.xz
+      BtbN's build scripts (https://github.com/BtbN/FFmpeg-Builds) at commit
+      3e6685eda92f9288c15ac320139622dcedca09a4: the scripts used to control
+      compilation and installation, the per-library configure options
+      (scripts.d/), the patches applied, and the Docker images' recipes
+      (images/). The build is `./build.sh win64 gpl 8.1`. That commit is the
+      one the tag autobuild-2026-09-22-13-18 pointed to: the head_sha of
+      BtbN's scheduled "Build FFmpeg" workflow run 35726071479, whose
+      "Publish release" job ran 13:16:45 to 13:38:16 UTC on 2026-09-22.
+
+  deps/*.tar.xz, deps/*.tar.gz
+      The source of every library those scripts build, one archive per pin,
+      named <stage>-<commit or tag>. Each is the repository the stage's
+      SCRIPT_REPO names at its SCRIPT_COMMIT (or SCRIPT_REV, for the two
+      Subversion repositories, LAME and Xvid), with submodules where BtbN's
+      download step fetches them. deps/PINS.tsv lists every pin. All 125
+      stages with a source pin are here, including ones this Windows build
+      does not link (the X11, PulseAudio and fdk-aac stages), because more
+      source than needed harms nobody and less does.
+      Also here, because BtbN's download step fetches them beyond a plain
+      checkout:
+        47-vulkan_50-shaderc-dep-*     the repositories shaderc's DEPS pins
+                                       (utils/git-sync-deps)
+        50-libopus-opus_data-*.tar.gz  Opus's DNN model data, fetched by
+                                       autogen.sh by its sha256 (verified)
+        50-librsvg_10-glib-subproject-proxy-libintl-0.5.tar.gz
+                                       glib's proxy-libintl subproject, by
+                                       its .wrap sha256 (verified)
+        50-librsvg_99-librsvg-*-cargo-vendor.tar.xz
+        50-rav1e-*-cargo-vendor.tar.xz every Rust crate librsvg's and rav1e's
+                                       Cargo.lock pins (cargo vendor --locked)
+
+What is not here, and why:
+
+  - The compilers and build tools (GCC, binutils, NASM, meson, Rust's
+    toolchain and so on) that BtbN's Docker images install. The GPL's
+    "Corresponding Source" excludes general-purpose tools used to build a
+    work. Their runtime pieces linked into the program are libgcc,
+    libstdc++ and libatomic (under the GCC Runtime Library Exception, which
+    places no source obligation on the program) and the Rust standard
+    library (MIT or Apache-2.0); mingw-w64's runtime, including winpthreads,
+    is in deps/ as 10-mingw.
+  - Generated files a build step creates from these sources (for example
+    the configure scripts LAME's `autoreconf -i` writes).
+
+Tangent itself is MIT licensed and does not link ffmpeg; it starts it as a
+separate program. Tangent's own source: https://github.com/ganten1998/tangent

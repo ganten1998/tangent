@@ -149,45 +149,69 @@ binaries are offered. Pointing at ffmpeg.org, at BtbN's release page (which
 hosts no source archives), or at johnvansickle.com (a rotating hobbyist
 server) does not meet that.
 
-**The hosting plan**, one mirror per binary pin, as assets on dedicated
-GitHub releases in the same repo the binaries are served from:
+**Where the source is.** One GitHub release per binary pin, in the same
+repository the binaries are served from, created by
+`scripts/publish-third-party-src.sh` from the folders
+`scripts/fetch-ffmpeg-sources.sh` stages (default
+`~/Library/Caches/tangent-dist/third-party-src/<release>/`, each with a
+`SOURCE.txt` saying what every file is and where it came from, and a
+`SHA256SUMS.txt`). Each is a pre-release with `--latest=false`, so it can
+never become the Latest release the download links resolve against.
 
-* Tag `third-party-src-ffmpeg-7.0.2`: the archives from
-  johnvansickle.com/ffmpeg/release-source/ for the 7.0.2 static build (the
-  builder's GPL source drop for that build, bundled libraries included) plus
-  his build readme. Fetch and hash these promptly; that server rotates old
-  builds out.
-* Tag `third-party-src-ffmpeg-n8.1.2-btbn-2026-08-17`, for the Windows
-  builds already out (every build from e5ae43b up to d6547f6: 4.4.1 through
-  5.0.0-beta.13 and the tester builds of that span): the FFmpeg source
-  archive at commit `7c533d0f86`, a git archive of `BtbN/FFmpeg-Builds` at
-  the COMMIT the tag `autobuild-2026-08-17-13-05` pointed to (the tag itself
-  is gone upstream), and the source tarball of every bundled library that
-  commit's `scripts.d/` files pin. "Reconstructible from someone else's repo"
-  is not hosting; the tarballs themselves go in the release.
-* Tag `third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`, for the current pin:
-  the FFmpeg source at the release tag `n8.1.3`, a git archive of
-  `BtbN/FFmpeg-Builds` at `autobuild-2026-09-22-13-18` (archive it now,
-  before it is pruned too), and the pinned library tarballs.
+* `third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`, for the Windows pin.
+  Staged and complete as far as the build's own scripts define it: the
+  FFmpeg 8.1.3 release tarball (signature verified) and the git tree at
+  `n8.1.3`; `BtbN/FFmpeg-Builds` at commit `3e6685eda92f`, the commit the
+  pruned tag `autobuild-2026-09-22-13-18` pointed to (identified from
+  BtbN's workflow run 35726071479, whose release job ran 13:16 to 13:38 UTC
+  that day); and the source of all 125 library pins in that commit's
+  `scripts.d/`, plus what their download steps fetch beyond a checkout
+  (shaderc's DEPS repositories, Opus's model data, glib's proxy-libintl,
+  and the vendored crates of librsvg and rav1e). About 1.1 GB, 148 files.
+  Not included, and not owed: the compilers and build tools in BtbN's
+  Docker images (GPLv3 section 1 excludes general-purpose tools); the
+  runtime pieces they link (libgcc, libstdc++, libatomic) are under the GCC
+  Runtime Library Exception.
+* `third-party-src-ffmpeg-7.0.2`, for the Linux pins (x86_64 and aarch64).
+  **Incomplete.** It holds the FFmpeg 7.0.2 release tarball (signature
+  verified) and the builder's readme, which names every library version
+  the build links. It does not hold those libraries' source or the
+  builder's build scripts and configure options, which GPLv3 counts as part
+  of the complete corresponding source: johnvansickle.com publishes none
+  for this build (its `release-source/` folder holds FFmpeg 4.1 from 2018),
+  so there is nothing to mirror. A written offer (GPLv3 section 6(b)) does
+  not help either, because it promises source we do not have. The ways to
+  close it, an owner decision: ask the builder for the exact source of the
+  7.0.2 builds (he owes it to us as recipients); or replace the Linux pin
+  with a build whose source we can publish whole, either BtbN's linux64 and
+  linuxarm64 builds at the same `3e6685eda92f` commit (the Windows source
+  release then covers them too, but see `fetch-ffmpeg.sh` for why BtbN's
+  linux64 build was reverted: it aborts on libva older than 2.22) or an
+  ffmpeg built by our own script with only what Tangent uses (libx264 and
+  LAME), whose script then is the source release.
+* The Windows builds made from e5ae43b up to d6547f6 (4.4.1 through
+  5.0.0-beta.13) bundled n8.1.2-44-g7c533d0f86 from
+  `autobuild-2026-08-17-13-05`. No source release is staged for it: the
+  plan is to stop offering those binaries by deleting the old GitHub
+  releases once 5.0.0 is Latest (docs/release/next/CHECKLIST.md, section
+  J). The source is owed for as long as anyone was given those binaries
+  under 6(d), so if that is judged to reach past the deletion, the same
+  fetcher can stage it from BtbN's commit for that day.
 * Never delete these source releases while the binaries are offered: the
-  `releases/latest/download` links in old supporter emails keep old binaries
+  `releases/latest/download` links in old supporter emails keep binaries
   on offer indefinitely, so availability is indefinite too.
 
-Follow-up work that lives in scripts, tracked as W31 in the 5.1 worklist and
-not yet done: a `scripts/fetch-ffmpeg-sources.sh` mirroring
-`fetch-ffmpeg.sh`'s pin-by-sha256 style, so bumping the binary pin forces
-bumping the source mirror in the same edit; `provenance()` in
-`fetch-ffmpeg.sh` rewriting SOURCE.txt to name the hosted URL as the
-licence-satisfying one (the upstream URL stays as provenance); the
-THIRD-PARTY-LICENSES ffmpeg section naming the hosted URL; and the hosted
-URLs joining the `check-store-links.sh` sweep so a deleted source release
-fails the same gate that guards download links.
+`scripts/check-store-links.sh` sweeps the source releases' links in
+README.md and the post-purchase page with the download links, so a deleted
+or never-created source release fails the same gate, and each artifact's
+`ffmpeg-licenses/SOURCE.txt` (`provenance()` in `fetch-ffmpeg.sh`) names
+the hosted release for its pin, the "clear directions next to the object
+code" GPLv3 section 6(d) asks for.
 
-**The uploads themselves are an owner action**: they need release
-credentials, and a standing decision that GitHub remains the hosting venue.
-Until all three tags exist with their assets, distribution of the Linux and
-Windows artifacts is out of compliance on this point, and no documentation
-edit changes that.
+**The uploads are an owner action**: they need release credentials and the
+repository public (the script refuses a private one). Until both releases
+exist with their assets, and the Linux one is complete, distribution of the
+Linux and Windows artifacts is out of compliance on this point.
 
 ## Trademarks, which are separate from all of the above
 
