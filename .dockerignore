@@ -18,3 +18,7 @@ tools/tangent-keygen
 # Third-party SDKs and caches (the ASIO SDK may not be redistributed; the
 # ffmpeg archives are 250 MB). Nothing in the fulfil image reads them.
 vendor
+
+# Agent worktrees (550 MB on 2026-10-12) and local build output.
+.claude
+build
