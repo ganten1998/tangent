@@ -497,6 +497,46 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
     }
 }
 
+/// A translucent colour as it actually lands on `ground`.
+///
+/// egui's colours are premultiplied, so this is `c + ground * (1 - a)`.
+/// Needed because the wood's own marks are written translucent
+/// (`gamma_multiply`), and a contrast measured on the colour alone is a
+/// contrast against nothing.
+fn over(c: Color32, ground: Color32) -> Color32 {
+    let k = 1.0 - f32::from(c.a()) / 255.0;
+    let f = |x: u8, y: u8| (f32::from(x) + f32::from(y) * k).round().min(255.0) as u8;
+    Color32::from_rgb(f(c.r(), ground.r()), f(c.g(), ground.g()), f(c.b(), ground.b()))
+}
+
+/// **The ink a word on the neck is written in: what was asked for, held to
+/// 4.5:1 on the ground it is painted on.**
+///
+/// Every word here took its colour from a ROLE: the root from the chord
+/// colour, the other intervals from `interval_text`, the open-string letter
+/// and the octave arrow from the lit dot, the damped-string crosses and the
+/// caption from the wood. But a theme paints the board, and a role chosen
+/// next to one ground lands on another: Centennial's chord colour is a
+/// near-black chosen for its pale band, and its board is `#3a3a40`, so the
+/// root was 1.3:1. Same rule as `chord_strip::label_ink`: kept when it
+/// reads, otherwise walked off the ground (`distinct_surface_at`), and if a
+/// mid-tone ground stops that walk short, the ground's own ink.
+fn ink_on(asked: Color32, ground: Color32) -> Color32 {
+    use crate::recorder_panel::{contrast_ratio, distinct_surface_at, INK_DARK, INK_LIGHT};
+    let asked = over(asked, ground);
+    let out = distinct_surface_at(asked, ground, 4.5);
+    if contrast_ratio(out, ground) >= 4.5 {
+        return out;
+    }
+    for ink in [INK_LIGHT, INK_DARK, Color32::WHITE, Color32::BLACK] {
+        if contrast_ratio(ink, ground) >= 4.5 {
+            return ink;
+        }
+    }
+    // Unreachable: one of black and white clears 4.58:1 on any ground.
+    Color32::WHITE
+}
+
 /// A pitch class as a letter, in the user's own preference.
 fn pc_name(pc: u8, prefer_flats: bool) -> &'static str {
     let i = usize::from(pc % 12);
@@ -587,7 +627,7 @@ pub fn draw(
     let Some(g) = Geom::new(rect, spec) else {
         // A tuning with no strings. There is no board to draw; say so rather
         // than leaving a blank rectangle that reads as a crash.
-        draw_caption(painter, rect, "no strings", &p, s);
+        draw_caption(painter, rect, "no strings", &p, None);
         return;
     };
 
@@ -744,7 +784,9 @@ pub fn draw(
                 Align2::CENTER_CENTER,
                 arrow,
                 FontId::new(fonts::px((r * 1.5).max(7.0)), fonts::courier_bold()),
-                p.dot,
+                // Inside a HOLLOW ring, so on the board, where the lit dot is
+                // only held to 3:1 (it is a mark) and the arrow is a glyph.
+                ink_on(p.dot, p.board),
             );
         } else if pos.fret == g.capo {
             // **Open (or capo'd): a ring behind the nut, and it has to read as
@@ -772,7 +814,8 @@ pub fn draw(
                         Align2::CENTER_CENTER,
                         pc_name(n.pitch % 12, s.prefer_flats),
                         FontId::new(size, fonts::courier_bold()),
-                        p.dot,
+                        // The ring is hollow: the letter sits on the board.
+                        ink_on(p.dot, p.board),
                     );
                 }
             }
@@ -800,7 +843,7 @@ pub fn draw(
                         Align2::CENTER_CENTER,
                         pc_name(n.pitch % 12, s.prefer_flats),
                         FontId::new(size, fonts::courier_bold()),
-                        p.dot_text,
+                        ink_on(p.dot_text, p.dot),
                     );
                 }
             }
@@ -820,9 +863,15 @@ pub fn draw(
             break;
         }
         // On the board now, so these follow the wood rather than the band.
+        //
+        // **Quieter by blending, not by alpha**, and held to 4.5:1 either
+        // way: the unused cross was `gamma_multiply(0.5)` of an ink that was
+        // itself translucent, which composited into a theme's board as
+        // nearly nothing.
+        let damp = ink_on(p.on_board, p.board);
         let colour = match state {
-            StringState::Skipped => p.on_board,
-            StringState::Unused => p.on_board.gamma_multiply(0.5),
+            StringState::Skipped => damp,
+            StringState::Unused => crate::arrangement_panel::quiet(damp, p.board, 0.5),
             StringState::Sounding { .. } => continue,
         };
         painter.text(
@@ -845,7 +894,7 @@ pub fn draw(
     }
 
     if let Some(c) = caption {
-        draw_caption(painter, rect, &c, &p, s);
+        draw_caption(painter, rect, &c, &p, Some(board));
     }
 }
 
@@ -929,15 +978,21 @@ fn gutter_x(rect: Rect, g: &Geom) -> f32 {
 /// Over the board, bottom right, past the last inlay. Small and dim: it is
 /// there to be read when something is missing, not to be noticed otherwise,
 /// and above all it must not move the neck to say so.
-fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, _s: &Settings) {
+///
+/// `board` is where the fingerboard was drawn, if it was: the caption's ink is
+/// measured on whichever of the board and the band it actually lands on.
+fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, board: Option<Rect>) {
     let size = fonts::px((rect.height() * 0.115).max(8.0));
-    painter.text(
-        Pos2::new(rect.right() - 6.0, rect.bottom() - 3.0),
-        Align2::RIGHT_BOTTOM,
-        text,
-        FontId::new(size, fonts::courier()),
-        p.on_board,
-    );
+    let at = Pos2::new(rect.right() - 6.0, rect.bottom() - 3.0);
+    let font = FontId::new(size, fonts::courier());
+    let laid = painter.layout_no_wrap(text.to_owned(), font.clone(), p.on_board);
+    let middle = Pos2::new(at.x - laid.size().x * 0.5, at.y - laid.size().y * 0.5);
+    let ground = if board.is_some_and(|b| b.contains(middle)) {
+        p.board
+    } else {
+        p.bg
+    };
+    painter.text(at, Align2::RIGHT_BOTTOM, text, font, ink_on(p.on_board, ground));
 }
 
 /// One-pixel top edge so the fretboard reads as its own band rather than as
@@ -1128,11 +1183,18 @@ fn draw_intervals(
             font.clone(),
             // The root in the app's own chord colour, so the thing everything
             // else is measured FROM is the thing the eye lands on first.
-            if name == "R" {
-                s.chord_text_color.to_color32()
-            } else {
-                p.interval
-            },
+            //
+            // Both held to the column's ground, which is the BOARD: the
+            // chord colour is chosen for the chord strip and the interval
+            // colour for the theory page, and neither is the neck.
+            ink_on(
+                if name == "R" {
+                    s.chord_text_color.to_color32()
+                } else {
+                    p.interval
+                },
+                p.board,
+            ),
         );
     }
 }
@@ -1779,6 +1841,117 @@ mod tests {
         )
         .unwrap();
         assert!(g.y(0).is_finite() && g.spacing.is_finite());
+    }
+
+    /// The ground a point was painted on: the last OPAQUE filled rect or
+    /// circle before shape `upto` that contains it.
+    fn ground_at(shapes: &[egui::epaint::ClippedShape], upto: usize, pt: Pos2) -> Option<Color32> {
+        let mut g = None;
+        for c in &shapes[..upto] {
+            match &c.shape {
+                egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.contains(pt) => g = Some(r.fill),
+                egui::Shape::Circle(c)
+                    if c.fill.a() == 255 && c.center.distance(pt) <= c.radius =>
+                {
+                    g = Some(c.fill);
+                }
+                _ => {}
+            }
+        }
+        g
+    }
+
+    /// **Every word the neck writes reads on what it is written on**, for
+    /// every factory theme, both modes, every wood: the interval column (the
+    /// root in the chord colour, the rest in `interval_text`), the letters in
+    /// and in the open rings, the octave arrows, the damped and unused
+    /// crosses, and the caption. Measured from what `draw` PAINTS, ground and
+    /// ink both, at 4.5:1.
+    ///
+    /// Centennial wrote its root `R` in `#1f1f23` on its `#3a3a40` board.
+    #[test]
+    fn every_theme_writes_the_neck_in_ink_its_ground_can_carry() {
+        use crate::recorder_panel::contrast_ratio;
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let spec = |capo| FretboardSpec { tuning: TUNINGS[0].clone(), frets: 22, capo };
+        // Open strings, a chord with damped and unused strings, notes out of
+        // range (ghosts and arrows), and a board that can make nothing
+        // (the caption).
+        let cases: &[(&[u8], u8)] = &[
+            (&[40, 47, 52, 56, 59, 64], 0),
+            (&[48, 52, 55, 60], 0),
+            (&[50, 57, 62, 66], 0),
+            (&[28, 30, 84, 90, 96], 0),
+            (&[60, 64, 67], 5),
+            (&[0, 1, 127], 0),
+        ];
+        let mut failures = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for t in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut s = Settings::default();
+                t.apply(&mut s);
+                s.theme_name = t.name.clone();
+                s.dark_mode = dark;
+                s.show_fret_note_names = true;
+                for wood in Wood::ALL {
+                    for (held, capo) in cases {
+                        let sp = spec(*capo);
+                        let v = solve_cold(&sp, held);
+                        let tonic = held.iter().copied().min().unwrap_or(0);
+                        let out = ctx.run(Default::default(), |ctx| {
+                            let p = ctx.layer_painter(egui::LayerId::background());
+                            draw(
+                                &p,
+                                rect(),
+                                &v,
+                                &sp,
+                                &s,
+                                wood,
+                                v.shape.barre,
+                                Some(Intervals { tonic, any: true }),
+                            );
+                        });
+                        for (i, c) in out.shapes.iter().enumerate() {
+                            let egui::Shape::Text(ts) = &c.shape else { continue };
+                            let text = ts.galley.job.text.clone();
+                            let pt = ts.visual_bounding_rect().center();
+                            let ground = ground_at(&out.shapes, i, pt)
+                                .unwrap_or_else(|| panic!("{text:?} has no ground"));
+                            let kind = match text.as_str() {
+                                "R" => "root",
+                                "\u{2191}" | "\u{2193}" => "arrow",
+                                "\u{00d7}" => "cross",
+                                x if INTERVAL_NAMES.contains(&x) => "interval",
+                                x if x.contains(' ') => "caption",
+                                _ => "letter",
+                            };
+                            seen.insert(kind);
+                            for sec in &ts.galley.job.sections {
+                                // As it lands: a translucent ink is
+                                // measured composited onto its ground.
+                                let ink = over(sec.format.color, ground);
+                                let r = contrast_ratio(ink, ground);
+                                if r < 4.5 {
+                                    failures.insert(format!(
+                                        "{} ({}, {wood:?}): {kind} {text:?} {ink:?} is {r:.2}:1 on {ground:?}",
+                                        t.name,
+                                        if dark { "dark" } else { "light" },
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for kind in ["root", "interval", "letter", "arrow", "cross", "caption"] {
+            assert!(seen.contains(kind), "no {kind} was drawn; the sweep proves nothing about it");
+        }
+        assert!(failures.is_empty(), "{} words the neck cannot carry:\n{}",
+            failures.len(), failures.iter().cloned().collect::<Vec<_>>().join("\n"));
     }
 
     #[test]

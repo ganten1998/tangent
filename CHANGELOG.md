@@ -349,6 +349,16 @@ published.
   the transpose number beside the arrows is a step brighter for the same
   reason. Colours that already read are left exactly as chosen.
 
+- **Every word on the guitar neck is readable, whatever the theme and
+  wood.** The interval names, note letters, octave arrows, damped-string
+  crosses and caption took their colours from places that were chosen for
+  other backgrounds, so on many themes they were hard to read on the neck:
+  the root "R" all but vanished on Centennial (1.5:1), and the interval
+  names were too dim on Sandstone, Celadon, Paperback, Malachite, Kiln,
+  Lapis, Woodblock, Confetti, Ditto and Default with a maple neck. The faint
+  cross on an unused string was too faint everywhere. Each word is now
+  brightened or darkened just enough to read on the neck.
+
 - **One loading splash during export, not two.** After pressing Export, the
   "Preparing export" splash showed in the Export window and a second,
   bigger copy showed behind it in the main window. The main window now
