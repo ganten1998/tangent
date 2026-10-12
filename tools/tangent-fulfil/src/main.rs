@@ -309,23 +309,28 @@ fn email_body(key: &str) -> String {
     format!(
         "Thank you for supporting Tangent.\n\n\
          Tangent is free, with up to 32 tracks. This key takes the track limit\n\
-         away. Buses, returns, sends and routes have no limit for anyone.\n\n\
+         away, on every machine you own. Buses, returns, sends and routes have\n\
+         no limit for anyone.\n\n\
          Your supporter key:\n\n\
          {key}\n\n\
-         To use it: open Tangent, right-click anywhere, choose \"Support Tangent...\",\n\
+         To use it, open Tangent, right-click anywhere, choose \"Support Tangent...\",\n\
          paste the key and press Activate. Case, spaces, dashes and line breaks\n\
          do not matter.\n\n\
-         Downloads. These links always give you the current version, so they are\n\
-         worth keeping alongside the key:\n\n\
+         Download Tangent here. These links always fetch the current version,\n\
+         so keep them with your key:\n\n\
          \x20 macOS 11 or later, Apple Silicon or Intel\n\
          \x20 {macos}\n\n\
          \x20 Windows 10 or later\n\
          \x20 {windows}\n\n\
          \x20 Linux x86_64 (the tarball has an install.sh that needs no root)\n\
          \x20 {linux}\n\n\
-         Keep this email. The key has no expiry and works on every machine you own.\n\n\
+         A new session opens with tracks ready to play. Tab moves between the\n\
+         keyboard view, the arrangement and the mixer, and holding H shows the\n\
+         shortcuts for the view you are in.\n\n\
+         Keep this email. The key never expires.\n\n\
+         If anything goes wrong, reply to this email and it reaches me.\n\n\
          Thanks again,\n\
-         Tangent\n",
+         Ganten\n",
         macos = DOWNLOAD_MACOS,
         windows = DOWNLOAD_WINDOWS,
         linux = DOWNLOAD_LINUX,
@@ -890,7 +895,7 @@ mod tests {
         let body = email_body("K").split_whitespace().collect::<Vec<_>>().join(" ");
         for fact in [
             "Tangent is free, with up to 32 tracks.",
-            "This key takes the track limit away.",
+            "This key takes the track limit away, on every machine you own.",
             "Buses, returns, sends and routes have no limit for anyone.",
         ] {
             assert!(body.contains(fact), "the email no longer says {fact:?}:\n{body}");

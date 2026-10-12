@@ -20,6 +20,10 @@ to GitHub (the links must resolve for a stranger).
 
 ## What changed on this page since 4.4
 
+- **Written from scratch for 5.0** (owner, 2026-10-12: "it's a DAW, all
+  content must be written from scratch for this release"). The page used to
+  sell a keyboard monitor that also records. It now sells a DAW, and the
+  chord naming, theory views, guitar neck and take video are features of it.
 - The 4.4 page said the key gates nothing. From 5.0 the free app holds 32
   tracks (MIDI and audio tracks and folders count) and a key takes that limit
   away. Keys already sold do the same, with nothing to do.
@@ -27,8 +31,9 @@ to GitHub (the links must resolve for a stranger).
   counted.
 - A project past 32 tracks still opens, plays, edits, exports and saves whole
   on a free install; only adding the next track asks for a key.
-- The DAW paragraph names what 5.0 added.
-- Linux is glibc 2.30+ (it said 2.32), and FreeBSD is listed.
+- No third-party product is named (no plugin, cable or streaming app), and
+  Tangent is not compared with any other program.
+- Linux is glibc 2.30+, and FreeBSD is listed.
 - The app also mentions "a certain code" beside the key. This page does not
   (owner call 9 in `docs/design/unlimited-tracks.md`).
 
@@ -44,8 +49,8 @@ README, and the app's own Supporter Key dialog.
 
 ## Subtitle / tagline
 
-Play. Tangent writes it down, explains it, and hands you the video. Free with
-32 tracks; a supporter key takes the limit away.
+A DAW for recording, arranging and mixing. Free with up to 32 tracks; a
+supporter key removes the limit.
 
 ## Price
 
@@ -55,70 +60,91 @@ $12, "pay what you want", minimum $12.
 
 ## Description
 
-> Tangent is free, with up to 32 tracks. A supporter key takes the track limit
-> away, and it is how Tangent keeps being made.
+> Tangent is a DAW, and it is free to use with up to 32 tracks. A supporter
+> key removes the track limit. It is also how Tangent keeps being made.
 
-### What Tangent is for
+### What Tangent is
 
-Plug in a MIDI keyboard and play. Tangent names the chord, engraves it on a
-staff, shows you why it works on three theory diagrams and where it sits on a
-guitar neck, all in real time. Then it records the whole thing: one press
-writes a `.wav`, a `.mid` and an `.mp4` of the window itself, with your camera
-already placed in it.
+Tangent is a digital audio workstation for macOS, Windows, Linux and
+FreeBSD. You record audio and MIDI into it, arrange clips on a timeline,
+edit notes in a piano roll, and mix on a desk with buses, returns, sends,
+folders and automation. It hosts your VST3 plugins on every platform, and
+LV2 plugins on Linux and FreeBSD.
 
-Around that is a recording DAW: a mixer, an arrangement view, a MIDI editor,
-a drum machine, automation that reaches plugins, folders that are real buses
-(each counts as a track), and VST3 plugin hosting on every platform (LV2 too
-on Linux and FreeBSD).
+It comes with its own instruments and effects, so a fresh install makes
+music before you add anything to it.
 
-### New in 5.0
+### What you can do with it
 
-- **Buses and returns**, as many as you want, with sends at their own level,
-  pre or post fader.
-- **Tangent Insert**: your outboard gear in an insert bay, with a PING that
-  measures the loop and keeps the session in time with it.
-- **Layered instruments**: several instruments on one track, all playing.
-- **Plugins follow the song**: tempo, meter, position and transport reach
-  every VST3 and LV2 plugin, so drum machines and synced delays lock in.
-- **Export what you want**: pick tracks or stems, and the whole song, the
-  loop or a custom range. Stems are named after their tracks.
-- **Send to Device**: the master on a virtual cable too, for OBS or Discord.
-- **Tangent Bitcrush**, audio quantize, track freezing, rendering on every
-  core, and thirty-two themes.
+- **Record.** Audio and MIDI, on every track you arm at once, with a
+  metronome, a count-in and software monitoring. A take can also film the
+  window itself, with your camera placed in it, and save the video beside
+  the audio and the MIDI.
+- **Arrange.** Clips loop, stretch from their edges and glue together.
+  Quantize works on audio takes as well as MIDI. The tempo lane takes ramps
+  and steps.
+- **Edit MIDI.** A piano roll with step entry, a note menu and humanize, and
+  a pad-based drum machine whose kits save as one file, samples included.
+- **Mix.** Faders, pan, inserts, sends before or after the fader, sidechain,
+  delay compensation, and automation in four modes that reaches plugin
+  parameters too. Freeze a heavy track to give its CPU back.
+- **Export.** A mixdown or stems, as WAV or MP3, for the whole song, the loop
+  or a range you type in, with only the tracks you pick.
+- **See what you play.** Tangent names the chord under your hands as you
+  play it, writes it on a staff, places it on a guitar neck, and draws it on
+  the circle of fifths. If it names a chord differently than you would, you
+  can teach it your name.
+
+### What comes in the box
+
+- **Instruments:** a modelled keyboard with eight sounds (grand pianos,
+  tine and reed electric pianos, clavs), an FM synth that reads DX7 patch
+  banks, an analog-style synth with an arpeggiator, a sampler, and a
+  sixteen-pad drum machine.
+- **Effects:** EQ, compressor, tape, stereo imager, plate reverb, echo,
+  chorus, tremolo, wah, overdrive, a tube amp with a pedalboard, a
+  convolution unit (with a wizard that captures impulse responses from your
+  own gear), a noise reducer that learns your noise floor, and a bitcrusher.
+- **Tangent Insert,** which puts outboard gear in an insert slot: it sends
+  out of your interface, takes the signal back in, and measures the round
+  trip so the session stays in time with it.
+- **Thirty-two themes,** each with its own palette of track colours.
+
+Several instruments can share one track and all play from the same MIDI.
+Plugins are told the song's tempo, meter, position and transport, so synced
+delays, arpeggiators and drum machines lock to the song.
 
 ### What is free, and what the key does
 
 **Free, for everyone:**
 
-- up to 32 tracks, folders included;
-- every feature: recording, video, the theory panels, the sheet music, the
-  guitar neck, plugins, hardware inserts, automation and export;
-- buses, returns, sends and routes, with no limit;
-- no trial, no time limit, no watermark, no account and no nag.
+- up to 32 tracks (MIDI tracks, audio tracks and folders count);
+- every feature on this page;
+- buses, returns, sends and routes, with no limit and never counted;
+- no trial, no time limit, no watermark, no account, no nag screen.
 
 **With a supporter key:**
 
 - **no track limit.** Add as many tracks as your machine can carry;
-- the supporter heart in the recorder band, in your theme's palette and
-  moving through it;
-- the mail that goes out when a release lands, written by the person who made
-  it.
+- the supporter heart in the recorder band, drawn in your theme's colours;
+- an email from me when a new release is out.
 
-**If you already bought a key**, it already does all of this. Keys have no
-expiry and cover every version, past and future.
+**If you already bought a key,** it already does all of this. Keys have no
+expiry and cover every version.
 
-**A project never gets smaller.** Open a 40-track project on a free install
-and it opens, plays, edits and saves whole. Only adding a new track while the
+**A project never gets smaller.** A 40-track project opens, plays, edits,
+exports and saves whole on a free install. Only adding a new track while the
 project already has 32 or more asks for a key.
 
-### And it stays out of the way
+### Offline, and yours
 
-**It is offline.** No account, no telemetry, no phoning home. A key is checked
-on your own machine with a signature and is never sent anywhere.
+Tangent needs no account and sends nothing about you anywhere: no
+telemetry, no update check. Your key is checked on your own machine with a
+signature, and never leaves it.
 
-macOS 11+ (Apple Silicon and Intel, signed and notarized), Windows 10+ (every
-program signed), Linux x86_64 and aarch64 (glibc 2.30+, ALSA, Wayland or X11),
-and FreeBSD 15.
+It runs on macOS 11 or later (Apple Silicon and Intel, signed and notarized),
+Windows 10 or later (signed, with ASIO), Linux x86_64 and aarch64 (glibc
+2.30+, ALSA or JACK, Wayland or X11), and FreeBSD 15.
 
 **Download:** <https://github.com/ganten1998/tangent/releases/latest>
 
@@ -126,16 +152,15 @@ and FreeBSD 15.
 
 ## Delivery / receipt content
 
-The post-purchase page is `docs/STORE-CONTENT.md`'s "Post-purchase page"
-block, and the key itself arrives in the email `email_body()` writes. Both
-say what this page says; paste that block, not a copy of it here. Its three
-stale lines (the "5.0.0 itself is not" signing sentence, "glibc 2.32", and the
-FFmpeg source sentence) are fixed; the FFmpeg source lines still must not be
-pasted until `scripts/publish-third-party-src.sh` has created both source
-releases and `scripts/check-store-links.sh` finds them.
+Nothing to paste here. The post-purchase page is the "Post-purchase page"
+block in `docs/STORE-CONTENT.md`, and the key arrives in the email that
+`email_body()` in `tools/tangent-fulfil/src/main.rs` writes. Both were
+rewritten with this page and say the same things. The FFmpeg source lines in
+the post-purchase block must not be pasted until
+`scripts/publish-third-party-src.sh` has created both source releases and
+`scripts/check-store-links.sh` finds them.
 
 ## Tags
 
-`music education` `piano teaching` `midi` `music theory` `chord detection`
-`sheet music` `piano` `screen recording` `vst3` `daw` `content creation`
-`freebsd`
+`daw` `music production` `recording` `mixing` `midi` `vst3` `lv2`
+`audio plugins` `linux audio` `freebsd` `music theory` `free software`
