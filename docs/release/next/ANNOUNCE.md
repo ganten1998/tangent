@@ -1,6 +1,9 @@
 # Tangent 5.0.0 announcement
 
 For existing users: supporters by email, and the same text for a post.
+Written from scratch for 5.0 (owner, 2026-10-12): it tells a supporter that
+Tangent is now a DAW before it tells them what changed, and names no
+third-party product.
 
 How it goes out (from the supporter-licence notes; nothing here sends it):
 Gumroad cannot email customers at these numbers, so the mail goes through the
@@ -30,39 +33,45 @@ Subject: Tangent 5.0 is out
 
 Hi,
 
-Tangent 5.0 is out, and it is the biggest release since the rewrite.
+Tangent 5.0 is out. You bought a key for a program that named the chords you
+played and could record them. This release is the one where it becomes a
+DAW.
 
-What is new, in short: buses and returns, as many as you want; Tangent
-Insert, which puts your outboard gear in an insert bay and keeps the session
-in time with it; several instruments on one track, all playing; plugins that
-follow the song's tempo and transport (Superior Drummer and synced delays
-included); exports that pick their tracks, stems or range, with stems named
-after their tracks; a send of the master to a virtual cable for OBS or
-Discord; a bitcrusher; audio quantize; track freezing; thirty-two themes; and
-FreeBSD as a supported platform.
+You can record audio and MIDI into it, arrange clips on a timeline, edit
+notes in a piano roll, and mix on a desk with buses, returns, sends, folders
+and automation. It hosts your VST3 plugins (and LV2 on Linux and FreeBSD) and
+tells them the song's tempo and transport. It also comes with its own
+instruments, among them modelled pianos and electric pianos, an analog-style
+synth and a sampler, and a shelf of effects from EQ and compression to tape,
+reverb, a tube amp and a bitcrusher. Tangent Insert puts your outboard gear
+in an insert slot and keeps the session in time with it. Exports can pick
+their tracks and their range. FreeBSD is now a supported platform too.
 
-What your key does now: the free app holds up to 32 tracks, and your key takes
-that limit away. You do not need to do anything for that; every key ever
-sold does it. Buses, returns, sends and routes have no limit for anyone.
+It still names the chord you are playing, and a take can still film the
+window.
 
-Two things to know if you are coming from 4.x:
+What your key does now: the free app holds up to 32 tracks, and your key
+removes that limit. Every key ever sold does this, so there is nothing for
+you to do. Buses, returns, sends and routes have no limit for anyone.
 
-1. Tangent as a VST3 plugin inside another DAW is retired. The 5.0 installer
-   removes the old Tangent.vst3. Tangent still hosts your VST3 and LV2
-   plugins.
+Two things to know before you upgrade from 4.x:
 
-2. 5.0 keeps its settings in a new folder and removes the old
+1. Tangent as a VST3 plugin inside another DAW is gone. The 5.0 installers
+   remove the old Tangent.vst3 on macOS and Windows; on Linux, delete
+   ~/.vst3/Tangent.vst3 yourself. Tangent still hosts your plugins.
+
+2. 5.0 keeps its settings in a new folder and deletes the old
    ~/.config/ivory folder the first time it starts. That folder held your
    settings, the chord names you taught Tangent, and your key. Your projects
-   and recordings are not affected. After upgrading, paste your key again
-   (right-click anywhere, Support Tangent..., Activate). It is in the email
-   your key first came in, from this same address; if you cannot find it,
-   reply and I will send it again. If you taught
-   Tangent chord names you want to keep, copy the ~/.config/ivory folder
-   somewhere safe before you start 5.0, and see the release notes for where
-   to put it back.
+   and recordings are not in it and are not touched. After upgrading, paste
+   your key again (right-click anywhere, Support Tangent..., Activate). It is
+   in the email your key first came in, from this same address; if you
+   cannot find it, reply and I will send it again. If you taught Tangent
+   chord names you want to keep, copy the ~/.config/ivory folder somewhere
+   safe before you start 5.0, and the release notes say where to put it
+   back.
 
-Download (these links always give you the current version):
+Download (these links always fetch the current version):
 
   macOS 11 or later, Apple Silicon or Intel
   https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
@@ -77,8 +86,8 @@ Download (these links always give you the current version):
   full release notes):
   https://github.com/ganten1998/tangent/releases/latest
 
-On Windows every program in the download is signed now. SmartScreen may still
-say "Windows protected your PC" the first time; click More info, then Run
+On Windows every program in the download is signed. SmartScreen may still say
+"Windows protected your PC" the first time; click More info, then Run
 anyway.
 
 Thank you for supporting it. Replies come to me.
