@@ -21567,10 +21567,7 @@ impl eframe::App for DesktopApp {
         // The overlay is painted over the main window's own screen rect, so
         // it covers that viewport and no other: a child viewport the app has
         // open is not underneath it and keeps its input.
-        if !self.busy_up || raw_input.viewport_id != egui::ViewportId::ROOT {
-            return;
-        }
-        raw_input.events.retain(|e| !is_gesture(e));
+        swallow_under_cover(self.busy_up, raw_input);
     }
 
     /// A take still running when the window is closed is FINISHED, not
@@ -23248,6 +23245,17 @@ fn is_gesture(e: &egui::Event) -> bool {
     )
 }
 
+/// The main window's gestures, eaten while the busy cover is up: what
+/// `raw_input_hook` does. `up` is what `busy::paint_cover` answered, which
+/// is the same whether the cover was painted here or is being carried by
+/// a window in front, so the desk under the Export window stays shut.
+fn swallow_under_cover(up: bool, raw_input: &mut egui::RawInput) {
+    if !up || raw_input.viewport_id != egui::ViewportId::ROOT {
+        return;
+    }
+    raw_input.events.retain(|e| !is_gesture(e));
+}
+
 /// Whether an announced job may be run this frame.
 ///
 /// The gate of the two-phase sequence, in one place so the reason survives:
@@ -23710,14 +23718,17 @@ impl DesktopApp {
         // app is derived from — see `Dress::of`, which measures each of its
         // colours on the thing that colour lands on.
         let face = self.app.panel_face();
-        let time = ctx.input(|i| i.time);
-        let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-busy"));
-        // As the splash: the content rectangle, not the whole viewport.
-        let rect = ctx.content_rect();
+        // **Not painted here while a window in front carries it** (the
+        // Export options window after Export, the export window during a
+        // pass): two splashes, "1 shows up under the export options window
+        // and another shows above". `up` is the same either way, so the
+        // main window's input stays blocked and the mirror below still goes
+        // out. As the splash: the content rectangle, not the whole viewport.
+        let elsewhere = self.app.cover_carried_elsewhere();
         let Some(busy) = self.busy.as_mut() else {
             return;
         };
-        let up = busy.draw(&painter, rect, face, time);
+        let up = tangent_ui::busy::paint_cover(ctx, busy, face, elsewhere);
         // **Mirrored into the export window**, which the operating system
         // keeps in FRONT of this one. Painted here alone, the cover landed
         // behind the window the user was looking at — "when clicking export
@@ -25042,11 +25053,17 @@ mod tests {
         // Everything above this module, so the strings spelled out below do
         // not find themselves.
         let src = &whole[..whole.find("mod tests {").expect("this module")];
+        // The splash asks `busy::cover_layer` itself; the busy overlay asks
+        // through `busy::paint_cover`, which asks it once in busy.rs.
         assert_eq!(
             src.matches("busy::cover_layer(").count(),
-            2,
-            "the busy overlay and the splash are the two covers; each asks \
-             `busy::cover_layer` for its layer exactly once"
+            1,
+            "the splash asks `busy::cover_layer` for its layer exactly once"
+        );
+        assert_eq!(
+            src.matches("busy::paint_cover(").count(),
+            1,
+            "the busy overlay is painted through `busy::paint_cover` exactly once"
         );
         assert!(
             !src.contains("egui::Order::"),
@@ -25316,6 +25333,56 @@ mod tests {
         let ctx = egui::Context::default();
         tangent_ui::fonts::install(&ctx, tangent_ui::fonts::FontChoice::default(), None);
         ctx
+    }
+
+    /// **A cover carried by the Export window is up in the main window
+    /// too, unpainted, and the main window's input stays shut.** The fix
+    /// for "2 loading splashes during export" takes the main window's
+    /// splash away while a window in front carries it; it must not take the
+    /// cover's other job with it. `paint_busy` hands `swallow_under_cover`
+    /// what `busy::paint_cover` answered, so the walk does the same.
+    ///
+    /// Revert-check: have `paint_cover` answer false when `elsewhere` and
+    /// the click reaches the desk.
+    #[test]
+    fn a_cover_carried_elsewhere_still_blocks_the_main_window() {
+        let ctx = ctx();
+        let face = egui::Color32::from_rgb(0x2a, 0x2c, 0x30);
+        let click = || {
+            let at = egui::pos2(300.0, 300.0);
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            }
+        };
+        for elsewhere in [true, false] {
+            let mut busy = Busy::new("Preparing export").with_detail("stems");
+            let (mut up, mut painted) = (false, false);
+            let _ = ctx.run(Default::default(), |ctx| {
+                up = tangent_ui::busy::paint_cover(ctx, &mut busy, face, elsewhere);
+                painted = ctx.graphics(|g| {
+                    g.get(tangent_ui::busy::cover_layer("tangent-busy"))
+                        .is_some_and(|l| !l.is_empty())
+                });
+            });
+            assert!(up, "elsewhere={elsewhere}: the cover is not up");
+            assert_eq!(painted, !elsewhere, "elsewhere={elsewhere}: painted in the main window");
+            let mut raw = click();
+            swallow_under_cover(up, &mut raw);
+            assert!(raw.events.is_empty(), "elsewhere={elsewhere}: a click reached the covered desk");
+        }
+        // With no cover up the desk gets its click.
+        let mut raw = click();
+        swallow_under_cover(false, &mut raw);
+        assert_eq!(raw.events.len(), 2);
     }
 
     /// **The announcement reaches the screen BEFORE the block runs, and so

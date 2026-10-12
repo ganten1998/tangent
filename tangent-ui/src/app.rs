@@ -30892,6 +30892,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.surface_cover = cover;
     }
 
+    /// **Is a window in front of the main one carrying the host's cover?**
+    /// The Export options window once Export was pressed (it paints the
+    /// cover over itself, see `settle_export_dialog`), or the export window
+    /// while a pass runs (it says the cover on its top line). The host then
+    /// keeps its cover up, and the main window's input blocked, but paints
+    /// no splash of its own under them: see `busy::paint_cover`.
+    ///
+    /// Asked at the bottom of the frame, after `frame` has settled the
+    /// dialog, so the answer covers the frame the options window closes in
+    /// too: it only closes then because the export window is up, or
+    /// because the cover is down. The same with dialogs drawn inline: the
+    /// window still carries the cover, and a second card over the whole
+    /// desk would still be a second splash.
+    pub fn cover_carried_elsewhere(&self) -> bool {
+        let starting = matches!(&self.dialog, Some(Dialog::ExportProject { pick, .. }) if pick.starting);
+        starting || self.export_progress.is_some()
+    }
+
     pub fn set_export_progress(&mut self, p: Option<crate::ports::ExportProgress>) {
         self.export_progress = p;
     }
@@ -57506,6 +57524,134 @@ mod tests {
         // The block ran and its cover went: the window goes the next frame.
         let _ = frame(&mut app, Vec::new(), &mut cover);
         assert!(app.dialog.is_none(), "the window outlived its pass's start");
+    }
+
+    /// **One splash during export setup: the Export window's.** The owner:
+    /// "theres 2 loading splashes during export -- 1 shows up under the
+    /// export options window and another shows above, bigger". The host
+    /// painted its cover in the main window as well as mirroring it into the
+    /// options window that floats in front. Driven in the host's own order
+    /// (as the test above) through `busy::paint_cover`, which is the call
+    /// `paint_busy` makes: from the press until the setup's block runs, the
+    /// main window's cover layer holds nothing, the cover is still UP (which
+    /// is what blocks the main window's input), and the card's "Preparing
+    /// export" and the foot's "Preparing export  stems" are each on screen
+    /// exactly once, both the Export window's. The same
+    /// while the export window carries a cover. Any other busy operation,
+    /// with neither window up, still paints its splash in the main window.
+    ///
+    /// Revert-check: have `cover_carried_elsewhere` answer false and the
+    /// "painted its own splash on the announcing frame" assert goes red.
+    #[test]
+    fn during_export_setup_the_main_window_paints_no_splash_of_its_own() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_channel_kind(0, Some(recorder::ChannelKind::Audio));
+        app.arrangement.clips.push(crate::arrangement::ArrClip { lane: 0, len_s: 1.0, ..Default::default() });
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        let count = |out: &egui::FullOutput, want: &str| {
+            out.shapes
+                .iter()
+                .filter(|c| matches!(&c.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == want))
+                .count()
+        };
+        let at_of = |out: &egui::FullOutput, want: &str| -> Option<Pos2> {
+            out.shapes.iter().find_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == want => {
+                    Some(Rect::from_min_size(t.pos, t.galley.size()).center())
+                }
+                _ => None,
+            })
+        };
+        // What one host frame left behind: the output, whether the owed
+        // block ran, whether the cover is up, and whether the MAIN window's
+        // cover layer was painted.
+        struct Seen {
+            out: egui::FullOutput,
+            ran: bool,
+            up: bool,
+            main: bool,
+        }
+        let mut cover: Option<crate::busy::Busy> = None;
+        let mut owed = false;
+        let mut frame = |app: &mut TangentApp, events: Vec<egui::Event>, cover: &mut Option<crate::busy::Busy>| {
+            let mut ran = false;
+            if owed && cover.as_ref().is_some_and(crate::busy::Busy::outlived_the_asking_frame) {
+                owed = false;
+                ran = true;
+            }
+            let (mut up, mut main) = (false, false);
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.frame(ctx);
+                    if let Some(crate::ports::ProjectRequest::Export(_)) = app.take_project_request() {
+                        *cover = Some(
+                            crate::busy::Busy::new("Preparing export").with_detail("stems").with_min_visible(Duration::ZERO),
+                        );
+                        owed = true;
+                    }
+                    if ran {
+                        *cover = None;
+                    }
+                    // `paint_busy`, verbatim in what it asks.
+                    let elsewhere = app.cover_carried_elsewhere();
+                    up = cover
+                        .as_mut()
+                        .is_some_and(|b| crate::busy::paint_cover(ctx, b, egui::Color32::GRAY, elsewhere));
+                    main = ctx.graphics(|g| {
+                        g.get(crate::busy::cover_layer("tangent-busy")).is_some_and(|l| !l.is_empty())
+                    });
+                    app.set_surface_cover(if up { cover.clone() } else { None });
+                },
+            );
+            Seen { out, ran, up, main }
+        };
+        let mut seen = frame(&mut app, Vec::new(), &mut cover);
+        for _ in 0..2 {
+            seen = frame(&mut app, Vec::new(), &mut cover);
+        }
+        let at = at_of(&seen.out, "Export").expect("the Export button is not on screen");
+        for e in [
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ] {
+            seen = frame(&mut app, vec![e], &mut cover);
+        }
+        assert!(cover.is_some(), "the press asked the host for nothing");
+        assert!(seen.up, "the cover is not up on the frame it was announced");
+        assert!(!seen.main, "the main window painted its own splash on the announcing frame");
+        let mut frames = 0;
+        loop {
+            let s = frame(&mut app, Vec::new(), &mut cover);
+            frames += 1;
+            if s.ran {
+                break;
+            }
+            assert!(s.up, "frame {frames}: the cover went down, and the main window's input with it");
+            assert!(!s.main, "frame {frames}: the main window painted its own splash under the Export window");
+            // The card's label once: the Export window's card, not a second
+            // one in the main window under it.
+            assert_eq!(count(&s.out, "Preparing export"), 1, "frame {frames}: the card is not on screen exactly once");
+            assert_eq!(count(&s.out, "Preparing export  stems"), 1, "frame {frames}: not said exactly once");
+            assert!(frames < 10, "the block never ran");
+        }
+        // The export window up and carrying a cover: still none in main.
+        app.set_export_progress(Some(crate::ports::ExportProgress::default()));
+        cover.replace(crate::busy::Busy::new("Writing files"));
+        let s = frame(&mut app, Vec::new(), &mut cover);
+        assert!(app.dialog.is_none(), "the options window outlived its pass's start");
+        assert!(s.up && !s.main, "the main window painted a splash under the export window");
+        // Any other busy operation, nothing in front: the main window's splash.
+        app.set_export_progress(None);
+        cover.replace(crate::busy::Busy::new("Opening project"));
+        let s = frame(&mut app, Vec::new(), &mut cover);
+        assert!(s.up && s.main, "a cover nothing else carries went unpainted");
+        assert_eq!(count(&s.out, "Opening project"), 1);
     }
 
     /// **Once Export is pressed the window carries the host's cover until
