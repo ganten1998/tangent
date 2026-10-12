@@ -206,6 +206,11 @@ pub struct PluginMeta {
     pub controls: Vec<PortMeta>,
     /// The designated latency output port's absolute index, if it has one.
     pub latency_port: Option<usize>,
+    /// Which atom INPUT sequences (by position among the atom inputs, the
+    /// order livi connects them in) declare `atom:supports time:Position`.
+    /// Those, and only those, are sent the song's position: a port that did
+    /// not ask for it is a patch or MIDI port and owes it nothing.
+    pub time_ports: Vec<usize>,
 }
 
 /// Every plugin's metadata, read once for the life of the process.
@@ -235,6 +240,9 @@ fn scan_meta() -> std::collections::HashMap<String, PluginMeta> {
     let enumeration = world.new_uri("http://lv2plug.in/ns/lv2core#enumeration");
     let unit = world.new_uri("http://lv2plug.in/ns/extensions/units#unit");
     let unit_symbol = world.new_uri("http://lv2plug.in/ns/extensions/units#symbol");
+    let atom_port = world.new_uri("http://lv2plug.in/ns/ext/atom#AtomPort");
+    let audio = world.new_uri("http://lv2plug.in/ns/lv2core#AudioPort");
+    let position = world.new_uri("http://lv2plug.in/ns/ext/time#Position");
 
     let mut out = std::collections::HashMap::new();
     for plugin in world.plugins().into_iter() {
@@ -246,10 +254,26 @@ fn scan_meta() -> std::collections::HashMap<String, PluginMeta> {
             .is_some_and(|uis| uis.into_iter().any(|u| u.is_a(&x11)));
 
         let mut controls = Vec::new();
+        let mut time_ports = Vec::new();
+        // The atom inputs counted in livi's order: port-index order, and
+        // classed exactly as livi classes them (input, neither audio nor
+        // control, an atom port), so position `k` here is `atom_in[k]` there.
+        let mut atom_inputs = 0usize;
         for i in 0..plugin.ports_count() {
             let Some(port) = plugin.port_by_index(i) else {
                 continue;
             };
+            if port.is_a(&input)
+                && !port.is_a(&audio)
+                && !port.is_a(&control)
+                && port.is_a(&atom_port)
+            {
+                if port.supports_event(&position) {
+                    time_ports.push(atom_inputs);
+                }
+                atom_inputs += 1;
+                continue;
+            }
             if !port.is_a(&control) || !port.is_a(&input) {
                 continue;
             }
@@ -304,6 +328,7 @@ fn scan_meta() -> std::collections::HashMap<String, PluginMeta> {
                 x11_ui,
                 controls,
                 latency_port: plugin.latency_port_index(),
+                time_ports,
             },
         );
     }
@@ -425,6 +450,17 @@ pub struct Instance {
     /// call from the host thread the way VST3 has. So it is read where it is
     /// written, and published from there.
     latency_port: Option<livi::PortIndex>,
+    /// The atom inputs that asked for `time:Position` (see
+    /// [`PluginMeta::time_ports`]), and the URIDs to spell it in, mapped at
+    /// creation because the URID map takes a lock.
+    time_ports: Vec<usize>,
+    time_urids: crate::transport::TimeUrids,
+    /// Where the song should be at the start of the next block if nothing
+    /// jumps: the sample, and the rolling, tempo and signature it would
+    /// still have. A position is sent when the next block's differs, as
+    /// Ardour does, rather than every block: a plugin is entitled to resync
+    /// its phase on each one it receives. `None` until the first block.
+    time_expect: Option<(i64, bool, u64, i32, i32)>,
 }
 
 impl Instance {
@@ -512,6 +548,9 @@ impl Instance {
             params,
             midi_urid: cat.features.midi_urid(),
             latency_port: plugin_meta.latency_port.map(livi::PortIndex),
+            time_urids: crate::transport::TimeUrids::mapped(|uri| cat.features.urid(uri)),
+            time_ports: plugin_meta.time_ports,
+            time_expect: None,
         })
     }
 
@@ -628,6 +667,51 @@ impl Instance {
     pub fn clear_midi(&mut self) {
         for seq in &mut self.atom_in {
             seq.clear();
+        }
+    }
+
+    /// **Start a block: clear every input sequence and tell the plugin where
+    /// the song is**, if it asked (`atom:supports time:Position`) and the
+    /// position is not the one it can already work out.
+    ///
+    /// Replaces [`Instance::clear_midi`] for a caller that knows the
+    /// timeline. The position goes in FIRST, at frame 0, because a sequence
+    /// must be time-ordered and the MIDI pushed after it starts at 0 too.
+    /// `frames` is this block's length, which is how the next block's
+    /// expected position is known. Audio-thread code: the event is a stack
+    /// array and the sequence was allocated at creation.
+    pub fn begin_block(&mut self, t: &crate::transport::Transport, frames: usize) {
+        self.clear_midi();
+        let now = (
+            t.sample,
+            t.playing,
+            t.tempo.to_bits(),
+            t.numerator,
+            t.denominator,
+        );
+        let send = self.time_expect != Some(now);
+        self.time_expect = Some((
+            if t.playing { t.sample.saturating_add(frames as i64) } else { t.sample },
+            now.1,
+            now.2,
+            now.3,
+            now.4,
+        ));
+        if !send || self.time_ports.is_empty() {
+            return;
+        }
+        let body = crate::transport::position_body(t, &self.time_urids);
+        let event = livi::event::LV2AtomEventBuilder::<{ crate::transport::POSITION_BODY }>::new_full(
+            0,
+            self.time_urids.object,
+            body,
+        );
+        for &k in &self.time_ports {
+            if let Some(seq) = self.atom_in.get_mut(k) {
+                // A full sequence drops the position rather than failing the
+                // block; it is resent on the next jump.
+                let _ = seq.push_event(&event);
+            }
         }
     }
 

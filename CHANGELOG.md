@@ -287,6 +287,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Plugins follow the song's tempo.** VST3 plugins were never told the
+  tempo, the time signature, whether the song was playing or where it
+  was, so anything set to follow the host (Superior Drummer's tempo,
+  synced delays, arpeggiators, LFOs, drum machines) ran at its own default.
+  Every plugin block now carries the tempo from the tempo map (ramps
+  included), the time signature, the position in samples, beats and bars,
+  play and record state and the loop, for the exact stretch of the song
+  that block renders, in playback and in exports alike. LV2 plugins that
+  ask for the song position (Linux and FreeBSD) are now told it too.
 - **A muted track is silent from an export's first sample.** A track
   muted on the desk, or silenced by a solo on another track, used to fade
   out over the first tenth of a second of every export, so its start was

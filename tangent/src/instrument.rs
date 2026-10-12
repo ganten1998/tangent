@@ -2632,6 +2632,19 @@ struct Shared {
     rack_count_seat: AtomicUsize,
     #[cfg(test)]
     rack_count: AtomicU64,
+    /// **What the watched seat's rack last told a hosted plugin**: the
+    /// sample position and the quarter (`f64` bits) of `host_transport`,
+    /// the anchor of the chunk it ran in, and how many of its blocks sat
+    /// AWAY from that anchor (a span rendered ahead). Beside `rack_count`,
+    /// for the same reason.
+    #[cfg(test)]
+    rack_host_sample: AtomicU64,
+    #[cfg(test)]
+    rack_host_beat: AtomicU64,
+    #[cfg(test)]
+    rack_host_anchor: AtomicU64,
+    #[cfg(test)]
+    rack_host_ahead: AtomicU64,
     /// Every other op the callback sent straight home: an Install over an
     /// occupied slot, an Attach for a lane that is not the one it was built
     /// for, a Grow smaller than the spine, a Capture while capturing.
@@ -2756,6 +2769,27 @@ struct Shared {
     /// tear.
     transport_beat: AtomicU64,
     transport_bpm: AtomicU64,
+    /// **The bar that frame is in, for a HOSTED plugin**: the quarter its
+    /// line falls on and how many quarters it lasts (both `f64` bits), its
+    /// index, and its signature packed `numerator << 16 | denominator`.
+    /// Published beside `transport_beat` by `run_transport`, from the meter
+    /// map the rack cannot reach, and read by `host_transport`. A VST3
+    /// `ProcessContext` and an LV2 `time:Position` both carry the bar; the
+    /// arp never needed it.
+    transport_bar_q: AtomicU64,
+    transport_bar_len: AtomicU64,
+    transport_bar: AtomicU64,
+    transport_sig: AtomicU32,
+    /// **The loop in QUARTERS**, `f64` bits, for a hosted plugin's cycle
+    /// fields: `loop_a`/`loop_b` walked through the tempo map once a chunk.
+    /// Equal when there is no loop.
+    transport_cycle_a: AtomicU64,
+    transport_cycle_b: AtomicU64,
+    /// **The arrangement is recording this chunk**: rolling with a punch
+    /// live on some lane (`Wide::punch_now`). Published by `mix_clips`,
+    /// before any rack runs, and read by `host_transport` for VST3's
+    /// `kRecording`.
+    transport_recording: AtomicBool,
     /// **The engine's sample rate, for whoever on the audio thread needs
     /// to turn frames past `transport_anchor` into beats.** A built-in voice's
     /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
@@ -3706,6 +3740,14 @@ impl Shared {
             rack_count_seat: AtomicUsize::new(usize::MAX),
             #[cfg(test)]
             rack_count: AtomicU64::new(0),
+            #[cfg(test)]
+            rack_host_sample: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            rack_host_beat: AtomicU64::new(0),
+            #[cfg(test)]
+            rack_host_anchor: AtomicU64::new(0),
+            #[cfg(test)]
+            rack_host_ahead: AtomicU64::new(0),
             op_refused: AtomicU32::new(0),
             plan_gen: AtomicU64::new(0),
             drum_strips: AtomicU32::new(0),
@@ -3729,6 +3771,13 @@ impl Shared {
             // The same seed `Arp::new` had, so a rack that runs before the
             // first `run_transport` is no worse off than it was.
             transport_bpm: AtomicU64::new(120.0f64.to_bits()),
+            transport_bar_q: AtomicU64::new(0.0f64.to_bits()),
+            transport_bar_len: AtomicU64::new(4.0f64.to_bits()),
+            transport_bar: AtomicU64::new(0),
+            transport_sig: AtomicU32::new(4 << 16 | 4),
+            transport_cycle_a: AtomicU64::new(0.0f64.to_bits()),
+            transport_cycle_b: AtomicU64::new(0.0f64.to_bits()),
+            transport_recording: AtomicBool::new(false),
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
@@ -4093,6 +4142,9 @@ impl Backend {
         controls: &[Control],
         params: &[tangent_host::ParamPoint],
         transport: crate::analog::arp::Transport,
+        // **The same block as a hosted plugin is told it** (`host_transport`):
+        // a VST3's `ProcessContext`, an LV2's `time:Position`.
+        host: &tangent_host::Transport,
         // **The lane's loaded sample**, borrowed for this block and ignored
         // by every backend but the built-in sampler. A hosted plugin brings
         // its own library; ours is handed one, and the hand-off is an
@@ -4103,16 +4155,19 @@ impl Backend {
         bufs: &mut [Vec<f32>],
     ) -> Result<(), String> {
         match self {
-            Backend::Vst3 { inst, .. } => inst
-                .process_with_controls(notes, controls, frames, bufs)
-                .map(|_| ()),
+            Backend::Vst3 { inst, .. } => {
+                inst.set_transport(*host);
+                inst.process_with_controls(notes, controls, frames, bufs)
+                    .map(|_| ())
+            }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             Backend::Lv2(inst) => {
                 // LV2 takes its notes as an atom sequence built before the run
                 // rather than as an argument to it. Cleared first, or last
                 // block's notes play again — which is exactly what a stuck note
-                // sounds like.
-                inst.clear_midi();
+                // sounds like. `begin_block` clears, then puts the song's
+                // position first in the sequence for a plugin that asked.
+                inst.begin_block(host, frames);
                 // **Back to wire MIDI, which is what LV2 speaks.** These
                 // structs are VST3's shape: a note's velocity is a float
                 // because VST3 made it one, and a pitch bend arrives as a
@@ -4197,19 +4252,23 @@ impl Backend {
         &mut self,
         planar: &mut [Vec<f32>],
         params: &[tangent_host::ParamPoint],
+        host: &tangent_host::Transport,
         frames: usize,
         out: &mut [Vec<f32>],
         key: Option<&[Vec<f32>]>,
     ) -> Result<(), String> {
         match self {
-            Backend::Vst3 { inst, .. } => match key {
-                Some(k) => inst
-                    .process_effect_keyed(planar, params, frames, out, k)
-                    .map(|_| ()),
-                None => inst
-                    .process_effect_automated(planar, params, frames, out)
-                    .map(|_| ()),
-            },
+            Backend::Vst3 { inst, .. } => {
+                inst.set_transport(*host);
+                match key {
+                    Some(k) => inst
+                        .process_effect_keyed(planar, params, frames, out, k)
+                        .map(|_| ()),
+                    None => inst
+                        .process_effect_automated(planar, params, frames, out)
+                        .map(|_| ()),
+                }
+            }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             Backend::Lv2(inst) => {
                 // LV2 automation is a control port written before the block,
@@ -4221,6 +4280,8 @@ impl Backend {
                 for p in params {
                     let _ = inst.set_param(p.id as usize, p.value as f32);
                 }
+                // A tempo-synced delay asks for the song's position too.
+                inst.begin_block(host, frames);
                 // No key path exists in this host's LV2 plumbing yet, so an
                 // armed key is IGNORED here rather than half-fed: the UI
                 // greys the option per backend (`insert_wants_key` answers
@@ -10308,6 +10369,69 @@ fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
     crate::analog::arp::Transport { bpm, playing: rolling, beat }
 }
 
+/// **Where the song is, for a HOSTED plugin inside a rack**: the VST3
+/// `ProcessContext` and the LV2 `time:Position` are both built from this.
+///
+/// [`rack_transport`]'s beat, tempo and rolling level, walked to the same
+/// `pos` by the same rule, plus what only a hosted plugin asks for: the
+/// sample position, the bar and its signature, the loop and whether the
+/// arrangement is recording, all as `run_transport` and `mix_clips`
+/// published them for this chunk.
+///
+/// * **The sample position is the span's own**, `pos`, or the chunk's
+///   anchor for the sentinel. So a grained lane rendering a grain AHEAD of
+///   the playhead tells its plugins the frame it is rendering, an offline
+///   export tells them the frame it is exporting however fast it runs, and
+///   in the chunk that wraps a loop the position jumps on the next chunk,
+///   which is the one that starts at the loop's head.
+/// * **Delay compensation does not move it.** This engine compensates by
+///   DELAYING the early lanes after their racks (`run_lane_pdc`), never by
+///   rendering anything early, so a lane's rack processes the audio of its
+///   own `pos` and is told `pos`. A rack AFTER a compensation delay (a
+///   folder, the Fx bus, the master) is handed the anchor like every other
+///   sentinel caller: the block the callback is on, which is what REAPER
+///   and Live tell a bus plugin too.
+/// * **The bar is walked forward** when a grained span has crossed a bar
+///   line since the anchor, at the anchor bar's length. A meter change on
+///   that very line inside one grain is the one case it gets wrong, for one
+///   grain, by the difference in bar length.
+/// * **Varispeed changes none of it.** The program clock runs at the map's
+///   tempo in program frames and the whole desk is resampled afterwards
+///   (`crate::varispeed`), so a plugin is told the map's tempo against its
+///   own samples, which is exactly what it renders against. What leaves the
+///   speakers is faster and higher, plugins included, like tape.
+fn host_transport(shared: &Shared, pos: u64) -> tangent_host::Transport {
+    let arp = rack_transport(shared, pos);
+    let sample = if pos == u64::MAX {
+        shared.transport_anchor.load(Ordering::Relaxed)
+    } else {
+        pos
+    };
+    let mut bar_start = f64::from_bits(shared.transport_bar_q.load(Ordering::Relaxed));
+    let len = f64::from_bits(shared.transport_bar_len.load(Ordering::Relaxed));
+    let mut bar = shared.transport_bar.load(Ordering::Relaxed) as f64;
+    if len > 0.0 && arp.beat >= bar_start + len {
+        let crossed = ((arp.beat - bar_start) / len).floor();
+        bar_start += crossed * len;
+        bar += crossed;
+    }
+    let sig = shared.transport_sig.load(Ordering::Relaxed);
+    let qa = f64::from_bits(shared.transport_cycle_a.load(Ordering::Relaxed));
+    let qb = f64::from_bits(shared.transport_cycle_b.load(Ordering::Relaxed));
+    tangent_host::Transport {
+        playing: arp.playing,
+        recording: arp.playing && shared.transport_recording.load(Ordering::Relaxed),
+        sample: i64::try_from(sample).unwrap_or(i64::MAX),
+        quarters: arp.beat,
+        bar_start,
+        bar: bar as i64,
+        tempo: arp.bpm,
+        numerator: (sig >> 16) as i32,
+        denominator: (sig & 0xFFFF) as i32,
+        cycle: (qb > qa).then_some((qa, qb)),
+    }
+}
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -10420,6 +10544,18 @@ fn run_rack(
     // See `rack_transport` for what the walk is exact for and what it is
     // not. Read once here so every bay in the rack sees the same block.
     let transport = rack_transport(shared, pos);
+    // And the same block as a hosted plugin is told it: `host_transport`.
+    let host = host_transport(shared, pos);
+    #[cfg(test)]
+    if shared.rack_count_seat.load(Ordering::Relaxed) == seat {
+        let anchor = shared.transport_anchor.load(Ordering::Relaxed);
+        shared.rack_host_sample.store(host.sample as u64, Ordering::Relaxed);
+        shared.rack_host_beat.store(host.quarters.to_bits(), Ordering::Relaxed);
+        shared.rack_host_anchor.store(anchor, Ordering::Relaxed);
+        if host.sample as u64 != anchor {
+            shared.rack_host_ahead.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     // **The scratch buffers are SHARED, and a hosted plugin SHRINKS them.**
     //
     // `tangent_host::Instance::process` clears and resizes the caller's
@@ -10618,7 +10754,7 @@ fn run_rack(
                 }
             }
             if p.backend
-                .process_voice(notes, controls, bay_params, transport, sample, frames, &mut p.bufs)
+                .process_voice(notes, controls, bay_params, transport, &host, sample, frames, &mut p.bufs)
                 .is_err()
             {
                 if let Some(a) = p.align.as_deref_mut() {
@@ -10628,7 +10764,7 @@ fn run_rack(
             }
         } else if p
             .backend
-            .process_effect(planar, bay_params, frames, out, keyed)
+            .process_effect(planar, bay_params, &host, frames, out, keyed)
             .is_err()
         {
             // A refused block leaves the audio ALONE rather than replacing it
@@ -15746,6 +15882,36 @@ impl Renderer {
         self.shared
             .transport_bpm
             .store(self.maps.tempo.bpm_at_beat(beat).to_bits(), Ordering::Relaxed);
+        // **And the bar and the loop, for a hosted plugin** (see
+        // `host_transport`): the meter map's walk at the same beat, and the
+        // loop's two ends through the tempo map. A handful of map walks a
+        // chunk, over a map of a few points.
+        let (bar, _) = self.maps.meter.bar_beat_at_quarter(beat);
+        let sig = self.maps.meter.sig_at_bar(bar);
+        self.shared
+            .transport_bar_q
+            .store(self.maps.meter.quarter_at_bar(bar).to_bits(), Ordering::Relaxed);
+        self.shared
+            .transport_bar_len
+            .store(self.maps.meter.quarters_in_bar(bar).to_bits(), Ordering::Relaxed);
+        self.shared.transport_bar.store(u64::from(bar), Ordering::Relaxed);
+        self.shared.transport_sig.store(
+            u32::from(sig.beats) << 16 | u32::from(sig.unit),
+            Ordering::Relaxed,
+        );
+        let a = self.shared.loop_a.load(Ordering::Relaxed);
+        let b = self.shared.loop_b.load(Ordering::Relaxed);
+        let rate = self.rate.max(1.0);
+        let (qa, qb) = if b > a {
+            (
+                self.maps.tempo.beat_at_seconds(a as f64 / rate),
+                self.maps.tempo.beat_at_seconds(b as f64 / rate),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        self.shared.transport_cycle_a.store(qa.to_bits(), Ordering::Relaxed);
+        self.shared.transport_cycle_b.store(qb.to_bits(), Ordering::Relaxed);
         (at, rolling, flush, wrap_from)
     }
 
@@ -15820,6 +15986,13 @@ impl Renderer {
                 }
             }
         }
+        // **Whether the song is being recorded, for a hosted plugin's
+        // `kRecording`.** Read off the same punches, once, before any rack
+        // of this chunk runs (`host_transport`).
+        self.shared.transport_recording.store(
+            rolling && self.spine.ext.punch_now.iter().any(|p| *p != u64::MAX),
+            Ordering::Relaxed,
+        );
         // **Which lanes have audio standing on them ANYWHERE on the
         // timeline** — not "under the playhead this block", and not "while
         // rolling".
@@ -47697,6 +47870,269 @@ mod sampler_road {
             !rack_transport(&e.shared, u64::MAX).playing,
             "a rack in a stopped chunk was told the song is playing"
         );
+    }
+
+    /// A song whose maps disagree with every default: 100 bpm ramping to
+    /// 160 across the first eight quarters, two bars of 4/4, then 3/4 from
+    /// bar 2 and 7/8 from bar 4.
+    fn host_fixture_maps() -> Maps {
+        use tangent_ui::recorder::TimeSignature;
+        use tangent_ui::tempo::{MeterMap, MeterPoint, TempoMap, TempoPoint};
+        Maps {
+            tempo: TempoMap::sanitised(vec![
+                TempoPoint { at_beat: 0.0, bpm: 100.0, ramp: true },
+                TempoPoint { at_beat: 8.0, bpm: 160.0, ramp: false },
+            ]),
+            meter: MeterMap::sanitised(vec![
+                MeterPoint { at_bar: 0, sig: TimeSignature { beats: 4, unit: 4 } },
+                MeterPoint { at_bar: 2, sig: TimeSignature { beats: 3, unit: 4 } },
+                MeterPoint { at_bar: 4, sig: TimeSignature { beats: 7, unit: 8 } },
+            ]),
+        }
+    }
+
+    /// What a hosted plugin should be told at frame `at` of `maps`.
+    fn host_expected(maps: &Maps, rate: u32, at: u64) -> (f64, f64, f64, u32, (i32, i32)) {
+        let q = maps.tempo.beat_at_seconds(at as f64 / f64::from(rate));
+        let (bar, _) = maps.meter.bar_beat_at_quarter(q);
+        let sig = maps.meter.sig_at_bar(bar);
+        (
+            q,
+            maps.tempo.bpm_at_beat(q),
+            maps.meter.quarter_at_bar(bar),
+            bar,
+            (i32::from(sig.beats), i32::from(sig.unit)),
+        )
+    }
+
+    /// **A hosted plugin is told the song's real position, tempo, bar and
+    /// signature for the block it renders, and the loop it is in.**
+    ///
+    /// Every VST3 `process` call used to carry a null `ProcessContext`, so
+    /// Superior Drummer's "follow host", a synced delay and an arp all ran
+    /// at their own defaults. `host_transport` is what both formats are now
+    /// built from. Driven here through a real engine, rendering offline as
+    /// an export does (as fast as the machine goes, so "now" means nothing),
+    /// over a tempo RAMP and two meter changes, with a loop whose end falls
+    /// mid-chunk: every chunk's figures must be the maps' at that chunk's
+    /// first frame, and the chunk after the wrap must say the loop's head.
+    #[test]
+    fn a_hosted_plugin_is_told_the_maps_position_bar_signature_and_loop() {
+        let rate = 48_000u32;
+        let maps = host_fixture_maps();
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        e.set_maps(maps.clone());
+        // Bar 0 to the end of bar 4's 7/8: across both meter changes.
+        let qb = maps.meter.quarter_at_bar(5);
+        let b = (maps.tempo.seconds_at_beat(qb) * f64::from(rate)) as u64;
+        e.set_loop(0, b);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        let (mut wraps, mut last, mut sigs) = (0, 0u64, std::collections::BTreeSet::new());
+        for _ in 0..(b / 512 + 40) {
+            let at = e.transport_position();
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let t = host_transport(&e.shared, u64::MAX);
+            let (q, bpm, bar_q, bar, sig) = host_expected(&maps, rate, at);
+            assert_eq!(t.sample, at as i64, "the chunk at {at} told a plugin sample {}", t.sample);
+            assert!(t.playing, "a rolling chunk said it was stopped");
+            assert!(!t.recording, "nothing is recording");
+            assert!((t.quarters - q).abs() < 1e-6, "at {at}: quarter {} where the map says {q}", t.quarters);
+            assert!((t.tempo - bpm).abs() < 1e-6, "at {at}: {} bpm where the map says {bpm}", t.tempo);
+            assert!((t.bar_start - bar_q).abs() < 1e-9, "at {at}: bar starts at {} where the meter says {bar_q}", t.bar_start);
+            assert_eq!(t.bar, i64::from(bar), "at {at}: bar index");
+            assert_eq!((t.numerator, t.denominator), sig, "at {at}: signature");
+            let (ca, cb) = t.cycle.expect("the loop is on");
+            // The loop's end is a whole FRAME, so its quarter is the map's at
+            // that frame, a few microbeats short of the bar line.
+            let want_b = maps.tempo.beat_at_seconds(b as f64 / f64::from(rate));
+            assert!(ca.abs() < 1e-9 && (cb - want_b).abs() < 1e-9, "loop told as {ca}..{cb}, not 0..{want_b}");
+            if at < last {
+                wraps += 1;
+                assert!(at < 512 * 2, "the chunk after the wrap is at {at}, not the loop's head");
+            }
+            last = at;
+            sigs.insert(sig);
+        }
+        assert!(wraps >= 1, "the loop never wrapped, so the jump went untested");
+        assert_eq!(sigs.len(), 3, "the fixture never crossed both meter changes: {sigs:?}");
+
+        // No loop: no cycle.
+        e.set_loop(0, 0);
+        e.render_offline(&mut out);
+        assert_eq!(host_transport(&e.shared, u64::MAX).cycle, None, "a cleared loop is still reported");
+    }
+
+    /// **A locate lands on the block it lands, and a stopped desk is still a
+    /// desk with a tempo.** Stopped: not playing, the parked playhead, the
+    /// map's tempo and bar at it, as a VST3 host must report (`kPlaying`
+    /// clear, `kTempoValid` set).
+    #[test]
+    fn a_locate_and_a_stop_reach_a_hosted_plugin_on_their_own_block() {
+        let rate = 48_000u32;
+        let maps = host_fixture_maps();
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        e.set_maps(maps.clone());
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        // Locate to the middle of bar 3 (3/4), mid-roll.
+        let to = (maps.tempo.seconds_at_beat(maps.meter.quarter_at_bar(3) + 1.5) * f64::from(rate)) as u64;
+        e.set_transport(2, to);
+        e.render_offline(&mut out);
+        let t = host_transport(&e.shared, u64::MAX);
+        let (q, _, bar_q, bar, sig) = host_expected(&maps, rate, to);
+        assert_eq!(t.sample, to as i64, "the block after a locate did not start at it");
+        assert!((t.quarters - q).abs() < 1e-6 && (t.bar_start - bar_q).abs() < 1e-9);
+        assert_eq!((t.bar, (t.numerator, t.denominator)), (i64::from(bar), sig));
+        assert_eq!(sig, (3, 4));
+
+        e.set_rolling(false);
+        e.render_offline(&mut out);
+        let parked = e.transport_position();
+        for _ in 0..3 {
+            e.render_offline(&mut out);
+            let t = host_transport(&e.shared, u64::MAX);
+            assert!(!t.playing, "a stopped desk told a plugin it was playing");
+            assert_eq!(t.sample, parked as i64, "a stopped desk's position moved");
+            let (q, bpm, ..) = host_expected(&maps, rate, parked);
+            assert!((t.quarters - q).abs() < 1e-6, "stopped at quarter {} where the map says {q}", t.quarters);
+            assert!(t.tempo > 0.0 && (t.tempo - bpm).abs() < 1e-6, "a stopped desk lost its tempo: {}", t.tempo);
+        }
+    }
+
+    /// **A span rendered ahead of the playhead is told its OWN frame, and
+    /// its own bar when it has crossed a line.** A grained lane renders up
+    /// to a grain past the chunk's anchor; handing it the anchor would put
+    /// a synced plugin early by exactly that much.
+    #[test]
+    fn a_span_rendered_ahead_is_told_its_own_frame_and_bar() {
+        let shared = Shared::new();
+        shared.rate.store(48_000, Ordering::Relaxed);
+        shared.transport_rolling.store(true, Ordering::Relaxed);
+        // 120 bpm: a quarter is 24,000 frames. The anchor is 100 frames
+        // before bar 1's line (quarter 4) of 4/4.
+        shared.transport_anchor.store(96_000 - 100, Ordering::Relaxed);
+        shared.transport_beat.store((4.0 - 100.0 / 24_000.0f64).to_bits(), Ordering::Relaxed);
+        shared.transport_bpm.store(120.0f64.to_bits(), Ordering::Relaxed);
+        shared.transport_bar_q.store(0.0f64.to_bits(), Ordering::Relaxed);
+        shared.transport_bar_len.store(4.0f64.to_bits(), Ordering::Relaxed);
+        shared.transport_bar.store(0, Ordering::Relaxed);
+        shared.transport_sig.store(4 << 16 | 4, Ordering::Relaxed);
+
+        let here = host_transport(&shared, u64::MAX);
+        assert_eq!(here.sample, 96_000 - 100);
+        assert_eq!((here.bar, here.bar_start), (0, 0.0));
+
+        let ahead = host_transport(&shared, 96_000 + 156);
+        assert_eq!(ahead.sample, 96_000 + 156, "a span ahead was told the anchor's frame");
+        assert!((ahead.quarters - (4.0 + 156.0 / 24_000.0)).abs() < 1e-9, "quarter {}", ahead.quarters);
+        assert_eq!((ahead.bar, ahead.bar_start), (1, 4.0), "a span past the bar line kept the old bar");
+    }
+
+    /// **`kRecording` while the arrangement records, and only then**: a
+    /// punch live on a lane AND the transport rolling.
+    #[test]
+    fn recording_reaches_a_hosted_plugin_only_while_a_punch_rolls() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let mut out = vec![0.0f32; 2 * 512];
+        e.set_transport(1, 0);
+        let mut punches = [None; LEGACY_LANES];
+        punches[1] = Some(0);
+        e.set_punches(punches);
+        e.render_offline(&mut out);
+        assert!(!host_transport(&e.shared, u64::MAX).recording, "a stopped desk was recording");
+        e.set_rolling(true);
+        e.render_offline(&mut out);
+        assert!(host_transport(&e.shared, u64::MAX).recording, "a rolling punch was not recording");
+        e.set_punches([None; LEGACY_LANES]);
+        e.render_offline(&mut out);
+        assert!(!host_transport(&e.shared, u64::MAX).recording, "recording outlived its punch");
+    }
+
+    /// **Delay compensation does not move what a lane's rack is told.**
+    ///
+    /// This engine aligns lanes by DELAYING the early ones after their
+    /// racks, so a lane with nothing to report still processes the audio of
+    /// its own frame and must be told that frame. Here the Analog's 68
+    /// frames on lane 2 make lane 3 wait; lane 3's rack is watched and must
+    /// be handed each chunk's own first frame, in a real engine, rendering
+    /// offline. Then with grains on, the Analog's lane may render ahead,
+    /// and every span it renders must be told a frame and quarter that
+    /// agree with the map at that frame.
+    #[test]
+    fn a_lane_waiting_on_compensation_is_told_the_frame_its_rack_renders() {
+        let rate = 48_000u32;
+        let maps = host_fixture_maps();
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        e.set_maps(maps.clone());
+        e.load_insert(2, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+            .expect("the analog loads")
+            .expect("and seats");
+        e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
+            .expect("the trim loads")
+            .expect("and seats");
+        let clip = |strip: usize| PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip,
+            start: 0,
+            len: 8 * u64::from(rate),
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 6 * u64::from(rate), key: 60, vel: 100 }]),
+        };
+        e.set_midi_clips(vec![clip(2), clip(3)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        assert!(
+            e.shared.max_latency.load(Ordering::Relaxed) > 0,
+            "the fixture has no delay compensation in it, so this proves nothing"
+        );
+        e.shared.rack_count_seat.store(lane_seat(3, CHAIN_OWN), Ordering::Relaxed);
+        e.shared.rack_count.store(0, Ordering::Relaxed);
+        for _ in 0..16 {
+            let at = e.transport_position();
+            e.shared.rack_host_sample.store(u64::MAX, Ordering::Relaxed);
+            e.render_offline(&mut out);
+            let told = e.shared.rack_host_sample.load(Ordering::Relaxed);
+            assert_eq!(told, at, "lane 3's rack, compensated, was told {told} for the chunk at {at}");
+        }
+        assert!(e.shared.rack_count.load(Ordering::Relaxed) >= 16, "lane 3's rack never ran");
+
+        // Grains on: the Analog's lane now renders spans of its own. A
+        // grain is only used when it is longer than the chunk, so 128-frame
+        // chunks against a 480-frame grain: most spans start away from the
+        // chunk's anchor, up to a grain ahead of it. Nothing armed and nothing listening to
+        // live MIDI, or the lanes are pinned to the chunk (`pinned_lanes`).
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_grain_ms(10.0);
+        e.shared.rack_count_seat.store(lane_seat(2, CHAIN_OWN), Ordering::Relaxed);
+        e.shared.rack_host_ahead.store(0, Ordering::Relaxed);
+        let mut small = vec![0.0f32; 2 * 128];
+        for _ in 0..64 {
+            e.render_offline(&mut small);
+            let told = e.shared.rack_host_sample.load(Ordering::Relaxed);
+            let anchor = e.shared.rack_host_anchor.load(Ordering::Relaxed);
+            let beat = f64::from_bits(e.shared.rack_host_beat.load(Ordering::Relaxed));
+            assert!(
+                told >= anchor && told - anchor <= MAX_BLOCK as u64,
+                "a span was told frame {told} for a chunk anchored at {anchor}"
+            );
+            let (q, ..) = host_expected(&maps, rate, told);
+            // Walked from the anchor at the anchor's tempo across at most a
+            // grain of a ramp: within a thousandth of a quarter.
+            assert!((beat - q).abs() < 1e-3, "a span at {told} was told quarter {beat}, the map says {q}");
+        }
+        let ahead = e.shared.rack_host_ahead.load(Ordering::Relaxed);
+        assert!(ahead > 0, "no span was ever rendered ahead, so the grained half proves nothing");
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures
