@@ -2868,7 +2868,7 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// nobody recovers from, and it is exactly the sort of thing that breaks when
 /// somebody adds a line.
 const WELCOME_LINES: [&str; 20] = [
-    "Welcome to the Tangent 5.0 beta!",
+    "Welcome to Tangent 5.0!",
     "",
     "Tangent is an attempt to create a seamless",
     "environment between learning/synthesizing",
