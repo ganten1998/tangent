@@ -118,6 +118,18 @@ its GPL terms apply to that binary and do not extend to Tangent itself
 (LICENSING.md sets out why).
 The macOS artifact bundles no encoder: it uses AVFoundation, part of macOS.
 
+LAME (macOS and FreeBSD artifacts)
+----------------------------------
+The macOS and FreeBSD builds link LAME 3.100 (https://lame.sourceforge.io/),
+the MP3 encoder, statically into the tangent program, through the crates
+mp3lame-sys 0.1.11 (which carries the unmodified LAME sources) and
+mp3lame-encoder 0.2.5, both listed below. LAME is licensed under the GNU
+Library General Public License, version 2 or any later version; the two
+crates under the GNU Lesser General Public License, version 3. Those texts,
+the GNU GPL version 3 that LGPL version 3 builds on, and a notice saying how
+to rebuild Tangent against a modified LAME ship in the lame-licenses/ folder
+of those artifacts. The Windows and Linux artifacts do not contain LAME.
+
 Rust crates
 -----------
 The Rust crates statically linked into Tangent are listed below with their

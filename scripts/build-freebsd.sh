@@ -159,6 +159,12 @@ install -m 0644 "$ROOT/assets/fonts/OFL.txt"   "$LIC/OFL.txt"
 for f in "$ROOT"/assets/font-licenses/*.txt; do
     install -m 0644 "$f" "$LIC/font-licenses/"
 done
+# LAME is statically linked here (the default `mp3` feature), so its LGPL
+# texts and our notice go wherever the binary goes (LICENSING.md, LAME).
+mkdir -p "$LIC/lame-licenses"
+for f in "$ROOT"/assets/lame-licenses/*.txt; do
+    install -m 0644 "$f" "$LIC/lame-licenses/"
+done
 
 # ── Manifest ─────────────────────────────────────────────────────────────────
 sed "s/@@VERSION@@/$PKG_VERSION/" \
@@ -264,6 +270,8 @@ bundle() {
     cp "$ROOT/assets/fonts/OFL.txt" "$dir/OFL.txt"
     mkdir -p "$dir/font-licenses"
     cp "$ROOT"/assets/font-licenses/*.txt "$dir/font-licenses/"
+    mkdir -p "$dir/lame-licenses"
+    cp "$ROOT"/assets/lame-licenses/*.txt "$dir/lame-licenses/"
     write_readme "$kind" > "$dir/README.txt"
 
     out="$DIST/tangent-$PKG_VERSION-freebsd-$ABI_TAG-$kind.tar.gz"
@@ -304,9 +312,10 @@ WHAT IS IN HERE
         printf 'every dependency, so this works on a\n                      machine that has never had a desktop package installed.' )
     install.sh        the installer
     README.txt        this
-    LICENSE, OFL.txt, THIRD-PARTY-LICENSES, font-licenses/
-                      the licences: Tangent's, the embedded fonts', and
-                      everything else the binary carries
+    LICENSE, OFL.txt, THIRD-PARTY-LICENSES, font-licenses/, lame-licenses/
+                      the licences: Tangent's, the embedded fonts', LAME's
+                      (the MP3 encoder linked into it), and everything else
+                      the binary carries
 
 AFTER INSTALLING
 

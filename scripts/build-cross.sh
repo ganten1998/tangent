@@ -407,6 +407,10 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   mkdir -p "$stage/font-licenses" || { rm -rf "$stage"; return 1; }
   cp assets/font-licenses/*.txt "$stage/font-licenses/" || { rm -rf "$stage"; return 1; }
   cp LICENSE THIRD-PARTY-LICENSES "$stage/" || { rm -rf "$stage"; return 1; }
+  # No lame-licenses/ here, on purpose: this leg builds without `mp3`, so
+  # LAME is not in the binary (its MP3 export runs through tangent-ffmpeg,
+  # whose texts are in ffmpeg-licenses/). build-macos.sh, build-freebsd.sh
+  # and build-linux-native.sh, which link it, ship them.
   # **The encoder, which this path shipped without for two releases.**
   #
   # Video on Linux is an ffmpeg subprocess, resolved exe-adjacent before PATH.
@@ -537,6 +541,8 @@ case ",$WIN_FEATURES," in
   *,asio,*) printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt" ;;
 esac
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
+# No lame-licenses/: the Windows leg builds without `mp3`, so LAME is not in
+# tangent.exe (see the Linux stage above).
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in tangent.exe.
 mkdir -p "$WINSTAGE/font-licenses"

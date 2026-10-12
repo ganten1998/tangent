@@ -249,6 +249,11 @@ cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
 # the stripped release binary). Their licences must accompany every copy too.
 mkdir -p "$APP/Contents/Resources/font-licenses"
 cp assets/font-licenses/*.txt "$APP/Contents/Resources/font-licenses/"
+# **LAME is linked into this binary** (the default `mp3` feature), so its
+# LGPL texts and our notice travel with every copy: the zip, the dmg and the
+# pkg all carry this bundle (LICENSING.md, LAME).
+mkdir -p "$APP/Contents/Resources/lame-licenses"
+cp assets/lame-licenses/*.txt "$APP/Contents/Resources/lame-licenses/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
