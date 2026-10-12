@@ -29,6 +29,8 @@ pub mod lv2ui;
 pub mod ready;
 pub mod scan;
 pub mod state;
+/// The song's position, spelled for VST3 and for LV2. See the module.
+pub mod transport;
 
 pub use editor::{Editor, EditorError, EditorHandle};
 pub use instance::{
@@ -37,3 +39,4 @@ pub use instance::{
 pub use ready::{Policy, Readiness, State as ReadyState};
 pub use scan::{discover, discover_in, search_paths, vendor_of, ClassInfo, Module};
 pub use state::{ParamInfo, StateHandle, MAX_STATE_BYTES};
+pub use transport::Transport;
