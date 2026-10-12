@@ -141,6 +141,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Bigger icons in the track menu.** The icon picker on a track's
+  right-click menu draws its icons a third bigger (42 points, was 31),
+  nine to a row instead of twelve, with the menu grown to fit so the
+  palette list keeps its room. They sit on whole pixels so they stay sharp.
+
 - **New Track always adds at the end.** The plus under the last track
   (timeline and mixer) and Ctrl/Cmd+T now put the new track after every
   other track, whatever is selected; they used to put it under the
