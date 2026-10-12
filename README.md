@@ -1,55 +1,30 @@
 # Tangent
 
-**Play. Tangent writes it down, explains it, and hands you the video.**
+**Record, arrange and mix on macOS, Windows, Linux and FreeBSD.**
+
+Free with up to 32 tracks; a supporter key removes the limit.
 
 ### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
 
-![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
+![The arrangement: drum, piano and audio tracks with MIDI and audio clips, a volume automation lane under the piano track, and the recorder band with its spectrum, clock and transport above](docs/img/screenshot-arrangement.png)
 
-Tangent is a small recording DAW built around one idea: the app should show
-you what you are playing while you play it, and keep what you played.
+![The mixer: a strip for each track, a folder, a return and the click, each with its inserts, routing, send, pan and fader, and the master on the right](docs/img/screenshot-mixer.png)
 
-Plug in a MIDI keyboard and play. Tangent renders all 88 keys in real time
-while a weighted-scoring chord engine names what you are holding, from plain
-triads to altered dominants, rootless jazz voicings, slash chords, and scales.
-It **engraves it on a staff**, shows the same notes **on a guitar neck** where
-a player would actually put their fingers, and **as geometry**: the circle of
-fifths, a Tonnetz, and the I-IV-V triangles.
+Tangent is a digital audio workstation for macOS, Windows, Linux and
+FreeBSD. You record audio and MIDI into it, arrange clips on a timeline,
+edit notes in a piano roll, and mix on a desk with buses, returns, sends,
+folders and automation. It hosts VST3 plugins on every platform and LV2
+plugins on Linux and FreeBSD, and it ships its own instruments and effects,
+so a new session makes a sound before you install anything.
 
-Then it records the whole thing, and keeps going from there. Tangent 5.0 is
-three tools in one window:
+It started as a program that names the chord you are playing, and it still
+does that: as you play, it names the chord, writes it on a staff, places it
+on a guitar neck and draws it on the circle of fifths. A take can also film
+the window itself, with your camera in it.
 
-**A teaching tool.** Everything a student needs is on screen at once and in
-one another's terms: the notes under your hands, the name of what they make,
-the notation for it, and the geometry that explains why it sounds like that.
-Switch the staff to any of six clefs and every note is written in that clef,
-so a violist or a cellist can read the chord in their own clef, off one
-keyboard. Teach it a chord name it does not know and it is yours from then on.
-
-**A recording tool.** One press writes a `.wav`, a `.mid` and a composited
-`.mp4`, and the video **is the window**: the same panels in the same places,
-with your camera already placed in it, at 16:9. There is no scene to build, no
-overlay to align, no second layout to keep in step with the first. What you
-were looking at is what your audience sees. macOS encodes natively; the
-Windows and Linux downloads carry their own encoder, so filming a take needs
-nothing installed. There is a native **Stream to OBS** sender too, for going
-live instead of to a file.
-
-**A DAW.** A desk with a mixer, an arrangement view, a MIDI editor and a drum
-machine. The free app holds up to 32 tracks and a supporter key takes the limit
-away; buses, returns, sends and routes have no limit for anyone. Folders are
-real buses that count as tracks: a group sums its children in the engine and
-runs its own insert rack over the sum. Automation reaches track controls and plugin parameters
-alike, the tempo lane does ramps and steps, clips time-stretch from their
-edges, audio takes quantize as well as MIDI, and delay compensation understands
-groups. It **hosts your plugins**: VST3 on every platform, LV2 on Linux and
-FreeBSD, editor windows included, and a new session opens with the built-in
-Tangent DX7 armed and set to a tine electric piano, so the app makes a sound
-out of the box.
-
-It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, on Linux
-(x86_64 and aarch64, glibc 2.30+, ALSA, Wayland or X11), and on FreeBSD 15
-(amd64).
+Tangent is free and MIT licensed. The free app holds up to 32 tracks, and a
+[supporter key](https://ganten.gumroad.com/l/ivory) removes the limit. It
+works offline, with no account and no telemetry.
 
 ## Download
 
@@ -59,128 +34,160 @@ It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, on Linux
 | Windows 10+ | [`setup.exe`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe) | |
 | Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz) |
 
-macOS builds are universal (Apple Silicon and Intel), signed and notarized.
-The Windows download is the installer; it puts Tangent in the Start menu and
-includes an uninstaller. The Linux `install.sh` needs no root by default and
-takes `--system`, `--prefix`, `--uninstall` and `--dry-run`. Other builds,
-including the Windows portable zip, the Linux aarch64 tarball, the FreeBSD
-package and its two offline bundles, and checksums, are on the
-[releases page](https://github.com/ganten1998/tangent/releases/latest).
+The macOS build is universal (Apple Silicon and Intel), signed and
+notarized. The Windows installer is signed, adds Tangent to the Start menu
+and includes an uninstaller. The Linux `install.sh` needs no root and takes
+`--system`, `--prefix`, `--uninstall` and `--dry-run`. The
+[releases page](https://github.com/ganten1998/tangent/releases/latest) has
+the rest: the Windows portable zip, the Linux aarch64 tarball, the FreeBSD
+15 package with its two offline bundles, and checksums.
 
-## Features
+Requirements: macOS 11 (Big Sur) or later; Windows 10 or later; Linux on
+x86_64 or aarch64 with glibc 2.30 or newer, ALSA, and Wayland or X11;
+FreeBSD 15 on amd64.
 
-- **The recorder.** One press writes audio, MIDI and video together. The video
-  is the window itself, with the camera composited in; the take's manifest
-  records what was captured, and a take that loses its video still keeps its
-  audio and its MIDI. Software monitoring, a metronome, and input trims live
-  on the recorder band.
-- **The mixer.** A strip for every track plus a master, each with a fader,
-  pan, a send into the effects bus, an insert rack, and meters. The free desk
-  holds 32 tracks; with a supporter key there is no track limit. Routing goes
-  two ways: a **hardware output** sends a copy of a channel out of your
-  interface's own jacks (a headphone amp, a stage monitor), and a **channel
-  route** moves a channel through another channel, which is how you build a
-  submix. Folders are buses that count as tracks: a group sums its children
-  and runs its own rack over the sum, so a compressor in a folder's bay is a
-  bus compressor.
-- **The arrangement.** Audio and MIDI clips on a timeline, groups that drag
-  their children with them, automation lanes for track controls and plugin
-  parameters (nodes that box-select, copy, paste and make steps), a tempo
-  lane with ramps and steps, time-stretch from a clip's edge (MIDI re-times,
-  audio renders), **quantize** for audio takes as well as MIDI (`Q`: a
-  take's attacks are found and warped onto the grid, with the attack itself
-  left as it was played), and glue for audio and MIDI clips alike.
-- **The MIDI editor and the drum machine.** A piano-roll editor for MIDI
-  clips, and a pad-based drum machine with its own kits. The kit is the one
-  thing that still saves itself, because a kit is hours of sample assignment
-  and the one thing a session must never lose to a missed save. Answering
-  Don't Save on a session you never saved keeps a kit built in it, in that
-  session's folder. A kit can
-  also be saved out as a single file that carries the samples inside it
-  alongside the layout, so kits can be shared with people who do not have
-  your sample folders.
-- **Plugin hosting.** VST3 on macOS, Windows, Linux and FreeBSD; LV2 on Linux
-  and FreeBSD; plugin editor windows everywhere. Scanning is recursive, takes
-  folders you add yourself, and rescans without a restart. A new session's
-  second track holds the built-in Tangent DX7, on a tine electric piano patch.
-- **Stream to OBS.** A native ReaStream-compatible sender pushes the master
-  over localhost UDP to the ReaStream plugin in OBS, so a lesson or a
-  performance can go live without an extra audio driver.
-- **Send to Device.** The master can also play out of a second output, such
-  as a virtual cable (VB-Audio CABLE Input, BlackHole, Loopback), for OBS or
-  Discord to record as an input. On Windows it opens the cable through
-  WASAPI even while the interface plays through ASIO, and it keeps the two
-  devices' clocks in step on its own.
-- **Chord detection, 95 chord patterns against all 12 roots.** Triads,
-  sevenths, extensions, altered dominants, add and sus chords, 6 and 6/9,
-  inversions, slash chords, and rootless voicings, plus **28 scales and
-  modes** when you run instead of hold. Readable labels in parenthetical
-  notation (`C7(b9,#11)`, `Cm(add9)/G`) with lead sheet symbols and a
-  flats/sharps preference.
-- **A theory band.** Circle of fifths, Tonnetz, harmonic triangles and a
-  sheet music panel, in any combination, side by side; the number keys
-  `1`-`4` choose what is up and where. The sheet music panel does six clefs,
-  one at a time or as the grand staff, and all fifteen key signatures. The
-  band shows what you **put there** rather than what you are playing, so it
-  holds still while your hands are busy; *Follow MIDI* makes it live if you
-  would rather.
-- **Guitar view, both ways.** A neck under the piano that places what you hold
-  where a guitarist would play it, weighing hand span, open strings and
-  barres, then holds the shape steady as you add notes. Seven tunings, a
-  capo, three fingerboard woods. With Keytoggle on it is an input too: click
-  the neck to build a shape and read the chord off the piano.
-- **Teach Tangent your names.** *Teach Chord Name…* pins your name to the
-  voicing you are holding, in every key if you want. *Correct Chord Name…*
-  teaches a general leaning instead, so similar voicings shift too. *Manage
-  Taught Chords…* lists, deletes, and can forget everything learned.
-- **Thirty-two themes.** `T` cycles them; every theme carries its own palette,
-  solved against contrast floors rather than picked by eye. Key and note
-  colors are customizable on top.
-- **Keyboard shortcuts.** Hold **H** and every view's bindings appear. **N**
-  names the chord you are holding; the rest is on the card.
-- **A MIDI device picker** that auto-connects at startup, and CLI flags for
-  scripted setups: `tangent -l` lists MIDI input ports, `tangent -p "<port>"`
-  connects to one.
-- **Consistent typography everywhere.** Three typefaces are bundled and
-  embedded, so the app looks identical on all platforms: Terminess Nerd Font
-  Mono by default, and `F` cycles through it, Courier Prime and JetBrains Mono.
+## What it does
 
-The right-click context menu is the primary UI surface. Every feature above
-that is not on screen is reachable from it or from a key (hold **H** to see
-the keys).
+### Record
 
-## Pay what you can
+- Audio and MIDI, on every track you arm at once, with a metronome, a
+  count-in, input trims and software monitoring.
+- A track can listen to several MIDI devices, each on a channel of its own.
+- A take can also save a video of the window, with your camera composited
+  into it. The video is written beside the take's `.wav` and `.mid`, and a
+  take that loses its video still keeps its audio and MIDI. macOS encodes
+  natively; the Windows and Linux downloads carry their own encoder.
+- Audio Setup picks the system and the device: Core Audio on macOS, WASAPI
+  or ASIO on Windows, ALSA or JACK on Linux, and OSS (through ALSA's
+  shim) or JACK on FreeBSD.
 
-Tangent is free software (MIT) and free to download. The free app holds up to
-32 tracks, and every feature is in it: recording, video, plugins, export, and
-buses, returns, sends and routes with no limit for anyone. Nothing is
-time-limited and nothing nags you.
+### Arrange
 
-A [supporter key](https://ganten.gumroad.com/l/ivory) takes the track limit
-away, and it is a way to say the app earned a place in your practice room.
-Every key already sold does the same: keys have no expiry and cover every
-version. The limit only ever stops a new track. A project with more than 32
-tracks opens, plays, edits and saves whole on a free install, and only adding
-the next track asks for a key. Pay what you like, and if you cannot afford it,
-just use the app.
+- Audio and MIDI clips on a timeline. Every clip is a loop: pull its right
+  edge and it repeats. Clips also time-stretch from their edges (MIDI
+  re-times, audio renders).
+- **Quantize** for audio takes as well as MIDI (`Q`): attacks are found and
+  moved onto the grid, and each attack stays as you played it.
+- Glue for audio and MIDI clips, normalize, split, and undo for each gesture.
+- A tempo lane with ramps and steps, and meter changes on the ruler.
+- **Freeze** a track (`Cmd/Ctrl+Shift+F`): it is rendered through its
+  inserts and played from the file, and its plugins stop using the CPU until
+  you thaw it.
+
+### Edit MIDI
+
+- A piano roll with step entry, a note menu, nudge, humanize (`Shift+H`) and
+  audition as you move notes.
+- **Tangent Drums**, a sixteen-pad drum machine. A kit saves as one file
+  with its samples inside, so it opens on another machine with nothing
+  missing.
+
+### Mix
+
+- A strip for every track, plus a master: fader, pan, mute, solo, polarity,
+  insert slots and meters.
+- **Buses and returns**, as many as you want. Any track sends to any number
+  of them, each send at its own level, before or after the fader.
+- **Folders** group tracks and sum them: a folder runs its own inserts over
+  its tracks' mix, and its fader, sends and meter act on the group. A folder
+  counts as a track toward the free limit.
+- Sidechain into Tangent Comp, or into any VST3 that has a key input.
+- Delay compensation across tracks, folders, buses and hardware inserts.
+- Automation lanes for track controls and plugin parameters, in four modes,
+  with nodes you can box-select, copy, paste and turn into steps.
+- **Render ahead** lets heavy plugin chains run in longer stretches, for the
+  CPU headroom of a large buffer without its latency.
+- **Send to Device** plays the master out of a second output as well, such as
+  a virtual audio cable, for a streaming or call app to use as an input.
+
+### Export
+
+- A mixdown or stems, as WAV (16-bit, 24-bit or 32-bit float) or MP3.
+- Pick the tracks, and pick the whole song, the loop or a custom range.
+- Stems are named after their tracks, and can be taken dry or processed.
+- Render at full speed, or in real time for hardware inserts and the odd
+  plugin that needs it.
+
+### Plugins and built-ins
+
+- **VST3** on macOS, Windows, Linux and FreeBSD; **LV2** on Linux and
+  FreeBSD; plugin editor windows everywhere. Scanning is recursive, takes
+  folders you add, and rescans without a restart. Plugins are told the
+  tempo (ramps included), meter, position and transport.
+- Several instruments on one track all play from the same MIDI.
+- **Instruments:** Tangent Keys (eight modelled sounds: grand pianos, tine
+  and reed electric pianos, clavs), an FM synth that reads DX7 patch banks,
+  Tangent Analog (an analog-style synth with an arpeggiator), Tangent Sampler,
+  and Tangent Drums.
+- **Effects:** EQ, Comp, Tape, Imager, Plate, Echo, Chorus, Trem, Wah,
+  Drive, Amp (a tube amp with seven pedal slots), IR (convolution, with a
+  wizard that captures impulse responses from your own gear), Denoise (a
+  noise reducer that learns the noise you play it) and Bitcrush.
+- **Tangent Insert** puts outboard gear in an insert slot: pick the outputs
+  it sends on and the inputs it returns on, press PING to measure the round
+  trip, and the rest of the session stays in time with it.
+- Presets for every built-in, saved as files you can share.
+
+### See what you play
+
+![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
+
+- **Chord naming** as you play: 95 chord patterns against all 12 roots, from
+  triads to altered dominants, slash chords and rootless voicings, plus 28
+  scales and modes. Names read like `C7(b9,#11)` and `Cm(add9)/G`, with
+  lead-sheet symbols and a flats or sharps preference.
+- **A theory band** with the circle of fifths, a Tonnetz, the I-IV-V
+  triangles and sheet music, side by side in any combination (`1` to `4`).
+  The staff reads in six clefs or as a grand staff, in all fifteen key
+  signatures.
+- **A guitar neck** under the piano that places what you hold where a
+  guitarist would play it, in seven tunings with a capo. With Keytoggle on
+  you can click the neck to build a shape and read its chord.
+- **Teach it your names.** *Teach Chord Name...* pins your name to a voicing;
+  *Correct Chord Name...* shifts how it reads similar voicings.
+
+### Everything else
+
+- **Thirty-two themes** (`T` cycles them), each with its own palette of
+  track colours, and three bundled typefaces (`F` cycles them).
+- **Stream to OBS**, the menu's name for a sender that streams the master
+  over UDP to a receiver at an address you choose (this machine unless you
+  change it).
+- `Tab` moves between the keyboard view, the arrangement and the mixer.
+  Everything not on screen is in the right-click menu, and holding `H` shows
+  the shortcuts for the view you are in.
+- `tangent -l` lists MIDI input ports and `tangent -p "<port>"` connects to
+  one, for scripted setups.
+
+## Free, and what a supporter key does
+
+Tangent is free to download and use. The free app holds up to 32 tracks:
+MIDI tracks, audio tracks and folders count. Buses, returns, sends and routes
+have no limit for anyone and are never counted. Every feature on this page is
+in the free app, with no trial, no time limit and no account.
+
+A [supporter key](https://ganten.gumroad.com/l/ivory) ($12 or more, pay what
+you want) removes the track limit. Keys have no expiry and cover every
+version, so a key bought for 4.x does the same in 5.0. The limit only ever
+stops a new track: a project with more than 32 tracks opens, plays, edits,
+exports and saves whole on a free install, and only adding the next track
+asks for a key.
 
 ## Support
 
 Something broken, or something missing? Open an issue on the
 [tracker](https://github.com/ganten1998/tangent/issues), or email
-<tangentdaw@gmail.com>. Both are read by the author.
+<tangentdaw@gmail.com>. The author reads both.
 
 ## Privacy
 
-Tangent collects no data. There is no telemetry, no update check, and no
-account. Your settings, your projects and your taught chords stay on your
-machine, in `~/.config/tangent/` and wherever you save your work. Supporter
-keys are verified offline with a signature check, so no server is contacted
-then either. The one network feature is the OBS stream, which is off by
-default and, when you turn it on, sends audio to an address you choose (your
-own machine, unless you say otherwise). Tangent itself opens no other network
-connection. A plugin you load runs inside Tangent but is its maker's program,
-so what it connects to is up to its maker.
+Tangent collects no data. It has no telemetry, no update check and no
+account. Your settings, projects and recordings stay on your machine, in
+`~/.config/tangent/` and wherever you save your work. A supporter key is
+checked offline with a signature. The one network feature is Stream to OBS,
+which is off until you turn it on and then sends audio only to the address
+you give it. A plugin you load runs inside Tangent but is its maker's
+program, so what it connects to is up to its maker.
 
 ## A note on the name
 

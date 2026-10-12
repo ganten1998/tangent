@@ -1,14 +1,15 @@
 Tangent
-=====
+=======
 
-Tangent draws all 88 piano keys and lights them from your MIDI keyboard in real
-time. As you play, it names what you are playing: triads and sevenths through
-altered dominants, slash chords, rootless jazz voicings, scales and modes. It
-records, mixes and arranges what you play too, and one press writes the audio,
-the MIDI and a video of the window itself.
+Tangent is a DAW: you record audio and MIDI into it, arrange clips on a
+timeline, edit notes in a piano roll, and mix with buses, returns, sends,
+folders and automation. It hosts VST3 plugins (and LV2 on Linux and FreeBSD)
+and comes with its own instruments and effects. As you play, it also names
+the chord under your hands, and a take can film the window with your camera
+in it.
 
-What is not on screen is in the right-click menu or on a key. Hold H to see
-the keys.
+It is free with up to 32 tracks. A supporter key removes the limit; buses,
+returns, sends and routes never count toward it.
 
 
 First launch
@@ -139,16 +140,46 @@ Linux
   files for license compliance, and in case you want them installed system-wide.
 
 
+Your first session
+-----------------
+
+Tangent opens on a new session with tracks ready to play. Three views share
+the window, and Tab moves between them: the keyboard view (the piano, the
+chord names and the theory band), the arrangement, and the mixer. The
+recorder band stays where it is in all three, with the transport, the
+metronome, the project's name and the cog for Settings and Audio Setup.
+
+  Space          play and stop (in the keyboard view, it sounds the lit chord)
+  Cmd/Ctrl+R     record into the arrangement, on every armed track
+  Cmd/Ctrl+T     new track
+  H (hold)       every shortcut for the view you are in
+
+The cassette on the recorder band starts a take, which can also save a video
+of the window beside its audio and MIDI.
+
+Everything that is not on screen is in the right-click menu. Right-click a
+track for New Bus, New Return, Freeze Track and its routing. The plus on an
+empty insert slot loads a plugin, a built-in instrument or a built-in effect.
+
+Audio Setup (the cog on the recorder band) picks the audio system, the
+device, the sample rate and the buffer size. On Windows, pick ASIO there if
+your interface has an ASIO driver.
+
+Click the project's name on the recorder band for New, Open, Save and
+Export. Export writes a mixdown or stems as WAV or MP3, for the whole song,
+the loop or a range you type, with only the tracks you tick.
+
+
 Connecting a MIDI keyboard
 --------------------------
 
-Plug it in, start Tangent, play. Tangent connects on its own at startup: the
-MIDI tracks a new session starts with listen to every device, so every keyboard
-that is plugged in is heard. A session with no MIDI track opens one port,
-preferring ports whose names contain "USB-MIDI", then "Scarlett" or both "USB"
-and "MIDI", and otherwise simply taking the first port it finds.
+Plug it in, start Tangent, play. The MIDI tracks a new session starts with
+listen to every device, so any keyboard that is plugged in is heard on the
+armed track. A session with no MIDI track opens one port, preferring ports
+whose names contain "USB-MIDI", then "Scarlett" or both "USB" and "MIDI", and
+otherwise the first port it finds.
 
-A device plugged in after launching, or unplugged and plugged back in, is picked
+A device plugged in after launch, or unplugged and plugged back in, is picked
 up by itself as long as a track listens to it. If one stays silent after being
 plugged straight back in, leave it out for a few seconds and plug it in again.
 To choose which devices a track listens to, select it, then right-click >
@@ -163,66 +194,67 @@ From a terminal:
 (on macOS that binary lives at /Applications/Tangent.app/Contents/MacOS/tangent)
 
 No keyboard to hand? Press K for Keytoggle, then click keys on the drawn piano
-to hold and release notes. Chord naming behaves exactly the same.
+to hold and release notes.
 
 
 When Tangent names a chord differently than you would
 ---------------------------------------------------
 
-Two menu items, both under Chords when you right-click the piano, and they do
-different things.
+Right-click the piano and look under Chords.
 
-"Teach Chord Name..." pins your name to the exact voicing you are holding. Type
-it, click OK, and that is what Tangent calls it from then on. Tick "Apply in all
-keys" and the name follows that shape into every key. It is greyed out when you
-are not holding anything, because it acts on what you are playing.
+"Teach Chord Name..." pins your name to the exact voicing you are holding.
+Type it and click OK, and Tangent calls that voicing by your name from then
+on. Tick "Apply in all keys" and the name follows the shape into every key.
 
 "Correct Chord Name..." teaches a general preference instead. It lists the
-readings Tangent actually weighed for this voicing, with their scores; pick the
-one you would rather see and click "Learn". Tangent then leans that way
-everywhere, so similar voicings shift too: about one chord in ten, sometimes
-in unrelated keys. That is the feature working, not a fault. If the name you
-want is not in the list, Tangent never considered it and cannot be argued into
-it, so pin it with "Teach Chord Name..." instead. The first correction that lands
-switches Chord Learning on, which also reactivates any earlier corrections.
+readings Tangent weighed for this voicing, with their scores; pick the one you
+would rather see and click "Learn". Tangent then leans that way everywhere, so
+similar voicings shift too, sometimes in unrelated keys. That is the feature
+working. If the name you want is not in the list, Tangent never considered it,
+so pin it with "Teach Chord Name..." instead.
 
-"Manage Taught Chords..." lists everything you have pinned, with a Delete button
-beside each, shows whether learning is on and what it has picked up, and offers
-"Forget Learning", which restores stock chord naming exactly. "Disable Chord
-Learning" in the menu silences learning without erasing anything.
+"Manage Taught Chords..." lists what you have pinned, with a Delete button
+beside each, and "Forget Learning" puts stock chord naming back exactly.
+"Disable Chord Learning" in the menu silences learning without erasing
+anything.
 
 
 Settings
 --------
 
-Colors, window size (75%, 100% or 125%) and borderless mode live in the
-right-click menu, under Colors and Window; dark mode is the D key and flats
-versus sharps the P key. All of them save themselves the moment you change
-them. Reset, at the bottom of the menu, puts back one part at a time (colours
-and theme, layout and windows, playing and theory, the desk, devices and
-folders, the default template) or everything at once, and asks first.
+Colours, themes and the window live in the right-click menu; T cycles the
+thirty-two themes. Settings save themselves the moment you change them.
+Projects do not: New, Open and Quit ask before they discard unsaved changes.
+Reset, at the bottom of the menu, puts back one part at a time (colours and
+theme, layout and windows, playing and theory, the desk, devices and folders,
+the default template) or everything at once, and asks first.
 
 Tangent keeps its settings in two files, at the same path on every platform:
 
-    ~/.config/tangent/settings.json    every setting, from colours to the desk
+    ~/.config/tangent/settings.json    every setting
     ~/.config/tangent/overrides.json   taught chords and learned leanings
 
-On Windows that folder is C:\Users\<you>\.config\tangent\. Deleting one of these
-files resets that part of Tangent and nothing else.
+On Windows that folder is C:\Users\<you>\.config\tangent\. Deleting one of
+these files resets that part of Tangent and nothing else. Your projects live
+wherever you save them.
+
+Coming from Tangent 4.x: 5.0 does not read the old ~/.config/ivory folder and
+removes it the first time it starts. Paste your supporter key again
+(right-click > "Support Tangent..." > Activate); it is in the email it came in.
 
 
 Privacy
 -------
 
-Tangent collects no data and makes no network connections, except Stream to OBS
-(behind the cog on the recorder band), which is off until you turn it on and
-then sends the master's audio over UDP to the host you give it: this machine
-(127.0.0.1) unless you change it. A plugin you load runs inside Tangent but is
-its maker's program, so what it connects to is up to its maker. Your settings
-and your taught chords stay on your machine. There is no telemetry, no update
-check, and no account. The two links in the app, the author's site in the
-About box and the store page in "Support Tangent...", hand the address to your
-browser if you click them, and that is the whole of it.
+Tangent collects no data. It has no telemetry, no update check and no account,
+and it checks a supporter key on your own machine. It makes no network
+connection of its own except Stream to OBS (behind the cog on the recorder
+band), which is off until you turn it on and then sends the master's audio
+over UDP to the host you give it: this machine (127.0.0.1) unless you change
+it. A plugin you load runs inside Tangent but is its maker's program, so what
+it connects to is up to its maker. The two links in the app, the author's
+site in the About box and the store page in "Support Tangent...", open in your
+browser only if you click them.
 
 
 If something looks wrong
@@ -232,14 +264,18 @@ If something looks wrong
       Only one copy runs at a time. Close the other window; if there is no
       window, quit the leftover process.
 
+  No sound
+      Open Audio Setup (the cog on the recorder band) and check the OUTPUT
+      row: it lights the output that is actually playing.
+
+  A keyboard is not heard
+      Arm the track, and check what it listens to: right-click > "Select
+      MIDI Input...", tick the keyboard, or untick everything, which means
+      every device.
+
   No chord names appear
       Chord detection may be switched off. Right-click the piano > Chords >
       "Enable Chord Detection".
-
-  Keys never light up
-      Tangent may not be listening to your keyboard. Right-click > "Select
-      MIDI Input..." and tick it, or untick everything, which means every
-      device.
 
 
 Licenses
@@ -269,5 +305,7 @@ THANKS
   Omer, for the rounded macOS app icon of the 2.x era.
   Hatsu, for extensive Windows testing and feedback.
 
-Tangent is pay-what-you-can, and nothing is a perfectly good amount. Thanks for
-playing.
+Tangent is free with up to 32 tracks, and a supporter key removes the limit:
+https://ganten.gumroad.com/l/ivory
+Source code, release notes and the issue tracker:
+https://github.com/ganten1998/tangent
