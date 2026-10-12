@@ -23,9 +23,9 @@ the machine; a redeploy wipes `/tmp`, so upload after the deploy. The usage
 is `tangent-fulfil announce --subject <text> --body <file> [--ledger <path>]
 [--send]`, tools/tangent-fulfil/src/main.rs:454.)
 
-"Replies come to me" holds only if the deployed service has `MAIL_REPLY_TO`
-unset or pointing at a read inbox (default `tangentdaw@gmail.com`,
-main.rs:352).
+"Replies come to me": the deployed `MAIL_REPLY_TO` is keys@tangentdaw.org,
+which Porkbun forwards to a read inbox (owner, 2026-10-12). Past keys were
+sent from keys@ivorymidi.com, so the body names that address for the search.
 
 ---
 
@@ -68,8 +68,9 @@ Two things to know before you upgrade from 4.x:
    settings, the chord names you taught Tangent, and your key. Your projects
    and recordings are not in it and are not touched. After upgrading, paste
    your key again (right-click anywhere, Support Tangent..., Activate). It is
-   in the email your key first came in, from this same address; if you
-   cannot find it, reply and I will send it again. If you taught Tangent
+   in the email your key first came in: search your inbox for
+   keys@ivorymidi.com. If you cannot find it, reply and I will send it
+   again. If you taught Tangent
    chord names you want to keep, copy the ~/.config/ivory folder somewhere
    safe before you start 5.0, and the release notes say where to put it
    back.
