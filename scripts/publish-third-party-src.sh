@@ -24,7 +24,7 @@
 # move.
 #
 # **Never delete them while the binaries are offered** (the GitHub wipe in
-# docs/release/next/CHECKLIST.md keeps every third-party-src-* tag).
+# docs/release/5.0.0/CHECKLIST.md keeps every third-party-src-* tag).
 #
 # Run it after the repository is public (it refuses a private one: the GPL
 # wants the source available to whoever got the binary, and a private
