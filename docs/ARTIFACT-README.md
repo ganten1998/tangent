@@ -252,6 +252,13 @@ Font License 1.1; see OFL.txt. The other two typefaces, Terminess Nerd Font
 Mono and JetBrains Mono, are under the same license; their license texts are
 in font-licenses/, with those of the four fallback fonts the app embeds.
 
+Where the download has a lame-licenses/ folder (macOS, FreeBSD), the app
+contains LAME, the MP3 encoder, under the GNU LGPL: that folder holds its
+licences and says how to rebuild Tangent with a changed LAME. Where it has
+an ffmpeg-licenses/ folder (Windows, Linux), tangent-ffmpeg is an
+unmodified GPL build of ffmpeg: that folder holds its licence and says
+where its source is published.
+
   macOS     inside the app: right-click Tangent.app > Show Package Contents >
             Contents/Resources
   Windows   next to tangent.exe
