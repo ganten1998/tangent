@@ -10,6 +10,39 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-10-12
+
+The version the arrangement became real in: buses and returns, folders that
+sum their tracks, automation that reaches a plugin, a timeline that keeps its
+promises, and a fourth platform. The last stable release was 4.4.1, so
+everything in this section is new to anyone upgrading from it, including the
+2026-08-31 notes at its end, which were written for a 5.0.0 that was never
+published.
+
+### Removed
+
+- **Tangent as a VST3 plugin.** 3.0.0 added a build of Tangent that ran
+  inside another DAW as a VST3 plugin (`Tangent.vst3`). It is retired: no
+  5.0 download or installer carries it. The macOS and Windows installers
+  remove a `Tangent.vst3` that an older installer left in the system VST3
+  folder; on Linux, delete `~/.vst3/Tangent.vst3` (or the one under your
+  install prefix's `lib/vst3`) yourself. A DAW project that used it will report the plugin as missing. Tangent still
+  hosts VST3 plugins on every platform, and LV2 on Linux and FreeBSD.
+- **4.x settings are cleared on the first launch.** Before 5.0, Tangent kept
+  its settings in `~/.config/ivory/` (on Windows,
+  `%USERPROFILE%\.config\ivory`). 5.0 keeps them in `~/.config/tangent/`
+  and deletes the old `ivory` folder, without reading it, the first time it
+  starts. That folder held your supporter key, the chord names you taught
+  Tangent, and your settings. Your projects and recordings were never in it
+  and are not touched. What to do when upgrading from 4.x:
+  - Paste your supporter key again: right-click anywhere, Support
+    Tangent..., Activate. The key is in the email it came in; if you cannot
+    find it, reply to your Gumroad receipt and it will be sent again.
+  - To keep chord names you taught 4.x, copy the `ivory` folder somewhere
+    safe **before you start 5.0 for the first time**. After 5.0 has started
+    once, quit it and copy `license.key` and `overrides.json` from your copy
+    into `~/.config/tangent/`.
+
 ### Added
 
 - **Middle-drag pans the arrangement and the MIDI editor** (experimental).
@@ -1370,7 +1403,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   session is the likeliest to lose that race, which is why it tended to be
   the same track every time.
 
-
 - **A frozen track's effects now look and behave frozen.** They are already
   in the rendered file, so swapping, bypassing or deleting one changed
   nothing anybody could hear until the track thawed - and the press landed
@@ -1383,7 +1415,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   frozen track's effects went on reading as live. It goes on last now, over
   the bays and the input button, which are the two things on a frozen track
   that do nothing until it thaws.
-
 
 - **A track's effects could be run over the same audio twice.** Only with
   render-ahead on. A reverb or a compressor handed the same stretch of
@@ -1645,7 +1676,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   before this opens on whatever theme is live and records it at the next
   save, and a project naming a theme that has since been deleted opens on
   the default.
-
 
 - **The IR reverb costs less than half what it did, and the reverbs on a
   desk stop landing on the same block.** Two separate faults, both in the
@@ -4002,32 +4032,28 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   from an earlier ALSA session falls back to the host's default instead of
   resolving to nothing.
 
-## [5.0.0] - 2026-08-31
-
-The version the arrangement became real in — groups that are buses, automation
-that reaches a plugin, a timeline that keeps its promises, and a fourth
-platform.
+<!-- The notes below were written on 2026-08-31 for a 5.0.0 that was never published; they are part of this release. -->
 
 ### Added
 
-- **Folders are buses.** A group used to be a drawing: it indented its rows and
+- **Folders sum their tracks.** A group used to be a drawing: it indented its rows and
   changed nothing about the sound. A folder now sums its children in the
   engine, runs its own rack over that sum, and its fader, pan, send and meter
-  govern the group — so a compressor in a folder's bay is a bus compressor and
+  govern the group, so a compressor in a folder's bay is a bus compressor and
   the meter finally moves. A folder drags its children with it, and they stay
   its children when it lands.
 - **Automation across four modes**, with plugin parameters as first-class
   lanes. The master automates like any track, across all six of its bays.
 - **Delay compensation that understands groups.** Every source waits for what
   it does not already pay: its own rack, plus every rack it is folded through.
-  Drum kits are compensated too — they never were, so with any lookahead plugin
+  Drum kits are compensated too; they never were, so with any lookahead plugin
   loaded the drums played early against everything else.
 - **LV2 hosting on Linux and FreeBSD**, plugin editor windows included. VST3
   everywhere.
 - **FreeBSD is a supported platform**, with a native OSS backend for cpal
   beside the ALSA shim, native MIDI, and a package rather than a script.
 - **Sixteen themes with per-theme palettes**, each carrying its own master
-  colour, its own automation dial and its own strip colours — solved against
+  colour, its own automation dial and its own strip colours, solved against
   contrast floors rather than picked by eye.
 
 ### Changed
@@ -4040,7 +4066,7 @@ platform.
   kit is hours of sample assignment and the one thing a session must never
   lose to a missed save.
 - **New starts from the shipped template, always.** Seeding the default wrote
-  the LIVE desk and ran on every New — so opening somebody's session and
+  the LIVE desk and ran on every New, so opening somebody's session and
   pressing New quietly re-wrote the default with that session's desk.
 - **The app wears its own wordmark**, the Tonnetz lattice the splash and the
   theory band already draw, drawn a second time for small sizes because a
@@ -4053,12 +4079,12 @@ platform.
   reading the fader, and the two could disagree for ever: one session played
   28 dB down while its master read 0.0 dB and pushing it did nothing.
 - **A folder is folded exactly once.** Four places put a channel's audio on the
-  bus and each ran the whole strip again over the group — so a stateful plugin
+  bus and each ran the whole strip again over the group, so a stateful plugin
   advanced at twice real time and put out noise, and a clip on a folder at
   -6 dB played at -12.
 - **The window icon fits in one X11 request.** The new artwork asked for 24 MB
   in a single `_NET_WM_ICON`, which poisons the connection rather than being
-  refused as a property — so the app failed to start on Linux and FreeBSD with
+  refused as a property, so the app failed to start on Linux and FreeBSD with
   an error that named neither X11 nor icons.
 - **Quitting with unsaved changes can be discarded.** The prompt's own Discard
   answer could not dismiss it: the flag it tested was the one the host consumes
