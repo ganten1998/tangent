@@ -178,8 +178,9 @@ use vst3::Steinberg::Vst::{
     IConnectionPointTrait, IEditController, IEditControllerTrait, IEventList, IEventListTrait,
     IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, IMessage_iid, IMidiMapping,
     IMidiMappingTrait, IParamValueQueue, IParamValueQueueTrait, IParameterChanges,
-    IParameterChangesTrait, LegacyMIDICCOutEvent, MediaTypes_, NoteOffEvent, NoteOnEvent, ParamID,
-    ParamValue, ProcessData, ProcessModes_, ProcessSetup, SymbolicSampleSizes_, TChar, ViewType,
+    IParameterChangesTrait, IProcessContextRequirements, IProcessContextRequirementsTrait,
+    LegacyMIDICCOutEvent, MediaTypes_, NoteOffEvent, NoteOnEvent, ParamID,
+    ParamValue, ProcessContext, ProcessData, ProcessModes_, ProcessSetup, SymbolicSampleSizes_, TChar, ViewType,
 };
 use vst3::Steinberg::{
     int32, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, tresult, uint32,
@@ -898,6 +899,25 @@ pub struct Instance {
     /// `process_with_controls` reads and writes an array that was allocated
     /// before the audio thread ever saw this object.
     edit_seen: Vec<u64>,
+    /// **Where the song is for the next block**, as the engine last set it
+    /// through [`Instance::set_transport`], or `None` for a caller that has
+    /// never said (the tests, a probe). `None` sends a null context, which
+    /// is what every block sent before this field existed.
+    transport: Option<crate::transport::Transport>,
+    /// The `ProcessContext` the plugin is handed a pointer to, rewritten in
+    /// place every block. A field rather than a local so the pointer is into
+    /// memory this instance owns for the whole call, and so nothing is built
+    /// or freed on the audio thread.
+    context: ProcessContext,
+    /// Samples this instance has processed since it was created: the
+    /// context's `continousTimeSamples`, a clock that never jumps.
+    continuous: i64,
+    /// What the processor said it needs, from
+    /// `IProcessContextRequirements::getProcessContextRequirements` (VST
+    /// 3.7), or `None` for a plugin that does not implement it. Asked once,
+    /// at creation, as the SDK says a host must; see
+    /// [`Instance::context_requirements`] for what is done with it.
+    context_needs: Option<u32>,
     /// Says out loud what this type has always relied on. See the struct docs.
     not_send: NotSend,
 }
@@ -1073,8 +1093,18 @@ impl Instance {
             scratch,
             has_editor: Cell::new(None),
             edit_seen: vec![0; MAX_EDIT_SLOTS],
+            transport: None,
+            context: crate::transport::EMPTY_CONTEXT,
+            continuous: 0,
+            context_needs: None,
             not_send: NOT_SEND,
         };
+        me.context_needs = me
+            .processor
+            .cast::<IProcessContextRequirements>()
+            // SAFETY: the processor is initialised; the call takes no
+            // arguments and returns a bit set.
+            .map(|r| unsafe { r.getProcessContextRequirements() });
 
         me.setup_processing()?;
         me.activate_all_buses();
@@ -1254,6 +1284,38 @@ impl Instance {
 
     pub fn audio_outputs(&self) -> &[Bus] {
         &self.audio_out
+    }
+
+    /// **Where the song is, for the blocks from here on.**
+    ///
+    /// Called by the engine before every block with the timeline position
+    /// of that block's first frame (see `crate::transport`). Plain data, no
+    /// allocation: the context itself is rebuilt in place inside `process`.
+    /// Sticky rather than an argument because the six `process_*` entries
+    /// all want it and none of their callers should be able to forget it on
+    /// one of them; the engine sets it on every rack call, so a stale value
+    /// lives at most until the next block.
+    pub fn set_transport(&mut self, t: crate::transport::Transport) {
+        self.transport = Some(t);
+    }
+
+    /// What the plugin says it needs in its `ProcessContext`
+    /// (`IProcessContextRequirements_::Flags_`), when it says at all.
+    ///
+    /// **Informational, because the answer is always yes.** Every field a
+    /// plugin can ask for that this host can know (tempo, signature,
+    /// transport state, project time in samples and quarters, bar position,
+    /// cycle, continuous time) is filled every block, whether asked for or
+    /// not; the ones it cannot know (system time, chord, frame rate, MIDI
+    /// clock) are left clear with their flags clear, which is what the SDK
+    /// tells a host to do with a field it does not have.
+    pub fn context_requirements(&self) -> Option<u32> {
+        self.context_needs
+    }
+
+    /// The context the last block was handed, for tests and probes.
+    pub fn last_context(&self) -> Option<&ProcessContext> {
+        self.transport.as_ref().map(|_| &self.context)
     }
 
     pub fn event_inputs(&self) -> &[Bus] {
@@ -1682,16 +1744,35 @@ impl Instance {
             outputParameterChanges: std::ptr::null_mut(),
             inputEvents: self.scratch.events_ptr.as_ptr(),
             outputEvents: std::ptr::null_mut(),
-            processContext: std::ptr::null_mut(),
+            processContext: match self.transport.as_ref() {
+                Some(t) => {
+                    crate::transport::fill_context(
+                        &mut self.context,
+                        t,
+                        self.setup.sample_rate,
+                        self.continuous,
+                    );
+                    &mut self.context
+                }
+                // Nobody has said where the song is. Null is what every
+                // block sent before the engine learned to say, and still
+                // the honest answer for a caller with no timeline.
+                None => std::ptr::null_mut(),
+            },
         };
 
         // SAFETY: every pointer in `data` is either null or owned by `self`,
-        // and all of them outlive the call. `inputParameterChanges` points at
+        // and all of them outlive the call. `processContext` is
+        // `self.context`, written just above and not touched again until the
+        // next block. `inputParameterChanges` points at
         // `self.changes` and `inputEvents` at `self.scratch.events`, both alive
         // for the whole `Instance` and both only written between calls;
         // `outputs` is `self.scratch.buses`, rebound five lines up to the
         // channel pointers this block is rendering into.
         let r = unsafe { self.processor.process(&mut data) };
+        // The block happened whether or not the plugin liked it: continuous
+        // time counts samples the host has driven, not samples that worked.
+        self.continuous = self.continuous.saturating_add(frames as i64);
         if r != kResultOk {
             return Err(format!("process returned {r}"));
         }
@@ -3407,6 +3488,37 @@ mod tests {
         assert_eq!(touches, 2, "one allocation and one free");
         let (_, quiet) = while_counting(|| ());
         assert_eq!(quiet, 0);
+    }
+
+    /// **Telling a plugin where the song is costs the allocator nothing.**
+    ///
+    /// The context is rebuilt in place every block inside `process_through`
+    /// and the LV2 object is a stack array, so both run on the audio thread.
+    /// Counted here rather than reasoned about, beside the counter that
+    /// would see it.
+    #[test]
+    fn the_transport_is_built_without_allocating() {
+        let t = crate::transport::Transport {
+            playing: true,
+            recording: true,
+            sample: 1 << 20,
+            quarters: 37.25,
+            bar_start: 36.0,
+            bar: 9,
+            tempo: 131.5,
+            numerator: 7,
+            denominator: 8,
+            cycle: Some((32.0, 48.0)),
+        };
+        let urids = crate::transport::TimeUrids::default();
+        let mut ctx = crate::transport::EMPTY_CONTEXT;
+        let (body, touches) = while_counting(|| {
+            crate::transport::fill_context(&mut ctx, &t, 48_000.0, 4096);
+            crate::transport::position_body(&t, &urids)
+        });
+        assert_eq!(touches, 0, "building the transport went to the allocator {touches} times");
+        assert_eq!(ctx.projectTimeMusic, 37.25);
+        assert_eq!(body.len(), crate::transport::POSITION_BODY);
     }
 
     /// **An effect is fed audio, and a plugin that wants more channels than
