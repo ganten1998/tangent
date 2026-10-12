@@ -141,6 +141,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Bigger icons in the track menu.** The icon picker on a track's
+  right-click menu draws its icons a third bigger (42 points, was 31),
+  nine to a row instead of twelve, with the menu grown to fit so the
+  palette list keeps its room. They sit on whole pixels so they stay sharp.
+
+- **New Track always adds at the end.** The plus under the last track
+  (timeline and mixer) and Ctrl/Cmd+T now put the new track after every
+  other track, whatever is selected; they used to put it under the
+  selected track. The new track is selected and scrolled into view, and
+  one undo takes it back. It never joins a folder that happens to be last.
+  To put a track somewhere in particular, use Insert Track Below on a
+  track's right-click menu, or the plus on an empty row, as before.
+
 - **Stems are named after their tracks.** Each stem is now
   `<track name>.wav` in the stems folder of the project's export folder,
   with no row number in front. Names are made safe for every system the
