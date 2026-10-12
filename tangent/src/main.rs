@@ -902,7 +902,7 @@ fn main() {
     // follows it — either would have to run after this, not before, or the
     // pre-5.0 directory would still be sitting there next to a new one.
     if tangent_core::config::purge_pre_5_0() {
-        log::info!("removed the pre-5.0 ~/.config/tangent");
+        log::info!("removed the 4.x settings folder ~/.config/ivory");
     }
 
     // **The graph-clock claim's crash road.** The claim (see
