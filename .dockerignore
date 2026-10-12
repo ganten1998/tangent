@@ -14,3 +14,7 @@ dist
 assets
 tests
 tools/tangent-keygen
+
+# Third-party SDKs and caches (the ASIO SDK may not be redistributed; the
+# ffmpeg archives are 250 MB). Nothing in the fulfil image reads them.
+vendor
