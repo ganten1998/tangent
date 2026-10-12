@@ -5954,14 +5954,12 @@ mod tests {
     /// it should read as the file chosen".
     ///
     /// **And the word on it is the SOUND**, which is the strip's own detail
-    /// — the file that ships has a name of its own ("UREI CLICK") and it is
-    /// not "CLICK", which is what the name plate two bands above it already
-    /// says. The owner: "make the name what the actual default file urei
-    /// click is."
+    /// (the bundled click reads "CLICK" since the owner's 2026-10-12 ruling
+    /// that the app names no hardware brand; a chosen file shows its name).
     #[test]
     fn the_click_carries_the_metronomes_own_button() {
         let mut v = a_view();
-        v.strips[CLICK].detail = "UREI CLICK";
+        v.strips[CLICK].detail = "CLICK";
         let l = Layout::new(rect(), &v);
         let click = &l.strips[CLICK];
         assert!(click.met.is_positive(), "the click has no sound button");

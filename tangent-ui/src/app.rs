@@ -11467,18 +11467,18 @@ impl TangentApp {
     fn tend_click_word(&mut self) {
         /// **What the bundled click is CALLED.**
         ///
-        /// `assets/click.wav` is a 48 kHz mono 24-bit UREI click — the
-        /// owner's own file, and `docs/RECORDER-PLAN.md` is where that is
-        /// written down. Spelled the way a chosen file's name is spelled on
-        /// this chip, which is upper case.
-        const BUNDLED_CLICK_WORD: &str = "UREI CLICK";
+        /// `assets/click.wav` is the owner's own file (`docs/RECORDER-PLAN.md`
+        /// records where it came from). It was named after the hardware it
+        /// was sampled from until 2026-10-12, when the owner ruled the
+        /// shipped app names no hardware brand: it is the plain "CLICK".
+        /// Spelled the way a chosen file's name is spelled on this chip,
+        /// which is upper case.
+        const BUNDLED_CLICK_WORD: &str = "CLICK";
         let want = if self.settings.click_sample.is_empty() {
-            // **The file that SHIPS, by its own name.** It read "CLICK",
-            // which is the word already on the strip's name plate two bands
-            // above the chip — one control saying what the strip is called
-            // rather than what it is playing. `assets/click.wav` is a UREI
-            // click (docs/RECORDER-PLAN.md records where it came from), and
-            // that is the thing to name.
+            // **The file that SHIPS.** It once read the hardware's name; the
+            // owner ruled on 2026-10-12 that the app names no brand, so the
+            // bundled click is "CLICK" and a chosen file still shows its own
+            // name.
             BUNDLED_CLICK_WORD.to_owned()
         } else {
             std::path::Path::new(&self.settings.click_sample)
