@@ -1,5 +1,5 @@
 # Tangent 5.0.0 store kit
-Everything to paste, in one place. Sources: docs/release/next/GUMROAD.md (product page), docs/STORE-CONTENT.md (links + post-purchase page), WEBSITE-CARD.md, ANNOUNCE.md. Edit those, not this file; regenerate this from them.
+Everything to paste, in one place. Sources: docs/release/5.0.0/GUMROAD.md (product page), docs/STORE-CONTENT.md (links + post-purchase page), WEBSITE-CARD.md, ANNOUNCE.md. Edit those, not this file; regenerate this from them.
 **Order:** publish 5.0.0 on GitHub (repo public) -> `scripts/check-store-links.sh` green while signed out -> paste the product page and post-purchase page -> re-enable the product -> `fly deploy` tangent-fulfil -> website card -> announcement -> set the GitHub description (CHECKLIST.md G5).
 
 ---
@@ -46,7 +46,7 @@ Free with up to 32 tracks; a supporter key removes the limit.
 
 ## Price
 
-$12, "pay what you want", minimum $12.
+"Pay what you want", minimum $9, suggested price $15. In Gumroad: set the price to $9, tick "Let customers pay what they want", and set the suggested amount to $15.
 
 ---
 

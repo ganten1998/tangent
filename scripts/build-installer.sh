@@ -99,7 +99,14 @@ build_macos() {
   # updates ~/Downloads and leaves /Applications empty. Turning it off is the
   # single most important line in this script.
   pkgbuild --analyze --root "$WORK/macos/root-app" "$WORK/macos/app.plist" >/dev/null
-  /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$WORK/macos/app.plist"
+  # macOS 27's `pkgbuild --analyze` no longer writes the key at all (it did
+  # through macOS 26), and PlistBuddy cannot Set a missing entry, so the
+  # field is removed if present and added explicitly: the result is the same
+  # `false` on every macOS this has to build on.
+  /usr/libexec/PlistBuddy -c "Delete :0:BundleIsRelocatable" "$WORK/macos/app.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$WORK/macos/app.plist"
+  [ "$(/usr/libexec/PlistBuddy -c "Print :0:BundleIsRelocatable" "$WORK/macos/app.plist")" = false ] \
+    || { echo "error: the component plist does not say BundleIsRelocatable=false" >&2; exit 1; }
 
   pkgbuild --root "$WORK/macos/root-app" \
     --component-plist "$WORK/macos/app.plist" \

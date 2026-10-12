@@ -55,7 +55,7 @@ Free with up to 32 tracks; a supporter key removes the limit.
 
 ## Price
 
-$12, "pay what you want", minimum $12.
+"Pay what you want", minimum $9, suggested price $15. In Gumroad: set the price to $9, tick "Let customers pay what they want", and set the suggested amount to $15.
 
 ---
 
