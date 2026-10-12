@@ -1002,21 +1002,39 @@ impl Instance {
         // added, which `from_raw` takes ownership of.
         let component = unsafe { ComPtr::<IComponent>::from_raw(raw.cast()) }
             .ok_or_else(|| "instantiated a null component".to_string())?;
+        Self::assemble(component, host, host_unknown, &class.name, setup, |c, h, handler| {
+            attach_controller(module, c, h, handler)
+        })
+    }
 
+    /// **Everything after the component exists**: initialise it, find its
+    /// processor, attach the controller `attach` builds, read the layout,
+    /// size the scratch, set up and activate. Split from [`Instance::create`]
+    /// so a test can hand a component of its own (`from_component`) and
+    /// reach the real `process` path without a plugin on the machine.
+    fn assemble(
+        component: ComPtr<IComponent>,
+        host: ComWrapper<HostApp>,
+        host_unknown: ComPtr<IHostApplication>,
+        name: &str,
+        setup: Setup,
+        attach: impl FnOnce(
+            &ComPtr<IComponent>,
+            &ComPtr<IHostApplication>,
+            &ComWrapper<ComponentHandler>,
+        ) -> Option<Editing>,
+    ) -> Result<Self, String> {
         // SAFETY: freshly created component; the host context outlives it,
         // because `Instance` owns both and drops the component first.
         let result = unsafe { component.initialize(host_unknown.as_ptr().cast()) };
         if result != kResultOk {
-            return Err(format!("{}: initialize failed ({result})", class.name));
+            return Err(format!("{name}: initialize failed ({result})"));
         }
 
         let Some(processor) = component.cast::<IAudioProcessor>() else {
             // SAFETY: initialize succeeded, so terminate is owed.
             unsafe { component.terminate() };
-            return Err(format!(
-                "{} is an Audio Module Class but has no IAudioProcessor",
-                class.name
-            ));
+            return Err(format!("{name} is an Audio Module Class but has no IAudioProcessor"));
         };
 
         // Before setupProcessing, matching the SDK's own host sequence: the
@@ -1025,7 +1043,7 @@ impl Instance {
         // this file before the editor landed, it is still here when this
         // returns.
         let handler = ComWrapper::new(ComponentHandler::new());
-        let editing = attach_controller(module, &component, &host_unknown, &handler);
+        let editing = attach(&component, &host_unknown, &handler);
         let midi_map = read_midi_map(&component, editing.as_ref());
 
         let changes = ComWrapper::new(ParamChanges::new());
@@ -1110,6 +1128,17 @@ impl Instance {
         me.activate_all_buses();
         me.set_active(true)?;
         Ok(me)
+    }
+
+    /// An instance over a component the caller built, with no controller:
+    /// the test double's road into the real `process` path.
+    #[cfg(test)]
+    fn from_component(component: ComPtr<IComponent>, setup: Setup) -> Result<Self, String> {
+        let host = ComWrapper::new(HostApp::new());
+        let host_unknown = host
+            .to_com_ptr::<IHostApplication>()
+            .ok_or_else(|| "could not build the host context".to_string())?;
+        Self::assemble(component, host, host_unknown, "test double", setup, |_, _, _| None)
     }
 
     fn setup_processing(&mut self) -> Result<(), String> {
@@ -3509,6 +3538,8 @@ mod tests {
             numerator: 7,
             denominator: 8,
             cycle: Some((32.0, 48.0)),
+            cycle_active: true,
+            map_epoch: 3,
         };
         let urids = crate::transport::TimeUrids::default();
         let mut ctx = crate::transport::EMPTY_CONTEXT;
@@ -3834,6 +3865,204 @@ mod tests {
         unsafe fn getState(&self, _state: *mut vst3::Steinberg::IBStream) -> tresult {
             kResultOk
         }
+    }
+
+    /// **A plugin double that records the `ProcessContext` it is handed**,
+    /// read through the pointer INSIDE its own `process`, which is the only
+    /// place a plugin ever reads it. One stereo output, no inputs, and a
+    /// VST 3.7 `IProcessContextRequirements` answer the host should keep.
+    struct TimeProbe {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<(u32, f64, i64, i64, f64, f64, f64, i32, i32)>>>>,
+    }
+
+    /// What the probe answers `getProcessContextRequirements` with: tempo,
+    /// time signature and transport state.
+    const PROBE_NEEDS: u32 = 64 | 128 | 1024;
+
+    impl Class for TimeProbe {
+        type Interfaces = (IComponent, IAudioProcessor, IProcessContextRequirements);
+    }
+
+    impl IPluginBaseTrait for TimeProbe {
+        unsafe fn initialize(&self, _context: *mut vst3::Steinberg::FUnknown) -> tresult {
+            kResultOk
+        }
+        unsafe fn terminate(&self) -> tresult {
+            kResultOk
+        }
+    }
+
+    impl IComponentTrait for TimeProbe {
+        unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
+            kResultFalse
+        }
+        unsafe fn setIoMode(&self, _mode: vst3::Steinberg::Vst::IoMode) -> tresult {
+            kResultOk
+        }
+        unsafe fn getBusCount(
+            &self,
+            media: vst3::Steinberg::Vst::MediaType,
+            dir: vst3::Steinberg::Vst::BusDirection,
+        ) -> int32 {
+            int32::from(media == MediaTypes_::kAudio as i32 && dir == BusDirections_::kOutput as i32)
+        }
+        unsafe fn getBusInfo(
+            &self,
+            media: vst3::Steinberg::Vst::MediaType,
+            dir: vst3::Steinberg::Vst::BusDirection,
+            _index: int32,
+            bus: *mut BusInfo,
+        ) -> tresult {
+            // SAFETY: the caller hands a valid out-parameter.
+            let out = unsafe { &mut *bus };
+            out.mediaType = media;
+            out.direction = dir;
+            out.channelCount = 2;
+            out.name.fill(0);
+            out.busType = 0;
+            out.flags = 0;
+            kResultOk
+        }
+        unsafe fn getRoutingInfo(
+            &self,
+            _in_info: *mut vst3::Steinberg::Vst::RoutingInfo,
+            _out_info: *mut vst3::Steinberg::Vst::RoutingInfo,
+        ) -> tresult {
+            kResultFalse
+        }
+        unsafe fn activateBus(
+            &self,
+            _media: vst3::Steinberg::Vst::MediaType,
+            _dir: vst3::Steinberg::Vst::BusDirection,
+            _index: int32,
+            _state: vst3::Steinberg::TBool,
+        ) -> tresult {
+            kResultOk
+        }
+        unsafe fn setActive(&self, _state: vst3::Steinberg::TBool) -> tresult {
+            kResultOk
+        }
+        unsafe fn setState(&self, _state: *mut vst3::Steinberg::IBStream) -> tresult {
+            kResultOk
+        }
+        unsafe fn getState(&self, _state: *mut vst3::Steinberg::IBStream) -> tresult {
+            kResultOk
+        }
+    }
+
+    impl IAudioProcessorTrait for TimeProbe {
+        unsafe fn setBusArrangements(
+            &self,
+            _inputs: *mut vst3::Steinberg::Vst::SpeakerArrangement,
+            _num_ins: int32,
+            _outputs: *mut vst3::Steinberg::Vst::SpeakerArrangement,
+            _num_outs: int32,
+        ) -> tresult {
+            kResultOk
+        }
+        unsafe fn getBusArrangement(
+            &self,
+            _dir: vst3::Steinberg::Vst::BusDirection,
+            _index: int32,
+            _arr: *mut vst3::Steinberg::Vst::SpeakerArrangement,
+        ) -> tresult {
+            kResultFalse
+        }
+        unsafe fn canProcessSampleSize(&self, _size: int32) -> tresult {
+            kResultOk
+        }
+        unsafe fn getLatencySamples(&self) -> uint32 {
+            0
+        }
+        unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+            kResultOk
+        }
+        unsafe fn setProcessing(&self, _state: vst3::Steinberg::TBool) -> tresult {
+            kResultOk
+        }
+        unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+            // SAFETY: the host hands a valid `ProcessData` for the call, and
+            // its context pointer, when not null, is valid for the call too.
+            let ctx = unsafe { (*data).processContext.as_ref() };
+            let row = ctx.map(|c| {
+                (
+                    c.state,
+                    c.sampleRate,
+                    c.projectTimeSamples,
+                    c.continousTimeSamples,
+                    c.projectTimeMusic,
+                    c.barPositionMusic,
+                    c.tempo,
+                    c.timeSigNumerator,
+                    c.timeSigDenominator,
+                )
+            });
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(row);
+            }
+            kResultOk
+        }
+        unsafe fn getTailSamples(&self) -> uint32 {
+            0
+        }
+    }
+
+    impl IProcessContextRequirementsTrait for TimeProbe {
+        unsafe fn getProcessContextRequirements(&self) -> uint32 {
+            PROBE_NEEDS
+        }
+    }
+
+    /// **The context reaches the plugin's own `process` call.** Every block
+    /// before `set_transport` existed went out with a null pointer, and a
+    /// builder that filled a struct nobody pointed at would pass every test
+    /// of the builder. This drives the real `process_through` into a double
+    /// that reads the pointer from inside its `process`.
+    #[test]
+    fn the_plugin_reads_the_filled_context_inside_its_own_process() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let component = ComWrapper::new(TimeProbe { seen: seen.clone() })
+            .to_com_ptr::<IComponent>()
+            .expect("the wrapper exposes IComponent");
+        let setup = Setup { sample_rate: 44_100.0, max_block: 128 };
+        let mut inst = Instance::from_component(component, setup).expect("the double assembles");
+        assert_eq!(inst.context_requirements(), Some(PROBE_NEEDS), "the requirements were not asked for");
+        let mut out = vec![vec![0.0f32; 128]; 2];
+
+        // Nobody has said where the song is: null, as before.
+        inst.process(&[], 64, &mut out).expect("a block");
+        let t = crate::transport::Transport {
+            playing: true,
+            recording: false,
+            sample: 88_200,
+            quarters: 6.5,
+            bar_start: 4.0,
+            bar: 1,
+            tempo: 133.0,
+            numerator: 5,
+            denominator: 4,
+            cycle: None,
+            cycle_active: false,
+            map_epoch: 0,
+        };
+        inst.set_transport(t);
+        inst.process(&[], 64, &mut out).expect("a block");
+        inst.set_transport(crate::transport::Transport { sample: 88_264, playing: false, ..t });
+        inst.process(&[], 32, &mut out).expect("a block");
+
+        let seen = seen.lock().expect("the probe's log").clone();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].is_none(), "a caller that never set a transport sent a context");
+        let (state, rate, sample, cont, q, bar, tempo, num, den) =
+            seen[1].expect("the plugin was handed no context");
+        use vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_ as F;
+        assert_ne!(state & F::kPlaying as u32, 0);
+        assert_ne!(state & F::kTempoValid as u32, 0);
+        assert_eq!((rate, sample, q, bar, tempo, num, den), (44_100.0, 88_200, 6.5, 4.0, 133.0, 5, 4));
+        assert_eq!(cont, 64, "continuous time counts the first, context-less block too");
+        let (state, _, sample, cont, ..) = seen[2].expect("the plugin was handed no context");
+        assert_eq!(state & F::kPlaying as u32, 0, "a stop did not reach the plugin");
+        assert_eq!((sample, cont), (88_264, 128));
     }
 
     #[test]
