@@ -44,9 +44,21 @@ pub struct Transport {
     /// The signature in force in that bar.
     pub numerator: i32,
     pub denominator: i32,
-    /// The loop, in quarters, when one is set. Set means ACTIVE here: the
-    /// engine has no "defined but switched off" loop.
+    /// The loop, in quarters, when one is set (VST3's `kCycleValid`).
     pub cycle: Option<(f64, f64)>,
+    /// **The block starts inside that loop** (`kCycleActive`): a loop the
+    /// playhead started beyond, and plays on past, is set but not active,
+    /// because the engine will never wrap it. A block that starts inside
+    /// and runs over the loop's end is active and is NOT cut there: the
+    /// engine renders it straight on and folds the overshoot into the next
+    /// block's start, which is the position that block is then told.
+    pub cycle_active: bool,
+    /// **Which version of the tempo and meter maps the figures above were
+    /// read from.** Bumped whenever the engine takes a new pair, so a plugin
+    /// that is only told the position when it changes (LV2, see
+    /// [`TimeGate`]) is told again when an edit moved the music under a
+    /// playhead whose sample did not move.
+    pub map_epoch: u64,
 }
 
 impl Default for Transport {
@@ -64,6 +76,8 @@ impl Default for Transport {
             numerator: 4,
             denominator: 4,
             cycle: None,
+            cycle_active: false,
+            map_epoch: 0,
         }
     }
 }
@@ -131,7 +145,10 @@ pub fn fill_context(ctx: &mut ProcessContext, t: &Transport, rate: f64, continuo
     }
     let (cycle_a, cycle_b) = match t.cycle {
         Some((a, b)) if b > a && a.is_finite() && b.is_finite() => {
-            state |= F::kCycleActive | F::kCycleValid;
+            state |= F::kCycleValid;
+            if t.cycle_active {
+                state |= F::kCycleActive;
+            }
             (a, b)
         }
         _ => (0.0, 0.0),
@@ -278,6 +295,62 @@ pub fn position_body(t: &Transport, urids: &TimeUrids) -> [u8; POSITION_BODY] {
     out
 }
 
+/// **When an LV2 plugin is owed a `time:Position`.**
+///
+/// A plugin is entitled to resync its phase on every position it is sent,
+/// so one is sent only when the block's position is not the one the plugin
+/// can work out for itself from the last: the first block, any jump (a
+/// locate, a loop wrap, a repeat at the same place), a start or a stop, a
+/// tempo or signature change (every block of a ramp), and any new version
+/// of the maps (`map_epoch`: an edit earlier in the song moves the music
+/// under a sample that did not move). Ardour sends on the same rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TimeGate {
+    expect: Option<(i64, bool, u64, i32, i32, u64)>,
+}
+
+impl TimeGate {
+    /// Whether the block `t`, `frames` long, needs a position sent, and
+    /// remember what the next block should then look like.
+    pub fn due(&mut self, t: &Transport, frames: usize) -> bool {
+        let key = |sample: i64| (sample, t.playing, t.tempo.to_bits(), t.numerator, t.denominator, t.map_epoch);
+        let send = self.expect != Some(key(t.sample));
+        let next = if t.playing { t.sample.saturating_add(frames as i64) } else { t.sample };
+        self.expect = Some(key(next));
+        send
+    }
+}
+
+/// What one LV2 port is, for [`time_port_positions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortClass {
+    pub input: bool,
+    pub audio: bool,
+    pub control: bool,
+    pub atom: bool,
+    /// It declares `atom:supports time:Position`.
+    pub time: bool,
+}
+
+/// **Which atom-sequence inputs want the song's position**, as positions
+/// AMONG the atom inputs (the order livi connects its sequences in), from
+/// the plugin's ports in port-index order. An atom input is classed as livi
+/// classes it: an input that is neither audio nor control and is an atom
+/// port.
+pub fn time_port_positions(ports: impl IntoIterator<Item = PortClass>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    for p in ports {
+        if p.input && !p.audio && !p.control && p.atom {
+            if p.time {
+                out.push(k);
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
 fn pad4(v: f32) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[..4].copy_from_slice(&v.to_ne_bytes());
@@ -306,6 +379,8 @@ mod tests {
             numerator: 3,
             denominator: 4,
             cycle: None,
+            cycle_active: false,
+            map_epoch: 0,
         }
     }
 
@@ -352,7 +427,7 @@ mod tests {
     #[test]
     fn a_loop_and_a_take_are_flagged() {
         let mut ctx = EMPTY_CONTEXT;
-        let t = Transport { recording: true, cycle: Some((8.0, 16.0)), ..rolling_at(9.0) };
+        let t = Transport { recording: true, cycle: Some((8.0, 16.0)), cycle_active: true, ..rolling_at(9.0) };
         fill_context(&mut ctx, &t, 48_000.0, 0);
         assert_ne!(ctx.state & F::kRecording as u32, 0);
         assert_ne!(ctx.state & F::kCycleActive as u32, 0);
@@ -362,6 +437,11 @@ mod tests {
         let t = Transport { cycle: Some((8.0, 8.0)), ..t };
         fill_context(&mut ctx, &t, 48_000.0, 0);
         assert_eq!(ctx.state & (F::kCycleActive | F::kCycleValid) as u32, 0);
+        // A loop the playhead is beyond is still a loop, but not one it is in.
+        let t = Transport { cycle: Some((8.0, 16.0)), cycle_active: false, ..rolling_at(20.0) };
+        fill_context(&mut ctx, &t, 48_000.0, 0);
+        assert_ne!(ctx.state & F::kCycleValid as u32, 0, "a set loop is valid");
+        assert_eq!(ctx.state & F::kCycleActive as u32, 0, "a loop the playhead is past is not active");
     }
 
     #[test]
@@ -371,6 +451,50 @@ mod tests {
         fill_context(&mut ctx, &t, 48_000.0, 0);
         assert_eq!(ctx.tempo, 120.0);
         assert_eq!((ctx.timeSigNumerator, ctx.timeSigDenominator), (1, 1));
+    }
+
+    #[test]
+    fn the_gate_sends_on_a_jump_a_change_or_a_new_map_and_not_otherwise() {
+        let mut g = TimeGate::default();
+        let t = rolling_at(5.0);
+        assert!(g.due(&t, 256), "the first block is always told");
+        let next = Transport { sample: t.sample + 256, ..t };
+        assert!(!g.due(&next, 256), "a block exactly where the last one ran to is not");
+        let after = Transport { sample: next.sample + 256, ..t };
+        assert!(!g.due(&after, 256));
+        // A repeat of the same place is a jump backwards.
+        assert!(g.due(&after, 256), "the same position twice is a jump");
+        let mut g = TimeGate::default();
+        g.due(&t, 256);
+        assert!(g.due(&Transport { sample: t.sample + 1000, ..t }, 256), "a locate");
+        let mut g = TimeGate::default();
+        g.due(&t, 256);
+        assert!(g.due(&Transport { sample: t.sample + 256, tempo: 101.0, ..t }, 256), "a tempo change");
+        let mut g = TimeGate::default();
+        g.due(&t, 256);
+        assert!(g.due(&Transport { sample: t.sample + 256, map_epoch: 1, ..t }, 256), "a map edit");
+        let mut g = TimeGate::default();
+        g.due(&t, 256);
+        assert!(g.due(&Transport { sample: t.sample + 256, playing: false, ..t }, 256), "a stop");
+        // Stopped, the place does not move, and nothing is resent.
+        let parked = Transport { playing: false, ..t };
+        let mut g = TimeGate::default();
+        assert!(g.due(&parked, 256));
+        assert!(!g.due(&parked, 256), "a parked playhead is told once");
+    }
+
+    #[test]
+    fn time_ports_are_counted_among_the_atom_inputs_only() {
+        let audio_in = PortClass { input: true, audio: true, ..Default::default() };
+        let control_in = PortClass { input: true, control: true, ..Default::default() };
+        let atom_in = PortClass { input: true, atom: true, ..Default::default() };
+        let atom_out = PortClass { input: false, atom: true, time: true, ..Default::default() };
+        let timed = PortClass { time: true, ..atom_in };
+        // audio, control, atom (patch), atom out, control, atom (time).
+        let ports = [audio_in, control_in, atom_in, atom_out, control_in, timed];
+        assert_eq!(time_port_positions(ports), vec![1], "the second atom input, not port 5");
+        assert_eq!(time_port_positions([timed, atom_in, timed]), vec![0, 2]);
+        assert!(time_port_positions([audio_in, atom_out]).is_empty());
     }
 
     fn urids() -> TimeUrids {
@@ -418,6 +542,8 @@ mod tests {
             numerator: 6,
             denominator: 8,
             cycle: None,
+            cycle_active: false,
+            map_epoch: 0,
         };
         let body = position_body(&t, &u);
         assert_eq!(word(&body, 0), 0, "blank object id");

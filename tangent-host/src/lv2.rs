@@ -254,26 +254,22 @@ fn scan_meta() -> std::collections::HashMap<String, PluginMeta> {
             .is_some_and(|uis| uis.into_iter().any(|u| u.is_a(&x11)));
 
         let mut controls = Vec::new();
-        let mut time_ports = Vec::new();
         // The atom inputs counted in livi's order: port-index order, and
-        // classed exactly as livi classes them (input, neither audio nor
-        // control, an atom port), so position `k` here is `atom_in[k]` there.
-        let mut atom_inputs = 0usize;
+        // classed exactly as livi classes them, so position `k` there is
+        // `atom_in[k]` here. See `transport::time_port_positions`.
+        let time_ports = crate::transport::time_port_positions((0..plugin.ports_count()).map(|i| {
+            plugin.port_by_index(i).map_or_else(Default::default, |port| crate::transport::PortClass {
+                input: port.is_a(&input),
+                audio: port.is_a(&audio),
+                control: port.is_a(&control),
+                atom: port.is_a(&atom_port),
+                time: port.supports_event(&position),
+            })
+        }));
         for i in 0..plugin.ports_count() {
             let Some(port) = plugin.port_by_index(i) else {
                 continue;
             };
-            if port.is_a(&input)
-                && !port.is_a(&audio)
-                && !port.is_a(&control)
-                && port.is_a(&atom_port)
-            {
-                if port.supports_event(&position) {
-                    time_ports.push(atom_inputs);
-                }
-                atom_inputs += 1;
-                continue;
-            }
             if !port.is_a(&control) || !port.is_a(&input) {
                 continue;
             }
@@ -455,12 +451,8 @@ pub struct Instance {
     /// creation because the URID map takes a lock.
     time_ports: Vec<usize>,
     time_urids: crate::transport::TimeUrids,
-    /// Where the song should be at the start of the next block if nothing
-    /// jumps: the sample, and the rolling, tempo and signature it would
-    /// still have. A position is sent when the next block's differs, as
-    /// Ardour does, rather than every block: a plugin is entitled to resync
-    /// its phase on each one it receives. `None` until the first block.
-    time_expect: Option<(i64, bool, u64, i32, i32)>,
+    /// When the next position is owed: see [`crate::transport::TimeGate`].
+    time_gate: crate::transport::TimeGate,
 }
 
 impl Instance {
@@ -550,7 +542,7 @@ impl Instance {
             latency_port: plugin_meta.latency_port.map(livi::PortIndex),
             time_urids: crate::transport::TimeUrids::mapped(|uri| cat.features.urid(uri)),
             time_ports: plugin_meta.time_ports,
-            time_expect: None,
+            time_gate: crate::transport::TimeGate::default(),
         })
     }
 
@@ -682,22 +674,7 @@ impl Instance {
     /// array and the sequence was allocated at creation.
     pub fn begin_block(&mut self, t: &crate::transport::Transport, frames: usize) {
         self.clear_midi();
-        let now = (
-            t.sample,
-            t.playing,
-            t.tempo.to_bits(),
-            t.numerator,
-            t.denominator,
-        );
-        let send = self.time_expect != Some(now);
-        self.time_expect = Some((
-            if t.playing { t.sample.saturating_add(frames as i64) } else { t.sample },
-            now.1,
-            now.2,
-            now.3,
-            now.4,
-        ));
-        if !send || self.time_ports.is_empty() {
+        if !self.time_gate.due(t, frames) || self.time_ports.is_empty() {
             return;
         }
         let body = crate::transport::position_body(t, &self.time_urids);
@@ -708,8 +685,9 @@ impl Instance {
         );
         for &k in &self.time_ports {
             if let Some(seq) = self.atom_in.get_mut(k) {
-                // A full sequence drops the position rather than failing the
-                // block; it is resent on the next jump.
+                // The sequence was emptied two lines up and holds 8 KiB, so
+                // this cannot be full; were it, the position is dropped
+                // rather than the block failed.
                 let _ = seq.push_event(&event);
             }
         }
@@ -882,6 +860,47 @@ mod tests {
     }
 
     const AMP: &str = "http://lv2plug.in/plugins/eg-amp";
+    /// The spec's metronome: one atom input, `atom:supports time:Position`.
+    const METRO: &str = "http://lv2plug.in/plugins/eg-metro";
+
+    /// **The metronome's control port is found as the time port, the
+    /// position goes FIRST in the block's sequence, ahead of the MIDI
+    /// pushed after it, and it is not resent to a block that continues.**
+    #[test]
+    fn a_time_port_is_told_the_position_first_and_only_when_it_moves() {
+        if !have(METRO) {
+            return;
+        }
+        assert_eq!(meta_for(METRO).time_ports, vec![0], "eg-metro's control port supports time:Position");
+        let mut inst = Instance::create(METRO, 48_000.0).expect("instantiates");
+        let t = crate::transport::Transport { playing: true, tempo: 96.0, ..Default::default() };
+        inst.begin_block(&t, 256);
+        inst.push_midi(0, &[0x90, 60, 100]).expect("room for a note");
+        let types: Vec<u32> = inst.atom_in[0].iter().map(|e| e.event.body.mytype).collect();
+        assert_eq!(types.len(), 2, "a position and a note: {types:?}");
+        assert_eq!(types[0], inst.time_urids.object, "the position is not first");
+        assert_eq!(types[1], inst.midi_urid);
+        // The block that continues it is told nothing new.
+        let next = crate::transport::Transport { sample: 256, ..t };
+        inst.begin_block(&next, 256);
+        assert_eq!(inst.atom_in[0].iter().count(), 0, "a continuing block was resent the position");
+        // A locate is.
+        inst.begin_block(&crate::transport::Transport { sample: 48_000, ..t }, 256);
+        assert_eq!(inst.atom_in[0].iter().count(), 1, "a locate was not told");
+    }
+
+    /// A plugin whose atom input did not ask is never sent a position.
+    #[test]
+    fn a_port_that_did_not_ask_is_sent_no_position() {
+        if !have("http://lv2plug.in/plugins/eg-midigate") {
+            return;
+        }
+        let uri = "http://lv2plug.in/plugins/eg-midigate";
+        assert!(meta_for(uri).time_ports.is_empty());
+        let mut inst = Instance::create(uri, 48_000.0).expect("instantiates");
+        inst.begin_block(&crate::transport::Transport::default(), 256);
+        assert_eq!(inst.atom_in[0].iter().count(), 0);
+    }
     const FIFTHS: &str = "http://lv2plug.in/plugins/eg-fifths";
 
     /// The metadata scan gives a control its real name, symbol and unit —
