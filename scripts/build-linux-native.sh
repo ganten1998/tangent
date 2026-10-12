@@ -54,6 +54,11 @@ cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
 # Licences for the four fonts eframe's `default_fonts` embeds in the binary.
 mkdir -p "$STAGE/font-licenses"
 cp assets/font-licenses/*.txt "$STAGE/font-licenses/"
+# A native build keeps the default `mp3` feature, so LAME is linked in and its
+# LGPL texts ship with it (LICENSING.md, LAME). The cross-built tarballs
+# (build-cross.sh) leave LAME out and carry none.
+mkdir -p "$STAGE/lame-licenses"
+cp assets/lame-licenses/*.txt "$STAGE/lame-licenses/"
 cp LICENSE THIRD-PARTY-LICENSES "$STAGE/"
 # The same user-facing readme the macOS and Windows artifacts carry.
 cp docs/ARTIFACT-README.md "$STAGE/README.txt"

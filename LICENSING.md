@@ -47,14 +47,12 @@ The app stays MIT; a weak-copyleft static link does not relicense it, but
 it does attach three obligations to the artifacts that carry the library:
 
 1. **Notice.** Each artifact must say it contains LAME and where the licence
-   texts are. The notice of record is this section plus the LAME entry in
-   THIRD-PARTY-LICENSES once regenerated (see status below).
-2. **Licence texts.** Ship both texts, verbatim, beside the binary: LGPL v2
-   covers LAME itself, LGPL v3 covers the wrapper crates. Until the build
-   scripts ship a `lame-licenses/` folder, the texts live in the vendored
-   crate (`mp3lame-sys-0.1.11/lame-3.100/COPYING`) and at
-   https://www.gnu.org/licenses/old-licenses/lgpl-2.0.txt and
-   https://www.gnu.org/licenses/lgpl-3.0.txt.
+   texts are: `lame-licenses/NOTICE.txt` beside the binary, and the LAME
+   section of THIRD-PARTY-LICENSES.
+2. **Licence texts.** Ship them verbatim beside the binary: LGPL v2 covers
+   LAME itself, LGPL v3 covers the wrapper crates, and LGPL v3 is written
+   as additional permissions on GPL v3, whose text it requires alongside
+   (LGPL-3.0 section 4(b)).
 3. **Relink route** (LGPL-2.1 section 6, LGPL-3.0 section 4(d)): a recipient
    must be able to rebuild the application against a modified LAME. That is
    available in substance: Tangent's complete source is MIT and public, and
@@ -64,14 +62,30 @@ it does attach three obligations to the artifacts that carry the library:
    point a `[patch.crates-io]` entry at it, and run
    `cargo build --release -p tangent`.
 
-**Status, 2026-08-31.** This file is the notice of record today. Still to do,
-and tracked as W30 in the 5.1 audit worklist: add the LAME section to
-`scripts/gen-third-party-licenses.sh` and regenerate THIRD-PARTY-LICENSES
-(stale since before mp3lame entered Cargo.lock, because every build script
-regenerates only when the file is MISSING); add `assets/lame-licenses/` with
-both texts; ship that folder from `build-macos.sh` and `build-freebsd.sh`
-(the FreeBSD tarball currently ships only LICENSE, not even
-THIRD-PARTY-LICENSES).
+**Status, 2026-10-12: done.** `assets/lame-licenses/` holds, verbatim:
+`LAME-COPYING-LGPL-2.txt` and `LAME-LICENSE.txt` (LAME 3.100's own `COPYING`
+and `LICENSE`, copied from `mp3lame-sys-0.1.11/lame-3.100/` in the cargo
+registry, the exact sources Cargo.lock links); `LGPL-3.0.txt` (the
+`LICENSE` both crates carry, byte-identical); `GPL-3.0.txt` (`COPYING.GPLv3`
+from the signature-verified FFmpeg 8.1.3 release tarball, the FSF text);
+and our `NOTICE.txt`. They ship wherever LAME is linked:
+
+* macOS: `build-macos.sh` puts them in `Tangent.app/Contents/Resources/lame-licenses/`,
+  so the zip, the dmg and the pkg (`build-installer.sh` packs that app)
+  all carry them.
+* FreeBSD: `build-freebsd.sh` installs them to
+  `share/licenses/tangent/lame-licenses/` in the package (listed in
+  `installer/freebsd/pkg-plist`) and copies them into both offline bundles.
+* Linux built natively (`build-linux-native.sh`, default features): in the
+  tarball.
+
+`scripts/check-artifacts.sh` refuses a macOS zip or pkg, a FreeBSD package
+or a FreeBSD bundle without all five files. The Windows download and the
+cross-built Linux tarballs (`build-cross.sh`) build without the `mp3`
+feature, do not contain LAME, and carry none of these; their MP3 export
+runs through `tangent-ffmpeg`, whose own LAME is covered by the ffmpeg
+source releases below. THIRD-PARTY-LICENSES has a LAME section
+(`scripts/gen-third-party-licenses.sh`).
 
 ## ffmpeg: GPL binaries in the Linux and Windows artifacts
 

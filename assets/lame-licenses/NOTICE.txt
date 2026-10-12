@@ -1,0 +1,41 @@
+LAME in Tangent
+===============
+
+This copy of Tangent contains LAME 3.100, the MP3 encoder
+(https://lame.sourceforge.io/), statically linked into the tangent program.
+It is what Tangent's MP3 export uses on macOS, on FreeBSD and in Linux builds
+made natively with the default features. (The Windows download and the Linux
+downloads built on a Mac do not contain LAME; they export MP3 through the
+separate tangent-ffmpeg program, whose own licences sit in ffmpeg-licenses/.)
+
+LAME reaches Tangent through two Rust crates, unmodified:
+
+  mp3lame-sys 0.1.11      carries the unmodified LAME 3.100 sources and
+                          builds them (https://github.com/DoumanAsh/mp3lame-sys)
+  mp3lame-encoder 0.2.5   a Rust interface to it
+                          (https://github.com/DoumanAsh/mp3lame-encoder)
+
+Licences, all in this folder, verbatim:
+
+  LAME-COPYING-LGPL-2.txt  LAME's own COPYING: the GNU Library General
+                           Public License, version 2. LAME is licensed under
+                           it, or at your option any later version.
+  LAME-LICENSE.txt         LAME's own note on using it in other programs.
+  LGPL-3.0.txt             the GNU Lesser General Public License, version 3,
+                           which both crates declare.
+  GPL-3.0.txt              the GNU General Public License, version 3, which
+                           the LGPL version 3 is written as additional
+                           permissions on top of, and so must accompany it.
+
+Tangent itself is MIT licensed (LICENSE); linking LAME does not change that,
+and these licences cover LAME and the two crates only.
+
+The source, and replacing LAME. Tangent's complete source code is public at
+https://github.com/ganten1998/tangent, and its Cargo.lock pins
+mp3lame-sys 0.1.11, which contains the exact LAME sources that were linked
+(also on crates.io: https://crates.io/crates/mp3lame-sys/0.1.11). To build
+Tangent against a modified LAME: check out the tag of this release, put a
+copy of mp3lame-sys carrying your changes in the tree, point a
+[patch.crates-io] entry in Cargo.toml at it, and run
+`cargo build --release -p tangent`. LICENSING.md in the source sets this out
+in full.

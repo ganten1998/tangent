@@ -583,10 +583,13 @@ enum Reads {
 /// fetched beside its binary), which are quoted law and not ours to reword;
 /// and the macOS package's `postinstall`, which prints nothing and is shown
 /// to no one.
-const SHIPPED: [(&str, Reads); 12] = [
+const SHIPPED: [(&str, Reads); 13] = [
     // The licence page of the macOS installer and of the Windows one (as
     // LICENSE.txt), and the Linux tarball (build-installer.sh).
     ("LICENSING.md", Reads::Whole),
+    // Our note heading the LAME licences, beside the app wherever LAME is
+    // linked (the texts after it are quoted law, as above).
+    ("assets/lame-licenses/NOTICE.txt", Reads::Whole),
     // README.txt beside the app in the macOS zip and disk image, the Linux
     // tarballs and the Windows zip.
     ("docs/ARTIFACT-README.md", Reads::Whole),

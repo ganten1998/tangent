@@ -26,6 +26,19 @@ PKG_VERSION="${PKG_VERSION:-$VERSION}"
 
 FAIL=0
 note() { echo "!! $*"; FAIL=1; }
+# lame_texts <artifact> <listing>: the LGPL texts and our notice, which must
+# travel with every copy of a binary that links LAME: the macOS app (zip, dmg,
+# pkg) and the FreeBSD package and bundles (LICENSING.md, LAME). The Windows
+# download and the cross-built Linux tarballs leave LAME out, so they are not
+# asked. The dmg is not opened (see the listing below); it carries the same
+# app the zip does.
+lame_texts() {
+  local f
+  for f in NOTICE.txt LAME-COPYING-LGPL-2.txt LAME-LICENSE.txt LGPL-3.0.txt GPL-3.0.txt; do
+    printf '%s\n' "$2" | grep -Eq "(^|/)lame-licenses/${f//./\\.}\$" \
+      || note "$1: no lame-licenses/$f (LAME is linked into this binary)"
+  done
+}
 # The programs the setup.exe and the portable zip carry, kept for the
 # comparison after the loop.
 SAME="$(mktemp -d)"
@@ -70,6 +83,7 @@ check_freebsd_pkg() {
               '^/usr/local/share/licenses/tangent/THIRD-PARTY-LICENSES$'; do
     printf '%s\n' "$list" | grep -Eq "$want" || note "$a: missing $want"
   done
+  lame_texts "$a" "$list"
   cm="$(tar -xOf "$a" +COMPACT_MANIFEST 2>/dev/null || true)"
   [ -n "$cm" ] || { note "$a: no readable +COMPACT_MANIFEST"; return; }
   # alsa-lib decides whether the app STARTS on the machine this port exists
@@ -94,6 +108,7 @@ check_freebsd_bundle() {
     || note "$a: no install.sh (README's first instruction)"
   printf '%s\n' "$list" | grep -Eq '/THIRD-PARTY-LICENSES$' \
     || note "$a: no THIRD-PARTY-LICENSES"
+  lame_texts "$a" "$list"
   for dep in alsa-lib alsa-plugins lilv; do
     printf '%s\n' "$list" | grep -Eq "/${dep}-[0-9][^/]*\.pkg$" \
       || note "$a: no $dep pkg (the app does not start without it)"
@@ -130,6 +145,12 @@ for a in "$@"; do
         # receive the update instead of /Applications.
         grep -q 'relocatable="false"' "$exp/x/Tangent-app.pkg/PackageInfo" 2>/dev/null \
           || note "$a: the app component is RELOCATABLE (it must not be)"
+        # The payload is a gzip cpio that bsdtar lists.
+        if pl="$(tar -tf "$exp/x/Tangent-app.pkg/Payload" 2>/dev/null)"; then
+          lame_texts "$a" "$pl"
+        else
+          note "$a: could not list the app component's payload"
+        fi
         pkgutil --check-signature "$a" 2>/dev/null | grep -q 'Status: signed' \
           || note "$a: UNSIGNED (needs a Developer ID Installer certificate)"
         # Signed-but-unnotarized passes the grep above and still warns on
@@ -216,6 +237,7 @@ for a in "$@"; do
     *macos*)
       printf '%s\n' "$list" | grep -Eq '^__MACOSX'           && note "$a: carries __MACOSX junk"
       printf '%s\n' "$list" | grep -Eq '/MacOS/tangent$'       || note "$a: no Tangent.app executable"
+      lame_texts "$a" "$list"
       ;;
     *windows*)
       printf '%s\n' "$list" | grep -Eq '^tangent\.exe$'        || note "$a: no tangent.exe"
