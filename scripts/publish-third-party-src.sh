@@ -7,10 +7,14 @@
 #   scripts/publish-third-party-src.sh              # creates and uploads
 #   scripts/publish-third-party-src.sh <release-name> ...   # only those
 #
-# Reads the folders scripts/fetch-ffmpeg-sources.sh staged under
-# $THIRD_PARTY_SRC (default ~/Library/Caches/tangent-dist/third-party-src),
-# one per release: third-party-src-ffmpeg-7.0.2 (the Linux pin) and
-# third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22 (the Windows pin).
+# Reads the folders staged under $THIRD_PARTY_SRC (default
+# ~/Library/Caches/tangent-dist/third-party-src), one per release:
+# third-party-src-ffmpeg-8.1.3-tangent-linux (the Linux builds, staged by
+# scripts/build-ffmpeg-linux.sh every time it builds) and
+# third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22 (the Windows pin, staged by
+# scripts/fetch-ffmpeg-sources.sh). The retired johnvansickle.com 7.0.2 pin's
+# folder, third-party-src-ffmpeg-7.0.2, is not in the default list: it can
+# never be complete (LICENSING.md); name it to publish it anyway.
 #
 # **These releases must never become "Latest".** Every download link a buyer
 # holds is /releases/latest/download/<name>, resolved against the latest
@@ -34,7 +38,7 @@ cd "$ROOT"
 REPO="${REPO:-ganten1998/tangent}"
 SRC="${THIRD_PARTY_SRC:-$HOME/Library/Caches/tangent-dist/third-party-src}"
 DRY="${DRY_RUN:-0}"
-RELEASES=(third-party-src-ffmpeg-7.0.2 third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22)
+RELEASES=(third-party-src-ffmpeg-8.1.3-tangent-linux third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22)
 [ "$#" -gt 0 ] && RELEASES=("$@")
 
 run() {
