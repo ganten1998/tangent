@@ -36,9 +36,8 @@ Hi,
 Tangent 5.0 is out: record, arrange and mix on macOS, Windows, Linux and
 FreeBSD. Free with up to 32 tracks; your key removes the limit.
 
-You bought a key for a program that named the chords you
-played and could record them. This release is the one where it becomes a
-DAW.
+You bought a key for a program that named the chords you played and could
+record them. This release is the one where it becomes a DAW.
 
 You can record audio and MIDI into it, arrange clips on a timeline, edit
 notes in a piano roll, and mix on a desk with buses, returns, sends, folders
@@ -70,10 +69,9 @@ Two things to know before you upgrade from 4.x:
    your key again (right-click anywhere, Support Tangent..., Activate). It is
    in the email your key first came in: search your inbox for
    keys@ivorymidi.com. If you cannot find it, reply and I will send it
-   again. If you taught Tangent
-   chord names you want to keep, copy the ~/.config/ivory folder somewhere
-   safe before you start 5.0, and the release notes say where to put it
-   back.
+   again. If you taught Tangent chord names you want to keep, copy the
+   ~/.config/ivory folder somewhere safe before you start 5.0; the names
+   are in overrides.json.
 
 Download (these links always fetch the current version):
 
