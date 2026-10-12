@@ -489,18 +489,30 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The changelog section that is still being written: `[Unreleased]` from
-/// its heading to the next `## [`, or, when a cut renamed `[Unreleased]` to
-/// the version (as the 2.3.0 cut did), the newest section, which is where
-/// this copy then lives. Panicking on a missing `[Unreleased]` would refuse a
+/// its heading to the next `## [`, or the newest version's section when
+/// there is no `[Unreleased]` (the 2.3.0 cut renamed it) or it is only an
+/// empty heading over the version just cut (the 3.0.0 and 4.4 cuts, and
+/// 5.0.0). Either way the scan reads the copy about to be published, not an
+/// empty heading. Panicking on a missing `[Unreleased]` would refuse a
 /// release for doing what a release does.
 fn unreleased(changelog: &str) -> &str {
-    let start = changelog
-        .find("## [Unreleased]")
-        .or_else(|| changelog.find("## ["))
-        .expect("CHANGELOG.md has no `## [` section at all");
-    let body = &changelog[start..];
-    let end = body[3..].find("\n## [").map_or(body.len(), |e| e + 3);
-    &body[..end]
+    let section = |start: usize| {
+        let body = &changelog[start..];
+        let end = body[3..].find("\n## [").map_or(body.len(), |e| e + 3);
+        &body[..end]
+    };
+    match changelog.find("## [Unreleased]") {
+        Some(start) => {
+            let kept = section(start);
+            let empty = kept["## [Unreleased]".len()..].trim().is_empty();
+            if empty && start + kept.len() < changelog.len() {
+                section(start + kept.len() + 1)
+            } else {
+                kept
+            }
+        }
+        None => section(changelog.find("## [").expect("CHANGELOG.md has no `## [` section at all")),
+    }
 }
 
 /// The folder under `docs/release/` that holds the newest release's page,
@@ -1080,12 +1092,17 @@ fn the_gumroad_page_scanned_is_the_newest_releases() {
 }
 
 /// **A changelog cut that renamed `[Unreleased]` scans its newest section**
-/// rather than panicking the release gate, and a kept `[Unreleased]` is
-/// still the section scanned, ending at the next version.
+/// rather than panicking the release gate, a kept `[Unreleased]` is still
+/// the section scanned, ending at the next version, and an EMPTY
+/// `[Unreleased]` over a version just cut scans that version, not nothing.
 #[test]
 fn the_changelog_section_scanned_survives_a_cut() {
     let kept = "# Changelog\n\n## [Unreleased]\n\n- new.\n\n## [5.0.0] - 2026-08-31\n\n- old.\n";
     assert_eq!(unreleased(kept), "## [Unreleased]\n\n- new.\n");
     let renamed = "# Changelog\n\n## [5.1.0] - 2026-10-09\n\n- new.\n\n## [5.0.0] - 2026-08-31\n\n- old.\n";
     assert_eq!(unreleased(renamed), "## [5.1.0] - 2026-10-09\n\n- new.\n");
+    let cut = "# Changelog\n\n## [Unreleased]\n\n## [5.0.0] - 2026-10-12\n\n- new.\n\n## [4.5.0] - 2026-08-18\n\n- old.\n";
+    assert_eq!(unreleased(cut), "## [5.0.0] - 2026-10-12\n\n- new.\n");
+    let only = "# Changelog\n\n## [Unreleased]\n";
+    assert_eq!(unreleased(only), "## [Unreleased]\n");
 }
