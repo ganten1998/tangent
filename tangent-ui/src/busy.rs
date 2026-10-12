@@ -894,6 +894,23 @@ impl Busy {
     /// exactly what a blocking operation leaves on the screen — is a correct
     /// drawing and not a stopped animation.
     pub fn draw(&mut self, painter: &Painter, rect: Rect, face: Color32, time: f64) -> bool {
+        if !self.stand(rect) {
+            return false;
+        }
+        paint(painter, rect, face, self, time);
+        true
+    }
+
+    /// **Up, and painted on another surface**: everything [`Busy::draw`]
+    /// records about a paint, with nothing painted here.
+    ///
+    /// For a host whose cover is being carried by a window the user is
+    /// looking at (see [`paint_cover`]). The clock, the paint count and the
+    /// silence measure are all kept exactly as a paint would keep them,
+    /// because the cover IS on screen, just not in this viewport; a blocking
+    /// job gated on [`Busy::outlived_the_asking_frame`] waits the same two
+    /// presented frames either way.
+    pub fn stand(&mut self, rect: Rect) -> bool {
         if !rect.is_positive() || !self.is_visible() {
             return false;
         }
@@ -915,7 +932,6 @@ impl Busy {
             self.spoke_detail.clone_from(&self.detail);
             self.spoke_at = Some(now);
         }
-        paint(painter, rect, face, self, time);
         true
     }
 
@@ -930,6 +946,28 @@ impl Busy {
             paint(painter, rect, face, self, time);
         }
     }
+}
+
+/// **The host's cover in its own window, or standing there unpainted
+/// because another window is carrying it.** Answers what [`Busy::draw`]
+/// answers: whether the cover is up, which is what the host blocks the main
+/// window's input on. That answer does not change with `elsewhere`; only
+/// the paint does.
+///
+/// `elsewhere` is [`crate::app::TangentApp::cover_carried_elsewhere`]: the
+/// Export options window carrying the cover after Export was pressed, or
+/// the export window saying it on its top line. Both float in front of the
+/// main window, so a cover painted here as well was a second splash, the
+/// bigger one, sitting under the window the user was reading: "theres 2
+/// loading splashes during export". The rule lives here and not in the
+/// host so the app's own frame tests run the same code the host does.
+pub fn paint_cover(ctx: &egui::Context, busy: &mut Busy, face: Color32, elsewhere: bool) -> bool {
+    let rect = ctx.content_rect();
+    if elsewhere {
+        return busy.stand(rect);
+    }
+    let painter = ctx.layer_painter(cover_layer("tangent-busy"));
+    busy.draw(&painter, rect, face, ctx.input(|i| i.time))
 }
 
 /// The drawing itself, once the decision to draw has been made.

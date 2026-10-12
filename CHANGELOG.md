@@ -300,6 +300,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **One loading splash during export, not two.** After pressing Export, the
+  "Preparing export" splash showed in the Export window and a second,
+  bigger copy showed behind it in the main window. The main window now
+  leaves it to the Export window (and to the export progress window while
+  a pass runs). It stays locked while they show it. Every other wait
+  (opening a project, loading plugins, a freeze getting ready) still shows
+  its splash in the main window.
+
 - **Plugins follow the song's tempo.** VST3 plugins were never told the
   tempo, the time signature, whether the song was playing or where it
   was, so anything set to follow the host (Superior Drummer's tempo,
