@@ -717,6 +717,22 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// **A build configured like the shipped app refuses both repository
+    /// keys.** This crate links tangent-core with `license` and nothing
+    /// else, as the app does, and is outside the workspace, so no
+    /// dev-dependency can hand it `test-keyring`: the runtime half of the
+    /// proof `scripts/check-home.sh features` makes from the manifests. The
+    /// test-keyring fixture is a bad signature here, and the key published
+    /// by mistake is genuine but revoked.
+    #[test]
+    fn the_repository_keys_unlock_nothing_in_a_shipped_configuration() {
+        use tangent_core::license::LicenseError;
+        let fixture = include_str!("../../../tests/fixtures/supporter.key");
+        assert_eq!(verify_key(fixture), Err(LicenseError::BadSignature));
+        let published = include_str!("../../../tests/fixtures/revoked-2026-08-11.key");
+        assert_eq!(verify_key(published), Err(LicenseError::Revoked));
+    }
+
     /// The ledger is one row per SALE. A repeat customer is several rows, and
     /// the live ledger already contains one who bought three times — announcing
     /// row-by-row would mail them three copies of the same message.

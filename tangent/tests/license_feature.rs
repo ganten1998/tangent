@@ -9,12 +9,15 @@ use tangent_core::license::verify_key;
 
 #[test]
 fn the_shipped_binary_can_actually_verify_licenses() {
-    // The committed fixture key (see tangent-core/tests/license_fixtures.rs).
-    // With the feature off this returns Err(BadSignature) and the test fails.
+    // The committed fixture key, signed by tangent-core's test keyring (see
+    // tangent-core/tests/license_fixtures.rs), which this test build accepts
+    // through the `test-keyring` dev-dependency feature. That feature does
+    // not turn `license` on, so with the ordinary line missing this still
+    // returns Err(BadSignature) and the test fails.
     let key = include_str!("../../tests/fixtures/supporter.key");
     let l = verify_key(key).expect(
         "the GUI crate must enable tangent-core/license — without it every \
          supporter key is rejected at runtime",
     );
-    assert_eq!(l.name.as_deref(), Some("Ganten"));
+    assert_eq!(l.name.as_deref(), Some("Tester"));
 }

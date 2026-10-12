@@ -43,6 +43,17 @@ published.
     them is `overrides.json`. Bringing it back into 5.0 has not been tested
     on every 4.x version, so keep the copy until you have checked.
 
+### Security
+
+- **A supporter key published in the source by mistake is revoked.** One
+  key, made in August as a test fixture for the developer's own use, was
+  committed to Tangent's source code, which was public for a while. In 5.0
+  a key lifts the 32-track limit, so this build refuses that key: pasted,
+  it says it no longer works, and a copy already installed stops unlocking
+  on the next launch, as if no key were there. No customer's key is
+  affected: every key sold verifies exactly as before. The test suites now
+  use keys signed by a test-only key that no release accepts.
+
 ### Added
 
 - **Middle-drag pans the arrangement and the MIDI editor** (experimental).

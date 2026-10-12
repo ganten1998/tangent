@@ -49,8 +49,9 @@
 # minutes, saved its settings once in a third, and logged a dropout in a
 # fourth.
 #
-# **`features` proves no build that ships carries `test-home`, and every
-# test build that links tangent-core does.** Resolver 2 gives a
+# **`features` proves no build that ships carries `test-home` (nor
+# `test-keyring`, the test-only signing key's feature, read the same way),
+# and every test build that links tangent-core does.** Resolver 2 gives a
 # dev-dependency's features to test builds alone; `cargo tree` resolves
 # features the way a build does, so the shipped configuration (every
 # feature of the binary, on every target) is read with dev edges off, and
@@ -271,6 +272,19 @@ features() {
     echo "  setting and project in a temp folder" >&2
     fail=1 ;;
   esac
+  # **And no shipped build carries the test keyring** (`test-keyring`), the
+  # same road: a build with it accepts keys signed by a seed that is in the
+  # source. A shipped build must verify with `license` on and the
+  # production ring alone.
+  case ",${shipped#+}," in *,test-keyring,*)
+    echo "check-home: a build of the binary that ships carries test-keyring: it would accept" >&2
+    echo "  keys anyone can mint from the public test seed" >&2
+    fail=1 ;;
+  esac
+  case ",${shipped#+}," in *,license,*) ;; *)
+    echo "check-home: the binary as it ships does not carry license: it would refuse every key" >&2
+    fail=1 ;;
+  esac
   # **Every test build that links tangent-core carries it**, each member
   # read alone, the way check.sh's `cargo test -p` legs build it: a
   # workspace run unifies any one member's dev-dependency line into all of
@@ -284,6 +298,12 @@ features() {
     printf '  %-34s %s\n' "$member's test build:" "tangent-core [${got#+}]"
     case ",${got#+}," in *,test-home,*) ;; *)
       echo "check-home: $member's test build does not carry test-home: its tests resolve the real home" >&2
+      fail=1 ;;
+    esac
+    # The test keyring too, or the fixture key would not install there and
+    # every supporter test would fail (or, worse, pass on a free store).
+    case ",${got#+}," in *,test-keyring,*) ;; *)
+      echo "check-home: $member's test build does not carry test-keyring: its fixture key is refused" >&2
       fail=1 ;;
     esac
   done

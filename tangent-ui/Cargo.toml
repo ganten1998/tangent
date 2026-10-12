@@ -54,8 +54,10 @@ ttf-parser = "0.25"
 # tests link, which read the real `~/.config/tangent` (the taught chords, for
 # every app a test built). A dev-dependency's features reach test builds
 # alone (resolver 2), so the binary, which links this crate, never carries
-# it; `scripts/check-home.sh features` proves that.
-tangent-core = { path = "../tangent-core", features = ["test-home"] }
+# it; `scripts/check-home.sh features` proves that. `test-keyring` rides the
+# same road: the supporter fixture is signed by a test-only key that no
+# shipped build accepts.
+tangent-core = { path = "../tangent-core", features = ["test-home", "test-keyring"] }
 
 [lints]
 workspace = true

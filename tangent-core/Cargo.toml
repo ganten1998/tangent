@@ -24,6 +24,15 @@ license = ["dep:ed25519-compact"]
 # features` proves that; never name it in a `[dependencies]` line or a
 # feature of a crate that ships.
 test-home = []
+# **The test keyring: test builds only.** Adds `license::test_keyring`'s
+# public key (its seed is in the source, deliberately) to the keys
+# `verify_key` accepts, so the suites install keys no real signing key ever
+# made. Same road as `test-home`: only `[dev-dependencies]` lines turn it
+# on, and `scripts/check-home.sh features` proves no shipped build carries
+# it. It does NOT imply `license`: a test build still has to get that from
+# the ordinary dependency line, which `tangent/tests/license_feature.rs`
+# guards.
+test-keyring = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -41,8 +50,9 @@ ed25519-compact = { version = "2.3", default-features = false, features = ["opt_
 # crate's test builds alone, the same road the binary and tangent-ui take;
 # dev edges are never followed for a crate that is somebody's dependency, so
 # no build that links this one sees it. `tests/test_home.rs` pins it, and
-# `scripts/check-home.sh features` reads it.
-tangent-core = { path = ".", features = ["test-home"] }
+# `scripts/check-home.sh features` reads it. `test-keyring` the same way, for
+# `tests/license_fixtures.rs`.
+tangent-core = { path = ".", features = ["test-home", "test-keyring"] }
 
 [lints]
 workspace = true
