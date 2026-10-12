@@ -366,12 +366,25 @@ fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Res
         "reply_to": env_opt("MAIL_REPLY_TO", DEFAULT_REPLY_TO),
     });
     let _ = name; // reserved: personalised subject lines
-    ureq::post("https://api.resend.com/emails")
+    resend_post(api_key, payload)
+}
+
+/// One POST to Resend. On a refusal the error carries Resend's own message
+/// ("domain is not verified", "rate limit exceeded"...): the bare status code
+/// is all ureq puts in its Display, and a 403 alone names no cause.
+fn resend_post(api_key: &str, payload: serde_json::Value) -> Result<(), String> {
+    match ureq::post("https://api.resend.com/emails")
         .set("Authorization", &format!("Bearer {api_key}"))
         .timeout(std::time::Duration::from_secs(20))
         .send_json(payload)
-        .map(|_| ())
-        .map_err(|e| format!("resend: {e}"))
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(format!("resend: status {code}: {}", body.trim()))
+        }
+        Err(e) => Err(format!("resend: {e}")),
+    }
 }
 
 fn mint(kp: &KeyPair, name: Option<&str>) -> Result<(String, [u8; 5]), String> {
@@ -518,12 +531,16 @@ fn announce(args: &[String]) -> i32 {
             "text": body,
             "reply_to": reply_to,
         });
-        match ureq::post("https://api.resend.com/emails")
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .timeout(std::time::Duration::from_secs(20))
-            .send_json(payload)
-        {
-            Ok(_) => {
+        // Resend allows 2 requests a second; at full speed the tenth mail of a
+        // batch came back 429. Pace under the limit, and give a 429 one retry.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut result = resend_post(&api_key, payload.clone());
+        if matches!(&result, Err(e) if e.contains("status 429")) {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            result = resend_post(&api_key, payload);
+        }
+        match result {
+            Ok(()) => {
                 sent += 1;
                 println!("    sent    {to}");
             }
