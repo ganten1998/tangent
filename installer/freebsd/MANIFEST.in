@@ -27,7 +27,7 @@
 name = "tangent"
 version = "@@VERSION@@"
 origin = "audio/tangent"
-comment = "MIDI keyboard monitor that names what you play in real time"
+comment = "DAW for recording, arranging and mixing audio and MIDI"
 maintainer = "ganten1998@gmail.com"
 www = "https://ganten.neocities.org/projects"
 prefix = "/usr/local"
@@ -36,18 +36,20 @@ licenselogic = "single"
 licenses = ["MIT"]
 
 desc = <<EOD
-Tangent watches a MIDI keyboard and tells you what you are playing: the chord
-by name, on the staff, around the circle of fifths, on a guitar neck and in a
-Tonnetz lattice, as you play it. It records audio, MIDI and video takes, hosts
-LV2 and VST3 plugins and carries its own FM synthesiser, so it makes a sound
-on a machine with nothing else installed.
+Tangent is a DAW. It records audio and MIDI, arranges clips on a timeline,
+edits notes in a piano roll, and mixes them on a desk with buses, returns,
+sends, folders and automation. It hosts LV2 and VST3 plugins and carries its
+own instruments and effects, so it makes a sound on a machine with nothing
+else installed. As you play, it also names the chord you are holding, and a
+take can film the window beside its audio and MIDI.
 
 On FreeBSD it reads MIDI straight from /dev/umidi and plays audio through the
 alsa-lib-over-OSS shim, so a keyboard and a pair of speakers work with nothing
 configured and no sound server running. JACK is offered in the Audio Setup
 panel for anyone who wants it, and is not required for anything.
 
-Free, offline, no telemetry, no account.
+Free with up to 32 tracks; a supporter key removes the limit. Offline, no
+telemetry, no account.
 EOD
 
 # ── Dependencies ─────────────────────────────────────────────────────────────

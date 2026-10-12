@@ -52,7 +52,9 @@ Gumroad → Products → Tangent → **Description**. This is the public page, t
 one people read before paying, and it is separate from the Content tab below.
 
 Kept here because it has been lost once already. If you rewrite it on the web,
-paste it back into this file.
+paste it back into this file. The fuller 5.0 page, with its own tagline and
+tags, is `docs/release/<newest>/GUMROAD.md`; this is the short form of the same
+facts, for when the long one is too much.
 
 NO EM DASHES anywhere in it. They read as machine-written and have drawn a
 real accusation before.
@@ -65,41 +67,40 @@ call 9 in `docs/design/unlimited-tracks.md`). `copy_scan.rs` in tangent-ui
 fails the build if the old wording (a key as a thanks that unlocks nothing)
 comes back here, in the README or in the email.
 
+Written from scratch for 5.0, when Tangent stopped being a keyboard monitor
+that records and became a DAW. No third-party product is named in it.
+
 ---
 
-Play a chord. Tangent names it.
+Tangent is a DAW for macOS, Windows, Linux and FreeBSD.
 
-Tangent is a MIDI keyboard monitor for people who want to see what they are
-playing. Plug in a keyboard and all 88 keys light up in real time, while the
-chord engine reads what you are holding: plain triads, sevenths, extensions,
-altered dominants, sus and add chords, slash chords, rootless jazz voicings,
-and 28 scales and modes. 95 chord patterns against all 12 roots.
+Record audio and MIDI. Arrange clips on a timeline, edit notes in a piano
+roll, program drums on sixteen pads, and mix on a desk with buses, returns,
+sends, folders and automation that reaches plugin parameters. Export a
+mixdown or stems, as WAV or MP3.
 
-It shows the same notes two more ways.
+It hosts VST3 plugins on every platform and LV2 plugins on Linux and
+FreeBSD, and tells them the song's tempo and transport. It also brings its
+own: a modelled keyboard with eight sounds, an FM synth, an analog-style
+synth, a sampler, and a shelf of effects from EQ and compression to tape,
+reverb, amp and a bitcrusher. Tangent Insert puts your outboard gear in an
+insert slot and keeps the session in time with it.
 
-On a guitar neck, where a player would actually put their fingers. One MIDI
-note can be six places on a guitar, so Tangent picks the shape a hand would
-use, weighing span, open strings and barres, and holds it steady as you add
-notes instead of jumping around the neck. Seven tunings, a capo, and the neck
-works backwards too: click it to build a shape and read the chord off the
-piano.
+Some things it does that you may not expect from a DAW. It names the chord
+you are playing as you play it, writes it on a staff and places it on a
+guitar neck. And a take can film the window itself, your camera included,
+and save the video beside the audio and the MIDI.
 
-As geometry, on the circle of fifths, on a Tonnetz, and as the I, IV and V
-triangles. Every key shaded by how much of your chord belongs to it, so keys
-that are close light up together.
+Tangent is free, with up to 32 tracks: MIDI tracks, audio tracks and folders
+count, and buses, returns, sends and routes have no limit for anyone. There
+is no trial, no time limit and no account. A supporter key removes the track
+limit and lights a small heart in your theme's colours. Every key already
+sold does the same.
 
-Teach it your own names. If you call something a Hendrix chord, right-click,
-type it, and that is what it says from then on, in every key if you want.
+It works offline, collects nothing, and checks your key on your own machine.
 
-Tangent is free, with up to 32 tracks. There is no trial, no time limit and no
-account, and buses, returns, sends and routes have no limit for anyone. It
-talks to no server and collects nothing. Paying gets you a supporter key,
-which takes the track limit away and sets a small pixel heart moving through
-your theme's colours, and my thanks. Every key already sold does the same.
-
-macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64
-and aarch64, FreeBSD 15 (amd64). Signed and notarized on macOS, signed on
-Windows.
+macOS 11 or later (Apple Silicon or Intel, signed and notarized), Windows 10
+or later (signed), Linux x86_64 and aarch64, FreeBSD 15 (amd64).
 
 ---
 
@@ -160,11 +161,11 @@ Thank you for supporting Tangent.
 
 Tangent is free, with up to 32 tracks. Your supporter key takes the track
 limit away, on every machine you own. Buses, returns, sends and routes have no
-limit for anyone, and every other feature is in the free app too.
+limit for anyone, and every other feature is in the free app as well.
 
 DOWNLOAD TANGENT
 
-These links always give you the current version, so they are worth keeping.
+These links always fetch the current version, so keep them with your key.
 
 macOS 11 or later, Apple Silicon or Intel
 https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
@@ -175,8 +176,9 @@ https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-s
 Linux x86_64 (the tarball has an install.sh that needs no root)
 https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
-Prefer to unpack it yourself? The .dmg, .zip and .tar.gz are all on the release
-page, with the Linux aarch64 tarball and the FreeBSD 15 package:
+The release page has everything else: the .dmg and .zip for macOS, a
+portable .zip for Windows, the Linux aarch64 tarball and the FreeBSD 15
+package:
 https://github.com/ganten1998/tangent/releases/latest
 
 Checksums:
@@ -184,48 +186,53 @@ https://github.com/ganten1998/tangent/releases/latest/download/SHA256SUMS
 
 YOUR SUPPORTER KEY
 
-The key is emailed to you within about a minute of your purchase, from
-keys@tangentdaw.org. If it has not arrived, search your spam folder for that
-address. If it is still missing, reply to your Gumroad receipt and I will send
-it by hand.
+Your key comes by email within about a minute, from keys@tangentdaw.org. If
+you cannot see it, look in your spam folder for that address. If it is not
+there either, reply to your Gumroad receipt and I will send it myself.
 
-To use it: open Tangent, right-click anywhere, choose "Support Tangent...", paste
-the key and press Activate. Case, spaces, dashes and line breaks do not matter.
+To use it, open Tangent, right-click anywhere, choose "Support Tangent...",
+paste the key and press Activate. Case, spaces, dashes and line breaks do not
+matter.
 
-The key has no expiry, contacts no server, and works on every machine you own.
+The key never expires, never contacts a server, and works on every machine
+you own.
 
 FIRST LAUNCH
 
 macOS: open the .pkg and follow it. It is signed with a Developer ID
-certificate and notarized by Apple, so there is no security prompt. If you took
-the .dmg instead, drag Tangent into your Applications folder.
+certificate and notarized by Apple, so macOS opens it without a security
+prompt. If you took the .dmg, drag Tangent into your Applications folder.
 
-Windows: run the setup.exe and follow it. Every program in it is code-signed
-under the author's name, but SmartScreen goes on reputation, which a new
-signature has to earn, so it may still show "Windows protected your PC" the
-first time. Click "More info", then "Run anyway". Windows
-remembers the choice. If you took the .zip instead, unzip it anywhere and run
-tangent.exe.
+Windows: run the setup.exe and follow it. Every program in it is signed
+under the author's name. SmartScreen judges a program by its reputation,
+which a new signature takes time to earn, so the first run may still show
+"Windows protected your PC". Click "More info", then "Run anyway", and
+Windows remembers the choice. If you took the .zip, unzip it anywhere and
+run tangent.exe.
 
 Linux: extract the archive and run ./install.sh, which needs no root;
-./install.sh --uninstall takes it back out. Or just chmod +x tangent and
-./tangent. MIDI goes through ALSA, so libasound.so.2 needs to be present.
-Requires glibc 2.30 or newer.
+./install.sh --uninstall removes it again. You can also run ./tangent
+straight from the folder. Tangent needs glibc 2.30 or newer and ALSA's
+libasound.so.2, which almost every desktop already has.
 
 FreeBSD 15: take the .pkg from the release page and run pkg install on it
-(pkg install ./tangent-...-freebsd-FreeBSD-15-amd64.pkg). On a machine with
-no network, unpack the desktop or complete bundle instead and run
+(pkg install ./tangent-...-freebsd-FreeBSD-15-amd64.pkg). On a machine
+without a network, unpack the desktop or complete bundle instead and run
 sh install.sh.
 
-The Windows and Linux downloads include tangent-ffmpeg, a helper program built
-from FFmpeg, which films takes and exports MP3. FFmpeg is licensed under the
-GPL. Its licence text ships next to it, and the source for those builds is
-published here:
+The Windows and Linux downloads include tangent-ffmpeg, a separate program
+built from FFmpeg, which films takes and writes MP3s. FFmpeg is licensed
+under the GPL. Its licence text ships next to it, and the source for those
+builds is published here:
 Windows: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22
 Linux: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-8.1.3-tangent-linux
 
-Plug your MIDI keyboard in before you start Tangent. Everything in the app
-lives in the right-click menu, and holding H shows every keyboard shortcut.
+GETTING STARTED
+
+A new session opens with tracks ready to play. Plug in your audio interface
+and MIDI keyboard before you start Tangent. Tab moves between the keyboard view,
+the arrangement and the mixer, the right-click menu holds everything else,
+and holding H shows the keyboard shortcuts for the view you are in.
 
 Source code and release notes:
 https://github.com/ganten1998/tangent
