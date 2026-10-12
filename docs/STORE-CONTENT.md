@@ -97,8 +97,9 @@ talks to no server and collects nothing. Paying gets you a supporter key,
 which takes the track limit away and sets a small pixel heart moving through
 your theme's colours, and my thanks. Every key already sold does the same.
 
-macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64.
-Signed and notarized on macOS.
+macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64
+and aarch64, FreeBSD 15 (amd64). Signed and notarized on macOS, signed on
+Windows.
 
 ---
 
@@ -134,11 +135,13 @@ redeployed for a NEW buyer to get them.
 The order that keeps this honest, and the one that was got wrong twice:
 **publish, check, paste, deploy.** Never edit the links in anticipation.
 
-One more gate, same spirit: the post-purchase block below now tells buyers the
-FFmpeg source for the bundled tangent-ffmpeg is available from the releases
-page. That sentence becomes true only once the `third-party-src-ffmpeg-*`
-source releases described in LICENSING.md exist. Do not paste it to Gumroad
-before they do.
+One more gate, same spirit: the post-purchase block below tells buyers the
+source for the bundled tangent-ffmpeg is published as two releases,
+`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22` and
+`third-party-src-ffmpeg-7.0.2`. That sentence becomes true only once
+`scripts/publish-third-party-src.sh` has created both (LICENSING.md, "The
+source it is owed") and `scripts/check-store-links.sh` finds them. Do not
+paste it to Gumroad before then.
 
 ## Post-purchase page
 
@@ -173,7 +176,8 @@ Linux x86_64 (the tarball has an install.sh that needs no root)
 https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 Prefer to unpack it yourself? The .dmg, .zip and .tar.gz are all on the release
-page: https://github.com/ganten1998/tangent/releases/latest
+page, with the Linux aarch64 tarball and the FreeBSD 15 package:
+https://github.com/ganten1998/tangent/releases/latest
 
 Checksums:
 https://github.com/ganten1998/tangent/releases/latest/download/SHA256SUMS
@@ -196,23 +200,29 @@ macOS: open the .pkg and follow it. It is signed with a Developer ID
 certificate and notarized by Apple, so there is no security prompt. If you took
 the .dmg instead, drag Tangent into your Applications folder.
 
-Windows: run the setup.exe and follow it. Every release after 5.0.0 is
-code-signed under the author's name (5.0.0 itself is not), but SmartScreen goes
-on reputation, which a new signature has to earn, so it may still show "Windows
-protected your PC" the first time. Click "More info", then "Run anyway". Windows
+Windows: run the setup.exe and follow it. Every program in it is code-signed
+under the author's name, but SmartScreen goes on reputation, which a new
+signature has to earn, so it may still show "Windows protected your PC" the
+first time. Click "More info", then "Run anyway". Windows
 remembers the choice. If you took the .zip instead, unzip it anywhere and run
 tangent.exe.
 
 Linux: extract the archive and run ./install.sh, which needs no root;
 ./install.sh --uninstall takes it back out. Or just chmod +x tangent and
 ./tangent. MIDI goes through ALSA, so libasound.so.2 needs to be present.
-Requires glibc 2.32 or newer.
+Requires glibc 2.30 or newer.
 
-The Windows and Linux downloads include tangent-ffmpeg, a small helper program
-built from FFmpeg and used for audio export. FFmpeg is licensed under the GPL.
-Its licence text ships next to it, and the complete source code for those
-exact builds is available from the project's releases page:
-https://github.com/ganten1998/tangent/releases
+FreeBSD 15: take the .pkg from the release page and run pkg install on it
+(pkg install ./tangent-...-freebsd-FreeBSD-15-amd64.pkg). On a machine with
+no network, unpack the desktop or complete bundle instead and run
+sh install.sh.
+
+The Windows and Linux downloads include tangent-ffmpeg, a helper program built
+from FFmpeg, which films takes and exports MP3. FFmpeg is licensed under the
+GPL. Its licence text ships next to it, and the source for those builds is
+published here:
+Windows: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22
+Linux: https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2
 
 Plug your MIDI keyboard in before you start Tangent. Everything in the app
 lives in the right-click menu, and holding H shows every keyboard shortcut.
