@@ -12826,45 +12826,76 @@ impl TangentApp {
     /// **Add a track**: Ctrl/Cmd+T in both views and the trailing + at the
     /// end of the desk. Asks the creation gate first and says why when it
     /// refuses (at the cap they used to do nothing at all), then makes a
-    /// bare track and selects it: directly under the selected row, joining
-    /// its folder run as Insert Track does, or with nothing selected at the
-    /// end ([`Self::open_trailing_row`]), so the trailing + makes the next
-    /// track where the eye already is. Under a running record or export it
-    /// is always the end, which moves nobody. A selected row that is drawn
-    /// but no track yet (the indented plus) is where the hand meant, the
-    /// owner's rule, and becomes the track in place.
+    /// bare track at the END of the desk ([`Self::open_trailing_row`]),
+    /// whatever is selected, selects it and scrolls both views to it.
+    ///
+    /// **Always the last position**, the owner's rule: "make the new track
+    /// button always add a track at the last position". It used to open a
+    /// row under the selected track (joining its folder run), and with an
+    /// empty folder row selected make the track on that row; both are
+    /// gone from this road. The gestures that NAME a place keep theirs: the
+    /// track menu's Insert Track Below ([`Self::insert_track_below`]) and
+    /// the circled plus on an empty drawn row (`HdrAdd` / the mixer's +,
+    /// [`Self::add_bare_track`]), which makes the track ON that row.
+    ///
+    /// The new row is a top-level row: `open_trailing_row` takes a row that
+    /// holds nothing (which is never a folder member) or appends one with
+    /// `in_folder` false, so a folder that happens to stand last is never
+    /// joined. Under a running record or export the end is the one place a
+    /// row may open anyway (it moves nobody).
     pub fn add_track(&mut self) {
         if !self.admit_tracks(1) {
             return;
         }
-        // (A bus is no track and never counted, but it is no empty row
-        // either: Add with one selected makes a track beside it.)
-        if let Some(sel) = self
-            .selected_row()
-            .filter(|n| *n < self.desk_extent() && !self.row_counted(*n) && !self.is_bus(*n) && self.in_folder(*n))
-        {
-            if self.add_bare_track(sel) {
-                self.select_alone(sel);
-            }
-            return;
-        }
-        let held = self.recorder.exporting || self.recorder.arr_recording;
         // ONE moment: the row opened and the track made on it.
         self.begin_one_moment();
-        let at = match self.selected_row().filter(|n| *n < self.desk_extent() && !held) {
-            Some(sel) => {
-                let member = self.is_folder(sel) || self.in_folder(sel);
-                self.open_row(sel + 1, member)
-            }
-            None => self.open_trailing_row(),
-        };
-        if let Some(at) = at {
+        if let Some(at) = self.open_trailing_row() {
             if self.add_bare_track(at) {
                 self.select_alone(at);
+                self.reveal_row(at);
             }
         }
         self.save_settings();
         self.commit_undo_moment();
+    }
+
+    /// **Scroll both views so row `n` is drawn**: the timeline's lane window
+    /// moved the least it must (the row at its bottom edge when it was
+    /// below, at its top when above), and the desk's strip run carried to
+    /// the row's rank. A view only; nothing about the desk changes. A row
+    /// the desk does not draw (a shut folder's member) is left alone.
+    fn reveal_row(&mut self, n: usize) {
+        let (rank, shown) = {
+            let index = self.desk_index();
+            let Some(rank) = index.rank_of(n) else {
+                return;
+            };
+            (rank, index.shown_len() + 1)
+        };
+        let vis = self.arr_visible().max(1);
+        let max = shown.saturating_sub(vis);
+        let lo = (rank + 1).saturating_sub(vis);
+        self.arr_lane_scroll = self.arr_lane_scroll.clamp(lo, rank.max(lo)).min(max);
+        self.arr_scroll_acc = 0.0;
+        // The desk: with its rect known, the least scroll that shows the
+        // strip whole; before the mixer has ever been drawn, the rank's own
+        // pitch is unknown, so the far end, which the layout clamps (`run`)
+        // and the wheel's clamp brings back (`mixer_scroll_by_px`).
+        match self.mixer_rect {
+            Some(rect) => {
+                let visible = self.mixer_visible();
+                let (_, pitch) = crate::mixer_panel::Layout::metrics(rect, visible);
+                let max_px = crate::mixer_panel::Layout::max_scroll_px(rect, visible, shown);
+                // How many whole strips the run shows: its window at rest.
+                let whole = crate::mixer_panel::track_window(rect, visible, shown, 0.0).len().max(1);
+                let first = crate::mixer_panel::track_window(rect, visible, shown, self.mixer_scroll_px).start;
+                if rank < first || rank >= first + whole {
+                    let to = (rank + 1).saturating_sub(whole).min(rank) as f32 * pitch;
+                    self.mixer_scroll_px = to.clamp(0.0, max_px);
+                }
+            }
+            None => self.mixer_scroll_px = 1.0e9,
+        }
     }
 
     /// **A new empty track directly under `n`** — the track menu's Insert
@@ -29764,9 +29795,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.arr_glue_selection();
         }
-        // **Ctrl/Cmd+T: a new track**, bare, under the selection or at the
-        // end of the desk (`add_track`) — the owner's keyboard twin of the
-        // trailing +.
+        // **Ctrl/Cmd+T: a new track**, bare, always at the end of the desk
+        // whatever is selected (`add_track`), the owner's keyboard twin of
+        // the trailing +.
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
