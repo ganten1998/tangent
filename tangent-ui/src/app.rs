@@ -12861,6 +12861,16 @@ impl TangentApp {
         }
     }
 
+    /// What the Supporter Key dialog says as it opens: nothing, unless the
+    /// key file on disk is a revoked key, which comes up free with no other
+    /// word (the store keeps the file and honors nothing), so the dialog
+    /// says why.
+    fn stored_key_note(&self) -> Option<String> {
+        self.license
+            .stored_key_revoked()
+            .then(|| tangent_core::license::LicenseError::Revoked.message().to_owned())
+    }
+
     /// **The trailing add, pressed**, on either view: Add
     /// ([`Self::add_track`]), or at the free cap the Supporter Key dialog
     /// the padlock on it promises, rather than a refusal line.
@@ -12868,7 +12878,7 @@ impl TangentApp {
         if self.trailing_plus() == crate::mixer_panel::Plus::Locked {
             self.dialog = Some(Dialog::SupporterKey {
                 input: String::new(),
-                message: None,
+                message: self.stored_key_note(),
                 installed_as: self.license.display_name().map(str::to_owned),
                 focus: true,
             });
@@ -38661,7 +38671,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             MenuAction::ShowSupporterKey => {
                 self.dialog = Some(Dialog::SupporterKey {
                     input: String::new(),
-                    message: None,
+                    message: self.stored_key_note(),
                     installed_as: self.license.display_name().map(str::to_owned),
                     focus: true,
                 });
@@ -45914,8 +45924,9 @@ impl TangentApp {
 pub(crate) mod tiers {
     use tangent_core::license::LicenseStore;
 
-    /// The committed fixture: a real, signed, perpetual supporter key (name
-    /// Ganten), whose only power is to be a supporter key. Spelled out only
+    /// The committed fixture: a perpetual supporter key (name Tester) signed
+    /// by tangent-core's test keyring, which only a test build accepts, so it
+    /// unlocks no shipped build. Spelled out only
     /// here, only under cfg(test); `the_fixture_key_is_read_only_by_tests`
     /// holds that.
     const SUPPORTER_KEY: &str = include_str!("../../tests/fixtures/supporter.key");
@@ -46738,6 +46749,45 @@ mod paywall_tests {
         assert!(app.license.is_supporter(), "the marker did not carry a removed key");
         assert_eq!(app.track_cap(), None);
         let _ = std::fs::remove_dir_all(tiers::dir("buyer-toggle"));
+    }
+
+    /// **A stored copy of the key published by mistake comes up free, and
+    /// the Supporter Key dialog says why**, on both roads that open it.
+    #[test]
+    fn a_stored_revoked_key_is_free_and_the_card_says_so() {
+        let dir = tiers::dir("revoked");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the store dir");
+        std::fs::write(
+            dir.join("license.key"),
+            include_str!("../../tests/fixtures/revoked-2026-08-11.key"),
+        )
+        .expect("the stored key");
+        let (ctx, mut app) = app_on(LicenseStore::load_from(dir.join("license.key")));
+        assert!(!app.license.is_supporter(), "a revoked key still unlocks");
+        assert!(app.track_cap().is_some(), "a revoked key lifted the cap");
+        let want = tangent_core::license::LicenseError::Revoked.message();
+        app.apply_menu_action(&ctx, MenuAction::ShowSupporterKey);
+        match &app.dialog {
+            Some(Dialog::SupporterKey { message, installed_as, .. }) => {
+                assert_eq!(message.as_deref(), Some(want));
+                assert!(installed_as.is_none());
+            }
+            _ => panic!("the menu did not open the Supporter Key dialog"),
+        }
+        app.dialog = None;
+        app.force_free_cap(CAP);
+        fill_to(&mut app, CAP);
+        app.press_trailing_add();
+        assert!(
+            matches!(&app.dialog, Some(Dialog::SupporterKey { message: Some(m), .. }) if m == want),
+            "the padlock's card did not say why"
+        );
+        // A free install with no file says nothing at all.
+        let (ctx, mut free) = app_on(tiers::free("revoked-free"));
+        free.apply_menu_action(&ctx, MenuAction::ShowSupporterKey);
+        assert!(matches!(&free.dialog, Some(Dialog::SupporterKey { message: None, .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **A directory holding only the marker reloads as a supporter**: the

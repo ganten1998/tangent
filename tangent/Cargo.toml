@@ -138,8 +138,10 @@ ttf-parser = "0.25"
 # Resolver 2 gives a dev-dependency's features to test builds alone, so
 # `cargo build` and every shipped artifact resolve the real home;
 # `scripts/check-home.sh features` proves it, and `home_tests` in main.rs
-# pins that this test build has it.
-tangent-core = { path = "../tangent-core", features = ["test-home"] }
+# pins that this test build has it. `test-keyring` rides the same road: the
+# supporter fixture is signed by a test-only key that no shipped build
+# accepts, and the same check proves none carries it.
+tangent-core = { path = "../tangent-core", features = ["test-home", "test-keyring"] }
 # One `#[ignore]` probe measures what the per-frame home lookups cost before
 # they were cached, and that "before" is `dirs::home_dir` itself. Tests only.
 dirs = "6"

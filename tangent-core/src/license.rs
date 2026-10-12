@@ -55,6 +55,24 @@ pub const PUBLIC_KEYS: &[[u8; 32]] = &[
     ],
 ];
 
+/// Sale codes (`License::order_id`) of keys that are genuine but no longer
+/// honored. A key here still carries a good signature; `verify_key` refuses
+/// it with [`LicenseError::Revoked`] after the signature has passed, so the
+/// list cannot be used to make a forgery look genuine, and a forgery that
+/// copies a listed order id is refused as a bad signature, same as before.
+///
+/// Keyed by order id because that is the one field a mint draws at random
+/// (40 bits from the OS RNG in both `tangent-keygen` and `tangent-fulfil`):
+/// it names one sale and no other, so listing it cannot reach any other
+/// key, whichever ring entry signed it.
+///
+/// Every entry is a key that is public, never one a customer holds:
+/// - `600b555348`: minted 2026-08-11 with k1 (name "Ganten", perpetual) as
+///   a test fixture and committed to the repository, which was briefly
+///   public. Harmless while a key unlocked cosmetics; in 5.0 a key lifts the
+///   free track limit. It stays in the history, so it is revoked here.
+pub const REVOKED_ORDERS: &[[u8; 5]] = &[[0x60, 0x0b, 0x55, 0x53, 0x48]];
+
 /// Why a license string was not accepted — or, for [`Unsaved`], accepted but
 /// not persisted. Only ever used to phrase a message; every refusal resolves
 /// to "run free".
@@ -86,6 +104,10 @@ pub enum LicenseError {
     /// `Ok` here, so the app said "thank you" while nothing had reached disk
     /// and the key silently evaporated on restart.
     Unsaved,
+    /// Genuine (the signature verified), but its order id is in
+    /// [`REVOKED_ORDERS`]: a key that was made public and no longer
+    /// unlocks anything. Treated exactly like no key at all.
+    Revoked,
 }
 
 impl LicenseError {
@@ -108,6 +130,10 @@ impl LicenseError {
             LicenseError::Unsaved => {
                 "That key is genuine, but it could not be saved - it works for \
                  now, and will need pasting again next launch."
+            }
+            LicenseError::Revoked => {
+                "That key was published by mistake and no longer works. Tangent \
+                 runs as the free version."
             }
         }
     }
@@ -322,29 +348,51 @@ fn decode_key(s: &str) -> Result<(Vec<u8>, [u8; SIG_LEN]), LicenseError> {
 ///
 /// Accepts a signature from ANY ring entry (rotation support). Never panics,
 /// never allocates unboundedly, never touches the network or the clock.
+///
+/// Revocation is checked LAST, after the signature: a listed order id on a
+/// key nobody signed is still `BadSignature`, and `Revoked` always means
+/// "genuine, and withdrawn".
 pub fn verify_key(s: &str) -> Result<License, LicenseError> {
     let (payload, sig) = decode_key(s)?;
     // Parse first so a future-version key reports that, rather than the
     // misleading "could not be verified" it would get from an unknown layout.
     let license = License::from_payload(&payload)?;
-    if verify_signature(&payload, &sig) {
-        Ok(license)
-    } else {
-        Err(LicenseError::BadSignature)
+    if !verify_signature(&payload, &sig) {
+        return Err(LicenseError::BadSignature);
     }
+    if REVOKED_ORDERS.contains(&license.order_id) {
+        return Err(LicenseError::Revoked);
+    }
+    Ok(license)
 }
 
+/// Whether any key in `ring` signed `payload`. The production check is this
+/// over [`PUBLIC_KEYS`]; a test build adds [`test_keyring`]'s key and
+/// nothing else.
 #[cfg(feature = "license")]
-fn verify_signature(payload: &[u8], sig: &[u8; SIG_LEN]) -> bool {
+fn signed_by(ring: &[[u8; 32]], payload: &[u8], sig: &[u8; SIG_LEN]) -> bool {
     use ed25519_compact::{PublicKey, Signature};
     let Ok(signature) = Signature::from_slice(sig) else {
         return false;
     };
-    PUBLIC_KEYS.iter().any(|raw| {
+    ring.iter().any(|raw| {
         PublicKey::from_slice(raw)
             .map(|pk| pk.verify(payload, &signature).is_ok())
             .unwrap_or(false)
     })
+}
+
+#[cfg(feature = "license")]
+fn verify_signature(payload: &[u8], sig: &[u8; SIG_LEN]) -> bool {
+    if signed_by(PUBLIC_KEYS, payload, sig) {
+        return true;
+    }
+    // The test keyring: compiled into test builds alone (see the module).
+    #[cfg(any(test, feature = "test-keyring"))]
+    if signed_by(&[test_keyring::public_key()], payload, sig) {
+        return true;
+    }
+    false
 }
 
 /// Without the `license` feature nothing verifies — the crate still compiles and
@@ -353,6 +401,64 @@ fn verify_signature(payload: &[u8], sig: &[u8; SIG_LEN]) -> bool {
 #[cfg(not(feature = "license"))]
 fn verify_signature(_payload: &[u8], _sig: &[u8; SIG_LEN]) -> bool {
     false
+}
+
+// ── Test keyring ─────────────────────────────────────────────────────────────
+
+/// **A signing key for tests, and only for tests.** Every key the test
+/// suites install (the fixture at `tests/fixtures/supporter.key`, the
+/// screenshot harness's supporter, the activation-flow tests) is signed by
+/// this keypair, whose seed is public, right here. No real key is in the
+/// repository's tree; the one that was is revoked (see [`REVOKED_ORDERS`]).
+///
+/// It exists in a build only under `cfg(test)` (this crate's unit tests) or
+/// the `test-keyring` feature, which nothing but a `[dev-dependencies]` line
+/// turns on (the binary's, tangent-ui's, and this crate's own, naming
+/// itself): resolver 2 gives a dev-dependency's features to test builds
+/// alone. `scripts/check-home.sh features` proves no shipped build carries
+/// it, and `tools/tangent-fulfil`'s tests prove at runtime that a build with
+/// only `license` refuses this keyring's keys. [`PUBLIC_KEYS`] never holds
+/// it, in any build.
+///
+/// Note the feature does NOT turn on `license`: a test build must still get
+/// `license` from the crate's ordinary dependency line, or
+/// `tangent/tests/license_feature.rs` could not catch that line going
+/// missing.
+#[cfg(any(test, feature = "test-keyring"))]
+pub mod test_keyring {
+    /// The test seed: 32 bytes of plain text, deliberately public.
+    pub const SEED: [u8; 32] = *b"tangent test keyring: never ship";
+
+    /// The public half of [`SEED`]'s keypair.
+    #[cfg(feature = "license")]
+    pub fn public_key() -> [u8; 32] {
+        use ed25519_compact::{KeyPair, Seed};
+        *KeyPair::from_seed(Seed::new(SEED)).pk
+    }
+
+    /// The license the committed fixture holds.
+    pub fn fixture_license() -> super::License {
+        super::License {
+            tier: super::TIER_SUPPORTER,
+            issued_days: 2414,
+            max_major: 0,
+            order_id: [0x7e, 0x57, 0x7e, 0x57, 0x01],
+            name: Some("Tester".to_owned()),
+        }
+    }
+
+    /// Sign `license` with the test key and encode it: deterministic (the
+    /// signature takes no noise), so the same license always mints the same
+    /// text, and the committed fixture can be checked against it.
+    #[cfg(feature = "license")]
+    pub fn mint(license: &super::License) -> String {
+        use ed25519_compact::{KeyPair, Seed};
+        let payload = license.payload_bytes();
+        let sig = KeyPair::from_seed(Seed::new(SEED)).sk.sign(&payload, None);
+        let mut sig64 = [0u8; super::SIG_LEN];
+        sig64.copy_from_slice(sig.as_ref());
+        super::encode_key(&payload, &sig64)
+    }
 }
 
 // ── On-disk store ────────────────────────────────────────────────────────────
@@ -479,6 +585,18 @@ impl LicenseStore {
         self.raw.as_deref()
     }
 
+    /// Whether the key file on disk is a genuine key that has been revoked
+    /// (and so is not honored). The store comes up free like any other
+    /// refusal and keeps the file; this is how the Supporter Key dialog
+    /// can say why, instead of a stored key going quiet with no word.
+    pub fn stored_key_revoked(&self) -> bool {
+        self.license.is_none()
+            && self
+                .raw
+                .as_deref()
+                .is_some_and(|r| verify_key(r) == Err(LicenseError::Revoked))
+    }
+
     /// Validate and install a pasted key. `Ok` means verified AND persisted
     /// atomically; on a refused key NOTHING changes, on disk or in memory.
     ///
@@ -537,6 +655,9 @@ impl LicenseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRC-32 of `PUBLIC_KEYS` flattened (k1 then k2).
+    const KEYRING_CRC: u32 = 0x0e0f_51c8;
 
     fn sample() -> License {
         License {
@@ -653,6 +774,98 @@ mod tests {
         assert_ne!(PUBLIC_KEYS[0], PUBLIC_KEYS[1], "successor must differ");
     }
 
+    /// **The production keyring is k1 and k2, byte for byte, and nothing
+    /// else**: a CRC over the ring as shipped. The test keyring is never in
+    /// it; it rides beside it in test builds alone (`test_keyring`).
+    #[test]
+    fn the_production_keyring_is_exactly_k1_and_k2() {
+        let flat: Vec<u8> = PUBLIC_KEYS.iter().flatten().copied().collect();
+        assert_eq!(flat.len(), 64);
+        assert_eq!(crc32(&flat), KEYRING_CRC, "PUBLIC_KEYS changed");
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn the_test_key_is_not_in_the_production_ring() {
+        let test = test_keyring::public_key();
+        assert!(!PUBLIC_KEYS.contains(&test), "the test key reached PUBLIC_KEYS");
+        // And a test-keyring key is refused by the production ring alone.
+        let key = test_keyring::mint(&test_keyring::fixture_license());
+        let (payload, sig) = decode_key(&key).unwrap();
+        assert!(!signed_by(PUBLIC_KEYS, &payload, &sig));
+        assert!(signed_by(&[test], &payload, &sig));
+    }
+
+    /// The key published by mistake (minted 2026-08-11 with k1). Public
+    /// already, and powerless now: kept as the revoked-key fixture.
+    const PUBLISHED_KEY: &str = include_str!("../../tests/fixtures/revoked-2026-08-11.key");
+
+    /// **The published key pins the whole production chain, and is
+    /// refused.** Base32 alphabet, CRC, payload layout and an Ed25519
+    /// signature by k1 all still hold for a key minted on 2026-08-11 (what
+    /// keeps every customer's key verifying), and the license layer turns
+    /// it away as revoked, not as a bad signature.
+    #[cfg(feature = "license")]
+    #[test]
+    fn the_published_key_is_genuine_under_k1_and_revoked() {
+        let (payload, sig) = decode_key(PUBLISHED_KEY).expect("decodes, CRC holds");
+        assert!(signed_by(&PUBLIC_KEYS[..1], &payload, &sig), "k1 signed it");
+        let l = License::from_payload(&payload).unwrap();
+        assert_eq!(l.tier, TIER_SUPPORTER);
+        assert_eq!(l.issued_days, 2414);
+        assert_eq!(l.max_major, 0, "perpetual");
+        assert_eq!(l.order_id, [0x60, 0x0b, 0x55, 0x53, 0x48]);
+        assert_eq!(l.name.as_deref(), Some("Ganten"));
+        assert_eq!(l.payload_bytes(), payload, "the signed preimage is byte-frozen");
+        assert_eq!(encode_key(&payload, &sig), PUBLISHED_KEY.trim(), "the encoder is frozen");
+        assert_eq!(verify_key(PUBLISHED_KEY), Err(LicenseError::Revoked));
+    }
+
+    /// A listed order id on a key nobody signed is a bad signature, not
+    /// "revoked": the list never vouches for anything.
+    #[test]
+    fn a_revoked_order_id_does_not_make_a_forgery_look_genuine() {
+        let l = License { order_id: REVOKED_ORDERS[0], ..sample() };
+        let key = encode_key(&l.payload_bytes(), &[7u8; SIG_LEN]);
+        assert_eq!(verify_key(&key).unwrap_err(), LicenseError::BadSignature);
+    }
+
+    /// **A stored copy of the published key stops unlocking on the next
+    /// launch**, keeps its file, says why, and cannot be installed again.
+    #[cfg(feature = "license")]
+    #[test]
+    fn a_stored_revoked_key_comes_up_free_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("tangent-lic-revoked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("license.key");
+        std::fs::write(&p, PUBLISHED_KEY).unwrap();
+        let mut s = LicenseStore::load_from(&p);
+        assert!(!s.is_supporter() && !s.licensed());
+        assert!(s.license().is_none() && s.display_name().is_none());
+        assert!(s.stored_key_revoked());
+        assert_eq!(s.raw(), Some(PUBLISHED_KEY), "the file is kept verbatim");
+        assert_eq!(s.install(PUBLISHED_KEY).unwrap_err(), LicenseError::Revoked);
+        assert!(!s.is_supporter());
+        // A genuine key replaces it, and the store stops reporting it.
+        s.install(&test_keyring::mint(&test_keyring::fixture_license())).unwrap();
+        assert!(s.is_supporter() && !s.stored_key_revoked());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The committed fixture is what the test keyring mints**, byte for
+    /// byte, so it is reproducible from the public test seed and holds no
+    /// real signature.
+    #[cfg(feature = "license")]
+    #[test]
+    fn the_committed_fixture_is_minted_by_the_test_keyring() {
+        let fixture = include_str!("../../tests/fixtures/supporter.key");
+        let minted = test_keyring::mint(&test_keyring::fixture_license());
+        assert_eq!(fixture, format!("{minted}\n"));
+        assert_eq!(verify_key(fixture).unwrap(), test_keyring::fixture_license());
+        let (payload, sig) = decode_key(fixture).unwrap();
+        assert!(!signed_by(PUBLIC_KEYS, &payload, &sig), "the fixture is signed by a real key");
+    }
+
     #[test]
     fn missing_file_is_free_not_an_error() {
         let s = LicenseStore::load_from("/nonexistent/tangent/license.key");
@@ -726,7 +939,11 @@ mod tests {
             LicenseError::BadSignature,
             LicenseError::VersionCapped(4),
             LicenseError::Unsaved,
+            LicenseError::Revoked,
         ];
+        for e in all {
+            assert!(!e.message().contains('\u{2014}'), "{e:?} has an em dash");
+        }
         for e in all {
             assert!(!e.message().contains("Ivory"), "{e:?}: {}", e.message());
         }

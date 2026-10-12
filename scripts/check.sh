@@ -99,7 +99,7 @@ echo "==> cargo test --workspace  (in a scratch home it watches: no test reaches
 scripts/check-home.sh selftest
 scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-fast
 
-echo "==> no build that ships carries test-home  (resolver 2 keeps it in test builds)"
+echo "==> no build that ships carries test-home or test-keyring  (resolver 2 keeps them in test builds)"
 # A dev-dependency's features reach test builds alone, so `cargo build` and
 # every artifact resolve the real home. Read the way a build resolves
 # features: the binary with every feature on every target, dev edges off (it

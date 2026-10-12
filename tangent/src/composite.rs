@@ -2502,8 +2502,9 @@ mod shot {
 pub(crate) mod tiers {
     use tangent_core::license::LicenseStore;
 
-    /// The committed fixture: a real, signed, perpetual supporter key (name
-    /// Ganten). Spelled out only here, only under cfg(test).
+    /// The committed fixture: a perpetual supporter key (name Tester) signed
+    /// by tangent-core's test keyring, which only a test build accepts.
+    /// Spelled out only here, only under cfg(test).
     const SUPPORTER_KEY: &str = include_str!("../../tests/fixtures/supporter.key");
 
     pub(crate) fn dir(tag: &str) -> std::path::PathBuf {
@@ -2547,7 +2548,7 @@ pub(crate) mod tiers {
         assert!(!free.is_supporter() && !free.cheated() && !free.licensed());
         let buyer = supporter("tiers-buyer");
         assert!(buyer.is_supporter() && buyer.licensed() && !buyer.cheated());
-        assert_eq!(buyer.display_name(), Some("Ganten"));
+        assert_eq!(buyer.display_name(), Some("Tester"));
         let cheat = cheater("tiers-cheat");
         assert!(cheat.is_supporter() && cheat.cheated() && !cheat.licensed());
         let again = LicenseStore::load_from(dir("tiers-cheat").join("license.key"));
