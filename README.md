@@ -1,12 +1,14 @@
 # Tangent
 
-**A DAW for recording, arranging and mixing. Free with up to 32 tracks.**
+**Record, arrange and mix on macOS, Windows, Linux and FreeBSD.**
+
+Free with up to 32 tracks; a supporter key removes the limit.
 
 ### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
 
-<!-- SCREENSHOT PLACEHOLDER: the arrangement view with a few tracks, the
-mixer below or beside it. docs/img/ has no 5.0 arrangement or mixer shot yet;
-add one (for example docs/img/screenshot-arrangement.png) and put it here. -->
+![The arrangement: drum, piano and audio tracks with MIDI and audio clips, a volume automation lane under the piano track, and the recorder band with its spectrum, clock and transport above](docs/img/screenshot-arrangement.png)
+
+![The mixer: a strip for each track, a folder, a return and the click, each with its inserts, routing, send, pan and fader, and the master on the right](docs/img/screenshot-mixer.png)
 
 Tangent is a digital audio workstation for macOS, Windows, Linux and
 FreeBSD. You record audio and MIDI into it, arrange clips on a timeline,

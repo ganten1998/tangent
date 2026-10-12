@@ -33,7 +33,10 @@ Subject: Tangent 5.0 is out
 
 Hi,
 
-Tangent 5.0 is out. You bought a key for a program that named the chords you
+Tangent 5.0 is out: record, arrange and mix on macOS, Windows, Linux and
+FreeBSD. Free with up to 32 tracks; your key removes the limit.
+
+You bought a key for a program that named the chords you
 played and could record them. This release is the one where it becomes a
 DAW.
 
