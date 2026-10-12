@@ -93,6 +93,9 @@ pub struct ChordDetector {
     pub max_notes_for_chord: usize,
     debug_mode: bool,
     debug_candidates: Vec<(String, f64)>,
+    /// The debug candidates that leave no sounded pitch class unexplained.
+    /// Filled alongside `debug_candidates`; read by `detect_chord_alternates`.
+    debug_complete: HashSet<String>,
     /// True only while `detect_chord_simple` scores a slash-reduced note set. It
     /// lifts the D23 tritone gate on the #11-shell bonus so slash upper structures
     /// name exactly as they did pre-fix (the primary pass keeps the gate).
@@ -128,6 +131,7 @@ impl ChordDetector {
             max_notes_for_chord: 7,
             debug_mode: false,
             debug_candidates: Vec::new(),
+            debug_complete: HashSet::new(),
             simplify_pass: false,
             overrides: None,
             #[cfg(feature = "learning")]
@@ -194,6 +198,7 @@ impl ChordDetector {
         // debug_candidates carries the scores; learn_capture carries features.
         self.debug_mode = true;
         self.debug_candidates.clear();
+        self.debug_complete.clear();
         let label = self.detect_chord(notes);
         self.debug_mode = prev_debug;
         let captured = self.learn_capture.take().unwrap_or_default();
@@ -603,6 +608,9 @@ impl ChordDetector {
                 }
                 if self.debug_mode {
                     self.debug_candidates.push((chord_name.clone(), score));
+                    if complete {
+                        self.debug_complete.insert(chord_name.clone());
+                    }
                 }
                 if complete
                     && raw_score > 0.0
@@ -737,7 +745,11 @@ impl ChordDetector {
                     let iv: HashSet<u8> =
                         pcs_all.iter().map(|&pc| pc_interval(implied, pc)).collect();
                     let name = self.name_rootless_dominant(implied, &iv);
-                    if self.debug_mode { self.debug_candidates.push((name.clone(), best_score)); }
+                    if self.debug_mode {
+                        self.debug_candidates.push((name.clone(), best_score));
+                        // Named from every tension present: complete by construction.
+                        self.debug_complete.insert(name.clone());
+                    }
                     best_match = Some(name);
                     best_root_pc = implied;
                 }
@@ -858,6 +870,7 @@ impl ChordDetector {
     ) -> (Option<String>, Vec<(String, f64)>) {
         self.debug_mode = true;
         self.debug_candidates.clear();
+        self.debug_complete.clear();
         let result = self.detect_chord(active_notes);
         let mut seen: HashMap<String, f64> = HashMap::new();
         for (name, score) in self.debug_candidates.drain(..) {
@@ -884,6 +897,30 @@ impl ChordDetector {
             }
         }
         (result, candidates)
+    }
+
+    /// The winner and up to `n` other names for the same notes, best first.
+    ///
+    /// The same detection as [`Self::detect_chord_debug`], so the winner can
+    /// never disagree with it, but an ALTERNATE must account for every
+    /// sounded pitch class. The scorer rates partial readings too (a triad
+    /// inside a six-note chord), and those are how it weighs the winner, not
+    /// other names for what is being played: shown beside the winner, a bare
+    /// "B" reads as a fragment of a name.
+    pub fn detect_chord_alternates(
+        &mut self,
+        active_notes: &HashSet<u8>,
+        n: usize,
+    ) -> (Option<String>, Vec<String>) {
+        let (winner, ranked) = self.detect_chord_debug(active_notes, usize::MAX);
+        let complete = std::mem::take(&mut self.debug_complete);
+        let alternates = ranked
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| Some(name.as_str()) != winner.as_deref() && complete.contains(name))
+            .take(n)
+            .collect();
+        (winner, alternates)
     }
 
     pub fn detect_interval(&self, active_notes: &HashSet<u8>) -> Option<String> {
@@ -1758,6 +1795,34 @@ mod tests {
     use super::*;
 
     fn notes(v: &[u8]) -> HashSet<u8> { v.iter().copied().collect() }
+
+    /// **An alternate is another name for EVERYTHING sounding, never for part
+    /// of it.** D F# C Eb Ab B is D7(b9,#11) or Ab7(#9,#11); the scorer also
+    /// rated a bare B triad (B, D#, F# are three of the six notes), and the
+    /// staff printed it as a lone "B" after the real alternate, which reads as
+    /// a fragment of a name. The winner is untouched; only the runners-up that
+    /// leave a sounded note unexplained are dropped.
+    #[test]
+    fn alternates_name_every_sounding_note() {
+        for flats in [true, false] {
+            let mut d = ChordDetector::new();
+            d.set_note_preference(flats);
+            let (winner, alts) = d.detect_chord_alternates(&notes(&[50, 54, 60, 63, 68, 71]), 2);
+            assert_eq!(winner.as_deref(), Some("D7(b9,#11)"));
+            let want = if flats { "Ab7(#9,#11)" } else { "G#7(#9,#11)" };
+            assert_eq!(alts, vec![want.to_string()], "flats={flats}");
+        }
+        // The winner never repeats as its own alternate, and a chord with no
+        // other complete reading has none.
+        let mut d = ChordDetector::new();
+        let (winner, alts) = d.detect_chord_alternates(&notes(&[60, 64, 67]), 2);
+        assert_eq!(winner.as_deref(), Some("C"));
+        assert!(!alts.iter().any(|a| a == "C"), "{alts:?}");
+        // C6 / Am7 is the teaching case the alternates exist for.
+        let (winner, alts) = d.detect_chord_alternates(&notes(&[60, 64, 67, 69]), 2);
+        assert!(winner.is_some());
+        assert!(!alts.is_empty(), "C E G A lost its second reading: {winner:?}");
+    }
 
     // ── Intervals ────────────────────────────────────────────────────────────
     #[test] fn t_m2()  { assert_eq!(ChordDetector::new().detect_chord(&notes(&[60,61])), Some("C (m2)".into())); }

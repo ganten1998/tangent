@@ -16,8 +16,10 @@
 //! the three hardest parts of engraving are not skipped here, they are
 //! genuinely absent from the problem.
 //!
-//! **No key signature**, so no naturals. Accidentals are per-note and follow
-//! `prefer_flats`, exactly like every other note name in the app.
+//! **Spelling.** A named chord spells its own notes by degree (the third of D
+//! is F sharp, see [`spell_chord`]); the key signature decides what is
+//! printed and the user's `prefer_flats` decides the black keys only where
+//! neither a chord nor a signature does.
 //!
 //! **Seconds are offset**, which is the one engraving rule that is not
 //! optional: two noteheads a diatonic second apart cannot share a side, and a
@@ -285,6 +287,12 @@ pub fn spell_in_key(midi: u8, key: i32, prefer_flats: bool) -> Spelled {
         }
     }
     let (letter, alter) = best;
+    spelled_as(midi, &alters, letter, alter)
+}
+
+/// `midi` written on `letter` bent by `alter`, with what the signature
+/// `alters` leaves to be printed in front of it.
+fn spelled_as(midi: u8, alters: &[i8; 7], letter: usize, alter: i32) -> Spelled {
     let printed = (alter != i32::from(alters[letter])).then_some(alter as i8);
     // MIDI 60 is C4, so the octave is `midi / 12 - 1` -- and a B sharp below
     // middle C belongs to the octave BELOW it, which is what taking the
@@ -301,6 +309,35 @@ pub fn spell_in_key(midi: u8, key: i32, prefer_flats: bool) -> Spelled {
         printed,
         letter: LETTERS[letter],
     }
+}
+
+/// Spell the notes of a named chord, in a key.
+///
+/// **The chord decides the letters; the signature decides what is printed.**
+/// A D7 has an F sharp in it whatever the signature, and an F sharp is what
+/// the staff writes: drawn as a G flat it is a diminished fourth over the
+/// root, which is not in the chord the readout beside it names. The key still
+/// says which accidentals are printed, and still turns a black-key ROOT round
+/// (the detector names roots by the user's preference alone, and in E flat
+/// major an A flat chord is not a G sharp chord).
+///
+/// `chord` is ignored unless its root is one of `notes`: a label that does not
+/// describe these notes says nothing about how to spell them. Without a chord,
+/// or for a degree that would need a double accidental, it is
+/// [`spell_in_key`], and `prefer_flats` decides only where the key is silent.
+pub fn spell_chord(notes: &[u8], chord: Option<&str>, key: i32, prefer_flats: bool) -> Vec<Spelled> {
+    let spelling = chord
+        .and_then(tangent_core::ChordSpelling::from_label)
+        .filter(|sp| notes.iter().any(|n| n % 12 == sp.root_pc()))
+        .map(|sp| if key == 0 { sp } else { sp.with_root_flats(key < 0) });
+    let alters = key_alterations(key);
+    notes
+        .iter()
+        .map(|&n| match spelling.and_then(|sp| sp.letter(n % 12)) {
+            Some((letter, alter)) => spelled_as(n, &alters, letter as usize, i32::from(alter)),
+            None => spell_in_key(n, key, prefer_flats),
+        })
+        .collect()
 }
 
 /// Spell with no key signature at all.
@@ -1066,10 +1103,12 @@ pub fn draw(
     };
     let mut sorted: Vec<u8> = notes.iter().copied().collect();
     sorted.sort_unstable();
-    let spelled: Vec<Spelled> = sorted
-        .iter()
-        .map(|n| spell_in_key(*n, s.staff_key, s.prefer_flats))
-        .collect();
+    let spelled = spell_chord(
+        &sorted,
+        readout.and_then(|r| r.chord),
+        s.staff_key,
+        s.prefer_flats,
+    );
     let set = s.staff_set();
     let per_staff = distribute(&set, &spelled);
     let (space, left, used_w, margin) = (f.space, f.left, f.used_w, f.margin);
@@ -1892,6 +1931,61 @@ mod tests {
     /// says it means.** Clicking the F line in D major is an F sharp; asking
     /// somebody to add the accidental in their head would make the staff the
     /// one view in the app that lies about what it draws.
+    /// **A named chord spells its own notes.** D F# C Eb Ab B is D7(b9,#11):
+    /// the third of D is F sharp, the #11 is G sharp, the b9 is E flat, the 13
+    /// is B and the b7 is C. With flats preferred and no signature the staff
+    /// used to write G flat (a diminished fourth over the root the readout
+    /// beside it names) and A flat.
+    #[test]
+    fn a_named_chord_spells_its_notes_from_its_root() {
+        fn written(v: &[Spelled]) -> Vec<String> {
+            v.iter()
+                .map(|n| {
+                    let acc = match n.alter {
+                        1 => "#",
+                        -1 => "b",
+                        _ => "",
+                    };
+                    format!("{}{acc}", n.letter)
+                })
+                .collect()
+        }
+        let notes = [50u8, 54, 60, 63, 68, 71];
+        for prefer_flats in [true, false] {
+            assert_eq!(
+                written(&spell_chord(&notes, Some("D7(b9,#11)"), 0, prefer_flats)),
+                ["D", "F#", "C", "Eb", "G#", "B"],
+                "prefer_flats={prefer_flats}"
+            );
+        }
+        // The F sharp is a line ABOVE the F, not the G: the letter is the
+        // degree, so the notehead sits a third over the D.
+        let spelled = spell_chord(&notes, Some("D7(b9,#11)"), 0, true);
+        assert_eq!(spelled[1].step - spelled[0].step, 2, "the third of D is not a third above it");
+
+        // No chord named: the preference decides, as it always did.
+        assert_eq!(written(&spell_chord(&notes, None, 0, true))[1], "Gb");
+        assert_eq!(written(&spell_chord(&notes, None, 0, false))[1], "F#");
+        // A label whose root is not sounding does not describe these notes.
+        assert_eq!(written(&spell_chord(&notes, Some("E7"), 0, true))[1], "Gb");
+    }
+
+    /// The signature still decides what is PRINTED, and turns a black-key
+    /// root round: in E flat major a chord the detector called G# (sharps
+    /// preferred) is written A flat, C, E flat with nothing in front of them.
+    #[test]
+    fn a_key_signature_still_prints_and_turns_the_root() {
+        let ab = spell_chord(&[56, 60, 63], Some("G#"), -3, false);
+        assert_eq!(
+            ab.iter().map(|n| (n.letter, n.alter, n.printed)).collect::<Vec<_>>(),
+            [("A", -1, None), ("C", 0, None), ("E", -1, None)],
+        );
+        // D7 in E flat major: the F sharp is printed, the C is not.
+        let d7 = spell_chord(&[50, 54, 57, 60], Some("D7"), -3, true);
+        assert_eq!((d7[1].letter, d7[1].printed), ("F", Some(1)));
+        assert_eq!((d7[3].letter, d7[3].printed), ("C", None));
+    }
+
     #[test]
     fn a_click_is_spelled_by_the_key_signature() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 240.0));

@@ -5885,11 +5885,19 @@ impl TangentApp {
             .and_then(theory_panel::parse_label)
             .filter(|(r, _)| pcs & (1 << (r % 12)) != 0)
             .map_or((None, false), |(r, m)| (Some(r), m));
+        // The chord's own spelling, under the same rule as the root: only
+        // when the label describes these notes.
+        let spelling = self
+            .current_chord
+            .as_deref()
+            .and_then(tangent_core::ChordSpelling::from_label)
+            .filter(|sp| Some(sp.root_pc()) == root);
         theory_panel::Input {
             pcs,
             bass,
             root,
             minor,
+            spelling,
         }
     }
 
@@ -6034,7 +6042,7 @@ impl TangentApp {
             return;
         }
         // The ranked pass, but only while the staff panel is on screen to
-        // show it. It is the SAME detection — `detect_chord_debug` calls
+        // show it. It is the SAME detection — `detect_chord_alternates` calls
         // `detect_chord` and collects what the scorer already computed — so
         // the winner cannot disagree between the two paths; the only cost is
         // a string per scored candidate, which nothing else would read.
@@ -6043,13 +6051,11 @@ impl TangentApp {
             .theory_views()
             .contains(theory_panel::View::Staff)
         {
-            let (winner, ranked) = self.detector.detect_chord_debug(&notes, 8);
-            self.chord_alternates = ranked
-                .into_iter()
-                .map(|(name, _)| name)
-                .filter(|name| Some(name.as_str()) != winner.as_deref())
-                .take(2)
-                .collect();
+            // Only readings of EVERY sounding note: the scorer also rates
+            // partial ones (a triad inside a six-note chord), and one of those
+            // printed as an alternate is a lone "B" that reads as a fragment.
+            let (winner, alternates) = self.detector.detect_chord_alternates(&notes, 2);
+            self.chord_alternates = alternates;
             self.current_chord = winner;
         } else {
             self.current_chord = self.detector.detect_chord(&notes);
@@ -63487,6 +63493,32 @@ mod tests {
             let said = app.spoken_note(n);
             assert!(!said.contains('#'), "{n} kept a sharp sign under flats: {said:?}");
         }
+    }
+
+    /// **D F# C Eb Ab B, end to end.** The readout names D7(b9,#11); its one
+    /// alternate is Ab7(#9,#11), and the bare B triad the scorer also rated is
+    /// not printed after it as a lone "B". The diagrams spell the third F
+    /// sharp and the #11 G sharp although flats are preferred.
+    #[test]
+    fn d7_flat9_sharp11_reads_out_whole_and_spelled_from_d() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.prefer_flats = true;
+        app.detector.set_note_preference(true);
+        app.settings.set_theory_views(&theory_panel::Views::all());
+        app.settings.chord_detection_enabled = true;
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes.extend([50u8, 54, 60, 63, 68, 71]);
+        app.detection_tick(true);
+        assert_eq!(app.current_chord.as_deref(), Some("D7(b9,#11)"));
+        assert_eq!(app.chord_alternates, vec!["Ab7(#9,#11)".to_string()]);
+
+        let display = app.display_notes();
+        let input = app.theory_input(&display);
+        let named: Vec<String> = [2u8, 6, 0, 3, 8, 11]
+            .iter()
+            .map(|&pc| theory_panel::note_label(pc, &input, true))
+            .collect();
+        assert_eq!(named, ["D", "F#", "C", "Eb", "G#", "B"]);
     }
 
     /// The theory surfaces say what is on them.
