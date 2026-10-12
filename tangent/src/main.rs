@@ -241,7 +241,7 @@ struct CliArgs {
 fn print_usage_and_exit(code: i32) -> ! {
     let text = "usage: tangent [-h] [-p PORT] [-l]\n\
                 \n\
-                MIDI keyboard monitor with chord detection\n\
+                Tangent, a DAW for recording, arranging and mixing\n\
                 \n\
                 options:\n\
                   -h, --help            show this help message and exit\n\

@@ -2867,25 +2867,23 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// strings: a card whose text overflows its own window is a first impression
 /// nobody recovers from, and it is exactly the sort of thing that breaks when
 /// somebody adds a line.
-const WELCOME_LINES: [&str; 20] = [
+const WELCOME_LINES: [&str; 18] = [
     "Welcome to Tangent 5.0!",
     "",
-    "Tangent is an attempt to create a seamless",
-    "environment between learning/synthesizing",
-    "musical information, and creating as soon",
-    "as the inspiration strikes. Start off",
-    "exploring with TAB, which cycles between",
-    "three views, or press 'H' for the full",
-    "keybind list, which differs per-view.",
-    "Anything that is extra lives in the",
-    "right-click menu.",
+    "Tangent is a DAW now. Record audio and MIDI,",
+    "arrange and edit it, mix it, and export it,",
+    "with your own plugins or with the instruments",
+    "and effects that come with it.",
     "",
-    "It may seem like nothing more than eye-candy",
-    "at first, but the substance is there, and I",
-    "want this to evolve into a home for those",
-    "who want to do it all in one place.",
+    "TAB moves between three views: the keyboard,",
+    "the arrangement and the mixer. Hold 'H' for",
+    "the shortcuts of the view you are in, and",
+    "right-click for everything else.",
     "",
-    "More to come,",
+    "It still names the chord you are playing, and",
+    "a take can still film the window as you go.",
+    "",
+    "Thanks for trying it,",
     "",
     "Ganten",
 ];
@@ -4319,7 +4317,7 @@ fn vst3_locations() -> &'static str {
 fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, String) {
     if !caps.capture_devices {
         return (
-            "A piano display with chord intelligence",
+            "A piano that names the chords you play",
             "Chord detection, sheet music, guitar view, theory diagrams".to_owned(),
         );
     }
@@ -4333,7 +4331,7 @@ fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, Strin
         None => "unlimited tracks".to_owned(),
     };
     (
-        "A recording DAW with chord intelligence",
+        "A DAW for recording, arranging and mixing",
         format!("Recorder, {desk}, arrangement, MIDI editor, drum machine, {formats}"),
     )
 }
@@ -19621,7 +19619,7 @@ at: None,
         let (painted, action) = run_picker_with(&mut dialog, desktop);
         assert!(action.is_none(), "About asked the app to do something");
         assert!(
-            painted.contains("A recording DAW with chord intelligence"),
+            painted.contains("A DAW for recording, arranging and mixing"),
             "{painted}"
         );
         assert!(
@@ -19697,7 +19695,7 @@ at: None,
         let mut dialog = Some(Dialog::About { supporter: false });
         let (painted, _) = run_picker(&mut dialog);
         assert!(
-            painted.contains("A piano display with chord intelligence"),
+            painted.contains("A piano that names the chords you play"),
             "{painted}"
         );
         for claim in ["recording DAW", "Recorder", "VST3", "LV2"] {

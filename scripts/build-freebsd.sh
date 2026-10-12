@@ -285,8 +285,8 @@ write_readme() {
 Tangent $CARGO_VERSION for FreeBSD ($ABI)
 =========================================
 
-Tangent names what you play on a MIDI keyboard in real time, and records,
-mixes and arranges it too.
+Tangent is a DAW: it records audio and MIDI, arranges it, and mixes it,
+with your own plugins or the instruments and effects it comes with.
 
 INSTALL
 
