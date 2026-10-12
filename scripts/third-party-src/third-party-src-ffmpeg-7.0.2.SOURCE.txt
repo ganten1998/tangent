@@ -1,0 +1,36 @@
+Source for the ffmpeg build in Tangent's Linux downloads
+========================================================
+
+Tangent's Linux tarballs carry tangent-ffmpeg, which is the ffmpeg program,
+unmodified, from John Van Sickle's static builds of FFmpeg 7.0.2:
+
+  x86_64:  ffmpeg-7.0.2-amd64-static.tar.xz
+           sha256 abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67
+  aarch64: ffmpeg-7.0.2-arm64-static.tar.xz
+           sha256 f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1
+  from https://johnvansickle.com/ffmpeg/
+
+It is licensed under the GNU GPL version 3 (the build is configured with
+--enable-gpl --enable-version3).
+
+Every file here, and where it came from (SHA256SUMS.txt lists the hashes):
+
+  ffmpeg-7.0.2.tar.xz, ffmpeg-7.0.2.tar.xz.asc
+      FFmpeg 7.0.2, the release tarball from https://ffmpeg.org/releases/,
+      with its detached signature. Verified: good signature from the FFmpeg
+      release signing key FCF986EA15E6E293A5644F10B4322F04D67658D8.
+
+  jvs-7.0.2-readme.txt
+      The builder's readme, taken out of the x86_64 archive above. It lists
+      the version of every library the build links (libx264, libx265,
+      libvpx, libaom, libmp3lame, libopus and the rest) and the compiler.
+
+What this release does not yet hold: the source of those libraries, at the
+versions the readme names, and the builder's own build scripts and
+configure options. The builder does not publish them for this build (his
+https://johnvansickle.com/ffmpeg/release-source/ folder holds sources for
+FFmpeg 4.1 from 2018), so they cannot be mirrored from him. LICENSING.md in
+Tangent's source, "The source it is owed", says what is being done about it.
+
+Tangent itself is MIT licensed and does not link ffmpeg; it starts it as a
+separate program. Tangent's own source: https://github.com/ganten1998/tangent

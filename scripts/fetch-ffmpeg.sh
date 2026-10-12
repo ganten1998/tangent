@@ -173,9 +173,14 @@ keep() {
 # certificate-table entry, and this file ships beside that copy; it used to
 # call it unmodified. **And the URL is where the archive came from, not where
 # its source is**: neither server hosts this build's source at that address,
-# and BtbN prunes dated releases within weeks. The hosted source the GPL
-# wants named here is W31 in the 5.1 worklist (LICENSING.md, the hosting
-# plan); until it exists, this says only what is true.
+# and BtbN prunes dated releases within weeks. GPLv3 6(d) wants "clear
+# directions next to the object code" to where WE host the source, so the
+# fourth argument names that release (fetch-ffmpeg-sources.sh stages it,
+# publish-third-party-src.sh creates it; LICENSING.md, "Where the source
+# is"). A new pin changes it in the same edit as the URL and the hash.
+SRC_BASE="https://github.com/ganten1998/tangent/releases/tag"
+LINUX_SRC="third-party-src-ffmpeg-7.0.2"
+WIN_SRC="third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22"
 provenance() {
     local how="This ffmpeg build is bundled unmodified."
     if [ "$PLATFORM" = windows ]; then
@@ -188,8 +193,9 @@ certificate-table entry. The program code is BtbN's, byte for byte."
 $how
 
 Tangent invokes it as a separate process. It is GPL-licensed (see the licence
-text beside this file), and ffmpeg's source code is available from
-https://ffmpeg.org/.
+text beside this file). The source for this build is published at
+
+  $SRC_BASE/$4
 
 The archive it came from, so the build can be identified after the link is
 gone (dated builds are pruned upstream):
@@ -211,7 +217,7 @@ linux)
     mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
     chmod 755 "$OUT/tangent-ffmpeg"
     mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
-    provenance "$OUT/ffmpeg-licenses" "${LINUX_URLS%%$'\n'*}" "$LINUX_SHA"
+    provenance "$OUT/ffmpeg-licenses" "${LINUX_URLS%%$'\n'*}" "$LINUX_SHA" "$LINUX_SRC"
     echo "==> $OUT/tangent-ffmpeg"
     ;;
 linux-arm64)
@@ -224,7 +230,7 @@ linux-arm64)
     mv "$OUT/ffmpeg" "$OUT/tangent-ffmpeg"
     chmod 755 "$OUT/tangent-ffmpeg"
     mv "$OUT/GPLv3.txt" "$OUT/ffmpeg-licenses/GPLv3.txt"
-    provenance "$OUT/ffmpeg-licenses" "${ARM64_URLS%%$'\n'*}" "$ARM64_SHA"
+    provenance "$OUT/ffmpeg-licenses" "${ARM64_URLS%%$'\n'*}" "$ARM64_SHA" "$LINUX_SRC"
     echo "==> $OUT/tangent-ffmpeg"
     ;;
 windows)
@@ -236,7 +242,7 @@ windows)
         "${WIN_FILE%.zip}/bin/ffmpeg.exe" "${WIN_FILE%.zip}/LICENSE.txt" -d "$OUT"
     mv "$OUT/ffmpeg.exe" "$OUT/tangent-ffmpeg.exe"
     mv "$OUT/LICENSE.txt" "$OUT/ffmpeg-licenses/LICENSE.txt"
-    provenance "$OUT/ffmpeg-licenses" "$WIN_URLS" "$WIN_SHA"
+    provenance "$OUT/ffmpeg-licenses" "$WIN_URLS" "$WIN_SHA" "$WIN_SRC"
     echo "==> $OUT/tangent-ffmpeg.exe"
     ;;
 esac

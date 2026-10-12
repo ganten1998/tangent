@@ -46,6 +46,19 @@ if [ "${1:-}" = "--names" ]; then
   exit 0
 fi
 
+# **And the source releases the GPL makes us keep up** (LICENSING.md, "The
+# source it is owed"): README.md and the post-purchase page name the
+# `third-party-src-*` releases, so a deleted or never-created one fails here,
+# the same gate as a dead download link. Swept, never listed by --names: they
+# are releases of their own, not assets publish-github.sh uploads.
+TAGS="$(
+  for f in "${SOURCES[@]}"; do
+    awk '/^```/ { fenced = !fenced; next } !fenced' "$f"
+  done | grep -ohE 'https://github\.com/[^ ")]*/releases/tag/third-party-src-[A-Za-z0-9._-]+' | sort -u
+)"
+[ -z "$TAGS" ] || URLS="$URLS
+$TAGS"
+
 fail=0
 n=0
 while IFS= read -r url; do
