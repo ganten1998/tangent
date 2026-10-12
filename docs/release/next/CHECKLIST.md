@@ -95,6 +95,14 @@ needed was done the same day (commits listed in section B).
   `Tangent-<v>-macos-universal.dmg` with the pkg and zip (it is a README
   link, and publish-github.sh refuses a release without it);
   build-macos.sh alone still treats it as best-effort for tester builds.
+- [x] **B11. Every readable written from scratch for a DAW. DONE** (branch
+  `copy-5.0`; owner, 2026-10-12: "it's a DAW, all content must be written
+  from scratch for this release"). GUMROAD.md, STORE-CONTENT.md (description
+  and post-purchase page), the key email, README.md, docs/ARTIFACT-README.md,
+  the release notes, WEBSITE-CARD.md, ANNOUNCE.md, the Welcome card, About,
+  the desktop entry, the FreeBSD package text, the macOS installer's welcome
+  page, the Windows FileDescription and `--help`. STORE-KIT.md is
+  regenerated from them. The GitHub description is step G5.
 - [ ] **B7. Rename `docs/release/next/` to `docs/release/5.0.0/`** in the
   release commit (copy_scan follows it, copy_scan.rs:506-537). Delete the
   owner header from `RELEASE-NOTES-5.0.0.md` before publishing.
@@ -240,6 +248,22 @@ Expected in `dist/`: `Tangent-5.0.0-macos.pkg`,
   so it becomes Latest over 4.4.1), uploads, and re-checks every
   `/releases/latest/download/` alias anonymously. It must end
   `==> OK. Every permanent download link resolves to 5.0.0.`
+- [ ] **G5. OWNER: the repository's description.** It still reads "Tangent:
+  a MIDI keyboard monitor that names what you play in real time. 88 keys,
+  chord detection, a guitar neck, theory diagrams, and a VST3 plugin. Free,
+  offline, no telemetry." The VST3 plugin is gone and Tangent is a DAW. Set
+  it (and, if wanted, topics) once the repository is public:
+
+  ```sh
+  gh repo edit ganten1998/tangent \
+    --description "Tangent: a DAW for recording, arranging and mixing audio and MIDI, with VST3 and LV2 hosting, built-in instruments and effects, and live chord naming. macOS, Windows, Linux and FreeBSD. Free with up to 32 tracks. Offline, no telemetry." \
+    --add-topic daw --add-topic audio --add-topic midi --add-topic music-production \
+    --add-topic vst3 --add-topic lv2 --add-topic rust --add-topic freebsd
+  ```
+
+  The description is 235 characters (GitHub allows 350) and has no em dash.
+  Codeberg's repository description, if it carries the old line, takes the
+  same text.
 
 ## H. Verify as a stranger
 
@@ -271,11 +295,12 @@ What depends on GitHub releases (all resolve by exact asset name against the
 LATEST release, so they survive deleting OLD releases as long as 5.0.0 is
 Latest and carries the aliases, which publish-github.sh uploads):
 
-- README.md:5,57-59,66 (download table and button), README.md:168 (issues).
+- README.md:5,31-33,39 (download button, table and releases page),
+  README.md:177 (issues).
 - The supporter-key email: tools/tangent-fulfil/src/main.rs:286,294,296, in
   every email already sent, plus the older `Ivory-*` names and the
   `github.com/ganten1998/ivory/...` slug in emails from before the rename.
-- The Gumroad post-purchase page and description (STORE-CONTENT.md:167-221,
+- The Gumroad post-purchase page and description (STORE-CONTENT.md:160-238,
   GUMROAD.md).
 - The website card (old slug `ganten1998/ivory`, projects.html:134,168).
 - LICENSING.md ("Where the source is"): the `third-party-src-*` source
@@ -283,7 +308,7 @@ Latest and carries the aliases, which publish-github.sh uploads):
   binaries are offered.
 - Nothing in the app: no update check (README Privacy section); the app
   links only to ganten.neocities.org and the Gumroad page
-  (tangent-ui/src/dialogs.rs:12607,14130).
+  (tangent-ui/src/dialogs.rs:12605,14128).
 
 Safe meaning (recommended): delete old releases and their remote tags, keep
 the repository. After 5.0.0 is Latest and H1 is green, for each old release:
