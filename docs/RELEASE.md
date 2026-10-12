@@ -344,8 +344,12 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    in a VM or under CrossOver if available.
 7. **Checksums** are written by `release.sh` itself, version-scoped, so a
    stale artifact from another version can never ride along.
-8. **Push**: the release commit and the tag, to Codeberg (source of truth)
-   and the GitHub mirror (`git push github main --tags`).
+8. **Push**: the release commit and the tag, and nothing else, to Codeberg
+   (source of truth) and the GitHub mirror:
+   `git push origin main v<v>` and `git push github main v<v>`. Never
+   `--tags`: it pushes every local tag, which after old GitHub releases and
+   their tags have been deleted would put all of them (dev and beta tags
+   included) back on the mirror.
 9. **Publish**: `scripts/publish-github.sh --notes-file <notes>` (the
    `github` remote is the release channel; `DRY_RUN=1` to rehearse). It
    uploads every artifact in THREE spellings: version-scoped, the
