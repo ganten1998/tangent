@@ -47,8 +47,9 @@ FreeBSD, editor windows included, and a new session opens with the built-in
 Tangent DX7 armed and set to a tine electric piano, so the app makes a sound
 out of the box.
 
-It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, and on
-Linux (glibc 2.30+, ALSA, Wayland or X11). It builds and runs on FreeBSD too.
+It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, on Linux
+(x86_64 and aarch64, glibc 2.30+, ALSA, Wayland or X11), and on FreeBSD 15
+(amd64).
 
 ## Download
 
@@ -62,7 +63,8 @@ macOS builds are universal (Apple Silicon and Intel), signed and notarized.
 The Windows download is the installer; it puts Tangent in the Start menu and
 includes an uninstaller. The Linux `install.sh` needs no root by default and
 takes `--system`, `--prefix`, `--uninstall` and `--dry-run`. Other builds,
-including the Linux aarch64 tarball and checksums, are on the
+including the Windows portable zip, the Linux aarch64 tarball, the FreeBSD
+package and its two offline bundles, and checksums, are on the
 [releases page](https://github.com/ganten1998/tangent/releases/latest).
 
 ## Features
@@ -205,7 +207,13 @@ release uploads those alongside the current ones.
 Tangent and every crate in this repo are **MIT**. The Windows and Linux
 artifacts bundle an unmodified GPL build of ffmpeg as a separate program
 (`tangent-ffmpeg`), which is an aggregate, not a combined work; its licenses
-and provenance ship beside it in `ffmpeg-licenses/`. `LICENSING.md` records
+and provenance ship beside it in `ffmpeg-licenses/`. The source for those
+builds is published as releases of this repository:
+[`third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22)
+for Windows and
+[`third-party-src-ffmpeg-7.0.2`](https://github.com/ganten1998/tangent/releases/tag/third-party-src-ffmpeg-7.0.2)
+for Linux. The macOS and FreeBSD builds link LAME (LGPL) for MP3 export; its
+licence texts ship beside the app in `lame-licenses/`. `LICENSING.md` records
 the reasoning.
 
 ## Building from source
@@ -229,15 +237,13 @@ builds natively on a Linux machine, and `build-freebsd.sh` on FreeBSD. See
 - **macOS.** Release builds are signed with a Developer ID certificate and
   notarized by Apple, with the ticket stapled to the bundle, so the app opens
   on a double-click with no Gatekeeper prompt and no need to be online.
-- **Windows.** From the first release after 5.0.0, every program in the
-  Windows download (the installer, the app, its video encoder and the
-  uninstaller) is signed under the author's name, and a release cannot be
-  cut with any of them unsigned. Windows 11's Smart App Control, where it
-  is switched on, runs a program it does not know only if it is signed, so
-  it refuses the unsigned 5.0.0. SmartScreen goes on reputation, which a
-  new signature has to earn, so the first signed releases may still show
-  "Windows protected your PC" on first run, as 5.0.0 does: click
-  **More info**, then **Run anyway**.
+- **Windows.** Every program in the Windows download (the installer, the
+  app, its video encoder and the uninstaller) is signed under the author's
+  name, and a release cannot be cut with any of them unsigned, so Windows
+  11's Smart App Control, which runs a program it does not know only if it
+  is signed, lets Tangent run. SmartScreen goes on reputation, which a new
+  signature has to earn, so it may still show "Windows protected your PC"
+  on first run: click **More info**, then **Run anyway**.
 - **Linux.** The tarball's `install.sh` installs to your home directory with
   no root. Two system libraries need to be present. MIDI and audio go through
   ALSA, so `libasound.so.2` is required (`libasound2` on Debian and Ubuntu,
