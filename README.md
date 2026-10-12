@@ -166,7 +166,7 @@ MIDI tracks, audio tracks and folders count. Buses, returns, sends and routes
 have no limit for anyone and are never counted. Every feature on this page is
 in the free app, with no trial, no time limit and no account.
 
-A [supporter key](https://ganten.gumroad.com/l/ivory) ($12 or more, pay what
+A [supporter key](https://ganten.gumroad.com/l/ivory) ($9 or more, pay what
 you want) removes the track limit. Keys have no expiry and cover every
 version, so a key bought for 4.x does the same in 5.0. The limit only ever
 stops a new track: a project with more than 32 tracks opens, plays, edits,

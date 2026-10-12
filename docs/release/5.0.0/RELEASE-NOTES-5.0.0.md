@@ -139,6 +139,19 @@ If you used 4.x, please read **Before you upgrade** below: some things from
 
 The full list, including more than 250 fixes, is in `CHANGELOG.md`.
 
+## Experimental in 5.0
+
+These work and are tested, but have not yet been tried on enough real
+setups. Please report anything that misbehaves.
+
+- **Tangent Insert** (sending a track out through your interface to outboard
+  gear and back). Press PING with the gear connected before you rely on its
+  timing.
+- **Tempo and position for hosted plugins.** Plugins that follow the host's
+  tempo, such as drum machines, synced delays and arpeggiators, now receive
+  it. Tell me about any plugin that does not lock to the song.
+- **Middle-button drag** to move around the arrangement and the MIDI editor.
+
 ## What a supporter key does now
 
 The free app holds up to 32 tracks: MIDI tracks, audio tracks and folders
