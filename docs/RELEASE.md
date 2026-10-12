@@ -176,7 +176,7 @@ Built into `dist/`; the version is read from the root `Cargo.toml`
 |---|---|---|
 | macOS installer | `Tangent-<v>-macos.pkg` | `build-installer.sh macos` |
 | macOS app zip (primary) | `Tangent-<v>-macos-universal.zip` | `build-macos.sh` |
-| macOS DMG (best-effort) | `Tangent-<v>-macos-universal.dmg` | `build-macos.sh` |
+| macOS DMG (required for a release; best-effort in `build-macos.sh` alone) | `Tangent-<v>-macos-universal.dmg` | `build-macos.sh` |
 | macOS app zip/DMG, host arch only | `Tangent-<v>-macos-<arch>.{zip,dmg}` (arm64 on Apple silicon) | `ARCH=host build-macos.sh` (quick checks, not a release artifact) |
 | Windows installer | `Tangent-<v>-windows-setup.exe` | `build-cross.sh` (needs `makensis`) |
 | Windows portable | `tangent-<v>-windows-x86_64.zip` | `build-cross.sh` |
@@ -272,9 +272,12 @@ artifacts, which are otherwise purged so no stale file rides a checksum or
 upload glob.)
 
 On the Mac a full run (not `--sums-only`) first requires the whole set the
-Mac builds: the pkg, the macOS zip, the setup.exe, the Windows zip and both
-Linux tarballs (the dmg stays best-effort; `SKIP_WINDOWS=1` waives the four
-the cross build makes). Only files that exist can be checked, so a leg that
+Mac builds: the pkg, the macOS zip and dmg, the setup.exe, the Windows zip
+and both Linux tarballs (`SKIP_WINDOWS=1` waives the four the cross build
+makes). The dmg is required because README.md links it and
+`publish-github.sh` refuses a stable release without an asset for every
+permanent link; `build-macos.sh` run on its own still treats it as
+best-effort, for tester builds. Only files that exist can be checked, so a leg that
 produced nothing used to leave every check green.
 
 Per artifact it runs `scripts/check-artifacts.sh`, the one copy of these

@@ -276,11 +276,16 @@ fi
 # are checked below, so a leg that produced nothing used to pass unseen: a
 # failed Linux leg gave a release with no Linux tarball, every check green,
 # and a `releases/latest/download` link in the README and in every
-# supporter email that 404ed. The dmg stays best-effort; SKIP_WINDOWS=1
-# waives the four the cross build makes.
+# supporter email that 404ed. **The dmg is required here too.**
+# build-macos.sh still treats it as best-effort, so a tester build is not
+# lost to a flaky hdiutil, but README.md links Tangent-macos-universal.dmg
+# and publish-github.sh refuses a stable release without an asset for every
+# permanent link: a release missing it could be built "OK" and then not be
+# publishable. SKIP_WINDOWS=1 waives the four the cross build makes.
 if [ "$(uname -s)" = Darwin ] && [ "$SUMS_ONLY" = 0 ]; then
   case "${ARCH:-universal}" in host) MAC_ARCH="$(uname -m)" ;; *) MAC_ARCH=universal ;; esac
-  WANT="Tangent-${VERSION}-macos.pkg Tangent-${VERSION}-macos-${MAC_ARCH}.zip"
+  WANT="Tangent-${VERSION}-macos.pkg Tangent-${VERSION}-macos-${MAC_ARCH}.zip
+    Tangent-${VERSION}-macos-${MAC_ARCH}.dmg"
   [ "${SKIP_WINDOWS:-0}" = 1 ] || WANT="$WANT Tangent-${VERSION}-windows-setup.exe
     tangent-${VERSION}-windows-x86_64.zip tangent-${VERSION}-linux-x86_64.tar.gz
     tangent-${VERSION}-linux-aarch64.tar.gz"
