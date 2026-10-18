@@ -51783,6 +51783,192 @@ mod tape_motor {
         assert!((moved - 14105.0).abs() <= 256.0, "the start moved the playhead {moved} frames, not 14105");
     }
 
+    /// **A take films the motor as the room hears it** (the owner's first
+    /// ruling).
+    ///
+    /// The take's tap is the desk the speakers play, put through the same
+    /// read from the same phase and the same stage: the start's pitch and
+    /// fade, the stop's reproducer, the hold's silence, the hand-back's
+    /// crossfade. On a desk where nothing differs between the two mixes (no
+    /// click, no monitored input), the take is the device's output sample
+    /// for sample through a Play, a Stop, the hold and a Play from it.
+    #[test]
+    fn a_take_is_the_desk_the_room_hears_through_every_ramp() {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut tap = e.take_recorder_tap().expect("the take's tap");
+        e.set_tape_motor(true, 0.3, 0.3);
+        let mut t = Transport::new();
+        t.locate(1.0);
+        let (mut heard, mut taken, mut shows) = (Vec::new(), Vec::new(), Vec::new());
+        for (press, passes) in [(None, 4), (Some(true), 200), (Some(false), 120), (Some(true), 200)] {
+            match press {
+                Some(true) => t.toggle_play(),
+                Some(false) => t.stop(),
+                None => {}
+            }
+            for _ in 0..passes {
+                let p = one(&mut e, &mut t, PASS);
+                heard.extend_from_slice(&p.out);
+                shows.push(p.show);
+                tap.drain(&mut taken);
+            }
+        }
+        for show in [MotorShow::Dipping, MotorShow::SpinningUp, MotorShow::WindingDown, MotorShow::Holding] {
+            assert!(shows.contains(&show), "the run never showed {show:?}, so it proved less than it says");
+        }
+        assert!(peak(&heard) > 0.1, "the desk was silent, so nothing was proved");
+        assert_eq!(taken.len(), heard.len(), "the take did not get every frame the speakers did");
+        if let Some(at) = heard.iter().zip(&taken).position(|(a, b)| a != b) {
+            panic!(
+                "the take left the speakers at frame {} (pass {}, {:?}): {} against {}",
+                at / 2,
+                at / 2 / PASS,
+                shows[at / 2 / PASS],
+                taken[at],
+                heard[at]
+            );
+        }
+    }
+
+    /// **The tape plays its slowed desk through the reproducer, at the speed
+    /// it is going.**
+    ///
+    /// As the tape slows the playback head's response follows the speed
+    /// (`motor::Tone`): the bass shelf's corner stays where it is while its
+    /// floor sinks with the speed, and the treble shelf closes in from the
+    /// top. A 500 Hz tone played at speed `s` reaches the speakers at
+    /// `500 s` Hz, through `H_s` there, and above the knee the final fade is
+    /// 1, so the analytic pair's level is the tone's 0.5 times
+    /// `|H_s(500 s)|`. In a slow (5 s) start, so the speed barely moves
+    /// across a pass, the passes nearest `s` = 0.07 and 0.1 (35 and 50 Hz
+    /// out, about 4.8 and 3.1 dB down, nearly all of it the bass shelf)
+    /// match the analog response within 0.25 dB, as test 5 holds the
+    /// digital design to it; a renderer that played the ramp without the
+    /// reproducer was off by those decibels.
+    #[test]
+    fn the_tape_plays_its_slowed_desk_through_the_reproducer() {
+        let analog = |k: f64, hz: f64| {
+            let w = std::f64::consts::TAU * hz;
+            let (t1, t2) = (3180e-6, 50e-6);
+            let bass = ((k * k + (w * t1).powi(2)) / (1.0 + (w * t1).powi(2))).sqrt();
+            let treble = ((1.0 + (w * t2).powi(2)) / (1.0 + (w * t2 / k).powi(2))).sqrt();
+            bass * treble
+        };
+        let mut e = tone_desk(RATE, 500.0, 12.0);
+        e.set_tape_motor(true, 5.0, 0.7);
+        let mut t = Transport::new();
+        t.locate(1.0);
+        run(&mut e, &mut t, 4, PASS);
+        t.toggle_play();
+        let mut seen = Vec::new();
+        for _ in 0..2000 {
+            let p = one(&mut e, &mut t, PASS);
+            let plan = e.offline.as_ref().expect("an offline renderer").motor.last();
+            seen.push(((plan.s0 + plan.s1) / 2.0, level(&p.out)));
+            if p.show == MotorShow::Running {
+                break;
+            }
+        }
+        for want in [0.07, 0.1] {
+            let &(s, heard) = seen
+                .iter()
+                .min_by(|a, b| (a.0 - want).abs().total_cmp(&(b.0 - want).abs()))
+                .expect("a start");
+            assert!((s - want).abs() < 0.002, "no pass of the start played near speed {want}");
+            let response = analog(s, 500.0 * s);
+            assert!(db(response) < -2.5, "at speed {s:.4} the reproducer barely acts, so nothing was proved");
+            let expect = 0.5 * response;
+            assert!(
+                (db(heard) - db(expect)).abs() < 0.25,
+                "at speed {s:.4} the tone was heard at {:.2} dB, the reproducer says {:.2} dB",
+                db(heard),
+                db(expect)
+            );
+        }
+    }
+
+    /// **The longest callback rides a ramp whole.**
+    ///
+    /// A device can hand the renderer 8192 frames at once, and while the
+    /// motor is not idle the callback is split at half that
+    /// (`max_callback_frames`), as under the dial. Each pass's envelope is
+    /// evaluated per sample and its fade and reproducer interpolated across
+    /// it, so a start and a stop in 8192-frame callbacks play as they do in
+    /// short ones: every sample finite, and the tone's level (the analytic
+    /// pair's) never moving more than 1 % of full scale from one frame to
+    /// the next, through the dip, the start, the hand-back, the stop, the
+    /// hold and a start from it. At the dial's rest the half cap cannot
+    /// bind: below speed a ramp's program never outgrows its pass (after an
+    /// engaged pass the phase sits under -1, and a stop's first pass from
+    /// rest is already slowing by more than the three frames the reader
+    /// reaches past), so the full cap holds it. The half cap is a margin,
+    /// and this holds the outcome.
+    #[test]
+    fn the_longest_callback_rides_a_ramp_whole() {
+        const LONG: usize = 8192;
+        let mut e = tone_desk(RATE, 500.0, 12.0);
+        e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        t.locate(1.0);
+        let mut heard = Vec::new();
+        let mut shows = Vec::new();
+        for (press, passes) in [(None, 2), (Some(true), 12), (Some(false), 12), (Some(true), 12)] {
+            match press {
+                Some(true) => t.toggle_play(),
+                Some(false) => t.stop(),
+                None => {}
+            }
+            for _ in 0..passes {
+                let p = one(&mut e, &mut t, LONG);
+                heard.extend_from_slice(&p.out);
+                shows.push(p.show);
+            }
+        }
+        assert!(shows.contains(&MotorShow::Running) && shows.contains(&MotorShow::Holding), "the run did not start and stop: {shows:?}");
+        assert!(heard.iter().all(|s| s.is_finite()), "a long callback rendered a NaN");
+        let amp: Vec<f64> = heard.chunks_exact(2).map(|f| (f64::from(f[0]).powi(2) + f64::from(f[1]).powi(2)).sqrt()).collect();
+        if let Some(j) = amp.windows(2).position(|w| (w[1] - w[0]).abs() > 0.01) {
+            panic!("the tone's level jumped from {:.4} to {:.4} at frame {} (callback {})", amp[j], amp[j + 1], j + 1, (j + 1) / LONG);
+        }
+    }
+
+    /// **A pad struck into a hold is a player, and lets it go.**
+    ///
+    /// A drum controller played into a parked desk is somebody playing: a
+    /// live pad hit, like a live note, releases the held tails at once
+    /// (spec 4.10), gliding up from the pass's first frame, so the strike is
+    /// heard and never held silent behind the last stop's tails. The tone's
+    /// desk with a kit on a lane that listens to live MIDI, held after a
+    /// stop: a pad struck lets go in the pass it lands in.
+    #[test]
+    fn a_pad_struck_into_a_hold_lets_it_go() {
+        const KIT_LANE: usize = 2;
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut kit = PadKit::default();
+        kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.5; 4_800 * 2],
+            rate: RATE,
+            source: PathBuf::new(),
+        }));
+        assert!(e.set_pad_kit(KIT_LANE, kit), "the kit was refused");
+        e.set_drum_strips(1 << KIT_LANE);
+        e.set_midi_off(u64::MAX & !(1 << KIT_LANE));
+        e.set_channel_gain(KIT_LANE, 1.0);
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        t.stop();
+        until(&mut e, &mut t, PASS, MotorShow::Holding, 400);
+        for p in run(&mut e, &mut t, 4, PASS) {
+            assert_eq!(p.show, MotorShow::Holding, "the hold let go before the pad was struck");
+        }
+        // On the drum channel, so it is a strike and nothing else: a note
+        // on any other channel is a live note, a player by its own road.
+        e.send_midi(0, &[0x90 | PAD_CHANNEL, PAD_BASE, 100]);
+        let p = one(&mut e, &mut t, PASS);
+        assert!(peak(&p.out) > 0.01, "the pad struck into a hold was held silent ({})", peak(&p.out));
+        assert_ne!(one(&mut e, &mut t, PASS).show, MotorShow::Holding, "the hold outlived a pad struck into it");
+    }
+
     /// The DX7 lane a clip note plays on, beside the tone's.
     const NOTE_LANE: usize = 3;
 
@@ -52624,6 +52810,29 @@ mod tape_motor {
             panic!("the motor never showed {show:?} in {limit} passes");
         }
 
+        /// The desk's plan again with the armed track muted: the arm still
+        /// takes its input into the take, the room no longer hears it.
+        fn mute_track(&mut self) {
+            use crate::desk_plan::{InLane, LaneFlags};
+            let lanes: Vec<InLane> = (0..LEGACY_LANES)
+                .map(|s| InLane {
+                    slot: Slot(s as u32),
+                    gen: self.e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                    flags: if s == TRACK {
+                        LaneFlags::ARMED | LaneFlags::MIDI_OFF | LaneFlags::MUTED
+                    } else {
+                        LaneFlags::MIDI_OFF
+                    },
+                    parent: None,
+                    punch: None,
+                    midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                    pick: None,
+                })
+                .collect();
+            self.e.publish_plan(&PlanInputs { lanes, ..PlanInputs::default() }).expect("the plan goes");
+            self.e.settle_offline();
+        }
+
         /// Whether the renderer read its last chunk as a tracking desk.
         fn tracking(&self) -> bool {
             self.e.offline.as_ref().is_some_and(|r| r.room_tracking)
@@ -52644,8 +52853,10 @@ mod tape_motor {
     /// straight: Play rolls from its first chunk and Stop is back at the
     /// cursor in the pass that meets it, as with the setting off. The same
     /// desk with monitoring off is nobody's monitor, and Play spins it up.
-    /// And a monitoring switch landing mid-start is a hard edge like every
-    /// other the motor is not allowed: the next pass is at speed.
+    /// A monitoring switch landing mid-start is a hard edge like every
+    /// other the motor is not allowed: the next pass is at speed. And
+    /// heard means heard by the room: with the armed track muted the room
+    /// plays nobody's input, so the tape spins.
     #[test]
     fn a_tracking_desk_plays_and_stops_at_once() {
         let mut d = Tracking::new(1, true, true, false);
@@ -52670,11 +52881,24 @@ mod tape_motor {
         t.toggle_play();
         let passes = d.until(&mut t, PASS, MotorShow::SpinningUp, 8);
         assert!(ramped(&passes), "an unmonitored desk did not spin up");
-        // Monitoring switched on mid-start: at speed by the next pass.
+        // Monitoring switched on mid-start: the pass it lands in finds the
+        // tracking desk, and the next one is at speed.
         d.run(&mut t, 20, PASS);
         d.e.set_monitor_on(true);
         let passes = d.run(&mut t, 20, PASS);
-        assert!(passes[2..].iter().all(|p| p.show == MotorShow::Running), "a monitoring switch mid-start did not snap the tape");
+        assert!(passes[1..].iter().all(|p| p.show == MotorShow::Running), "a monitoring switch mid-start did not snap the tape");
+        // Heard is the room's: monitoring on and the armed track muted, the
+        // take still records it (the arm beats the mute there) but the room
+        // does not hear it, so nobody plays through the desk and it spins.
+        let mut d = Tracking::new(1, true, true, false);
+        d.mute_track();
+        d.e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        assert!(!d.tracking(), "a muted armed input is a tracking desk");
+        t.toggle_play();
+        let passes = d.until(&mut t, PASS, MotorShow::SpinningUp, 8);
+        assert!(ramped(&passes), "a desk whose armed input the room does not hear did not spin up");
     }
 
     /// **An unmonitored desk holds its slowed tails; a tracking desk is
@@ -52920,7 +53144,9 @@ mod tape_motor {
     /// an IR job plays and records at the jacks, and an arrangement capture
     /// tapes the program at its rate: none of them may ride a ramp. With a
     /// port claimed by an insert in circuit, an IR tone running, or a pick's
-    /// capture flag up, Play rolls from its first chunk and nothing ramps.
+    /// capture flag up, Play rolls from its first chunk and nothing ramps;
+    /// and a capture raised while the tape spins up snaps it to speed in the
+    /// next pass.
     #[test]
     fn a_hardware_loop_an_ir_job_or_a_capture_keeps_the_motor_down() {
         let plays_at_once = |e: &mut Engine, what: &str| {
@@ -52999,5 +53225,21 @@ mod tape_motor {
         let passes = d.run(&mut t, 40, PASS);
         assert_eq!(passes[0].pos, PASS as u64, "a capture: Play did not roll from its first chunk");
         assert!(!ramped(&passes), "a capture: the tape spun up");
+        // And a capture raised mid-start: the pass reads the flags at its
+        // top, before anything sizes its program, so the next pass is at
+        // speed. Each chunk's own read only makes an edge hard, and a start
+        // under way has no edge left to refuse.
+        let mut d = Tracking::new(1, false, true, false);
+        d.e.set_tape_motor(true, 0.5, 0.7);
+        let armed = d.table.armed(&d.rows);
+        d.e.sync_capture_rings(&armed).expect("the armed pick's ring");
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        t.toggle_play();
+        d.until(&mut t, PASS, MotorShow::SpinningUp, 8);
+        d.run(&mut t, 10, PASS);
+        d.e.set_capturing(&[d.pick]);
+        let shows: Vec<MotorShow> = d.run(&mut t, 4, PASS).iter().map(|p| p.show).collect();
+        assert!(shows.iter().all(|s| *s == MotorShow::Running), "a capture raised mid-start did not snap the tape to speed: {shows:?}");
     }
 }

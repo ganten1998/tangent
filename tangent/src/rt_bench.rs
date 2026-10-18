@@ -3148,25 +3148,6 @@ fn the_grain_knob_may_be_turned_while_the_transport_rolls() {
     }
 }
 
-/// **The grain render's A/B, paired, for a machine that is not quiet.**
-///
-/// The rung rows in `rt_bench` are absolute microseconds, and an absolute
-/// microsecond is only worth having on an idle machine. This was written
-/// after a sweep taken during a video call, where the row the grain cannot
-/// touch (512 frames, which is `MAX_BLOCK`, so the grain can never exceed
-/// the callback) held to 2% across four runs while the 128-frame row moved
-/// 37%. Between-run drift of that size buries the effect.
-///
-/// So this measures the conditions INTERLEAVED: within one repeat, every
-/// grain setting is timed back to back on the same engine, and the ratio is
-/// taken inside the repeat before anything is averaged across repeats.
-/// Whatever the rest of the machine was doing, it was doing it to both
-/// sides of each ratio.
-///
-/// Doors, all optional: `TANGENT_GATE_PLUGIN` and `TANGENT_GATE_STATE` as
-/// the rung uses them, `TANGENT_AB_FRAMES` (the callback, default 64),
-/// `TANGENT_AB_GRAINS` (frames, comma separated, default `0,240,512`),
-/// `TANGENT_AB_REPEATS` (default 7) and `TANGENT_AB_BLOCKS` (default 400).
 /// `MEASURED` passes of `block` frames, each timed, after `warmup` untimed,
 /// with `between(e, k)` before pass `k`.
 fn timed(name: &str, e: &mut Engine, block: usize, warmup: usize, mut between: impl FnMut(&Engine, usize)) -> Stats {
@@ -3238,6 +3219,25 @@ fn tape_start_and_stop_costs_what_the_dial_costs_probe() {
     assert!(failed.is_empty(), "tape start and stop costs more than the dial: {failed:#?}");
 }
 
+/// **The grain render's A/B, paired, for a machine that is not quiet.**
+///
+/// The rung rows in `rt_bench` are absolute microseconds, and an absolute
+/// microsecond is only worth having on an idle machine. This was written
+/// after a sweep taken during a video call, where the row the grain cannot
+/// touch (512 frames, which is `MAX_BLOCK`, so the grain can never exceed
+/// the callback) held to 2% across four runs while the 128-frame row moved
+/// 37%. Between-run drift of that size buries the effect.
+///
+/// So this measures the conditions INTERLEAVED: within one repeat, every
+/// grain setting is timed back to back on the same engine, and the ratio is
+/// taken inside the repeat before anything is averaged across repeats.
+/// Whatever the rest of the machine was doing, it was doing it to both
+/// sides of each ratio.
+///
+/// Doors, all optional: `TANGENT_GATE_PLUGIN` and `TANGENT_GATE_STATE` as
+/// the rung uses them, `TANGENT_AB_FRAMES` (the callback, default 64),
+/// `TANGENT_AB_GRAINS` (frames, comma separated, default `0,240,512`),
+/// `TANGENT_AB_REPEATS` (default 7) and `TANGENT_AB_BLOCKS` (default 400).
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn grain_ab() {
