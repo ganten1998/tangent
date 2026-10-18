@@ -23611,7 +23611,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The host aims live notes at this one lane while it is open: an
     /// audition in the editor is about ONE clip, and a desk with two armed
     /// instruments played both of them from a single key — the owner's "Mini
-    /// v4 on track one, piano on track 2, audition note, it triggers
+    /// v4 on track one, the modelled piano on track 2, audition note, it triggers
     /// BOTH".
     pub fn midi_editor_lane(&self) -> Option<usize> {
         let id = self.midi_edit.as_ref()?.id;
@@ -65287,7 +65287,7 @@ mod tests {
     fn a_retired_message_is_a_notification_and_does_not_freeze_the_desk() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         // The startup notice: the one that used to be `Dialog::Notice`.
-        app.set_startup_notice("the modelled piano crashed Tangent while loading.".to_owned());
+        app.set_startup_notice("Grand crashed Tangent while loading.".to_owned());
         assert!(app.dialog.is_none(), "a notice opened a window");
         pointer_frame(&ctx, &mut app, Vec::new());
         assert_eq!(app.notify_boxes.len(), 1, "the message was never drawn");
@@ -65347,7 +65347,7 @@ mod tests {
         crate::fonts::apply_text_styles(&ctx);
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 620.0));
         let bodies = [
-            "the modelled piano crashed Tangent while loading, so it has been taken \
+            "Grand 8 crashed Tangent while loading, so it has been taken \
              out of its slot. Its settings are kept; load it again to retry.",
             "project.tangent existed but held nothing, so this project opened \
              empty. If that file was a song, its bytes were already gone.",

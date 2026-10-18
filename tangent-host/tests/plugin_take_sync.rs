@@ -70,7 +70,7 @@ fn instrument() -> Option<(std::sync::Arc<Module>, tangent_host::ClassInfo)> {
         let w = w.to_lowercase();
         order.extend(bundles.iter().filter(|p| name_of(p).contains(&w)).cloned());
     } else {
-        for hint in ["piano", "piano", "grand", "keyscape"] {
+        for hint in ["piano", "grand", "keyscape"] {
             let hits: Vec<_> = bundles
                 .iter()
                 .filter(|p| name_of(p).contains(hint) && !order.contains(p))

@@ -53,8 +53,8 @@
 //!
 //! 1. **`IMidiMapping` is not on the component.** It is on the edit controller,
 //!    which is a separate class the factory exports and which nothing else in
-//!    this host needs. the modelled piano: `component.cast::<IMidiMapping>()` is `None`.
-//! 2. **An unconnected controller answers, and answers wrongly.** the modelled piano's
+//!    this host needs. The modelled piano: `component.cast::<IMidiMapping>()` is `None`.
+//! 2. **An unconnected controller answers, and answers wrongly.** The modelled piano's
 //!    `getMidiControllerAssignment` returns `kResultOk` for every controller on
 //!    every channel *before* `IConnectionPoint::connect` — with `paramId 0` each
 //!    time. Zero is a legal parameter id. A host that trusts the result code
@@ -66,7 +66,7 @@
 //!    it takes to read the table and no longer.
 //!
 //! **And a third trap, found by measurement after both of those were fixed:**
-//! the modelled piano publishes a mapping for CC64, accepts the parameter change, returns
+//! The modelled piano publishes a CC64 mapping, accepts the parameter change, returns
 //! `kResultOk`, and ignores it — the rendered audio is identical to six decimal
 //! places. It responds only to the LEGACY MIDI CC event. So both are sent, on
 //! every control, always; a CC is a value rather than a delta, so a plugin that
@@ -102,7 +102,7 @@
 //! a UI whose knobs move and whose sound does not change, because the news never
 //! reaches the processor. [`HostMessage`] and [`HostAttributes`] are here for
 //! exactly that, and [`HostApp::messages_made`] counts how often a plugin took
-//! the offer — the modelled piano does, during `initialize`, before a single block is
+//! the offer — the modelled piano does, in `initialize`, before a single block is
 //! rendered.
 //!
 //! **Fifth trap: three objects now have to be torn down in one order.** An
@@ -151,7 +151,7 @@
 //!
 //! Every block used to allocate a `Vec` of channel pointers, an
 //! `AudioBusBuffers` vector, one scratch buffer per channel of every output bus
-//! past the first (fourteen on the modelled piano), and a `ComWrapper`ed event list —
+//! past the first (14 on the modelled piano), and a `ComWrapper`ed event list —
 //! four allocation sites, identical in size every time, under a realtime
 //! deadline. `tangent/src/instrument.rs` recorded it as a landmine it could not
 //! defuse from where it stood, and with three layered instruments it was three
@@ -648,7 +648,7 @@ struct EditSlot {
 /// **`performEdit` is the host's cue to carry a GUI parameter move to the
 /// PROCESSOR**, and this was the sixth trap, found by measurement:
 ///
-/// > the modelled piano's editor was opened, its volume slider dragged to minimum, and
+/// > The modelled piano's editor was opened, volume slider dragged to minimum, and
 /// > the rendered audio did not change **at all** — a probe C4 measured
 /// > 0.0871 / 0.0817 / 0.0898 RMS across the drag, byte-identical to the same
 /// > probes in a run where nothing was touched. `performEdit` had fired. The
@@ -663,7 +663,7 @@ struct EditSlot {
 /// sound never changes, which is a worse outcome than having no editor, because
 /// it looks like it works.
 ///
-/// Preset changes are a separate path and do arrive without help — the modelled piano
+/// Preset changes are a separate path and do arrive unaided — the modelled piano
 /// announces them with `restartComponent` and both halves reload — which is
 /// exactly why this was so easy to miss: change a preset, hear it change,
 /// conclude the editor is wired up, ship it.
@@ -890,7 +890,7 @@ pub struct Instance {
     /// Whether the plugin builds an editor, answered lazily and remembered.
     ///
     /// Lazily because the only way to ask is to build one and throw it away —
-    /// there is no `hasEditor` anywhere in VST3 — and building the modelled piano's UI
+    /// there is no `hasEditor` in VST3 — and building the modelled piano's UI
     /// costs real milliseconds that a load which nobody will ever open an editor
     /// for should not pay. Remembered because the answer cannot change.
     has_editor: Cell<Option<bool>>,
@@ -1714,7 +1714,7 @@ impl Instance {
                     // The parameter change is the specified path: `IMidiMapping`
                     // names a parameter, the host pushes a point into
                     // `inputParameterChanges`, and the processor applies it.
-                    // the modelled piano publishes the mapping (CC64 -> 0x6d636d40),
+                    // The modelled piano publishes the mapping (CC64 -> 0x6d636d40),
                     // accepts the queue without complaint, returns `kResultOk`
                     // — **and does nothing at all**. Measured on a held C4
                     // released with the pedal down: 0.001452 RMS of tail with
@@ -1975,7 +1975,7 @@ pub struct Control {
     pub controller: i16,
     /// 0..=127 for a CC or channel pressure; 0..=16383 for pitch bend.
     pub value: u16,
-    /// 0..=15. **Not decoration**: the modelled piano publishes a different parameter for
+    /// 0..=15. **Not decoration**: the modelled piano maps a different parameter for
     /// each channel's CC64, so a host that queries channel 0 and sends channel 3
     /// moves the wrong piano.
     pub channel: i16,
@@ -2152,7 +2152,7 @@ impl EventList {
     /// The fallback for a plugin that publishes no `IMidiMapping`, and a weak
     /// one: `kLegacyMIDICCOutEvent` is named for the direction the SDK actually
     /// specifies — plugin to host — and instruments are under no obligation to
-    /// read it coming the other way. Measured on the modelled piano, which does have a
+    /// read it coming the other way. Measured on the modelled piano, which has a
     /// mapping and so never sees this path, and on a mapping-less plugin, where
     /// it changed nothing. It is sent anyway because it costs one struct and it
     /// is the only other door VST3 leaves open; the caller is told through
@@ -2237,7 +2237,7 @@ impl IEventListTrait for EventList {
 /// event list.
 ///
 /// **Sized once, in [`Instance::create`], from [`Setup::max_block`] and the bus
-/// layout.** Every field here used to be built per call. Measured on the modelled piano's
+/// layout.** Every field used to be built per call. Measured on the modelled piano's
 /// layout by reproducing the old code under a counting allocator: **42
 /// allocator calls for one block** — 21 allocations and 21 frees — which is 126
 /// with three slots layered, about 12,000 a second at 512 frames and 48 kHz.
@@ -2613,7 +2613,7 @@ const MAX_POINTS: usize = 32;
 /// called on the audio thread by a component that has something to tell its
 /// controller mid-block — the SDK's answer is a "connection proxy" that defers
 /// every message to the UI thread, which this host does not have. Measured on
-/// the modelled piano: the messages all arrive during `initialize`, before a block is
+/// the modelled piano: the messages all arrive in `initialize`, before a block is
 /// rendered. A plugin that chatters during `process` would be allocating on the
 /// audio thread through this path, and the proxy is the fix.
 fn attach_controller(
@@ -4108,15 +4108,22 @@ mod tests {
     /// that a commercial plugin's behaviour is not deducible from the API, and
     /// both of them exist because something the API said yes to turned out to
     /// be silent (the eight output buses) or ignored (CC64).
-    fn piano() -> (Module, ClassInfo) {
+    fn modelled_piano() -> (Module, ClassInfo) {
+        let wanted = std::env::var("TANGENT_TEST_PIANO").unwrap_or_default().to_lowercase();
+        assert!(
+            !wanted.is_empty(),
+            "set TANGENT_TEST_PIANO to part of an installed VST3 instrument's bundle name; \
+             these tests need a piano with eight stereo output buses, a CC64 mapping and a \
+             parameter called Volume"
+        );
         let bundle = crate::scan::discover()
             .into_iter()
             .find(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase().contains("piano"))
+                    .map(|n| n.to_string_lossy().to_lowercase().contains(&wanted))
                     .unwrap_or(false)
             })
-            .expect("no VST3 matching the modelled piano; this test needs one installed");
+            .expect("no VST3 matching TANGENT_TEST_PIANO; this test needs one installed");
         let module = Module::open(&bundle).expect("open module");
         let class = module
             .audio_modules()
@@ -4169,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the modelled piano installed; loads it twice, warms both up and \
+    #[ignore = "needs a piano VST3 installed; loads it twice, warms both up and \
                 renders about a minute of audio, so it takes about twenty-five \
                 seconds. Run with --test-threads=1."]
     fn a_restored_instrument_renders_the_saved_sound_and_not_the_default_one() {
@@ -4180,7 +4187,7 @@ mod tests {
         // two cases where the API said yes and the audio said no: eight output
         // buses (`kResultOk`, silence) and CC64 as a parameter change
         // (`kResultOk`, byte-identical rendering).
-        let (module, class) = piano();
+        let (module, class) = modelled_piano();
         let setup = Setup { sample_rate: 48_000.0, max_block: 512 };
 
         let mut a = Instance::create(&module, &class, setup).expect("instantiate");
@@ -4195,7 +4202,7 @@ mod tests {
         // next block's parameter changes. That is the sixth trap's path, so
         // this test also fails if editor forwarding ever regresses.
         let volume = {
-            let e = a.editing.as_ref().expect("the modelled piano exports an edit controller");
+            let e = a.editing.as_ref().expect("the piano exports an edit controller");
             // SAFETY: a live controller on the thread that owns it.
             let count = unsafe { e.controller.getParameterCount() };
             let mut found = None;
@@ -4211,7 +4218,7 @@ mod tests {
                     break;
                 }
             }
-            found.expect("the modelled piano publishes a parameter called Volume")
+            found.expect("the piano publishes a parameter called Volume")
         };
         // Measured, not chosen: the modelled piano's volume curve is nearly flat from
         // 0.5 to its 0.727 default (a probe reads 0.0662 against 0.0685, a 3%
@@ -4223,7 +4230,7 @@ mod tests {
         const QUIETER: f64 = 0.3;
         // SAFETY: trait method on the live handler this instance owns.
         unsafe { a.handler.performEdit(volume, QUIETER) };
-        // **Four seconds of settling, and it is not superstition.** the modelled piano
+        // **Four seconds of settling, and it is not superstition.** The modelled piano
         // ramps its volume rather than stepping it, and the ramp is slow enough
         // that a probe played eight blocks after the move measures the ramp and
         // not the value: the first attempt at this test read 0.0660 for a
@@ -4248,7 +4255,7 @@ mod tests {
         assert_eq!(&bytes[..4], b"TGST");
         let blob = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
         println!(
-            "the modelled piano state: {} bytes total = {} processor + {} controller + 18 header",
+            "Piano state: {} bytes total = {} processor + {} controller + 18 header",
             bytes.len(),
             blob(6),
             blob(10)
@@ -4282,7 +4289,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the modelled piano installed; takes about ten seconds. Run with \
+    #[ignore = "needs a piano VST3 installed; takes about ten seconds. Run with \
                 --test-threads=1."]
     fn a_hundred_blocks_of_a_real_instrument_touch_the_allocator_zero_times() {
         // The counter cannot see the plugin's own `malloc`s — it is C++ and
@@ -4290,7 +4297,7 @@ mod tests {
         // crate is responsible for, and nothing else. That is the honest scope:
         // a host cannot make a plugin realtime-safe, it can only stop being the
         // reason it is not.
-        let (module, class) = piano();
+        let (module, class) = modelled_piano();
         let setup = Setup { sample_rate: 48_000.0, max_block: 512 };
         let mut inst = Instance::create(&module, &class, setup).expect("instantiate");
 

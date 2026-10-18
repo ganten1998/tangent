@@ -1,7 +1,7 @@
 //! Opening a hosted plugin's own editor, in a real window.
 //!
 //! `instance.rs` can make a plugin play. It could not make one *sound
-//! different*, because every knob a the modelled piano owner wants is inside the modelled piano's
+//! different*, because every knob a modelled-piano owner wants is in the plugin's
 //! own UI and nothing here had ever drawn it. This is that UI.
 //!
 //! # The sequence, which is short and unforgiving
@@ -69,7 +69,7 @@
 //! frame of the drag, and getting that wrong looks like a plugin that will not
 //! lay out. The plugin's own path is implemented and is the one that matters:
 //! [`IPlugFrame::resizeView`](vst3::Steinberg::IPlugFrameTrait::resizeView) is
-//! how the modelled piano asks for a different size when you switch instrument layout or
+//! how the modelled piano asks for a new size when you switch instrument layout or
 //! change its zoom, and ignoring it leaves a plugin drawing outside its window.
 //!
 //! # In front until closed, but never holding the keyboard hostage

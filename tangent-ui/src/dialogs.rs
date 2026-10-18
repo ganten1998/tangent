@@ -306,7 +306,7 @@ pub enum Dialog {
         /// loaded plugin, so the preselected row is not invisible.
         open_folders: Vec<String>,
         /// Free-text filter. There are 112 VST3s on the owner's machine and
-        /// scrolling a list that long to find "piano" is the difference
+        /// scrolling a list that long to find the modelled piano is the difference
         /// between a usable picker and a bad one, so this is the primary
         /// interaction rather than a nicety.
         filter: String,
@@ -4227,8 +4227,8 @@ impl PluginChoice<'_> {
 /// Three rules, in this order:
 ///
 /// 1. The highlighted entry, **if the filter still shows it** — and if its
-///    vendor folder is OPEN, the same rule in a second hat: select the modelled piano,
-///    collapse A VENDOR, and the highlight is gone from the screen; committing
+///    vendor folder is OPEN, the same rule in a second hat: select Grand 8,
+///    collapse its folder, and the highlight is gone from the screen; committing
 ///    it would be the classic filtered-list bug wearing a different hat.
 ///    Filtering forces every folder open (the draw does the same), and the
 ///    built-ins stand above the folders.
@@ -19094,8 +19094,8 @@ at: None,
             ),
             entry(
                 "/Users/x/Library/Audio/Plug-Ins/VST3/Grand 8.vst3",
-                "the modelled piano",
-                "the vendor",
+                "Grand 8",
+                "Pianoworks",
             ),
             entry("/Library/Audio/Plug-Ins/VST3/Serum2.vst3", "Serum2", ""),
             entry("/Library/Audio/Plug-Ins/VST3/Vital.vst3", "Vital", ""),
@@ -19198,13 +19198,13 @@ at: None,
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(names(""), ["Analog Lab V", "the modelled piano", "Serum2", "Vital"]);
+        assert_eq!(names(""), ["Analog Lab V", "Grand 8", "Serum2", "Vital"]);
         assert_eq!(names("   "), names(""), "whitespace is not a filter");
-        assert_eq!(names("piano"), ["the modelled piano"]);
-        assert_eq!(names("PIANO"), ["the modelled piano"], "the caps lock case");
-        assert_eq!(names(" piano "), ["the modelled piano"], "a pasted name has spaces");
+        assert_eq!(names("grand"), ["Grand 8"]);
+        assert_eq!(names("GRAND"), ["Grand 8"], "the caps lock case");
+        assert_eq!(names(" grand "), ["Grand 8"], "a pasted name has spaces");
         assert_eq!(names("arturia"), ["Analog Lab V"], "not matched on vendor");
-        assert_eq!(names("A VENDOR"), ["the modelled piano"]);
+        assert_eq!(names("PIANOWORKS"), ["Grand 8"]);
         // A blank vendor must not turn into a wildcard. `contains("")` is true
         // of every string, so the empty needle is ruled out first and the two
         // vendorless rows answer for their names alone.
@@ -19219,7 +19219,7 @@ at: None,
     #[test]
     fn filtering_after_a_selection_never_commits_a_row_the_user_can_no_longer_see() {
         let plugins = installed();
-        // Vital is highlighted; "an" leaves Analog Lab V and the modelled piano, and
+        // Vital is highlighted; "an" leaves Analog Lab V and Grand 8, and
         // Vital is not among them.
         let stale = plugin_choice(&plugins, Some(3), None, "an", &[]);
         assert_eq!(
@@ -19477,7 +19477,7 @@ at: None,
                         "Tangent Bitcrush",
                         "Tangent Insert",
                         "analog lab v",
-                        "the modelled piano",
+                        "Grand 8",
                         "Vital"
                     ],
                     "sorted the way a byte comparison sorts, not the way a person reads"
@@ -19527,7 +19527,7 @@ at: None,
         let (painted, action) = run_picker(&mut dialog);
         assert!(action.is_none(), "the picker loaded a plugin unasked");
         assert!(
-            painted.contains("\u{2022} the modelled piano"),
+            painted.contains("\u{2022} Grand 8"),
             "the mark never reached the screen: {painted}"
         );
         assert!(

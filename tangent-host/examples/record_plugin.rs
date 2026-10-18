@@ -2,7 +2,7 @@
 //! recorded to a real take directory.
 //!
 //! ```text
-//! cargo run -p tangent-host --example record_plugin -- the modelled piano
+//! cargo run -p tangent-host --example record_plugin -- piano
 //! ```
 //!
 //! This is the moment the two lanes stop being separate work. It exercises the
@@ -61,7 +61,10 @@ fn performance() -> Vec<Played> {
 }
 
 fn main() {
-    let filter = std::env::args().nth(1).unwrap_or_else(|| "piano".into());
+    let filter = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("TANGENT_TEST_PIANO").ok())
+        .unwrap_or_else(|| "piano".into());
 
     let Some(bundle) = tangent_host::discover().into_iter().find(|p| {
         p.file_name()

@@ -1275,7 +1275,7 @@ invalidated everything else. `tangent-host/src/scan.rs` and
 `cargo run -p tangent-host --example scanvst`.
 
 **Result: 112 of 112 plugins on this machine loaded. Zero failures.** Including
-**the modelled piano**, which reports three classes — `Plugin Compatibility
+**a modelled-piano VST3**, which reports three classes — `Plugin Compatibility
 Class`, `Audio Module Class`, `Component Controller Class` — exactly as the ABI
 says it should. `vst3` 0.3.0 pulled in one transitive dependency
 (`com-scrape-types`) and no build script, confirming the pre-generated-bindings
@@ -1320,9 +1320,9 @@ Four things the spike settled that reading could not:
 ### Spike 2, same day: a plugin instantiated and rendered audio
 
 `tangent-host/src/instance.rs` and
-`cargo run -p tangent-host --example playnote -- the modelled piano`.
+`cargo run -p tangent-host --example playnote -- piano`.
 
-**the modelled piano rendered a middle C from Rust**, peak 0.342 / RMS 0.046, written
+**The modelled piano rendered a middle C from Rust**, peak 0.342 / RMS 0.046, written
 through `tangent-record`'s own BWF writer and played back — which also proves the
 two lanes compose, since the host and the recorder were built independently.
 
@@ -1372,7 +1372,7 @@ Three findings, each of which would have shipped as a bug:
 
 ### Milestone, 2026-08-16: a complete take, recorded from a hosted plugin
 
-`cargo run -p tangent-host --example record_plugin -- the modelled piano`
+`cargo run -p tangent-host --example record_plugin -- piano`
 
 A four-chord ii-V-I played into the modelled piano produced a real take directory — a
 1.2 MB 24-bit BWF `.wav`, a 202-byte format-1 `.mid`, and a `take.json` — with

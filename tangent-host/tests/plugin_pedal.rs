@@ -1,7 +1,7 @@
 //! Does the sustain pedal actually reach the instrument?
 //!
 //! "`process` returned `kResultOk`" proves nothing here, and `instance.rs` has
-//! the scar to prove it: the modelled piano was handed one `AudioBusBuffers` for its eight
+//! the scar to prove it: the modelled piano got one `AudioBusBuffers` for its eight
 //! output buses, wrote nothing at all, and returned `kResultOk`. A control
 //! change is worse, because there is no return value to ignore in the first
 //! place — `IParameterChanges` is a list the plugin may simply not read.
@@ -60,7 +60,7 @@ fn instrument() -> Option<(std::sync::Arc<Module>, ClassInfo)> {
         let w = w.to_lowercase();
         order.extend(bundles.iter().filter(|p| name_of(p).contains(&w)).cloned());
     } else {
-        for hint in ["piano", "piano", "grand", "keyscape"] {
+        for hint in ["piano", "grand", "keyscape"] {
             let hits: Vec<_> = bundles
                 .iter()
                 .filter(|p| name_of(p).contains(hint) && !order.contains(p))

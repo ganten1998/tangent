@@ -2411,7 +2411,7 @@ published.
   a lamp and a lane bit unchanged - and rests when it would not, with a grace
   so a transient is followed down its decay every frame. And a lane carrying
   an instrument never parked its rack at all, the class of the plugin deciding
-  that at load, so the owner's the modelled piano ran its physical model over nothing
+  that at load, so the owner's modelled piano ran its physical model over nothing
   for the life of the session. A voice now parks on a stricter rule than an
   effect: nothing above -80 dBFS at its pre-fader output, its own instrument
   reporting no voice where it can be asked, and no note or control event, for

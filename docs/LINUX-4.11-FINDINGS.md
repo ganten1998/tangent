@@ -107,7 +107,7 @@ verified on 4.11.1 unless noted; audio confirmed by capturing the sink monitor, 
        | Sentinel restores before the welcome dialog is even dismissed.
   
   |  | Third-party VST3 hosting | PASS
-       | the modelled piano loads and registers; chipsynth-OPS7 enumerates.
+       | A modelled-piano VST3 loads and registers; chipsynth-OPS7 enumerates.
   
   |  | Editor deep pass, Save-to-my-bank, takes, video | NOT RUN
        | Video is blocked by finding 2 on any clean box anyway.

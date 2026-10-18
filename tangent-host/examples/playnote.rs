@@ -9,7 +9,10 @@
 use tangent_host::{Instance, Note, Setup};
 
 fn main() {
-    let filter = std::env::args().nth(1).unwrap_or_else(|| "piano".into());
+    let filter = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("TANGENT_TEST_PIANO").ok())
+        .unwrap_or_else(|| "piano".into());
     let Some(bundle) = tangent_host::discover()
         .into_iter()
         .find(|p| {

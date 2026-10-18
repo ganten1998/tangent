@@ -6232,7 +6232,7 @@ impl DesktopApp {
         //
         // eframe presents a frame when `update` RETURNS, and this runs inside
         // it — so every blocking thing here happens before the window has ever
-        // been drawn. Loading one insert is enough: a the modelled piano takes seconds
+        // been drawn. Loading one insert is enough: a modelled piano takes seconds
         // to construct, and the first window draw waited on it, every launch.
         // The owner called it exactly — "it still waits for the vsts to load
         // before a single window draw every single time".

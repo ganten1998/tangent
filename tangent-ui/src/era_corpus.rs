@@ -1402,7 +1402,7 @@ const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
     ("settings-v20.json", 0x9e7e_be7f_44bb_7a4d, 81022),
     ("settings-v21.json", 0x2096_b471_2d6c_7348, 79829),
     ("settings-v22.json", 0x55be_1dc5_3ee3_ede8, 79864),
-    ("daw-3x.json", 0x0d97_ad93_d952_23bb, 76669),
+    ("daw-3x.json", 0x2847_627a_ed64_d912, 76666),
     ("daw-4x.json", 0xaf17_1b77_e6ed_e0ff, 77065),
     ("daw-5x.json", 0xc049_f263_aa3a_3d59, 78002),
     // **The documents read their drum row's badge** (W6): a document from

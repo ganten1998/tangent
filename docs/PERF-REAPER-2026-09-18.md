@@ -107,7 +107,7 @@ So the 16-lane, 3-insert desk the owner asked about, at 128 frames / 48 kHz, on 
 | Heavy commercial (Pro-R, TAPE-201, PLATE-140) | 1715 us | 64.3% |
 | All Tangent Tape | 2997 us | **112%, dropout** |
 | All Tangent Drive | 4259 us | **160%, dropout** |
-| Plus one the modelled piano lane | +316 us | +11.9% |
+| Plus one modelled-piano lane | +316 us | +11.9% |
 
 And the ceiling, one core, keeping 30% headroom (1846 us usable after the engine floor):
 
@@ -610,7 +610,7 @@ be spent, because there are no more slots to fill.
    carries only the spine, which is small at every buffer, and the limit
    becomes total CPU, which does not change with buffer size at all. That is
    32 or 64 frame monitoring with a full mix loaded, which today needs freezing.
-2. **Heavy instruments.** Sixteen the modelled piano lanes is 5058 us serial, about 55%
+2. **Heavy instruments.** Sixteen modelled-piano lanes is 5058 us serial, about 55%
    of a 128-frame deadline forked, and about 2% prerendered.
 3. **Headroom against the machine being busy with something else.**
 

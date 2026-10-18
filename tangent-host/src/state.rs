@@ -1,6 +1,6 @@
 //! Saving and restoring what a plugin sounds like.
 //!
-//! A user picks a the modelled piano preset, quits, and comes back to the default piano.
+//! A user picks a piano preset, quits, and comes back to the default piano.
 //! Nothing about a hosted instrument survived the process before this file: the
 //! host could create an instance and open its editor, and every knob the user
 //! touched died with the instance.

@@ -2225,8 +2225,8 @@ mod tests {
             ..VideoReport::default()
         });
         m.plugin = Some(PluginReport {
-            name: "the modelled piano".to_string(),
-            preset: Some("D4 Classical".to_string()),
+            name: "Grand 8".to_string(),
+            preset: Some("Concert".to_string()),
         });
         m.files.push("2026-08-15_143207_nocturne.wav".to_string());
         let out = m.render();
@@ -2245,7 +2245,7 @@ mod tests {
             "\"iso8601\": \"2026-08-15T14:32:07Z\"",
             "\"tempo_bpm\": 120",
             "\"ppq\": 960",
-            "the modelled piano",
+            "Grand 8",
         ] {
             assert!(out.contains(field), "manifest is missing {field}:\n{out}");
         }

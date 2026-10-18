@@ -4698,7 +4698,7 @@ mod tests {
         assert!(off(2, &m), "an audio lane was handed a note");
 
         // **The editor takes the desk.** Both lanes armed, editor open on
-        // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, piano
+        // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, the modelled piano
         // on track 2, audition note, it triggers BOTH".
         let m = live_midi_off(&kinds, &armed(&[0, 1], width), Some(1));
         assert!(!off(1, &m), "the edited lane went quiet");

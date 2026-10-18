@@ -24,7 +24,7 @@
 //! On Windows and Linux you `dlopen` and call `GetPluginFactory`. On macOS that
 //! is **not sufficient**: the bundle must first be initialised with
 //! `bundleEntry(CFBundleRef)`, and plugins are entitled to do real work there —
-//! the modelled piano and the Arturia plugins both locate their sample and preset
+//! a modelled-piano VST3 and the Arturia plugins both locate their sample and preset
 //! directories relative to the bundle. Skipping it gets you a factory pointer
 //! that segfaults later rather than an error now.
 //!
@@ -1144,13 +1144,13 @@ mod tests {
     #[test]
     fn an_audio_module_is_distinguished_from_a_controller() {
         let processor = ClassInfo {
-            name: "piano".into(),
+            name: "Grand".into(),
             category: "Audio Module Class".into(),
             sub_categories: "Instrument|Piano".into(),
             cid: [0; 16],
         };
         let controller = ClassInfo {
-            name: "the modelled piano Controller".into(),
+            name: "Grand Controller".into(),
             category: "Component Controller Class".into(),
             sub_categories: String::new(),
             cid: [0; 16],
@@ -1330,7 +1330,7 @@ mod tests {
     /// Two lanes running the same drum plugin is the ordinary case and it used
     /// to open the bundle twice. macOS requires `bundleEntry(CFBundleRef)`
     /// before the factory is usable, plugins are entitled to do real work in
-    /// it — this module's header names the modelled piano and Arturia, which find their
+    /// it — the module header names the modelled piano and Arturia, which find their
     /// resources there, and drum samplers commonly start a shared streaming
     /// engine — and the SDK's own `ModuleHandle` refcounts per path for
     /// exactly this reason. Re-running that initialiser underneath a live

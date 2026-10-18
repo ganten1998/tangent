@@ -1189,7 +1189,7 @@ mod catalog_tests {
         )]);
         let row = rows
             .iter()
-            .find(|(p, _, _)| p.to_string_lossy().contains("piano"))
+            .find(|(p, _, _)| p.to_string_lossy().contains("Grand"))
             .expect("the bundle handed in should come back");
         assert_eq!(row.2, None, "a VST3 row must not carry a display name");
     }

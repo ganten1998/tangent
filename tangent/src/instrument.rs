@@ -137,7 +137,7 @@
 //! `Instance::process` allocated internally on every call — a `Vec` of channel
 //! pointers, an `AudioBusBuffers` vector, one scratch buffer per channel of
 //! every output bus past the first, and a `ComWrapper`ed event list. Measured
-//! on the modelled piano's eight-stereo-bus layout by putting the old code under a
+//! on a modelled-piano VST3's eight-stereo-bus layout by putting the old code under a
 //! counting allocator: **42 allocator calls for one block**, 21 allocations and
 //! 21 frees, and **three loaded slots was three times that** — 126 a block,
 //! about 12,000 a second. It is the one place layering made an existing
@@ -1114,7 +1114,7 @@ fn place(stamp: Nanos, block_start: Nanos, rate: f64, frames: usize) -> Placemen
 /// * **Two or more sources fill the first two destination channels** and leave
 ///   the rest silent. Taking the first two of a multi-output instrument is the
 ///   right answer because bus 0 is the main mix by VST3 convention — the other
-///   seven of the modelled piano's eight are stem outputs of the same performance, and
+///   seven of a modelled-piano VST3's eight are stem outputs of the same performance, and
 ///   summing them would be the same piano eight times.
 /// * **A mono destination gets the average, not the sum.** Summing is +6 dB and
 ///   clips a mix that was correct in stereo.
@@ -5088,7 +5088,7 @@ const RACK_PARK_S: f64 = 8.0;
 /// A voice used to never park at all — the class of the plugin decided it,
 /// at load — because an instrument may be holding a note and a park would
 /// cut it. That kept every instrument lane on the desk rendering every
-/// block for as long as the project was open: the owner's the modelled piano lane,
+/// block for as long as the project was open: the owner's modelled-piano lane,
 /// armed and untouched, ran its physical model over nothing all afternoon,
 /// and the meter it fed never read zero, so the window it fed never
 /// rested. See `desktop.rs`'s `MeterPicture` for the other half of that.
@@ -29089,7 +29089,9 @@ pub fn plugin_test(filter: Option<String>) {
     /// Long enough to cover the phrase and its release tail.
     const MEASURE_SECONDS: f64 = 3.5;
 
-    let filter = filter.unwrap_or_else(|| "piano".to_string());
+    let filter = filter
+        .or_else(|| std::env::var("TANGENT_TEST_PIANO").ok())
+        .unwrap_or_else(|| "piano".to_string());
     let needle = filter.to_lowercase();
     // VST3 first, by bundle name, which is what this probe has always matched
     // on. LV2 second, by the plugin's own name, since an LV2 has no file name
@@ -30108,7 +30110,7 @@ mod tests {
 
     #[test]
     fn a_multi_output_instrument_contributes_its_first_two_channels_and_no_more() {
-        // the modelled piano's eight are stem outputs of the SAME performance; summing
+        // The modelled piano's eight are stem outputs of the SAME performance; summing
         // them would be the same piano eight times, 18 dB up and clipped.
         let src = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
         let mut dst = [9.0; 2];
@@ -32074,14 +32076,16 @@ mod tests {
     ///
     ///     cargo test -p tangent an_instrument_in_a_bay -- --ignored --nocapture
     #[test]
-    #[ignore = "needs an audio device and the modelled piano installed; runs a vendor's initialiser"]
+    #[ignore = "needs an audio device and a VST3 instrument named by TANGENT_TEST_PIANO; runs a \
+                vendor's initialiser"]
     fn an_instrument_in_a_bay_renders_notes_and_the_arm_gate_holds() {
+        let needle = test_piano("an instrument that sounds when a chord is played");
         let Some(bundle) = tangent_host::discover().into_iter().find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase().contains("piano"))
+                .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
                 .unwrap_or(false)
         }) else {
-            panic!("no VST3 matching the modelled piano; this test needs one installed");
+            panic!("no VST3 matching TANGENT_TEST_PIANO={needle}; this test needs one installed");
         };
         let mut engine = Engine::start(None).expect("an audio output");
         engine
@@ -41996,7 +42000,7 @@ mod tests {
         // `instance.rs`, where a rendered probe can be measured; here the claim
         // is that the bytes can be got at all while the stream runs, and that a
         // bad blob costs the preset rather than the piano.
-        let bundle = piano();
+        let bundle = modelled_piano();
         let mut engine = Engine::start(None).expect("an audio output");
         engine.load_insert(0, 0, Some(&bundle), None).expect("load");
         assert!(engine.insert_state_error(0, 0).is_none());
@@ -42050,7 +42054,7 @@ mod tests {
     #[ignore = "needs a real VST3 instrument installed; run with \
                 `cargo test -p tangent -- --ignored a_real_instrument`"]
     fn a_real_instrument_is_heard_and_can_be_swapped_while_the_stream_runs() {
-        let bundle = piano();
+        let bundle = modelled_piano();
         let mut engine = Engine::start(None).expect("an audio output");
         let loaded = engine
             .load_insert(0, 0, Some(&bundle), None)
@@ -42099,7 +42103,7 @@ mod tests {
         // peak must double. It is the only way to tell "both channels got the
         // notes" from "one got them and the other is silent", which every
         // structural test in this file would happily pass.
-        let bundle = piano();
+        let bundle = modelled_piano();
         let mut engine = Engine::start(None).expect("an audio output");
         engine
             .load_insert(0, 0, Some(&bundle), None)
@@ -42137,7 +42141,7 @@ mod tests {
         // The per-bay handoff in one test: the rings channel 2's bay uses are
         // not the rings channel 1's uses, so retiring one instrument cannot
         // take the other with it.
-        let bundle = piano();
+        let bundle = modelled_piano();
         let mut engine = Engine::start(None).expect("an audio output");
         engine
             .load_insert(0, 0, Some(&bundle), None)
@@ -42172,7 +42176,7 @@ mod tests {
         // `LEGACY_SEATS`, not `LEGACY_STRIPS + 1`: that seat is pad 0's FX bay now,
         // a bay that very much exists — the first seat that does not is the
         // one past the whole map.
-        let bundle = piano();
+        let bundle = modelled_piano();
         let mut engine = Engine::start(None).expect("an audio output");
         assert!(matches!(
             engine.load_insert(LEGACY_SEATS, 0, Some(&bundle), None),
@@ -42194,16 +42198,32 @@ mod tests {
 
     /// The one instrument every one of these tests needs, found the way the
     /// probe finds it.
-    fn piano() -> PathBuf {
+    fn modelled_piano() -> PathBuf {
+        let needle = test_piano(
+            "an instrument that sounds within half a second of a chord and has state to save",
+        );
         let bundles = tangent_host::discover();
         let Some(bundle) = bundles.into_iter().find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase().contains("piano"))
+                .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
                 .unwrap_or(false)
         }) else {
-            panic!("no VST3 matching the modelled piano; this test needs one installed");
+            panic!("no VST3 matching TANGENT_TEST_PIANO={needle}; this test needs one installed");
         };
         bundle
+    }
+
+    /// What `TANGENT_TEST_PIANO` holds, lowercased: part of an installed VST3
+    /// instrument's bundle name, matched the way the probe matches its filter.
+    /// Unset, the test stops and says what it needs from that instrument.
+    fn test_piano(needs: &str) -> String {
+        match std::env::var("TANGENT_TEST_PIANO") {
+            Ok(name) if !name.trim().is_empty() => name.to_lowercase(),
+            _ => panic!(
+                "set TANGENT_TEST_PIANO to part of an installed VST3 instrument's bundle \
+                 name; this test needs {needs}"
+            ),
+        }
     }
 
     /// Play a chord, hold it for half a second, and report the loudest thing the

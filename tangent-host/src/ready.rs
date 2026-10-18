@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! plugin                  cold      after a 5 s warm-up
-//! the modelled piano              0.342     -
+//! Modelled piano          0.342     -
 //! Analog Lab V            0.224     -
 //! Augmented GRAND PIANO   0.003     0.167
 //! CP-70 V                 0.0007    0.143
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn an_instrument_that_sounds_immediately_still_waits_out_the_warm_up_floor() {
-        // the modelled piano's shape: 0.342 cold. The gate cannot tell it apart from
+        // The modelled piano's shape: 0.342 cold. The gate cannot tell it apart from
         // Augmented GRAND's 0.003, so it pays the floor either way.
         let mut fake = Fake::new();
         let mut g = gate(quick());
@@ -1547,12 +1547,18 @@ mod tests {
     #[ignore = "needs a real VST3 instrument installed; every other test here runs \
                 with no plugin, no device and no audio"]
     fn a_real_instrument_warms_up_and_then_makes_a_sound() {
+        let wanted = std::env::var("TANGENT_TEST_PIANO").unwrap_or_default().to_lowercase();
+        assert!(
+            !wanted.is_empty(),
+            "set TANGENT_TEST_PIANO to part of an installed VST3 instrument's bundle name; \
+             this test needs a piano that sounds the probe note once it has warmed up"
+        );
         let Some(bundle) = crate::scan::discover().into_iter().find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase().contains("piano"))
+                .map(|n| n.to_string_lossy().to_lowercase().contains(&wanted))
                 .unwrap_or(false)
         }) else {
-            panic!("no VST3 matching the modelled piano; this test needs one installed");
+            panic!("no VST3 matching {wanted:?}; this test needs one installed");
         };
         let module = crate::scan::Module::open(&bundle).expect("open module");
         let class = module
@@ -1716,7 +1722,7 @@ mod tests {
     /// still, and what silences it?**
     ///
     /// ```text
-    /// TANGENT_PROBE_BUNDLE="/Library/Audio/Plug-Ins/VST3/Grand 9.vst3" \
+    /// TANGENT_PROBE_BUNDLE="/Library/Audio/Plug-Ins/VST3/<piano>.vst3" \
     /// TANGENT_PROBE_STATE=".../state/pstate-t3-c0-b0.bin" \
     /// cargo test -p tangent-host --lib --release -- --ignored how_loud_the_test_note --nocapture
     /// ```

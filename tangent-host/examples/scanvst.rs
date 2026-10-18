@@ -1,7 +1,7 @@
 //! The spike: does a real VST3 load, and what does it say it is?
 //!
 //!   cargo run -p tangent-host --example scanvst
-//!   cargo run -p tangent-host --example scanvst -- the modelled piano
+//!   cargo run -p tangent-host --example scanvst -- piano
 //!
 //! Filters by substring when given an argument. Prints one line per module and
 //! one indented line per exported class.

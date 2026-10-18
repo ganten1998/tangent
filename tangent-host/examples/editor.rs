@@ -1,6 +1,6 @@
 //! Open a plugin's own editor and leave it on screen until it is closed.
 //!
-//!   cargo run -p tangent-host --example editor -- the modelled piano
+//!   cargo run -p tangent-host --example editor -- piano
 //!
 //! The thing a human can actually look at. Everything else about hosting can be
 //! measured — peak, RMS, a written file — but "the plugin's UI appeared and you
@@ -14,7 +14,7 @@
 //!
 //! **No audio device.** This renders into a buffer and throws it away; it exists
 //! to prove the window works. Use
-//! `dist/Tangent.app/Contents/MacOS/tangent --plugin-test the modelled piano` for the
+//! `dist/Tangent.app/Contents/MacOS/tangent --plugin-test piano` for the
 //! version you can hear, which is also the one that runs inside a signed bundle
 //! and therefore the one a plugin with a licence check will talk to.
 
@@ -78,7 +78,10 @@ fn probe(inst: &mut Instance, bufs: &mut [Vec<f32>], channels: usize) -> (f32, f
 }
 
 fn main() {
-    let filter = std::env::args().nth(1).unwrap_or_else(|| "piano".into());
+    let filter = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("TANGENT_TEST_PIANO").ok())
+        .unwrap_or_else(|| "piano".into());
     let Some(bundle) = tangent_host::discover().into_iter().find(|p| {
         p.file_name()
             .map(|n| n.to_string_lossy().to_lowercase().contains(&filter.to_lowercase()))
