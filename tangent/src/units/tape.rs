@@ -638,7 +638,8 @@ const DEEP_SLEW: f64 = 0.03;
 /// sample-and-hold every 2.5 s through two poles at 0.2 Hz, both at Rate's
 /// pace, a delay of up to [`BELT_MS`]. Depths are linear in Wow's dial (the
 /// owner's ruling): at the default 0.3 the deep range already swings the
-/// pitch about 0.8 % at its peak, and at full Wow about 2.7 %.
+/// pitch about 1 % at its peak, and at full Wow about 2.6 %
+/// (`the_deep_range_swings_the_pitch_like_a_worn_cassette`).
 const CASSETTE_HZ: [f64; 2] = [0.45, 1.5];
 const CASSETTE_SHARE: [f64; 2] = [0.55, 0.30];
 const CASSETTE_DEPTH: f64 = 0.03;
@@ -3000,9 +3001,10 @@ impl Tape {
     /// **The transport alone, for `frames` frames at `p`**, as one block of
     /// `process` would run it: the same designs on the same frame grid, the
     /// same glides, the heads and their per-channel noise (counted against
-    /// the line as `process` counts them), and no audio. Returns the sway,
-    /// in samples, without the per-channel noise. Called again it carries
-    /// on, so a test can automate it block by block.
+    /// the line as `process` counts them), and no audio. Returns the sway of
+    /// the head the range selects, in samples, without the per-channel
+    /// noise. Called again it carries on, so a test can automate it block by
+    /// block.
     #[cfg(test)]
     pub(crate) fn transport_trace(&mut self, p: &TapeParams, frames: usize) -> Vec<f64> {
         self.trace_of(p, frames, |t| if t.deep { t.deep_sway } else { t.sway })
@@ -3014,6 +3016,8 @@ impl Tape {
         self.trace_of(p, frames, |t| t.pack_sway)
     }
 
+    /// The hooks' one road: the transport run as `process` runs it, `read`
+    /// off it every frame.
     #[cfg(test)]
     fn trace_of(&mut self, p: &TapeParams, frames: usize, read: impl Fn(&Transport) -> f64) -> Vec<f64> {
         self.aim(p);

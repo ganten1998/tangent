@@ -2288,8 +2288,8 @@ impl TapeUnit {
             if self.dry_fade < 1.0 {
                 let then = (self.dry_at + line - self.dry_was) % line;
                 let (now, was) = (self.dry_fade * std::f32::consts::FRAC_PI_2).sin_cos();
-                for (d, line) in dry.iter_mut().zip(&self.dry) {
-                    *d = was * line[then] + now * *d;
+                for (d, tape) in dry.iter_mut().zip(&self.dry) {
+                    *d = was * tape[then] + now * *d;
                 }
                 self.dry_fade = (self.dry_fade + self.dry_step).min(1.0);
             }
