@@ -3198,17 +3198,24 @@ mod tests {
     ///
     /// The setting is the live desk's and only the live desk's: an export
     /// renders its span as fast as it can and must never spin, and a project
-    /// exports the same file whatever the switch says. The first corpus
-    /// project exported through the real road (`full_build_with`, then the
-    /// span rendered as `start_offline_render` renders it) with the setting
-    /// off and with it on at its fastest, 0.1 s up and 0.1 s down: the same
-    /// bytes, file for file.
+    /// exports the same file whatever the switch says. Two things make that
+    /// so, and each is held here on its own. The builder never arms the
+    /// motor: an engine built through the real road (`full_build_with`) from
+    /// an app whose setting is on at its fastest, 0.1 s up and 0.1 s down,
+    /// says its host does not let the motor move (`Engine::motor_armed`; the
+    /// scan and the runtime edges are `no_offline_build_arms_the_tape_motor`).
+    /// And the export's road has no edge inside its span: the transport and
+    /// the level are set before the first render and a fresh renderer adopts
+    /// that level, so even an engine armed by hand after the build exports
+    /// the same file. The first corpus project, its span rendered as
+    /// `start_offline_render` renders it, with the setting off, on, and on
+    /// with the built engine armed: the same bytes, file for file.
     #[test]
     fn an_export_is_the_same_file_with_tape_start_and_stop_on() {
-        let render = |on: bool| {
+        let render = |on: bool, arm: bool| {
             let mut c = corpus().into_iter().next().expect("a corpus project");
             c.settings.start_stop = tangent_ui::motor::StartStop::new(on, 0.1, 0.1);
-            let dir = scratch(&format!("tape-motor-{on}"));
+            let dir = scratch(&format!("tape-motor-{on}-{arm}"));
             let app = open(&c, &dir);
             assert_eq!(app.start_stop().on(), on, "the setting did not reach the app");
             let (live, live_bridge) = live_engine(&c, &app);
@@ -3216,16 +3223,21 @@ mod tests {
             let mut ctx = Furnish { live: Some((&live, &live_bridge)), ..Furnish::default() };
             let built = full_build_with(&app, RATE, Timebase::new(), BuildFor::Export(spec.clone()), &mut ctx)
                 .expect("an offline engine");
+            assert!(!built.engine.motor_armed(), "the offline builder let an export's motor move");
+            if arm {
+                built.engine.set_tape_motor(true, 0.1, 0.1);
+            }
             let files = render_files(built, &app, &spec, None, &dir.join("out"));
             let _ = std::fs::remove_dir_all(&dir);
             files
         };
-        let off = render(false);
-        let on = render(true);
+        let off = render(false, false);
         assert!(off.iter().any(|(_, _, loud)| *loud), "the export was silent, so nothing was proved");
-        assert_eq!(off.len(), on.len(), "the setting changed which files an export writes");
-        for ((name, a, _), (_, b, _)) in off.iter().zip(&on) {
-            assert!(a == b, "{name} is not the same file with tape start and stop on");
+        for (what, on) in [("on", render(true, false)), ("on and the built engine armed", render(true, true))] {
+            assert_eq!(off.len(), on.len(), "the setting {what} changed which files an export writes");
+            for ((name, a, _), (_, b, _)) in off.iter().zip(&on) {
+                assert!(a == b, "{name} is not the same file with tape start and stop {what}");
+            }
         }
     }
 
