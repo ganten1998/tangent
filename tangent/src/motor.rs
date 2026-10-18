@@ -749,7 +749,8 @@ pub(crate) struct Motor {
     tone_run: ToneRun,
     /// The device rate of the last pass, or 0 for none worth the name.
     rate: f64,
-    /// The gain the last pass ended at: the fade times the envelope.
+    /// The gain the last pass ended at: the fade times the envelope, or 1
+    /// for a steady pass (`Motor::plan`).
     gain_end: f64,
     last: Plan,
 }
@@ -1008,6 +1009,16 @@ impl Motor {
             && self.hold.is_none()
             && !tone
             && !tone_clear;
+        // **A steady pass is at full gain, and says so here.** Its stage
+        // never runs (the renderer skips it, and `Motor::stage` would bypass
+        // it), so the stage cannot say it. A count's snap jumps the envelope
+        // to 1 out of a hold whose reproducer has already settled, and that
+        // pass is steady at once: left to the stage, the gain stayed at the
+        // hold's 0, and the master meter read silence under a playing desk
+        // until the next ramp.
+        if steady {
+            self.gain_end = 1.0;
+        }
         self.last = Plan {
             s0,
             s1,
@@ -1131,7 +1142,8 @@ impl Motor {
     }
 
     /// **The gain the last pass ended at**, fade times envelope, in
-    /// `[0, 1]`: the master meter's scale, read at the pass's start.
+    /// `[0, 1]`, and 1 once a steady pass is planned (it is at full gain
+    /// throughout): the master meter's scale, read at the pass's start.
     pub(crate) fn gain_now(&self) -> f64 {
         self.gain_end
     }
@@ -1295,6 +1307,19 @@ mod tests {
         let mut m = running(i);
         until(&mut m, i, false, MotorShow::Holding);
         m
+    }
+
+    /// A hold whose reproducer has settled and been cleared, the tails
+    /// still held: the gain at 0 and nothing else left to move.
+    fn settled_hold(i: &PlanIn) -> Motor {
+        let mut m = holding(i);
+        loop {
+            let p = pass(&mut m, i, false);
+            assert_eq!(p.show, MotorShow::Holding, "the hold let go before its reproducer settled");
+            if !p.tone && !p.tone_clear {
+                return m;
+            }
+        }
     }
 
     /// The first pass of a start from the floor (out of a hold, so no dip).
@@ -1664,6 +1689,9 @@ mod tests {
                         for s in [p.s0, p.s1] {
                             assert!(s.is_finite() && (FLOOR..=1.0).contains(&s), "rate {rate}, time {time}: speed {s}");
                         }
+                        if p.steady {
+                            assert_eq!(m.gain_now(), 1.0, "rate {rate}, time {time}: a steady pass is not at full gain");
+                        }
                         assert_eq!(MotorShow::from_u8(p.show as u8), p.show);
                         let level = (k / 6) % 2 == 1;
                         let c = m.chunk(level, i.ok, k % 3 == 0);
@@ -1882,7 +1910,10 @@ mod tests {
     /// A count-in's first click starts in the very frame the count does,
     /// so the motor goes to its steady state in that pass, from a stop's
     /// coast, from a hold and from a start alike, and the gain is 1 at the
-    /// pass's first frame, the jump under the click. Refused instead (an
+    /// pass's first frame, the jump under the click. From a hold whose
+    /// reproducer has settled, that pass is steady at once and its stage
+    /// never runs, and the motor still says it is at full gain: that is
+    /// the master meter's scale. Refused instead (an
     /// export, a record pressed mid-ramp), the gain never steps: it glides
     /// from where it was to 1 over exactly the house declick,
     /// `round(CUT_S * rate)` frames, every frame's change within the
@@ -1892,8 +1923,12 @@ mod tests {
     fn a_count_snaps_the_tape_where_it_is_and_jumps_the_gain() {
         let i = inp(48_000.0, 256);
         let cut = (CUT_S * 48_000.0).round() as usize;
-        let starts: [(&str, fn(&PlanIn) -> Motor, bool); 3] =
-            [("a stop's coast", deep_in_a_stop, false), ("a hold", holding, false), ("a start", spinning, true)];
+        let starts: [(&str, fn(&PlanIn) -> Motor, bool); 4] = [
+            ("a stop's coast", deep_in_a_stop, false),
+            ("a hold", holding, false),
+            ("a hold past its settle", settled_hold, false),
+            ("a start", spinning, true),
+        ];
         for (what, build, level) in starts {
             let mut m = build(&i);
             assert!(m.gain_now() < 1.0, "{what} was already at full gain");
@@ -1903,6 +1938,7 @@ mod tests {
             let want = if level { MotorShow::Running } else { MotorShow::Parked };
             assert_eq!((p.show, p.s0, p.s1), (want, 1.0, 1.0), "a count in {what}");
             assert_eq!(st.gain(0), 1.0, "under a count from {what} the gain is not 1 at its first frame");
+            assert_eq!(m.gain_now(), 1.0, "after a count from {what} the motor does not say it is at full gain");
 
             let mut m = build(&i);
             let from = m.gain_now();

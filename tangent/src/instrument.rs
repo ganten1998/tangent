@@ -52504,6 +52504,80 @@ mod tape_motor {
         assert!(after.iter().all(|p| db(f64::from(peak(&p.out))) > -90.0), "a tracking desk's tail was not heard");
     }
 
+    /// **The master meter reads what the speakers play, through a hold and
+    /// after a count that ends one.**
+    ///
+    /// The master meter is scaled by the motor's gain at the pass's start
+    /// (`Renderer::meter_scale`), so through a hold, the slowed tails kept
+    /// silent, it reads silence while the plate's own strip meter, before
+    /// the motor, says the plate still rings. A count snaps the motor to
+    /// rest at full gain in its own pass, and once the reproducer's 50 ms
+    /// settle is over that pass is steady at once: the stage that brought
+    /// the gain back never ran, and the meter read the hold's 0 under a
+    /// playing desk through the whole count and the record or take after
+    /// it. A plate desk held for 20 passes (107 ms), the count started
+    /// there with the motor held off for it as the host holds it, then the
+    /// song rolled: every pass's meter peak is the scope's (the speakers'
+    /// pair before the click joins), and both are heard.
+    #[test]
+    fn the_master_meter_reads_what_the_speakers_play_through_a_hold_and_a_count() {
+        let ring = |e: &Engine| {
+            let cells = e.lane_shared(Slot(LANE as u32)).expect("the lane's numbers");
+            (0..2).map(|c| f32::from_bits(cells.peak[c].swap(0, Ordering::Relaxed))).fold(0.0f32, f32::max)
+        };
+        let mut d = Tracking::new(1, false, true, true);
+        d.e.set_tape_motor(true, 0.5, 0.2);
+        let mut t = Transport::new();
+        t.toggle_play();
+        d.run(&mut t, RATE as usize / PASS, PASS);
+        t.stop();
+        d.until(&mut t, PASS, MotorShow::Holding, 400);
+        let mut scope = Vec::new();
+        let mut pass = |d: &mut Tracking, t: &mut Transport| {
+            let p = d.one(t, PASS);
+            let m = d.e.meters();
+            scope.clear();
+            d.e.drain_scope(&mut scope);
+            let side = |c: usize| scope.iter().skip(c).step_by(TAP_CHANNELS).fold(0.0f32, |a, s| a.max(s.abs()));
+            (p, [m.left.peak, m.right.peak], [side(0), side(1)])
+        };
+        let _ = pass(&mut d, &mut t);
+        let mut rang = 0;
+        for k in 0..20 {
+            let (p, metered, _) = pass(&mut d, &mut t);
+            assert_eq!(p.show, MotorShow::Holding, "the hold let go {k} passes in");
+            assert!(metered.iter().all(|m| *m == 0.0), "{k} passes into the hold the master meter read {metered:?}");
+            if ring(&d.e) > PARK_FLOOR {
+                rang += 1;
+            }
+        }
+        assert!(rang > 10, "the plate was not ringing through the hold, so nothing was proved");
+        d.e.start_count_in(4, 120.0);
+        // The host keeps the motor quiet for the count (`run.counting`),
+        // and for the song's go after it (`Recorder::motor_hold`).
+        d.e.set_tape_motor(false, 0.5, 0.2);
+        let mut passes = Vec::new();
+        for _ in 0..40 {
+            passes.push(pass(&mut d, &mut t));
+        }
+        t.toggle_play();
+        for _ in 0..40 {
+            passes.push(pass(&mut d, &mut t));
+        }
+        for (k, (p, metered, played)) in passes.iter().enumerate() {
+            assert_ne!(p.show, MotorShow::Holding, "pass {k}: the count did not end the hold");
+            assert!(played.iter().all(|s| *s > 1e-3), "pass {k}: the desk was not heard ({played:?}), so nothing was proved");
+            for c in 0..2 {
+                assert!(
+                    (metered[c] - played[c]).abs() <= 1e-6,
+                    "pass {k}: the master meter read {} with the speakers at {}",
+                    metered[c],
+                    played[c]
+                );
+            }
+        }
+    }
+
     /// **The input keeps its place through a ramp.**
     ///
     /// Under the motor the input is stretched by a step that moves, up to
