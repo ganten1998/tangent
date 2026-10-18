@@ -2074,6 +2074,32 @@ const TAPE_BYPASS_FADE_MS: f32 = 10.0;
 /// delay and this much more, and only then fades back to the tape.
 const TAPE_REFILL_MS: f32 = 5.0;
 
+/// **The one map from a tape control's id to the field it drives**: an arm
+/// per row of [`TAPE_FACE_PARAMS`], and nothing for an id the table does not
+/// declare.
+///
+/// Every id names its field, and an id with no arm writes nothing.
+/// `TapeUnit::set_param` used to end in a catch-all into the trim, which was
+/// harmless while the table stopped at the trim and would not stay so: a row
+/// appended to the table without an arm would have driven the output level,
+/// and the seat's sweep would still have passed, because the trim moves the
+/// output. One map rather than a match inside `set_param`, so whatever else
+/// has to turn a bay's values into the kernel's params reads the same arms
+/// and cannot grow a second map that disagrees with this one.
+/// `every_tape_id_reaches_its_own_field` holds every arm to its row.
+fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32> {
+    match id {
+        0 => Some(&mut p.drive),
+        1 => Some(&mut p.bump),
+        2 => Some(&mut p.roll),
+        3 => Some(&mut p.wobble),
+        4 => Some(&mut p.hiss),
+        5 => Some(&mut p.trim),
+        6 => Some(&mut p.speed),
+        _ => None,
+    }
+}
+
 pub struct TapeUnit {
     kernel: crate::units::tape::Tape,
     params: crate::units::tape::TapeParams,
@@ -2134,22 +2160,8 @@ impl TapeUnit {
         let Some(spec) = TAPE_FACE_PARAMS.get(id as usize) else {
             return;
         };
-        let v = washed(spec, value);
-        // **Every id names its field, and an id with no arm writes
-        // nothing.** The last arm used to be a catch-all into the trim, which
-        // was harmless while the table stopped at the trim and would not stay
-        // so: a row appended to `TAPE_FACE_PARAMS` without an arm here would
-        // have driven the output level, and the seat's sweep would still have
-        // passed, because the trim moves the output.
-        match id {
-            0 => self.params.drive = v,
-            1 => self.params.bump = v,
-            2 => self.params.roll = v,
-            3 => self.params.wobble = v,
-            4 => self.params.hiss = v,
-            5 => self.params.trim = v,
-            6 => self.params.speed = v,
-            _ => {}
+        if let Some(slot) = tape_slot(&mut self.params, id) {
+            *slot = washed(spec, value);
         }
     }
 
