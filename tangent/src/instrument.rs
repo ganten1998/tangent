@@ -52170,28 +52170,48 @@ mod tape_motor {
         assert!(empty > 0, "no pass near the floor rendered no program, so nothing was proved");
     }
 
-    /// **The stall watch never fires near ratio zero.**
+    /// **The stall watch never fires near ratio zero, because every pass
+    /// counts.**
     ///
     /// The watch declares the output dead when the callback count sits still
-    /// for two seconds of device time. Three seconds of 32-frame passes
-    /// through a 2 s stop and its hold, each reading fed to the watch at the
-    /// device time it was rendered at: never a stall, because every pass
-    /// counts.
+    /// for two seconds of device time, and its heartbeat is one count a
+    /// callback. Near the floor a short pass can need no program at all, and
+    /// the render used to return before it counted one there. Even so the
+    /// watch itself could not have fired: at the slowest read ratio, the
+    /// dial's 0.5 times the floor (0.00786), a 32-frame pass reads a quarter
+    /// of a program frame, so one pass in four renders some and counts, far
+    /// inside two seconds. What keeps the watch quiet is that every pass
+    /// counts, and that is what is held here, pass by pass, where it is
+    /// hardest: the dial at 0.5, a 2 s stop and its hold, three seconds of
+    /// 32-frame passes, passes that render no program among them. Every pass
+    /// counts exactly one callback, and the watch, fed each reading at the
+    /// device time it was rendered at, never declares a stall.
     #[test]
     fn the_stall_watch_never_fires_near_ratio_zero() {
         let mut e = tone_desk(RATE, 500.0, 8.0);
         let mut t = Transport::new();
         rolling_from_one_second(&mut e, &mut t);
+        e.set_varispeed(0.5);
         e.set_tape_motor(true, 0.5, 2.0);
+        run(&mut e, &mut t, 8, 32);
         t.stop();
         let mut watch = StallWatch::new();
         let t0 = Instant::now();
         let passes = 3 * RATE as usize / 32;
+        let mut empty = 0usize;
+        let mut last = e.transport_position();
         for k in 0..passes {
-            one(&mut e, &mut t, 32);
+            let callbacks = e.callbacks();
+            let p = one(&mut e, &mut t, 32);
+            assert_eq!(e.callbacks(), callbacks + 1, "pass {k} of the stop did not count one callback");
+            if p.show == MotorShow::WindingDown && p.pos == last {
+                empty += 1;
+            }
+            last = p.pos;
             let at = t0 + Duration::from_secs_f64((k * 32) as f64 / f64::from(RATE));
             assert!(!watch.note(true, e.callbacks(), at), "the watch declared a stall {k} passes into the stop");
         }
+        assert!(empty > 0, "no pass near the floor rendered no program, so nothing was proved");
     }
 
     /// **A count during a coast snaps the tape and counts from its own
