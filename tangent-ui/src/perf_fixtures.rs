@@ -389,6 +389,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         master_mono: Some(s.master_mono),
         lufs_window: Some(s.lufs_window),
         varispeed: Some(s.varispeed),
+        start_stop: Some(s.start_stop),
         click: Some(crate::arrangement::Click {
             div: s.metronome_div,
             in_take: s.metronome_in_take,

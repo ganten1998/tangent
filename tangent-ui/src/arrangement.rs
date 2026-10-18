@@ -1367,6 +1367,13 @@ pub struct DeskSnap {
     /// document written before it, which reads as "keep whatever the app
     /// has" rather than as a set of zeroes.
     pub view: Option<View>,
+    /// `start_stop`: the tape's start and stop, the switch and its two times
+    /// (`Settings::start_stop`), **as the model**, whose times are whole
+    /// centiseconds so the file, the fingerprint and the field read one
+    /// number. `None` is a document from before it, and the live switch
+    /// stands: an old project must not start spinning up, or stop doing so,
+    /// because a key was added.
+    pub start_stop: Option<crate::motor::StartStop>,
     /// **The drum bus, the click, the effects return and the master**: each
     /// one's name, colour, sends, mute, solo and polarity (W5). Always said:
     /// a legacy document's are read off its strip arrays, a format-2 desk
@@ -1472,8 +1479,9 @@ impl Says {
     pub const LOOK: Self = Self(1 << 17);
     pub const VIEW: Self = Self(1 << 18);
     pub const FROZEN: Self = Self(1 << 19);
+    pub const START_STOP: Self = Self(1 << 20);
     /// Every field: what a live desk and a format-2 desk say.
-    pub const ALL: Self = Self((1 << 20) - 1);
+    pub const ALL: Self = Self((1 << 21) - 1);
     /// The late facts that live on a row: what [`DeskSnap::row_says`] holds.
     pub const ROWS: Self =
         Self(Self::PHASE.0 | Self::TO_THEORY.0 | Self::INSTRUMENTS.0 | Self::FROZEN.0);
@@ -1779,6 +1787,8 @@ pub struct DeskRef<'a> {
     pub look: Option<LookRef<'a>>,
     /// See [`DeskSnap::view`].
     pub view: Option<ViewRef<'a>>,
+    /// See [`DeskSnap::start_stop`]. `Copy`, so it needs no borrowed twin.
+    pub start_stop: Option<crate::motor::StartStop>,
     /// See [`DeskSnap::next_id`]. Not hashed: it moves only when an id is
     /// minted, which moves a row.
     pub next_id: u64,
@@ -1951,6 +1961,7 @@ impl DeskRef<'_> {
             transpose: self.transpose,
             count_in: self.count_in,
             view: self.view.map(|v| v.to_view()),
+            start_stop: self.start_stop,
             look: self.look.map(|l| Look {
                 theme: l.theme.to_owned(),
                 palette: l.palette,
@@ -2176,6 +2187,17 @@ impl DeskRef<'_> {
             f.bool(sp.solo);
             f.bool(phase_said && sp.phase);
         }
+        // **The tape's start and stop, APPENDED**: after every word an
+        // earlier build hashed, so none of theirs moves, and its absence
+        // apart from every value it could hold, as the late fields above.
+        // The times as the centiseconds they are held in, the number the
+        // file and the field read.
+        opt(f, self.start_stop.is_some());
+        if let Some(m) = self.start_stop {
+            f.bool(m.on());
+            f.u64(u64::from(m.start_cs()));
+            f.u64(u64::from(m.stop_cs()));
+        }
     }
 }
 
@@ -2317,6 +2339,7 @@ impl DeskSnap {
                 quantize_sensitivity: v.quantize_sensitivity,
                 quantize_fit: &v.quantize_fit,
             }),
+            start_stop: self.start_stop,
             look: self.look.as_ref().map(|l| LookRef {
                 theme: &l.theme,
                 palette: l.palette,
@@ -2358,6 +2381,7 @@ impl DeskSnap {
             (self.notation.is_some(), Says::NOTATION),
             (self.look.is_some(), Says::LOOK),
             (self.view.is_some(), Says::VIEW),
+            (self.start_stop.is_some(), Says::START_STOP),
         ] {
             if on {
                 bits |= s.0;
@@ -2797,6 +2821,12 @@ impl DeskSnap {
             vm.insert("len_s".into(), serde_json::json!(v.len_s));
             m.insert("viewport".into(), Value::Object(vm));
         }
+        // **The tape's start and stop, after the window and only when said**:
+        // appended behind every key an earlier build wrote, the window's own
+        // rule, so none of theirs moves.
+        if let Some(v) = self.start_stop {
+            m.insert("start_stop".into(), v.to_json());
+        }
         Value::Object(m)
     }
 
@@ -3232,6 +3262,14 @@ impl DeskSnap {
                 }
                 v
             }),
+            // **The tape's start and stop**, through the model's setters
+            // member by member (`StartStop::from_json`). Absent, or not an
+            // object, is a document that does not say, which leaves the live
+            // switch standing, as the varispeed's block above is read.
+            start_stop: m
+                .get("start_stop")
+                .filter(|v| v.is_object())
+                .map(crate::motor::StartStop::from_json),
             click: m.get("click").and_then(Value::as_object).map(|cm| Click {
                 div: cm.get("div").and_then(Value::as_i64).unwrap_or(1),
                 in_take: cm.get("in_take").and_then(Value::as_bool).unwrap_or(false),
@@ -6010,6 +6048,9 @@ mod tests {
             master_mono: Some(true),
             lufs_window: Some(crate::recorder::LoudnessWindow::ShortTerm),
             varispeed: Some(crate::varispeed::Varispeed::with_range(80, 130)),
+            // Off its default in all three, so a reader that dropped it, or
+            // either time, writes other bytes than this fixture.
+            start_stop: Some(crate::motor::StartStop::new(true, 1.5, 3.0)),
             click: Some(Click {
                 div: 2,
                 in_take: true,
@@ -6609,6 +6650,15 @@ mod tests {
             desk(a).varispeed = Some(v);
         });
         moves_both("the varispeed going unsaid", |a| desk(a).varispeed = None);
+        // The tape's start and stop: the switch and each time on its own
+        // line, because the three hash side by side, and its absence.
+        fn start_stop(a: &mut Arrangement) -> &mut crate::motor::StartStop {
+            desk(a).start_stop.as_mut().unwrap()
+        }
+        moves_both("the tape start and stop going off", |a| start_stop(a).set_on(false));
+        moves_both("its start time", |a| start_stop(a).set_start_s(0.25));
+        moves_both("its stop time", |a| start_stop(a).set_stop_s(0.25));
+        moves_both("its going unsaid", |a| desk(a).start_stop = None);
         moves_both("a lane freezing", |a| {
             row(a, 0).frozen = Some(crate::desk_model::Frozen { path: "media/frozen-01-7.wav".into(), len_s: 3.0 });
         });

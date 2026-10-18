@@ -2902,6 +2902,8 @@ fn num_field_key(f: NumField) -> usize {
         NumField::VariMax => 108,
         NumField::MetBeats => 109,
         NumField::MetUnit => 110,
+        NumField::MotorStart => 111,
+        NumField::MotorStop => 112,
         // Offset well past the band's own fields: there can be one of these
         // per bar, and two controls that answer `true` to `is_same_control`
         // are two controls a drag can slide between.
@@ -7887,6 +7889,146 @@ mod tests {
         // A field open somewhere else is not these fields'.
         let tempo = NumEdit::prefilled(NumField::Tempo, "90".to_owned());
         assert_eq!(drawn(Some(&tempo)), (vec!["7".to_owned()], vec!["8".to_owned()]), "the tempo's typing");
+    }
+
+    /// **The tape's rows are reachable and legible at every font**: in each
+    /// of the three bundled faces, on every window from the floor up, with
+    /// the dial at the top of the window or at its foot (where the screen's
+    /// edge pushes the taller panel up), the panel stays on the screen, the
+    /// switch and its two times answer a press at their middles, and every
+    /// word of the section is painted at `MIN_TEXT` or more, inside the row
+    /// it names.
+    ///
+    /// The panel is at its narrowest from the window's floor to a window of
+    /// 1250 points, so the floor is where a word would be dropped first; the
+    /// faces are the three a person can choose. And the range above keeps its
+    /// place: wherever the screen is taller than 1.55 times the panel's width
+    /// and the panel opens below its dial, the title, the X, Min, Max and
+    /// RESET are exactly where the one-section panel put them (its formula
+    /// is restated below), so the hand finds them where it always did.
+    ///
+    /// Revert-checks, all performed: leave the section's height at the old
+    /// cap (`0.80` of the screen) and the panel runs off a wide window at the
+    /// floor's height; stop the screen's edge pushing the panel up and it
+    /// runs off the floor's window with the dial at its foot; paint no label
+    /// on the switch's row, or swap Start's and Stop's, and the word is named
+    /// as missing from its row; take the padding from the whole panel's
+    /// height and the range's title moves.
+    #[test]
+    fn the_tape_rows_are_reachable_and_legible_at_every_font() {
+        use crate::motor::StartStop;
+        let floor = crate::settings::MIN_WINDOW;
+        // The floor; the window ladder's three rungs on a first launch's
+        // 1300-point base; a wide screen; and a wide window dragged down to
+        // the floor's height, where the panel is widest against the least
+        // room under it.
+        let windows = [
+            floor,
+            Vec2::new(975.0, 640.0),
+            Vec2::new(1300.0, 900.0),
+            Vec2::new(1625.0, 1000.0),
+            Vec2::new(2600.0, 1400.0),
+            Vec2::new(2600.0, floor.y),
+        ];
+        for face in fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            fonts::install(&ctx, face, None);
+            for size in windows {
+                let screen = Rect::from_min_size(Pos2::ZERO, size);
+                // A dial near the top of the window, where the band is, and
+                // one at its foot, whose panel the screen's edge pushes up.
+                let top = Rect::from_min_size(Pos2::new(size.x * 0.5, size.y * 0.08), Vec2::splat(24.0));
+                let foot = Rect::from_min_size(Pos2::new(size.x * 0.5, size.y - 40.0), Vec2::splat(24.0));
+                for (dial, anchor) in [("the top", top), ("the foot", foot)] {
+                    let l = VariLayout::new(screen, anchor);
+                    assert!(screen.contains_rect(l.panel), "{size:?}, dial at {dial}: the panel runs off the screen");
+                    // **Reachable**: each control at its middle, and nothing else.
+                    assert_eq!(vari_hit_test(screen, anchor, l.motor.center()), Some(VariHit::Motor), "{size:?}, dial at {dial}");
+                    for (row, field) in l.times.into_iter().zip([NumField::MotorStart, NumField::MotorStop]) {
+                        assert!(row.is_positive() && l.panel.contains_rect(row), "{size:?}, dial at {dial}: {field:?} has no row");
+                        assert_eq!(vari_hit_test(screen, anchor, row.center()), Some(VariHit::Type(field)), "{size:?}, dial at {dial}");
+                    }
+                    // **The range where it was**, from the one-section formula.
+                    let w = l.panel.width();
+                    if dial == "the top" && size.y > 1.55 * w {
+                        let h = (w * 0.62).min(size.y * 0.80);
+                        let panel = Rect::from_min_size(
+                            Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.05),
+                            Vec2::new(w, h),
+                        );
+                        let body = panel.shrink((h * 0.08).clamp(4.0, 14.0));
+                        let title = Rect::from_min_max(body.min, Pos2::new(body.right(), body.top() + body.height() * 0.30));
+                        let close_w = (title.height() * 0.42).min(body.width() * 0.16);
+                        let rest = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
+                        let row = |i: f32| {
+                            Rect::from_min_size(
+                                Pos2::new(rest.left(), rest.top() + rest.height() / 3.0 * i),
+                                Vec2::new(rest.width(), rest.height() / 3.0 * 0.86),
+                            )
+                        };
+                        let reset = row(2.0);
+                        assert_eq!(l.title, title, "{size:?}, dial at {dial}: the range's title moved");
+                        assert_eq!(l.close, Rect::from_min_size(Pos2::new(title.right() - close_w, title.top()), Vec2::splat(close_w)));
+                        assert_eq!(l.rows, [row(0.0), row(1.0)], "{size:?}, dial at {dial}: Min or Max moved");
+                        assert_eq!(
+                            l.reset,
+                            Rect::from_min_max(Pos2::new(reset.right() - reset.width() * 0.40, reset.top()), reset.max),
+                            "{size:?}, dial at {dial}: RESET moved"
+                        );
+                    }
+                    // **Legible**: every word of the section, painted, big enough,
+                    // in its own row.
+                    for ss in [StartStop::default(), StartStop::new(true, 10.0, 0.75)] {
+                        let out = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                            let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                            draw_vari_range(
+                                &painter,
+                                screen,
+                                anchor,
+                                crate::varispeed::Varispeed::default(),
+                                ss,
+                                None,
+                                &Settings::default(),
+                            );
+                        });
+                        let mut texts: Vec<(String, f32, Rect)> = Vec::new();
+                        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32, Rect)>) {
+                            match shape {
+                                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                                egui::Shape::Text(t) => {
+                                    let size = t.galley.job.sections.first().map_or(0.0, |s| s.format.font_id.size);
+                                    out.push((t.galley.text().to_owned(), size, t.visual_bounding_rect()));
+                                }
+                                _ => {}
+                            }
+                        }
+                        for c in &out.shapes {
+                            walk(&c.shape, &mut texts);
+                        }
+                        let switch = if ss.on() { "ON" } else { "OFF" };
+                        let start = StartStop::reading(ss.start_cs());
+                        let stop = StartStop::reading(ss.stop_cs());
+                        for (word, home) in [
+                            ("TAPE START AND STOP", l.tape_title),
+                            ("Play spins up, Stop winds down: 0.1 to 10 s", l.tape_title),
+                            ("Tape start and stop", l.motor_row),
+                            (switch, l.motor),
+                            ("Start", l.times[0]),
+                            ("Stop", l.times[1]),
+                            (start.as_str(), l.times[0]),
+                            (stop.as_str(), l.times[1]),
+                        ] {
+                            let (_, painted, at) = texts
+                                .iter()
+                                .find(|(t, _, at)| t == word && home.contains(at.center()))
+                                .unwrap_or_else(|| panic!("{face:?} at {size:?}, dial at {dial}: {word:?} is not painted in its row: {texts:?}"));
+                            assert!(*painted >= MIN_TEXT, "{face:?} at {size:?}, dial at {dial}: {word:?} is painted at {painted}");
+                            assert!(l.panel.contains_rect(*at), "{face:?} at {size:?}, dial at {dial}: {word:?} spills out of the panel");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// **NOTE's minus and plus walk exactly the note values a signature can
@@ -13297,6 +13439,10 @@ const FX_TRACK: (f32, f32) = (0.40, 0.86);
 // instead of four tracks. **Typed and not dragged**: the ends of a range are
 // numbers somebody has in mind — 85 and 115, or 50 and 200 — and there is
 // nothing to sweep along between them worth the pixels a track would take.
+//
+// **And under the range, the tape's start and stop**: a switch and its two
+// times, typed the same way and for the same reason. They are the desk's,
+// like the dial, and the dial is the tape control there already is.
 
 /// Where everything in the range panel goes.
 struct VariLayout {
@@ -13306,6 +13452,13 @@ struct VariLayout {
     /// Min, then Max.
     rows: [Rect; 2],
     reset: Rect,
+    /// **The tape start and stop's section**, under the range: its title
+    /// band, the switch's row and the word that is its button, then the
+    /// two times' rows, Start and Stop.
+    tape_title: Rect,
+    motor_row: Rect,
+    motor: Rect,
+    times: [Rect; 2],
 }
 
 impl VariLayout {
@@ -13315,6 +13468,10 @@ impl VariLayout {
         close: Rect::NOTHING,
         rows: [Rect::NOTHING; 2],
         reset: Rect::NOTHING,
+        tape_title: Rect::NOTHING,
+        motor_row: Rect::NOTHING,
+        motor: Rect::NOTHING,
+        times: [Rect::NOTHING; 2],
     };
 
     fn new(screen: Rect, anchor: Rect) -> Self {
@@ -13324,16 +13481,24 @@ impl VariLayout {
         // Narrower and shorter than an effect's: two rows, not four, and
         // nothing in them but a word and a number.
         let w = (screen.width() * 0.16).clamp(200.0, 300.0_f32.min(screen.width()));
-        let h = (w * 0.62).min(screen.height() * 0.80);
+        // **One section's height, and the panel is two sections.** The range
+        // keeps the top one on the proportions it always had, and the tape's
+        // start and stop takes the same proportions in the one below. The
+        // cap is half the old one, so the two together are never taller than
+        // one was allowed to be: on any screen taller than 1.55 times the
+        // panel's width (465 points for the widest) the section is the size
+        // the whole panel was, and every hit in the range is where it was.
+        let h = (w * 0.62).min(screen.height() * 0.40);
         let mut panel = Rect::from_min_size(
             Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.05),
-            Vec2::new(w, h),
+            Vec2::new(w, 2.0 * h),
         );
         let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
         let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
         panel = panel.translate(Vec2::new(dx, dy));
         let pad = (h * 0.08).clamp(4.0, 14.0);
-        let body = panel.shrink(pad);
+        let section = |n: f32| Rect::from_min_size(panel.min + Vec2::new(0.0, h * n), Vec2::new(w, h));
+        let body = section(0.0).shrink(pad);
         if !body.is_positive() {
             return Self { panel, ..Self::NONE };
         }
@@ -13352,21 +13517,40 @@ impl VariLayout {
                 Vec2::new(rest.width(), pitch * 0.86),
             )
         };
+        // The tape's section: the range's proportions, a title band of 30 %
+        // and three row pitches under it, the switch, Start and Stop.
+        let tape = section(1.0).shrink(pad);
+        let tape_title = Rect::from_min_max(tape.min, Pos2::new(tape.right(), tape.top() + tape.height() * 0.30));
+        let tape_rest = Rect::from_min_max(Pos2::new(tape.left(), tape_title.bottom()), tape.max);
+        let tape_pitch = tape_rest.height() / 3.0;
+        let tape_row = |i: usize| {
+            Rect::from_min_size(
+                Pos2::new(tape_rest.left(), tape_rest.top() + tape_pitch * i as f32),
+                Vec2::new(tape_rest.width(), tape_pitch * 0.86),
+            )
+        };
         Self {
             panel,
             title,
             close,
             rows: [row(0), row(1)],
-            reset: {
-                let r = row(2);
-                Rect::from_min_max(Pos2::new(r.right() - r.width() * 0.40, r.top()), r.max)
-            },
+            reset: Self::button(row(2)),
+            tape_title,
+            motor_row: tape_row(0),
+            motor: Self::button(tape_row(0)),
+            times: [tape_row(1), tape_row(2)],
         }
     }
 
     /// Where a row's number sits — the part a press opens for typing.
     fn field(row: Rect) -> Rect {
         slice_h(row, 0.52, 1.0)
+    }
+
+    /// Where a row's word button sits: RESET's, and the switch's in the
+    /// same column under it.
+    fn button(row: Rect) -> Rect {
+        Rect::from_min_max(Pos2::new(row.right() - row.width() * 0.40, row.top()), row.max)
     }
 }
 
@@ -14039,6 +14223,10 @@ pub enum VariHit {
     /// Back to 85 and 115.
     Reset,
     Close,
+    /// **The tape start and stop's switch**: its ON or OFF, pressed to turn
+    /// it the other way. Appended at the END. Its two times are
+    /// `Type(NumField::MotorStart)` and `Type(NumField::MotorStop)`.
+    Motor,
 }
 
 /// Where the range panel goes, for a caller that has to swallow presses.
@@ -14064,18 +14252,28 @@ pub fn vari_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<VariHit> {
             return Some(VariHit::Type(field));
         }
     }
+    if l.motor.contains(pos) {
+        return Some(VariHit::Motor);
+    }
+    for (row, field) in l.times.into_iter().zip([NumField::MotorStart, NumField::MotorStop]) {
+        if row.contains(pos) {
+            return Some(VariHit::Type(field));
+        }
+    }
     None
 }
 
-/// The range panel.
+/// The range panel, and the tape's start and stop under it.
 pub fn draw_vari_range(
     painter: &Painter,
     screen: Rect,
     anchor: Rect,
     v: crate::varispeed::Varispeed,
+    ss: crate::motor::StartStop,
     typing: Option<&crate::recorder::NumEdit>,
     s: &Settings,
 ) {
+    use crate::motor::{StartStop, MAX_CS, MIN_CS};
     use crate::varispeed::{HARD_MAX, HARD_MIN};
     let l = VariLayout::new(screen, anchor);
     if !l.panel.is_positive() {
@@ -14111,30 +14309,33 @@ pub fn draw_vari_range(
         }
         draw_close_x(painter, l.close, &p);
     }
-    for (row, (field, label, value)) in l.rows.into_iter().zip([
-        (NumField::VariMin, "Min", v.min()),
-        (NumField::VariMax, "Max", v.max()),
-    ]) {
-        if !row.is_positive() {
-            continue;
-        }
-        let size = fit_text(slice_h(row, 0.0, 0.5), label, row.height() * 0.52);
+    // A label on a row's left, as Min and Max and the switch carry theirs.
+    let label_at = |r: Rect, label: &str, row_h: f32| {
+        let size = fit_text(r, label, row_h * 0.52);
         if size >= MIN_TEXT {
             painter.text(
-                Pos2::new(row.left(), row.center().y),
+                Pos2::new(r.left(), r.center().y),
                 Align2::LEFT_CENTER,
                 label,
                 font_light(size),
                 p.ink,
             );
         }
+    };
+    // One typed row: its label, and its number in a well on the right, or
+    // what is being typed there with the caret after it.
+    let typed_row = |row: Rect, field: NumField, label: &str, value: String| {
+        if !row.is_positive() {
+            return;
+        }
+        label_at(slice_h(row, 0.0, 0.5), label, row.height());
         let field_r = VariLayout::field(row);
         let well = surface_of(p.field);
         painter.rect_filled(field_r, 2.0, well.bg);
         let editing = typing.filter(|e| e.field == field);
         let text = match editing {
             Some(e) => format!("{}|", e.text),
-            None => format!("{value}"),
+            None => value,
         };
         let size = fit_text(field_r.shrink(4.0), &text, row.height() * 0.56);
         if size >= MIN_TEXT {
@@ -14146,8 +14347,59 @@ pub fn draw_vari_range(
                 well.ink,
             );
         }
+    };
+    for (row, (field, label, value)) in l.rows.into_iter().zip([
+        (NumField::VariMin, "Min", v.min()),
+        (NumField::VariMax, "Max", v.max()),
+    ]) {
+        typed_row(row, field, label, format!("{value}"));
     }
     draw_word_button_sized(painter, l.reset, &["RESET"], 0.34, &p);
+
+    // ── TAPE START AND STOP: the switch, then its two times ──
+    if l.tape_title.is_positive() {
+        let size = fit_text(l.tape_title, "TAPE START AND STOP", l.tape_title.height() * 0.34);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.tape_title.left(), l.tape_title.top() + l.tape_title.height() * 0.30),
+                Align2::LEFT_CENTER,
+                "TAPE START AND STOP",
+                font_light(size),
+                p.ink,
+            );
+        }
+        // What the switch does and how far the two times reach, said out
+        // loud for the reason the range's limits are.
+        let sub = format!(
+            "Play spins up, Stop winds down: {} to {}",
+            StartStop::reading(MIN_CS).trim_end_matches(" s"),
+            StartStop::reading(MAX_CS)
+        );
+        let size = fit_text(l.tape_title, &sub, l.tape_title.height() * 0.22);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.tape_title.left(), l.tape_title.top() + l.tape_title.height() * 0.74),
+                Align2::LEFT_CENTER,
+                &sub,
+                font_light(size),
+                p.faint,
+            );
+        }
+    }
+    if l.motor_row.is_positive() {
+        // The label owns the row up to the button, less the gap Min keeps
+        // from its well.
+        let gap = l.motor_row.width() * 0.02;
+        let label_r = Rect::from_min_max(l.motor_row.min, Pos2::new(l.motor.left() - gap, l.motor_row.bottom()));
+        label_at(label_r, "Tape start and stop", l.motor_row.height());
+        draw_word_button_sized(painter, l.motor, &[if ss.on() { "ON" } else { "OFF" }], 0.34, &p);
+    }
+    for (row, (field, label, cs)) in l.times.into_iter().zip([
+        (NumField::MotorStart, "Start", ss.start_cs()),
+        (NumField::MotorStop, "Stop", ss.stop_cs()),
+    ]) {
+        typed_row(row, field, label, StartStop::reading(cs));
+    }
 }
 
 /// Where an effect panel goes, for a caller that has to swallow presses.

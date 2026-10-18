@@ -1727,6 +1727,18 @@ pub struct Settings {
     /// reset itself while the seven beside it did not is the surprise, not
     /// the other way round.
     pub varispeed: crate::varispeed::Varispeed,
+    /// **The tape's start and stop**: whether Play spins the whole desk up
+    /// from a standstill and Stop or Pause wind it down, and the two times.
+    /// See `crate::motor`; set in the varispeed's range panel.
+    ///
+    /// **Per project, like the dial it sits under**: how a song starts and
+    /// stops is part of how it plays back, not a fact about this computer, so
+    /// it travels in the document (`DeskSnap::start_stop`) and is undoable.
+    /// **Off out of the box**, because a desk that never asked for it must
+    /// start and stop at once, as every session before the switch did. Kept
+    /// as the model, in whole centiseconds, for the reason the varispeed is:
+    /// a hand-edited file goes through its setters on the way in.
+    pub start_stop: crate::motor::StartStop,
     /// A short name for the audio interface, used on every one of its inputs.
     ///
     /// **One name for the box, not one per channel.** "Scarlett 18i20 USB  -
@@ -2393,6 +2405,7 @@ impl Default for Settings {
             master_gain: 1.0,
             lufs_window: crate::recorder::LoudnessWindow::default(),
             varispeed: crate::varispeed::Varispeed::default(),
+            start_stop: crate::motor::StartStop::default(),
             track_gain: 1.0,
             bus_effect: None,
             guitar_intervals: true,
@@ -4041,6 +4054,13 @@ impl Settings {
         // `reconcile_midi_inputs`.
         let stored_midi = map.shift_remove("channel_midi_inputs");
         desk.rows.channel_midi_inputs = crate::recorder::read_midi_inputs(stored_midi.as_ref());
+        // **The tape's start and stop**, which joined after the MIDI device
+        // sets. Read at the END like it is written at the end; absent is off
+        // at the shipped times, and every member goes through the model's
+        // setters (`StartStop::from_json`).
+        if let Some(v) = map.shift_remove("start_stop") {
+            s.start_stop = crate::motor::StartStop::from_json(&v);
+        }
 
         // Whatever is left, in the order the FILE had it.
         //
@@ -5713,6 +5733,12 @@ impl Settings {
                 Value::String(self.device_send_name.clone()),
             );
         }
+        // **The tape's start and stop**, at the END like every additive key,
+        // and only once it is moved off the shipped setting, so a machine
+        // that never touched it keeps its byte-for-byte file.
+        if self.start_stop != crate::motor::StartStop::default() {
+            map.insert("start_stop".into(), self.start_stop.to_json());
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -6135,6 +6161,7 @@ impl Settings {
         self.input_alias_for = fresh.input_alias_for.clone();
         self.master_gain = fresh.master_gain;
         self.varispeed = fresh.varispeed;
+        self.start_stop = fresh.start_stop;
         self.lufs_window = fresh.lufs_window;
         self.track_gain = fresh.track_gain;
         self.drums_gain = fresh.drums_gain;
@@ -7195,6 +7222,72 @@ mod tests {
         assert!(odd.device_send_name.is_empty());
     }
 
+    /// **Tape start and stop is written only once it is moved, and LAST**:
+    /// after every key an earlier build wrote, ahead only of a newer build's
+    /// strangers, in both shapes of the file.
+    ///
+    /// The additive-key law, whole. A machine that never touched the switch
+    /// keeps its byte-for-byte file, and one that did gains one line at the
+    /// end instead of a diff down the middle. It reads back as it was; a file
+    /// from before it reads as off at the shipped times; a member of the
+    /// wrong type falls back alone, the others standing. And it is the
+    /// DESK's: a reset of the desk puts it back, a reset of anything else
+    /// leaves it.
+    ///
+    /// Revert-checks, all performed: write the key before `device_send_name`
+    /// and it is not the last key; drop the reader and it comes back off;
+    /// drop it from `take_desk` and the desk reset leaves it on (and
+    /// `the_scopes_together_are_everything` names a field no scope resets).
+    #[test]
+    fn tape_start_and_stop_is_written_only_when_moved_and_last() {
+        use crate::motor::StartStop;
+        let mut s = Settings::default();
+        assert_eq!(s.start_stop, StartStop::default(), "it does not ship at the shipped setting");
+        for format in [crate::desk_format::Format::Legacy, crate::desk_format::Format::V2] {
+            assert!(!s.to_map_as(format).contains_key("start_stop"), "an untouched desk wrote the key");
+        }
+
+        // Moved, it is written after the late key it joined behind.
+        s.start_stop = StartStop::new(true, 1.5, 3.0);
+        s.device_send_enabled = true;
+        s.device_send_name = "a cable".to_owned();
+        for format in [crate::desk_format::Format::Legacy, crate::desk_format::Format::V2] {
+            let map = s.to_map_as(format);
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            assert_eq!(keys.last(), Some(&"start_stop"), "{format:?}: not the last key");
+            assert_eq!(&keys[keys.len() - 3..], ["device_send_enabled", "device_send_name", "start_stop"]);
+            assert_eq!(map["start_stop"], serde_json::json!({"on": true, "start_s": 1.5, "stop_s": 3.0}));
+            assert_eq!(Settings::from_map(map).start_stop, s.start_stop, "{format:?}: it did not read back");
+        }
+        // Ahead only of a newer build's keys, which keep the file's end.
+        s.extra.insert("from_a_newer_build".into(), Value::from(1));
+        let map = s.to_map();
+        let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(&keys[keys.len() - 2..], ["start_stop", "from_a_newer_build"]);
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.start_stop, s.start_stop);
+        assert!(!back.extra.contains_key("start_stop"), "the key was carried as a stranger's");
+
+        // A file from before it: off, at the shipped times.
+        assert_eq!(Settings::from_json("{}").start_stop, StartStop::default());
+        assert_eq!(Settings::from_json(r#"{"reastream_enabled": true}"#).start_stop, StartStop::default());
+        // A member of the wrong type falls back for that member alone.
+        let odd = Settings::from_json(r#"{"start_stop": {"on": true, "start_s": "slow", "stop_s": 2.5}}"#);
+        assert_eq!(odd.start_stop, StartStop::new(true, crate::motor::START_DEFAULT_S, 2.5));
+
+        // The desk's: the desk reset puts it back, the others leave it.
+        for scope in [ResetScope::Colours, ResetScope::Layout, ResetScope::Playing, ResetScope::Devices] {
+            let mut moved = Settings::default();
+            moved.start_stop = StartStop::new(true, 1.5, 3.0);
+            moved.reset(scope);
+            assert_eq!(moved.start_stop, StartStop::new(true, 1.5, 3.0), "{scope:?} reset it");
+        }
+        let mut moved = Settings::default();
+        moved.start_stop = StartStop::new(true, 1.5, 3.0);
+        moved.reset(ResetScope::Desk);
+        assert_eq!(moved.start_stop, StartStop::default(), "the desk reset left it");
+    }
+
     #[test]
     fn an_unstamped_file_gets_the_defaults_it_never_had_a_chance_to_see() {
         let now = Settings::default();
@@ -7951,6 +8044,9 @@ mod tests {
         // it says something, so a first launch's map never shows it.
         out.device_send_enabled = true;
         out.device_send_name = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        // The tape's start and stop, by hand for the same reason: written
+        // only once it is moved off the shipped setting.
+        out.start_stop = crate::motor::StartStop::new(true, 1.5, 3.0);
         out
     }
 
@@ -8129,6 +8225,7 @@ mod tests {
             assert_eq!(s.legacy_inserts(), before.legacy_inserts(), "{scope:?}");
             assert_eq!(s.device_send_enabled, before.device_send_enabled, "{scope:?}");
             assert_eq!(s.device_send_name, before.device_send_name, "{scope:?}");
+            assert_eq!(s.start_stop, before.start_stop, "{scope:?}");
         }
         // And the colours scope really does move the colours.
         let mut s = every_value_moved();
