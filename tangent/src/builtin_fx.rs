@@ -233,14 +233,23 @@ const EQ_KNOBS_PER_NODE: u32 = 5;
 /// for a fresh bay only: a saved one keeps every value it was saved with,
 /// because its state writes every symbol, so neither needs an
 /// [`absent_reads_as`] entry.
+///
+/// Id 3 keeps 5.0's symbol, `wobble`, and is named Wow: it drove wow and
+/// flutter together and drives the slow half alone now, Flutter (id 7) the
+/// fast half, and Rate (id 8) how fast every rotating part turns. A session
+/// saved before those two existed reads them at their defaults, which is
+/// the owner's ruling for every appended control: nothing is pinned to how
+/// 5.0 sounded.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.5, steps: 0 },
     ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
     ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.0, steps: 0 },
-    ParamSpec { id: 3, symbol: "wobble", name: "Wobble", units: "%", default: 0.3, steps: 0 },
+    ParamSpec { id: 3, symbol: "wobble", name: "Wow", units: "%", default: 0.3, steps: 0 },
     ParamSpec { id: 4, symbol: "hiss", name: "Hiss", units: "%", default: 0.25, steps: 0 },
     ParamSpec { id: 5, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
     ParamSpec { id: 6, symbol: "speed", name: "Speed", units: "ips", default: 2.0 / 3.0, steps: crate::units::tape::TAPE_SPEED_STEPS },
+    ParamSpec { id: 7, symbol: "flutter", name: "Flutter", units: "%", default: 0.3, steps: 0 },
+    ParamSpec { id: 8, symbol: "rate", name: "Rate", units: "x", default: 0.5, steps: 0 },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -960,8 +969,8 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // the bump is the decibels its bell adds at the head's own bump
         // frequency, the repro corner is a frequency, a trim is decibels,
         // and the speed is the selector's own words, the same strings
-        // `choices` offers. Drive, wobble and hiss stay percent below, and
-        // their specs say so.
+        // `choices` offers. Drive, Wow, Hiss and Flutter stay percent below,
+        // and their specs say so.
         (TAPE_PATH, 1) => fmt_db(lerp(crate::units::tape::BUMP_DB)),
         (TAPE_PATH, 2) => {
             // Zero is the stage out of circuit, not a 20 kHz corner: naming
@@ -975,6 +984,10 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         }
         (TAPE_PATH, 5) => fmt_db(lerp(crate::units::tape::TRIM_DB)),
         (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::from_dial(v).label().to_owned(),
+        // Rate is a multiple of the parts' own speed, so it reads as one:
+        // half at the bottom, the machine as built at the middle, twice at
+        // the top.
+        (TAPE_PATH, 8) => format!("{:.2}x", crate::units::tape::rate_multiplier(v)),
         // The rest of the tape speaks in percent on purpose: those knobs are
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
@@ -2096,6 +2109,8 @@ fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32
         4 => Some(&mut p.hiss),
         5 => Some(&mut p.trim),
         6 => Some(&mut p.speed),
+        7 => Some(&mut p.flutter),
+        8 => Some(&mut p.rate),
         _ => None,
     }
 }
@@ -3547,7 +3562,9 @@ mod tests {
     #[test]
     fn the_face_tables_open_at_the_kernels_shipped_defaults() {
         let t = crate::units::tape::TapeParams::default();
-        let fields = [t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed];
+        let fields = [
+            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate,
+        ];
         assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
         for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
             assert_eq!(spec.default, want, "{} drifted from TapeParams::default", spec.symbol);
@@ -3844,7 +3861,7 @@ mod tests {
             panic!("the tape path built something that is not a tape");
         };
         let fields = |p: &crate::units::tape::TapeParams| {
-            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed]
+            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate]
         };
         assert_eq!(
             fields(&u.params).len(),
@@ -3931,7 +3948,9 @@ mod tests {
         const BLOCKS: usize = 64;
         let sr = 48_000.0_f32;
         let spec = spec_for(TAPE_PATH).unwrap();
-        let neutral = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        // The 5.0 six with every colour off, the studio speed, and Flutter
+        // at 0 too, so the transport is still.
+        let neutral = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 2.0 / 3.0, 0.0];
         let amp = 10.0_f64.powf(-12.0 / 20.0);
         let sine: Vec<f32> = (0..BLOCK * BLOCKS)
             .map(|i| (amp * (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(sr)).sin()) as f32)
@@ -4031,7 +4050,7 @@ mod tests {
         const BLOCK: usize = 256;
         const LANE: usize = 5;
         let spec = spec_for(TAPE_PATH).unwrap();
-        let neutral = state_text(spec, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5], &[]).into_bytes();
+        let neutral = state_text(spec, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 2.0 / 3.0, 0.0], &[]).into_bytes();
         let amp = 0.05_f64;
         let tone: Vec<f32> = (0..24_000)
             .flat_map(|i| {
@@ -4794,11 +4813,19 @@ mod tests {
         assert_eq!(describe(TAPE_PATH, 6, 1.0 / 3.0, &[]), "7.5 ips");
         assert_eq!(describe(TAPE_PATH, 6, 1.0, &[]), "30 ips");
         assert_eq!(choices(TAPE_PATH, 6), vec!["3.75 ips", "7.5 ips", "15 ips", "30 ips"]);
-        // And the three that are character rather than calibration keep
+        // Rate as the multiple its parts turn at, and read back from it.
+        assert_eq!(describe(TAPE_PATH, 8, 0.0, &[]), "0.50x");
+        assert_eq!(describe(TAPE_PATH, 8, 0.5, &[]), "1.00x");
+        assert_eq!(describe(TAPE_PATH, 8, 1.0, &[]), "2.00x");
+        let v = value_for_reading(TAPE_PATH, 8, "1.5x", &[]).expect("a rate");
+        assert_eq!(describe(TAPE_PATH, 8, v, &[]), "1.50x");
+        assert!(choices(TAPE_PATH, 8).is_empty(), "Rate grew steps");
+        // And the four that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
         assert_eq!(describe(TAPE_PATH, 3, 0.3, &[]), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 4, 0.25, &[]), fmt_pct(0.25));
+        assert_eq!(describe(TAPE_PATH, 7, 0.3, &[]), fmt_pct(0.3));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
         assert_eq!(
             choices(DENOISE_PATH, 6),

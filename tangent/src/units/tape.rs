@@ -44,8 +44,11 @@
 //! bias-linearised tanh with the refused flux fed back → the repro line-up →
 //! the NAB shelf's exact inverse → HF self-erasure (the envelope-driven
 //! corner above) → the tape: a short Hermite-interpolated play head swayed by
-//! wow and flutter whose depths are themselves noise-modulated, plus a
-//! whisper of scrape, and on each track the tape's own modulation noise →
+//! the transport's parts ([`Transport`]: Wow's reel, pinch roller and drift,
+//! Flutter's guides, capstan, the tape's own resonance and a whisper of
+//! scrape, their depths noise-modulated and the head's travel shared out
+//! between them by a governor), and on each track the tape's own modulation
+//! noise →
 //! the head's own top → the hiss, white behind the speed's playback EQ → the
 //! head contour: the bump, its dip an octave above, and the head's low-end
 //! roll-off → Roll → output trim. The `drive` knob is the record level, as
@@ -101,9 +104,13 @@ pub struct TapeParams {
     /// How much high end a worn head gives up, on top of the speed's own top.
     /// 0 is out of circuit, and a fresh tape opens there; see [`ROLL_HZ`].
     pub roll: f32,
-    /// Wow and flutter together, one master. 0 stops the transport, and the
-    /// head then moves only by the tape's own modulation noise, which is the
-    /// hiss's ([`JITTER_UM`]); see [`WOW_DEPTH_MS`].
+    /// **Wow**: the slow half of the transport's sway, the supply reel, the
+    /// pinch roller and the servo's drift ([`ROTOR_HZ_PER_IPS`],
+    /// [`DRIFT_MS`]). The symbol is 5.0's `wobble`, which drove wow and
+    /// flutter together; it drives the wow alone now, and Flutter the rest.
+    /// 0.3 is the specified machine, linear from there. Wow and Flutter at 0
+    /// stop the transport, and the head then moves only by the tape's own
+    /// modulation noise, which is the hiss's ([`JITTER_UM`]).
     pub wobble: f32,
     /// Tape hiss, and the modulation noise that rides the music. 0 is silent
     /// tape, which no real reel ever was; see [`HISS_GAIN`] and
@@ -114,6 +121,16 @@ pub struct TapeParams {
     /// The tape speed, a selector of four ([`TapeSpeed`]). A fresh tape runs
     /// at 15 ips.
     pub speed: f32,
+    /// **Flutter**: the fast half of the transport's sway, the tension
+    /// guides, the capstan with its second harmonic, the tape's own 44 Hz
+    /// resonance and the head's scrape. 0.3 is the specified machine, on a
+    /// squared taper.
+    pub flutter: f32,
+    /// **Rate**: how fast every rotating part turns, from half to twice its
+    /// own speed across the dial ([`rate_multiplier`]). 0.5 is the machine
+    /// as built. The resonance, the scrape and the drift keep their own
+    /// time.
+    pub rate: f32,
 }
 
 impl Default for TapeParams {
@@ -137,6 +154,11 @@ impl Default for TapeParams {
             trim: 0.5,
             // The studio speed.
             speed: TapeSpeed::Ips15.dial(),
+            // A studio transport inside its published spec: with Wow at
+            // 0.3, 0.04 % weighted peak at 15 ips.
+            flutter: 0.3,
+            // The parts turning at their own speed.
+            rate: 0.5,
         }
     }
 }
@@ -144,9 +166,9 @@ impl Default for TapeParams {
 #[cfg(test)]
 impl TapeParams {
     /// Every colour off: the record level at the bottom of its travel, no
-    /// bump, no roll, a parked head, silent tape, unity trim, at the studio
-    /// speed. The recipe the neutrality tests here and at the seat spell
-    /// out, in one place.
+    /// bump, no roll, a parked head (no wow, no flutter), silent tape, unity
+    /// trim, at the studio speed and the parts' own rate. The recipe the
+    /// neutrality tests here and at the seat spell out, in one place.
     pub(crate) const NEUTRAL: TapeParams = TapeParams {
         drive: 0.0,
         bump: 0.0,
@@ -155,6 +177,8 @@ impl TapeParams {
         hiss: 0.0,
         trim: 0.5,
         speed: TapeSpeed::Ips15.dial(),
+        flutter: 0.0,
+        rate: 0.5,
     };
 }
 
@@ -222,6 +246,15 @@ impl TapeSpeed {
     pub const fn dial(self) -> f32 {
         self as usize as f32 / (TapeSpeed::ALL.len() - 1) as f32
     }
+}
+
+/// **Rate, as the multiple of its own speed every rotating part turns at**:
+/// `2^(2x - 1)`, half at the bottom of the dial, twice at the top, the
+/// machine as built at the middle. An octave either way spans a reel from
+/// full to empty. Depths stay fractions of the speed, so a slower turn
+/// sways the head further for the same pitch.
+pub fn rate_multiplier(x: f32) -> f32 {
+    (2.0 * norm_or(x, 0.5) - 1.0).exp2()
 }
 
 // ── the voicing ─────────────────────────────────────────────────────────────
@@ -495,24 +528,106 @@ const ERASE_RELEASE_MS: f32 = 80.0;
 ///
 /// The head's REST position is this less [`OS_LATENCY`], because the record
 /// stage's oversampler is already holding that many samples: the two together
-/// come to [`BASE_MS`] and that is what the host is told. The head is still
-/// far longer than the sway, which is a fifth of a millisecond at its
-/// deepest — see [`WOW_DEPTH_MS`].
+/// come to [`BASE_MS`] and that is what the host is told. The head may sway
+/// [`STUDIO_TRAVEL_MS`] either way of it, which is more than a fresh machine
+/// asks for at any speed and less than the line holds at any rate.
 const LINE_MS: f32 = 15.0;
 const BASE_MS: f32 = 2.0;
 
-/// Wow: the slow one. Under 1 Hz — the reel servo hunting and the tape
-/// packing unevenly — and the depth in absolute milliseconds of sway, so the
-/// pitch bend it makes is the same at every sample rate.
-const WOW_HZ: f32 = 0.6;
-const WOW_DEPTH_MS: f32 = 0.20;
+/// **The transport's depth scale**: the unweighted peak speed deviation, as
+/// a fraction of the speed, that a part of relative depth one sways the tape
+/// by at Wow and Flutter 0.3, Rate 1x and 15 ips.
+///
+/// One number calibrates the whole transport. Each part below has its own
+/// relative depth and its own law with speed, and this scale puts their sum,
+/// through the DIN 45507 / IEC 386 weighting and its 2-sigma detector, on
+/// the weighted peaks studio two-tracks are specified at: 0.10, 0.06, 0.04
+/// and 0.03 % at 3.75, 7.5, 15 and 30 ips, the per-speed medians of
+/// published servo-capstan machines (modelled 0.098, 0.061, 0.040 and
+/// 0.028 %).
+const TRANSPORT_K: f64 = 5.61e-4;
 
-/// Flutter: the fast pair, in hertz. Two rates rather than one because a
-/// transport has more than one rotating part — a pinch-roller rate and a
-/// capstan-bearing rate — and a single sinusoid reads as a test tone where
-/// two beat against each other and read as a machine.
-const FLUTTER_HZ: (f32, f32) = (6.3, 11.0);
-const FLUTTER_DEPTH_MS: (f32, f32) = (0.012, 0.005);
+/// Where Wow and Flutter are calibrated on their dials: 0.3 reads the
+/// specified machine. Wow's depth is linear in its dial from there, because
+/// the head's own travel already bounds how much wow a studio head can
+/// carry; Flutter's is the square, so the bottom of its travel has the fine
+/// control a fast sway needs.
+const DIAL_AT_SPEC: f32 = 0.3;
+
+/// **The transport's rotating parts**, slowest first: the supply reel once
+/// around, the pinch roller, the tension guides and the capstan, as hertz
+/// per inch per second of tape and depth relative to [`TRANSPORT_K`].
+///
+/// A rotating part turns once per its own circumference of tape, so its
+/// rate is the speed over that length: 0.64, 2.55, 5.78 and 13.3 Hz at
+/// 15 ips. Rate ([`rate_multiplier`]) turns all four from half to twice
+/// that, as a reel's radius does from full to empty. Their depths are
+/// fractions of the speed, so a slower turn sways the head further for the
+/// same pitch. The depths fall with speed as `(15 / v)^0.8` ([`SPEED_LADDER`],
+/// the ladder that reproduces the per-speed medians), except the supply
+/// reel's below 15 ips, which falls with the speed itself, as the published
+/// reel figures do. The first two are Wow's, the last two Flutter's.
+const ROTOR_HZ_PER_IPS: [f64; 4] = [0.0425, 0.17, 0.385, 0.889];
+const ROTOR_DEPTH: [f64; 4] = [1.0, 0.35, 0.30, 0.50];
+const SPEED_LADDER: f64 = 0.8;
+
+/// Where each rotating part starts, in turns: apart, so no two start in step.
+const ROTOR_PHASE: [f64; 4] = [0.0, 0.21, 0.53, 0.37];
+
+/// The capstan's second harmonic: its depth relative to [`TRANSPORT_K`] and
+/// its phase against the capstan's own turn, in radians. An eccentric
+/// capstan is never a pure once-around; the harmonic rides the same shaft,
+/// so it is part of the capstan and the governor sheds the two together.
+const CAPSTAN_2ND: f64 = 0.20;
+const CAPSTAN_2ND_RAD: f64 = 0.9;
+
+/// The tape's own mass resonance between its guides: noise narrowed to
+/// 44 Hz at a Q of 5, whatever the speed or Rate, at 0.15 of
+/// [`TRANSPORT_K`] RMS on the same ladder as the rotating parts. Flutter's,
+/// and the governor never sheds it.
+const RESONANCE_HZ: f64 = 44.0;
+const RESONANCE_Q: f64 = 5.0;
+const RESONANCE_DEPTH: f64 = 0.15;
+
+/// The servo and the tape's tension drifting: a sample-and-hold every 4 s
+/// through two one-poles of a second each, a delay of up to 0.10 ms at
+/// Wow 0.3. So slow that the weighting barely sees it, it is what keeps a
+/// long note's pitch from repeating itself. Wow's, and the first part the
+/// governor sheds.
+const DRIFT_MS: f64 = 0.10;
+const DRIFT_HOLD_S: f64 = 4.0;
+const DRIFT_POLE_S: f64 = 1.0;
+
+/// **How far the studio head may sway, and how fast its parts may change how
+/// far they sway.**
+///
+/// The head may move [`STUDIO_TRAVEL_MS`] either way of its rest, and the
+/// governor shares that between the parts once the per-channel noise has
+/// its reserve. And the parts' excursions may grow or shrink, all together,
+/// by at most [`STUDIO_SLEW`] of a sample per sample, 0.3 % of the speed,
+/// shared equally by the head's [`STUDIO_PARTS`]: so an automated depth, Rate
+/// or Speed bends the pitch at most 0.3 % past what either setting does on
+/// its own. A Wow thrown from 0 to 1 at 15 ips develops over about a second.
+const STUDIO_TRAVEL_MS: f64 = 0.90;
+const STUDIO_SLEW: f64 = 0.003;
+const STUDIO_PARTS: usize = 7;
+
+/// The studio head's parts, as the governor's arrays hold them: Wow's three
+/// slowest first (the drift, the reel, the pinch roller), Flutter's two
+/// slowest first (the guides, the capstan with its harmonic), then the two
+/// it never sheds (the tape's resonance and the scrape). The four rotating
+/// parts are `REEL..=CAPSTAN`, in [`ROTOR_HZ_PER_IPS`] order.
+const DRIFT: usize = 0;
+const REEL: usize = 1;
+const PINCH: usize = 2;
+const GUIDES: usize = 3;
+const CAPSTAN: usize = 4;
+const RESONANCE: usize = 5;
+const SCRAPE: usize = 6;
+
+/// How long Rate takes to arrive, as the time constant of its glide in
+/// octaves, in milliseconds.
+const RATE_GLIDE_MS: f64 = 50.0;
 
 /// The depth wander: how far the noise is allowed to breathe the wow and
 /// flutter depths, as a range of scale, and how the noise moves.
@@ -520,23 +635,36 @@ const FLUTTER_DEPTH_MS: (f32, f32) = (0.012, 0.005);
 /// **A transport's drag is not a metronome.** Real wow and flutter spectra
 /// are smeared, not lines, because the friction that causes them varies with
 /// the wind of the reel. Sampled-and-held uniform noise, slewed, scales the
-/// sinusoids: held long enough to read as drift, slewed so the depth never
-/// steps audibly.
-const DEPTH_WANDER: (f32, f32) = (0.5, 0.95);
-const WOW_HOLD_S: f32 = 0.7;
-const FLUTTER_HOLD_S: f32 = 0.23;
-const WANDER_SLEW_S: f32 = 0.1;
+/// parts' depths, one noise for Wow's and one for Flutter's: held long
+/// enough to read as drift, slewed so the depth never steps audibly. The
+/// governor plans for the top of the range, so the head always has room for
+/// the deepest the wander can breathe.
+const DEPTH_WANDER: (f64, f64) = (0.5, 0.95);
+const WOW_HOLD_S: f64 = 0.7;
+const FLUTTER_HOLD_S: f64 = 0.23;
+const WANDER_SLEW_S: f64 = 0.1;
 
 /// Scrape: the head's own whisper, as band-limited noise swaying the tap by
 /// fractions of a microsecond. Tape dragging on a fixed head sticks and
 /// slips at kilohertz rates; the sidebands it sprays are 50 dB down, felt as
-/// a faint graininess rather than heard as anything.
+/// a faint graininess rather than heard as anything. Flutter's, on its
+/// squared taper, and never shed.
 ///
-/// The depth scales the band noise as [`DESIGN_RATE`] draws it, and
-/// `process` scales the noise so every other rate draws the same sway per
-/// hertz: at the shipped wobble, about 0.026 µs RMS of head movement.
-const SCRAPE_MS: f32 = 0.000_5;
-const SCRAPE_BAND_HZ: (f32, f32) = (800.0, 3_000.0);
+/// The depth scales the band noise as [`DESIGN_RATE`] draws it, and the
+/// transport scales the noise so every other rate draws the same sway per
+/// hertz: at Flutter 0.3, about 0.026 µs RMS of head movement, the scrape
+/// 5.0 shipped at its default.
+const SCRAPE_MS: f64 = 0.000_5;
+const SCRAPE_BAND_HZ: (f64, f64) = (800.0, 3_000.0);
+
+/// The transport's noises' seeds: the depth wander (the one 5.0 shipped),
+/// the scrape, the tape's resonance and the drift. Each its own stream, so
+/// the slow wander draws the same values at the same moments at every rate,
+/// and restored by `clear`.
+const WANDER_SEED: u32 = 0x1B0F_5EED;
+const SCRAPE_SEED: u32 = 0x5C2A_9E01;
+const RESONANCE_SEED: u32 = 0x0D1F_7A11;
+const DRIFT_SEED: u32 = 0x0D21_F7ED;
 
 /// The head's own top at each speed, slowest first: the band edge, in hertz,
 /// where a studio two-track's response is specified 2 dB down.
@@ -1489,6 +1617,464 @@ impl Voicing {
     }
 }
 
+/// The rotation a turning part takes in one frame, `(cos w, sin w)` for an
+/// increment of `w` radians, by the first terms of their series: within a
+/// billionth under 0.1 rad, which every part stays far under at any rate
+/// the tape can be built at, so a moving Rate or Speed costs no
+/// transcendental on the audio thread.
+#[inline]
+fn rotation(w: f64) -> [f64; 2] {
+    let w2 = w * w;
+    [1.0 - w2 * (0.5 - w2 / 24.0), w * (1.0 - w2 * (1.0 / 6.0 - w2 / 120.0))]
+}
+
+/// What the capstan's harmonic sways relative to the capstan's own turn:
+/// [`CAPSTAN_2ND`] of the depth at twice the rate is a fifth of the
+/// excursion.
+const CAPSTAN_2ND_EXC: f64 = CAPSTAN_2ND / ROTOR_DEPTH[3] / 2.0;
+
+/// How far each of the studio head's parts can move the head, per unit of
+/// what its own state holds: a rotating part's excursion is its amplitude,
+/// the capstan's its amplitude and its harmonic's, the drift's its gain on
+/// noise held within one, and the two noises' three of their RMS.
+const PEAK: [f64; STUDIO_PARTS] = [1.0, 1.0, 1.0, 1.0, 1.0 + CAPSTAN_2ND_EXC, 3.0, 3.0];
+
+/// **What every part of the studio head asks for**, as its excursion at a
+/// depth wander of one, in samples at its peak ([`PEAK`]): for a tape at `v`
+/// ips whose rotating parts turn at `omega` radians a frame, with Wow's and
+/// Flutter's multipliers `m`, at the rate `sr`, where a unit-RMS resonance
+/// moves `kappa` a frame and the scrape at Flutter's unit multiplier sways
+/// `scrape` samples RMS. A part's depth of pitch is a fraction of the speed
+/// ([`TRANSPORT_K`]), so its excursion is that depth over its turn. Shared
+/// by the transport and by the figure a face shows, so the two cannot plan
+/// differently.
+fn studio_wants(v: f64, omega: &[f64; 4], m: [f64; 2], sr: f64, kappa: f64, scrape: f64) -> [f64; STUDIO_PARTS] {
+    let ladder = (15.0 / v).powf(SPEED_LADDER);
+    let law = [if v <= 15.0 { v / 15.0 } else { ladder }, ladder, ladder, ladder];
+    let [m_w, m_f] = m;
+    let dial = [m_w, m_w, m_f, m_f];
+    let mut want = [0.0_f64; STUDIO_PARTS];
+    for k in 0..4 {
+        want[REEL + k] = PEAK[REEL + k] * TRANSPORT_K * ROTOR_DEPTH[k] * law[k] * dial[k] / omega[k];
+    }
+    want[DRIFT] = DRIFT_MS * 1.0e-3 * sr * m_w;
+    want[RESONANCE] = PEAK[RESONANCE] * TRANSPORT_K * RESONANCE_DEPTH * ladder * m_f / kappa;
+    want[SCRAPE] = PEAK[SCRAPE] * scrape * m_f;
+    want
+}
+
+/// Every part's ask at the top of its depth wander: the governor plans for
+/// the deepest the wander can breathe.
+fn at_the_top(want: &[f64; STUDIO_PARTS]) -> [f64; STUDIO_PARTS] {
+    let mut asked = *want;
+    for (j, a) in asked.iter_mut().enumerate() {
+        *a *= Transport::breath(j, DEPTH_WANDER.1, DEPTH_WANDER.1);
+    }
+    asked
+}
+
+/// **The governor**: given what every part asks for at the top of its
+/// wander and the `room` the head has after its reserve, the fraction of its
+/// ask each part keeps. The resonance and the scrape take theirs first and
+/// are never shed; if Wow's three and Flutter's two then ask for more than
+/// is left, the rest is shared between the two groups in proportion to what
+/// each asked for, and inside each group the slowest part gives way first.
+fn govern(asked: &[f64; STUDIO_PARTS], room: f64) -> [f64; STUDIO_PARTS] {
+    let room = (room - asked[RESONANCE] - asked[SCRAPE]).max(0.0);
+    let wow = asked[DRIFT] + asked[REEL] + asked[PINCH];
+    let flutter = asked[GUIDES] + asked[CAPSTAN];
+    let mut keep = [1.0_f64; STUDIO_PARTS];
+    if wow + flutter > room {
+        let mut shed = |order: &[usize], mut over: f64| {
+            for &j in order {
+                let cut = asked[j].min(over.max(0.0));
+                keep[j] = if asked[j] > 0.0 { (asked[j] - cut) / asked[j] } else { 1.0 };
+                over -= cut;
+            }
+        };
+        shed(&[DRIFT, REEL, PINCH], wow - room * wow / (wow + flutter));
+        shed(&[GUIDES, CAPSTAN], flutter - room * flutter / (wow + flutter));
+    }
+    keep
+}
+
+/// The studio head's travel either way of its rest, in samples, for a tape
+/// built at `sr` whose head rests `base` samples back.
+fn studio_travel(sr: f64, base: usize) -> f64 {
+    (STUDIO_TRAVEL_MS * 1.0e-3 * sr).min(base as f64 - 2.0).max(0.0)
+}
+
+/// The resonance's two-pole at `sr`, `[c1, c2]`, and how much its output,
+/// made unit-RMS, moves from one frame to the next, RMS: `sqrt(2 (1 - rho))`
+/// for its correlation a frame apart, `rho = c1 / (1 - c2)`.
+fn resonance_at(sr: f64) -> ([f64; 2], f64) {
+    let w0 = std::f64::consts::TAU * RESONANCE_HZ / sr;
+    let pole = (-w0 / (2.0 * RESONANCE_Q)).exp();
+    let (c1, c2) = (2.0 * pole * w0.cos(), -pole * pole);
+    ([c1, c2], (2.0 * (1.0 - c1 / (1.0 - c2))).sqrt())
+}
+
+/// The scrape's band at `sr`: its two one-poles' coefficients and the RMS of
+/// their difference on uniform noise. A one-pole's energy is `a / (2 - a)`,
+/// and two of the same noise share `a1 a2 / (1 - b1 b2)`.
+fn scrape_band(sr: f64) -> ([f64; 2], f64) {
+    let a = [lp_a(sr, SCRAPE_BAND_HZ.0), lp_a(sr, SCRAPE_BAND_HZ.1)].map(f64::from);
+    let one = |a: f64| a / (2.0 - a);
+    let both = a[0] * a[1] / (1.0 - (1.0 - a[0]) * (1.0 - a[1]));
+    (a, ((one(a[0]) + one(a[1]) - 2.0 * both) / 3.0).sqrt())
+}
+
+/// The scrape's sway per unit of Flutter's multiplier at `sr`, in samples
+/// per unit of its band noise: 5.0's scrape at its default, with the root
+/// that puts the same sway in every hertz at every rate.
+fn scrape_per_m(sr: f64) -> f64 {
+    SCRAPE_MS * 1.0e-3 * sr * (sr / f64::from(DESIGN_RATE)).sqrt() * f64::from(DIAL_AT_SPEC)
+}
+
+/// **The transport**: every part that sways the play head, the governor that
+/// shares the head's travel between them, and the slew that keeps a moving
+/// dial from bending the pitch. One for both channels: one capstan.
+///
+/// # The excursion form
+///
+/// A rotating part is held as how far it moves the head, its excursion `A`
+/// in samples, and how fast it turns, `omega` in radians a frame; its sway
+/// is `-A sin(phi)` and the pitch it bends is `A omega`. A part's depth of
+/// pitch is a fraction of the speed, so its excursion's target is that
+/// depth over `omega`, and the excursion moves to its target by at most
+/// [`STUDIO_SLEW`]'s share a frame. **A part's turn may fall at once but
+/// rise only as fast as its excursion can shrink**, by a factor of
+/// `1 + 32 sigma / A` a design, and that is what keeps a Rate or Speed
+/// change from overshooting: while `A` shrinks by `sigma` and `omega` rises
+/// by `1 + sigma / A`, the depth `A omega` becomes `A omega - sigma^2 omega
+/// / A`, and cannot grow. The price is that a part with a long excursion
+/// takes up to about a second to reach a much faster turn, with its depth
+/// right all the way.
+///
+/// # The governor
+///
+/// Once a design, on targets: the head may sway [`STUDIO_TRAVEL_MS`] either
+/// way of its rest, less a reserve for the per-channel noise, less the
+/// resonance's and the scrape's three sigma, which are never shed. If Wow's
+/// parts and Flutter's ask for more than is left, at the top of the depth
+/// wander, **the travel is shared in proportion to what each asked for, and
+/// inside each the slowest part gives way first**: the drift, then the
+/// reel, then the pinch roller; the guides, then the capstan with its
+/// harmonic. So both dials stay live where the tape asks for more than the
+/// head can hold, and nothing is ever clipped: a part's excursion only ever
+/// grows into the room the others leave.
+struct Transport {
+    sample_rate: f64,
+    /// Wow's and Flutter's depth multipliers, and Rate as `log2` of its
+    /// multiple, gliding to their dials.
+    wow: Glide,
+    flutter: Glide,
+    rate: Glide,
+    a_glide: f64,
+    a_rate: f64,
+    /// The rotating parts, in [`ROTOR_HZ_PER_IPS`] order: each one's phase
+    /// as a rotator (`cos`, `sin`), the rotation it takes a frame, and that
+    /// rotation's angle.
+    turn: [[f64; 2]; 4],
+    step: [[f64; 2]; 4],
+    omega: [f64; 4],
+    /// Where each rotating part starts, as a rotator.
+    start: [[f64; 2]; 4],
+    /// The capstan harmonic's phase against the capstan, as `cos` and `sin`.
+    harmonic: [f64; 2],
+    /// Every part's excursion now and its governed target at a wander of
+    /// one, in samples at its peak ([`PEAK`]); what it asked for and what it
+    /// was given at the wander's top, from the last design.
+    exc: [f64; STUDIO_PARTS],
+    aim: [f64; STUDIO_PARTS],
+    asked: [f64; STUDIO_PARTS],
+    given: [f64; STUDIO_PARTS],
+    /// How far a part's excursion may move a frame: [`STUDIO_SLEW`]'s share.
+    slew: f64,
+    /// The head's travel either way of its rest, and what the parts may use
+    /// of it after the reserve, in samples.
+    travel: f64,
+    room: f64,
+    /// The drift: its noise, its hold's countdown and length, the value it
+    /// holds, and its two poles.
+    drift_rng: u32,
+    drift_hold: u32,
+    drift_frames: u32,
+    drift_held: f64,
+    drift_lp: [f64; 2],
+    a_drift: f64,
+    /// The resonance: its noise, its two-pole's states and coefficients, the
+    /// gain that makes it unit-RMS, and how much a unit-RMS resonance moves
+    /// from one frame to the next, RMS.
+    res_rng: u32,
+    res_y: [f64; 2],
+    res_c: [f64; 2],
+    res_unit: f64,
+    res_kappa: f64,
+    /// The scrape: its noise, its band's two one-poles (800 Hz, 3 kHz), the
+    /// band's RMS, and its sway per unit of Flutter's multiplier.
+    scrape_rng: u32,
+    scrape_lp: [f64; 2],
+    a_scrape: [f64; 2],
+    scrape_rms: f64,
+    scrape_per_m: f64,
+    /// The depth wander, Wow's and Flutter's: its noise, the held targets,
+    /// the slewed states, the countdowns and their lengths.
+    wander_rng: u32,
+    wander: [f64; 2],
+    wander_target: [f64; 2],
+    wander_hold: [u32; 2],
+    wander_frames: [u32; 2],
+    a_wander: f64,
+    /// The sway this frame, in samples.
+    sway: f64,
+    /// Whether the next design is the first since `new` or `clear`, which
+    /// puts every part at its target at once: a fresh tape is a running
+    /// machine, not one spinning up.
+    fresh: bool,
+}
+
+impl Transport {
+    fn new(sample_rate: f64, base: usize) -> Self {
+        let sr = sample_rate;
+        let step = |ms: f64| 1.0 - (-1.0 / (sr * ms * 1.0e-3)).exp();
+        // The resonance: a two-pole at 44 Hz and Q 5 driven by uniform noise,
+        // whose output variance is a third of its impulse response's energy,
+        // `(1 - c2) / ((1 + c2) ((1 - c2)^2 - c1^2))`.
+        let ([c1, c2], res_kappa) = resonance_at(sr);
+        let energy = (1.0 - c2) / ((1.0 + c2) * ((1.0 - c2).powi(2) - c1 * c1));
+        let (a_scrape, scrape_rms) = scrape_band(sr);
+        let start = ROTOR_PHASE.map(|t| {
+            let (s, c) = (std::f64::consts::TAU * t).sin_cos();
+            [c, s]
+        });
+        let mut t = Self {
+            sample_rate: sr,
+            wow: Glide::new(1.0e-9),
+            flutter: Glide::new(1.0e-9),
+            rate: Glide::new(1.0e-7),
+            a_glide: step(GLIDE_MS),
+            a_rate: step(RATE_GLIDE_MS),
+            turn: start,
+            step: [[1.0, 0.0]; 4],
+            omega: [0.0; 4],
+            start,
+            harmonic: [CAPSTAN_2ND_RAD.cos(), CAPSTAN_2ND_RAD.sin()],
+            exc: [0.0; STUDIO_PARTS],
+            aim: [0.0; STUDIO_PARTS],
+            asked: [0.0; STUDIO_PARTS],
+            given: [0.0; STUDIO_PARTS],
+            slew: STUDIO_SLEW / STUDIO_PARTS as f64,
+            travel: studio_travel(sr, base),
+            room: 0.0,
+            drift_rng: DRIFT_SEED,
+            drift_hold: 0,
+            drift_frames: (DRIFT_HOLD_S * sr) as u32,
+            drift_held: 0.0,
+            drift_lp: [0.0; 2],
+            a_drift: step(DRIFT_POLE_S * 1.0e3),
+            res_rng: RESONANCE_SEED,
+            res_y: [0.0; 2],
+            res_c: [c1, c2],
+            res_unit: (3.0 / energy).sqrt(),
+            res_kappa,
+            scrape_rng: SCRAPE_SEED,
+            scrape_lp: [0.0; 2],
+            a_scrape,
+            scrape_rms,
+            scrape_per_m: scrape_per_m(sr),
+            wander_rng: WANDER_SEED,
+            wander: [0.5; 2],
+            wander_target: [0.5; 2],
+            wander_hold: [0; 2],
+            wander_frames: [(WOW_HOLD_S * sr) as u32, (FLUTTER_HOLD_S * sr) as u32],
+            a_wander: step(WANDER_SLEW_S * 1.0e3),
+            sway: 0.0,
+            fresh: true,
+        };
+        t.clear();
+        t
+    }
+
+    /// Back to the moment the machine was built: every phase, noise and
+    /// excursion, and the next design puts every part at its target.
+    fn clear(&mut self) {
+        self.turn = self.start;
+        self.step = [[1.0, 0.0]; 4];
+        self.omega = [0.0; 4];
+        self.exc = [0.0; STUDIO_PARTS];
+        self.aim = [0.0; STUDIO_PARTS];
+        self.drift_rng = DRIFT_SEED;
+        self.drift_hold = 0;
+        self.drift_held = 0.0;
+        self.drift_lp = [0.0; 2];
+        self.res_rng = RESONANCE_SEED;
+        self.res_y = [0.0; 2];
+        self.scrape_rng = SCRAPE_SEED;
+        self.scrape_lp = [0.0; 2];
+        self.wander_rng = WANDER_SEED;
+        self.wander = [0.5; 2];
+        self.wander_target = [0.5; 2];
+        self.wander_hold = [0; 2];
+        self.sway = 0.0;
+        self.fresh = true;
+    }
+
+    /// The dials' targets, once a block: Wow's and Flutter's multipliers on
+    /// their tapers, and Rate in octaves. `settle` puts the glides there at
+    /// once, for the first block after `new` or `clear`.
+    fn aim(&mut self, p: &TapeParams, settle: bool) {
+        let at = f64::from(DIAL_AT_SPEC);
+        self.wow.target = f64::from(norm(p.wobble)) / at;
+        self.flutter.target = (f64::from(norm_or(p.flutter, DIAL_AT_SPEC)) / at).powi(2);
+        self.rate.target = 2.0 * f64::from(norm_or(p.rate, 0.5)) - 1.0;
+        if settle {
+            for g in [&mut self.wow, &mut self.flutter, &mut self.rate] {
+                g.settle();
+            }
+        }
+    }
+
+    /// The scale each part's target takes from the depth wander: Wow's for
+    /// the reel and the pinch roller, Flutter's for the guides, the capstan
+    /// and the resonance; the drift and the scrape do not breathe.
+    #[inline]
+    fn breath(part: usize, wow: f64, flutter: f64) -> f64 {
+        match part {
+            REEL | PINCH => wow,
+            GUIDES | CAPSTAN | RESONANCE => flutter,
+            _ => 1.0,
+        }
+    }
+
+    /// **Once a design: every part's turn and governed target**, for the
+    /// glided speed `v` in ips and a `reserve` of samples kept for the
+    /// per-channel noise. See the type's doc for the rise limit and the
+    /// governor.
+    fn design(&mut self, v: f64, reserve: f64) {
+        let sr = self.sample_rate;
+        let r = self.rate.cur.exp2();
+        for k in 0..4 {
+            let target = std::f64::consts::TAU * ROTOR_HZ_PER_IPS[k] * v * r / sr;
+            let held = self.exc[REEL + k];
+            self.omega[k] = if self.fresh || target <= self.omega[k] || held <= 0.0 {
+                target
+            } else {
+                target.min(self.omega[k] * (1.0 + SUB_BLOCK as f64 * self.slew / held))
+            };
+            self.step[k] = rotation(self.omega[k]);
+            let [c, s] = self.turn[k];
+            let g = 1.5 - 0.5 * (c * c + s * s);
+            self.turn[k] = [c * g, s * g];
+        }
+        let want = studio_wants(
+            v,
+            &self.omega,
+            [self.wow.cur, self.flutter.cur],
+            sr,
+            self.res_kappa,
+            self.scrape_rms * self.scrape_per_m,
+        );
+        let asked = at_the_top(&want);
+        self.room = (self.travel - reserve).max(0.0);
+        let keep = govern(&asked, self.room);
+        for j in 0..STUDIO_PARTS {
+            self.aim[j] = want[j] * keep[j];
+            self.asked[j] = asked[j];
+            self.given[j] = asked[j] * keep[j];
+        }
+        if self.fresh {
+            let (w, f) = self.breaths();
+            for j in 0..STUDIO_PARTS {
+                self.exc[j] = self.aim[j] * Self::breath(j, w, f);
+            }
+            self.fresh = false;
+        }
+    }
+
+    /// The depth wander's scales now, Wow's and Flutter's.
+    #[inline]
+    fn breaths(&self) -> (f64, f64) {
+        let span = DEPTH_WANDER.1 - DEPTH_WANDER.0;
+        (
+            DEPTH_WANDER.0 + span * self.wander[0],
+            DEPTH_WANDER.0 + span * self.wander[1],
+        )
+    }
+
+    /// **One frame of the transport**: the glides, the wander, every part's
+    /// excursion moved toward its target (shrinking first, growing only into
+    /// the room left), every part turned, and the sway they add up to, in
+    /// samples.
+    #[inline]
+    fn tick(&mut self) -> f64 {
+        self.wow.tick(self.a_glide);
+        self.flutter.tick(self.a_glide);
+        self.rate.tick(self.a_rate);
+        for g in 0..2 {
+            if self.wander_hold[g] == 0 {
+                self.wander_target[g] = f64::from(uniform(&mut self.wander_rng));
+                self.wander_hold[g] = self.wander_frames[g];
+            }
+            self.wander_hold[g] -= 1;
+            self.wander[g] += (self.wander_target[g] - self.wander[g]) * self.a_wander;
+        }
+        let (w, f) = self.breaths();
+        let mut used = 0.0;
+        let mut asking = 0.0;
+        let mut grow = [0.0_f64; STUDIO_PARTS];
+        for j in 0..STUDIO_PARTS {
+            let target = self.aim[j] * Self::breath(j, w, f);
+            if target < self.exc[j] {
+                self.exc[j] = (self.exc[j] - self.slew).max(target);
+            } else {
+                grow[j] = (target - self.exc[j]).min(self.slew);
+                asking += grow[j];
+            }
+            used += self.exc[j];
+        }
+        if asking > 0.0 {
+            let fit = ((self.room - used) / asking).clamp(0.0, 1.0);
+            for (e, g) in self.exc.iter_mut().zip(grow) {
+                *e += g * fit;
+            }
+        }
+        for (turn, step) in self.turn.iter_mut().zip(self.step) {
+            let [c, s] = *turn;
+            *turn = [c * step[0] - s * step[1], s * step[0] + c * step[1]];
+        }
+
+        // The noises: the drift's hold and its two poles, the resonance, the
+        // scrape's band. Drawn every frame whatever their depth, so each
+        // stream is the same at any setting.
+        if self.drift_hold == 0 {
+            self.drift_held = f64::from(white(&mut self.drift_rng));
+            self.drift_hold = self.drift_frames;
+        }
+        self.drift_hold -= 1;
+        self.drift_lp[0] += (self.drift_held - self.drift_lp[0]) * self.a_drift;
+        self.drift_lp[1] += (self.drift_lp[0] - self.drift_lp[1]) * self.a_drift;
+        let x = f64::from(white(&mut self.res_rng));
+        let y = x + self.res_c[0] * self.res_y[0] + self.res_c[1] * self.res_y[1];
+        self.res_y = [y, self.res_y[0]];
+        let x = f64::from(white(&mut self.scrape_rng));
+        for (lp, a) in self.scrape_lp.iter_mut().zip(self.a_scrape) {
+            *lp += (x - *lp) * a;
+        }
+
+        let [c, s] = self.turn[3];
+        let harmonic = 2.0 * s * c * self.harmonic[0] + (c * c - s * s) * self.harmonic[1];
+        self.sway = -(self.exc[REEL] * self.turn[0][1]
+            + self.exc[PINCH] * self.turn[1][1]
+            + self.exc[GUIDES] * self.turn[2][1]
+            + self.exc[CAPSTAN] / PEAK[CAPSTAN] * (s + CAPSTAN_2ND_EXC * harmonic))
+            + self.exc[DRIFT] * self.drift_lp[1]
+            + self.exc[RESONANCE] / PEAK[RESONANCE] * self.res_unit * y
+            + self.exc[SCRAPE] / (PEAK[SCRAPE] * self.scrape_rms) * (self.scrape_lp[1] - self.scrape_lp[0]);
+        self.sway
+    }
+}
+
 /// One stereo pair of tracks through the record and repro chain. See the
 /// module header for the signal flow.
 pub struct Tape {
@@ -1500,7 +2086,7 @@ pub struct Tape {
     line: [Vec<f32>; 2],
     at: usize,
     /// The play head's rest position in whole samples. Whole on purpose:
-    /// with the wobble and the hiss at zero the tap interpolates at exactly
+    /// with Wow, Flutter and Hiss at zero the tap interpolates at exactly
     /// zero fraction and hands samples through untouched. Shortened by
     /// [`OS_LATENCY`], for the reason [`BASE_MS`] gives.
     base: usize,
@@ -1543,28 +2129,21 @@ pub struct Tape {
     jitter: Glide,
     jitter_rng: [u32; 2],
     jitter_lp: [f32; 2],
-    /// Where the modulators are, in turns. One set for both channels: one
-    /// capstan.
-    wow: f32,
-    flutter: [f32; 2],
-    /// The depth wander: sample-and-hold targets, slewed states, countdowns.
-    wander_rng: u32,
-    wow_scale: f32,
-    wow_target: f32,
-    wow_hold: u32,
-    flutter_scale: f32,
-    flutter_target: f32,
-    flutter_hold: u32,
-    /// Scrape band-limit states.
-    scrape_lo: f32,
-    scrape_hi: f32,
+    /// The transport: every part that sways the head, shared by both
+    /// channels.
+    transport: Transport,
+    /// How many times a head had to be held inside the line. The governor
+    /// keeps every sway inside the head's travel, so this is a safety net
+    /// the tests require never to catch anything.
+    clamp_hits: u64,
+    /// The furthest a head has been asked to sit from its rest, either way,
+    /// in samples: what the travel test reads.
+    #[cfg(test)]
+    deepest: f32,
     // Per-rate coefficients, fixed at construction: the sample rate is, too,
     // per the house law.
     a_att: f32,
     a_rel: f32,
-    a_scrape_lo: f32,
-    a_scrape_hi: f32,
-    a_wander: f32,
     /// Every [`Glide`]'s per-frame step, [`GLIDE_MS`] at this rate, and the
     /// speed's, [`SPEED_GLIDE_MS`].
     a_glide: f64,
@@ -1649,23 +2228,12 @@ impl Tape {
             jitter: Glide::new(1.0e-9),
             jitter_rng: JITTER_SEEDS,
             jitter_lp: [0.0; 2],
-            wow: 0.0,
-            // Apart, so the two flutter rates never start in step.
-            flutter: [0.0, 0.37],
-            wander_rng: 0x1B0F_5EED,
-            wow_scale: 0.5,
-            wow_target: 0.5,
-            wow_hold: 0,
-            flutter_scale: 0.5,
-            flutter_target: 0.5,
-            flutter_hold: 0,
-            scrape_lo: 0.0,
-            scrape_hi: 0.0,
+            transport: Transport::new(rate, base),
+            clamp_hits: 0,
+            #[cfg(test)]
+            deepest: 0.0,
             a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
             a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
-            a_scrape_lo: lp_a(rate, f64::from(SCRAPE_BAND_HZ.0)),
-            a_scrape_hi: lp_a(rate, f64::from(SCRAPE_BAND_HZ.1)),
-            a_wander: env_a(rate, f64::from(WANDER_SLEW_S * 1_000.0)),
             a_glide: step(GLIDE_MS),
             a_speed: step(SPEED_GLIDE_MS),
             voicings: TapeSpeed::ALL.map(|v| Voicing::at(v, rate)),
@@ -1766,6 +2334,7 @@ impl Tape {
         let taper = f64::from(hiss / 0.25).powi(2);
         self.hiss_level.target = taper * f64::from(noise_rate);
         self.jitter.target = (JITTER_UM * taper).min(JITTER_CAP_UM);
+        self.transport.aim(p, self.fresh);
         if self.fresh {
             // The first block after `new` or `clear` starts AT its controls,
             // not gliding to them from wherever the glides were left.
@@ -1838,6 +2407,52 @@ impl Tape {
             self.roll_for = corner;
         }
         self.roll_on = roll_wanted || self.roll.cur != self.roll.target;
+
+        // The transport, at the speed the glide is at. Its reserve is what
+        // the per-channel noise can take beyond the sway, four of its sigma
+        // and a sample, at the deeper of where the noise and the speed are
+        // and where they are going, so it is in place before either arrives.
+        let ips = TapeSpeed::Ips3_75.ips();
+        let v = ips * pos.exp2();
+        let slowest = v.min(ips * self.speed.target.exp2());
+        let noise_um = self.jitter.cur.max(self.jitter.target);
+        let reserve = 4.0 * noise_um * 1.0e-6 * f64::from(self.sample_rate) / (0.0254 * slowest) + 1.0;
+        self.transport.design(v, reserve);
+    }
+
+    /// **The two tracks' play-head delays this frame**, in samples: the
+    /// transport's sway, shared, plus each track's own modulation noise,
+    /// held inside the line, and counted when they had to be.
+    #[inline]
+    fn heads(&mut self) -> [f32; 2] {
+        let sway = self.transport.tick() as f32;
+        // The modulation noise: each channel's head jitters by its own
+        // band-limited noise, unit-RMS, times the depth in samples. At Hiss 0
+        // the depth glides to exactly nothing and no noise is drawn, so a
+        // still tape sits on whole samples.
+        let depth = self.jitter.tick(self.a_glide) as f32 * self.per_um;
+        let mut jitter = [0.0_f32; 2];
+        if depth > 0.0 {
+            for (ch, j) in jitter.iter_mut().enumerate() {
+                let w = white(&mut self.jitter_rng[ch]) * 3.0_f32.sqrt();
+                self.jitter_lp[ch] = flush(self.jitter_lp[ch] + self.jitter_a * (w - self.jitter_lp[ch]));
+                *j = self.jitter_lp[ch] * self.jitter_norm * depth;
+            }
+        }
+        let rest = self.base as f32;
+        let last = (self.line[0].len() - 4) as f32;
+        jitter.map(|j| {
+            let want = rest + sway + j;
+            let held = want.clamp(2.0, last);
+            if held != want {
+                self.clamp_hits += 1;
+            }
+            #[cfg(test)]
+            {
+                self.deepest = self.deepest.max((want - rest).abs());
+            }
+            held
+        })
     }
 
     /// In place on an interleaved buffer; `channels` is the stride. Stereo
@@ -1849,26 +2464,10 @@ impl Tape {
             return;
         }
         debug_assert!(buf.len() >= frames * channels);
-        let sr = self.sample_rate;
         self.aim(p);
         let roll_wanted = norm(p.roll) > 1.0e-3;
-        let wobble = norm(p.wobble);
-        let noise_rate = (sr / DESIGN_RATE).sqrt();
-        let wow_amp = WOW_DEPTH_MS * 1.0e-3 * sr * wobble;
-        let flutter_amp = (
-            FLUTTER_DEPTH_MS.0 * 1.0e-3 * sr * wobble,
-            FLUTTER_DEPTH_MS.1 * 1.0e-3 * sr * wobble,
-        );
-        // The scrape is white noise through a band too, so its sway per
-        // hertz needs the same root; without it the head scraped 3.4 dB
-        // less at 96 kHz than at 44.1, and
-        // `the_scrape_sprays_the_same_sidebands_at_every_sample_rate`
-        // holds that.
-        let scrape_amp = SCRAPE_MS * 1.0e-3 * sr * wobble * noise_rate;
         let n = self.line[0].len();
-        let tau = std::f32::consts::TAU;
         let e_scale = (ERASE_POINTS - 1) as f32 / ERASE_CLAMP as f32;
-
         for i in 0..frames {
             let f = i * channels;
             if self.frame.is_multiple_of(SUB_BLOCK) {
@@ -1889,55 +2488,8 @@ impl Tape {
             let d = log2_d.exp2() as f32;
             let inv_d = 1.0 / d;
 
-            // ── the transport, shared by both channels ──────────────────
-            self.wow += WOW_HZ / sr;
-            if self.wow >= 1.0 {
-                self.wow -= 1.0;
-            }
-            for (ph, hz) in self.flutter.iter_mut().zip([FLUTTER_HZ.0, FLUTTER_HZ.1]) {
-                *ph += hz / sr;
-                if *ph >= 1.0 {
-                    *ph -= 1.0;
-                }
-            }
-            if self.wow_hold == 0 {
-                self.wow_target = uniform(&mut self.wander_rng);
-                self.wow_hold = (WOW_HOLD_S * sr) as u32;
-            }
-            self.wow_hold -= 1;
-            self.wow_scale += (self.wow_target - self.wow_scale) * self.a_wander;
-            if self.flutter_hold == 0 {
-                self.flutter_target = uniform(&mut self.wander_rng);
-                self.flutter_hold = (FLUTTER_HOLD_S * sr) as u32;
-            }
-            self.flutter_hold -= 1;
-            self.flutter_scale += (self.flutter_target - self.flutter_scale) * self.a_wander;
-            let wsc = DEPTH_WANDER.0 + (DEPTH_WANDER.1 - DEPTH_WANDER.0) * self.wow_scale;
-            let fsc = DEPTH_WANDER.0 + (DEPTH_WANDER.1 - DEPTH_WANDER.0) * self.flutter_scale;
-            let w = white(&mut self.wander_rng);
-            self.scrape_lo = flush(self.scrape_lo + self.a_scrape_lo * (w - self.scrape_lo));
-            self.scrape_hi = flush(self.scrape_hi + self.a_scrape_hi * (w - self.scrape_hi));
-            let scrape = (self.scrape_hi - self.scrape_lo) * scrape_amp;
-            let sway = (tau * self.wow).sin() * wow_amp * wsc
-                + (tau * self.flutter[0]).sin() * flutter_amp.0 * fsc
-                + (tau * self.flutter[1]).sin() * flutter_amp.1 * fsc
-                + scrape;
-            let head = self.base as f32 + sway;
-
-            // The modulation noise: each channel's head jitters by its own
-            // band-limited noise, unit-RMS, times the depth in samples. At
-            // Hiss 0 the depth glides to exactly nothing and no noise is
-            // drawn, so a still tape sits on whole samples.
-            let depth = self.jitter.tick(self.a_glide) as f32 * self.per_um;
-            let mut jitter = [0.0_f32; 2];
-            if depth > 0.0 {
-                for (ch, j) in jitter.iter_mut().enumerate() {
-                    let w = white(&mut self.jitter_rng[ch]) * 3.0_f32.sqrt();
-                    self.jitter_lp[ch] =
-                        flush(self.jitter_lp[ch] + self.jitter_a * (w - self.jitter_lp[ch]));
-                    *j = self.jitter_lp[ch] * self.jitter_norm * depth;
-                }
-            }
+            // ── the heads: the transport's sway and each track's noise ───
+            let delays = self.heads();
             let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain;
 
             for ch in 0..2 {
@@ -1972,8 +2524,7 @@ impl Tape {
                 self.line[ch][self.at] = self.erase_lp[ch];
 
                 // The play head, swaying, and the head's own top.
-                let delay = (head + jitter[ch]).clamp(2.0, (n - 4) as f32);
-                let v = tap(&self.line[ch], self.at, delay);
+                let v = tap(&self.line[ch], self.at, delays[ch]);
                 self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
                 let mut v = self.top[ch];
 
@@ -2035,17 +2586,7 @@ impl Tape {
         self.hiss_eq = [0.0; 2];
         self.jitter_rng = JITTER_SEEDS;
         self.jitter_lp = [0.0; 2];
-        self.wow = 0.0;
-        self.flutter = [0.0, 0.37];
-        self.wander_rng = 0x1B0F_5EED;
-        self.wow_scale = 0.5;
-        self.wow_target = 0.5;
-        self.wow_hold = 0;
-        self.flutter_scale = 0.5;
-        self.flutter_target = 0.5;
-        self.flutter_hold = 0;
-        self.scrape_lo = 0.0;
-        self.scrape_hi = 0.0;
+        self.transport.clear();
         self.voiced_at = f64::NAN;
         self.bells_for = (f64::NAN, f64::NAN, f64::NAN);
         self.roll_for = f64::NAN;
@@ -2060,21 +2601,90 @@ impl Tape {
     pub(crate) fn speed_now(&self) -> f64 {
         TapeSpeed::Ips3_75.ips() * self.speed.cur.exp2()
     }
+
+    /// **The transport alone, for `frames` frames at `p`**, as one block of
+    /// `process` would run it: the same designs on the same frame grid, the
+    /// same glides, the heads and their per-channel noise (counted against
+    /// the line as `process` counts them), and no audio. Returns the sway,
+    /// in samples, without the per-channel noise. Called again it carries
+    /// on, so a test can automate it block by block.
+    #[cfg(test)]
+    pub(crate) fn transport_trace(&mut self, p: &TapeParams, frames: usize) -> Vec<f64> {
+        self.aim(p);
+        let roll_wanted = norm(p.roll) > 1.0e-3;
+        let mut sway = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            if self.frame.is_multiple_of(SUB_BLOCK) {
+                self.design(roll_wanted);
+            }
+            self.frame += 1;
+            self.speed.tick(self.a_speed);
+            self.bump_db.tick(self.a_glide);
+            self.roll.tick(self.a_glide);
+            self.trim.tick(self.a_glide);
+            self.drive.tick(self.a_glide);
+            self.heads();
+            self.hiss_level.tick(self.a_glide);
+            sway.push(self.transport.sway);
+        }
+        sway
+    }
+
+    /// What the governor asked of the head and gave each part at its last
+    /// design.
+    #[cfg(test)]
+    pub(crate) fn governed(&self) -> GovernorView {
+        let t = &self.transport;
+        GovernorView {
+            asked: t.asked,
+            given: t.given,
+            omega: t.omega,
+            travel: t.travel,
+            room: t.room,
+        }
+    }
+
+    /// How many times a head has had to be held inside the line.
+    #[cfg(test)]
+    pub(crate) fn clamp_hits(&self) -> u64 {
+        self.clamp_hits
+    }
+
+    /// The furthest a head has been asked to sit from its rest, in samples.
+    #[cfg(test)]
+    pub(crate) fn deepest(&self) -> f32 {
+        self.deepest
+    }
+}
+
+/// **What the governor did at its last design**, for the tests: every part's
+/// excursion as it asked for it and as it was given it, in samples at the
+/// top of the depth wander, in the governor's order (`DRIFT..=SCRAPE`); the
+/// rotating parts' turns in radians a frame (`REEL..=CAPSTAN` as 0..4); the
+/// head's travel either way of its rest, and the room the parts share after
+/// the per-channel reserve.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GovernorView {
+    pub asked: [f64; STUDIO_PARTS],
+    pub given: [f64; STUDIO_PARTS],
+    pub omega: [f64; 4],
+    pub travel: f64,
+    pub room: f64,
 }
 
 // ── what a face shows ───────────────────────────────────────────────────────
+//
+// The figures a face prints beside the dials, from the dials alone. The face
+// cannot reach this crate, so the host asks these of a bay's values on every
+// push and every automated frame, and hands the face the answers. That is
+// why each is a pure function of the params and nothing else: no allocation,
+// no noise, no tape to run, and a few dozen multiply-adds and a handful of
+// roots at most, so a drag that asks sixty times a second costs nothing.
+// Each reads the speed a dial is heading for, not the glide's position,
+// because the face shows where the machine is going.
 
-/// **The figures a face prints beside the dials, from the dials alone.**
-///
-/// The face cannot reach this crate, so the host asks these of a bay's
-/// values on every push and every automated frame, and hands the face the
-/// answers. That is why each is a pure function of the params and nothing
-/// else: no allocation, no noise, no tape to run, and a few dozen
-/// multiply-adds at most, so a drag that asks sixty times a second costs
-/// nothing. Each reads the speed a dial is heading for, not the glide's
-/// position, because the face shows where the machine is going.
-///
-/// The centre of the head contour's bell, in hertz: the speed over the
+/// **The centre of the head contour's bell**, in hertz: the speed over the
 /// bump's wavelength ([`BUMP_WAVELENGTH_MM`]), 8.74, 17.48, 34.95 and
 /// 69.91 Hz at the four speeds. Bump only sizes the bell, so it does not
 /// move this.
@@ -2083,10 +2693,9 @@ pub fn bump_hz(p: &TapeParams) -> f32 {
     (0.0254 * speed.ips() / (BUMP_WAVELENGTH_MM * 1.0e-3)) as f32
 }
 
-/// The A-weighted level of the tape's hiss on silence, in dBFS: what an
-/// A-weighted meter across the audible band, 20 Hz to 20 kHz, reads at the
-/// output with nothing playing. Minus infinity at Hiss 0, which is silent
-/// tape.
+/// **The tape's hiss on silence, A-weighted, in dBFS**: what an A-weighted
+/// meter across the audible band, 20 Hz to 20 kHz, reads at the output with
+/// nothing playing. Minus infinity at Hiss 0, which is silent tape.
 ///
 /// The bias noise is white at [`HISS_GAIN`] behind the speed's playback
 /// shelf ([`HISS_EQ_US`]), and the rate law in `aim` puts the same noise in
@@ -2140,6 +2749,87 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
     let a_norm = 10.0_f64.powf(0.2);
     let trim = f64::from((norm(p.trim) - 0.5) * (TRIM_DB.1 - TRIM_DB.0));
     (10.0 * (density * sum * step * a_norm).log10() + trim) as f32
+}
+
+/// The weighted peaks a fresh transport is calibrated to read at each
+/// speed, slowest first, in percent: the per-speed medians of published
+/// studio machines ([`TRANSPORT_K`]).
+const WEIGHTED_SPEC_PCT: [f64; 4] = [0.10, 0.06, 0.04, 0.03];
+
+/// The flutter weighting's gain at `f` hertz, DIN 45507 / IEC 386 as the
+/// spec fits it: unity near 4 Hz, a second-order high-pass at 0.447 Hz and a
+/// first-order at 1.27 Hz under it, a first-order low-pass at 11.7 Hz over
+/// it, and 0.946 dB of gain.
+fn flutter_weight(f: f64) -> f64 {
+    const GAIN: f64 = 1.114_98;
+    let (f2, q, f1, fl) = (0.4470, 0.5905, 1.2744, 11.722);
+    let ff = f * f;
+    let hp2 = ff / ((f2 * f2 - ff).powi(2) + (f * f2 / q).powi(2)).sqrt();
+    GAIN * hp2 * (f / (ff + f1 * f1).sqrt()) * (fl / (ff + fl * fl).sqrt())
+}
+
+/// What the transport's parts add up to through the weighting, before the
+/// detector: the square root of the sum of every governed part's peak
+/// speed deviation at the top of its wander, weighted at its own frequency
+/// (the capstan's harmonic at twice the capstan's, the resonance as the
+/// sine of its RMS), planned by the same arithmetic the kernel's governor
+/// runs at the design rate.
+fn weighted_parts(p: &TapeParams) -> f64 {
+    let sr = f64::from(DESIGN_RATE);
+    let v = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())).ips();
+    let r = f64::from(rate_multiplier(p.rate));
+    let at = f64::from(DIAL_AT_SPEC);
+    let m = [
+        f64::from(norm(p.wobble)) / at,
+        (f64::from(norm_or(p.flutter, DIAL_AT_SPEC)) / at).powi(2),
+    ];
+    let hz: [f64; 4] = std::array::from_fn(|k| ROTOR_HZ_PER_IPS[k] * v * r);
+    let omega = hz.map(|f| std::f64::consts::TAU * f / sr);
+    let (_, kappa) = resonance_at(sr);
+    let (_, band) = scrape_band(sr);
+    let asked = at_the_top(&studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr)));
+    let taper = f64::from(norm(p.hiss) / 0.25).powi(2);
+    let noise_um = (JITTER_UM * taper).min(JITTER_CAP_UM);
+    let reserve = 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0;
+    let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
+    let mut sum = 0.0;
+    for k in 0..4 {
+        let part = REEL + k;
+        let depth = asked[part] * keep[part] / PEAK[part] * omega[k];
+        sum += (depth * flutter_weight(hz[k])).powi(2);
+        if part == CAPSTAN {
+            let second = depth * CAPSTAN_2ND / ROTOR_DEPTH[3];
+            sum += (second * flutter_weight(2.0 * hz[k])).powi(2);
+        }
+    }
+    let ladder = (15.0 / v).powf(SPEED_LADDER);
+    let resonance = std::f64::consts::SQRT_2 * TRANSPORT_K * RESONANCE_DEPTH * ladder * m[1] * DEPTH_WANDER.1;
+    sum += (resonance * flutter_weight(RESONANCE_HZ)).powi(2);
+    sum.sqrt()
+}
+
+/// **The whole transport's weighted flutter**, in percent of the speed: what
+/// a DIN 45507 / IEC 386 meter's 2-sigma detector reads off the tape, wow
+/// and flutter together, as the governor shares the head, at the speed and
+/// Rate the dials are heading for.
+///
+/// The parts' weighted depths summed as squares ([`weighted_parts`]) scale
+/// with every dial the way the meter does; how far the detector's 2-sigma
+/// sits above that sum depends on how the speed's parts are mixed, so it is
+/// fitted at each speed's fresh transport, where the figure reads the
+/// machine it is calibrated to be, 0.10, 0.06, 0.04 and 0.03 %
+/// ([`WEIGHTED_SPEC_PCT`]). Away from it the figure follows the parts:
+/// `the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed`
+/// holds it within 15 % of a meter on the head's own sway, at every speed
+/// and where Wow, Flutter and the governor have all moved it.
+pub fn wow_flutter_weighted_pct(p: &TapeParams) -> f32 {
+    let i = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())) as usize;
+    let fresh = TapeParams {
+        speed: TapeSpeed::ALL[i].dial(),
+        ..TapeParams::default()
+    };
+    let calibrated = weighted_parts(&fresh);
+    (WEIGHTED_SPEC_PCT[i] * weighted_parts(p) / calibrated) as f32
 }
 
 // ── proof ───────────────────────────────────────────────────────────────────
@@ -2374,9 +3064,14 @@ mod tests {
         );
     }
 
-    /// A steady 1 kHz through full wobble bends by a believable transport's
-    /// amount: worn machines measure a few tenths of a percent, and anything
-    /// past that is seasickness, not tape.
+    /// **Full Wow bends a sine by a believable fraction of a percent.** A
+    /// steady 1 kHz through Wow 1 at 15 ips, Flutter at the specified
+    /// machine's 0.3: a studio transport's slow sway turned all the way up
+    /// moves the pitch a few tenths of a percent peak to peak, and no more,
+    /// because the studio head's own travel bounds what wow it can carry; a
+    /// cassette's warble is the deep range's, not this head's. Peak to peak
+    /// in 0.25 to 0.6 % (model 0.375 to 0.459 % over seven seeds; measured
+    /// 0.452 %).
     #[test]
     fn full_wobble_bends_a_sine_by_a_believable_fraction_of_a_percent() {
         let sr = 48_000.0_f32;
@@ -2388,6 +3083,7 @@ mod tests {
         let p = TapeParams {
             drive: 0.5,
             wobble: 1.0,
+            flutter: 0.3,
             ..TapeParams::NEUTRAL
         };
         let mut unit = Tape::new(sr);
@@ -2406,7 +3102,7 @@ mod tests {
         }
         let periods: Vec<f64> = crossings.windows(2).map(|w| w[1] - w[0]).collect();
         // Five-cycle smoothing knocks down the scrape jitter without dulling
-        // the 11 Hz flutter, whose period is ninety of these.
+        // the capstan's 13 Hz, whose period is seventy-five of these.
         let smooth: Vec<f64> = periods
             .windows(5)
             .map(|w| w.iter().sum::<f64>() / 5.0)
@@ -2417,9 +3113,9 @@ mod tests {
             .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
         let peak_to_peak = (hi - lo) / mean;
         assert!(
-            (0.000_5..0.004).contains(&peak_to_peak),
+            (0.002_5..0.006).contains(&peak_to_peak),
             "peak-to-peak pitch deviation {:.4}% is outside the believable \
-             0.05%..0.4% of a real transport",
+             0.25%..0.6% of a studio transport at full wow",
             peak_to_peak * 100.0
         );
     }
@@ -2724,6 +3420,8 @@ mod tests {
             hiss: 2.0,
             trim: f32::NAN,
             speed: f32::NAN,
+            flutter: f32::NEG_INFINITY,
+            rate: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -2759,6 +3457,8 @@ mod tests {
                     hiss: end,
                     trim: end,
                     speed: end,
+                    flutter: end,
+                    rate: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -2948,6 +3648,7 @@ mod tests {
             wobble: 0.0,
             hiss: 0.0,
             trim: 0.5,
+            flutter: 0.0,
             ..TapeParams::default()
         };
         let measure = |drive: f32| -> f64 {
@@ -3060,7 +3761,7 @@ mod tests {
     fn full_drive_on_a_high_note_does_not_fold_the_band_back_on_itself() {
         let sr = 48_000.0_f32;
         let frames = (sr * 0.7) as usize;
-        // Everything that is not the saturator, off: the wobble spreads a
+        // Everything that is not the saturator, off: the transport spreads a
         // tone into sidebands and the hiss fills every bin, and both would be
         // read as aliasing by a measurement that cannot tell them apart.
         let clean = TapeParams {
@@ -3250,6 +3951,88 @@ mod tests {
         }
     }
 
+    /// A biquad cascade in f64, transposed direct form, each section's
+    /// numerator and denominator in powers of `z^-1` (the denominator's
+    /// first term one): the flutter meters below run it.
+    struct Sections(Vec<([f64; 3], [f64; 2], [f64; 2])>);
+
+    impl Sections {
+        fn run(&mut self, x: f64) -> f64 {
+            let mut v = x;
+            for (b, a, z) in &mut self.0 {
+                let y = b[0] * v + z[0];
+                z[0] = b[1] * v - a[0] * y + z[1];
+                z[1] = b[2] * v - a[1] * y;
+                v = y;
+            }
+            v
+        }
+    }
+
+    /// **The flutter meter's weighting**, DIN 45507 / IEC 386, as the spec
+    /// fits it: `10^(0.946/20) s^2 / (s^2 + s w2/0.5905 + w2^2) x s/(s + w1)
+    /// x wl/(s + wl)` at 0.4470, 1.2744 and 11.722 Hz, within 0.75 dB of the
+    /// published curve from 0.125 to 200 Hz, by the bilinear transform at
+    /// the trace's rate (whose warp is nothing at these frequencies).
+    fn flutter_weighting(sr: f64) -> Sections {
+        let tau = std::f64::consts::TAU;
+        let k = 2.0 * sr;
+        let (w2, q, w1, wl) = (tau * 0.4470, 0.5905, tau * 1.2744, tau * 11.722);
+        let a0 = k * k + k * w2 / q + w2 * w2;
+        let g = 10.0_f64.powf(0.946 / 20.0);
+        Sections(vec![
+            (
+                [g * k * k / a0, -2.0 * g * k * k / a0, g * k * k / a0],
+                [(2.0 * w2 * w2 - 2.0 * k * k) / a0, (k * k - k * w2 / q + w2 * w2) / a0],
+                [0.0; 2],
+            ),
+            ([k / (k + w1), -k / (k + w1), 0.0], [(w1 - k) / (k + w1), 0.0], [0.0; 2]),
+            ([wl / (k + wl), wl / (k + wl), 0.0], [(wl - k) / (k + wl), 0.0], [0.0; 2]),
+        ])
+    }
+
+    /// The speed deviation a sway makes, `-(D[n] - D[n-1])`, as a fraction
+    /// of the speed: a head falling behind is the tape running slow.
+    fn speed_of(sway: &[f64]) -> Vec<f64> {
+        sway.windows(2).map(|w| -(w[1] - w[0])).collect()
+    }
+
+    /// **What a flutter meter reads off a speed deviation** sampled at `sr`,
+    /// in percent of the speed: through the weighting or, unweighted, through
+    /// a meter's 200 Hz demodulator low-pass (which leaves the scrape's
+    /// kilohertz grain out, as a meter's does), into the 2-sigma detector, the
+    /// level exceeded 5 % of the time, past `skip` samples of the meter
+    /// settling.
+    fn meter_2sigma(dev: &[f64], sr: f64, skip: usize, weighted: bool) -> f64 {
+        let mut weighting = flutter_weighting(sr);
+        let mut demod = Butter::new(2, sr, 200.0, false);
+        let mut read: Vec<f64> = dev
+            .iter()
+            .map(|&s| if weighted { weighting.run(s) } else { demod.run(s) }.abs())
+            .skip(skip)
+            .collect();
+        read.sort_by(f64::total_cmp);
+        100.0 * read[(0.95 * read.len() as f64) as usize]
+    }
+
+    /// [`meter_2sigma`] of a sway.
+    fn flutter_2sigma(sway: &[f64], sr: f64, skip: usize, weighted: bool) -> f64 {
+        meter_2sigma(&speed_of(sway), sr, skip, weighted)
+    }
+
+    /// The speed deviation a sway makes through the meter's 200 Hz
+    /// demodulator, frame by frame, in percent.
+    fn demodulated(sway: &[f64], sr: f64) -> Vec<f64> {
+        let mut demod = Butter::new(2, sr, 200.0, false);
+        speed_of(sway).into_iter().map(|s| 100.0 * demod.run(s)).collect()
+    }
+
+    /// The largest speed deviation a sway makes past `skip` frames, in
+    /// percent, through the meter's 200 Hz demodulator.
+    fn flutter_peak(sway: &[f64], sr: f64, skip: usize) -> f64 {
+        demodulated(sway, sr).into_iter().skip(skip).fold(0.0, |m, v| m.max(v.abs()))
+    }
+
     /// **The oversampler is invisible to the host.** The record stage's
     /// filter pair delays the signal by [`OS_LATENCY`] samples, and the play
     /// head gives up exactly that many, so what a host is told to compensate
@@ -3281,7 +4064,7 @@ mod tests {
                  to the {got} frames reported",
                 unit.base
             );
-            for combo in 0..3_usize.pow(7) {
+            for combo in 0..3_usize.pow(9) {
                 let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
                 let p = TapeParams {
                     drive: at(0),
@@ -3291,6 +4074,8 @@ mod tests {
                     hiss: at(4),
                     trim: at(5),
                     speed: at(6),
+                    flutter: at(7),
+                    rate: at(8),
                 };
                 assert_eq!(
                     unit.latency_frames(&p),
@@ -3471,8 +4256,8 @@ mod tests {
     /// So a lone impulse after a second of silence must peak on exactly the
     /// reported frame at every rate an engine runs at and at every speed,
     /// with every colour off and at a fresh tape's settings with the
-    /// transport and the hiss still. Minimum-phase stages add their delay
-    /// after the peak without moving it.
+    /// transport (Wow and Flutter) and the hiss still. Minimum-phase stages
+    /// add their delay after the peak without moving it.
     ///
     /// With every colour off at 15 and 30 ips its three-point parabolic
     /// centre must also sit within a twentieth of a sample of the report at
@@ -3498,6 +4283,7 @@ mod tests {
                 wobble: 0.0,
                 hiss: 0.0,
                 speed: speed.dial(),
+                flutter: 0.0,
                 ..TapeParams::default()
             };
             let centred = matches!(speed, TapeSpeed::Ips15 | TapeSpeed::Ips30);
@@ -3666,6 +4452,17 @@ mod tests {
     /// reads at 44.1. Four seconds of it at each rate pin the band power to a
     /// few hundredths of a decibel. Measured: +0.02 and +0.05 dB; with the
     /// root the wrong way up, -0.72 and -6.71.
+    ///
+    /// **And the transport is the same machine.** Its parts turn in hertz
+    /// and sway in seconds, and the slow wander draws its own noise, so it
+    /// breathes the same values at the same moments at every rate: a fresh
+    /// tape's weighted flutter at 15 ips, 20 s of the head's sway through
+    /// the meter, reads within 5 % at 48 and 96 kHz of what it reads at
+    /// 44.1; and the tape's 44 Hz resonance, at Flutter 1 with the wow
+    /// still, sways the head by the same time within a decibel, 30 s of its
+    /// sway in seconds through a 36 to 52 Hz band (its noise is drawn per
+    /// frame, so each rate hears its own, which is why it gets a decibel).
+    /// Measured: +1.1 and +0.6 %; -0.35 and -0.16 dB.
     #[test]
     fn the_same_machine_runs_at_every_sample_rate() {
         let p = TapeParams {
@@ -3686,6 +4483,36 @@ mod tests {
                  (every rate, in dB: {offs:?})"
             );
         }
+
+        let transport = |sr: f32| {
+            let fresh = Tape::new(sr).transport_trace(&TapeParams::default(), (sr * 20.0) as usize);
+            let weighted = flutter_2sigma(&fresh, sr.into(), (sr * 5.0) as usize, true);
+            let p = TapeParams {
+                wobble: 0.0,
+                flutter: 1.0,
+                ..TapeParams::default()
+            };
+            let seconds: Vec<f32> = Tape::new(sr)
+                .transport_trace(&p, (sr * 30.0) as usize)
+                .into_iter()
+                .map(|d| (d / f64::from(sr)) as f32)
+                .collect();
+            let resonance = 10.0 * band_power(&seconds, sr.into(), 36.0, 52.0, (sr * 1.0) as usize).log10();
+            (weighted, resonance)
+        };
+        let (weighted, resonance) = transport(44_100.0);
+        for sr in [48_000.0_f32, 96_000.0] {
+            let (w, r) = transport(sr);
+            assert!(
+                (w / weighted - 1.0).abs() < 0.05,
+                "a fresh tape's weighted flutter reads {w:.4} % at {sr} Hz and {weighted:.4} % at 44.1 kHz"
+            );
+            assert!(
+                (r - resonance).abs() < 1.0,
+                "the tape's 44 Hz resonance sways the head {:+.2} dB at {sr} Hz against 44.1 kHz",
+                r - resonance
+            );
+        }
     }
 
     /// **The scrape sprays the same sidebands at every sample rate.**
@@ -3698,19 +4525,19 @@ mod tests {
     /// head writes onto anything playing through it, hundreds of hertz to a
     /// few kilohertz either side.
     ///
-    /// So a 5 kHz tone through full wobble, everything else off, is shifted
-    /// down to 0 Hz and the band 600 Hz to 4 kHz either side of it measured
-    /// against the tone. The wow and flutter sit within 30 Hz of the tone
-    /// and the shift's image twice the tone away, far outside the band, so
-    /// what is measured is the scrape's own spray, 54 dB under the tone, and
-    /// it must read the same within a quarter of a decibel at 48 and at
-    /// 96 kHz as at 44.1. Measured: +0.01 and -0.04 dB; without the root,
-    /// -0.35 and -3.41.
+    /// So a 5 kHz tone through full Flutter, the scrape's dial, everything
+    /// else off, is shifted down to 0 Hz and the band 600 Hz to 4 kHz either
+    /// side of it measured against the tone. The transport's rotating parts
+    /// and its 44 Hz resonance sit within 100 Hz of the tone and the shift's
+    /// image twice the tone away, far outside the band, so what is measured
+    /// is the scrape's own spray, 43 dB under the tone, and it must read the
+    /// same within a quarter of a decibel at 48 and at 96 kHz as at 44.1.
+    /// Measured: -0.02 and -0.09 dB; without the root, -0.39 and -3.45.
     #[test]
     fn the_scrape_sprays_the_same_sidebands_at_every_sample_rate() {
         const TONE: f64 = 5_000.0;
         let p = TapeParams {
-            wobble: 1.0,
+            flutter: 1.0,
             ..TapeParams::NEUTRAL
         };
         let spray = |sr: f32| {
@@ -3778,26 +4605,37 @@ mod tests {
         // Each floor is 3 dB under what the knob measured from a fresh
         // tape, rounded down to the whole decibel; the measured figure is
         // beside it.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 7] = [
-            // -3.8 dB.
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 9] = [
+            // -3.7 dB.
             ("drive", |p, v| p.drive = v, -7.0),
-            // -36.4 dB: at 15 ips the contour's bell sits near 35 Hz, a
+            // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
             // thin slice of broadband noise; the bump's own size is pinned
             // in hertz by its octave test and by the sample-rate test.
             ("bump", |p, v| p.bump = v, -40.0),
-            // -2.6 dB.
+            // -2.5 dB.
             ("roll", |p, v| p.roll = v, -6.0),
-            // +2.8 dB.
-            ("wobble", |p, v| p.wobble = v, -1.0),
-            // -9.2 dB, most of it the modulation noise: at Hiss 1 each
+            // +3.1 dB: Wow alone now, its reel and pinch roller swaying the
+            // head by up to twenty samples at full travel, and broadband
+            // noise a few samples apart is another noise, so the difference
+            // is the programme's own level twice over, which is as loud as
+            // this measure can read.
+            ("wobble", |p, v| p.wobble = v, 0.0),
+            // -9.5 dB, most of it the modulation noise: at Hiss 1 each
             // channel's head jitters by up to 2 µm of spacing, which moves
             // broadband programme far more than the hiss under it does. Its
             // skirt and the hiss's colour are pinned by their own tests.
             ("hiss", |p, v| p.hiss = v, -13.0),
             // +9.5 dB.
             ("trim", |p, v| p.trim = v, 6.0),
-            // -5.0 dB: 15 ips to either end of the selector.
-            ("speed", |p, v| p.speed = v, -9.0),
+            // +2.9 dB: 15 ips to either end of the selector, which moves
+            // the transport's parts with it as well as the voicing.
+            ("speed", |p, v| p.speed = v, -1.0),
+            // +0.9 dB: Flutter's parts sway the head by a few samples at
+            // full travel.
+            ("flutter", |p, v| p.flutter = v, -3.0),
+            // +3.1 dB: the parts turning at half or twice their speed sway
+            // the head through other samples.
+            ("rate", |p, v| p.rate = v, 0.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -4195,4 +5033,291 @@ mod tests {
             }
         }
     }
+
+    /// **The transport reads a studio machine's weighted flutter at every
+    /// speed.**
+    ///
+    /// A fresh tape is a servo-capstan two-track inside its published spec,
+    /// and the spec is a DIN 45507 / IEC 386 meter's weighted 2-sigma
+    /// peak: the per-speed medians of published machines are 0.10, 0.06,
+    /// 0.04 and 0.03 % at 3.75, 7.5, 15 and 30 ips. So the head's own sway
+    /// over 30 s at 44.1 kHz, through that meter, reads within 15 % of the
+    /// model of the same parts (0.098, 0.061, 0.040 and 0.028 %); its
+    /// unweighted 2-sigma (the meter's 200 Hz demodulator, no weighting)
+    /// stands 1.25 to 2.7 times above it, the spread published machines
+    /// show between the two standards; and the figure the face prints for
+    /// it ([`wow_flutter_weighted_pct`]) is within 15 % of what the meter
+    /// reads, there, at 15 ips with Wow and Flutter at 1, where the governor
+    /// has begun to share the head, and at 3.75 ips with them at 1 and Rate
+    /// at its bottom, where it has shed most of the head's parts. Measured:
+    /// 0.0967, 0.0595, 0.0415 and 0.0279 %, unweighted 1.30, 1.30, 1.65 and
+    /// 1.42 times that, the face 3.5, 0.8, 3.7 and 7.5 % off; 4.9 % off at
+    /// full Wow and Flutter at 15 ips (0.2959 % measured) and 8.1 % in the
+    /// governed corner (0.3470 %).
+    #[test]
+    fn the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed() {
+        let sr = 44_100.0_f32;
+        let (frames, skip) = ((sr * 30.0) as usize, (sr * 5.0) as usize);
+        let face_agrees = |p: &TapeParams, read: f64, what: &str| {
+            let told = f64::from(wow_flutter_weighted_pct(p));
+            assert!(
+                (told / read - 1.0).abs() < 0.15,
+                "{what}: the face is told {told:.4} % weighted, and a meter reads {read:.4} %"
+            );
+        };
+        for (speed, band) in TapeSpeed::ALL.into_iter().zip([
+            0.085..=0.115,
+            0.051..=0.069,
+            0.034..=0.046,
+            0.024..=0.033,
+        ]) {
+            let p = TapeParams {
+                speed: speed.dial(),
+                ..TapeParams::default()
+            };
+            let sway = Tape::new(sr).transport_trace(&p, frames);
+            let weighted = flutter_2sigma(&sway, sr.into(), skip, true);
+            let unweighted = flutter_2sigma(&sway, sr.into(), skip, false);
+            assert!(
+                band.contains(&weighted),
+                "a fresh tape at {} reads {weighted:.4} % weighted, outside {band:?}",
+                speed.label()
+            );
+            assert!(
+                (1.25..=2.7).contains(&(unweighted / weighted)),
+                "a fresh tape at {} reads {unweighted:.4} % unweighted against {weighted:.4} % \
+                 weighted, {:.2} times",
+                speed.label(),
+                unweighted / weighted
+            );
+            face_agrees(&p, weighted, speed.label());
+        }
+        for (what, p) in [
+            (
+                "Wow and Flutter 1 at 15 ips",
+                TapeParams {
+                    wobble: 1.0,
+                    flutter: 1.0,
+                    ..TapeParams::default()
+                },
+            ),
+            (
+                "Wow and Flutter 1 at 3.75 ips and the bottom of Rate",
+                TapeParams {
+                    wobble: 1.0,
+                    flutter: 1.0,
+                    rate: 0.0,
+                    speed: TapeSpeed::Ips3_75.dial(),
+                    ..TapeParams::default()
+                },
+            ),
+        ] {
+            let sway = Tape::new(sr).transport_trace(&p, frames);
+            face_agrees(&p, flutter_2sigma(&sway, sr.into(), skip, true), what);
+        }
+    }
+
+    /// **The weighted flutter survives the audio path.** The meter is read
+    /// off a tone, as a real one is: a 3150 Hz tone at -12 dBFS through a
+    /// fresh tape at 15 ips, Drive and Hiss at 0, for 8 s, its frequency
+    /// period by period from sub-sample zero crossings, through the same
+    /// weighting and detector, reads the 0.040 % the transport is
+    /// calibrated to, within 35 % (the per-period reading is a sample of
+    /// the speed 3150 times a second, and the scrape's kilohertz grain
+    /// folds a little into it). Measured: 0.0411 %.
+    #[test]
+    fn weighted_flutter_survives_the_audio_path() {
+        let sr = 44_100.0_f32;
+        let frames = (sr * 8.0) as usize;
+        let amp = 10.0_f64.powf(-12.0 / 20.0);
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| (amp * (std::f64::consts::TAU * 3_150.0 * i as f64 / f64::from(sr)).sin()) as f32)
+            .collect();
+        let p = TapeParams {
+            drive: 0.0,
+            hiss: 0.0,
+            ..TapeParams::default()
+        };
+        let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
+        let crossings: Vec<f64> = (1..out.len())
+            .filter(|&i| out[i - 1] < 0.0 && out[i] >= 0.0)
+            .map(|i| (i - 1) as f64 + f64::from(out[i - 1]) / f64::from(out[i - 1] - out[i]))
+            .collect();
+        let nominal = f64::from(sr) / 3_150.0;
+        let dev: Vec<f64> = crossings.windows(2).map(|w| nominal / (w[1] - w[0]) - 1.0).collect();
+        let read = meter_2sigma(&dev, 3_150.0, (3_150.0 * 3.0) as usize, true);
+        assert!(
+            (read / 0.040 - 1.0).abs() < 0.35,
+            "a 3150 Hz tone through a fresh tape reads {read:.4} % weighted, not 0.040 %"
+        );
+    }
+
+    /// **The play head never runs off its tape at any setting.** Every speed
+    /// and Rate at its ends and middle, with Wow, Flutter and Hiss at their
+    /// tops, ten seconds of the transport at 44.1 kHz each: the head is never
+    /// held inside the line (the safety net catches nothing), and no track's
+    /// head, its sway and its own modulation noise together, ever sits
+    /// further from its rest than the head's travel. Where the parts ask for
+    /// more than that, the governor shares it; nothing is clipped.
+    #[test]
+    fn the_play_head_never_runs_off_its_tape_at_any_setting() {
+        let sr = 44_100.0_f32;
+        for speed in TapeSpeed::ALL {
+            for rate in [0.0, 0.5, 1.0] {
+                let p = TapeParams {
+                    wobble: 1.0,
+                    flutter: 1.0,
+                    hiss: 1.0,
+                    rate,
+                    speed: speed.dial(),
+                    ..TapeParams::default()
+                };
+                let mut unit = Tape::new(sr);
+                unit.transport_trace(&p, (sr * 10.0) as usize);
+                let travel = unit.governed().travel;
+                assert_eq!(
+                    unit.clamp_hits(),
+                    0,
+                    "at {} and Rate {rate} the head was held inside the line",
+                    speed.label()
+                );
+                assert!(
+                    f64::from(unit.deepest()) <= travel + 1.0e-3,
+                    "at {} and Rate {rate} a head sat {:.3} samples from its rest, past its \
+                     {travel:.3} of travel",
+                    speed.label(),
+                    unit.deepest()
+                );
+            }
+        }
+    }
+
+    /// **The head is shared when the tape asks for more than it holds.**
+    ///
+    /// At 3.75 ips and the bottom of Rate, Wow and Flutter at their tops ask
+    /// for about four and a half milliseconds of sway, and the studio head
+    /// has under one. The governor shares what it has in proportion to what
+    /// Wow's parts and Flutter's asked for, and inside each the slowest part
+    /// gives way first: the drift and the reel are shed whole before the
+    /// pinch roller is touched, and the guides before the capstan; the
+    /// tape's 44 Hz resonance and the scrape are never shed. So over 20 s at
+    /// 44.1 kHz the head swings to between 70 % and all of the room it has
+    /// and never past it, the safety net catches nothing, and Wow stays a
+    /// live dial there: the wow the head carries at Wow 1 is at least 1.5
+    /// times what it carries at Wow 0.3, with Flutter at 1 and at 0.3 (model
+    /// 2.2 and 2.3 times). And a fresh tape asks for nothing to be shed at
+    /// any speed. Measured: 79 % of the room, and 2.18 and 2.27 times.
+    #[test]
+    fn the_head_is_shared_when_the_tape_asks_for_more_than_it_holds() {
+        let sr = 44_100.0_f32;
+        let corner = |wobble: f32, flutter: f32| TapeParams {
+            wobble,
+            flutter,
+            rate: 0.0,
+            speed: TapeSpeed::Ips3_75.dial(),
+            ..TapeParams::default()
+        };
+        let mut unit = Tape::new(sr);
+        let sway = unit.transport_trace(&corner(1.0, 1.0), (sr * 20.0) as usize);
+        let g = unit.governed();
+        let peak = sway.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            (0.70..=1.0).contains(&(peak / g.room)),
+            "the governed head swung {peak:.2} samples with {:.2} of room",
+            g.room
+        );
+        assert_eq!(unit.clamp_hits(), 0, "the governed head was held inside the line");
+        let name = ["drift", "reel", "pinch roller", "guides", "capstan", "resonance", "scrape"];
+        for j in [DRIFT, REEL, GUIDES] {
+            assert_eq!(g.given[j], 0.0, "the {} was kept ({:.3} samples) before a faster part gave way", name[j], g.given[j]);
+        }
+        for j in [PINCH, CAPSTAN] {
+            assert!(
+                g.given[j] > 0.0 && g.given[j] < g.asked[j],
+                "the {} kept {:.3} of the {:.3} samples it asked for",
+                name[j],
+                g.given[j],
+                g.asked[j]
+            );
+        }
+        for j in [RESONANCE, SCRAPE] {
+            assert_eq!(g.given[j], g.asked[j], "the {} was shed", name[j]);
+        }
+        let wow_carried = |wobble: f32, flutter: f32| {
+            let mut unit = Tape::new(sr);
+            unit.transport_trace(&corner(wobble, flutter), 64);
+            let g = unit.governed();
+            [REEL, PINCH].iter().map(|&j| g.given[j] * g.omega[j - REEL]).sum::<f64>()
+        };
+        for flutter in [1.0, 0.3] {
+            let (top, spec) = (wow_carried(1.0, flutter), wow_carried(0.3, flutter));
+            assert!(
+                spec > 0.0 && top >= 1.5 * spec,
+                "with Flutter at {flutter} the head carries {:.4} % of wow at Wow 1 and {:.4} % \
+                 at Wow 0.3: the dial went dead",
+                top * 100.0,
+                spec * 100.0
+            );
+        }
+        for speed in TapeSpeed::ALL {
+            let mut unit = Tape::new(sr);
+            unit.transport_trace(&TapeParams { speed: speed.dial(), ..TapeParams::default() }, 64);
+            let g = unit.governed();
+            assert_eq!(g.given, g.asked, "a fresh tape at {} is governed", speed.label());
+        }
+    }
+
+    /// **A Rate or Speed change never bends the pitch past the setting's own
+    /// depth.**
+    ///
+    /// A rotating part's sway is its excursion times its turn, so a part
+    /// that sped up before its excursion had shrunk would bend the pitch
+    /// past anything either setting does: a pinch roller's wow at 3.75 ips
+    /// carried into 30 ips eight times faster. A part's turn may only rise as
+    /// fast as its excursion shrinks, and the head's parts may change their
+    /// excursions by 0.3 % of the speed between them, so through any change
+    /// the largest speed deviation (through the meter's 200 Hz demodulator)
+    /// never exceeds the larger of the two settings' own largest, over 20 s
+    /// of each, by more than that 0.3 %: Wow 1 from 3.75 to 30 ips and back,
+    /// and Wow and Flutter thrown from 0 to 1 at once at 15 ips. Measured:
+    /// 0.231 and 0.292 % through the speed changes against their settings'
+    /// 0.310, and 0.841 through the jump, which is the largest of the
+    /// setting it settles into; with a part's turn free to rise at once the
+    /// first reads 0.772.
+    #[test]
+    fn a_rate_or_speed_change_never_bends_the_pitch_past_the_settings_own_depth() {
+        let sr = 44_100.0_f32;
+        let srf = f64::from(sr);
+        let steady = |p: &TapeParams| {
+            let mut unit = Tape::new(sr);
+            let sway = unit.transport_trace(p, (sr * 20.0) as usize);
+            flutter_peak(&sway, srf, (sr * 0.5) as usize)
+        };
+        let at = |wobble: f32, flutter: f32, speed: TapeSpeed| TapeParams {
+            wobble,
+            flutter,
+            speed: speed.dial(),
+            ..TapeParams::default()
+        };
+        for (what, from, to, slew) in [
+            ("Wow 1, 3.75 to 30 ips", at(1.0, 0.3, TapeSpeed::Ips3_75), at(1.0, 0.3, TapeSpeed::Ips30), 0.3),
+            ("Wow 1, 30 to 3.75 ips", at(1.0, 0.3, TapeSpeed::Ips30), at(1.0, 0.3, TapeSpeed::Ips3_75), 0.3),
+            ("Wow and Flutter 0 to 1 at 15 ips", at(0.0, 0.0, TapeSpeed::Ips15), at(1.0, 1.0, TapeSpeed::Ips15), 0.3),
+        ] {
+            let mut unit = Tape::new(sr);
+            let mut sway = unit.transport_trace(&from, (sr * 3.0) as usize);
+            let switch = sway.len();
+            sway.extend(unit.transport_trace(&to, (sr * 4.0) as usize));
+            let moved = demodulated(&sway, srf)[switch - 1..]
+                .iter()
+                .fold(0.0_f64, |m, v| m.max(v.abs()));
+            let bound = steady(&from).max(steady(&to));
+            assert!(
+                moved <= bound + slew,
+                "{what}: the pitch bent {moved:.3} % through the change, past the settings' own \
+                 {bound:.3} % and the head's {slew} % of slew"
+            );
+        }
+    }
+
 }
