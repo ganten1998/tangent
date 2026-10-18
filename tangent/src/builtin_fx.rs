@@ -238,10 +238,11 @@ const EQ_KNOBS_PER_NODE: u32 = 5;
 /// flutter together and drives the slow half alone now, Flutter (id 7) the
 /// fast half, and Rate (id 8) how fast every rotating part turns. Wow Range
 /// (id 9) moves the wow onto a second play head 25 ms back, a cassette's,
-/// and is the one control that moves the delay the seat reports. A session
-/// saved before these existed reads them at their defaults, which is the
-/// owner's ruling for every appended control: nothing is pinned to how 5.0
-/// sounded.
+/// and is the one control that moves the delay the seat reports. Bias
+/// (id 10) is the record bias either side of the aligned point, which its
+/// middle is, and reads signed about it. A session saved before these
+/// existed reads them at their defaults, which is the owner's ruling for
+/// every appended control: nothing is pinned to how 5.0 sounded.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.5, steps: 0 },
     ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
@@ -253,6 +254,7 @@ const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 7, symbol: "flutter", name: "Flutter", units: "%", default: 0.3, steps: 0 },
     ParamSpec { id: 8, symbol: "rate", name: "Rate", units: "x", default: 0.5, steps: 0 },
     ParamSpec { id: 9, symbol: "wow_range", name: "Wow Range", units: "", default: 0.0, steps: crate::units::tape::WOW_RANGE_STEPS },
+    ParamSpec { id: 10, symbol: "bias", name: "Bias", units: "dB", default: 0.5, steps: 0 },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -992,6 +994,17 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // the top.
         (TAPE_PATH, 8) => format!("{:.2}x", crate::units::tape::rate_multiplier(v)),
         (TAPE_PATH, 9) => crate::units::tape::WowRange::from_dial(v).label().to_owned(),
+        // Bias is decibels either side of the point the machine is aligned
+        // at, and the middle of the dial IS that point, so it says so in
+        // the machine's word rather than as a number: "aligned" there, and
+        // a signed reading either side of it, symmetric about it.
+        (TAPE_PATH, 10) => {
+            if v == 0.5 {
+                "aligned".to_owned()
+            } else {
+                fmt_db(crate::units::tape::BIAS_RANGE_DB * (2.0 * v - 1.0))
+            }
+        }
         // The rest of the tape speaks in percent on purpose: those knobs are
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
@@ -2127,6 +2140,7 @@ fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32
         7 => Some(&mut p.flutter),
         8 => Some(&mut p.rate),
         9 => Some(&mut p.wow_range),
+        10 => Some(&mut p.bias),
         _ => None,
     }
 }
@@ -3618,7 +3632,7 @@ mod tests {
     fn the_face_tables_open_at_the_kernels_shipped_defaults() {
         let t = crate::units::tape::TapeParams::default();
         let fields = [
-            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate, t.wow_range,
+            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate, t.wow_range, t.bias,
         ];
         assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
         for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
@@ -3962,7 +3976,7 @@ mod tests {
         let blob = b"tangentfx 1\ndrive=0.6\nbump=0.5\nroll=0.12\nwobble=0.3\nhiss=0.25\ntrim=0.5\n";
         let values = values_from_state(spec, blob).expect("a 5.0 blob reads");
         assert_eq!(&values[..6], &[0.6, 0.5, 0.12, 0.3, 0.25, 0.5], "the six 5.0 values moved");
-        assert_eq!(&values[6..10], &[2.0 / 3.0, 0.3, 0.5, 0.0], "an appended control read off its default");
+        assert_eq!(&values[6..11], &[2.0 / 3.0, 0.3, 0.5, 0.0, 0.5], "an appended control read off its default");
         for p in &spec.params[6..] {
             assert_eq!(values[p.id as usize], p.default, "{} read off its default", p.symbol);
             assert!(absent_reads_as(TAPE_PATH, p.symbol).is_none(), "{} is pinned to 5.0", p.symbol);
@@ -3992,7 +4006,7 @@ mod tests {
             panic!("the tape path built something that is not a tape");
         };
         let fields = |p: &crate::units::tape::TapeParams| {
-            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range]
+            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range, p.bias]
         };
         assert_eq!(
             fields(&u.params).len(),
@@ -4335,6 +4349,46 @@ mod tests {
                 step <= largest + 1.0e-3,
                 "frame {k} after the onset stepped by {step:.4}, against the tone's own \
                  {largest:.4}: the lane jumped when the tape came back"
+            );
+        }
+    }
+
+    /// **The bias reads signed about aligned, and every reading reads back.**
+    ///
+    /// Bias is the record bias in decibels either side of the point the
+    /// machine is aligned at, and the middle of its dial is that point. So
+    /// the middle reads "aligned", the machine's own word, and a hand typing
+    /// the word lands exactly there, where a drag's catch and a double-click
+    /// home land too; either side reads signed decibels, the same figure
+    /// with its sign turned at the same distance either way; and every
+    /// reading the dial can show, typed back into it, lands where the
+    /// reading says the same: the word, or the same number. (Typed "+0.0"
+    /// may land a hair the other side of aligned, which reads "-0.0", the
+    /// same number: the dial's middle answers to its word, not to zero.)
+    #[test]
+    fn the_bias_reads_signed_about_aligned_and_every_reading_reads_back() {
+        assert_eq!(describe(TAPE_PATH, 10, 0.5, &[]), "aligned");
+        assert_eq!(value_for_reading(TAPE_PATH, 10, "aligned", &[]), Some(0.5));
+        assert_eq!(value_for_reading(TAPE_PATH, 10, "Aligned", &[]), Some(0.5));
+        for k in 1..=64 {
+            let x = k as f32 / 128.0;
+            let (up, down) = (describe(TAPE_PATH, 10, 0.5 + x, &[]), describe(TAPE_PATH, 10, 0.5 - x, &[]));
+            assert!(
+                up.starts_with('+') && down.starts_with('-') && up[1..] == down[1..],
+                "Bias reads {up} at {} and {down} at {}: not signed and symmetric about aligned",
+                0.5 + x,
+                0.5 - x
+            );
+        }
+        for i in 0..=96 {
+            let v = i as f32 / 96.0;
+            let shown = describe(TAPE_PATH, 10, v, &[]);
+            let typed = value_for_reading(TAPE_PATH, 10, &shown, &[])
+                .unwrap_or_else(|| panic!("Bias's own reading {shown} does not read back"));
+            let again = describe(TAPE_PATH, 10, typed, &[]);
+            assert!(
+                again == shown || (reading_number(&again).is_some() && reading_number(&again) == reading_number(&shown)),
+                "Bias at {v} reads {shown}, which typed back lands at {typed}, reading {again}"
             );
         }
     }
@@ -5027,6 +5081,13 @@ mod tests {
         assert_eq!(describe(TAPE_PATH, 9, 0.0, &[]), "studio");
         assert_eq!(describe(TAPE_PATH, 9, 1.0, &[]), "deep");
         assert_eq!(choices(TAPE_PATH, 9), vec!["studio", "deep"]);
+        // The bias, in the machine's word at its middle and in signed
+        // decibels either side of it.
+        assert_eq!(describe(TAPE_PATH, 10, 0.5, &[]), "aligned");
+        assert_eq!(describe(TAPE_PATH, 10, 0.0, &[]), "-6.0 dB");
+        assert_eq!(describe(TAPE_PATH, 10, 1.0, &[]), "+6.0 dB");
+        assert_eq!(describe(TAPE_PATH, 10, 0.75, &[]), "+3.0 dB");
+        assert!(choices(TAPE_PATH, 10).is_empty(), "Bias grew steps");
         // And the four that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));

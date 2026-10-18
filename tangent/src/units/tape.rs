@@ -40,10 +40,11 @@
 //! # Signal flow
 //!
 //! The input transformer (a one-pole high-pass at [`TRANSFORMER_HZ`]) → the
-//! NAB record shelf → record, at four times the session rate: a
-//! bias-linearised tanh with the refused flux fed back → the repro line-up →
-//! the NAB shelf's exact inverse → HF self-erasure (the envelope-driven
-//! corner above) → the tape: a short Hermite-interpolated play head swayed by
+//! NAB record shelf, and under the aligned bias the under-bias low shelf →
+//! record, at four times the session rate: a bias-linearised tanh with the
+//! refused flux fed back → the repro line-up → both shelves' exact inverses →
+//! the bias's own treble shelf ([`BIAS_RANGE_DB`]) → HF self-erasure (the
+//! envelope-driven corner above) → the tape: a short Hermite-interpolated play head swayed by
 //! the transport's parts ([`Transport`]: Wow's reel, pinch roller and drift,
 //! Flutter's guides, capstan, the tape's own resonance and a whisper of
 //! scrape, their depths noise-modulated and the head's travel shared out
@@ -139,6 +140,13 @@ pub struct TapeParams {
     /// head, [`DEEP_MS`] back. The only control that moves the delay the
     /// host is told. A fresh tape opens on the studio head.
     pub wow_range: f32,
+    /// **Bias**: the record bias, from [`BIAS_RANGE_DB`] under the aligned
+    /// point to as far over it, the machine lined up again at 1 kHz after
+    /// every change, as a real one is. 0.5 is aligned, at the recommended
+    /// over-bias. Under-bias brightens the top, saturates the bass sooner
+    /// and raises the modulation noise; over-bias dulls the top. See
+    /// [`bias_shelf_db`] and [`UNDER_BIAS_UM`].
+    pub bias: f32,
 }
 
 impl Default for TapeParams {
@@ -169,6 +177,9 @@ impl Default for TapeParams {
             rate: 0.5,
             // The studio head.
             wow_range: WowRange::Studio.dial(),
+            // Aligned: the recommended over-bias, where the datasheets
+            // quote the tape.
+            bias: 0.5,
         }
     }
 }
@@ -177,8 +188,9 @@ impl Default for TapeParams {
 impl TapeParams {
     /// Every colour off: the record level at the bottom of its travel, no
     /// bump, no roll, a parked head (no wow, no flutter), silent tape, unity
-    /// trim, at the studio speed and the parts' own rate. The recipe the
-    /// neutrality tests here and at the seat spell out, in one place.
+    /// trim, at the studio speed and the parts' own rate, the bias aligned.
+    /// The recipe the neutrality tests here and at the seat spell out, in
+    /// one place.
     pub(crate) const NEUTRAL: TapeParams = TapeParams {
         drive: 0.0,
         bump: 0.0,
@@ -190,6 +202,7 @@ impl TapeParams {
         flutter: 0.0,
         rate: 0.5,
         wow_range: WowRange::Studio.dial(),
+        bias: 0.5,
     };
 }
 
@@ -564,6 +577,89 @@ const NAB_SHELF_DB: [f64; 4] = [4.0, 4.0, 4.0, 0.0];
 /// Drive has no dead travel at any speed.
 const DMOL_DB: [f64; 4] = [-2.3, 0.0, 2.3, 2.7];
 
+/// **Bias, as decibels of record bias either side of the aligned point**:
+/// `b = (2x - 1) 6` across the dial, 6 dB under at the bottom and 6 dB over
+/// at the top, the span from beyond the 10 kHz sensitivity's peak to well
+/// down its over-bias flank.
+///
+/// **Bias moves the tape's curve, not the record level.** The datasheets
+/// agree on three things: under-bias lowers the tape's maximum output about
+/// 1.4 dB for every dB it is under; it lowers it at long wavelengths and
+/// leaves the short ones their own headroom, or a little more; and the
+/// small-signal treble rises with under-bias and falls with over-bias. So
+/// bias drives neither the record curve's `d` nor the self-erasure, which
+/// would lower every frequency's ceiling and deepen the treble's loss. It
+/// acts through two stages and the line-up instead. Under the aligned
+/// point, a low shelf before the curve and its exact inverse after it
+/// ([`UNDER_BIAS_UM`]) put the long wavelengths into the curve hotter: a
+/// lower ceiling for the bass, and nothing at all at small signal. Either
+/// side of it, a first-order shelf after the curve ([`BIAS_SHELF_UM`],
+/// [`bias_shelf_db`]) is the small-signal treble law. And the machine is
+/// lined up again at 1 kHz after every change, as a real one is: the shelf
+/// is unity there, and the line-up reads the record level the 1 kHz tone
+/// actually meets through the low shelf.
+pub const BIAS_RANGE_DB: f32 = 6.0;
+
+/// The under-bias low shelf: the wavelength of its half-height, in
+/// micrometres, and how many decibels of long-wavelength headroom each
+/// decibel of under-bias takes.
+///
+/// A second-order low shelf (Q of a half root two) whose height is 1.4 dB
+/// per dB under the aligned point and whose half-height sits at 85 µm, the
+/// geometric middle of the two wavelengths the datasheets pin: the whole
+/// drop at 190 µm (500 Hz at 3.75 ips) and none at 38.1 µm (10 kHz at
+/// 15 ips): 8.0 of its 8.4 dB at 190 µm and 0.4 at 38.1 µm at full
+/// under-bias. Second order because a first-order shelf would still lift
+/// 38.1 µm by a decibel and a half into the curve, where the treble must
+/// keep its own headroom. Before the curve and exactly undone after it,
+/// so it is transparent at small signal and a lower ceiling at large.
+const UNDER_BIAS_UM: f64 = 85.0;
+const UNDER_BIAS_DB_PER_DB: f64 = 1.4;
+
+/// The small-signal bias shelf's corner, as a wavelength in micrometres:
+/// 2.5, 5, 10 and 20 kHz at the four speeds, where the published bias
+/// ladders put the 10 kHz sensitivity's swing.
+const BIAS_SHELF_UM: f64 = 38.1;
+
+/// How far the tape's modulation noise rises for each dB of under-bias, in
+/// dB: an under-biased tape's grain is coarser ([`JITTER_UM`]).
+const UNDER_BIAS_JITTER_DB: f64 = 2.1;
+
+/// **The bias shelf's height at its corner, in dB, for a bias `b` dB re
+/// aligned**: what the treble does against a long wavelength as the bias
+/// moves, fitted to the published bias ladders.
+///
+/// Over the aligned point the treble falls 0.8 dB per dB, a little faster
+/// as it goes (`-0.8 b - 0.07 b^2`): at 15 ips 10 kHz loses 0.8 dB per dB
+/// and 16 kHz more. Under it, the treble rises to its peak, 3.0 dB at
+/// 5.4 dB under, along a cubic that leaves aligned at the same slope and
+/// arrives at the peak flat; past the peak it falls again (`3.0 - 0.5 (b +
+/// 5.4)^2`), the far flank where tape that far under-biased gives its top
+/// back to distortion. Zero at aligned, where the shelf is a wire. The
+/// shelf's top is twice this, and its corner is [`BIAS_SHELF_UM`], so the
+/// peak-to-aligned swing of 10 kHz against a long wavelength is 5.6, 4.8,
+/// 3.0 and 1.2 dB at 3.75, 7.5, 15 and 30 ips, inside every published
+/// ladder.
+fn bias_shelf_db(b: f64) -> f64 {
+    const PEAK_DB: f64 = 3.0;
+    const PEAK_AT: f64 = -5.4;
+    const SLOPE: f64 = -0.8;
+    if b >= 0.0 {
+        SLOPE * b - 0.07 * b * b
+    } else if b >= PEAK_AT {
+        let t = (b - PEAK_AT) / -PEAK_AT;
+        PEAK_DB * (2.0 * t * t * t - 3.0 * t * t + 1.0) + SLOPE * -PEAK_AT * (t * t * t - t * t)
+    } else {
+        PEAK_DB - 0.5 * (b - PEAK_AT).powi(2)
+    }
+}
+
+/// The bias the dial asks for, in dB re aligned ([`BIAS_RANGE_DB`]); a NaN
+/// reads as aligned.
+fn bias_db(p: &TapeParams) -> f64 {
+    f64::from(BIAS_RANGE_DB) * (2.0 * f64::from(norm_or(p.bias, 0.5)) - 1.0)
+}
+
 /// Where the self-erasure corner falls to at each speed, in hertz, slowest
 /// first, and how fast it falls with the record level.
 ///
@@ -919,6 +1015,28 @@ const HISS_DRIVE: f32 = 0.6;
 const JITTER_UM: f64 = 0.194;
 const JITTER_CAP_UM: f64 = 2.0;
 const JITTER_HZ_15: f64 = 500.0;
+
+/// **The modulation noise's depth the dials ask for**, in micrometres RMS:
+/// [`JITTER_UM`] on the hiss's squared taper, raised
+/// [`UNDER_BIAS_JITTER_DB`] for every dB of under-bias, and never past
+/// [`JITTER_CAP_UM`]. The kernel's glide aims here, and so does the figure a
+/// face prints, so the two plan the head's reserve alike.
+fn jitter_um(p: &TapeParams) -> f64 {
+    let taper = f64::from(norm(p.hiss) / 0.25).powi(2);
+    let under = (-bias_db(p)).max(0.0);
+    (JITTER_UM * taper * 10.0_f64.powf(UNDER_BIAS_JITTER_DB * under / 20.0)).min(JITTER_CAP_UM)
+}
+
+/// **What the head keeps in reserve for each track's own movement**, in
+/// samples at `sr`, for modulation noise of `noise_um` µm RMS on tape
+/// running at `v` ips: four of its sigma, which it never reaches, and a
+/// sample. The governor shares the head's travel only after this, so a
+/// track's noise can never carry its head off the line. The one place the
+/// reserve is worked out: the kernel's governor and the figure a face
+/// prints both read it.
+fn reserve(noise_um: f64, v: f64, sr: f64) -> f64 {
+    4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0
+}
 
 /// Output trim, in dB across the knob. Midpoint is exactly unity.
 pub const TRIM_DB: (f32, f32) = (-12.0, 12.0);
@@ -1620,6 +1738,54 @@ impl Section {
         [(1.0 + k * t2) / (1.0 + k * t1), (1.0 - k * t2) / (1.0 + k * t1), (1.0 - k * t1) / (1.0 + k * t1)]
     }
 
+    /// The bias shelf `A (s + w / sqrt A) / (s + w sqrt A)`, unity at DC
+    /// and `A` at the top, its corner `w` at `fc` hertz with `db` of height
+    /// there (`A` is twice that, in decibels), held to unity at 1 kHz: the
+    /// machine lined up again after the bias moved. A first-order section
+    /// matched to it in magnitude at DC, at 1 kHz and at 10 kHz (or a
+    /// quarter of the rate, if that is lower); `points` are those last two,
+    /// each as its hertz and `cos w` at the rate.
+    ///
+    /// **Matched, not warped.** A bilinear transform is exact at one
+    /// frequency, and this shelf is read at three: at DC, where the
+    /// published ladders anchor their long wavelength; at the 1 kHz the
+    /// machine is lined up at; and at 10 kHz, where every ladder is quoted.
+    /// Warped at 10 kHz, the 1 kHz tone met the shelf where the analog one
+    /// is at 850 Hz at 48 kHz, and at 3.75 ips, whose corner is 2.5 kHz,
+    /// that moved the bass half a decibel, by a different half at every
+    /// rate. A first-order section has three numbers, so it can meet the
+    /// analog shelf exactly at all three points at any rate: a section's
+    /// squared gain is a ratio of two lines in `cos w`, the three points on
+    /// it fix its pole, and then its zero and its gain, each the root
+    /// inside the unit circle.
+    fn bias_shelf(fc: f64, db: f64, points: [(f64, f64); 2]) -> [f64; 3] {
+        let a = 10.0_f64.powf(db / 10.0);
+        // The analog shelf's squared gain at `f` hertz, `A^2 (r + 1/A) / (r +
+        // A)` for `r` the square of `f` over the corner.
+        let shelf = |f: f64| {
+            let r = (f / fc).powi(2);
+            a * a * (r + 1.0 / a) / (r + a)
+        };
+        let at = |k: usize| if k == 0 { 1.0 } else { points[k - 1].1 };
+        let one = shelf(points[0].0);
+        let x = [1.0 / one, 1.0, shelf(points[1].0) / one];
+        let (d1, d2) = (at(1) - at(0), at(2) - at(0));
+        let ap = (x[1] - x[0]) * d2 - (x[2] - x[0]) * d1;
+        let bp = (x[1] * at(1) - x[0] * at(0)) * d2 - (x[2] * at(2) - x[0] * at(0)) * d1;
+        let a1 = if bp == 0.0 {
+            0.0
+        } else {
+            -ap / (bp + (bp * bp - ap * ap).max(0.0).sqrt().copysign(bp))
+        };
+        let line = |k: usize| x[k] * (1.0 + a1 * a1 + 2.0 * a1 * at(k));
+        let slope = (line(1) - line(0)) / d1;
+        let rest = line(0) - slope * at(0);
+        let m = (slope / (2.0 * rest)).clamp(-0.5, 0.5);
+        let zero = 2.0 * m / (1.0 + (1.0 - 4.0 * m * m).sqrt());
+        let g = (rest / (1.0 + zero * zero)).sqrt();
+        [g, g * zero, a1]
+    }
+
     fn of(c: [f64; 3]) -> Section {
         Section {
             b0: c[0] as f32,
@@ -1690,6 +1856,73 @@ impl Bell {
 /// rate's Nyquist.
 fn bell_g(hz: f64, sample_rate: f64) -> f64 {
     (std::f64::consts::PI * (hz / sample_rate).min(0.49)).tan()
+}
+
+/// A low shelf as a trapezoidal state-variable filter, the bell's sections
+/// with their low-pass mixed in as well: the analog second-order shelf
+/// `A (s^2 + s sqrt(A) / Q + A) / (A s^2 + s sqrt(A) / Q + 1)` at a Q of a
+/// half root two, `A^2` of gain at DC, `A` at its corner, unity at the top,
+/// warped at the corner.
+///
+/// **Its inverse is the same shelf at the opposite gain, exactly**: `A` for
+/// `1 / A` swaps the analog shelf's numerator and its denominator, and the
+/// bilinear transform warped at the same corner keeps them swapped. So what
+/// goes onto the tape through one comes off it through the other, as it
+/// does through the NAB pair, and the form stays stable for any glide of
+/// its gain, which moves with the bias.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Shelf {
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    m1: f32,
+    m2: f32,
+}
+
+impl Shelf {
+    const WIRE: Shelf = Shelf {
+        a1: 1.0,
+        a2: 0.0,
+        a3: 0.0,
+        m1: 0.0,
+        m2: 0.0,
+    };
+
+    /// The low shelf whose corner is at `t = tan(pi f / rate)`, with `db` of
+    /// gain at DC.
+    fn low(t: f64, db: f64) -> Self {
+        let a = 10.0_f64.powf(db / 40.0);
+        let k = std::f64::consts::SQRT_2;
+        let g = t / a.sqrt();
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        Self {
+            a1: a1 as f32,
+            a2: a2 as f32,
+            a3: (g * a2) as f32,
+            m1: (k * (a - 1.0)) as f32,
+            m2: (a * a - 1.0) as f32,
+        }
+    }
+
+    /// That shelf's gain at the frequency whose `tan(pi f / rate)` is `at`:
+    /// the analog shelf at the frequency the bilinear transform warps it
+    /// to, which is the digital section's gain there exactly.
+    fn low_gain(t: f64, at: f64, db: f64) -> f64 {
+        let a = 10.0_f64.powf(db / 40.0);
+        let (r, q) = (at / t, std::f64::consts::SQRT_2 * a.sqrt());
+        a * (((a - r * r).powi(2) + (q * r).powi(2)) / ((1.0 - a * r * r).powi(2) + (q * r).powi(2))).sqrt()
+    }
+
+    #[inline]
+    fn run(&self, st: &mut [f32; 2], x: f32) -> f32 {
+        let v3 = x - st[1];
+        let v1 = self.a1 * st[0] + self.a2 * v3;
+        let v2 = st[1] + self.a2 * st[0] + self.a3 * v3;
+        st[0] = flush(2.0 * v1 - st[0]);
+        st[1] = flush(2.0 * v2 - st[1]);
+        x + self.m1 * v1 + self.m2 * v2
+    }
 }
 
 /// The hiss's seeds, one per channel (two tracks, two noises), and the
@@ -2462,6 +2695,11 @@ pub struct Tape {
     /// channel.
     nab_in: [f32; 2],
     nab_out: [f32; 2],
+    /// The under-bias low shelf's states on the way onto the tape and off
+    /// it, per channel, and the bias shelf's after the curve ([`BIAS_RANGE_DB`]).
+    under_in: [[f32; 2]; 2],
+    under_out: [[f32; 2]; 2],
+    bias_hf: [f32; 2],
     /// The record stage's oversampler: one designed set of taps, and the
     /// histories each channel reads them against. See [`OS`].
     os_taps: OsTaps,
@@ -2544,6 +2782,38 @@ pub struct Tape {
     roll_a: f32,
     roll_for: f64,
     roll_on: bool,
+    /// The bias's stages: the under-bias low shelf and its inverse, the
+    /// bias shelf after the curve, whether each is in circuit (each is a
+    /// wire at aligned, and skipped), and the `(bias dB, speed)` they were
+    /// designed at (NaN until the first design).
+    ///
+    /// **The inverse follows the shelf [`OS_LATENCY`] frames late**, because
+    /// the two straddle the record stage's oversampler: what the shelf
+    /// shapes at one frame leaves the curve that many frames later, and the
+    /// inverse must meet it with the same design, or every design while the
+    /// bias glides is a 44-frame step in the bass, a click. So each design's
+    /// inverse waits in `inverse_due` with the frame it takes over at (at
+    /// most two wait, designs being 32 frames apart).
+    under: Shelf,
+    under_on: bool,
+    under_inv: Shelf,
+    under_inv_on: bool,
+    inverse_due: [(u64, Shelf, bool); 2],
+    inverse_waiting: usize,
+    shelf: Section,
+    shelf_on: bool,
+    bias_for: (f64, f64),
+    /// The line-up's reading of the bias, as how many octaves hotter the
+    /// 1 kHz alignment tone meets the curve through the under-bias shelf:
+    /// where it was at the last design and where it is going, ramped across
+    /// the sub-block so the line-up never steps while the bias glides.
+    lineup_from: f64,
+    lineup_to: f64,
+    /// `tan(pi 1 kHz / rate)`, and 1 kHz and 10 kHz (or a quarter of the
+    /// rate) as their hertz and `cos w` at this rate: where the bias's
+    /// stages are held to the alignment tone and the ladders.
+    tan_1k: f64,
+    shelf_points: [(f64, f64); 2],
     /// The glides: the speed as its position on [`TapeSpeed::ALL`] (which is
     /// `log2` of the speed, since the speeds are octaves apart), the dial's
     /// record level as `log2 d`, the bump in dB, Roll's corner as `log2` Hz,
@@ -2553,6 +2823,8 @@ pub struct Tape {
     bump_db: Glide,
     roll: Glide,
     trim: Glide,
+    /// The bias in dB re aligned ([`BIAS_RANGE_DB`]).
+    bias: Glide,
     /// Frames since `new` or `clear`: the grid [`SUB_BLOCK`] counts on.
     frame: u64,
     /// Whether the next block is the first since `new` or `clear`, which
@@ -2583,6 +2855,9 @@ impl Tape {
             g_transformer: tpt_g(TRANSFORMER_HZ, rate) as f32,
             nab_in: [0.0; 2],
             nab_out: [0.0; 2],
+            under_in: [[0.0; 2]; 2],
+            under_out: [[0.0; 2]; 2],
+            bias_hf: [0.0; 2],
             os_taps: OsTaps::new(),
             os: [OsChannel::new(), OsChannel::new()],
             makeup: makeup_table(),
@@ -2629,11 +2904,26 @@ impl Tape {
             roll_a: 0.0,
             roll_for: f64::NAN,
             roll_on: false,
+            under: Shelf::WIRE,
+            under_on: false,
+            under_inv: Shelf::WIRE,
+            under_inv_on: false,
+            inverse_due: [(0, Shelf::WIRE, false); 2],
+            inverse_waiting: 0,
+            shelf: Section::WIRE,
+            shelf_on: false,
+            bias_for: (f64::NAN, f64::NAN),
+            lineup_from: 0.0,
+            lineup_to: 0.0,
+            tan_1k: (std::f64::consts::PI * 1_000.0 / rate).tan(),
+            shelf_points: [1_000.0, 10_000.0_f64.min(0.25 * rate)]
+                .map(|hz| (hz, (std::f64::consts::TAU * hz / rate).cos())),
             speed: Glide::new(1.0e-7),
             drive: Glide::new(1.0e-7),
             bump_db: Glide::new(1.0e-6),
             roll: Glide::new(1.0e-6),
             trim: Glide::new(1.0e-9),
+            bias: Glide::new(1.0e-6),
             frame: 0,
             fresh: true,
         }
@@ -2709,7 +2999,8 @@ impl Tape {
         let noise_rate = (self.sample_rate / DESIGN_RATE).sqrt();
         let taper = f64::from(hiss / 0.25).powi(2);
         self.hiss_level.target = taper * f64::from(noise_rate);
-        self.jitter.target = (JITTER_UM * taper).min(JITTER_CAP_UM);
+        self.jitter.target = jitter_um(p);
+        self.bias.target = bias_db(p);
         self.transport.aim(p, self.fresh);
         if self.fresh {
             // And the heads stand where the range is, not fading to it.
@@ -2728,6 +3019,7 @@ impl Tape {
                 &mut self.trim,
                 &mut self.hiss_level,
                 &mut self.jitter,
+                &mut self.bias,
             ] {
                 g.settle();
             }
@@ -2789,6 +3081,7 @@ impl Tape {
             self.roll_for = corner;
         }
         self.roll_on = roll_wanted || self.roll.cur != self.roll.target;
+        self.design_bias(pos);
 
         // The transport, at the speed the glide is at. Its reserve is what
         // the per-channel noise can take beyond the sway, four of its sigma
@@ -2798,8 +3091,89 @@ impl Tape {
         let v = ips * pos.exp2();
         let slowest = v.min(ips * self.speed.target.exp2());
         let noise_um = self.jitter.cur.max(self.jitter.target);
-        let reserve = 4.0 * noise_um * 1.0e-6 * f64::from(self.sample_rate) / (0.0254 * slowest) + 1.0;
-        self.transport.design(v, reserve);
+        self.transport.design(v, reserve(noise_um, slowest, f64::from(self.sample_rate)));
+    }
+
+    /// **The bias's stages for where its glide and the speed's are now**,
+    /// part of each design: the under-bias low shelf and its inverse at
+    /// [`UNDER_BIAS_UM`] on this speed, the bias shelf at [`BIAS_SHELF_UM`],
+    /// and the record level the line-up reads for the 1 kHz tone. Each stage
+    /// is in circuit only off the aligned point, where it is a wire, and
+    /// starts again from rest when it comes back in: a glide through aligned
+    /// takes it out at the last sub-block's small gain, and the inverse goes
+    /// with that design, its frames later, so nothing steps. Nothing here
+    /// runs while neither the bias nor the speed moves.
+    fn design_bias(&mut self, pos: f64) {
+        let b = self.bias.cur;
+        if b == self.bias_for.0 && pos == self.bias_for.1 {
+            self.lineup_from = self.lineup_to;
+            return;
+        }
+        let first = self.bias_for.0.is_nan();
+        let sr = f64::from(self.sample_rate);
+        let v_m = 0.0254 * TapeSpeed::Ips3_75.ips() * pos.exp2();
+        let under = (-b).max(0.0);
+        let mut lineup = 0.0;
+        if under > 0.0 {
+            let db = UNDER_BIAS_DB_PER_DB * under;
+            let t = bell_g(v_m / (UNDER_BIAS_UM * 1.0e-6), sr);
+            self.under = Shelf::low(t, db);
+            self.under_on = true;
+            self.inverse_after(Shelf::low(t, -db), true, first);
+            lineup = Shelf::low_gain(t, self.tan_1k, db).log2();
+        } else if self.under_on {
+            self.under_on = false;
+            self.under_in = [[0.0; 2]; 2];
+            self.inverse_after(Shelf::WIRE, false, first);
+        }
+        let height = bias_shelf_db(b);
+        if height != 0.0 {
+            self.shelf = Section::of(Section::bias_shelf(v_m / (BIAS_SHELF_UM * 1.0e-6), height, self.shelf_points));
+            self.shelf_on = true;
+        } else if self.shelf_on {
+            self.shelf_on = false;
+            self.bias_hf = [0.0; 2];
+        }
+        self.lineup_from = if first { lineup } else { self.lineup_to };
+        self.lineup_to = lineup;
+        self.bias_for = (b, pos);
+    }
+
+    /// Queue the under-bias shelf's inverse to take over [`OS_LATENCY`]
+    /// frames from now, when what the shelf just started shaping leaves the
+    /// curve; on the first design after `new` or `clear` there is nothing in
+    /// the curve yet, and it takes over at once.
+    fn inverse_after(&mut self, inverse: Shelf, on: bool, now: bool) {
+        if now {
+            (self.under_inv, self.under_inv_on, self.inverse_waiting) = (inverse, on, 0);
+            return;
+        }
+        if self.inverse_waiting == self.inverse_due.len() {
+            self.inverse_take();
+        }
+        self.inverse_due[self.inverse_waiting] = (self.frame + OS_LATENCY as u64, inverse, on);
+        self.inverse_waiting += 1;
+    }
+
+    /// The oldest waiting inverse takes over: in circuit with its design, or
+    /// out of it, starting again from rest.
+    fn inverse_take(&mut self) {
+        let (_, inverse, on) = self.inverse_due[0];
+        self.inverse_due[0] = self.inverse_due[1];
+        self.inverse_waiting -= 1;
+        if !on {
+            self.under_out = [[0.0; 2]; 2];
+        }
+        (self.under_inv, self.under_inv_on) = (inverse, on);
+    }
+
+    /// One frame's turn of the waiting inverses: the one due at the frame
+    /// now being made (`frame` already counts it) takes over.
+    #[inline]
+    fn inverse_turn(&mut self) {
+        if self.inverse_waiting > 0 && self.frame > self.inverse_due[0].0 {
+            self.inverse_take();
+        }
     }
 
     /// **The two heads this frame**: each track's delay on the studio head
@@ -2891,17 +3265,24 @@ impl Tape {
                 self.design(roll_wanted);
             }
             self.frame += 1;
+            self.inverse_turn();
 
             // ── the glides, and the record level they make ─────────────────
             self.speed.tick(self.a_speed);
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
+            self.bias.tick(self.a_glide);
             let trim_gain = self.trim.tick(self.a_glide) as f32;
             // The dial's record level, scaled by this speed's headroom: the
             // `d` the curve is asked for, and the line-up for it, read from
-            // the table [`Tape::new`] solved (see [`sat_makeup_refused`]).
+            // the table [`Tape::new`] solved (see [`sat_makeup_refused`]) at
+            // the level the 1 kHz alignment tone meets the curve, which the
+            // under-bias shelf raises ([`BIAS_RANGE_DB`]), ramped across the
+            // sub-block.
             let log2_d = self.drive.tick(self.a_glide) + self.dmol;
-            let makeup = makeup_at(&self.makeup, log2_d);
+            let along = ((self.frame - 1) % SUB_BLOCK + 1) as f64 / SUB_BLOCK as f64;
+            let lineup = self.lineup_from + (self.lineup_to - self.lineup_from) * along;
+            let makeup = makeup_at(&self.makeup, log2_d + lineup);
             let d = log2_d.exp2() as f32;
             let inv_d = 1.0 / d;
 
@@ -2927,13 +3308,24 @@ impl Tape {
                 };
                 self.erase_env[ch] = flush(self.erase_env[ch] + (lvl - self.erase_env[ch]) * a);
 
-                // Onto the tape through the NAB record shelf, the record
-                // amplifier and the tape at 4× (see [`record`]), the repro
-                // amplifier's line-up (not a knob: see [`sat_makeup`]), and
-                // off it through the shelf's exact inverse.
-                let r = self.nab.run(&mut self.nab_in[ch], u);
-                let y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r);
-                let y = self.nab_inv.run(&mut self.nab_out[ch], y * makeup);
+                // Onto the tape through the NAB record shelf and, under the
+                // aligned bias, the under-bias shelf, the record amplifier
+                // and the tape at 4× (see [`record`]), the repro amplifier's
+                // line-up (not a knob: see [`sat_makeup`]), and off it
+                // through both shelves' exact inverses, then the bias's own
+                // treble shelf.
+                let mut r = self.nab.run(&mut self.nab_in[ch], u);
+                if self.under_on {
+                    r = self.under.run(&mut self.under_in[ch], r);
+                }
+                let mut y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r) * makeup;
+                if self.under_inv_on {
+                    y = self.under_inv.run(&mut self.under_out[ch], y);
+                }
+                let mut y = self.nab_inv.run(&mut self.nab_out[ch], y);
+                if self.shelf_on {
+                    y = self.shelf.run(&mut self.bias_hf[ch], y);
+                }
 
                 // HF self-erasure: the corner falls as the level rises, read
                 // from this speed's table. At rest `b` is zero: a wire.
@@ -2999,6 +3391,13 @@ impl Tape {
         self.transformer = [OnePole::default(); 2];
         self.nab_in = [0.0; 2];
         self.nab_out = [0.0; 2];
+        self.under_in = [[0.0; 2]; 2];
+        self.under_out = [[0.0; 2]; 2];
+        self.bias_hf = [0.0; 2];
+        (self.under_on, self.under_inv_on, self.shelf_on) = (false, false, false);
+        self.inverse_waiting = 0;
+        self.bias_for = (f64::NAN, f64::NAN);
+        (self.lineup_from, self.lineup_to) = (0.0, 0.0);
         for c in &mut self.os {
             c.clear();
         }
@@ -3061,10 +3460,12 @@ impl Tape {
                 self.design(roll_wanted);
             }
             self.frame += 1;
+            self.inverse_turn();
             self.speed.tick(self.a_speed);
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
             self.trim.tick(self.a_glide);
+            self.bias.tick(self.a_glide);
             self.drive.tick(self.a_glide);
             self.heads();
             self.hiss_level.tick(self.a_glide);
@@ -3256,9 +3657,7 @@ fn weighted_parts(p: &TapeParams) -> f64 {
     let (_, kappa) = resonance_at(sr);
     let (_, band) = scrape_band(sr);
     let asked = at_the_top(&studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr)));
-    let taper = f64::from(norm(p.hiss) / 0.25).powi(2);
-    let noise_um = (JITTER_UM * taper).min(JITTER_CAP_UM);
-    let reserve = 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0;
+    let reserve = reserve(jitter_um(p), v, sr);
     let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
     let deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
     let mut sum = 0.0;
@@ -3640,9 +4039,13 @@ mod tests {
     /// tone stops the same band has fallen by at least 15 dB, because what
     /// is left there is only the hiss, which is still there, above 1e-7 RMS:
     /// the noise that follows the music is around each note, not a swell.
+    /// (d) And an under-biased tape's grain is coarser, 2.1 dB more
+    /// modulation noise for every dB under: at the bottom of Bias the same
+    /// tone's skirt stands 12.6 dB over the aligned tape's, within 1.5.
     /// Measured: a slope of -0.20 dB an octave; +4.07, -0.11, -0.11 and
     /// -6.71 dB; a skirt of -70.9 dB that falls to -96.7 once the tone
-    /// stops, over a floor of 1.0e-4 RMS.
+    /// stops, over a floor of 1.0e-4 RMS; and 12.56 dB more of it at the
+    /// bottom of Bias.
     #[test]
     fn the_hiss_is_white_behind_the_playback_eq_and_the_modulation_noise_rides_the_signal() {
         let sr = 48_000.0_f32;
@@ -3724,10 +4127,11 @@ mod tests {
         let during = &out[(sr * 0.9) as usize..(sr * 0.9) as usize + second];
         let after = &out[(sr * 2.5) as usize..(sr * 2.5) as usize + second];
         let tone = band(during, sr.into(), 1_000.0).powi(2);
-        let skirt = |seg: &[f32]| {
+        let skirt_under = |seg: &[f32], tone: f64| {
             let bins: f64 = (795..=805).map(|f| band(seg, sr.into(), f64::from(f)).powi(2)).sum();
             10.0 * (bins * 10.0 / (11.0 * 1.5) / tone).log10()
         };
+        let skirt = |seg: &[f32]| skirt_under(seg, tone);
         let (with, without) = (skirt(during), skirt(after));
         assert!(
             (with + 72.5).abs() < 3.0,
@@ -3741,6 +4145,18 @@ mod tests {
         );
         let floor = rms(after);
         assert!(floor > 1.0e-7, "the hiss floor vanished entirely: {floor:.2e}");
+
+        // (d) An under-biased tape's grain is coarser: 2.1 dB more modulation
+        // noise for every dB under, so the bottom of Bias, 6 dB under,
+        // carries the same tone's skirt 12.6 dB higher.
+        let coarse = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &TapeParams { bias: 0.0, ..p }));
+        let during = &coarse[(sr * 0.9) as usize..(sr * 0.9) as usize + second];
+        let risen = skirt_under(during, band(during, sr.into(), 1_000.0).powi(2)) - with;
+        assert!(
+            (risen - 12.6).abs() < 1.5,
+            "at the bottom of Bias the tone's skirt stands {risen:+.1} dB over the aligned tape's, \
+             where an under-biased tape's coarser grain puts it 12.6 dB higher"
+        );
     }
 
     /// **The hiss floor and colour follow each speed's datasheet.**
@@ -3993,6 +4409,7 @@ mod tests {
             flutter: f32::NEG_INFINITY,
             rate: f32::NAN,
             wow_range: f32::NAN,
+            bias: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -4031,6 +4448,7 @@ mod tests {
                     flutter: end,
                     rate: end,
                     wow_range: end,
+                    bias: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -4331,7 +4749,16 @@ mod tests {
     /// a slow tape's self-erasure takes more from the 7 kHz fundamental than
     /// from the folds below it: the honest measure of the record stage is
     /// the input. At 15 ips against the output: -43.5 at the top, -95.5 at
-    /// a fresh tape's Drive.
+    /// a fresh tape's Drive. **And under-biased**, where the low shelf
+    /// before the curve puts the long wavelengths in hotter: what it adds is
+    /// bass, whose harmonics stay far under the 4x Nyquist, and at 3.75 ips
+    /// it is a wire at 7 kHz. So 3.75 ips at the bottom of Bias folds no more
+    /// than aligned, read against the output tone, within half a decibel
+    /// (measured -30.6 against aligned's -29.0). Not against the input tone:
+    /// there it reads -47.8, because the bias's own treble shelf, after the
+    /// curve, lifts the whole band above its 2.5 kHz corner by up to 5.6 dB,
+    /// the folds and the fundamental alike; that is a tone control on what
+    /// the curve made, not fold.
     #[test]
     fn full_drive_on_a_high_note_does_not_fold_the_band_back_on_itself() {
         let sr = 48_000.0_f32;
@@ -4352,13 +4779,14 @@ mod tests {
         let tone_in = band(&mono[lo..hi], sr.into(), 7_000.0);
 
         // The fold against the output tone, and against the input tone.
-        let fold = |drive: f32, speed: TapeSpeed| -> (f64, f64) {
+        let fold_at = |drive: f32, speed: TapeSpeed, bias: f32| -> (f64, f64) {
             let out = left(&feed(
                 &mut Tape::new(sr),
                 &to_stereo(&mono),
                 &TapeParams {
                     drive,
                     speed: speed.dial(),
+                    bias,
                     ..clean
                 },
             ));
@@ -4377,6 +4805,7 @@ mod tests {
             }
             (db(alias.sqrt() / fund.max(1.0e-12)), db(alias.sqrt() / tone_in))
         };
+        let fold = |drive: f32, speed: TapeSpeed| fold_at(drive, speed, 0.5);
         let residue = |drive: f32| fold(drive, TapeSpeed::Ips15).0;
 
         let slammed = residue(1.0);
@@ -4401,6 +4830,12 @@ mod tests {
                 speed.label()
             );
         }
+        let ((under, _), (aligned, _)) = (fold_at(1.0, TapeSpeed::Ips3_75, 0.0), fold(1.0, TapeSpeed::Ips3_75));
+        assert!(
+            under <= aligned + 0.5,
+            "full drive at 3.75 ips at the bottom of Bias folded {under:.1} dB of hash against the \
+             tone that came out, where aligned folds {aligned:.1}"
+        );
     }
 
     /// **The record level is not a volume control at the level the machine is
@@ -4428,10 +4863,11 @@ mod tests {
     /// takes more of the top at the dial's end. And a steady 0 VU tone at
     /// 100 Hz, the long wavelength a line-up that chased the erasure would
     /// have lifted, rises by no more than 0.05 dB from any tenth of Drive to
-    /// the next at any of the four speeds (model +0.002 dB at most, measured
-    /// +0.002 at 30 ips and none at the others). Not pinned: the
-    /// programme at 30 ips, whose last step rises +0.037 dB in the model,
-    /// too near the bar to be a fair pin.
+    /// the next at any of the four speeds and at the bottom, middle and top
+    /// of Bias, where the line-up is the machine's at that bias (model
+    /// +0.002 dB at most, measured +0.002 at 30 ips at every bias and none
+    /// at the others). Not pinned: the programme at 30 ips, whose last step rises
+    /// +0.037 dB in the model, too near the bar to be a fair pin.
     #[test]
     fn the_record_level_holds_its_level_where_the_machine_is_lined_up() {
         let sr = 48_000.0_f32;
@@ -4505,23 +4941,26 @@ mod tests {
         let (t_lo, t_hi) = ((sr * 0.3) as usize, (sr * 0.6) as usize);
         let tone_in = band(&hundred[t_lo..t_hi], sr.into(), 100.0);
         for speed in TapeSpeed::ALL {
-            let mut last = f64::INFINITY;
-            for step in 0..=10 {
-                let p = TapeParams {
-                    drive: step as f32 / 10.0,
-                    speed: speed.dial(),
-                    ..TapeParams::NEUTRAL
-                };
-                let out = left(&feed(&mut Tape::new(sr), &to_stereo(&hundred), &p));
-                let here = db(band(&out[t_lo..t_hi], sr.into(), 100.0) / tone_in);
-                assert!(
-                    here <= last + 0.05,
-                    "at {} a 0 VU 100 Hz tone read {here:.3} dB at drive {}, against \
-                     {last:.3} dB the step before: the dial is a bass volume control",
-                    speed.label(),
-                    step as f32 / 10.0
-                );
-                last = here;
+            for bias in [0.0_f32, 0.5, 1.0] {
+                let mut last = f64::INFINITY;
+                for step in 0..=10 {
+                    let p = TapeParams {
+                        drive: step as f32 / 10.0,
+                        speed: speed.dial(),
+                        bias,
+                        ..TapeParams::NEUTRAL
+                    };
+                    let out = left(&feed(&mut Tape::new(sr), &to_stereo(&hundred), &p));
+                    let here = db(band(&out[t_lo..t_hi], sr.into(), 100.0) / tone_in);
+                    assert!(
+                        here <= last + 0.05,
+                        "at {} and Bias {bias} a 0 VU 100 Hz tone read {here:.3} dB at drive {}, \
+                         against {last:.3} dB the step before: the dial is a bass volume control",
+                        speed.label(),
+                        step as f32 / 10.0
+                    );
+                    last = here;
+                }
             }
         }
     }
@@ -4618,7 +5057,7 @@ mod tests {
     ///
     /// The figure is asked of the settings, so it is also pinned against
     /// them: each head and the pair add up to its figure exactly, and of
-    /// every position of the ten dials only the wow range moves it (the
+    /// every position of the eleven dials only the wow range moves it (the
     /// owner's ruling), the speed included, because a report that moved with
     /// a character dial would re-time the lane in the compensation graph
     /// every time somebody turned it. And the figure a face prints
@@ -4651,7 +5090,7 @@ mod tests {
                      to the {got} frames reported",
                     range.label()
                 );
-                for combo in 0..3_usize.pow(9) {
+                for combo in 0..3_usize.pow(10) {
                     let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
                     let p = TapeParams {
                         drive: at(0),
@@ -4664,6 +5103,7 @@ mod tests {
                         flutter: at(7),
                         rate: at(8),
                         wow_range: range.dial(),
+                        bias: at(9),
                     };
                     assert_eq!(
                         unit.latency_frames(&p),
@@ -5217,7 +5657,7 @@ mod tests {
         // Each floor is 3 dB under what the knob measured from a fresh
         // tape, rounded down to the whole decibel; the measured figure is
         // beside it.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 10] = [
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 11] = [
             // -3.7 dB.
             ("drive", |p, v| p.drive = v, -7.0),
             // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
@@ -5251,6 +5691,9 @@ mod tests {
             // +3.0 dB: the deep head plays the tape 23 ms later, with a
             // cassette's sway on it.
             ("wow_range", |p, v| p.wow_range = v, 0.0),
+            // -4.6 dB: the top of the dial dulls 10 kHz by seven decibels at
+            // 15 ips, and the bottom lifts it and saturates the bass sooner.
+            ("bias", |p, v| p.bias = v, -8.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -5617,35 +6060,260 @@ mod tests {
         );
     }
 
-    /// **The line-up tone comes back at its level at every speed.**
+    /// **The line-up tone comes back at its level at every speed and bias.**
     ///
     /// A machine is lined up with a 1 kHz tone at 0 VU, and the line-up's
     /// whole job is that tone: from the bottom of the dial to the Drive a
-    /// fresh tape opens at and a tenth past it, at all four speeds, it comes
-    /// back within 0.35 dB of where it went in (model 0.23 at most; measured
-    /// -0.24 dB at 3.75 ips at Drive 0.6, and 0.05 or under at the other
-    /// three). What is left over is the self-erasure the slow speeds already
-    /// do at that level, and the refused flux's lift past where its
-    /// correction holds.
+    /// fresh tape opens at and a tenth past it, at all four speeds, and at
+    /// the bottom, middle and top of Bias, where the machine is lined up
+    /// again (the bias shelf is unity at 1 kHz, and the line-up reads the
+    /// record level the tone meets through the under-bias shelf), it comes
+    /// back within 0.35 dB of where it went in (model 0.23 at most;
+    /// measured, at its worst, -0.25 dB at 3.75 ips and Drive 0.6 at the
+    /// bottom of Bias, -0.24 aligned and at the top, and under 0.08 at the
+    /// other three speeds). What is left over is the
+    /// self-erasure the slow speeds already do at that level, and the
+    /// refused flux's lift past where its correction holds.
     #[test]
     fn the_line_up_tone_comes_back_at_its_level_at_every_speed_and_bias() {
         let sr = 48_000.0_f32;
         let amp = 10.0_f32.powf(-18.0 / 20.0) * std::f32::consts::SQRT_2;
         for speed in TapeSpeed::ALL {
-            for step in 0..=6 {
-                let p = TapeParams {
-                    drive: step as f32 / 10.0,
-                    speed: speed.dial(),
-                    ..TapeParams::NEUTRAL
-                };
-                let level = tone_through(&p, sr, 1_000.0, amp, 0.2, 0.2, None);
+            for bias in [0.0_f32, 0.5, 1.0] {
+                for step in 0..=6 {
+                    let p = TapeParams {
+                        drive: step as f32 / 10.0,
+                        speed: speed.dial(),
+                        bias,
+                        ..TapeParams::NEUTRAL
+                    };
+                    let level = tone_through(&p, sr, 1_000.0, amp, 0.2, 0.2, None);
+                    assert!(
+                        level.abs() < 0.35,
+                        "at {} Drive {} and Bias {bias} the 0 VU line-up tone comes back {level:+.3} dB",
+                        speed.label(),
+                        step as f32 / 10.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Bias dial's position for a bias of `b` dB re aligned
+    /// ([`BIAS_RANGE_DB`]).
+    fn bias_at(b: f64) -> f32 {
+        ((b / f64::from(BIAS_RANGE_DB) + 1.0) / 2.0) as f32
+    }
+
+    /// **Over-bias dulls the top and under-bias lifts it, by the published
+    /// slope.**
+    ///
+    /// A tape's small-signal treble falls about 0.8 dB at 10 kHz for every
+    /// dB of over-bias at 15 ips, faster at 16 kHz, and rises toward a peak
+    /// about 5.4 dB under the aligned point; the machine is lined up at
+    /// 1 kHz after every change, so 1 kHz is what everything is read
+    /// against. At 15 ips, Drive 0.2 and -30 dBFS: the 10 kHz slope at
+    /// aligned is -0.95 to -0.65 dB per dB and 16 kHz's -1.5 to -0.9 (model
+    /// -0.81 and -1.17); 10 kHz at the bottom of the dial stands 2.3 to
+    /// 3.4 dB over aligned and at the top 6.3 to 8.3 under (model +2.76 and
+    /// -7.16). The published ladders, 10 kHz against a long wavelength from
+    /// the peak to aligned, are each speed's: 4.9 to 6.2 dB at 3.75 ips, 4.1
+    /// to 5.4 at 7.5, 2.6 to 3.4 at 15 and 0.9 to 1.6 at 30 (model 5.62,
+    /// 4.76, 3.00 and 1.24).
+    ///
+    /// **The bias tilt is pinned, as a decision.** Holding 1 kHz leaves a
+    /// long wavelength where the shelf puts it, and at 3.75 ips, where even
+    /// 1 kHz is short enough for over-bias to dull, that is audible: a
+    /// 100 Hz tone stands 2.5 dB over the aligned machine's at the top of
+    /// the dial, within 0.4 dB, and 0.85 under at the bottom, within 0.25;
+    /// 0.76 over at 7.5 ips, within 0.25; and within 0.3 at 15 and 30. Each
+    /// is read against the same tone through the aligned machine, which is
+    /// the bias's own share: the head's own low end takes a third of a
+    /// decibel at 100 Hz at 30 ips whatever the bias. And the top of the
+    /// dial reads the same 10 kHz at 44.1, 48 and 96 kHz within 0.2 dB.
+    /// Measured: -0.79 and -1.13 dB per dB; +2.76 and -7.10 dB; ladders of
+    /// 5.61, 4.75, 3.00 and 1.25 dB; the tilt +2.54 and -0.79 at 3.75 ips,
+    /// +0.81 at 7.5, +0.22 at 15 and +0.06 at 30; and -7.63 dB at all three
+    /// rates within 0.002.
+    #[test]
+    fn over_bias_dulls_the_top_and_under_bias_lifts_it_by_the_published_slope() {
+        let amp = 10.0_f32.powf(-30.0 / 20.0);
+        let line = |speed: TapeSpeed, b: f64, sr: f32, hz: f64| {
+            let p = TapeParams {
+                drive: 0.2,
+                speed: speed.dial(),
+                bias: bias_at(b),
+                ..TapeParams::NEUTRAL
+            };
+            tone_through(&p, sr, hz, amp, 0.2, 0.2, None)
+        };
+        let sr = 48_000.0_f32;
+        let studio = TapeSpeed::Ips15;
+        // 10 and 16 kHz against 1 kHz, a quarter of a decibel either side
+        // of aligned.
+        let (up, down) = (line(studio, 0.25, sr, 1_000.0), line(studio, -0.25, sr, 1_000.0));
+        let slope = |hz: f64| ((line(studio, 0.25, sr, hz) - up) - (line(studio, -0.25, sr, hz) - down)) / 0.5;
+        let (s10, s16) = (slope(10_000.0), slope(16_000.0));
+        assert!(
+            (-0.95..=-0.65).contains(&s10),
+            "at 15 ips 10 kHz moves {s10:+.3} dB per dB of bias at aligned"
+        );
+        assert!(
+            (-1.5..=-0.9).contains(&s16),
+            "at 15 ips 16 kHz moves {s16:+.3} dB per dB of bias at aligned"
+        );
+        let top = |b: f64| line(studio, b, sr, 10_000.0) - line(studio, b, sr, 1_000.0);
+        let aligned = top(0.0);
+        let (lift, dull) = (top(-6.0) - aligned, top(6.0) - aligned);
+        assert!(
+            (2.3..=3.4).contains(&lift),
+            "at 15 ips the bottom of Bias lifts 10 kHz {lift:+.2} dB over aligned"
+        );
+        assert!(
+            (-8.3..=-6.3).contains(&dull),
+            "at 15 ips the top of Bias takes 10 kHz {dull:+.2} dB under aligned"
+        );
+
+        for (speed, ladder, tilt) in [
+            (TapeSpeed::Ips3_75, 4.9..=6.2, 2.1..=2.9),
+            (TapeSpeed::Ips7_5, 4.1..=5.4, 0.51..=1.01),
+            (TapeSpeed::Ips15, 2.6..=3.4, -0.3..=0.3),
+            (TapeSpeed::Ips30, 0.9..=1.6, -0.3..=0.3),
+        ] {
+            let hundred = |b: f64| line(speed, b, sr, 100.0);
+            let held = hundred(0.0);
+            let swing = (line(speed, -5.4, sr, 10_000.0) - hundred(-5.4)) - (line(speed, 0.0, sr, 10_000.0) - held);
+            assert!(
+                ladder.contains(&swing),
+                "at {} 10 kHz against 100 Hz swings {swing:+.2} dB from the bias peak to aligned, \
+                 outside {ladder:?}",
+                speed.label()
+            );
+            let over = hundred(6.0) - held;
+            assert!(
+                tilt.contains(&over),
+                "at {} the top of Bias leaves a 100 Hz tone {over:+.2} dB from the aligned machine's, \
+                 outside {tilt:?}",
+                speed.label()
+            );
+            if speed == TapeSpeed::Ips3_75 {
+                let under = hundred(-6.0) - held;
                 assert!(
-                    level.abs() < 0.35,
-                    "at {} Drive {} the 0 VU line-up tone comes back {level:+.3} dB",
-                    speed.label(),
-                    step as f32 / 10.0
+                    (under + 0.85).abs() <= 0.25,
+                    "at 3.75 ips the bottom of Bias leaves a 100 Hz tone {under:+.2} dB from the aligned \
+                     machine's"
                 );
             }
+        }
+
+        let rates: Vec<f64> = [44_100.0_f32, 48_000.0, 96_000.0]
+            .into_iter()
+            .map(|sr| line(studio, 6.0, sr, 10_000.0) - line(studio, 6.0, sr, 1_000.0))
+            .collect();
+        let spread = rates.iter().fold(f64::MIN, |m, v| m.max(*v)) - rates.iter().fold(f64::MAX, |m, v| m.min(*v));
+        assert!(
+            spread < 0.2,
+            "the top of Bias reads 10 kHz {rates:.2?} dB against 1 kHz at 44.1, 48 and 96 kHz"
+        );
+    }
+
+    /// **Under-bias saturates sooner without moving the line-up.** An
+    /// under-biased tape's bass meets the curve hotter, which is a lower
+    /// ceiling and more third harmonic on a tone at the same level, while
+    /// the machine lined up again at 1 kHz plays the tone back where it
+    /// was. At 15 ips and Drive 0.6, a 220 Hz tone at 0 VU at the bottom of
+    /// Bias carries at least three times the aligned tape's HD3 (model
+    /// 6.8 times), at a level within half a decibel of the aligned tape's
+    /// (model -0.13 dB). Measured: 6.8 times (4.83 against 0.71 %), at
+    /// -0.11 dB.
+    #[test]
+    fn under_bias_saturates_sooner_without_moving_the_line_up() {
+        let sr = 48_000.0_f32;
+        let at = |bias: f32| TapeParams {
+            drive: 0.6,
+            bias,
+            ..TapeParams::NEUTRAL
+        };
+        let hd3 = |bias: f32| 10.0_f64.powf(tone_through(&at(bias), sr, 220.0, zero_vu(), 0.3, 0.6, Some(3.0)) / 20.0);
+        let level = |bias: f32| tone_through(&at(bias), sr, 220.0, zero_vu(), 0.3, 0.6, None);
+        let (under, aligned) = (hd3(0.0), hd3(0.5));
+        assert!(
+            under >= 3.0 * aligned,
+            "under-biased, a 0 VU 220 Hz tone carries {:.2} % HD3 against {:.2} % aligned: only {:.1} times",
+            under * 100.0,
+            aligned * 100.0,
+            under / aligned
+        );
+        let moved = level(0.0) - level(0.5);
+        assert!(
+            moved.abs() < 0.5,
+            "under-biased, the 0 VU 220 Hz tone comes back {moved:+.2} dB from the aligned tape's"
+        );
+    }
+
+    /// The tape's maximum output level at 1 kHz through `p`: the output, in
+    /// dB re 0 VU, at the input level where the third harmonic reaches 3 %
+    /// of the fundamental, found by bisection.
+    fn mol(p: &TapeParams, sr: f32) -> f64 {
+        let at = |level_db: f64| zero_vu() * 10.0_f32.powf(level_db as f32 / 20.0);
+        let (mut lo, mut hi) = (-12.0_f64, 24.0_f64);
+        for _ in 0..16 {
+            let mid = 0.5 * (lo + hi);
+            if tone_through(p, sr, 1_000.0, at(mid), 0.1, 0.05, Some(3.0)) < db(0.03) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let level = 0.5 * (lo + hi);
+        level + tone_through(p, sr, 1_000.0, at(level), 0.1, 0.05, None)
+    }
+
+    /// **Under-bias takes the bass's headroom first and leaves the treble
+    /// its own.**
+    ///
+    /// The datasheets put an under-biased tape's maximum output about
+    /// 1.4 dB lower for every dB it is under, and its 10 kHz ceiling where
+    /// it was or a little higher: bias reaches the curve at long
+    /// wavelengths only. So at 15 ips and Drive 0.6 the 1 kHz MOL falls
+    /// 1.2 to 1.6 dB per dB, from aligned to 3 and to 6 dB under (model 1.45
+    /// and 1.37); and a 38.1 µm tone (2.5, 5 and 10 kHz at 3.75, 7.5 and
+    /// 15 ips), read as its output at its own 1 dB compression point
+    /// against the 1 kHz small-signal level, comes out at least a decibel
+    /// higher at the bottom of Bias than aligned (model +1.90, +2.50 and
+    /// +2.55): the shelf that lifts its small-signal level is after the
+    /// curve, and the low shelf before the curve barely reaches it.
+    /// Measured: -1.45 and -1.37 dB per dB; +1.91, +2.52 and +2.63 dB.
+    #[test]
+    fn under_bias_takes_the_bass_headroom_first_and_leaves_the_treble_its_own() {
+        let sr = 48_000.0_f32;
+        let at = |speed: TapeSpeed, b: f64| TapeParams {
+            drive: 0.6,
+            speed: speed.dial(),
+            bias: bias_at(b),
+            ..TapeParams::NEUTRAL
+        };
+        let aligned = mol(&at(TapeSpeed::Ips15, 0.0), sr);
+        for under in [3.0, 6.0] {
+            let slope = (mol(&at(TapeSpeed::Ips15, -under), sr) - aligned) / under;
+            assert!(
+                (-1.6..=-1.2).contains(&slope),
+                "at 15 ips {under} dB of under-bias moves the 1 kHz MOL {slope:+.2} dB per dB"
+            );
+        }
+        let small = zero_vu() * 10.0_f32.powf(-30.0 / 20.0);
+        for (speed, hz) in [(TapeSpeed::Ips3_75, 2_500.0), (TapeSpeed::Ips7_5, 5_000.0), (TapeSpeed::Ips15, 10_000.0)] {
+            let ceiling = |b: f64| {
+                let p = at(speed, b);
+                let gain = |f: f64| tone_through(&p, sr, f, small, 0.1, 0.05, None);
+                compression_point(&p, sr, hz) + (gain(hz) - 1.0) - gain(1_000.0)
+            };
+            let kept = ceiling(-6.0) - ceiling(0.0);
+            assert!(
+                kept >= 1.0,
+                "at {} a {hz} Hz tone's ceiling moves {kept:+.2} dB from aligned to the bottom of Bias",
+                speed.label()
+            );
         }
     }
 
@@ -5770,11 +6438,12 @@ mod tests {
     /// **The play head never runs off its tape at any setting.**
     ///
     /// (a) Every speed, on either head, at the ends and middle of Rate, with
-    /// Wow, Flutter and Hiss at their tops, ten seconds of the transport at
-    /// 44.1 kHz each: no head is ever held inside the line (the safety net
-    /// catches nothing), and no track's head, its sway and its own modulation
-    /// noise together, ever sits further from its rest than that head's
-    /// travel. Where the parts ask for more than that, the governor shares
+    /// Wow, Flutter and Hiss at their tops and the bias at its bottom, whose
+    /// coarser grain asks the most of the modulation noise, ten seconds of
+    /// the transport at 44.1 kHz each: no head is ever held inside the line
+    /// (the safety net catches nothing), and no track's head, its sway and
+    /// its own modulation noise together, ever sits further from its rest
+    /// than that head's travel. Where the parts ask for more than that, the governor shares
     /// it; nothing is clipped. (b) And the switch between the heads, which is
     /// where a cassette's excursion could land on a studio head: the range
     /// thrown every half second while Rate and Speed jump every second, from
@@ -5811,6 +6480,7 @@ mod tests {
                         rate,
                         speed: speed.dial(),
                         wow_range: range.dial(),
+                        bias: 0.0,
                         ..TapeParams::default()
                     };
                     let mut unit = Tape::new(sr);
@@ -6113,12 +6783,17 @@ mod tests {
     /// the louder of the two settings' own steady state, plus 6 dB. And the
     /// range switch fades the heads with equal power, two copies of the tone
     /// 23 ms apart, so its level never rises past the steady tone's by more
-    /// than 3.2 dB. (Bias, Age and Damage join this when they land.)
-    /// Measured: at most +0.85 dB above 12 kHz, the range into the deep
-    /// head, and every other throw under the louder steady state; the
-    /// heads' fade swells the tone +2.48 dB into the deep head, whose
-    /// cassette starts from nothing so the two copies nearly agree, and not
-    /// at all on the way back.
+    /// than 3.2 dB. (Age and Damage join this when they land.) Bias's
+    /// under-bias shelf and its inverse straddle the record stage's
+    /// oversampler, so the inverse takes each design over 44 frames after
+    /// the shelf does; designed together, each design while the bias glided
+    /// was a 44-frame step in the bass, +9.3 dB above 12 kHz.
+    /// Measured: at most +3.9 dB above 12 kHz, Bias thrown from its bottom
+    /// to its top, its shelves redesigned a sub-block at a time through the
+    /// glide, and +0.6 or under for every other throw; the heads' fade
+    /// swells the tone +2.48 dB into the deep head, whose cassette starts
+    /// from nothing so the two copies nearly agree, and not at all on the
+    /// way back.
     #[test]
     fn a_moving_control_never_clicks() {
         let sr = 48_000.0_f32;
@@ -6163,7 +6838,8 @@ mod tests {
                 6 => p.speed = v,
                 7 => p.flutter = v,
                 8 => p.rate = v,
-                _ => p.wow_range = v,
+                9 => p.wow_range = v,
+                _ => p.bias = v,
             }
             p
         };
@@ -6171,8 +6847,8 @@ mod tests {
             6 => (TapeSpeed::Ips15.dial(), TapeSpeed::Ips3_75.dial()),
             _ => (0.0, 1.0),
         };
-        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range"];
-        for k in 0..10 {
+        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias"];
+        for k in 0..names.len() {
             let (a, b) = ends(k);
             for (x, y) in [(a, b), (b, a)] {
                 let heard = thrown(&set(k, x), &set(k, y));
