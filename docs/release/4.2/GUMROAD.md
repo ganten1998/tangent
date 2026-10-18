@@ -1,6 +1,6 @@
 # Gumroad product page for 4.2
 
-Paste-ready copy for <https://ganten.gumroad.com/l/ivory>. The product is the
+Paste-ready copy for <https://ganten.gumroad.com/l/tangent>. The product is the
 **supporter key**, not the app: the app is free and always has been, and the
 page has to say so before it says anything else or the whole thing reads as a
 paywall with the price filed off.

@@ -14446,16 +14446,17 @@ fn show_on(
                                 // for a key and never used to say where one
                                 // comes from — the only purchase link lived
                                 // in the README, which a person inside the
-                                // app is not reading. Still `/l/ivory`: the
-                                // slug is the one commercial URL the rename
-                                // deliberately left alone, because every key
-                                // email ever sent points at it.
+                                // app is not reading. It is `/l/tangent`
+                                // since the store's permalink was renamed;
+                                // the old slug redirects to it, which keeps
+                                // the link in every key email ever sent
+                                // working.
                                 ui.hyperlink_to(
-                                    RichText::new("ganten.gumroad.com/l/ivory")
+                                    RichText::new("ganten.gumroad.com/l/tangent")
                                         .font(bold(11.0))
                                         .color(t.text)
                                         .underline(),
-                                    "https://ganten.gumroad.com/l/ivory",
+                                    "https://ganten.gumroad.com/l/tangent",
                                 );
                             }
                             ui.add_space(8.0);
@@ -20102,7 +20103,7 @@ at: None,
         });
         let (painted, _) = run_picker(&mut dialog);
         assert!(
-            painted.contains("ganten.gumroad.com/l/ivory"),
+            painted.contains("ganten.gumroad.com/l/tangent"),
             "no way to buy a key from the dialog that asks for one: {painted}"
         );
         // **What the key does, all three facts.** The free desk's size from

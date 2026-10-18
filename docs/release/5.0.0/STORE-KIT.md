@@ -352,7 +352,7 @@ a supporter key removes the limit.
               no account.
             </p>
             <p>
-              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/ivory" target="_blank" rel="noopener">Support it</a>
+              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/tangent" target="_blank" rel="noopener">Support it</a>
             </p>
             <p class="post__tags">
               <span class="tag">rust</span>

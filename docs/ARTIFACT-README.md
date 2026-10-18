@@ -307,6 +307,6 @@ THANKS
   Hatsu, for extensive Windows testing and feedback.
 
 Tangent is free with up to 32 tracks, and a supporter key removes the limit:
-https://ganten.gumroad.com/l/ivory
+https://ganten.gumroad.com/l/tangent
 Source code, release notes and the issue tracker:
 https://github.com/ganten1998/tangent

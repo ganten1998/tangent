@@ -4,7 +4,7 @@
 
 Free with up to 32 tracks; a supporter key removes the limit.
 
-### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
+### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/tangent)
 
 ![The arrangement: drum, piano and audio tracks with MIDI and audio clips, a volume automation lane under the piano track, and the recorder band with its spectrum, clock and transport above](docs/img/screenshot-arrangement.png)
 
@@ -23,7 +23,7 @@ on a guitar neck and draws it on the circle of fifths. A take can also film
 the window itself, with your camera in it.
 
 Tangent is free and MIT licensed. The free app holds up to 32 tracks, and a
-[supporter key](https://ganten.gumroad.com/l/ivory) removes the limit. It
+[supporter key](https://ganten.gumroad.com/l/tangent) removes the limit. It
 works offline, with no account and no telemetry.
 
 ## Download
@@ -167,7 +167,7 @@ MIDI tracks, audio tracks and folders count. Buses, returns, sends and routes
 have no limit for anyone and are never counted. Every feature on this page is
 in the free app, with no trial, no time limit and no account.
 
-A [supporter key](https://ganten.gumroad.com/l/ivory) ($9 or more, pay what
+A [supporter key](https://ganten.gumroad.com/l/tangent) ($9 or more, pay what
 you want) removes the track limit. Keys have no expiry and cover every
 version, so a key bought for 4.x does the same in 5.0. The limit only ever
 stops a new track: a project with more than 32 tracks opens, plays, edits,

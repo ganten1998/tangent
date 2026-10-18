@@ -64,11 +64,12 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   **DONE WHEN** the Windows arm folds into the software-encoder arm.
 - [ ] **W11 · About still says "Simple MIDI Keyboard Monitor with Advanced Chord Detection"**
   (`dialogs.rs:5656`), directly above "Version 5.0.0-beta.15". Draw the Tonnetz mark there too.
-- [ ] **W12 · README sells the retired VST3 plugin** (`:37, :45, :53-64, :134-137`) and links
-  Gumroad at **`/l/ivory`** — the one commercial URL the rename was supposed to protect.
+- [X] **W12 · README sells the retired VST3 plugin** (`:37, :45, :53-64, :134-137`) and links
+  Gumroad at the pre-rename permalink — the one commercial URL the rename was supposed to protect.
   *(2026-10-10: the plugin half is closed. The README no longer sells it (012aebd), and with the
-  plugin crate removed its "every crate in this repo is MIT" line is true. The Gumroad link
-  still reads `/l/ivory`.)*
+  plugin crate removed its "every crate in this repo is MIT" line is true. 2026-10-18: so is the
+  Gumroad half. The permalink is `/l/tangent`, the old one redirects to it, and the README,
+  README.txt and the key dialog link the new one.)*
 - [ ] **W13 · README claims the config path was never changed** so nobody's settings are orphaned.
   False in all three of its claims now (crates renamed, bundle id renamed, config path changed).
 - [ ] **W14 · `docs/ARTIFACT-README.md`** — shipped as `README.txt` inside *every* artifact — says
