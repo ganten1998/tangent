@@ -1419,7 +1419,7 @@ impl Palette {
 
 /// The AUTO-PALETTES: **one per THEME, named for it.**
 ///
-/// They were eight abstract sets (IVORY, EMBER, TIDE…) that sixteen themes
+/// They were eight abstract sets (EMBER, TIDE…) that sixteen themes
 /// mapped onto, several sharing. The owner's word was "pick and choose": a
 /// palette per theme, named so you can put Rhodes' colours on the Iris desk
 /// if that is what you want. AUTO in the track menu is the ordinary answer

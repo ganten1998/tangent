@@ -809,8 +809,8 @@ const ARM_SLOP: f32 = 6.0;
 
 /// Stable surface identities. As windows these are viewport ids; inline they
 /// are `Area` ids. One string each, so the two paths cannot drift.
-const MENU_ID: &str = "ivory-menu";
-const SUBMENU_ID: &str = "ivory-menu-sub";
+const MENU_ID: &str = "tangent-menu";
+const SUBMENU_ID: &str = "tangent-menu-sub";
 
 /// The menu, in four compartments.
 ///

@@ -23,7 +23,7 @@ pub fn main() {
 mod imp {
     /// A logger in twenty lines rather than a dependency.
     ///
-    /// `ivory` takes `log` but not `env_logger`, and this example exists to
+    /// `tangent` takes `log` but not `env_logger`, and this example exists to
     /// read wgpu-hal's own `log::debug!` lines — which are the only place the
     /// EGL negotiation is described. Adding a dev-dependency to see them would
     /// be a crate bought for one example.

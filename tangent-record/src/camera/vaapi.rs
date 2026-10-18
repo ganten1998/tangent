@@ -343,7 +343,7 @@ macro_rules! sym {
 
 fn debug(msg: &str) {
     if std::env::var_os("TANGENT_VAAPI_DEBUG").is_some() {
-        eprintln!("ivory vaapi: {msg}");
+        eprintln!("tangent vaapi: {msg}");
     }
 }
 

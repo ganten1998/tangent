@@ -235,11 +235,11 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
     if let Some(path) = custom_font_path {
         if let Ok(bytes) = std::fs::read(path) {
             defs.font_data.insert(
-                "IvoryCustom".to_owned(),
+                "TangentCustom".to_owned(),
                 Arc::new(FontData::from_owned(bytes)),
             );
-            regular.insert(0, "IvoryCustom".to_owned());
-            bold.insert(0, "IvoryCustom".to_owned());
+            regular.insert(0, "TangentCustom".to_owned());
+            bold.insert(0, "TangentCustom".to_owned());
         }
     }
 

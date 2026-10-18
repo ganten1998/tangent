@@ -14,14 +14,14 @@ fn notes(v: &[u8]) -> HashSet<u8> {
 /// Every test gets its own store path — never touch the real overrides.json.
 fn detector(name: &str) -> ChordDetector {
     let mut p = std::env::temp_dir();
-    p.push(format!("ivory-learn-it-{}-{}", std::process::id(), name));
+    p.push(format!("tangent-learn-it-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_file(&p);
     ChordDetector::new().with_overrides(OverrideStore::load_from(p))
 }
 
 fn store_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("ivory-learn-it-{}-{}", std::process::id(), name));
+    p.push(format!("tangent-learn-it-{}-{}", std::process::id(), name));
     p
 }
 

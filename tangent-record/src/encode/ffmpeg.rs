@@ -268,7 +268,7 @@ impl Encoder {
         // The writer owns the pipe for the whole take. It ends when the
         // channel closes, which `finish` does by dropping the sender.
         let writer = std::thread::Builder::new()
-            .name("ivory-encode".into())
+            .name("tangent-encode".into())
             .spawn(move || {
                 let mut alive = true;
                 // The last picture written, kept so a gap can be filled with

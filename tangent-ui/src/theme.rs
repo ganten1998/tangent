@@ -2303,7 +2303,7 @@ mod tests {
             );
         }
         assert!(
-            !EXAMPLE.contains("IVORY"),
+            !EXAMPLE.contains("EMBER"),
             "the retired abstract palette names are back in the example"
         );
     }

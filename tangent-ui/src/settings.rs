@@ -8171,7 +8171,7 @@ mod tests {
     #[test]
     fn a_backup_is_a_way_back_to_the_live_desk() {
         let dir = std::env::temp_dir()
-            .join(format!("ivory-backup-{}-{:?}", std::process::id(), std::thread::current().id()));
+            .join(format!("tangent-backup-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.backup.json");
         let _ = std::fs::remove_file(&path);

@@ -17,6 +17,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
   `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
   a shell or a launcher that still sets it needs the new name.
+- **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
+  see its MIDI client as `tangent` and its input port as `tangent-in`. A
+  patchbay that saved a connection to the names they had before (qpwgraph,
+  qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
+  save. Choosing a MIDI input in Tangent works as before.
 
 ## [5.1.0] - 2026-10-18
 

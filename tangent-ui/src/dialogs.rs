@@ -4946,7 +4946,7 @@ fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
 /// Stable surface identity: a viewport id on the desktop, an `Area` id in a
 /// plugin. `dialog: Option<Dialog>` means there is never more than one open, so
 /// one id serves them all and the window keeps its place between dialogs.
-const DIALOG_ID: &str = "ivory-dialog";
+const DIALOG_ID: &str = "tangent-dialog";
 
 /// **The STACKED window's identity** — the amp's pedal, opened over the amp.
 ///
@@ -4970,7 +4970,7 @@ const DIALOG_ID: &str = "ivory-dialog";
 /// window's own recorded scar ([`EXPORT_ID`]), and [`held_geometry`] keyed
 /// on one id with two titles takes its "two windows share a name" arm and
 /// re-places both every frame.
-const PEDAL_ID: &str = "ivory-dialog-pedal";
+const PEDAL_ID: &str = "tangent-dialog-pedal";
 
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
@@ -5027,7 +5027,7 @@ fn theme_of(face: Color32) -> DialogTheme {
 }
 
 /// Where this frame's face is kept for the windows that are NOT dialogs.
-const FACE_ID: &str = "ivory-dialog-face";
+const FACE_ID: &str = "tangent-dialog-face";
 
 /// The face the frozen pair used to be made of, and the answer [`live_face`]
 /// gives on a frame [`show`] has not run yet — which, with `show` called
@@ -6020,7 +6020,7 @@ fn shorten_middle(s: &str, max: usize) -> String {
 /// remembered geometry. Nothing else keyed off `DIALOG_ID` on its behalf:
 /// `pointer_over_dialog` and `dialog_drawn_inline` are both gated on a
 /// `Dialog` being open, which an export is not.
-const EXPORT_ID: &str = "ivory-export";
+const EXPORT_ID: &str = "tangent-export";
 
 /// **How much of the screen the export window takes.**
 ///

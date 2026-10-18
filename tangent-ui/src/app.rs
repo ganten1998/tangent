@@ -8452,7 +8452,7 @@ impl TangentApp {
     ) {
         let resp = ui.interact(
             ui.max_rect(),
-            egui::Id::new("ivory-main-bg"),
+            egui::Id::new("tangent-main-bg"),
             egui::Sense::click_and_drag(),
         );
         // **Ending a gesture is not interacting, and it happens first.**
@@ -70828,7 +70828,7 @@ mod tests {
     #[test]
     fn a_new_session_reclaims_an_unsaved_untitled() {
         let root = std::env::temp_dir().join(format!(
-            "ivory-fresh-dir-{}",
+            "tangent-fresh-dir-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -70866,7 +70866,7 @@ mod tests {
     #[test]
     fn a_scratch_with_a_built_kit_is_not_reclaimed() {
         let root = std::env::temp_dir().join(format!(
-            "ivory-kit-guard-{}",
+            "tangent-kit-guard-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);

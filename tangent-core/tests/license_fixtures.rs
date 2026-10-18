@@ -47,7 +47,7 @@ fn the_published_key_is_revoked_not_forged() {
 
 #[test]
 fn a_stored_published_key_unlocks_nothing() {
-    let dir = std::env::temp_dir().join(format!("ivory-lic-published-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tangent-lic-published-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("license.key");
     std::fs::write(&p, PUBLISHED_KEY).unwrap();
@@ -98,7 +98,7 @@ fn one_altered_character_is_rejected() {
 
 #[test]
 fn an_installed_key_survives_a_reload() {
-    let dir = std::env::temp_dir().join(format!("ivory-lic-install-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tangent-lic-install-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("license.key");
     let mut s = LicenseStore::load_from(&p);
@@ -112,7 +112,7 @@ fn an_installed_key_survives_a_reload() {
 
 #[test]
 fn installing_the_published_key_changes_nothing() {
-    let dir = std::env::temp_dir().join(format!("ivory-lic-install-pub-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tangent-lic-install-pub-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("license.key");
     let mut s = LicenseStore::load_from(&p);
@@ -126,7 +126,7 @@ fn installing_the_published_key_changes_nothing() {
 fn a_genuine_key_that_cannot_be_saved_is_honored_this_run_and_says_so() {
     // The store's parent "directory" is a regular FILE, so the temp-file write
     // fails deterministically on every platform, no permission games.
-    let blocker = std::env::temp_dir().join(format!("ivory-lic-blocker-{}", std::process::id()));
+    let blocker = std::env::temp_dir().join(format!("tangent-lic-blocker-{}", std::process::id()));
     std::fs::write(&blocker, "not a directory").unwrap();
     let mut s = LicenseStore::load_from(blocker.join("license.key"));
     assert_eq!(s.install(FIXTURE_KEY).unwrap_err(), LicenseError::Unsaved);

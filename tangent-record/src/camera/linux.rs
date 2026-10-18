@@ -391,7 +391,7 @@ pub(super) fn open(
     let thread_stop = Arc::clone(&stop);
     let thread_state = Arc::clone(&state);
     let join = std::thread::Builder::new()
-        .name("ivory-camera".to_owned())
+        .name("tangent-camera".to_owned())
         .spawn(move || {
             capture_loop(
                 cap,

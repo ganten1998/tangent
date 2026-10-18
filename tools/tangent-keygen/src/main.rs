@@ -1,6 +1,6 @@
-//! Ivory supporter-key minting tool. Runs on the owner's machine only.
+//! Tangent supporter-key minting tool. Runs on the owner's machine only.
 //!
-//! This crate is outside the Ivory workspace on purpose — see Cargo.toml. It
+//! This crate is outside the Tangent workspace on purpose — see Cargo.toml. It
 //! links `tangent-core`'s canonical payload/encoder so a minted key is encoded by
 //! exactly the code that will verify it.
 //!
@@ -232,7 +232,7 @@ fn usage() -> ! {
 }
 
 const USAGE: &str = "\
-tangent-keygen — mint Ivory supporter keys (owner tool, never shipped)
+tangent-keygen — mint Tangent supporter keys (owner tool, never shipped)
 
   genesis                            create the two signing keys (run once)
   mint [--name NAME] [--key 1|2]     mint a supporter key; prints it on stdout

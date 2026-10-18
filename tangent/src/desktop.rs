@@ -10194,8 +10194,7 @@ impl DesktopApp {
     /// as `NSOSPLastRootDirectory` in the app's own preference domain. On the
     /// owner's machine `org.codeberg.ganten1998.tangent.plist` holds
     /// `/Users/<user>`, written the minute he opened five panels to
-    /// demonstrate this; the previous identity's file,
-    /// `org.codeberg.ganten1998.ivory.plist`, still holds
+    /// demonstrate this; the previous identity's preference file still holds
     /// `~/Documents/Tangent Media/Projects`. So it did work, it stopped, and
     /// the boundary is the identity change rather than anything in this
     /// function's history — `git log -L` over the old `match` shows the
@@ -17259,7 +17258,7 @@ fn screen_reader_attached(_ctx: &egui::Context) -> bool {
     // what makes this true.
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        _ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
+        _ctx.accesskit_node_builder(egui::Id::new("tangent-a11y-probe"), |_| ())
             .is_some()
     }
 }

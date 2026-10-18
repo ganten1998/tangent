@@ -668,7 +668,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("ivory-ovr-test-{}-{}", std::process::id(), name));
+        p.push(format!("tangent-ovr-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -894,7 +894,7 @@ mod learning_tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("ivory-learn-test-{}-{}", std::process::id(), name));
+        p.push(format!("tangent-learn-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
         p
     }
