@@ -11993,6 +11993,11 @@ struct Renderer {
     /// The pass landed every level on its target (`Engine::land_gains_at`),
     /// and the motor's gain with them.
     motor_landed: bool,
+    /// **This pass's program does not continue the last pass's**: its
+    /// first chunk applied a seek, or took a loop's wrap (`run_transport`'s
+    /// flush). A hand-back pass then has nothing to cross into
+    /// (`render_inner`).
+    motor_jumped: bool,
     /// **The master meter's scale for this pass**: the motor's gain at the
     /// pass's start, so the meter reads what the speakers play through a
     /// fade and silence through a hold. 1.0 leaves the meter untouched.
@@ -13292,6 +13297,11 @@ impl Renderer {
             // the channels know where the timeline stands — the MIDI clips
             // play from here.
             let (at, rolling, jumped, wrap_from) = self.run_transport(n);
+            // A pass whose first chunk jumps does not continue the last
+            // pass's program: see the hand-back in `render_inner`.
+            if done == 0 && jumped {
+                self.motor_jumped = true;
+            }
             // **The land, on the first chunk that ROLLS at its generation**
             // or a later one (`Engine::land_gains_at`), never a parked chunk
             // before the locate arrives: the host's transport push comes a
@@ -14440,13 +14450,27 @@ impl Renderer {
             return;
         }
         let tap_frames = self.render_program(&mut dev[..need], program, now, heard);
+        // **A hand-back pass that begins with a jump has nothing to cross
+        // into.** Its first chunk applied a seek or took a loop's wrap, so
+        // its program does not continue the history the resampled path
+        // reads its first frames from, and the crossfade put the song from
+        // before the jump at the pass's head at full weight. A realtime
+        // export pressed while the tape is heard ramping lands its head in
+        // just such a pass (the park, the locate and the land all met by
+        // one), and its file began with a frame or two from before its
+        // span. The program is already the device's frames, so it is the
+        // pass, as a pass at rest would be, and so are the taps.
+        let direct = handback && self.motor_jumped;
         out.fill(0.0);
-        if ramp {
+        if direct {
+            let m = need.min(out.len());
+            out[..m].copy_from_slice(&dev[..m]);
+        } else if ramp {
             self.vs_out.run_ramp(&dev, program, out, dev_frames, frac, r0, r1);
         } else {
             self.vs_out.run(&dev, program, out, dev_frames, frac, r0);
         }
-        if handback {
+        if handback && !direct {
             crossfade_into(out, &dev[..need], dev_ch, dev_frames, 0, dev_frames);
         }
         self.vs_dev = dev;
@@ -14461,7 +14485,8 @@ impl Renderer {
             (&mut self.vs_reastream, &mut self.reastream_scratch, 2),
         ] {
             let n = dev_frames * ch;
-            if dst.len() < n || src.len() < n {
+            // Left as rendered by a hand-back that jumped: see above.
+            if dst.len() < n || src.len() < n || direct {
                 continue;
             }
             if ramp {
@@ -14528,6 +14553,7 @@ impl Renderer {
         self.meter_scale = self.motor.gain_now() as f32;
         self.live_struck = false;
         self.motor_landed = false;
+        self.motor_jumped = false;
         plan
     }
 
@@ -24977,6 +25003,7 @@ impl Engine {
             live_struck: false,
             room_tracking: false,
             motor_landed: false,
+            motor_jumped: false,
             meter_scale: 1.0,
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
@@ -32051,6 +32078,7 @@ mod tests {
             live_struck: false,
             room_tracking: false,
             motor_landed: false,
+            motor_jumped: false,
             meter_scale: 1.0,
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
@@ -52288,6 +52316,82 @@ mod tape_motor {
             armed.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits()),
             "a hard edge is not the unarmed desk's render"
         );
+    }
+
+    /// **A realtime export pressed while the tape is heard moving starts at
+    /// its head.**
+    ///
+    /// The export's press parks the motor, stops, locates to the span's head
+    /// and plays, and asks for the land on that locate (`start_bounce`).
+    /// When one pass meets all of it, the motor snaps to speed there, and
+    /// with the dial at rest that pass is the motor's hand-back to rest,
+    /// which crossfades the resampled path into the direct one. Its first
+    /// chunk applies the seek, so the resampled path's first frames were the
+    /// song from BEFORE the head, and the take, which is the export's file,
+    /// began with them at full weight. The span's head at 10 s, past the
+    /// clip, so the file must start silent, as the motor-off desk's does:
+    /// pressed mid start and mid stop, each press meeting a tape that is
+    /// moving and heard, the export's first pass is at its head and silent,
+    /// at the speakers and in the take.
+    #[test]
+    fn a_realtime_export_pressed_while_the_tape_moves_starts_at_its_head() {
+        for (what, coast) in [("mid start", false), ("mid stop", true)] {
+            let head = |armed: bool| {
+                let mut e = tone_desk(RATE, 500.0, 8.0);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                let mut t = Transport::new();
+                if armed {
+                    e.set_tape_motor(true, 0.5, 0.7);
+                }
+                t.locate(1.0);
+                run(&mut e, &mut t, 4, PASS);
+                t.toggle_play();
+                if coast {
+                    run(&mut e, &mut t, 200, PASS);
+                    t.stop();
+                    run(&mut e, &mut t, 10, PASS);
+                } else {
+                    run(&mut e, &mut t, 40, PASS);
+                }
+                if armed {
+                    let r = e.offline.as_ref().expect("an offline renderer");
+                    assert!(
+                        r.vs_motor_was && r.motor.gain_now() > 0.1,
+                        "{what}: the press did not meet a moving tape that is heard, so nothing was proved"
+                    );
+                }
+                // `start_bounce`, in its order, all before the next pass.
+                let mut taken = Vec::new();
+                tap.drain(&mut taken);
+                e.park_tape_motor();
+                t.stop();
+                t.locate(10.0);
+                t.toggle_play();
+                e.land_gains_at(t.generation());
+                let first = one(&mut e, &mut t, PASS);
+                taken.clear();
+                tap.drain(&mut taken);
+                assert_eq!(taken.len(), PASS * TAP_CHANNELS, "{what}: the take did not get the pass");
+                (first, taken)
+            };
+            let (armed, armed_take) = head(true);
+            let (plain, plain_take) = head(false);
+            assert!(
+                plain.out.iter().chain(&plain_take).all(|s| *s == 0.0),
+                "{what}: the motor-off desk's export did not start silent"
+            );
+            assert_eq!(armed.pos, plain.pos, "{what}: the export's first pass is not at its head");
+            assert!(
+                armed.out.iter().all(|s| *s == 0.0),
+                "{what}: the export's first pass carries {} from before its head",
+                peak(&armed.out)
+            );
+            assert!(
+                armed_take.iter().all(|s| *s == 0.0),
+                "{what}: the export's file begins with {} from before its head",
+                peak(&armed_take)
+            );
+        }
     }
 
     /// The audio track an input is bound to, beside the tone's lane.
