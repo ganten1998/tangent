@@ -249,7 +249,7 @@ costs nothing that was ever available — a GL adapter reaching the check is
 refused two lines later — and it is the difference between the app starting and
 not. Vulkan (hardware, or mesa's lavapipe) is what composites here.
 
-Note `IVORY_RENDERER=glow` is **not** an escape hatch on this platform: the
+Note `TANGENT_RENDERER=glow` is **not** an escape hatch on this platform: the
 renderer is hardcoded to Glow on everything but macOS, so the variable does
 nothing here. The crash was never the main window.
 
@@ -450,7 +450,7 @@ signature as the shim's fake buffer control, and should have been suspicious on
 its face. It was: `SNDCTL_DSP_GETODELAY` reports only the *hardware* queue, not
 the software one the application is actually queued behind, so the host's own
 `playback` timestamp under-reported and the probe believed it. The numbers
-above come from `IVORY_RAW_TIMING=1`, which ignores every backend's latency
+above come from `TANGENT_RAW_TIMING=1`, which ignores every backend's latency
 claims and measures wall clock from the callback that wrote the click to the
 callback that saw it — the only way to compare hosts that disagree about their
 own bookkeeping.
@@ -793,5 +793,5 @@ cargo build --release -p tangent --features recorder
 ./target/release/tangent
 
 # make it sound without MIDI hardware:
-IVORY_DEMO_NOTES=60,64,67,71 ./target/release/tangent
+TANGENT_DEMO_NOTES=60,64,67,71 ./target/release/tangent
 ```

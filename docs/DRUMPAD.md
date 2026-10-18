@@ -51,7 +51,7 @@ and it is draggable by its title strip.
 | Key | `tangent-ui/src/keys.rs` | `W` → `ToggleDrumpad`, gated on `recorder_shown`, clustered with Enter/Space at the table's end |
 | Engine | `tangent/src/instrument.rs` | `PadKit` (clips' swap protocol exactly), `PadVoice`/`PadPlay`, channel-10 branch in `collect_notes`, `mix_pads` between `mix_monitor` and the click, `Shared` pad atomics, `Engine::{set_pad_kit, set_pad_params, pad_peaks}`; render tests at the bottom |
 | Host | `tangent/src/desktop.rs` | `reload_pads` (+ its own `pad_cache` — `track_cache` evicts by what the ARRANGEMENT references), `PadHit` arm by `Audition`'s, params push in `push_monitor_settings`, peaks read in `after_frame`, the live mirror in the `pump_midi` closure |
-| Screenshot | `tangent/src/composite.rs` | `shot::drumpad` — `IVORY_SHOT=/tmp/dp.png cargo test -p tangent --bins shot::drumpad -- --ignored --nocapture` |
+| Screenshot | `tangent/src/composite.rs` | `shot::drumpad` — `TANGENT_SHOT=/tmp/dp.png cargo test -p tangent --bins shot::drumpad -- --ignored --nocapture` |
 
 The seams follow the house pattern end to end: the UI marks
 `drumpad_dirty`, the host drains `take_drumpad_dirty` and re-decodes;

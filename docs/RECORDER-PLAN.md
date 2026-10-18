@@ -1737,7 +1737,7 @@ Runs in about a second with no hardware.
 
 **Test B — the real pipeline, proven from the artifacts.** Inject a
 synchronising slate into all three streams at one known instant, gated behind
-`IVORY_RECORD_SLATE=1` in the repo's existing `IVORY_*` convention. Audio:
+`TANGENT_RECORD_SLATE=1` in the repo's existing `TANGENT_*` convention. Audio:
 electrically through a loopback device, never acoustically. Video: a synthetic
 camera behind the `VideoSource` trait emitting **binary-coded burnt-in
 timecode**, decoded back out of the *exported* file — which is the strongest

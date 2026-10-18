@@ -11,7 +11,7 @@
 //! Run the same capture at several depths and compare:
 //!
 //!   for n in 2 4 6 8; do
-//!     IVORY_V4L2_BUFFERS=$n cargo run --release -p tangent-record --example bufdepth -- 20
+//!     TANGENT_V4L2_BUFFERS=$n cargo run --release -p tangent-record --example bufdepth -- 20
 //!   done
 //!
 //! The honest question is whether depth still buys anything now that the
@@ -48,7 +48,7 @@ pub fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20.0);
-    let requested = std::env::var("IVORY_V4L2_BUFFERS").unwrap_or_else(|_| "(default)".into());
+    let requested = std::env::var("TANGENT_V4L2_BUFFERS").unwrap_or_else(|_| "(default)".into());
 
     let list = match cameras() {
         Ok(l) => l,

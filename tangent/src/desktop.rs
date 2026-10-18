@@ -486,7 +486,7 @@ struct Recorder {
     /// without it, ticking the box after a take would immediately open a Finder
     /// window for a recording made ten minutes ago.
     seen_take: Option<String>,
-    /// `IVORY_OPEN_EDITOR=1` bookkeeping. See `after_frame`.
+    /// `TANGENT_OPEN_EDITOR=1` bookkeeping. See `after_frame`.
     dev_editor_at: Option<std::time::Instant>,
     dev_editor_done: bool,
     /// The red button is DOWN: armed lanes are being recorded into the
@@ -1127,7 +1127,7 @@ struct Bounce {
     hw_flagged: bool,
 }
 
-/// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
+/// How long `TANGENT_OPEN_EDITOR` waits before opening, so the plugin has
 /// finished loading and the window has drawn at least one ordinary frame.
 #[cfg(feature = "recorder")]
 const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1536,9 +1536,9 @@ pub struct DesktopApp {
     /// the project's name and its dirtiness, and re-sending an unchanged
     /// string every frame is noise some window managers animate.
     last_title: String,
-    /// Frames counted by the `IVORY_GEOM_PROBE` diagnostic. See `update`.
+    /// Frames counted by the `TANGENT_GEOM_PROBE` diagnostic. See `update`.
     probe_frames: u32,
-    /// `IVORY_PACE_PROBE` accumulators: when the window last reported, how
+    /// `TANGENT_PACE_PROBE` accumulators: when the window last reported, how
     /// many frames since, and the frame times seen in that second.
     pace_since: Option<std::time::Instant>,
     pace_frames: u32,
@@ -2649,7 +2649,7 @@ fn strip_title(app: &TangentApp, node: tangent_ui::desk_id::Node) -> String {
     }
 }
 
-/// **The bay `IVORY_OPEN_EDITOR` names**: `1` or `patch` for the first
+/// **The bay `TANGENT_OPEN_EDITOR` names**: `1` or `patch` for the first
 /// row's first slot, `<row>,<slot>` for a row and the slot its strip shows
 /// (`desk_id::slot_key`), or any bay by its identity's text (`t40-c1-b0`,
 /// `drums-c0-b2`). `None` for anything else, and for a row the desk does
@@ -3111,7 +3111,7 @@ const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 /// of it, tessellation and the render included, so `cpu(prev) - update` is
 /// the part of a frame this function cannot see from inside itself.
 ///
-/// The same OnceLock discipline as `IVORY_PACE` and `IVORY_GEOM_PROBE`,
+/// The same OnceLock discipline as `TANGENT_PACE` and `TANGENT_GEOM_PROBE`,
 /// and the same rule for its cost: when the variable is unset every mark
 /// is one `bool` test and the log is never touched. A diagnostic that costs
 /// something when it is off is a diagnostic that gets deleted, and this
@@ -3285,7 +3285,7 @@ const METER_FLOOR: f32 = 1.0e-3;
 /// thread was delivering pictures, and the ledger held the window at
 /// `LIVE_TICK` for as long as the band was open, collecting frames from a
 /// thread that did not exist. The owner's desk, 2026-09-15, after every
-/// other pin had been found and removed: `IVORY_PACE_PROBE` read
+/// other pin had been found and removed: `TANGENT_PACE_PROBE` read
 /// `host_live=[camera]` on every second, at 55 fps, with no camera
 /// selected. A capture that is still opening owes nothing yet either: the
 /// gesture that opened it keeps the window live through `ACTIVITY_GRACE`,
@@ -6017,12 +6017,12 @@ impl DesktopApp {
         // meter, a scale and a gain-reduction bar are exactly the things that
         // have to be LOOKED at rather than reasoned about. Pushed after the
         // engine's own numbers, because it is overriding them.
-        //   IVORY_DEMO_LEVELS=1 /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_DEMO_LEVELS=1 /Applications/Tangent.app/Contents/MacOS/tangent
         // Read ONCE: the same OnceLock discipline as every other diagnostic
         // variable in this file. `var` walks the environment and allocates,
         // and this ran every frame.
         static DEMO_LEVELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DEMO_LEVELS.get_or_init(|| std::env::var_os("IVORY_DEMO_LEVELS").is_some()) {
+        if *DEMO_LEVELS.get_or_init(|| std::env::var_os("TANGENT_DEMO_LEVELS").is_some()) {
             // Every row metered, engine or none.
             state.row_peaks.resize(rows, [0.0; 2]);
             for (i, peaks) in state.row_peaks.iter_mut().chain(state.special_peaks.iter_mut()).enumerate() {
@@ -6250,11 +6250,11 @@ impl DesktopApp {
         }
         use tangent_ui::recorder::RecorderRequest as R;
 
-        // Dev hook, alongside IVORY_INLINE and IVORY_DEMO_NOTES: open slot 0's
+        // Dev hook, alongside TANGENT_INLINE and TANGENT_DEMO_NOTES: open slot 0's
         // editor once, a second in, without anybody clicking. It is how a
         // window-interaction bug gets reproduced and bisected from a script;
         // driving it by hand makes every measurement a different measurement.
-        //   IVORY_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
         //
         // **`=<strip>,<bay>` names a different bay**, because bay 1 of channel
         // 1 holds the built-in on a fresh desk and therefore opens the PATCH
@@ -6262,8 +6262,8 @@ impl DesktopApp {
         // so with the hook pinned to slot 0 there was no way to put it on
         // screen from a script at all — which is the one thing the hook exists
         // to make possible.
-        //   IVORY_OPEN_EDITOR=0,1 tangent      # channel 1, bay 2: empty
-        //   IVORY_OPEN_EDITOR=t40-c1-b0 tangent # a bay by identity
+        //   TANGENT_OPEN_EDITOR=0,1 tangent      # channel 1, bay 2: empty
+        //   TANGENT_OPEN_EDITOR=t40-c1-b0 tangent # a bay by identity
         // `<row>,<slot>` is a row and the slot its strip shows; any bay at
         // all, a special's or a pad's, is named by its identity's text
         // (design Appendix C). It was the frozen map's `(seat, bay)`, which
@@ -6272,7 +6272,7 @@ impl DesktopApp {
         // two environment walks a frame for a hook that ships inert.
         static OPEN_EDITOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let open_editor = OPEN_EDITOR
-            .get_or_init(|| std::env::var("IVORY_OPEN_EDITOR").ok())
+            .get_or_init(|| std::env::var("TANGENT_OPEN_EDITOR").ok())
             .as_deref();
         let dev_editor_bay = open_editor.and_then(|v| dev_editor_bay(&self.app, v));
         if let (false, Some(dev_bay)) = (self.recorder.dev_editor_done, dev_editor_bay) {
@@ -6295,7 +6295,7 @@ impl DesktopApp {
                             slot: 0,
                         });
                 }
-                eprintln!("IVORY_OPEN_EDITOR: opened {dev_bay}");
+                eprintln!("TANGENT_OPEN_EDITOR: opened {dev_bay}");
             }
             ctx.request_repaint();
         }
@@ -9857,7 +9857,7 @@ impl DesktopApp {
         // `bootstrap_project` and the tests still take it, and a fourth
         // answer is one call here, not a rewrite.
         //
-        // The dev hook keeps its door: `IVORY_ARRANGEMENT_PATH` names an
+        // The dev hook keeps its door: `TANGENT_ARRANGEMENT_PATH` names an
         // explicit document and touches no settings, which is a developer
         // aiming the app at a file, not a session coming back.
         //
@@ -21502,7 +21502,7 @@ impl eframe::App for DesktopApp {
             let dt = ctx.input(|i| i.unstable_dt);
             self.frame_log.end(dt, frame.info().cpu_usage);
         }
-        // **The geometry probe.** `IVORY_GEOM_PROBE=1` prints, once the
+        // **The geometry probe.** `TANGENT_GEOM_PROBE=1` prints, once the
         // window has settled, everything the app believes about where it is
         // — then closes itself through the ordinary quit path, because an
         // audio client that is killed rather than quit wedges CoreAudio for
@@ -21511,7 +21511,7 @@ impl eframe::App for DesktopApp {
         // environment and allocates, and a diagnostic that costs something
         // when it is off is a diagnostic that gets deleted.
         static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PROBE.get_or_init(|| std::env::var_os("IVORY_GEOM_PROBE").is_some()) {
+        if *PROBE.get_or_init(|| std::env::var_os("TANGENT_GEOM_PROBE").is_some()) {
             self.probe_frames += 1;
             if self.probe_frames == 120 {
                 let vp = ctx.input(|i| {
@@ -21535,7 +21535,7 @@ impl eframe::App for DesktopApp {
             }
             ctx.request_repaint();
         }
-        // **The pacing probe.** `IVORY_PACE_PROBE=1` prints once a second what
+        // **The pacing probe.** `TANGENT_PACE_PROBE=1` prints once a second what
         // the window is actually doing, because "the drag feels choppy" and
         // "the drag IS choppy" are different claims and only one of them can
         // be checked. Same OnceLock discipline as the geometry probe above:
@@ -21546,7 +21546,7 @@ impl eframe::App for DesktopApp {
         // frame in 240 good ones. `sends` counts window-size commands: on a
         // tiling manager that number staying flat is the whole fix.
         static PACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PACE.get_or_init(|| std::env::var_os("IVORY_PACE_PROBE").is_some()) {
+        if *PACE.get_or_init(|| std::env::var_os("TANGENT_PACE_PROBE").is_some()) {
             let now = std::time::Instant::now();
             let since = *self.pace_since.get_or_insert(now);
             self.pace_frames += 1;
@@ -23862,7 +23862,7 @@ mod tests {
     /// **Read-only with respect to the projects.** It opens each document and
     /// never saves; `Caps::NONE` leaves `persist_global_settings` down so
     /// nothing reaches the runner's own settings either, and
-    /// `IVORY_SETTINGS_PATH` is redirected as a second belt.
+    /// `TANGENT_SETTINGS_PATH` is redirected as a second belt.
     ///
     /// **The discard half of the probe cannot be measured here and reads
     /// zero.** Every event that would throw a look-ahead ring away is a
@@ -23880,7 +23880,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&shelf);
         // SAFETY: nothing else in this process has started a thread that
         // reads the environment, and the value is a path just created here.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", shelf.join("settings.json")) };
         // And the media roots, or the app resolves the owner's own Documents.
         unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
 
@@ -23959,7 +23959,7 @@ mod tests {
         let shelf = std::env::temp_dir().join(format!("tangent-click-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&shelf);
         // SAFETY: single-threaded here, and a path this process just made.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", shelf.join("settings.json")) };
         // And the media roots, or the app resolves the owner's own Documents.
         unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
         let ctx = egui::Context::default();
@@ -24068,7 +24068,7 @@ mod tests {
         // fault `desk_insert_state` documents, and it made a click hunt over
         // a real session a hunt over a session nobody has.
         //
-        // The shelf is the one the caller redirected `IVORY_SETTINGS_PATH`
+        // The shelf is the one the caller redirected `TANGENT_SETTINGS_PATH`
         // at, so this copies INTO scratch and never writes the project.
         if let Some(doc) = app.project_doc() {
             if let Some(dir) = doc.parent().map(|d| d.join("state")) {
@@ -30434,7 +30434,7 @@ mod tests {
     /// **The displaced-state test stays off the live shelf.** It once read
     /// and rewrote `insert-state-35-2.bin` - the master's sixth slot - beside
     /// the owner's own settings, with no redirect and no lock against the
-    /// tests that move `IVORY_SETTINGS_PATH`, and put the file back only at
+    /// tests that move `TANGENT_SETTINGS_PATH`, and put the file back only at
     /// the end: a failed assert left a foreign-tagged state file, and a live
     /// save in between was overwritten. Since the shelf took directories
     /// (`shelf::write_state_in`, `shelf::read_state`) it names a scratch
@@ -30455,7 +30455,7 @@ mod tests {
             "shelf::saved_state(",
             "shelf::state_path(",
             "global_dir(",
-            "IVORY_SETTINGS_PATH",
+            "TANGENT_SETTINGS_PATH",
             "set_var(",
         ] {
             let live: String = live.chars().filter(|c| !c.is_whitespace()).collect();
@@ -32178,7 +32178,7 @@ mod tests {
     /// opened the app to edit.
     ///
     /// `composite.rs` has always answered this by setting
-    /// `IVORY_SETTINGS_PATH` — honoured in every build — beside each of its
+    /// `TANGENT_SETTINGS_PATH` — honoured in every build — beside each of its
     /// app constructions. That was a convention nothing enforced, and the
     /// file that did not follow it is this one. So the convention is a test
     /// now: every app either file builds, through EITHER door
@@ -32204,7 +32204,7 @@ mod tests {
     /// `Caps::DESKTOP` and this goes red naming it. Run 2026-10-09 on
     /// `a_sample_loaded_during_a_session_rides_into_its_template_and_duplicate`
     /// (which sets no redirect) and on composite's `splash` shot with its
-    /// `IVORY_SETTINGS_PATH` misspelt: both red. Narrow `DOORS` back to
+    /// `TANGENT_SETTINGS_PATH` misspelt: both red. Narrow `DOORS` back to
     /// `new(` alone and it goes red on the empty count.
     #[test]
     fn no_test_in_this_crate_writes_the_real_settings_file() {
@@ -32261,11 +32261,11 @@ mod tests {
                     .unwrap_or(0)
                     .min(abs.saturating_sub(3_000));
                 let back = &body[opens..abs];
-                let redirected = back.contains("IVORY_SETTINGS_PATH");
+                let redirected = back.contains("TANGENT_SETTINGS_PATH");
                 assert!(
                     !desktop || redirected,
                     "{name}: a test builds a Caps::DESKTOP app without pointing \
-                     IVORY_SETTINGS_PATH somewhere safe first, so running the \
+                     TANGENT_SETTINGS_PATH somewhere safe first, so running the \
                      suite writes the user's own settings file (byte {abs} of \
                      the test module)"
                 );
@@ -32310,7 +32310,7 @@ mod tests {
     /// remembered project — a reopen that ran first and returned would put
     /// the last session back, which is the exact thing he asked to stop. It
     /// must still reach the template adopt, or a launch has nothing to stand
-    /// on. And the dev hook keeps its door: `IVORY_ARRANGEMENT_PATH` names
+    /// on. And the dev hook keeps its door: `TANGENT_ARRANGEMENT_PATH` names
     /// an explicit document, and that road must come BEFORE the adopt and
     /// RETURN, or the file a developer aimed the app at is replaced by an
     /// empty one. Reset Template must not go through this function either:
@@ -32350,7 +32350,7 @@ mod tests {
             .expect("the launch no longer stands on the template at all");
         let hook = launch
             .find("self.app.reopen_dev_hook_project()")
-            .expect("the IVORY_ARRANGEMENT_PATH dev hook has no door at launch");
+            .expect("the TANGENT_ARRANGEMENT_PATH dev hook has no door at launch");
         assert!(
             hook < adopt,
             "the launch adopts the template before it asks the dev hook, so \
@@ -33637,8 +33637,8 @@ mod tests {").expect("the tests module")];
 
     /// **No frame body reads the environment outside a once-only init.**
     ///
-    /// `IVORY_DEMO_LEVELS` was read in `fill_recorder_state` and
-    /// `IVORY_OPEN_EDITOR` twice in `after_frame`, every frame, for hooks
+    /// `TANGENT_DEMO_LEVELS` was read in `fill_recorder_state` and
+    /// `TANGENT_OPEN_EDITOR` twice in `after_frame`, every frame, for hooks
     /// that ship inert: three environment walks and three allocations a
     /// frame to learn nothing. Every diagnostic variable in this file is
     /// read once into a `OnceLock` now, and this holds the line for the
@@ -37803,7 +37803,7 @@ mod sidecar_walk_probe {
     use tangent_ui::desk_id::{state_file_name, Node, Rack, SeatBay, TrackId};
     use tangent_ui::desk_legacy::{identity_ids, V32_INSERT_SPACE, V32_TOTAL_SEATS};
 
-    /// **`IVORY_SETTINGS_PATH` is process-global, and tests are not.** Same
+    /// **`TANGENT_SETTINGS_PATH` is process-global, and tests are not.** Same
     /// reason and same shape as `SETTINGS_PATH_ENV` in `settings.rs`: cargo
     /// runs these on parallel threads in ONE process, so a settings path set
     /// here would be taken away under another test. The one test below that
@@ -37812,13 +37812,13 @@ mod sidecar_walk_probe {
     /// (`shelf::fs_calls`), so a count read here is this test's alone.
     pub(super) static SIDECAR_ENV: Mutex<()> = Mutex::new(());
 
-    /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
+    /// A throwaway folder. `TANGENT_PROBE_DIR` moves it onto whatever volume the
     /// question is about — the shelf that matters is a PROJECT folder, and a
     /// project folder is very often the one place a person keeps in Dropbox,
     /// where a stat is a round trip through a file provider rather than a hit
     /// in the local disk's cache.
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let root = std::env::var_os("IVORY_PROBE_DIR")
+        let root = std::env::var_os("TANGENT_PROBE_DIR")
             .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
         let dir = root.join(format!(
             "tangent-sidecar-{tag}-{}-{:?}",
@@ -38667,7 +38667,7 @@ mod sidecar_walk_probe {
     /// The tap is armed PROCESSED for both, so the only difference between the
     /// two numbers is where the knobs came from.
     ///
-    /// **Sandboxed, and in this module for that reason.** `IVORY_SETTINGS_PATH`
+    /// **Sandboxed, and in this module for that reason.** `TANGENT_SETTINGS_PATH`
     /// is process-global and `SIDECAR_ENV` is the one lock that makes writing
     /// a sidecar safe while the rest of the suite runs beside it.
     ///
@@ -38679,7 +38679,7 @@ mod sidecar_walk_probe {
         let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("export-mirror");
         // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", dir.join("settings.json")) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", dir.join("settings.json")) };
 
         // The shelf: the same unit, at the knobs it is born with, in the
         // bay's own state file.
@@ -38725,7 +38725,7 @@ mod sidecar_walk_probe {
         let untouched = stem_peak(&mut from_shelf);
 
         // SAFETY: still under `SIDECAR_ENV`.
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(

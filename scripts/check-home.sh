@@ -190,7 +190,7 @@ run() {
   (
     export CARGO_HOME="${CARGO_HOME:-$real/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real/.rustup}"
     export HOME="$scratch"
-    unset TANGENT_CONFIG_DIR TANGENT_MEDIA_ROOT IVORY_SETTINGS_PATH \
+    unset TANGENT_CONFIG_DIR TANGENT_MEDIA_ROOT TANGENT_SETTINGS_PATH TANGENT_ARRANGEMENT_PATH \
       XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
     exec "$@"
   ) || status=$?
@@ -418,9 +418,10 @@ selftest() {
   expect_run pass running "a write elsewhere in HOME passes, the app running" \
     sh -c 'mkdir -p "$HOME/elsewhere" && printf x > "$HOME/elsewhere/f"'
   expect_run pass absent "nothing written passes" true
-  TANGENT_CONFIG_DIR=/nowhere TANGENT_MEDIA_ROOT=/nowhere IVORY_SETTINGS_PATH=/nowhere \
+  TANGENT_CONFIG_DIR=/nowhere TANGENT_MEDIA_ROOT=/nowhere TANGENT_SETTINGS_PATH=/nowhere \
+    TANGENT_ARRANGEMENT_PATH=/nowhere \
     expect_run pass absent "the developer's switches do not reach the command" \
-    sh -c '[ -z "${TANGENT_CONFIG_DIR:-}${TANGENT_MEDIA_ROOT:-}${IVORY_SETTINGS_PATH:-}" ]'
+    sh -c '[ -z "${TANGENT_CONFIG_DIR:-}${TANGENT_MEDIA_ROOT:-}${TANGENT_SETTINGS_PATH:-}${TANGENT_ARRANGEMENT_PATH:-}" ]'
   expect_run fail absent "a failing command's status comes through" false
   return "$fails"
 }

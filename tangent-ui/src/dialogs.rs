@@ -10705,7 +10705,7 @@ fn show_on(
                                         // three-way match is the three numbers
                                         // — and the arm that says both is the
                                         // one that fires when the graph widens
-                                        // a request, when `IVORY_OUT_BUFFER`
+                                        // a request, when `TANGENT_OUT_BUFFER`
                                         // overrides it, or when the device's
                                         // own range clamps it.
                                         //
@@ -24994,13 +24994,13 @@ mod midi_inputs_tests {
 /// every triangle egui would have sent to the card, text included. It is why
 /// `midi_inputs_body` is a function of its own.
 ///
-///     IVORY_SHOT=/tmp/midi-dark.png \
+///     TANGENT_SHOT=/tmp/midi-dark.png \
 ///       cargo test -p tangent-ui --lib dialogs::shot -- --ignored --nocapture
 ///
-/// `IVORY_SHOT_THEME=<name>` and `IVORY_SHOT_LIGHT=1` pick the dress, the same
+/// `TANGENT_SHOT_THEME=<name>` and `TANGENT_SHOT_LIGHT=1` pick the dress, the same
 /// two every other shot in this repo honours.
 ///
-/// The rows are `app::demo_midi_rows`, shared with `IVORY_INLINE=midiinputs`,
+/// The rows are `app::demo_midi_rows`, shared with `TANGENT_INLINE=midiinputs`,
 /// so the picture and the running app show the same thing: a device that is
 /// on, one that is off, and one that is on and NOT PLUGGED IN — which is the
 /// row nobody developing this can produce by hand.
@@ -25011,12 +25011,12 @@ mod shot {
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn midi_inputs() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         let mut set = crate::settings::Settings::default();
-        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+        if let Ok(name) = std::env::var("TANGENT_SHOT_THEME") {
             match crate::theme::factory().into_iter().find(|t| t.name == name) {
                 Some(t) => {
                     t.apply(&mut set);
@@ -25025,7 +25025,7 @@ mod shot {
                 None => eprintln!("no theme called {name}"),
             }
         }
-        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+        if std::env::var("TANGENT_SHOT_LIGHT").is_ok() {
             set.dark_mode = false;
         }
         // The face the app hands `dialogs::show`, derived exactly as

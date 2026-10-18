@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
+## [Unreleased]
+
+### Changed
+
+- **The developer switches are spelled with Tangent's name.** The
+  environment variables that turn on diagnostics and test hooks now start
+  with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
+  `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
+  a shell or a launcher that still sets it needs the new name.
+
 ## [5.1.0] - 2026-10-18
 
 The version Tangent Keys was rebuilt in: ten sounds re-voiced against
@@ -2412,9 +2422,9 @@ published.
   with the recorder showing and no camera selected at all was held at
   `LIVE_TICK` for as long as the band was open, collecting frames from a thread
   that did not exist. Found last, after every other pin below had been removed
-  and `IVORY_PACE_PROBE` still read `host_live=[camera]` on every second with
+  and `TANGENT_PACE_PROBE` still read `host_live=[camera]` on every second with
   nothing selected. The ledger now counts the camera only while a capture is
-  actually running. `IVORY_PACE_PROBE` prints `host_live=[...]`, the host's
+  actually running. `TANGENT_PACE_PROBE` prints `host_live=[...]`, the host's
   reasons for staying awake, so the next one of these names itself.
 
 - **The heart no longer sets the pace of the whole window.** The animated
@@ -2423,7 +2433,7 @@ published.
   MINIMUM asked, that one line beat every resting cadence the rest of the app
   had negotiated: with nothing playing, the owner's desk painted fifty-six
   frames a second for as long as it was open, about half a core, for a sprite
-  seven pixels wide. Found by adding `asked_by=` to `IVORY_PACE_PROBE`, which
+  seven pixels wide. Found by adding `asked_by=` to `TANGENT_PACE_PROBE`, which
   prints egui's own record of every call site that asked for a frame that
   second; it named this one on every frame. Every resting test had passed,
   because the test fixture turns the heart off - the one animator this machine
@@ -2432,7 +2442,7 @@ published.
   ten seconds) and only while the window is focused and not minimised; unseen,
   it still moves at the idle poll, for free. The analyzer answers to the same
   rule, since a noise floor moves its bins by more than its settling threshold
-  on every frame. `IVORY_PACE_PROBE` now also prints the smallest delay the
+  on every frame. `TANGENT_PACE_PROBE` now also prints the smallest delay the
   app's ledger and the host's ledger each asked for in the second.
 
 - **An idle desk rests, whatever is loaded on it.** Two more reasons a
@@ -2470,7 +2480,7 @@ published.
   the ballistics are untouched.
 
   Measured on the owner's machine with the modelled piano and Brusfri loaded and the
-  transport stopped: `IVORY_PACE_PROBE=1` read `fps=59 p99=18.3ms`, which is
+  transport stopped: `TANGENT_PACE_PROBE=1` read `fps=59 p99=18.3ms`, which is
   the 16 ms request plus the frame it buys, and `TANGENT_FRAME_LOG=1` priced
   that frame at `update 1.0/1.1/1.1 | cpu(prev) 2.7/3.0/3.1`. The resting
   policy had a test for an idle desk already; it rested its meters at exactly
@@ -2898,7 +2908,7 @@ published.
   second forever. Now every animator (the transport, live meters, a
   notification, the busy cover, the splash, a drag, the camera, the
   analyzer with signal) asks for its own frames, and a still window asks for
-  none. `IVORY_PACE` still forces the old cadence; `IVORY_PACE_PROBE=1`
+  none. `TANGENT_PACE` still forces the old cadence; `TANGENT_PACE_PROBE=1`
   shows the frame rate; `TANGENT_FRAME_LOG=1` logs where each second of
   frames went, section by section.
 
@@ -4566,7 +4576,7 @@ take is now simply the window it was played in.
   13,133-voicing test corpus, in both the stock and Chord Learning builds.
 - Diminished, half-diminished and augmented chords now use standard lead-sheet
   symbols: `C°`, `C°7`, `Cø7`, `C+` in place of the spelled-out forms.
-- `IVORY_LOG=debug` turns on diagnostic logging. Quiet by default; the app
+- `TANGENT_LOG=debug` turns on diagnostic logging. Quiet by default; the app
   writes nothing unless asked.
 
 ### Fixed

@@ -9560,28 +9560,28 @@ LaneView {
     /// `face::fit` is `busy.rs`'s software rasteriser: no window, no GPU,
     /// every triangle egui would have sent to the card, text included.
     ///
-    ///     IVORY_SHOT=/tmp/headers.png \
+    ///     TANGENT_SHOT=/tmp/headers.png \
     ///       cargo test -p tangent-ui --lib arrangement_panel::shot \
     ///       -- --ignored --nocapture
     ///
-    /// `IVORY_SHOT_W` / `IVORY_SHOT_H` set the window and `IVORY_SHOT_HDR`
+    /// `TANGENT_SHOT_W` / `TANGENT_SHOT_H` set the window and `TANGENT_SHOT_HDR`
     /// the header column, because this panel's whole shape is a function of
-    /// how much room it was given. `IVORY_SHOT_PANEL` draws a panel WIDER
+    /// how much room it was given. `TANGENT_SHOT_PANEL` draws a panel WIDER
     /// than the window and lets the window clip it, which is how to get a
     /// picture of the header column alone at full size rather than a
     /// thumbnail of the whole timeline.
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn headers() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         let num = |k: &str, d: f32| {
             std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d)
         };
-        let (w, hgt) = (num("IVORY_SHOT_W", 1512.0), num("IVORY_SHOT_H", 620.0));
-        let hdr = std::env::var("IVORY_SHOT_HDR").ok().and_then(|v| v.parse::<f32>().ok());
+        let (w, hgt) = (num("TANGENT_SHOT_W", 1512.0), num("TANGENT_SHOT_H", 620.0));
+        let hdr = std::env::var("TANGENT_SHOT_HDR").ok().and_then(|v| v.parse::<f32>().ok());
         let c = clips();
         let mut v = a_view(&c);
         v.lanes[1].is_folder = true;
@@ -9602,7 +9602,7 @@ LaneView {
         }
         let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
         let surface = crate::recorder_panel::surface_of(Color32::from_rgb(0x61, 0x37, 0x3A));
-        let panel_w = num("IVORY_SHOT_PANEL", w);
+        let panel_w = num("TANGENT_SHOT_PANEL", w);
         let (pw, ph, rgba) = crate::face::fit::shoot(
             &ctx,
             Vec2::new(w, hgt + crate::shell::CHROME_BAR_H),

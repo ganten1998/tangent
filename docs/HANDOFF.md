@@ -234,7 +234,7 @@ platform coverage:
 **THE NAME.** The product is **Tangent**. "Ivory" is now the INTERNAL CODENAME
 and is deliberately everywhere it is invisible: crate names (`ivory`,
 `tangent-core`, `tangent-keygen`, `tangent-fulfil`), `~/.config/tangent/`, the settings
-and overrides paths, `IVORY_*` env switches, `assets/tangent.*`, and above all
+and overrides paths, `TANGENT_*` env switches, `assets/tangent.*`, and above all
 **`CFBundleIdentifier = org.codeberg.ganten1998.tangent`, which must never
 change** (it would reset Gatekeeper trust on every signed build). The binary is
 `tangent` via a `[[bin]]` entry, so the package stays `ivory`: **`cargo run -p
@@ -703,7 +703,7 @@ reserved for after the full code audit the owner asked for.
 `tangent/src/dx7/` is a faithful six-operator FM engine: `voice.rs` unpacks the
 128 packed bytes of a patch, `sysex.rs` reads a 4104-byte cartridge,
 `algorithms.rs` is the transcribed routing table, `synth.rs` is the DSP.
-Validated against 11,756 real cartridges (`IVORY_SYX_CORPUS=... cargo test -p
+Validated against 11,756 real cartridges (`TANGENT_SYX_CORPUS=... cargo test -p
 ivory --bins the_whole_corpus -- --ignored --nocapture`).
 
 `ivory/src/builtin.rs` is **gone** — the two-operator sketch it held is fully
@@ -763,7 +763,7 @@ mid-session. `composite.rs` has an ignored test that renders a frame offscreen
 through the real compositor and writes a PNG:
 
 ```
-IVORY_SHOT=/tmp/x.png IVORY_SHOT_ROWS=210 \
+TANGENT_SHOT=/tmp/x.png TANGENT_SHOT_ROWS=210 \
   cargo test -p tangent --bins shot::window -- --ignored --nocapture
 ```
 
@@ -891,7 +891,7 @@ checked with the same filter that made it is the detector agreeing with itself.
   firewall and `RecorderView` has no route for them. It needs a display-unit
   hint on `EffectDefaults`; it is not hard, it was just more than the knob was
   worth today.
-- `IVORY_SHOT_FX` renders no panel — for the reverb either, so it predates
+- `TANGENT_SHOT_FX` renders no panel — for the reverb either, so it predates
   this work. The panels are covered by `every_panel_row_reaches_its_own_parameter`
   instead, which walks all six.
 - Everything in §2g's "take next" that is still open, plus Void finding 1: the
@@ -1162,9 +1162,9 @@ panel prints is what the field accepts, which is asserted.
 `MIN_TRIM` stops the handles crossing: an out-point before the in-point is a
 track that plays nothing, discovered by pressing Record and hearing silence.
 
-**It does not screenshot.** `IVORY_SHOT_TRACK=open` loads a fake clip, but the
+**It does not screenshot.** `TANGENT_SHOT_TRACK=open` loads a fake clip, but the
 compositor draws BANDS for the video and not overlay panels — the same gap
-`IVORY_SHOT_FX` has. The panel is covered by hit-test and layout tests instead.
+`TANGENT_SHOT_FX` has. The panel is covered by hit-test and layout tests instead.
 
 ### Two things moved
 
@@ -1539,7 +1539,7 @@ macOS one did, which is where the reset had accidentally been fixed.
 ### One line that would have halved the investigation
 
 The Linux build said **nothing** when a capture stream opened, even at
-`IVORY_LOG=debug`, so establishing what the device actually negotiated took
+`TANGENT_LOG=debug`, so establishing what the device actually negotiated took
 inspecting the PipeWire graph from outside the app. There is a `debug!` at the
 open now: device, channels, rate, format, buffer. What is ASKED for is nothing
 like what arrives, and every future field report that mentions channels or rate
@@ -1869,7 +1869,7 @@ to `devices::restore` at startup, exactly as the chosen device's own uid already
 is. The grammar stays on the host's side of the firewall; `tangent-ui` cannot
 spell one and must not learn to.
 
-`IVORY_INLINE=channels` opens it against a fake eighteen-in interface, because
+`TANGENT_INLINE=channels` opens it against a fake eighteen-in interface, because
 the chooser only offers itself above two inputs and nobody developing this owns
 such a box.
 
@@ -1944,7 +1944,7 @@ band's fader are ONE value in settings that both read
 muted; the effects return takes no send either, because a bus that can feed
 itself is a bus that howls.
 
-`IVORY_INLINE=mixer` opens the view on the first frame. Use it: photographing
+`TANGENT_INLINE=mixer` opens the view on the first frame. Use it: photographing
 the view otherwise means sending a keystroke at a desktop that may not be
 listening, and a stray keystroke on a shared machine lands somewhere else.
 

@@ -262,7 +262,7 @@ const MAX_BLOCK: i32 = 512;
 /// Output buffer asked of the device, in frames. 256 is 5.3 ms at 48 kHz, which
 /// every CoreAudio and WASAPI device on this machine accepts, and it is the
 /// dominant term in what a player feels from the audio path. Overridable with
-/// `IVORY_OUT_BUFFER` for a machine that crackles at it.
+/// `TANGENT_OUT_BUFFER` for a machine that crackles at it.
 const WANT_BUFFER_FRAMES: u32 = 256;
 
 /// The largest device callback the mix scratch is sized for. Anything larger is
@@ -24106,7 +24106,7 @@ impl Engine {
                     // exactly them.
                     let want = asked_buffer
                         .or_else(|| {
-                            std::env::var("IVORY_OUT_BUFFER")
+                            std::env::var("TANGENT_OUT_BUFFER")
                                 .ok()
                                 .and_then(|v| v.parse::<u32>().ok())
                         })
@@ -28737,7 +28737,7 @@ fn pick_buffer(
     // to go through the settings file, and behind the SETTING so that what the
     // Audio Status panel says is what the panel was told.
     let choice = asked.or_else(|| {
-        std::env::var("IVORY_OUT_BUFFER")
+        std::env::var("TANGENT_OUT_BUFFER")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
     });

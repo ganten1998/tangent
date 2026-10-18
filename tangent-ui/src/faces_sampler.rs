@@ -2043,22 +2043,22 @@ mod shot {
     /// software rasteriser instead, lifted into `face::fit` so the next
     /// face's shot costs thirty lines.
     ///
-    ///     IVORY_SHOT=/tmp/sampler.png \
+    ///     TANGENT_SHOT=/tmp/sampler.png \
     ///       cargo test -p tangent-ui --lib faces_sampler::shot \
     ///       -- --ignored --nocapture
     ///
-    /// `IVORY_SHOT_THEME=<name>` and `IVORY_SHOT_LIGHT=1` pick the dress,
-    /// the same two `shot::window` honours; `IVORY_SHOT_EMPTY=1` shoots the
+    /// `TANGENT_SHOT_THEME=<name>` and `TANGENT_SHOT_LIGHT=1` pick the dress,
+    /// the same two `shot::window` honours; `TANGENT_SHOT_EMPTY=1` shoots the
     /// panel with nothing loaded.
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn draw_it() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         let mut set = crate::settings::Settings::default();
-        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+        if let Ok(name) = std::env::var("TANGENT_SHOT_THEME") {
             match crate::theme::factory().into_iter().find(|t| t.name == name) {
                 Some(t) => {
                     t.apply(&mut set);
@@ -2067,12 +2067,12 @@ mod shot {
                 None => eprintln!("no theme called {name}"),
             }
         }
-        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+        if std::env::var("TANGENT_SHOT_LIGHT").is_ok() {
             set.dark_mode = false;
         }
         let p = crate::recorder_panel::palette(&set);
         let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
-        let loaded = std::env::var("IVORY_SHOT_EMPTY").is_err();
+        let loaded = std::env::var("TANGENT_SHOT_EMPTY").is_err();
         let ctx = fit::a_ctx(fonts::FontChoice::default());
         let window = crate::dialogs::face_window_size(SAMPLER_PATH, None);
         let mut live = a_face(loaded);

@@ -77,7 +77,7 @@ use crate::audio::{DeviceState, Timebase};
 /// not the ~250 KB an actual JPEG occupies — so this queue costs 10.5 MB
 /// rather than the 1.5 MB a compressed-size estimate predicts.
 ///
-/// Override with `IVORY_V4L2_BUFFERS` to measure the difference; the driver
+/// Override with `TANGENT_V4L2_BUFFERS` to measure the difference; the driver
 /// may grant fewer, and [`CameraStats::buffers_allocated`] reports what it
 /// actually gave.
 const DEFAULT_BUFFER_COUNT: u32 = 6;
@@ -97,7 +97,7 @@ fn frames_lost_between(prev: u32, seq: u32) -> u64 {
 }
 
 fn requested_buffer_count() -> u32 {
-    match std::env::var("IVORY_V4L2_BUFFERS") {
+    match std::env::var("TANGENT_V4L2_BUFFERS") {
         Ok(v) => v.trim().parse::<u32>().ok().filter(|n| *n > 0).unwrap_or(DEFAULT_BUFFER_COUNT),
         Err(_) => DEFAULT_BUFFER_COUNT,
     }

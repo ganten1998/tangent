@@ -189,7 +189,7 @@ channels play back their clips and nothing else. "Ready to play" and
 ## The machinery underneath (implementation shape)
 
 - **Doc** (`tangent-ui/src/arrangement.rs`, already stubbed: versioned,
-  atomic save, `IVORY_ARRANGEMENT_PATH`): clips carry
+  atomic save, `TANGENT_ARRANGEMENT_PATH`): clips carry
   `(lane, start_s, len_s, source, source_offset_s, fade_in_s, fade_out_s,
   name, id)`. Lanes are plain indices — variable count later stays cheap.
 - **Engine**: the single backing `Placed` generalises to per-channel clip

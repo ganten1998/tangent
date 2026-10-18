@@ -92,7 +92,7 @@ verified on 4.11.1 unless noted; audio confirmed by capturing the sink monitor, 
   |  | Check |  | Evidence
   
   |  | Fresh install plays TINE ONE | PASS
-       | Virgin IVORY_SETTINGS_PATH → slot 1 auto-loads the built-in, zero config, <5s.
+       | Virgin TANGENT_SETTINGS_PATH → slot 1 auto-loads the built-in, zero config, <5s.
   
   |  | Built-in loads & sounds | PASS
        | Held key measured −19 dBFS on the sink monitor (4.11.0 and 4.11.1).
@@ -202,4 +202,4 @@ what changed on dresden, and how to undo it
   
   |  | Interim RT test | Until finding 1c, RT can be granted per-run: sudo chrt -f -p 70 $(ps -Lo tid=,comm= -p $(pgrep -x tangent) | awk '$2=="cpal_alsa_out"{print $1}') — worth an A/B during a video take.
 
-Method: shipped binaries driven on the live X session; audio verified by capturing the sink monitor and measuring peaks; stream geometry from pw-dump; underruns counted from stderr logs; slot behavior cross-checked against settings.json writes; fresh-install simulated via IVORY_SETTINGS_PATH. Sources of truth on-box: the 4.4.1 tree for host/plugin internals, strings(1) on the 4.11.x binaries for the rest.
+Method: shipped binaries driven on the live X session; audio verified by capturing the sink monitor and measuring peaks; stream geometry from pw-dump; underruns counted from stderr logs; slot behavior cross-checked against settings.json writes; fresh-install simulated via TANGENT_SETTINGS_PATH. Sources of truth on-box: the 4.4.1 tree for host/plugin internals, strings(1) on the 4.11.x binaries for the rest.

@@ -320,7 +320,7 @@ impl Compositor {
     /// Build a compositor for a frame of `width` x `height`.
     ///
     /// `state` comes from `eframe::Frame::wgpu_render_state()`. `None` there
-    /// means the app is running under glow, which is `IVORY_RENDERER=glow` and
+    /// means the app is running under glow, which is `TANGENT_RENDERER=glow` and
     /// every non-macOS build — those cannot composite, and say so rather than
     /// producing an empty file.
     pub fn new(
@@ -333,7 +333,7 @@ impl Compositor {
             Some(s) => Self::on(s.device.clone(), s.queue.clone(), width, height),
             // **A device of its own, rather than a refusal.** `None` means the
             // app is drawing with OpenGL, which is every Windows and Linux
-            // build and `IVORY_RENDERER=glow` on a Mac. That used to end the
+            // build and `TANGENT_RENDERER=glow` on a Mac. That used to end the
             // video, on the reasoning that a compositor needs the renderer the
             // window is using. It does not: it paints an OFFSCREEN egui pass
             // into a texture nothing else ever sees, so any adapter will do.
@@ -1101,7 +1101,7 @@ mod tests {
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-glguard-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -1183,7 +1183,7 @@ mod tests {
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-defaults-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -1227,7 +1227,7 @@ mod tests {
         // settings file and resolves the owner's own media folder.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-camera-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -1576,7 +1576,7 @@ mod cost {
             // SAFETY: single-threaded test setup, before any app exists.
             unsafe {
                 std::env::set_var(
-                    "IVORY_SETTINGS_PATH",
+                    "TANGENT_SETTINGS_PATH",
                     std::env::temp_dir().join(format!("tangent-cost-settings-{}.json", std::process::id())),
                 );
                 std::env::set_var(
@@ -1710,7 +1710,7 @@ mod cost {
         // can save, and `tangent-ui`'s own test guard is not in force here.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-cost-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -1792,7 +1792,7 @@ mod shot {
 
     /// Render the whole window offscreen to a PNG, for a person to look at.
     ///
-    ///   IVORY_SHOT=/tmp/x.png cargo test -p tangent --bins shot::window \
+    ///   TANGENT_SHOT=/tmp/x.png cargo test -p tangent --bins shot::window \
     ///     -- --ignored --nocapture
     ///
     /// **It photographs the COMPOSITE, not the app's own frame**, and the
@@ -1805,15 +1805,15 @@ mod shot {
     ///
     /// To look at a DIALOG, run the real binary in screen-reader mode
     /// (Window > Menus Inside the Window, or J), where dialogs are drawn as a
-    /// layer over the canvas; `IVORY_INLINE=menu` opens the menu on the first
+    /// layer over the canvas; `TANGENT_INLINE=menu` opens the menu on the first
     /// frame:
     ///
-    ///   IVORY_INLINE=menu ./target/debug/tangent
+    ///   TANGENT_INLINE=menu ./target/debug/tangent
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn window() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // **Never the real settings file.** This builds an `TangentApp` and runs
@@ -1823,7 +1823,7 @@ mod shot {
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -1843,8 +1843,8 @@ mod shot {
         settings.show_recorder = true;
         // A named theme, so the band can be looked at in the colours a
         // legibility test only ever measures.
-        //   IVORY_SHOT_THEME=Centennial IVORY_SHOT=/tmp/x.png ...
-        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+        //   TANGENT_SHOT_THEME=Centennial TANGENT_SHOT=/tmp/x.png ...
+        if let Ok(name) = std::env::var("TANGENT_SHOT_THEME") {
             if let Some(t) = tangent_ui::theme::factory().into_iter().find(|t| t.name == name) {
                 t.apply(&mut settings);
                 settings.theme_name = name;
@@ -1855,15 +1855,15 @@ mod shot {
         // **Light mode.** `Settings::default` ships dark, so every picture
         // this harness ever wrote was one half of a theme — and a shot that
         // cannot photograph both sides of a toggle cannot settle an argument
-        // about a toggle. (Notes down: `IVORY_DEMO_NOTES`, already honoured.)
-        //   IVORY_SHOT_LIGHT=1 ...
-        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+        // about a toggle. (Notes down: `TANGENT_DEMO_NOTES`, already honoured.)
+        //   TANGENT_SHOT_LIGHT=1 ...
+        if std::env::var("TANGENT_SHOT_LIGHT").is_ok() {
             settings.dark_mode = false;
         }
         // The theory band, which ships collapsed and so was never in a shot
         // either. `1` for all four diagrams, or a `Views::keys` list.
-        //   IVORY_SHOT_THEORY=1 ...
-        if let Ok(which) = std::env::var("IVORY_SHOT_THEORY") {
+        //   TANGENT_SHOT_THEORY=1 ...
+        if let Ok(which) = std::env::var("TANGENT_SHOT_THEORY") {
             settings.theory_order = if which == "1" {
                 tangent_ui::theory_panel::Views::all().keys()
             } else {
@@ -1872,13 +1872,13 @@ mod shot {
         }
         // The varispeed dial off its detent, which is the state its lit word
         // and its own colours only exist in.
-        //   IVORY_SHOT_VARI=1 ...
-        if std::env::var("IVORY_SHOT_VARI").is_ok() {
+        //   TANGENT_SHOT_VARI=1 ...
+        if std::env::var("TANGENT_SHOT_VARI").is_ok() {
             settings.varispeed.set_pos(0.78);
         }
         // The neck, for looking at what the solver put where.
-        //   IVORY_SHOT_FRET=1 IVORY_DEMO_NOTES=60 ...
-        if std::env::var("IVORY_SHOT_FRET").is_ok() {
+        //   TANGENT_SHOT_FRET=1 TANGENT_DEMO_NOTES=60 ...
+        if std::env::var("TANGENT_SHOT_FRET").is_ok() {
             settings.show_fretboard = true;
         }
         settings.reverb_mix = 0.42;
@@ -1891,7 +1891,7 @@ mod shot {
         settings.metronome_gain = 0.5;
         let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
-        if std::env::var("IVORY_SHOT_METER").is_ok() {
+        if std::env::var("TANGENT_SHOT_METER").is_ok() {
             use tangent_ui::recorder::{Level, Meters};
             app.set_master_for_shot(
                 Meters {
@@ -1916,7 +1916,7 @@ mod shot {
                 4.5,
             );
         }
-        if std::env::var("IVORY_SHOT_TRACK").is_ok() {
+        if std::env::var("TANGENT_SHOT_TRACK").is_ok() {
             // A waveform with a quiet lead-in and a quiet tail, which is what
             // somebody actually trims off.
             let wave: Vec<f32> = (0..1000)
@@ -1946,21 +1946,21 @@ mod shot {
         // painted, so the picture answers "does this read" rather than "does
         // this draw".
         //
-        //   IVORY_SHOT=/tmp/x.png IVORY_SHOT_MIXER=1 \
+        //   TANGENT_SHOT=/tmp/x.png TANGENT_SHOT_MIXER=1 \
         //     cargo test -p tangent --bins shot::window -- --ignored --nocapture
-        if std::env::var("IVORY_SHOT_MIXER").is_ok() {
+        if std::env::var("TANGENT_SHOT_MIXER").is_ok() {
             app.open_mixer_for_shot();
         }
         // The settings popup over the band.
-        //   IVORY_SHOT_SETUP=1 ...
-        if std::env::var("IVORY_SHOT_SETUP").is_ok() {
+        //   TANGENT_SHOT_SETUP=1 ...
+        if std::env::var("TANGENT_SHOT_SETUP").is_ok() {
             app.open_setup_for_shot();
         }
         // The arrangement's document, for the band's overview scrubber —
         // the window shot cannot draw the arrangement panel itself (the
         // compositor paints the piano), but the band it paints reads the
         // document, viewport included.
-        if std::env::var("IVORY_SHOT_ARRANGE").is_ok() {
+        if std::env::var("TANGENT_SHOT_ARRANGE").is_ok() {
             app.open_arrangement_for_shot();
         }
         let mut shoot = |app: &TangentApp| {
@@ -1987,7 +1987,7 @@ mod shot {
         // **After a frame, not before.** A panel hangs off its knob, and where
         // the knob is is not known until the band has been drawn once — so a
         // panel opened before that has no anchor and closes itself.
-        if std::env::var("IVORY_SHOT_EDITOR").is_ok() {
+        if std::env::var("TANGENT_SHOT_EDITOR").is_ok() {
             app.open_patch_editor_for_shot();
             for _ in 0..2 {
                 if let Err(e) = shoot(&app) {
@@ -1997,11 +1997,11 @@ mod shot {
             }
         }
         // The keyboard's eight-sound panel, on a chosen sound.
-        //   IVORY_SHOT_KEYSPANEL=<0..7> ...
+        //   TANGENT_SHOT_KEYSPANEL=<0..7> ...
         // KNOWN GAP: dialogs are egui viewports and this compositor does
         // not paint child viewports, so the panel does not land in the PNG
         // yet - the hook stands so a dialog-capable harness can use it.
-        if let Ok(which) = std::env::var("IVORY_SHOT_KEYSPANEL") {
+        if let Ok(which) = std::env::var("TANGENT_SHOT_KEYSPANEL") {
             app.open_keys_panel_for_shot(which.parse().unwrap_or(0));
             for _ in 0..2 {
                 if let Err(e) = shoot(&app) {
@@ -2010,7 +2010,7 @@ mod shot {
                 }
             }
         }
-        if let Ok(which) = std::env::var("IVORY_SHOT_FX") {
+        if let Ok(which) = std::env::var("TANGENT_SHOT_FX") {
             app.open_effect_panel(match which.as_str() {
                 "delay" => tangent_ui::recorder_panel::Fx::Delay,
                 "chorus" => tangent_ui::recorder_panel::Fx::Chorus,
@@ -2033,7 +2033,7 @@ mod shot {
         // Only the top of the frame when asked, because the band is a tenth of
         // a 900-row window and every crop tool on this machine measures its
         // offset from somewhere different.
-        let rows = std::env::var("IVORY_SHOT_ROWS")
+        let rows = std::env::var("TANGENT_SHOT_ROWS")
             .ok()
             .and_then(|r| r.parse::<u32>().ok())
             .unwrap_or(h)
@@ -2056,23 +2056,23 @@ mod shot {
     /// the one panel that could not be photographed without running the app
     /// and standing on the user's desktop to do it.
     ///
-    ///   IVORY_SHOT=/tmp/desk.png cargo test -p tangent --bins shot::mixer \
+    ///   TANGENT_SHOT=/tmp/desk.png cargo test -p tangent --bins shot::mixer \
     ///     -- --ignored --nocapture
     /// The arrangement view, alone at panel size.
     ///
-    ///   IVORY_SHOT=/tmp/arr.png cargo test -p tangent --bins shot::arrange \
+    ///   TANGENT_SHOT=/tmp/arr.png cargo test -p tangent --bins shot::arrange \
     ///     -- --ignored --nocapture
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn arrange() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -2132,19 +2132,19 @@ mod shot {
 
     /// The MIDI editor over the arrangement:
     ///
-    ///   IVORY_SHOT=/tmp/me.png cargo test -p tangent --bins shot::midiedit \
+    ///   TANGENT_SHOT=/tmp/me.png cargo test -p tangent --bins shot::midiedit \
     ///     -- --ignored --nocapture
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn midiedit() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -2163,8 +2163,8 @@ mod shot {
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
         // The bottom lane holds the PEDAL rather than velocity:
-        //   IVORY_SHOT_PEDAL=1 IVORY_SHOT=/tmp/x.png ...
-        settings.midi_pedal_lane = std::env::var("IVORY_SHOT_PEDAL").is_ok();
+        //   TANGENT_SHOT_PEDAL=1 TANGENT_SHOT=/tmp/x.png ...
+        settings.midi_pedal_lane = std::env::var("TANGENT_SHOT_PEDAL").is_ok();
         let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.open_midi_editor_for_shot();
         let mut shoot = |app: &TangentApp| {
@@ -2208,19 +2208,19 @@ mod shot {
 
     /// The drumpad floating over the arrangement:
     ///
-    ///   IVORY_SHOT=/tmp/dp.png cargo test -p tangent --bins shot::drumpad \
+    ///   TANGENT_SHOT=/tmp/dp.png cargo test -p tangent --bins shot::drumpad \
     ///     -- --ignored --nocapture
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn drumpad() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -2283,14 +2283,14 @@ mod shot {
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn mixer() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(
@@ -2350,7 +2350,7 @@ mod shot {
 
     /// The LAUNCH SPLASH, rendered offscreen exactly as the window draws it.
     ///
-    ///   IVORY_SHOT=/tmp/splash.png cargo test -p tangent --bins shot::splash \
+    ///   TANGENT_SHOT=/tmp/splash.png cargo test -p tangent --bins shot::splash \
     ///     --features recorder -- --ignored --nocapture
     ///
     /// Through the same compositor and the same painter the host hands the
@@ -2360,14 +2360,14 @@ mod shot {
     #[test]
     #[ignore = "writes a file; run on purpose"]
     fn splash() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         // SAFETY: single-threaded test setup, before any app exists.
         unsafe {
             std::env::set_var(
-                "IVORY_SETTINGS_PATH",
+                "TANGENT_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
             std::env::set_var(

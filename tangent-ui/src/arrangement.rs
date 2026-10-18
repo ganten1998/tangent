@@ -3609,7 +3609,7 @@ impl Arrangement {
     /// ordinary `tangent-ui`, and one that ran a frame against the real home
     /// directory would edit the user's own song.
     pub fn path() -> PathBuf {
-        if let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") {
+        if let Some(p) = std::env::var_os("TANGENT_ARRANGEMENT_PATH") {
             return PathBuf::from(p);
         }
         Settings_dir().join("arrangement.json")

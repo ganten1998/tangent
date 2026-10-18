@@ -238,7 +238,7 @@ anywhere public.
 - **Scripting.** No scripting API, deliberately. An API is a permanent
   compatibility contract, and this project's positioning (no telemetry, no
   network, one person) depends on promising only surfaces it can actually
-  honour. The developer switches (`IVORY_*`) are switches, not an interface.
+  honour. The developer switches (`TANGENT_*`) are switches, not an interface.
 - **ARA.** ARA exists so a DAW can hand its audio timeline to an editor
   plugin. Tangent has no audio editing for ARA to serve: no comping (the
   rationale sits beside `CHANNELS` in `tangent-ui/src/recorder.rs`) and no

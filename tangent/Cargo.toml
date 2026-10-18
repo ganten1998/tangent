@@ -233,7 +233,7 @@ core-graphics = "0.23"
 # host ends up drawing into the wrong drawable. Confirmed by switching
 # renderers with nothing else changed: under Metal the flicker is gone.
 #
-# `glow` is still compiled in and `IVORY_RENDERER=glow` selects it, because it
+# `glow` is still compiled in and `TANGENT_RENDERER=glow` selects it, because it
 # is what every shipped build until now has used.
 #
 # macOS-only deliberately: Windows and Linux have no plugin editor yet, so no

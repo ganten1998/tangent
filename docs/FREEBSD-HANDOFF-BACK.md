@@ -37,7 +37,7 @@ reaches it because `owned_gl_is_hardware()` returns first. Fixed by excluding
 the GL backend from the probe on FreeBSD, which costs nothing — a GL adapter is
 refused two lines later anyway.
 
-Also: **`IVORY_RENDERER=glow` is a no-op here.** The renderer is hardcoded to
+Also: **`TANGENT_RENDERER=glow` is a no-op here.** The renderer is hardcoded to
 Glow on everything but macOS, so that lever does not exist. Worth knowing before
 sending the tester after it.
 
@@ -118,7 +118,7 @@ periods legal at all. 68,884 interrupts / 0 underruns under four CPU hogs.
 5.05 ms, flat across every buffer size — the same signature as the shim's fake
 buffer control. `SNDCTL_DSP_GETODELAY` reports only the hardware queue, so the
 host's own timestamp under-reported and the probe believed it. Added
-`IVORY_RAW_TIMING`, which trusts no backend's claims and measures wall clock
+`TANGENT_RAW_TIMING`, which trusts no backend's claims and measures wall clock
 callback-to-callback. Worth knowing if you review the probe.
 
 **vs Ardour**, checked rather than assumed: `ardour-8.12.0_3` on FreeBSD ships

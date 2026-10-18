@@ -2773,7 +2773,7 @@ impl Settings {
         // frame writes the user's own settings file. That is not theoretical:
         // an offscreen screenshot test did exactly that and emptied the
         // owner's instrument slots.
-        if let Some(p) = std::env::var_os("IVORY_SETTINGS_PATH") {
+        if let Some(p) = std::env::var_os("TANGENT_SETTINGS_PATH") {
             return PathBuf::from(p);
         }
         #[cfg(test)]
@@ -4620,7 +4620,7 @@ impl Settings {
     /// **Since 5.0 no file in `~/.config/tangent` can be older than v19**:
     /// 5.0 started that directory fresh, and no build since reads the 4.x
     /// one, so versions below 19 are reachable only through a hand-copied
-    /// pre-5.0 file or `IVORY_SETTINGS_PATH`. They are kept anyway, decided
+    /// pre-5.0 file or `TANGENT_SETTINGS_PATH`. They are kept anyway, decided
     /// on audit: a settings file copied between machines is a supported flow
     /// (see the `config` module doc), and these migrations are the only code
     /// that makes an old one land right.
@@ -7789,7 +7789,7 @@ mod tests {
         assert_eq!(json.matches("settings_version").count(), 1, "{json}");
     }
 
-    /// **`IVORY_SETTINGS_PATH` is process-global, and tests are not.**
+    /// **`TANGENT_SETTINGS_PATH` is process-global, and tests are not.**
     ///
     /// Two tests below point it at their own directory and take it away
     /// again. Cargo runs them on parallel threads in ONE process, so without
@@ -7824,9 +7824,9 @@ mod tests {
         std::fs::write(&path, "\u{feff}{ \"transpose\": -28, \"audio_system\": \"ASIO\" }").unwrap();
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
         assert_eq!(s.transpose, -28, "the marked file was not read");
         assert_eq!(s.audio_system(), Some("ASIO"));
         assert!(s.unreadable.is_none(), "a readable file was reported as unreadable");
@@ -7855,9 +7855,9 @@ mod tests {
         std::fs::write(&path, b"{ \"dark_mode\": true, and then the disk died").unwrap();
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
 
         assert!(
             aside.exists(),
@@ -8214,9 +8214,9 @@ mod tests {
         let path = dir.join("settings.json");
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
 
         assert!(!dir.join("settings.json.unreadable").exists());
         assert!(s.show_recorder);

@@ -150,7 +150,7 @@ static CURVE: AtomicPtr<Curve> = AtomicPtr::new(std::ptr::null_mut());
 /// can still be reading it.
 static RETIRED: AtomicPtr<Curve> = AtomicPtr::new(std::ptr::null_mut());
 
-/// How many times the table has been rebuilt. Read by `IVORY_PACE_PROBE`.
+/// How many times the table has been rebuilt. Read by `TANGENT_PACE_PROBE`.
 ///
 /// A number rather than a belief: the comment that used to sit on the leak
 /// asserted "a handful of times in a session", and nothing measured it.
@@ -382,7 +382,7 @@ fn install(window: &NSWindow) -> bool {
         HOOKED.with(|h| h.set(Some(false)));
         return false;
     }
-    if std::env::var("IVORY_ASPECT_HOOK").as_deref() == Ok("0") {
+    if std::env::var("TANGENT_ASPECT_HOOK").as_deref() == Ok("0") {
         HOOKED.with(|h| h.set(Some(false)));
         return false;
     }
@@ -671,7 +671,7 @@ fn verdict(w: WindowFacts) -> Verdict {
 
 /// Whether the adoption is armed. `TANGENT_CHILD_WINDOWS=0` disarms it.
 ///
-/// The same escape hatch `IVORY_ASPECT_HOOK` is: this is AppKit behaviour on
+/// The same escape hatch `TANGENT_ASPECT_HOOK` is: this is AppKit behaviour on
 /// one person's machine and the honest position is that a rebuild should not
 /// be the only way to back it out. Cached rather than read per frame, because
 /// `std::env::var` allocates and this runs in the draw loop.

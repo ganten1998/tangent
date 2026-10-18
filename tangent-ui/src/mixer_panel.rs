@@ -4821,20 +4821,20 @@ mod tests {
     /// To look at those, render `assets/icons/*.a8` directly: it is a bare
     /// 192x192 block of 8-bit coverage with no header.
     ///
-    ///     IVORY_SHOT=/tmp/desk.png IVORY_SHOT_W=900 IVORY_SHOT_H=700 \
+    ///     TANGENT_SHOT=/tmp/desk.png TANGENT_SHOT_W=900 TANGENT_SHOT_H=700 \
     ///       cargo test -p tangent-ui --lib mixer_panel::tests::desk \
     ///       -- --ignored --nocapture
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn desk() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         let num = |k: &str, d: f32| {
             std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d)
         };
-        let (w, hgt) = (num("IVORY_SHOT_W", 900.0), num("IVORY_SHOT_H", 700.0));
+        let (w, hgt) = (num("TANGENT_SHOT_W", 900.0), num("TANGENT_SHOT_H", 700.0));
         let mut v = a_view();
         v.strips[Column::Track(1)].is_folder = true;
         for i in 0..3 {
@@ -4850,12 +4850,12 @@ mod tests {
             &mut |ui| {
                 let r = ui.max_rect();
                 ui.set_clip_rect(r);
-                // `IVORY_SHOT_PANEL` draws a desk WIDER than the window and
-                // `IVORY_SHOT_FROM` slides it left, so a strip at the right
+                // `TANGENT_SHOT_PANEL` draws a desk WIDER than the window and
+                // `TANGENT_SHOT_FROM` slides it left, so a strip at the right
                 // end can be photographed at full size rather than as a
                 // thumbnail of the whole desk.
-                let panel_w = num("IVORY_SHOT_PANEL", w);
-                let from = num("IVORY_SHOT_FROM", 0.0);
+                let panel_w = num("TANGENT_SHOT_PANEL", w);
+                let from = num("TANGENT_SHOT_FROM", 0.0);
                 draw(
                     ui.painter(),
                     Rect::from_min_size(

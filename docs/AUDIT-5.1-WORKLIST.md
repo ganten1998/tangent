@@ -88,7 +88,7 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   opposite (`instrument.rs:4061` zeroes `route_direct`). The dialog copy is correct; the module doc
   is backwards and is the first thing anyone reads before touching routing.
 - [ ] **W20 · All four README screenshots predate the 5.0 batch.** They show a chord monitor: no
-  recorder, mixer, arrangement, editor, drum machine or themes. `IVORY_SHOT` already renders
+  recorder, mixer, arrangement, editor, drum machine or themes. `TANGENT_SHOT` already renders
   deterministic frames headlessly, so this is a script.
 
 ### Tier 3 · packaging and release machinery
