@@ -207,9 +207,6 @@ The clavichord's tangent is the brass blade at the back of each key. It
 strikes the string and stays in contact with it for as long as the note
 sounds, which is what the display does with a held note.
 
-Downloads published under the old `Ivory-*` asset names keep working; every
-release uploads those alongside the current ones.
-
 ## Licensing
 
 Tangent and every crate in this repo are **MIT**. The Windows and Linux

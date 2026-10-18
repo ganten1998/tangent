@@ -14,17 +14,15 @@
 # The Gumroad post-purchase page, the supporter-key email and README.md all
 # link through it, using the version-less names:
 #
-#   Tangent-macos-arm64.dmg   Tangent-macos-arm64.zip
+#   Tangent-macos.pkg             Tangent-windows-setup.exe
+#   Tangent-macos-universal.dmg   Tangent-macos-universal.zip
 #   tangent-windows-x86_64.zip   tangent-linux-x86_64.tar.gz   SHA256SUMS
 #
-# Ship a release carrying only `Tangent-2.3.0-macos-arm64.dmg` and every one of
-# those links 404s for everybody, including people who have already paid, with
-# nothing in any log to say so. That is the whole reason this script exists:
-# uploading the aliases is not optional polish, it is the release contract.
-#
-# AND, since the 2.3.0 rename from Ivory to Tangent, the same four assets go up
-# a THIRD time under their old Ivory-* names, because those are the links in
-# every supporter-key email already sent. See the legacy block below.
+# Ship a release carrying only `Tangent-5.1.0-macos-universal.dmg` and every
+# one of those links 404s for everybody, including people who have already
+# paid, with nothing in any log to say so. That is the whole reason this script
+# exists: uploading the aliases is not optional polish, it is the release
+# contract.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -63,8 +61,8 @@ TAG="v${VERSION}"
 # beta to people who paid for a finished app.
 #
 # For the same reason a pre-release uploads ONLY version-scoped names. The
-# version-less aliases and the legacy Ivory-* set are the permanent-link
-# contract, and a beta has no business owning them even by accident.
+# version-less aliases are the permanent-link contract, and a beta has no
+# business owning them even by accident.
 PRERELEASE=0
 case "$VERSION" in *-*) PRERELEASE=1 ;; esac
 
@@ -92,8 +90,8 @@ fi
 PKG_VERSION="$(printf '%s' "$VERSION" | sed -E 's/-beta\.?/.b/; s/-alpha\.?/.a/; s/-rc\.?/.r/; s/-/./g')"
 shopt -s nullglob
 ARTIFACTS=()
-# Tangent-* since the 2.3.0 rename. This glob still said Ivory-* long after
-# build-macos.sh stopped producing that name, so the script exited "no
+# Tangent-* since the 2.3.0 rename. This glob kept the pre-rename prefix long
+# after build-macos.sh stopped producing that name, so the script exited "no
 # artifacts in dist/" on the first release it was asked to publish.
 for f in dist/Tangent-"${VERSION}"-macos-*.zip dist/Tangent-"${VERSION}"-macos-*.dmg \
          dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip \
@@ -135,8 +133,9 @@ done < "$SUMS"
 echo "==> Checksums: $SUMS"
 
 # ── Build the alias set in a temp dir ────────────────────────────────────────
-# `Ivory-2.2.0-macos-arm64.dmg` -> `Ivory-macos-arm64.dmg`, and the checksums
-# go up twice: version-scoped for the record, bare for the permalink.
+# `Tangent-5.1.0-macos-universal.dmg` -> `Tangent-macos-universal.dmg`, and
+# the checksums go up twice: version-scoped for the record, bare for the
+# permalink.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -163,46 +162,10 @@ if [ "$PRERELEASE" = 0 ]; then
   UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
 fi
 
-# ── Legacy Ivory-named aliases ───────────────────────────────────────────────
-# The product was renamed to Tangent at 2.3.0, but the permanent download links
-# under the OLD name are already sitting in the inbox of everyone who has bought
-# a supporter key, and in the 2.2.0 README. Those links resolve by exact asset
-# name, so dropping these four would 404 for exactly the people who paid.
-# They cost 26MB per release and they are not optional.
-for a in "${ARTIFACTS[@]}"; do
-  [ "$PRERELEASE" = 1 ] && break
-  base="${a#dist/}"
-  legacy="${base/-${VERSION}-/-}"          # Tangent-macos-arm64.dmg
-  legacy="${legacy/#Tangent-/Ivory-}"      # Ivory-macos-arm64.dmg
-  legacy="${legacy/#tangent-/ivory-}"      # ivory-windows-x86_64.zip
-  if [ "$legacy" != "${base/-${VERSION}-/-}" ]; then
-    cp "$a" "$STAGE/$legacy"
-    UPLOADS+=("$STAGE/$legacy")
-  fi
-done
-
-# ── arm64-named aliases for the universal build ──────────────────────────────
-# The macOS app was Apple Silicon only until 3.0.0 and shipped as
-# `Tangent-macos-arm64.{zip,dmg}`. Those exact names are the permanent links in
-# the README, in every supporter email already sent, and on the store page.
-# Going universal renames the artifact, so without this they 404 for everyone
-# who has ever been given a link — the same failure the legacy Ivory-* block
-# exists to prevent, one rename later.
-#
-# The file is the same file. A universal binary IS an arm64 binary, so an old
-# link keeps working and now happens to run on an Intel Mac too.
-for a in "${ARTIFACTS[@]}"; do
-  [ "$PRERELEASE" = 1 ] && break
-  base="${a#dist/}"
-  case "$base" in *-universal.*) ;; *) continue ;; esac
-  for name in "${base/-${VERSION}-/-}" ; do
-    for spelled in "${name}" "${name/#Tangent-/Ivory-}"; do
-      arm="${spelled/-universal./-arm64.}"
-      cp "$a" "$STAGE/$arm"
-      UPLOADS+=("$STAGE/$arm")
-    done
-  done
-done
+# **No third spelling.** Every asset also went up under its pre-rename name,
+# and the universal Mac build under the arm64 names it had before 3.0.0, so
+# that links in old supporter emails kept working. The owner retired both
+# sets: 5.1.0 carries neither, and those old links 404.
 
 echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done

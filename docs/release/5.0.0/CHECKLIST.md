@@ -242,7 +242,7 @@ Expected in `dist/`: `Tangent-5.0.0-macos.pkg`,
 - [ ] **G3.** Strip the owner header from the notes, then
   `DRY_RUN=1 scripts/publish-github.sh --notes-file docs/release/5.0.0/RELEASE-NOTES-5.0.0.md`.
   It must list every artifact in three spellings (version-scoped, the
-  version-less alias, the legacy `Ivory-*`/`ivory-*` and `-arm64` names) and
+  version-less alias, the legacy pre-rename and `-arm64` names) and
   not refuse any permanent link.
 - [ ] **G4.** The same without `DRY_RUN`. It creates the release (stable,
   so it becomes Latest over 4.4.1), uploads, and re-checks every
@@ -298,7 +298,7 @@ Latest and carries the aliases, which publish-github.sh uploads):
 - README.md:5,31-33,39 (download button, table and releases page),
   README.md:177 (issues).
 - The supporter-key email: tools/tangent-fulfil/src/main.rs:286,294,296, in
-  every email already sent, plus the older `Ivory-*` names and the
+  every email already sent, plus the older pre-rename asset names and the
   `github.com/ganten1998/ivory/...` slug in emails from before the rename.
 - The Gumroad post-purchase page and description (STORE-CONTENT.md:160-238,
   GUMROAD.md).

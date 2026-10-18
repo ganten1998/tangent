@@ -245,9 +245,14 @@ a held note. Synthogy's Ivory is a famous virtual piano and a VST3 build would
 have put us in the same browser. Three naming rounds and a trademark analysis
 are behind this; do not reopen it.
 
+> **Retired (2026-10-18).** The next paragraph is the 2.3.0 record. The
+> owner retired the third set: 5.1.0 carries none of the pre-rename assets,
+> `publish-github.sh` no longer uploads them, and the old emails' links to
+> those names 404.
+
 **Artifacts renamed**, and `scripts/publish-github.sh` now uploads every
 artifact THREE times: version-scoped, version-less alias, and under the OLD
-`Ivory-*` names. That third set is not optional. Those exact links are in the
+pre-rename names. That third set is not optional. Those exact links are in the
 inbox of everyone who has already bought a supporter key, and they resolve by
 exact asset name. The `Tangent-*` aliases were also back-filled onto the v2.2.0
 release, because the fulfilment email was redeployed with new links before new
@@ -468,7 +473,7 @@ overflow panic (`note_slack: usize::MAX`), but determinism was never reviewed.
 
 **2.3.0 IS PUBLIC** on all three platforms (macOS signed+notarized, Windows,
 Linux x86_64 — the first Linux build this project has ever produced). Every
-permalink, including the legacy `Ivory-*` names in supporter emails already
+permalink, including the legacy pre-rename names in supporter emails already
 sent, was byte-verified as serving 2.3.0. The nine existing purchasers were
 emailed via Resend; Gumroad refuses customer email below a payout or $100 in
 sales, and `keys@ivorymidi.com` can send but not receive, so Reply-To matters.
@@ -553,7 +558,7 @@ one — it must be GATED, not merely left to no-op.
    bump belongs to the release commit, as it did for 2.2.0), move
    `CHANGELOG.md`'s `[Unreleased]` under the new heading, then
    `scripts/release.sh`. Remember `scripts/publish-github.sh` must still upload
-   the legacy `Ivory-*` names (§2c) — that is not optional.
+   the legacy pre-rename names (§2c, since retired).
 4. Then the `Shell`/`Caps` refactor, then `tangent-plugin` with
    `nih_export_vst3!`, then the installer. `Caps::detachable = false` for the
    plugin; the fretboard panel needs no detached variant either.
@@ -681,7 +686,7 @@ rewriting rather than re-deriving.
    `release.sh` passes.
 5. **No release cut.** Bump the workspace version, move `[Unreleased]` under
    the new heading, then `scripts/release.sh`. `publish-github.sh` must still
-   upload the legacy `Ivory-*` names (§2c).
+   upload the legacy pre-rename names (§2c, since retired).
 
 ### Commands added this round
 

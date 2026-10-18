@@ -4538,8 +4538,7 @@ take is now simply the window it was played in.
 - The binary is now `tangent`; artifacts are `Tangent-<version>-macos-*`,
   `tangent-<version>-windows-*` and `tangent-<version>-linux-*`.
 - Nothing you have is affected. `~/.config/tangent/` keeps your settings and
-  taught chords, existing supporter keys keep working, and downloads published
-  under the old `Ivory-*` names keep resolving.
+  taught chords, and existing supporter keys keep working.
 
 ### Fixed (from the 2.2.0 tester report)
 

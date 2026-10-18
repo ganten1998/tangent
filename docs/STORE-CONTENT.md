@@ -35,9 +35,9 @@ for the README, and nothing anywhere reports it. See `docs/RELEASE.md` step 9.
 | Linux | `tangent-linux-x86_64.tar.gz` |
 | checksums | `SHA256SUMS` |
 
-`Tangent-macos-arm64.{dmg,zip}` are still uploaded as aliases of the universal
-build, because they are the names in every email sent before 3.0.0. They are
-not what a new page should hand out.
+`Tangent-macos-arm64.{dmg,zip}`, the names in the emails sent before 3.0.0,
+are no longer uploaded: those links 404, and a new page hands out the
+universal names above.
 
 **Links, not uploaded copies.** Gumroad can host the binaries itself, and that
 was the alternative. Links win because the buyer always gets the current

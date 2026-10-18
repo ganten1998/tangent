@@ -98,7 +98,7 @@ three URLs every future announcement uses. What changes is the prose.
 ## Checklist before sending
 
 - [ ] 3.0.0 is published and all three installer links resolve (click each one)
-- [ ] `Tangent-macos-arm64.dmg` and `Ivory-macos-arm64.dmg` still resolve — the
+- [ ] `Tangent-macos-arm64.dmg` and its pre-rename alias still resolve: the
       universal build renamed the artifact, and `publish-github.sh` uploads the
       arm64-named aliases so older emails keep working. Check both.
 - [ ] The fulfil service is redeployed, so NEW buyers get the installer links
