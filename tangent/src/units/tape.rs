@@ -45,7 +45,8 @@
 //! the NAB shelf's exact inverse → HF self-erasure (the envelope-driven
 //! corner above) → the tape: a short Hermite-interpolated play head swayed by
 //! wow and flutter whose depths are themselves noise-modulated, plus a
-//! whisper of scrape → the head's own top → the hiss, level-tracked → the
+//! whisper of scrape, and on each track the tape's own modulation noise →
+//! the head's own top → the hiss, white behind the speed's playback EQ → the
 //! head contour: the bump, its dip an octave above, and the head's low-end
 //! roll-off → Roll → output trim. The `drive` knob is the record level, as
 //! the speed's own headroom scales it, and the repro trim that follows it is
@@ -100,11 +101,13 @@ pub struct TapeParams {
     /// How much high end a worn head gives up, on top of the speed's own top.
     /// 0 is out of circuit, and a fresh tape opens there; see [`ROLL_HZ`].
     pub roll: f32,
-    /// Wow and flutter together, one master. 0 parks the play head; see
-    /// [`WOW_DEPTH_MS`].
+    /// Wow and flutter together, one master. 0 stops the transport, and the
+    /// head then moves only by the tape's own modulation noise, which is the
+    /// hiss's ([`JITTER_UM`]); see [`WOW_DEPTH_MS`].
     pub wobble: f32,
-    /// Tape hiss. 0 is silent tape, which no real reel ever was; see
-    /// [`HISS_MAX`].
+    /// Tape hiss, and the modulation noise that rides the music. 0 is silent
+    /// tape, which no real reel ever was; see [`HISS_GAIN`] and
+    /// [`JITTER_UM`].
     pub hiss: f32,
     /// Output trim. 0.5 is unity; see [`TRIM_DB`].
     pub trim: f32,
@@ -586,35 +589,56 @@ const SPEED_GLIDE_MS: f64 = 100.0;
 /// redesigns on the same frames at any block size.
 const SUB_BLOCK: u64 = 32;
 
-/// The hiss shaper: three one-pole corners in hertz and their injection
-/// gains, plus a direct white term.
+/// The tape's bias noise at each speed, slowest first: the gain on uniform
+/// white noise that puts it at its datasheet level at Hiss 0.25 at
+/// [`DESIGN_RATE`], and the playback equalisation's time constant, in
+/// microseconds, that colours it.
 ///
-/// **Tape hiss is pink-ish, not white**, because the repro chain's
-/// equalisation tilts the head's flat noise downward — a white hiss is a
-/// digital tell. The three-pole ladder is the standard economy pinking
-/// arrangement: each pole hands off to the next an octave-ish apart, and the
-/// sum falls within a fraction of a dB per octave of true −3. The corners
-/// are in hertz and the gains are rescaled per rate so the same colour comes
-/// out of every machine.
-const PINK_HZ: [f64; 3] = [16.5, 264.6, 3_946.0];
-const PINK_GAIN: [f64; 3] = [0.099_046, 0.296_516_4, 1.052_691_3];
-const PINK_WHITE: f64 = 0.184_8;
+/// **Tape hiss is white behind the playback equalisation.** The noise a
+/// play head reads off the tape is close to white per hertz once NAB
+/// playback has taken its record emphasis back off, so the hiss is white
+/// noise through one first-order shelf: the speed's own playback time
+/// constant against the 50 µs the level is quoted behind. 7.5 and 15 ips
+/// are NAB 50 µs, a wire; 3.75 ips is NAB 90 µs, 4 dB brighter at 10 kHz
+/// against 1 kHz; 30 ips is AES 17.5 µs, 6.6 dB duller. The pink ladder
+/// 5.0 shipped tilted the whole band, which no tape does.
+///
+/// **The level is a high-output mastering tape's datasheet.** Its bias noise
+/// sits 76.0 dB(A) under its 3 % distortion point on a 2.575 mm track, and
+/// 1.1 dB nearer it on these 2 mm tracks; with the 3 % point where
+/// the hot alignment 5.0 shipped puts it at 15 ips, 5.9 dB over 0 VU, that
+/// is -69.0 dB(A) re 0 VU, -87.0 dBFS(A), 0.7 dB over 5.0's hiss at rest.
+/// The other speeds take the same flux's noise: 30 ips 3 dB quieter,
+/// 7.5 ips 1.5 dB quieter and 3.75 ips 2.5 dB louder, so -72.0, -70.5 and
+/// -66.5 dB(A) re 0 VU. The level does not follow Drive: at a fresh tape's
+/// datasheet alignment (Drive 0.5, the 3 % point 10.2 dB over 0 VU) the
+/// datasheet's noise would sit 4.3 dB higher, at Hiss 0.32. The knob's
+/// taper is squared, because ears meet noise in decibels, and `process`
+/// scales the gain so every rate puts the same hiss in every hertz.
+const HISS_GAIN: [f64; 4] = [8.619e-5, 8.613e-5, 1.023_7e-4, 1.133_2e-4];
+const HISS_EQ_US: [f64; 4] = [90.0, 50.0, 50.0, 17.5];
 
-/// How loud the hiss can get, in full scale at the top of the knob, and how
-/// it follows the program.
+/// Modulation noise, as the head's spacing jittering: its depth at Hiss 0.25
+/// in micrometres RMS, the most it can reach, and its bandwidth at 15 ips in
+/// hertz.
 ///
-/// **The floor is why silence still sounds like tape.** The tracker raises
-/// the hiss with the music — the machine's electronics and the tape's own
-/// modulation noise ride the level — and lets it fall back when the music
-/// stops, but never to nothing: a stopped machine still has tape against
-/// the head. Squared knob taper, because ears meet noise in dB.
-///
-/// The level is the white source's scale at [`DESIGN_RATE`]; `process`
-/// rescales it so every other rate puts the same hiss in every hertz.
-const HISS_MAX: f32 = 2.0e-3;
-const HISS_FLOOR: f32 = 0.3;
-const HISS_ATTACK_MS: f32 = 10.0;
-const HISS_RELEASE_MS: f32 = 300.0;
+/// **The hiss a tone carries with it.** Tape's magnetisation is grainy, and
+/// the grain modulates whatever is recorded on it: a 1 kHz tone at 0 VU on a
+/// studio machine at 15 ips carries a skirt of noise 72.5 dB under it in
+/// 10 Hz at 800 Hz, and nothing of it when the tone stops. Wallace's spacing
+/// law, linearised, makes a jitter in the head-to-tape distance a jitter in
+/// time, `sigma n / v`, which is what this is: each channel's tap moves by a
+/// fraction of a microsecond, 0.51 µs RMS at 15 ips and 2.0 at 3.75 at the
+/// default Hiss, through noise band-limited to this bandwidth, which moves
+/// with the speed (125 Hz at 3.75 ips to 1 kHz at 30). 0.194 µm is that
+/// skirt; the depth follows the hiss's squared taper up to its cap, and
+/// Hiss 0 removes it. It replaces the program tracker 5.0's hiss rode on:
+/// the noise that follows the music is this, around each note, not a
+/// broadband swell. (Its sidebands are phase rather than amplitude, the
+/// same power.)
+const JITTER_UM: f64 = 0.194;
+const JITTER_CAP_UM: f64 = 2.0;
+const JITTER_HZ_15: f64 = 500.0;
 
 /// Output trim, in dB across the knob. Midpoint is exactly unity.
 pub const TRIM_DB: (f32, f32) = (-12.0, 12.0);
@@ -1304,6 +1328,26 @@ impl Section {
         )
     }
 
+    /// The playback shelf `(1 + s t2) / (1 + s t1)`, unity at DC, by the
+    /// bilinear transform warped at 10 kHz (or a quarter of the rate, if that
+    /// is lower), so the shelf is exact where its colour is quoted. Equal
+    /// time constants are one zero and one pole in the same place: a wire.
+    fn playback_shelf(t2_us: f64, t1_us: f64, sample_rate: f64) -> [f64; 3] {
+        let fw = 10_000.0_f64.min(0.25 * sample_rate);
+        let w = std::f64::consts::TAU * fw;
+        let k = w / (w / (2.0 * sample_rate)).tan();
+        let (t2, t1) = (t2_us * 1.0e-6, t1_us * 1.0e-6);
+        [(1.0 + k * t2) / (1.0 + k * t1), (1.0 - k * t2) / (1.0 + k * t1), (1.0 - k * t1) / (1.0 + k * t1)]
+    }
+
+    fn of(c: [f64; 3]) -> Section {
+        Section {
+            b0: c[0] as f32,
+            b1: c[1] as f32,
+            a1: c[2] as f32,
+        }
+    }
+
     #[inline]
     fn run(&self, s: &mut f32, x: f32) -> f32 {
         let y = self.b0 * x + *s;
@@ -1368,55 +1412,11 @@ fn bell_g(hz: f64, sample_rate: f64) -> f64 {
     (std::f64::consts::PI * (hz / sample_rate).min(0.49)).tan()
 }
 
-/// The pinking ladder: white noise into three one-poles whose corners are in
-/// hertz, plus the direct term. See [`PINK_HZ`].
-#[derive(Debug, Clone, Copy)]
-struct Pink {
-    p: [f32; 3],
-    g: [f32; 3],
-    b: [f32; 3],
-    rng: u32,
-    seed: u32,
-}
-
-impl Pink {
-    fn new(sample_rate: f32, seed: u32) -> Self {
-        let mut p = [0.0_f32; 3];
-        let mut g = [0.0_f32; 3];
-        for i in 0..3 {
-            let pole = |rate: f64| (-std::f64::consts::TAU * PINK_HZ[i] / rate).exp();
-            let ps = pole(f64::from(sample_rate));
-            let p44 = pole(f64::from(DESIGN_RATE));
-            p[i] = ps as f32;
-            // Same DC gain per section at every rate, so the colour designed
-            // at 44.1k comes out of a 96k machine too.
-            g[i] = (PINK_GAIN[i] * (1.0 - ps) / (1.0 - p44)) as f32;
-        }
-        Self {
-            p,
-            g,
-            b: [0.0; 3],
-            rng: seed,
-            seed,
-        }
-    }
-
-    #[inline]
-    fn step(&mut self) -> f32 {
-        let w = white(&mut self.rng);
-        let mut sum = 0.0;
-        for i in 0..3 {
-            self.b[i] = flush(self.p[i] * self.b[i] + w * self.g[i]);
-            sum += self.b[i];
-        }
-        sum + w * PINK_WHITE as f32
-    }
-
-    fn clear(&mut self) {
-        self.b = [0.0; 3];
-        self.rng = self.seed;
-    }
-}
+/// The hiss's seeds, one per channel (two tracks, two noises), and the
+/// modulation noise's. Restored by `clear`, so a cleared tape hisses the same
+/// hiss again.
+const HISS_SEEDS: [u32; 2] = [0xA5A5_0001, 0x5EED_C0DE];
+const JITTER_SEEDS: [u32; 2] = [0x30D0_0001, 0x30D0_0002];
 
 // ── the machine ─────────────────────────────────────────────────────────────
 
@@ -1440,6 +1440,15 @@ struct Voicing {
     dip_g: f64,
     /// The head's low-end roll-off, a trapezoidal one-pole's coefficient.
     low: f64,
+    /// The hiss: its playback shelf ([`Section::playback_shelf`]) and its
+    /// gain as `log2` ([`HISS_GAIN`]), blended in octaves so a glide moves
+    /// it in decibels.
+    hiss_eq: [f64; 3],
+    hiss_gain: f64,
+    /// The modulation noise's one-pole at its bandwidth for this speed, and
+    /// the factor that keeps its output unit-RMS.
+    jitter_a: f64,
+    jitter_norm: f64,
 }
 
 impl Voicing {
@@ -1450,6 +1459,7 @@ impl Voicing {
         let v_m = 0.0254 * speed.ips();
         let floor = v_m / (ERASE_FLOOR_UM * 1.0e-6);
         let f_b = v_m / (BUMP_WAVELENGTH_MM * 1.0e-3);
+        let jitter_a = f64::from(lp_a(sample_rate, JITTER_HZ_15 * speed.ips() / 15.0));
         Self {
             dmol: -DMOL_DB[i] / 20.0 * std::f64::consts::LOG2_10,
             nab: Section::nab_shelf(NAB_SHELF_DB[i], sample_rate),
@@ -1469,6 +1479,12 @@ impl Voicing {
             bump_g: bell_g(f_b, sample_rate),
             dip_g: bell_g(2.0 * f_b, sample_rate),
             low: tpt_g((HEAD_LF_SHARE * f_b).max(HEAD_LF_FLOOR_HZ), sample_rate),
+            hiss_eq: Section::playback_shelf(HISS_EQ_US[i], 50.0, sample_rate),
+            hiss_gain: HISS_GAIN[i].log2(),
+            jitter_a,
+            // A one-pole `y += a (x - y)` driven by unit white noise has a
+            // variance of `a / (2 - a)`; this hands it back.
+            jitter_norm: ((2.0 - jitter_a) / jitter_a).sqrt(),
         }
     }
 }
@@ -1479,13 +1495,14 @@ pub struct Tape {
     sample_rate: f32,
     /// The tape: one line per channel, because the two tracks are magnetised
     /// independently, but read by one head at one place, which is why the
-    /// sway below is shared.
+    /// transport's sway below is shared; only the modulation noise, which
+    /// is each track's own grain, differs between them.
     line: [Vec<f32>; 2],
     at: usize,
     /// The play head's rest position in whole samples. Whole on purpose:
-    /// with the wobble at zero the tap interpolates at exactly zero fraction
-    /// and hands samples through untouched. Shortened by [`OS_LATENCY`], for
-    /// the reason [`BASE_MS`] gives.
+    /// with the wobble and the hiss at zero the tap interpolates at exactly
+    /// zero fraction and hands samples through untouched. Shortened by
+    /// [`OS_LATENCY`], for the reason [`BASE_MS`] gives.
     base: usize,
     /// The input transformer, per channel, and its coefficient.
     transformer: [OnePole; 2],
@@ -1515,12 +1532,17 @@ pub struct Tape {
     dip: [[f32; 2]; 2],
     low: [OnePole; 2],
     roll_lp: [f32; 2],
-    /// Hiss: a pinking ladder per channel (two tracks, two noises) and the
-    /// shared program tracker that rides them up and down.
-    pink: [Pink; 2],
-    hiss_env: f32,
-    /// The hiss's level as a linear gain, gliding to the dial. See [`Glide`].
+    /// The hiss: a noise per channel through its speed's playback shelf.
+    hiss_rng: [u32; 2],
+    hiss_eq: [f32; 2],
+    /// The hiss's level on its dial, as a linear gain gliding to it (see
+    /// [`Glide`]); the speed's own gain multiplies it.
     hiss_level: Glide,
+    /// The modulation noise: its depth in micrometres, gliding to the dial,
+    /// and a noise and its band-limit per channel.
+    jitter: Glide,
+    jitter_rng: [u32; 2],
+    jitter_lp: [f32; 2],
     /// Where the modulators are, in turns. One set for both channels: one
     /// capstan.
     wow: f32,
@@ -1540,8 +1562,6 @@ pub struct Tape {
     // per the house law.
     a_att: f32,
     a_rel: f32,
-    a_hatt: f32,
-    a_hrel: f32,
     a_scrape_lo: f32,
     a_scrape_hi: f32,
     a_wander: f32,
@@ -1563,6 +1583,13 @@ pub struct Tape {
     bump_g: f64,
     dip_g: f64,
     low_g: f32,
+    hiss_shelf: Section,
+    hiss_gain: f32,
+    jitter_a: f32,
+    jitter_norm: f32,
+    /// Samples of play-head delay per micrometre of spacing jitter, at the
+    /// speed the voicing is at: the tape's speed, inverted, at this rate.
+    per_um: f32,
     /// The contour's two bells, and the `(bump g, dip g, bump dB)` they were
     /// designed at.
     bump_bell: Bell,
@@ -1616,9 +1643,12 @@ impl Tape {
             dip: [[0.0; 2]; 2],
             low: [OnePole::default(); 2],
             roll_lp: [0.0; 2],
-            pink: [Pink::new(sr, 0xA5A5_0001), Pink::new(sr, 0x5EED_C0DE)],
-            hiss_env: 0.0,
+            hiss_rng: HISS_SEEDS,
+            hiss_eq: [0.0; 2],
             hiss_level: Glide::new(1.0e-9),
+            jitter: Glide::new(1.0e-9),
+            jitter_rng: JITTER_SEEDS,
+            jitter_lp: [0.0; 2],
             wow: 0.0,
             // Apart, so the two flutter rates never start in step.
             flutter: [0.0, 0.37],
@@ -1633,8 +1663,6 @@ impl Tape {
             scrape_hi: 0.0,
             a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
             a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
-            a_hatt: env_a(rate, f64::from(HISS_ATTACK_MS)),
-            a_hrel: env_a(rate, f64::from(HISS_RELEASE_MS)),
             a_scrape_lo: lp_a(rate, f64::from(SCRAPE_BAND_HZ.0)),
             a_scrape_hi: lp_a(rate, f64::from(SCRAPE_BAND_HZ.1)),
             a_wander: env_a(rate, f64::from(WANDER_SLEW_S * 1_000.0)),
@@ -1650,6 +1678,11 @@ impl Tape {
             bump_g: 0.0,
             dip_g: 0.0,
             low_g: 0.0,
+            hiss_shelf: Section::WIRE,
+            hiss_gain: 0.0,
+            jitter_a: 0.0,
+            jitter_norm: 0.0,
+            per_um: 0.0,
             bump_bell: Bell::WIRE,
             dip_bell: Bell::WIRE,
             bells_for: (f64::NAN, f64::NAN, f64::NAN),
@@ -1730,7 +1763,9 @@ impl Tape {
         // glides as a linear gain: see [`Glide`] for why it may not glide in
         // decibels.
         let noise_rate = (self.sample_rate / DESIGN_RATE).sqrt();
-        self.hiss_level.target = f64::from(hiss * hiss * HISS_MAX * noise_rate);
+        let taper = f64::from(hiss / 0.25).powi(2);
+        self.hiss_level.target = taper * f64::from(noise_rate);
+        self.jitter.target = (JITTER_UM * taper).min(JITTER_CAP_UM);
         if self.fresh {
             // The first block after `new` or `clear` starts AT its controls,
             // not gliding to them from wherever the glides were left.
@@ -1741,6 +1776,7 @@ impl Tape {
                 &mut self.roll,
                 &mut self.trim,
                 &mut self.hiss_level,
+                &mut self.jitter,
             ] {
                 g.settle();
             }
@@ -1778,6 +1814,16 @@ impl Tape {
             self.bump_g = mix(a.bump_g, b.bump_g);
             self.dip_g = mix(a.dip_g, b.dip_g);
             self.low_g = mix(a.low, b.low) as f32;
+            self.hiss_shelf = Section::of([
+                mix(a.hiss_eq[0], b.hiss_eq[0]),
+                mix(a.hiss_eq[1], b.hiss_eq[1]),
+                mix(a.hiss_eq[2], b.hiss_eq[2]),
+            ]);
+            self.hiss_gain = mix(a.hiss_gain, b.hiss_gain).exp2() as f32;
+            self.jitter_a = mix(a.jitter_a, b.jitter_a) as f32;
+            self.jitter_norm = mix(a.jitter_norm, b.jitter_norm) as f32;
+            let v_m = 0.0254 * TapeSpeed::Ips3_75.ips() * pos.exp2();
+            self.per_um = (1.0e-6 * f64::from(self.sample_rate) / v_m) as f32;
             self.voiced_at = pos;
         }
         let bells = (self.bump_g, self.dip_g, self.bump_db.cur);
@@ -1876,20 +1922,23 @@ impl Tape {
                 + (tau * self.flutter[0]).sin() * flutter_amp.0 * fsc
                 + (tau * self.flutter[1]).sin() * flutter_amp.1 * fsc
                 + scrape;
-            let delay = (self.base as f32 + sway).clamp(2.0, (n - 4) as f32);
+            let head = self.base as f32 + sway;
 
-            // The hiss rides the program, judged before this frame is
-            // overwritten.
-            let program = buf[f].abs().max(buf[f + 1].abs());
-            let ah = if program > self.hiss_env {
-                self.a_hatt
-            } else {
-                self.a_hrel
-            };
-            self.hiss_env = flush(self.hiss_env + (program - self.hiss_env) * ah);
-            let hiss_level = self.hiss_level.tick(self.a_glide) as f32;
-            let hiss_gain =
-                hiss_level * (HISS_FLOOR + (1.0 - HISS_FLOOR) * self.hiss_env.min(1.0));
+            // The modulation noise: each channel's head jitters by its own
+            // band-limited noise, unit-RMS, times the depth in samples. At
+            // Hiss 0 the depth glides to exactly nothing and no noise is
+            // drawn, so a still tape sits on whole samples.
+            let depth = self.jitter.tick(self.a_glide) as f32 * self.per_um;
+            let mut jitter = [0.0_f32; 2];
+            if depth > 0.0 {
+                for (ch, j) in jitter.iter_mut().enumerate() {
+                    let w = white(&mut self.jitter_rng[ch]) * 3.0_f32.sqrt();
+                    self.jitter_lp[ch] =
+                        flush(self.jitter_lp[ch] + self.jitter_a * (w - self.jitter_lp[ch]));
+                    *j = self.jitter_lp[ch] * self.jitter_norm * depth;
+                }
+            }
+            let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain;
 
             for ch in 0..2 {
                 // The input transformer: keep DC and rumble out of the
@@ -1923,15 +1972,18 @@ impl Tape {
                 self.line[ch][self.at] = self.erase_lp[ch];
 
                 // The play head, swaying, and the head's own top.
+                let delay = (head + jitter[ch]).clamp(2.0, (n - 4) as f32);
                 let v = tap(&self.line[ch], self.at, delay);
                 self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
                 let mut v = self.top[ch];
 
-                // The hiss: the repro chain's noise, which the head contour
-                // and Roll shape as they shape the music. A level glided to
-                // exactly nothing skips the stage.
-                if hiss_level > 0.0 {
-                    v += self.pink[ch].step() * hiss_gain;
+                // The hiss: white noise behind the speed's playback shelf,
+                // which the head contour and Roll then shape as they shape
+                // the music. A level glided to exactly nothing skips the
+                // stage.
+                if hiss_gain > 0.0 {
+                    let w = white(&mut self.hiss_rng[ch]);
+                    v += self.hiss_shelf.run(&mut self.hiss_eq[ch], w) * hiss_gain;
                 }
 
                 // The head contour, then Roll. Out of circuit, Roll's state
@@ -1979,10 +2031,10 @@ impl Tape {
         self.dip = [[0.0; 2]; 2];
         self.low = [OnePole::default(); 2];
         self.roll_lp = [0.0; 2];
-        for p in &mut self.pink {
-            p.clear();
-        }
-        self.hiss_env = 0.0;
+        self.hiss_rng = HISS_SEEDS;
+        self.hiss_eq = [0.0; 2];
+        self.jitter_rng = JITTER_SEEDS;
+        self.jitter_lp = [0.0; 2];
         self.wow = 0.0;
         self.flutter = [0.0, 0.37];
         self.wander_rng = 0x1B0F_5EED;
@@ -2292,25 +2344,44 @@ mod tests {
         );
     }
 
-    /// The hiss falls off like pink noise — between −2 and −4 dB per octave
-    /// across the band that matters — and ducks back towards its floor once
-    /// the music stops, instead of hanging at its playing level.
+    /// **The hiss is white behind the playback EQ, and the modulation noise
+    /// rides the signal.**
+    ///
+    /// (a) On silence at Hiss 1 at 15 ips, whose playback shelf is a wire,
+    /// the hiss is flat per hertz: its least-squares slope from 250 Hz to
+    /// 8 kHz is within a decibel an octave of level, where 5.0's pink ladder
+    /// fell at three. (b) Each speed's colour is its own playback EQ against
+    /// the 50 µs its level is quoted behind: per hertz, 10 kHz against 1 kHz
+    /// reads +4.0 dB at 3.75 ips (NAB 90 µs), level at 7.5 and 15 ips, and
+    /// -6.6 dB at 30 (AES 17.5 µs), each within a decibel. (c) And the noise
+    /// a tone carries: a 1 kHz tone at 0 VU at 15 ips, Drive 0.6 and the
+    /// default Hiss, the transport still, carries a skirt at 800 Hz 72.5 dB
+    /// under it in 10 Hz, within 3 dB, the figure studio machines measure.
+    /// It is eleven 1 Hz bins of a one-second Hann window summed and scaled
+    /// by `10 / (11 x 1.5)`: a Hann bin gathers 1.5 bins' worth of noise, so
+    /// the eleven unscaled would read 2.2 dB high. Half a second after the
+    /// tone stops the same band has fallen by at least 15 dB, because what
+    /// is left there is only the hiss, which is still there, above 1e-7 RMS:
+    /// the noise that follows the music is around each note, not a swell.
+    /// Measured: a slope of -0.20 dB an octave; +4.07, -0.11, -0.11 and
+    /// -6.71 dB; a skirt of -71.1 dB that falls to -101.3 once the tone
+    /// stops, over a floor of 6.2e-5 RMS.
     #[test]
-    fn the_hiss_slopes_down_like_pink_noise_and_ducks_when_the_music_stops() {
+    fn the_hiss_is_white_behind_the_playback_eq_and_the_modulation_noise_rides_the_signal() {
         let sr = 48_000.0_f32;
-        let p = TapeParams {
-            drive: 0.5,
+        let hissing = |speed: TapeSpeed| TapeParams {
             hiss: 1.0,
+            speed: speed.dial(),
             ..TapeParams::NEUTRAL
         };
 
-        // The slope, on silence: nothing in the output but the shaper.
+        // (a) The slope, on silence: nothing in the output but the hiss.
         let mut unit = Tape::new(sr);
         let warm = 4_096;
         let windows = 16;
         let len = 8_192;
         let silence = vec![0.0_f32; (warm + windows * len) * 2];
-        let out = left(&feed(&mut unit, &silence, &p));
+        let out = left(&feed(&mut unit, &silence, &hissing(TapeSpeed::Ips15)));
         let freqs = [250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0];
         let mut powers = [0.0_f64; 6];
         for w in 0..windows {
@@ -2336,33 +2407,121 @@ mod tests {
             .sum::<f64>()
             / xs.iter().map(|x| (x - xm) * (x - xm)).sum::<f64>();
         assert!(
-            (-4.0..-2.0).contains(&slope),
-            "the hiss slopes at {slope:.2} dB/octave, which is not pink-ish"
+            (-1.0..=1.0).contains(&slope),
+            "the hiss slopes at {slope:.2} dB/octave, which is not white"
         );
 
-        // The ducking: a second of music, then silence. The hiss right after
-        // the last note is louder than the hiss a second and a half later.
-        let mut unit = Tape::new(sr);
-        let note = (sr * 1.0) as usize;
-        let total = (sr * 3.0) as usize;
-        let mono: Vec<f32> = (0..total)
+        // (b) Each speed's colour: the density at 10 kHz against 1 kHz.
+        for (speed, want) in TapeSpeed::ALL.into_iter().zip([4.0, 0.0, 0.0, -6.6]) {
+            let frames = (sr * 4.0) as usize;
+            let out = left(&feed(&mut Tape::new(sr), &vec![0.0; frames * 2], &hissing(speed)));
+            let skip = (sr * 0.1) as usize;
+            let density = |lo: f64, hi: f64| band_power(&out, sr.into(), lo, hi, skip) / (hi - lo);
+            let tilt = 10.0 * (density(9_000.0, 11_000.0) / density(900.0, 1_100.0)).log10();
+            assert!(
+                (tilt - want).abs() < 1.0,
+                "at {} the hiss reads {tilt:+.2} dB per hertz at 10 kHz against 1 kHz, \
+                 where its playback EQ gives {want:+.1}",
+                speed.label()
+            );
+        }
+
+        // (c) The skirt a tone carries, and what is left when it stops.
+        let p = TapeParams {
+            drive: 0.6,
+            hiss: 0.25,
+            ..TapeParams::NEUTRAL
+        };
+        let tone_end = (sr * 2.0) as usize;
+        let mono: Vec<f32> = (0..(sr * 3.5) as usize)
             .map(|i| {
-                if i < note {
-                    0.4 * (std::f32::consts::TAU * 1_000.0 * i as f32 / sr).sin()
+                if i < tone_end {
+                    zero_vu() * (std::f64::consts::TAU * 1_000.0 * i as f64 / f64::from(sr)).sin() as f32
                 } else {
                     0.0
                 }
             })
             .collect();
-        let out = left(&feed(&mut unit, &to_stereo(&mono), &p));
-        let win = |from: f32, to: f32| &out[(sr * from) as usize..(sr * to) as usize];
-        let early = rms(win(1.05, 1.35));
-        let late = rms(win(2.55, 2.85));
+        let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
+        let second = sr as usize;
+        let during = &out[(sr * 0.9) as usize..(sr * 0.9) as usize + second];
+        let after = &out[(sr * 2.5) as usize..(sr * 2.5) as usize + second];
+        let tone = band(during, sr.into(), 1_000.0).powi(2);
+        let skirt = |seg: &[f32]| {
+            let bins: f64 = (795..=805).map(|f| band(seg, sr.into(), f64::from(f)).powi(2)).sum();
+            10.0 * (bins * 10.0 / (11.0 * 1.5) / tone).log10()
+        };
+        let (with, without) = (skirt(during), skirt(after));
         assert!(
-            early > late * 1.2,
-            "the hiss did not duck after the music stopped: {early:.2e} then {late:.2e}"
+            (with + 72.5).abs() < 3.0,
+            "a 0 VU 1 kHz tone at 15 ips carries {with:+.1} dB in 10 Hz at 800 Hz, \
+             where studio machines measure -72.5"
         );
-        assert!(late > 1.0e-7, "the hiss floor vanished entirely: {late:.2e}");
+        assert!(
+            without < with - 15.0,
+            "half a second after the tone stopped the band at 800 Hz reads {without:+.1} dB, \
+             against {with:+.1} under the tone: the modulation noise did not leave with it"
+        );
+        let floor = rms(after);
+        assert!(floor > 1.0e-7, "the hiss floor vanished entirely: {floor:.2e}");
+    }
+
+    /// **The hiss floor and colour follow each speed's datasheet.**
+    ///
+    /// On silence, every colour off and the default Hiss, at 44.1 kHz, the
+    /// rate the levels are designed at: the hiss's density at 1 kHz is each
+    /// speed's datasheet noise behind its playback EQ, -128.7, -129.5,
+    /// -128.0 and -127.5 dB re full scale squared per hertz at 3.75, 7.5, 15
+    /// and 30 ips, within a decibel; and at 15 ips its A-weighted level is
+    /// -87.0 dBFS(A), -69.0 dB(A) re 0 VU, within 0.7 dB, measured as the
+    /// A-weighted sum of the third-octave bands the output actually carries.
+    /// Measured: -128.7, -129.3, -127.8 and -127.2 dB/Hz, and -86.9 dBFS(A).
+    #[test]
+    fn the_hiss_floor_and_colour_follow_each_speeds_datasheet() {
+        let sr = 44_100.0_f32;
+        let frames = (sr * 4.0) as usize;
+        let skip = (sr * 0.1) as usize;
+        // The A-weighting curve, normalised to 0 dB at 1 kHz.
+        let a_weight = |f: f64| {
+            let f2 = f * f;
+            let ra = 12_194.0_f64.powi(2) * f2 * f2
+                / ((f2 + 20.6_f64.powi(2))
+                    * ((f2 + 107.7_f64.powi(2)) * (f2 + 737.9_f64.powi(2))).sqrt()
+                    * (f2 + 12_194.0_f64.powi(2)));
+            ra * 10.0_f64.powf(2.0 / 20.0)
+        };
+        for (speed, want) in TapeSpeed::ALL.into_iter().zip([-128.7, -129.5, -128.0, -127.5]) {
+            let p = TapeParams {
+                hiss: 0.25,
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            let out = left(&feed(&mut Tape::new(sr), &vec![0.0; frames * 2], &p));
+            let density = 10.0 * (band_power(&out, sr.into(), 900.0, 1_100.0, skip) / 200.0).log10();
+            assert!(
+                (density - want).abs() < 1.0,
+                "at {} the hiss reads {density:+.1} dB re FS^2/Hz at 1 kHz, where its \
+                 datasheet puts {want:+.1}",
+                speed.label()
+            );
+            if speed == TapeSpeed::Ips15 {
+                let weighted: f64 = (-17..=13)
+                    .map(|k| {
+                        let centre = 1_000.0 * 2.0_f64.powf(f64::from(k) / 3.0);
+                        let (lo, hi) = (
+                            centre * 2.0_f64.powf(-1.0 / 6.0),
+                            (centre * 2.0_f64.powf(1.0 / 6.0)).min(0.495 * f64::from(sr)),
+                        );
+                        band_power(&out, sr.into(), lo, hi, skip) * a_weight(centre).powi(2)
+                    })
+                    .sum();
+                let dba = 10.0 * weighted.log10();
+                assert!(
+                    (dba + 87.0).abs() < 0.7,
+                    "at 15 ips the hiss reads {dba:+.2} dBFS(A), where the datasheet puts -87.0"
+                );
+            }
+        }
     }
 
     /// **Nothing the six knobs can reach may blow up.** Every combination of
@@ -3483,10 +3642,11 @@ mod tests {
             ("roll", |p, v| p.roll = v, -6.0),
             // +2.8 dB.
             ("wobble", |p, v| p.wobble = v, -1.0),
-            // -38.5 dB. Hiss is meant to sit under the music. Its shape and
-            // its ducking are pinned by their own test; this only says it
-            // is there.
-            ("hiss", |p, v| p.hiss = v, -42.0),
+            // -9.2 dB, most of it the modulation noise: at Hiss 1 each
+            // channel's head jitters by up to 2 µm of spacing, which moves
+            // broadband programme far more than the hiss under it does. Its
+            // skirt and the hiss's colour are pinned by their own tests.
+            ("hiss", |p, v| p.hiss = v, -13.0),
             // +9.5 dB.
             ("trim", |p, v| p.trim = v, 6.0),
             // -5.0 dB: 15 ips to either end of the selector.
