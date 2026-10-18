@@ -240,9 +240,15 @@ fn line(ui: &egui::Ui, size: f32, family: egui::FontFamily) -> f32 {
 /// **What the panel may not spend**, in points, on the font and spacing this
 /// frame is drawn with: four captions, every pushed control at the height
 /// its kind is drawn at, the transport's pointer, and the footer
-/// `faces::draw` appends under it. It is exactly the distance from the
-/// panel's top to the bottom of the preset strip with no air anywhere, so
-/// whatever the room holds past it is air the panel can prove it has.
+/// `faces::draw` appends under it. At one pixel per point it is exactly the
+/// distance from the panel's top to the bottom of the preset strip with no
+/// air anywhere, so whatever the room holds past it is air the panel can
+/// prove it has. At a fractional density egui rounds layout to a
+/// thirty-second of a point and text to the pixel, and draws the panel a
+/// fraction of a pixel taller than this (under a quarter of a point at 125
+/// percent, most of it the preset strip's own reserve), which the room
+/// under the strip takes; the tape's test of its own window holds the two
+/// within a pixel there.
 ///
 /// Every figure is the one egui sizes the part at. A slider row is the
 /// tallest of the kit's row floor, its eleven-point name and the slider's
@@ -482,6 +488,17 @@ mod tests {
         hits[0]
     }
 
+    /// The ink the one word that says `text` was painted in, found by
+    /// [`word`]'s rule: exactly one such word, or a panic naming what was.
+    fn ink(shapes: &[egui::Shape], text: &str) -> Color32 {
+        let _ = word(shapes, text);
+        words(shapes)
+            .into_iter()
+            .find(|(w, ..)| w == text)
+            .map(|(.., c)| c)
+            .expect("the word was found once above")
+    }
+
     /// The home marks a frame painted: every one-point vertical hairline,
     /// as its two ends, top first, and its colour.
     fn marks(shapes: &[egui::Shape]) -> Vec<(Pos2, Pos2, Color32)> {
@@ -519,22 +536,38 @@ mod tests {
     /// floor set too low, and the air is the first thing a short window
     /// takes, so it is the first thing to measure. **The count the air is
     /// worked out from is the face drawn there**: the panel and its footer,
-    /// less the air, come to exactly `floor_cost`, so the air is spent out of
-    /// room the window really has, and a part the count leaves out or counts
-    /// shorter than egui lays it out fails here rather than as a strip
-    /// pushed down by points nobody had. **And the preset strip is one line
-    /// there**, with a preset saved and with an empty folder, whose
-    /// closed menu says "none saved yet", the widest thing it says. The strip
-    /// clears its wrap at this width by under half a point on two of the
-    /// three fonts (it holds one line at 375.75 points of content and wraps
-    /// at 375.5), and a wrap adds a whole line the floor would pay for out of
-    /// the air, so a strip that grows a part fails here by name rather than
-    /// as air quietly lost.
+    /// less the air, come to exactly `floor_cost` at one pixel per point, so
+    /// the air is spent out of room the window really has, and a part the
+    /// count leaves out or counts shorter than egui lays it out fails here
+    /// rather than as a strip pushed down by points nobody had. **And the
+    /// preset strip is one line there**, with a preset saved and with an
+    /// empty folder, whose closed menu says "none saved yet", the widest
+    /// thing it says. The strip clears its wrap at this width by under half
+    /// a point on two of the three fonts (it holds one line at 375.75 points
+    /// of content and wraps at 375.5), and a wrap adds a whole line the
+    /// floor would pay for out of the air, so a strip that grows a part
+    /// fails here by name rather than as air quietly lost.
+    ///
+    /// **And the floor is held at the densities a desk is scaled to**, 125
+    /// and 175 percent, the steps a display offers between whole pixels,
+    /// because those desks never draw at one pixel per point: inside the
+    /// window, the air whole, the strip one line, and the count within a
+    /// pixel of the face drawn. Exact is the one-pixel-per-point claim. At a
+    /// fractional density egui rounds layout to a thirty-second of a point
+    /// and text to the pixel, and the drawn panel comes out a fraction of a
+    /// pixel taller than the count: under a quarter of a point at 125
+    /// percent, most of it in the preset strip's own reserve
+    /// (`faces::preset_foot_height`) and the rest a selector's centring.
+    /// No part the count could leave out is that small.
     #[test]
     fn the_tape_is_whole_at_its_own_window_on_every_font() {
         let st = style();
         let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
         let ceiling = crate::dialogs::face_window_size(TAPE_PATH, Some(Vec2::new(3840.0, 2160.0)));
+        // `face_min_size` answers every face's floor today, so this holds by
+        // its construction; it is here for the day a face is given a drag
+        // minimum of its own, which for the tape would let a hand drag it
+        // below the room its air is proven in.
         assert_eq!(fit::drag_minimum(TAPE_PATH), floor, "the tape can be dragged below its floor");
         let &(_, n, stepped, _, opens, grows) = fit::FACES
             .iter()
@@ -545,71 +578,98 @@ mod tests {
             (floor, ceiling),
             "the shared sweeps measure the tape at {opens:?} and {grows:?}; it opens at {floor:?} and grows to {ceiling:?}"
         );
+        // The row is spelled with these very consts today. It is held to
+        // them for the day it is spelled with numbers, as the kernel lane's
+        // stopgap row is, so a respelt row cannot drift from the panel's
+        // ceiling and its selectors.
         assert_eq!((n, stepped), (ID_CEILING, STEPPED), "the shared sweeps push the tape a different shape");
         let about = crate::faces::suite_unit(TAPE_PATH).map_or("", |(_, a)| a);
         let mut bad: Vec<String> = Vec::new();
         for font in fit::FONTS {
-            let ctx = fit::a_ctx(font);
-            for (edge, window) in [("opens at", floor), ("grown to", ceiling)] {
-                let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
-                let (right, bottom) = fit::escape(&ctx, window, about, &st.s, &mut |ui| {
-                    let _ = crate::faces::draw(ui, &st, &mut live);
+            for zoom in [1.0_f32, 1.25, 1.75] {
+                let ctx = fit::a_ctx(font);
+                ctx.set_zoom_factor(zoom);
+                let on = if zoom == 1.0 {
+                    font.key().to_owned()
+                } else {
+                    format!("{} at {}%", font.key(), (zoom * 100.0).round())
+                };
+                // One frame for the density to land, as a window's first.
+                let mut warm = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
+                let _ = fit::escape(&ctx, floor, about, &st.s, &mut |ui| {
+                    let _ = crate::faces::draw(ui, &st, &mut warm);
                 });
-                if right > fit::SLACK {
-                    bad.push(format!("{} {edge} {}x{}: {right:.1} off the right", font.key(), window.x, window.y));
-                }
-                if bottom > fit::SLACK {
-                    bad.push(format!("{} {edge} {}x{}: {bottom:.1} off the bottom", font.key(), window.x, window.y));
-                }
-            }
-            // The air, read where the panel reads it: at the top of the room
-            // the face is handed, inside the window it opens at. And the
-            // count it is worked out from, held to the face drawn there.
-            let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
-            let (mut air, mut cost, mut took) = (f32::NAN, f32::NAN, f32::NAN);
-            let _ = fit::escape(&ctx, floor, about, &st.s, &mut |ui| {
-                air = section_air(ui, &live);
-                cost = floor_cost(ui, &live);
-                took = ui
-                    .scope(|ui| {
+                let windows: &[(&str, Vec2)] =
+                    if zoom == 1.0 { &[("opens at", floor), ("grown to", ceiling)] } else { &[("opens at", floor)] };
+                for &(edge, window) in windows {
+                    let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
+                    let (right, bottom) = fit::escape(&ctx, window, about, &st.s, &mut |ui| {
                         let _ = crate::faces::draw(ui, &st, &mut live);
-                    })
-                    .response
-                    .rect
-                    .height();
-            });
-            if air != GROUP_AIR {
-                bad.push(format!("{} at the floor: the section air is {air:.2}, not {GROUP_AIR}", font.key()));
-            }
-            if (took - 3.0 * air - cost).abs() > 0.01 {
-                bad.push(format!(
-                    "{} at the floor: the panel and its footer take {:.2} points past the air, and floor_cost counts {cost:.2}",
-                    font.key(),
-                    took - 3.0 * air
-                ));
-            }
-            for saved in [true, false] {
-                let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
-                if !saved {
-                    live.preset_rows.clear();
+                    });
+                    if right > fit::SLACK {
+                        bad.push(format!("{on} {edge} {}x{}: {right:.1} off the right", window.x, window.y));
+                    }
+                    if bottom > fit::SLACK {
+                        bad.push(format!("{on} {edge} {}x{}: {bottom:.1} off the bottom", window.x, window.y));
+                    }
                 }
-                let shown = show(&ctx, floor, &st, &mut live, 1.0, egui::Modifiers::NONE, Vec::new());
-                // On one line when the strip's first word and its last share
-                // a height: a caption and a button's word do not share a
-                // centre (the label is centred in the row before the menu
-                // makes it taller, two points higher on every font), but a
-                // wrap puts Init a whole line of the strip below PRESET.
-                let (caption, init) = (word(&shown.shapes, "PRESET"), word(&shown.shapes, "Init"));
-                if init.top() >= caption.bottom() || caption.top() >= init.bottom() {
+                // The air, read where the panel reads it: at the top of the
+                // room the face is handed, inside the window it opens at. And
+                // the count it is worked out from, held to the face drawn
+                // there: exactly at one pixel per point, within a pixel at a
+                // fractional density.
+                let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
+                let (mut air, mut cost, mut took, mut ppp) = (f32::NAN, f32::NAN, f32::NAN, f32::NAN);
+                let _ = fit::escape(&ctx, floor, about, &st.s, &mut |ui| {
+                    ppp = ui.ctx().pixels_per_point();
+                    air = section_air(ui, &live);
+                    cost = floor_cost(ui, &live);
+                    took = ui
+                        .scope(|ui| {
+                            let _ = crate::faces::draw(ui, &st, &mut live);
+                        })
+                        .response
+                        .rect
+                        .height();
+                });
+                if (ppp - zoom).abs() > 1.0e-3 {
+                    bad.push(format!("{on}: the face was drawn at {ppp} pixels a point"));
+                }
+                if air != GROUP_AIR {
+                    bad.push(format!("{on} at the floor: the section air is {air:.2}, not {GROUP_AIR}"));
+                }
+                let allowed = if zoom == 1.0 { 0.01 } else { 1.0 / ppp };
+                if (took - 3.0 * air - cost).abs() > allowed {
                     bad.push(format!(
-                        "{} at the floor, {}: the preset strip wraps, PRESET at y {:.1} to {:.1} and Init at y {:.1} to {:.1}",
-                        font.key(),
-                        if saved { "a preset saved" } else { "none saved yet" },
-                        caption.top(),
-                        caption.bottom(),
-                        init.top(),
-                        init.bottom()
+                        "{on} at the floor: the panel and its footer take {:.3} points past the air, and floor_cost \
+                         counts {cost:.3}, more than {allowed:.2} apart",
+                        took - 3.0 * air
                     ));
+                }
+                for saved in [true, false] {
+                    let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
+                    if !saved {
+                        live.preset_rows.clear();
+                    }
+                    let shown = show(&ctx, floor, &st, &mut live, 1.0, egui::Modifiers::NONE, Vec::new());
+                    // On one line when the strip's first word and its last
+                    // share a height: a caption and a button's word do not
+                    // share a centre (the label is centred in the row before
+                    // the menu makes it taller, two points higher on every
+                    // font), but a wrap puts Init a whole line of the strip
+                    // below PRESET.
+                    let (caption, init) = (word(&shown.shapes, "PRESET"), word(&shown.shapes, "Init"));
+                    if init.top() >= caption.bottom() || caption.top() >= init.bottom() {
+                        bad.push(format!(
+                            "{on} at the floor, {}: the preset strip wraps, PRESET at y {:.1} to {:.1} and Init at y \
+                             {:.1} to {:.1}",
+                            if saved { "a preset saved" } else { "none saved yet" },
+                            caption.top(),
+                            caption.bottom(),
+                            init.top(),
+                            init.bottom()
+                        ));
+                    }
                 }
             }
         }
@@ -628,7 +688,11 @@ mod tests {
     /// table holds before Bias is appended, and the six it holds today,
     /// where TRANSPORT holds Wow alone and TAPE holds Hiss alone. A section
     /// whose ids are not pushed yet keeps its caption, so the panel reads the
-    /// same with a control missing as with it present.
+    /// same with a control missing as with it present; two more tables walk
+    /// that claim rather than assume it, the first four ids, which leave
+    /// TAPE with nothing under it, and none at all. Every caption wears the
+    /// caption tier's faint ink, the role the shared sweeps measure on this
+    /// ground; a caption in any other colour is one no sweep would read.
     #[test]
     fn every_control_sits_in_its_section_in_the_panels_order() {
         let st = style();
@@ -655,7 +719,7 @@ mod tests {
             ("KNOB 5", Some(P_TRIM)),
             ("BYPASS", None),
         ];
-        for count in [13_u32, 10, 6] {
+        for count in [13_u32, 10, 6, 4, 0] {
             let mut live = a_tape_of(0..count);
             let shown = show(&ctx, floor, &st, &mut live, 1.0, egui::Modifiers::NONE, Vec::new());
             let mut last: Option<(&str, f32)> = None;
@@ -667,6 +731,13 @@ mod tests {
                         "with {count} controls pushed the panel still paints {text}"
                     );
                     continue;
+                }
+                if SECTIONS.iter().any(|(title, _)| *title == text) {
+                    assert_eq!(
+                        ink(&shown.shapes, text),
+                        st.s.faint,
+                        "with {count} controls pushed the {text} caption is not in the caption tier's faint ink"
+                    );
                 }
                 let y = word(&shown.shapes, text).center().y;
                 if let Some((above, at)) = last {
@@ -694,6 +765,13 @@ mod tests {
     /// click on "studio" asks for "deep". A face that kept a list of its own
     /// would paint its words over the kernel's and drift from them the day
     /// the kernel moved.
+    ///
+    /// And which controls are selectors is the push's to say, never the
+    /// id's: Drive, no selector in the engine's table, pushed two positions
+    /// of its own is drawn and walked as one, and Speed pushed none is drawn
+    /// as the slider any continuous control is. The fixture gives positions
+    /// to exactly the ids the engine does, so without this a panel that
+    /// chose its selectors by id would pass every other test here.
     #[test]
     fn the_selectors_walk_the_positions_the_kernel_pushes() {
         let st = style();
@@ -753,6 +831,46 @@ mod tests {
         assert!(
             matches!(click(&mut live, "studio", primary, none), Some(FaceAction::Set { id: 9, value }) if near(value, 1.0)),
             "a click on studio did not ask for the deep range"
+        );
+
+        // **The kind is the push's.** Drive pushed two positions with words
+        // of its own; Speed pushed none.
+        for p in live.face.params.iter_mut() {
+            if p.id == P_DRIVE {
+                p.choices = ["soft", "hard"].map(str::to_owned).to_vec();
+                p.steps = 2;
+                p.value = 0.0;
+                p.default = 0.0;
+            } else if p.id == P_SPEED {
+                p.steps = 0;
+                p.value = 0.5;
+            }
+        }
+        assert!(
+            matches!(click(&mut live, "soft", primary, none), Some(FaceAction::Set { id: P_DRIVE, value }) if near(value, 1.0)),
+            "Drive pushed two positions was not drawn and walked as a selector"
+        );
+        let shown = show(&ctx, floor, &st, &mut live, 100.0, none, Vec::new());
+        assert!(
+            !words(&shown.shapes).iter().any(|(w, ..)| w.ends_with(" ips")),
+            "Speed pushed no positions still wears its choices"
+        );
+        // Three fifths across the window is past the middle of Speed's
+        // track, so a slider asks a value of its own there, and a selector
+        // would ask a step.
+        let at = Pos2::new(floor.x * 0.6, word(&shown.shapes, "KNOB 6").center().y);
+        let mut asked = Vec::new();
+        for (t, events) in [
+            (100.02, vec![egui::Event::PointerMoved(at)]),
+            (100.04, vec![press(at, primary, true, none)]),
+            (100.06, vec![press(at, primary, false, none)]),
+        ] {
+            asked.push(show(&ctx, floor, &st, &mut live, t, none, events).asked);
+        }
+        assert!(
+            asked.iter().any(|a| matches!(a, Some(FaceAction::Set { id: P_SPEED, value })
+                if *value > 0.5 && *value < 0.75 && ![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0].iter().any(|s| near(*value, *s)))),
+            "a press on Speed's track, Speed pushed no positions, did not ask a slider's value of its own"
         );
     }
 
@@ -1013,7 +1131,11 @@ mod tests {
     /// room with plenty to spare and at one far too short for it, differs by
     /// exactly the three seams of air and no more, and the squeezed panel
     /// still holds four captions, thirteen rows at the kit's own height and
-    /// the pointer at its own.
+    /// the pointer at its own. The air given up is the amp's own figure for
+    /// the air between its groups, which is the figure the tape's doc names,
+    /// read off the amp's source where it is private: a tape with no air at
+    /// all passes the measurement as easily as one with six points of it,
+    /// and would fail here by name.
     #[test]
     fn a_squeezed_tape_gives_up_its_air_and_never_its_rows() {
         let st = style();
@@ -1059,6 +1181,10 @@ mod tests {
             squeezed >= 4.0 * caption_h + ID_CEILING as f32 * face::ROW_H + pointer_h,
             "the squeezed panel is {squeezed:.1} points, which cannot hold four captions, {ID_CEILING} rows and the pointer"
         );
+        assert!(
+            include_str!("faces_amp.rs").contains(&format!("const GROUP_AIR: f32 = {GROUP_AIR:?};")),
+            "the tape's air between its sections is {GROUP_AIR} points, not the amp's own figure for its groups"
+        );
     }
 
     /// **The transport points at tape start and stop, and holds no copy of
@@ -1070,11 +1196,17 @@ mod tests {
     /// off, it is on: three first lines, each spelled here because the words
     /// are the pointer's contract, the times through `StartStop::reading`
     /// (trailing zeros trimmed, so ten seconds is "10 s"). Painted, the row
-    /// closes the transport, under Rate and over RECORD, and it is the same
-    /// row whatever it says: the panel's extent and the auto ids it takes are
-    /// identical for the three, so the setting arriving or moving shifts
-    /// nothing under the hand. A press on either line is the ask to be taken
-    /// there; a press on Rate's slider, directly above it, is Rate's.
+    /// closes the transport, under Rate and over RECORD, on every font and at
+    /// a window too short for any air, where nothing but the item gap
+    /// stands between the pointer and RECORD and a line run past its row
+    /// would land on the caption. It is the same row whatever it says: the
+    /// panel's extent and the auto ids it takes are identical for the three,
+    /// so the setting arriving or moving shifts nothing under the hand. Its
+    /// inks are the roles the shared sweeps measure on this ground, the
+    /// first line the panel's ink and the second and the chevron the
+    /// caption tier's faint; a colour of its own is a pair no sweep reads.
+    /// A press on either line is the ask to be taken there; a press on
+    /// Rate's slider, directly above it, is Rate's.
     ///
     /// The second line's words are ruled, and both halves of them are held:
     /// the line itself, spelled in full, so a reworded pointer fails here by
@@ -1107,42 +1239,58 @@ mod tests {
         );
 
         let st = style();
-        let ctx = fit::a_ctx(fonts::FontChoice::default());
         let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
+        let squeezed = Vec2::new(floor.x, 420.0);
         let none = egui::Modifiers::NONE;
-        let mut seen: Vec<(String, u64, Rect)> = Vec::new();
-        for (k, ss) in [None, Some(StartStop::default()), Some(StartStop::new(true, 0.5, 0.7))]
-            .into_iter()
-            .enumerate()
-        {
-            let mut live = a_tape_of(0..ID_CEILING as u32);
-            live.start_stop = ss;
-            let said = start_stop_line(ss);
-            let shown = show(&ctx, floor, &st, &mut live, 1.0 + k as f64, none, Vec::new());
-            let (rate, line, sub, record) = (
-                word(&shown.shapes, "KNOB 8"),
-                word(&shown.shapes, &said),
-                word(&shown.shapes, START_STOP_WHERE),
-                word(&shown.shapes, "RECORD"),
-            );
-            assert!(
-                rate.bottom() <= line.top() && line.bottom() <= sub.top() && sub.bottom() <= record.top(),
-                "{said:?} at y {:.1} to {:.1} and {START_STOP_WHERE:?} at y {:.1} to {:.1} are not between Rate \
-                 (ending at {:.1}) and RECORD (starting at {:.1})",
-                line.top(),
-                line.bottom(),
-                sub.top(),
-                sub.bottom(),
-                rate.bottom(),
-                record.top()
-            );
-            seen.push((said, shown.consumed, shown.took));
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            for (w, (room, window)) in [("its floor", floor), ("a window with no air", squeezed)].into_iter().enumerate() {
+                let on = format!("{} at {room}", font.key());
+                let mut seen: Vec<(String, u64, Rect)> = Vec::new();
+                for (k, ss) in [None, Some(StartStop::default()), Some(StartStop::new(true, 0.5, 0.7))]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut live = a_tape_of(0..ID_CEILING as u32);
+                    live.start_stop = ss;
+                    let said = start_stop_line(ss);
+                    let shown = show(&ctx, window, &st, &mut live, 1.0 + (3 * w + k) as f64, none, Vec::new());
+                    let (rate, line, sub, record) = (
+                        word(&shown.shapes, "KNOB 8"),
+                        word(&shown.shapes, &said),
+                        word(&shown.shapes, START_STOP_WHERE),
+                        word(&shown.shapes, "RECORD"),
+                    );
+                    assert!(
+                        rate.bottom() <= line.top() && line.bottom() <= sub.top() && sub.bottom() <= record.top(),
+                        "{on}: {said:?} at y {:.1} to {:.1} and {START_STOP_WHERE:?} at y {:.1} to {:.1} are not \
+                         between Rate (ending at {:.1}) and RECORD (starting at {:.1})",
+                        line.top(),
+                        line.bottom(),
+                        sub.top(),
+                        sub.bottom(),
+                        rate.bottom(),
+                        record.top()
+                    );
+                    for (what, text, want) in [
+                        ("first line", said.as_str(), st.s.ink),
+                        ("second line", START_STOP_WHERE, st.s.faint),
+                        ("chevron", "\u{203A}", st.s.faint),
+                    ] {
+                        let got = ink(&shown.shapes, text);
+                        assert_eq!(got, want, "{on}: the pointer's {what} is not painted in the role it reads in");
+                    }
+                    seen.push((said, shown.consumed, shown.took));
+                }
+                assert!(
+                    seen.iter().all(|(_, ids, took)| (*ids, *took) == (seen[0].1, seen[0].2)),
+                    "{on}: the panel is not the same panel whatever the pointer says (line, auto ids, extent): \
+                     {seen:#?}"
+                );
+            }
         }
-        assert!(
-            seen.iter().all(|(_, ids, took)| (*ids, *took) == (seen[0].1, seen[0].2)),
-            "the panel is not the same panel whatever the pointer says (line, auto ids, extent): {seen:#?}"
-        );
 
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
         let mut live = a_tape_of(0..ID_CEILING as u32);
         live.start_stop = Some(StartStop::new(true, 0.5, 0.7));
         let shown = show(&ctx, floor, &st, &mut live, 10.0, none, Vec::new());
