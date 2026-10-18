@@ -1015,14 +1015,14 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         crate::faces_sampler::SAMPLER_PATH => crate::faces_sampler::draw_sampler(ui, st, live),
         crate::faces_bitcrush::BITCRUSH_PATH => crate::faces_bitcrush::draw_bitcrush(ui, st, live),
         crate::faces_hwinsert::HWINSERT_PATH => crate::faces_hwinsert::draw_hwinsert(ui, st, live),
-        // The tape, the trim, and anything the suite grows before its face
-        // does: every parameter as a row, in id order — sliders for the
-        // continuous ones, the cycling button for anything stepped, so a
-        // toggle like the denoise's Learn or the drive's Symmetry wears its
-        // words instead of pretending to be a fader. The amp and the IR
-        // route here DELIBERATELY for now: their real faces (a tolex panel,
-        // an IR browser) are other lanes' work, and generic rows are the
-        // honest floor under them until those land.
+        crate::faces_tape::TAPE_PATH => crate::faces_tape::draw_tape(ui, st, live),
+        // Every unit without a panel of its own, and anything the suite
+        // grows before its face does: every parameter as a row, in id
+        // order, sliders for the continuous ones and the cycling button for
+        // anything stepped, so a toggle like the denoise's Learn or the
+        // drive's Symmetry wears its words instead of pretending to be a
+        // fader. The generic rows are the honest floor under a unit until
+        // it has a panel.
         _ => {
             let mut out = None;
             let ids: Vec<(u32, bool)> = live
@@ -1112,6 +1112,31 @@ fn bypass_row(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive) -> Option<Face
             "take this unit out of circuit without unloading it"
         });
     hit.clicked().then_some(FaceAction::SetBypass { on: !on })
+}
+
+/// **The room [`bypass_row`] takes**, for a panel that budgets its height
+/// before it draws: the lead over the button and the button itself, each
+/// measured off the live `Ui` the way egui sizes it, so a taller font or a
+/// roomier theme moves the figure with it. It stops at the button. The gap
+/// under it is the one [`preset_foot_height`] opens with, and a budget adds
+/// that next, so counted here as well it would be counted twice. The
+/// reserving half of `bypass_row`, as the strip's height is the reserving
+/// half of the strip, and `faces_tape`'s floor is the first panel to ask.
+pub(crate) fn bypass_foot_height(ui: &egui::Ui) -> f32 {
+    let word = ui
+        .painter()
+        .layout_no_wrap(
+            "BYPASSED".to_owned(),
+            egui::FontId::new(9.5, crate::fonts::courier_bold()),
+            egui::Color32::WHITE,
+        )
+        .rect
+        .height();
+    BYPASS_LEAD
+        + ui.spacing()
+            .interact_size
+            .y
+            .max(word + ui.spacing().button_padding.y * 2.0)
 }
 
 /// The air over the bypass row, so it reads as part of the footer rather
@@ -3114,7 +3139,11 @@ mod tests {
             ("@tangent-comp", 7),
             ("@tangent-amp", 9),
             ("@tangent-ir", 2),
-            ("@tangent-tape", 8),
+            (crate::faces_tape::TAPE_PATH, crate::faces_tape::ID_CEILING),
+            // The generic rows, on a sentinel no unit is, so the renderer
+            // most of the shelf wears is still swept now the tape that used
+            // to stand in for it has a panel of its own.
+            (face::fit::GENERIC_ROWS, 8),
             ("@tangent-bitcrush", 6),
         ] {
             for w in [200.0f32, 296.0, 316.0, 376.0, 446.0, 516.0, 900.0, 1400.0] {
@@ -4464,6 +4493,72 @@ mod tests {
         assert!(
             bad.is_empty(),
             "the face runs out of the window it was given:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// **The bypass row's reserve is what the row takes.** A panel that
+    /// budgets its height before it draws counts a footer it cannot see,
+    /// and [`bypass_foot_height`] is how it counts the bypass row: the lead
+    /// and the button, measured. The reserve and the row are the two halves
+    /// of one bargain, as the preset strip's are, so this draws the row and
+    /// measures what it took, at egui's own padding and the dialogs', on all
+    /// three fonts, lit and unlit: the two words differ in length and must
+    /// not differ in height. A reserve a point short is a panel spending air
+    /// out of room it did not have, and the tape's floor is exactly that
+    /// budget.
+    #[test]
+    fn the_bypass_rows_reserve_is_what_it_takes() {
+        let st = a_test_style();
+        let mut bad: Vec<String> = Vec::new();
+        let mut measured = 0;
+        for font in face::fit::FONTS {
+            let ctx = face::fit::a_ctx(font);
+            for pad in [Vec2::new(4.0, 1.0), Vec2::new(12.0, 4.0)] {
+                padded(&ctx, pad);
+                for on in [false, true] {
+                    let live = FaceLive { bypassed: on, ..Default::default() };
+                    let mut seen = None;
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::pos2(0.0, 0.0),
+                                Vec2::new(400.0, 200.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(ctx, |ui| {
+                                    let reserved = bypass_foot_height(ui);
+                                    let took = ui
+                                        .scope(|ui| {
+                                            let _ = bypass_row(ui, &st, &live);
+                                        })
+                                        .response
+                                        .rect
+                                        .height();
+                                    seen = Some((reserved, took));
+                                });
+                        },
+                    );
+                    let (reserved, took) = seen.expect("the row never drew");
+                    measured += 1;
+                    if (reserved - took).abs() > 0.01 {
+                        bad.push(format!(
+                            "{} {pad:?} {}: reserved {reserved:.3}, the row takes {took:.3}",
+                            font.key(),
+                            if on { "BYPASSED" } else { "BYPASS" }
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(measured, 12, "the sweep measured {measured} rows, wanted every case");
+        assert!(
+            bad.is_empty(),
+            "the bypass row's reserve is not what it takes:\n  {}",
             bad.join("\n  ")
         );
     }

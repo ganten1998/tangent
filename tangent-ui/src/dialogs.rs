@@ -6121,6 +6121,13 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // knob rows, here the stair over six rows where the comp has a needle
     // over seven.
     ("@tangent-bitcrush", Vec2::new(0.344, 0.582), Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
+    // **The tape is a machine in four sections** (`faces_tape`): up to
+    // thirteen controls under four captions, room under the transport for
+    // the pointer to the desk's tape start and stop, and the footer,
+    // measured on all three fonts with the section air whole at the floor.
+    // The knob panels' width share and the rule's 1.6 ceiling; the height
+    // share puts a 14-inch laptop about a third over the floor.
+    (crate::faces_tape::TAPE_PATH, Vec2::new(0.344, 0.688), Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
     // The insert: the glass, two routing rows, four knobs and the ping row
     // stacked over the footer. Taller than the knob panels by those rows.
     (
@@ -21033,6 +21040,10 @@ at: None,
     /// nothing ever gets smaller; the ceiling is that floor scaled by 1.6 in
     /// both directions, so a face keeps its proportions when the cap bites;
     /// and a laptop lands comfortably between the two. See [`FACE_SIZES`].
+    ///
+    /// The tape's floor grew from 400 by 360 to 400 by 520 when it took a
+    /// panel of its own; the promise it keeps is that it never opens smaller
+    /// than its panel needs.
     #[test]
     fn a_face_is_sized_from_the_screen_between_its_floor_and_its_ceiling() {
         // Every face that has a size of its own, with the size it used to
@@ -21042,7 +21053,7 @@ at: None,
             ("@tangent-eq", Vec2::new(470.0, 470.0)),
             ("@tangent-imager", Vec2::new(340.0, 480.0)),
             ("@tangent-comp", Vec2::new(400.0, 430.0)),
-            ("@tangent-tape", Vec2::new(400.0, 360.0)),
+            ("@tangent-tape", Vec2::new(400.0, 520.0)),
             ("@tangent-bitcrush", Vec2::new(400.0, 440.0)),
         ];
         for (unit, floor) in was {
@@ -21130,11 +21141,41 @@ at: None,
             );
         }
         // It is meaningfully bigger than the generic face it used to share a
-        // size with, which is the whole reason it is called out.
+        // size with, which is the whole reason it is called out. Asked of a
+        // sentinel no unit is, so it is the generic face by definition: the
+        // tape stood in for it until the tape grew a panel and a size of
+        // its own.
         let laptop = Some(Vec2::new(1512.0, 982.0));
         assert!(
             face_window_size("@tangent-ir", laptop).x
-                > face_window_size("@tangent-tape", laptop).x * 2.0
+                > face_window_size(crate::face::fit::GENERIC_ROWS, laptop).x * 2.0
+        );
+    }
+
+    /// **No face is sized by two rows.** [`face_window_size`] takes the
+    /// FIRST row of [`FACE_SIZES`] that names a unit, so a second row for
+    /// the same unit is silently dead: whichever of the two a merge put
+    /// lower never sizes anything, and nothing says so. That is exactly what
+    /// a stopgap row and a panel's own row would leave if a merge kept them
+    /// both, so every unit appears once. And the IR appears not at all,
+    /// because [`FACE_IR`] sizes it ahead of the table, and a row there
+    /// would be one somebody tuned for nothing. The tape's own row is
+    /// there, too: a merge that resolved the two rows by dropping both
+    /// would open its panel at the generic size, under its own floor.
+    #[test]
+    fn no_face_is_sized_by_two_rows() {
+        let mut seen: Vec<&str> = Vec::new();
+        for &(unit, ..) in FACE_SIZES {
+            assert!(!seen.contains(&unit), "{unit} has two rows in FACE_SIZES; only the first sizes it");
+            seen.push(unit);
+        }
+        assert!(
+            !seen.contains(&"@tangent-ir"),
+            "the IR has a FACE_SIZES row, which FACE_IR answers ahead of"
+        );
+        assert!(
+            seen.contains(&crate::faces_tape::TAPE_PATH),
+            "the tape has no row of its own, so it opens at the generic size"
         );
     }
 

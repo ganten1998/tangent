@@ -38,6 +38,7 @@ pub mod faces_analog;
 pub mod faces_bitcrush;
 pub mod faces_hwinsert;
 pub mod faces_sampler;
+pub mod faces_tape;
 /// The drumpad's document: the kit, saved beside the arrangement.
 pub mod drumpad;
 /// The drumpad: sixteen sample pads in a popup that floats over any view.
