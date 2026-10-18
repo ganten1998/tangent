@@ -15,15 +15,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   environment variables that turn on diagnostics and test hooks now start
   with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
   `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
-  a shell or a launcher that still sets it needs the new name.
+  a shell or a launcher that still sets it needs the new name. Every
+  release up to 5.1.0 reads only the old prefix, so the `TANGENT_` names in
+  the older entries below work from this release on.
 - **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
   see its MIDI client as `tangent` and its input port as `tangent-in`. A
   patchbay that saved a connection to the names they had before (qpwgraph,
   qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
   save. Choosing a MIDI input in Tangent works as before.
-- **Tangent no longer deletes a 4.x settings folder at launch.** The folder
-  4.x kept its settings in is left where it is. It is still not read, so a
-  supporter key from 4.x is pasted again, as before.
+- **Tangent no longer deletes a 4.x settings folder at launch.** 5.0.0 and
+  5.1.0 deleted the folder 4.x kept its settings in, unread, when they
+  started; from this release it is left where it is. It is still not read,
+  so paste a 4.x supporter key again, as with 5.0.
 
 ## [5.1.0] - 2026-10-18
 
@@ -4533,8 +4536,8 @@ take is now simply the window it was played in.
   sounds, which is what the display does with a held note.
 - The binary is now `tangent`; artifacts are `Tangent-<version>-macos-*`,
   `tangent-<version>-windows-*` and `tangent-<version>-linux-*`.
-- Nothing you have is affected. `~/.config/tangent/` keeps your settings and
-  taught chords, and existing supporter keys keep working.
+- Nothing you have is affected. Your settings and taught chords stay in the
+  folder they were in, and existing supporter keys keep working.
 
 ### Fixed (from the 2.2.0 tester report)
 
@@ -4651,7 +4654,7 @@ Python runtime, no Qt, a single self-contained executable per platform.
 
 - **Teach Chord Name…** — pin your own name to an exact voicing, optionally in
   all keys. Taught names are consulted before detection and stored in
-  `~/.config/tangent/overrides.json`, separate from your settings.
+  `overrides.json`, a file of their own beside your settings.
 - **Manage Taught Chords…** — review and delete taught names.
 - **Reset Settings to Default** in the context menu.
 - `custom_font_path` — an optional settings key pointing at any TTF/OTF on your
@@ -4691,10 +4694,10 @@ Python runtime, no Qt, a single self-contained executable per platform.
 - Courier New is never bundled or redistributed. Courier Prime replaces it.
 
 > **One-way caveat when downgrading.** Tangent 2.x reads Python 1.1.0's
-> `~/.config/tangent/settings.json` in place, so upgrading is seamless. Going back
-> to Python 1.1.0 is not: it rewrites that file with its own fixed set of 13
-> keys, discarding `custom_font_path` and any other key it does not recognize.
-> Taught chord names live in a separate file, `~/.config/tangent/overrides.json`,
+> `settings.json` in place, so upgrading is seamless. Going back to Python
+> 1.1.0 is not: it rewrites that file with its own fixed set of 13 keys,
+> discarding `custom_font_path` and any other key it does not recognize.
+> Taught chord names live in a separate file beside it, `overrides.json`,
 > which the Python app never touches.
 
 ## [1.1.0] - 2025-12-31
@@ -4730,7 +4733,7 @@ First tagged release, ported from the original GTK3 prototype to Qt.
 - MIDI device selection, and a flats/sharps preference.
 - Window size presets (50%, 75%, 100%, 125%, 150%, 175%, 200%) and borderless
   mode with drag support.
-- Settings persistence at `~/.config/tangent/settings.json`.
+- Settings persistence in a `settings.json` under `~/.config`.
 - Cross-platform builds for Linux, Windows and macOS.
 
 ### Changed
