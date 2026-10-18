@@ -58,7 +58,7 @@ translation cannot pass.
 
 **Yes, and it is the main thing: beta.13 is not pushed.**
 
-`origin/main` is `40103bc`, version `5.0.0-beta.9`. To be precise about what is
+`origin/main` is `5e2db7a`, version `5.0.0-beta.9`. To be precise about what is
 and is not there, because the distinction matters:
 
 | symbol | on `origin/main` |

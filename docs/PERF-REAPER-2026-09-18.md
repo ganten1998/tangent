@@ -6,7 +6,7 @@
 # Tangent vs REAPER: the standing, the reason, and the road to parity
 
 Machine: Apple M5 Pro (5 performance + 10 efficiency cores), 24 GB, macOS 27.0, Scarlett 18i20 USB.
-Repo: tangent @ 76212f6, clean except `tangent/src/rt_bench.rs` (new, test-only) and a 4-line `mod rt_bench;` in `tangent/src/main.rs`.
+Repo: tangent @ 3c76e4b, clean except `tangent/src/rt_bench.rs` (new, test-only) and a 4-line `mod rt_bench;` in `tangent/src/main.rs`.
 
 ---
 
@@ -720,7 +720,7 @@ owner said go on 2026-09-19; progress is marked here.
    done, each on its own, each with a test that sets the `leased` mask
    directly and asserts the behaviour. The mask is zero in every build,
    because nothing leases yet.
-   - `a8ea7c7` **the automation answers for the position it is asked about.**
+   - `d50105f` **the automation answers for the position it is asked about.**
      This was the review's find and the one that would have been silent. It
      was resolved once per block for ONE position into a single desk-wide
      table, so a track worked on ahead and the tracks on the deadline could
@@ -728,17 +728,17 @@ owner said go on 2026-09-19; progress is marked here.
      the desk's own fader, pan, send and mute and for every automated plugin
      parameter. The one-shot knob and preset road stays, and a track it lands
      on is pinned by `param_lanes` anyway.
-   - `d58e6b1` **the pool is stopped before the desk is freed.** Field order
+   - `0a0b29b` **the pool is stopped before the desk is freed.** Field order
      had the rack bank, the DX7s and the Keys dropped before the pool, so
      teardown freed every seat and then stopped the threads that render into
      them. An explicit `Drop` takes the pool first.
-   - `10dd7b2` **an instrument arriving for a held track waits.** The
+   - `956d91c` **an instrument arriving for a held track waits.** The
      sampler, DX7 and Keys rings and the patch queue all learned their track
      only after taking the arrival. They look first now. The patch queue had
      to change shape from `drain` to `retain`, because a drain takes every
      entry before any track is looked at and the obvious gate would have
      dropped a patch rather than deferring it.
-   - `7463ff6` **a plugin dropped onto a held track waits for it.** The swap
+   - `0e852ce` **a plugin dropped onto a held track waits for it.** The swap
      walk skips a held track's seats. The review's own design used a mask on
      the shared state and had two faults in it; which track a seat belongs to
      is arithmetic, so there is no table to keep in step and neither fault
@@ -775,16 +775,16 @@ owner said go on 2026-09-19; progress is marked here.
    **The original design, for the record, did not survive its attack.**
    Three live faults it turned up on the way ARE fixed and shipped, because
    each stands alone and none of them is about the look-ahead:
-   - `74c60fb` a worker that is late could claim a lane belonging to the NEXT
+   - `da60d64` a worker that is late could claim a lane belonging to the NEXT
      round and run it through the previous round's closure, which is a
      `mix_channels` stack frame that has returned. One callback is several
      chunks, so the rounds are microseconds apart. The claim word carries the
      round now and a stale claim is refused.
-   - `cf942dd` a panic anywhere inside a lane's render skipped the line that
+   - `4e23db1` a panic anywhere inside a lane's render skipped the line that
      marks the lane done, and the barrier has no timeout and no exit, so the
      audio callback spun and yielded for ever. The lane is marked from a
      destructor now. The readiness count is handed back the same way.
-   - `cf942dd` a test asserting a workgroup-less pool is never ready was made
+   - `4e23db1` a test asserting a workgroup-less pool is never ready was made
      false on three platforms by step 6 and had no `cfg` guard.
 
    **What the attack found in the protocol itself**, all of it fixable but

@@ -1,6 +1,6 @@
 # The plate, the tape echo and the pedals: what is done, and what is owed
 
-Branch `fx-dsp`, off `5e3796d`. Two files changed, `tangent/src/effects.rs` and
+Branch `fx-dsp`, off `46b54c5`. Two files changed, `tangent/src/effects.rs` and
 `tangent-ui/src/dialogs.rs`, chosen because they were the only two clean in the
 other session's tree. Five commits, +2053/−364.
 
@@ -181,7 +181,7 @@ Three ways out, in the order I would take them:
    next person does not think the parameters were forgotten.
 
 **Updated after `Fx::A`/`Fx::B` were retired:** `enum Fx` is back to the eight
-at `5e3796d`, so the grid is eight cells in two rows and nothing is competing
+at `46b54c5`, so the grid is eight cells in two rows and nothing is competing
 for the space. That removes the reason I hedged here. With a plain eight-dial
 grid I would take (1) — six rows costs one array width and one layout test, and
 it is the only option that does not trade a control away. (2) is the right
@@ -194,7 +194,7 @@ fallback if the panel geometry fights back.
 `dialogs::is_builtin(path)` exists and the seven sites inside `dialogs.rs` are
 converted. Outside it there are **two** places where the two-way test is now
 wrong, both in `desktop.rs`. **Named by function and by the line they contain,
-not by line number** — line numbers taken against `5e3796d` will not resolve
+not by line number** — line numbers taken against `46b54c5` will not resolve
 against a tree that is moving.
 
 Both sites are the identical two lines:

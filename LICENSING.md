@@ -106,10 +106,10 @@ The Linux tarballs and the Windows artifact ship a **GPL** ffmpeg as
 * Windows: BtbN autobuild ffmpeg **n8.1.3** (`ffmpeg-n8.1.3-win64-gpl-8.1.zip`),
   from the dated tag `autobuild-2026-09-22-13-18` of `BtbN/FFmpeg-Builds`.
   BtbN prunes dated tags after a few weeks, so the pin says which build, not
-  where it can still be fetched. Every Windows build made from e5ae43b up
-  to d6547f6 (2026-08-18 to 2026-09-22), that is releases 4.4.1 through
+  where it can still be fetched. Every Windows build made from 78d17aa up
+  to 6b340e1 (2026-08-18 to 2026-09-22), that is releases 4.4.1 through
   5.0.0-beta.13 and the 5.0.0-dev builds handed to testers in that span,
-  the last of them 21567be, bundled **n8.1.2-44-g7c533d0f86** from
+  the last of them 576d1b7, bundled **n8.1.2-44-g7c533d0f86** from
   `autobuild-2026-08-17-13-05` (already gone upstream).
 * Once Windows signing is configured, the shipped `tangent-ffmpeg.exe`
   carries Tangent's Authenticode signature, because Smart App Control
@@ -208,7 +208,7 @@ never become the Latest release the download links resolve against.
   for 7.0.2 binaries already handed out, which only the builder can supply
   (he owes it to us as recipients) or which stops mattering when those
   artifacts stop being offered.
-* The Windows builds made from e5ae43b up to d6547f6 (4.4.1 through
+* The Windows builds made from 78d17aa up to 6b340e1 (4.4.1 through
   5.0.0-beta.13) bundled n8.1.2-44-g7c533d0f86 from
   `autobuild-2026-08-17-13-05`. No source release is staged for it: the
   plan is to stop offering those binaries by deleting the old GitHub

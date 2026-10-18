@@ -188,7 +188,7 @@ SHIPPED = {
             (0x1c, 0x65, 0x57), (0x19, 0x38, 0x5b), (0x6b, 0x4d, 0x8e), (0x60, 0x1b, 0x49),
         ],
         click=(0x3f, 0x34, 0x31),
-        # **#0a5fc2 until 584354f, and this copy did not follow.** That
+        # **#0a5fc2 until 0a0f57b, and this copy did not follow.** That
         # commit changed index 300 in the Rust from a blue to this red and
         # left the frozen copy here on the old value, so `--check` has been
         # reporting two failures -- the drift and the byte-identity that

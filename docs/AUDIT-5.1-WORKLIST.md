@@ -1,6 +1,6 @@
 # Tangent 5.1 worklist
 
-Derived from `docs/AUDIT-5.1.md` at `0f5e78e` (5.0.0-beta.15). **This file is the working copy —
+Derived from `docs/AUDIT-5.1.md` at `36b1f56` (5.0.0-beta.15). **This file is the working copy —
 tick items as they land and move them to the bottom.** The audit is the reasoning; this is the list.
 
 **The rule that keeps this useful:** Part 2 is as important as Part 1. Anything in *SETTLED* has
@@ -66,7 +66,7 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   (`dialogs.rs:5656`), directly above "Version 5.0.0-beta.15". Draw the Tonnetz mark there too.
 - [ ] **W12 · README sells the retired VST3 plugin** (`:37, :45, :53-64, :134-137`) and links
   Gumroad at **`/l/ivory`** — the one commercial URL the rename was supposed to protect.
-  *(2026-10-10: the plugin half is closed. The README no longer sells it (1bb4c84), and with the
+  *(2026-10-10: the plugin half is closed. The README no longer sells it (012aebd), and with the
   plugin crate removed its "every crate in this repo is MIT" line is true. The Gumroad link
   still reads `/l/ivory`.)*
 - [ ] **W13 · README claims the config path was never changed** so nobody's settings are orphaned.

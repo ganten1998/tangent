@@ -1,6 +1,6 @@
 # Tangent 5.0.0 release-day checklist
 
-Audit of 2026-10-12 against main at 0ed41a68, updated the same day with
+Audit of 2026-10-12 against main at 01da483a, updated the same day with
 the owner's decisions and the fixes they called for. Every line is READY, BLOCKED
 (with why) or OWNER (a person has to do it). Do them in order: the order is
 the one docs/RELEASE.md enforces (publish, check, paste, deploy), with the

@@ -406,7 +406,7 @@ fn write_observations() {
 }
 
 /// **A 27-sends file lifts its buses, its master and its master's curves.**
-/// The 24-channel window (d298cee..af9bda6) had no arm, so its drum bus,
+/// The 24-channel window (9224522..936f3bb) had no arm, so its drum bus,
 /// click, fx return and master opened on channels 24..27 and its master's
 /// automation on channel 24. Red at the base.
 ///
@@ -633,7 +633,7 @@ fn the_composed_shelf_map_is_the_frozen_in_place_renames() {
     // **The transcription is the code the host ran**, held verbatim to its
     // loop headers for as long as that code stood (`run_in_place` above),
     // and frozen with it since: the copy-only conversion replaced it
-    // (W4-integrate (B); 1e82dbe is the last tree that renamed in place).
+    // (W4-integrate (B); 6e371d1 is the last tree that renamed in place).
     // What the host must now be is a COPY through this map, never a rename.
     let host = include_str!("../../tangent/src/desktop.rs");
     // Production only: the host's own tests spell the name to forbid it.
@@ -1123,7 +1123,7 @@ const DEFAULT_V2_BYTES: (u64, usize) = (0xe028_4149_425a_c38c, 30430);
 /// fixture and for the default settings: `WRITE_V8` is on, so what a user's
 /// install writes is exactly what the format-2 writers write, and the legacy
 /// desk is never written again. Until the flip this pinned the base's legacy
-/// bytes (8084254) for the same fixtures, which no writer of this tree
+/// bytes (8494d80) for the same fixtures, which no writer of this tree
 /// writes any more: the legacy writer now stamps what this build is.
 #[test]
 fn production_writes_the_format_2_bytes() {

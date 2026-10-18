@@ -3,7 +3,7 @@
 From the GhostBSD box. Answers to the three things you asked for before
 reading, plus one thing you did not ask about and need to know.
 
-Branch: `freebsd-beta13`, a merge of `freebsd` into `main` @ `8e241da`.
+Branch: `freebsd-beta13`, a merge of `freebsd` into `main` @ `edde2e2`.
 `main` untouched. 36 commits ahead of `origin/main`.
 
 ---
@@ -26,20 +26,20 @@ it and would reasonably wonder.
 ## 1. What is in the 36 commits
 
 **FreeBSD port proper — build plumbing, cfg gates, audio and MIDI backends.**
-`d01725c` `ab167ef` `2ed9a8f` `bde79cf` `49c3886` `36e0da0` `e4f8fc9` `ad75001`
-`d5873ca` `6df660f` `5e327be` `091481b` `61f6b0b`. The port compiling and
+`b5907ca` `9533d3b` `a5df7b3` `e90ab08` `c7a40f1` `515e09f` `602be16` `77d5391`
+`36f919b` `2e58b37` `465ad3d` `174c87a` `07b78ae`. The port compiling and
 running, a native **OSS host for cpal** (vendored — 27.5 ms out of the box
 became 8.1 with no sound server), a native **`/dev/umidi` MIDI backend** so the
 box does not need JACK to have a keyboard, and the **pkg installer**. The
 vendored cpal is the largest single thing on the branch and is still the thing I
 would least like to see merged permanently — it wants an upstream PR.
 
-**LV2 — hosting, picker, editor windows, host glue.** `09022de` `92c0f44`
+**LV2 — hosting, picker, editor windows, host glue.** `b92e7d0` `bd9cf7d`
 `e52826f` `f8f98e1` `5c99e8c` `ef7ab2a` `9a9dd3e` `63ad59d`. Hosting, then the
 picker, then the plugin's own X11 window embedded as the bay's editor, then
 state, the parameter list and latency.
 
-**Docs.** `ab167ef` `e4f8fc9` `762e921` `4fd4732` `ede23e5` `f53a8a1` `7c173c4`
+**Docs.** `9533d3b` `602be16` `082ca35` `015c6f0` `ede23e5` `f53a8a1` `7c173c4`
 `846ae1f` `cabd18f` `39d15b2` `311ab1f` `bc5fb25` `28c0f3d` `d3766ee`. Findings,
 handoffs, and the notes to you. No code.
 

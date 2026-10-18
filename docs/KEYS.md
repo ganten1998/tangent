@@ -1,7 +1,7 @@
 # Tangent Keys: ten instruments, computed
 
 Built 2026-09-01 against `main` at "Pertinent entries, taken slowly"
-(`ea77eeb`, 5.0.0-dev). Written for whoever changes the physics next.
+(`6688495`, 5.0.0-dev). Written for whoever changes the physics next.
 
 Since then the instrument has moved three times. It grew to eight sounds,
 two of each mechanism; on 2026-09-04/05 its physics was reworked against a

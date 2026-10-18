@@ -1672,7 +1672,7 @@ impl Instance {
         // therefore saw none of them. Every automation lane the owner has
         // ever drawn on a VST3 insert was inert, silently, while the knob
         // moved on screen and the saved project kept the curve. It was
-        // introduced by the commit that ADDED automation (6a7051e4, 2026-08-28)
+        // introduced by the commit that ADDED automation (696cd5a1, 2026-08-28)
         // pushing its new loop above a clear that already existed; nothing
         // moved the clear, and nothing could have noticed without a plugin.
         // `the_pool_carries_a_curve_into_the_block` is what notices now.

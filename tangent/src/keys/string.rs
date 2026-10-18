@@ -1317,7 +1317,7 @@ mod tests {
         contact_ms_on(&PianoBase::JAZZ, &PianoKnobs::default(), midi)
     }
 
-    /// The bench's tables at base 898cbfb, `keysrig piano report`: what the
+    /// The bench's tables at base 040e06b, `keysrig piano report`: what the
     /// instrument was signed off sounding like, and what every test below
     /// that says "stays" is measured against.
     const BASE_PEAK: [f32; 12] = [

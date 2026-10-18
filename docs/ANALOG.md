@@ -1,6 +1,6 @@
 # Tangent Analog — a subtractive synthesiser, solved
 
-Built 2026-09-04 against `main` from `09cb882` (5.0.0-dev), to the contract
+Built 2026-09-04 against `main` from `d4884d0` (5.0.0-dev), to the contract
 in `docs/ANALOG-BRIEF.md`. Written for whoever changes the model next, and
 for whoever wonders why a knob is where it is.
 

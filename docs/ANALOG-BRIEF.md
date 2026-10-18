@@ -1,6 +1,6 @@
 # Tangent Analog — the brief
 
-Written 2026-09-04 against `main` at `98ea626` ("The tempo draws in the
+Written 2026-09-04 against `main` at `15a5684` ("The tempo draws in the
 master's lane…", 5.0.0-dev). This is the contract for building the fourth
 built-in instrument. It is written for whoever builds it, and it says *why*
 as often as *what*, because half of the decisions below were made once

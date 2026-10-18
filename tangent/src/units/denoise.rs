@@ -5647,7 +5647,7 @@ mod tests {
     ///
     /// # What that repair did NOT move, said plainly
     ///
-    /// The defect report `907fd2c` put in the tree names a different
+    /// The defect report `3023421` put in the tree names a different
     /// number: "5.50 dB of single-block movement at the default cap and
     /// 10.40 dB at REDUCE 1.0", over a 64-frame BLOCK and over ANY band.
     /// The commit that constrained the target claimed the jump as repaired.

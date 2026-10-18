@@ -1,6 +1,6 @@
 # Tangent 5.1 Readiness Audit
 
-2026-08-30 · repo at `0f5e78e` (5.0.0-beta.15) · successor to `docs/AUDIT-5.0.md` (`04b5196`, v4.92.0)
+2026-08-30 · repo at `36b1f56` (5.0.0-beta.15) · successor to `docs/AUDIT-5.0.md` (`488bbdd`, v4.92.0)
 · 28-agent audit: 9 code sweeps, 9 adversarial refutations, a 4-level programmer panel, 4 judgement
 passes, 2 critics
 
@@ -9,7 +9,7 @@ passes, 2 critics
 > distinct · (6) is the feature set competitive · (7) what would programmers of different levels
 > think, before and after seeing the code
 
-**Method note.** Every verdict below was checked against the code at `0f5e78e`, not against the
+**Method note.** Every verdict below was checked against the code at `36b1f56`, not against the
 previous audit's claims and not against commit messages. Optimistic verdicts were then attacked by
 a second agent whose job was to refute them; 23 verdicts were downgraded in that pass, and those
 downgrades are reflected here. Where two agents disagreed, the disagreement was resolved by hand.

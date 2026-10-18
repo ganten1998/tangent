@@ -1988,7 +1988,7 @@ mod tests {
 
     // ── frozen copies of today's walks ──────────────────────────────────
     //
-    // Transcribed from `instrument.rs` at 624d78a with the desk width made a
+    // Transcribed from `instrument.rs` at d821bb3 with the desk width made a
     // parameter and the masks made u128, so the copies answer at every
     // width up to 63 lanes plus the three specials. Everything else is
     // verbatim, the `.min(..)` clamp included (at these widths it never

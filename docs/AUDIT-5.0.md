@@ -1,8 +1,8 @@
 # Tangent 5.0 Readiness Audit
-2026-08-25 · repo at ef2ab01 (v4.92.0) · 14-agent audit (5 repo sweeps, 7 research, 2 synthesis)
+2026-08-25 · repo at 84bafe1 (v4.92.0) · 14-agent audit (5 repo sweeps, 7 research, 2 synthesis)
 · companion to the /code-review ultra run on the v4.82.0..HEAD diff
 
-> **Read as of its date.** This is a snapshot of the repo at `ef2ab01`, not a live
+> **Read as of its date.** This is a snapshot of the repo at `84bafe1`, not a live
 > reference, and the gesture vocabulary has moved since. Notably: drawing a MIDI
 > item on a lane is CMD-drag (it was shift, and shift is now unbound there), the
 > exclusive arm is ALT rather than shift, and clips carry a loop with a draggable
@@ -849,7 +849,7 @@ Anchored under the cog; click away dismisses; **Done** closes. Nothing here can 
 
 > **2026-10-04:** the count-in is counted in bars, not beats: it cycles 0, 1, 2
 > and 4 bars at the take's time signature (`recorder::COUNT_IN_CHOICES`), and
-> it already did at `ef2ab01` (bars since 3.7.0). 0, 4 and 8 beats was the
+> it already did at `84bafe1` (bars since 3.7.0). 0, 4 and 8 beats was the
 > choice before there were time signatures.
 
 ### 1.3 Effect parameter panels (`recorder_panel.rs` FxLayout)
@@ -876,7 +876,7 @@ Black strip showing the detected chord name (user-settable color, auto font-fit,
 - **Supporter heart** top-right (when no recorder band is showing): click cycles color; hover raises the thanks card.
 - **Detached chord window** ("Detach Chord Window" in menu): resizable, min 220x80, remembers size/position, always-on-top while the main window is focused; right-click anywhere opens the app menu; in borderless mode click-drag anywhere moves it; closing it re-attaches.
 
-> **2026-10-04:** the menu row was already gone at `ef2ab01` (nothing has
+> **2026-10-04:** the menu row was already gone at `84bafe1` (nothing has
 > detached since 4.82.0), and round five of the 2026-10-02 audit removed the
 > window itself, with the other three popouts and their settings.
 
@@ -1399,7 +1399,7 @@ The separate thing x264 genuinely carries is **patents**: distributing an AVC en
 
 Ship-blocking (do before 5.0):
 
-1. **Host the Corresponding Source and link it "next to the object code."** Create a `tangent-ffmpeg source` location you control (GitHub release on `ganten1998/tangent`, or a Codeberg release; the repo is already public) containing, per bundled build: (a) the JVS `release-source` bundle for ffmpeg 7.0.2 as fetched from johnvansickle.com, and (b) for EACH BtbN build that has shipped: n8.1.3 (current, `autobuild-2026-09-22-13-18`, ffmpeg release tag `n8.1.3`) and n8.1.2 (every Windows build from e5ae43b up to d6547f6, that is 4.4.1 through 5.0.0-beta.13 and the tester builds of that span: the FFmpeg-Builds commit behind the now-deleted `autobuild-2026-08-17-13-05`, ffmpeg at `7c533d0f86`), each with the FFmpeg-Builds repo archived at that point (the tag's `scripts.d/` pins every library commit; archiving the fetched sources too is the gold-plated version). Then put the URL: on the **Gumroad product page** (the "place" the object code is offered), in **`SOURCE.txt`** inside `ffmpeg-licenses/`, and in **`THIRD-PARTY-LICENSES`**. Keep it up as long as 5.0 is sold plus a safety margin.
+1. **Host the Corresponding Source and link it "next to the object code."** Create a `tangent-ffmpeg source` location you control (GitHub release on `ganten1998/tangent`, or a Codeberg release; the repo is already public) containing, per bundled build: (a) the JVS `release-source` bundle for ffmpeg 7.0.2 as fetched from johnvansickle.com, and (b) for EACH BtbN build that has shipped: n8.1.3 (current, `autobuild-2026-09-22-13-18`, ffmpeg release tag `n8.1.3`) and n8.1.2 (every Windows build from 78d17aa up to 6b340e1, that is 4.4.1 through 5.0.0-beta.13 and the tester builds of that span: the FFmpeg-Builds commit behind the now-deleted `autobuild-2026-08-17-13-05`, ffmpeg at `7c533d0f86`), each with the FFmpeg-Builds repo archived at that point (the tag's `scripts.d/` pins every library commit; archiving the fetched sources too is the gold-plated version). Then put the URL: on the **Gumroad product page** (the "place" the object code is offered), in **`SOURCE.txt`** inside `ffmpeg-licenses/`, and in **`THIRD-PARTY-LICENSES`**. Keep it up as long as 5.0 is sold plus a safety margin.
 2. **Pin the archives forever.** `dist/vendor/*.tar.xz|zip` are already cached and sha256-pinned; also copy them (and the source bundles) somewhere durable outside Dropbox sync accidents, since you must be *able* to produce the source for as long as you distribute the binaries.
 3. **Add LAME to `THIRD-PARTY-LICENSES`** (and the LGPL text to the artifact license folder) for the macOS and Linux apps: "This application incorporates the LAME MP3 encoder (lame-3.100, LGPL), statically linked; complete source including build scripts at github.com/ganten1998/tangent" plus the acknowledgment/link LAME's own LICENSE asks for. Investigate why `gen-third-party-licenses.sh` (cargo-license over Cargo.lock) missed `mp3lame-encoder`/`mp3lame-sys` and regenerate.
 4. **Scope the EULA/click-through.** One sentence in the Gumroad description and installer text: the bundled `tangent-ffmpeg` is a separate GPLv3 program, not covered by Tangent's terms, license and source in `ffmpeg-licenses/`. (This is also exactly the "form" the FSF asks for in GPLInProprietarySystem: make the free program's status clear.)

@@ -1,6 +1,6 @@
 # Folders and sessions — the two rulings
 
-2026-09-01 · at `ea77eeb` · the owner's executive calls from the beta push,
+2026-09-01 · at `6688495` · the owner's executive calls from the beta push,
 recorded so the next audit inherits them as law rather than rediscovering
 them as bugs.
 

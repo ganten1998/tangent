@@ -8528,7 +8528,7 @@ struct Wide {
     /// The invariant was already written three lines above the gate that
     /// broke it: "An AUDIO channel's bit is set and its rack runs in
     /// `mix_monitor`, over its input — running it here too would fold its
-    /// effect tails twice." `bf9300e` added `has_audio` to that gate so a
+    /// effect tails twice." `bc5cbad` added `has_audio` to that gate so a
     /// plugin on an audio track would stop being furniture, which was a real
     /// and much-needed fix, and in doing so it let the timeline pass reach
     /// the rack of a channel the room was already playing.
@@ -10075,7 +10075,7 @@ fn render_lane(
     // whose input the room is monitoring goes to the bus DRY that
     // chunk. That is what shipped for years — the comment on `armed`
     // above says so — and it is the narrow price of not clocking a
-    // stateful chain twice. It costs `bf9300e`'s fix nothing where
+    // stateful chain twice. It costs `bc5cbad`'s fix nothing where
     // that fix was aimed: an audio track being MIXED is not a track
     // the room is monitoring, so a compressor on a recorded vocal
     // still runs, which was the fault that commit existed to end.
@@ -37898,7 +37898,7 @@ mod tests {
     /// pass the first and fail the second.
     ///
     /// Written after the owner reported monitoring that had been beating
-    /// REAPER by a good margin and was suddenly on par with it; `edb1f78`
+    /// REAPER by a good margin and was suddenly on par with it; `641e258`
     /// moved `limiter_mix`'s default from 1.0 (bypass) to `LIMITER_SHIPS_AT`
     /// and nothing else about the audio path changed.
     #[test]
@@ -37959,7 +37959,7 @@ mod tests {
             (at, peak)
         };
 
-        // Out of circuit, which is what it was before `edb1f78`.
+        // Out of circuit, which is what it was before `641e258`.
         let (bypassed, _) = run(1.0, 0.5);
         assert_eq!(bypassed, 0, "the monitor was late with the limiter bypassed");
 

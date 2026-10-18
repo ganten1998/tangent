@@ -82,7 +82,7 @@ pub enum DeskEra {
     V16NoDrumBus,
     /// Sixteen channels with the drum bus, 4.82 through 5.0: nineteen sends.
     V16,
-    /// The 24-channel window, d298cee..af9bda6 (2026-08-31): 27 sends.
+    /// The 24-channel window, 9224522..936f3bb (2026-08-31): 27 sends.
     V24,
     /// Thirty-two channels: 35 sends. Nothing to lift.
     V32,

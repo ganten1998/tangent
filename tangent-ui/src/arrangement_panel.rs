@@ -5295,7 +5295,7 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
 /// (1, 1/2, 1/4 ...), so the bar is the one rung that is neither, and every
 /// spelling it had read as something it is not. In 4/4 it was "1", the name
 /// of a whole note; in 3/4 "1/2·", a dotted half; in a meter whose bar is no
-/// one note it was the time signature (2d292a27; a decimal like "8.000q"
+/// one note it was the time signature (295fa8fc; a decimal like "8.000q"
 /// before that). The owner met the last of those in 4/2, whose ladder went
 /// 2, 4/2, 1: "why does the option between 1 and 2 = 4/2 in grid frequency
 /// and why is it even an option?" The rung is there because a grid of one
@@ -5375,7 +5375,7 @@ pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
 /// second half: "there should exist a single state of that button that
 /// produces 1/4th" is still the law here and still holds — it is the
 /// derivation from `grid_quarters` that holds it — while "and that's the
-/// glyph" is the part being overruled. Anyone reading 629955e's commit
+/// glyph" is the part being overruled. Anyone reading d362285's commit
 /// message and reaching for the glyph again should read that paragraph
 /// first.
 ///

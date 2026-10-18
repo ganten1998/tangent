@@ -23437,7 +23437,7 @@ impl Counted {
 /// template) a bay the old desk occupied wears the reload sentinel while its
 /// OLD instance goes on playing until the reconcile reaches it, and holding
 /// the room over a folder denoiser that is still running played the noise it
-/// removes, inverted, at full level - the residue d6547f6 took away from a
+/// removes, inverted, at full level - the residue 6b340e1 took away from a
 /// plugin picked by hand, back on every Open. Such a bay is let through for
 /// the reason a picked plugin is: the chain it is in goes on playing, and its
 /// swap is one block. `engine_holds` is asked of the engine
@@ -33391,7 +33391,7 @@ mod tests {").expect("the tests module")];
 
     /// **What the per-frame strings and the comp walk cost, before and
     /// after.** `--ignored --nocapture`, release. "Before" is the sequence
-    /// `fill_recorder_state` ran every frame at ab2ccd5 — five
+    /// `fill_recorder_state` ran every frame at 226b92f — five
     /// `shorten_home`s each calling `dirs::home_dir`, `folder_name` off the
     /// clock, the camera line and four input labels — and the walk over
     /// `INSERT_SPACE` ledger rows for the comp needles. "After" is the

@@ -123,7 +123,7 @@ Use the rustup toolchain, not Homebrew's cargo:
 
 ## Handoff
 
-Branch `themes-2026-09-18`, cut from `main` at 76212f6. `scripts/check.sh`
+Branch `themes-2026-09-18`, cut from `main` at 3c76e4b. `scripts/check.sh`
 green. Three commits, all prefixed `theme:`.
 
 ### What changed, per theme
@@ -180,8 +180,8 @@ folder by the session that first ran it, and that folder was gone.
 
 ### A correction that predates this branch
 
-`scripts/palgen.py --check` was red at 76212f6, two failures, and it is
-green now. Commit 584354f changed `STRIP_COLORS` index 300 (Default's
+`scripts/palgen.py --check` was red at 3c76e4b, two failures, and it is
+green now. Commit 0a0f57b changed `STRIP_COLORS` index 300 (Default's
 per-palette master) from `#0a5fc2` to `#b02a37` without updating the frozen
 copy in the script, so the script and the table disagreed about a colour.
 The table is the source of truth and the runs are frozen history, so the
@@ -195,7 +195,7 @@ That second one is worth stating plainly, because a script whose failure
 count is not the count of what it shows you is a script whose green runs
 prove nothing. The tail filtered on "the prefix is not a run name", and
 every byte-identity, master and extension error in the file is prefixed
-with a run's name, so none of them could ever be printed. At 76212f6 that
+with a run's name, so none of them could ever be printed. At 3c76e4b that
 was the whole of the output: `CHECK FAILS (2)` and not one word about
 which two or why. Both were the index 300 drift. The reporter prints
 whatever the per-palette loop did not, and the honest run today, on this
