@@ -51,7 +51,9 @@ already lean — ~35 µs busy per cycle, about 2.4% of even the 1.45 ms window �
 so there is nothing to make leaner; it is purely a scheduling-cushion problem.
 
 Four 30-second runs of the shipping 4.16.0 binary under identical 4×`yes` CPU
-load, using the `TANGENT_OUT_BUFFER` override already present in the binary:
+load, using the output-buffer override already present in the binary. 4.16.0
+read it under the old prefix; releases after 5.1.0 read it as
+`TANGENT_OUT_BUFFER`, the name the table and this report use:
 
 | Config | Ring / period | RT? | Underruns / 30 s |
 |---|---|---|---|
@@ -80,7 +82,9 @@ assumes. Worst-case added output latency is ~23 ms at 44.1 kHz — and ×2
 period alongside the ring in the Audio Status panel, since the two now differ
 on Linux.
 
-**Until the rebuild:** `TANGENT_OUT_BUFFER=1024 tangent` runs clean right now.
+**Until the rebuild:** the same override at 1024 runs clean right now (on the
+4.16.0 binary, under the old prefix; `TANGENT_OUT_BUFFER=1024 tangent` on a
+release after 5.1.0).
 
 ## Side observations
 

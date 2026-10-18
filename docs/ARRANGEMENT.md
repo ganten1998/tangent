@@ -388,8 +388,8 @@ channels play back their clips and nothing else. "Ready to play" and
     duplicate a grid step ahead, arrows nudge (alt = fine), Cmd+A, Z fit
     clip, Delete; draw previews audition through the live path.
   - **Right-click a channel** (either view) → Remove Track / colour
-    swatches / auto-palette. Auto-palette is ON by default (five staged:
-    SPECTRUM, EMBER, TIDE, MOSS, NEON), colours are per SLOT, and manual
+    swatches / auto-palette. Auto-palette is ON by default (five staged,
+    among them EMBER, TIDE, MOSS and NEON), colours are per SLOT, and manual
     paint overrides per strip. The mixer × retired with it.
   - **The dial standard**: every dial in the program — band, mixer
     strips, arrange headers, drumpad inspector — reads VALUE on top,

@@ -130,10 +130,12 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   about the *old* name's collision.
 - [ ] **W33 · Ledger backup stale since 11 August**, Dropbox-only (violating the keygen tool's own
   threat model), and the folder still carries the old name.
-- [ ] **W34 · Fulfilment runbook drifted from the service.** `SETUP.md` step 4 says
+- [ ] **W34 · Fulfilment runbook drifted from the service.** `SETUP.md` step 4 said
   `fly volumes create` with the pre-rename volume name; `fly.toml` mounts `tangent_data`.
-  Following the runbook stands up a service whose ledger is ephemeral. Confirm the historical
-  ledger rode across the rename.
+  Following the runbook stood up a service whose ledger is ephemeral. Confirm the historical
+  ledger rode across the rename. *(2026-08-31, 2cf184b5: the runbook half is closed. Step 4
+  creates `tangent_data`, and the runbook asks for the ledger check before a deploy. What is
+  left is the check itself, the owner's, on Fly: `fly volumes list -a tangent-fulfil`.)*
 - [ ] **W35 · Double-minting bug.** `tangent-fulfil/src/main.rs:113` uses `?` on a per-line parse
   *inside* the loop, so one blank or malformed row makes every later sale look unfulfilled and mint
   a second key. The sibling function skips bad lines deliberately.

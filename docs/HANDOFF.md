@@ -2890,8 +2890,9 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
 
 `docs/spec/*.md` were produced by 6 parallel readers over the Python source and
 machine-verified (chord tables imported and counted; 146 test vectors executed
-byte-for-byte). Trust them over the Python app's own notes folder, which
-are aspirational and self-contradictory in places. The reference Python app:
-the Python 1.x archive (main script 2035 lines PySide6, `chord_detector.py`
-2153 lines). A native arm64 reference build was extracted to the session
-scratchpad (`refapp/`, the Python app's bundle) for side-by-side comparison.
+byte-for-byte). Trust them over the notes in the Python app's own notes
+folder, which are aspirational and self-contradictory in places. The
+reference Python app: the Python 1.x archive (main script 2035 lines PySide6,
+`chord_detector.py` 2153 lines). A native arm64 reference build was extracted
+to the session scratchpad (`refapp/`, the Python app's bundle) for
+side-by-side comparison.

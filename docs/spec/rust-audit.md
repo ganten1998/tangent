@@ -76,7 +76,7 @@ Caveat: 42 tests is thin coverage for a 95-pattern engine whose behavior is defi
 
 - `tangent-core/src/patterns.rs` — the entire data layer: 95 chord patterns in priority order, essential/optional tables, 28 scales, mode lists. This encodes many hours of tuning against the Python. (Restore the `7` in `altered` or document its removal.)
 - `tangent-core/src/detector.rs` — the whole detection engine incl. its 42 tests. It is a *superset* of the Python's correctness. Port more Python test cases into it rather than re-porting the engine.
-- `tangent/src/midi.rs` — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
+- `midi.rs` (kept in `docs/reference/`, now in git history) — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
 - `piano_widget.rs` (kept in `docs/reference/`, now in git history) — correct 88-key geometry (A0 edge cases handled), hit-testing, aspect-ratio helper. Keep the math; the draw function needs its signature widened (see gaps).
 
 **Rewrite / discard:**

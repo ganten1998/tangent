@@ -1,8 +1,9 @@
 # The 4.4.0 announcement email
 
-Draft for the people who already hold a supporter key. Sent from
-`keys@tangentdaw.org` via Resend, the same way 3.0.0 went out. Gumroad still
-refuses customer email below a payout.
+Draft for the people who already hold a supporter key. Sent from the old
+sender address via Resend, the same way 3.0.0 went out. Gumroad still
+refuses customer email below a payout. Send a new one from
+`keys@tangentdaw.org`, as the `MAIL_FROM` below does.
 
 The sender address of that time **could send but not receive**, so Reply-To
 must be a real inbox or every reply disappears silently.

@@ -82,9 +82,9 @@ all 13,133 exactly in testing.
   many corrections you have made, and what it has picked up. **Forget Learning**
   wipes all of it and restores stock behaviour.
 - Right-click → **Disable Chord Learning** silences it without erasing anything.
-- Nothing is sent anywhere. Everything lives in `~/.config/tangent/overrides.json`
-  (on Windows: `C:\Users\<you>\.config\tangent\overrides.json`). Deleting that
-  file is a full reset.
+- Nothing is sent anywhere. Everything lives in one file, `overrides.json`, in
+  the folder your settings are in, under `~/.config` (on Windows, under
+  `C:\Users\<you>\.config`). Deleting that file is a full reset.
 
 ## What is worth reporting back
 

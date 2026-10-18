@@ -99,8 +99,9 @@ three URLs every future announcement uses. What changes is the prose.
 
 - [ ] 3.0.0 is published and all three installer links resolve (click each one)
 - [ ] `Tangent-macos-arm64.dmg` and its pre-rename alias still resolve: the
-      universal build renamed the artifact, and `publish-github.sh` uploads the
-      arm64-named aliases so older emails keep working. Check both.
+      universal build renamed the artifact, and `publish-github.sh` uploaded the
+      arm64-named aliases so older emails kept working. Check both. (Retired
+      2026-10-18: neither is uploaded any more, and those links 404.)
 - [ ] The fulfil service is redeployed, so NEW buyers get the installer links
       (`tools/tangent-fulfil`, then `fly deploy`)
 - [ ] Reply-To set to an inbox that exists

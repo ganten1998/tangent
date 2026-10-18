@@ -14,7 +14,7 @@ The archive's own file, bundle and package names carry the app's pre-2.3 name; t
 - Runs the input through a **chord-detection engine (100+ chord types)**: triads (maj/min/dim/aug); 7ths (maj7, m7, dom7, half-dim, dim7); extensions (9, 11, 13); altered dominants (b9, #9, #11, b13 and combinations, incl. C9(b13)); add chords (add9, add11); sus (sus2, sus4, 9sus, 13sus); 6/9; inversions; slash chords; rootless voicings; scale detection for clustered notes.
 - Chord labels use **parenthetical notation**: `C(add9)`, `Cm(add9)`, `C9(sus)`, `C7(b9)`, `C7(b9,#11)` — this was a deliberate v1.0.0 notation change from `Cadd9`/`C7b9` style.
 - UI features: **detachable chord display window** (independent, borderless-capable), **dark mode** with theme-aware context menus (cream-on-black / black-on-cream), **sustain-pedal visualization**, customizable key/note colors, MIDI device selection, flats/sharps preference toggle, window size presets (50/75/100/125/150/175/200%), **borderless mode with drag support**, settings persistence.
-- Settings: JSON at `~/.config/tangent/settings.json` (Linux/macOS) or `%USERPROFILE%\.config\tangent\settings.json` (Windows). Persists window size, borderless mode, chord-window state, colors, dark mode.
+- Settings: JSON at `~/.config/<app>/settings.json` (Linux/macOS) or `%USERPROFILE%\.config\<app>\settings.json` (Windows). Persists window size, borderless mode, chord-window state, colors, dark mode.
 - CLI flags: `-p "<port name>"` to pick a MIDI port, `-l` to list ports.
 - Keyboard shortcuts (README): Ctrl+D dark mode, Ctrl+C chord detection toggle, Ctrl+W chord window toggle, Ctrl+Q quit. Right-click opens the context menu (primary UI surface).
 - Window title = the app name; blank allowed in borderless mode. `StartupWMClass=<App>`.
@@ -52,7 +52,7 @@ Polychord detection; quartal harmony support; recording & playback; MIDI output 
 Triggers: push of tag `v*`, or `workflow_dispatch`. Three build jobs + a release job. All use Python 3.10, checkout@v3, setup-python@v4, upload/download-artifact@v4, softprops/action-gh-release@v1 with `generate_release_notes: true`. Release job runs only on tags; manual runs fall back to VERSION=1.0.0.
 
 **Linux (.deb, arch `all`)** — built inline in YAML (predates build_deb.sh):
-- Layout: `usr/bin/<app>` (the main script, chmod +x), `usr/bin/chord_detector.py`, `usr/share/applications/<app>.desktop`, single 128x128 icon at `usr/share/icons/hicolor/128x128/apps/<app>.png`, `usr/share/doc/tangent/`.
+- Layout: `usr/bin/<app>` (the main script, chmod +x), `usr/bin/chord_detector.py`, `usr/share/applications/<app>.desktop`, single 128x128 icon at `usr/share/icons/hicolor/128x128/apps/<app>.png`, `usr/share/doc/<app>/`.
 - control: `Section: sound`, `Depends: python3 (>= 3.6), python3-pyqt5, python3-pyqt5.qtsvg` (stale — app is PySide6 now).
 - Desktop entry: `Categories=AudioVideo;Audio;MIDI;Music;` (note: `MIDI` is not a valid freedesktop category; build_deb.sh corrected to `AudioVideo;Audio;Music;`), `Keywords=midi;keyboard;piano;music;chord;detection;<app>;monitor;88-key;visualizer;`, StartupWMClass=<App>.
 - Version extracted from `$GITHUB_REF` (`refs/tags/vX.Y.Z` → X.Y.Z).
@@ -126,7 +126,7 @@ All in the archive notes' `03_GitHub_and_Software_Center_Descriptions.md` (keep 
 - **Tagline**: "See every note. Understand every chord. Master music theory." One-liner: "🎹 Professional MIDI keyboard monitor with AI-powered chord detection."
 - **GNOME/Ubuntu Software short (78 ch)**: "Professional MIDI monitor with 88-key display and intelligent chord detection". **Flathub (100 ch)** variant also present.
 - **AppStream XML long description** (full feature list; ends with a GTK3/GNOME sentence — stale for the Qt app).
-- **Flatpak AppData**: id `com.github.ganten7.<App>`, categories Audio/Music/Utility, keywords, screenshot URL `raw.githubusercontent.com/ganten7/tangent/main/screenshots/main.png` (screenshots never made — README says "Coming soon!"), OARS content rating, a 1.0.1 release entry.
+- **Flatpak AppData**: id `com.github.ganten7.<App>`, categories Audio/Music/Utility, keywords, screenshot URL `raw.githubusercontent.com/ganten7/<app>/main/screenshots/main.png` (screenshots never made — README says "Coming soon!"), OARS content rating, a 1.0.1 release entry.
 - **Snapcraft summary/description** ready to paste.
 - **APT control description** (matches shipped .deb).
 - **Microsoft Store listing** (title "<App> - MIDI Keyboard Monitor", long description with full chord-type checklist, "MIDI input support via USB and Bluetooth", "PERFECT FOR" audience list) and **Mac App Store listing** (subtitle "88-Key MIDI Visualizer & Chord Detector", mentions CoreMIDI integration, native interface) — written speculatively; app never shipped to either store, and MAS would require signing/sandboxing the current build doesn't have.
