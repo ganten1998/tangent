@@ -2839,15 +2839,23 @@ fn a_tape_stop_lets_the_plate_ring_out_unheard() {
     assert!(dbfs(heard) > -80.0, "the tail was not heard once let go: {:.1} dBFS", dbfs(heard));
 }
 
-/// **The tape motor falls back to the chunk, and comes back.**
+/// **A grained desk stops and starts with the tape motor as the chunked
+/// one does.**
 ///
-/// While the tape changes speed the varispeed path is in circuit, so the
+/// While the tape changes speed the varispeed path is in circuit and the
 /// grain render stands aside for the whole desk, as it does under the dial,
-/// and resumes when the tape is at rest or at speed again. A stop at 100
-/// and a Play at 160, at 0.1 s each way, through a plate, against the
-/// chunked reference: within the transitions' own two bars.
+/// resuming when the tape is at rest or at speed again; that it stands
+/// aside is pinned where the lanes' spans can be seen,
+/// `instrument::tape_motor::the_grain_render_stands_aside_while_the_tape_changes_speed`.
+/// This is the sound-level net over the same road, the kind every other
+/// transition has: a stop at 100 and a Play at 160, at 0.1 s each way,
+/// through a plate, against the chunked reference, within the transitions'
+/// own two bars. It cannot see the fallback itself, because a grain serves
+/// a moving ratio's spans correctly and the two desks would meet these bars
+/// either way: the guard is a rule of what can be planned, not of what a
+/// grain sounds like.
 #[test]
-fn the_tape_motor_falls_back_to_the_chunk_and_comes_back() {
+fn a_grained_desk_stops_and_starts_as_the_chunked_one_does() {
     for grain in [240.0f64, 512.0] {
         let t = transition(
             || {

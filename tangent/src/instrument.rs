@@ -52425,6 +52425,76 @@ mod tape_motor {
         }
     }
 
+    /// What the grain render did with the tone's lane in the last chunk
+    /// of the last pass: whether the varispeed path was engaged, whether the
+    /// lane was served from its grain or rendered ahead of the tape, and
+    /// whether it rendered the chunk's own span and nothing more (and a
+    /// resting lane's clock counted just that chunk). `None` while the lane
+    /// rests, when its span is the one it rested with.
+    fn grain_seen(e: &Engine) -> Option<(bool, bool, bool)> {
+        let r = e.offline.as_ref().expect("an offline renderer");
+        if r.spine.ext.resting.contains(LANE) {
+            return None;
+        }
+        let lane = r.spine.lanes[LANE].as_deref().expect("the tone's lane").peek();
+        let end = lane.at + lane.len as u64;
+        let ahead = lane.skip || end > r.pos;
+        let chunked = !lane.skip && end == r.pos && r.rest_inc == lane.len as u64;
+        Some((r.vs_now.engaged, ahead, chunked))
+    }
+
+    /// **The grain render stands aside while the tape changes speed, and
+    /// comes back.**
+    ///
+    /// While the motor ramps the varispeed path is in circuit, and a grain
+    /// cannot be planned: the next pass's program length follows the speed.
+    /// So, as under the dial, on every pass the path is engaged each lane
+    /// renders the chunk's own span and none is served from its grain
+    /// (`plan_grains`), and a resting lane's clock counts the chunk and no
+    /// grain (`fill_active`'s `rest_inc`); once the tape is at speed again
+    /// the lanes are served from their grains, rendering ahead of the tape.
+    /// The tone's lane at a 512-frame grain, watched after every pass of a
+    /// stop and a re-spin: a lane served from its grain or rendering ahead
+    /// shows it in its span, which is the chunk's own exactly when it is
+    /// not. (`rt_bench::a_grained_desk_stops_and_starts_as_the_chunked_one_does`
+    /// is the sound-level net over the same road.)
+    #[test]
+    fn the_grain_render_stands_aside_while_the_tape_changes_speed() {
+        let mut e = tone_desk(RATE, 500.0, 12.0);
+        e.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        let grained = |e: &mut Engine, t: &mut Transport, n: usize| {
+            (0..n)
+                .filter(|_| {
+                    one(e, t, PASS);
+                    grain_seen(e).is_some_and(|(on, ahead, _)| !on && ahead)
+                })
+                .count()
+        };
+        assert!(grained(&mut e, &mut t, 40) > 30, "the lane was not served from its grain at speed, so nothing was proved");
+        let mut engaged = 0usize;
+        for (what, play, until) in [("the stop", false, MotorShow::Holding), ("the start", true, MotorShow::Running)] {
+            if play {
+                t.toggle_play();
+            } else {
+                t.stop();
+            }
+            for k in 0..400 {
+                let p = one(&mut e, &mut t, PASS);
+                if let Some((true, ahead, chunked)) = grain_seen(&e) {
+                    engaged += 1;
+                    assert!(!ahead && chunked, "pass {k} of {what}: the lane was served from its grain while the tape changed speed");
+                }
+                if p.show == until {
+                    break;
+                }
+            }
+        }
+        assert!(engaged > 150, "only {engaged} passes ramped with the lane awake, so little was proved");
+        assert!(grained(&mut e, &mut t, 40) > 30, "the grains did not come back once the tape was at speed");
+    }
+
     /// The audio track an input is bound to, beside the tone's lane.
     const TRACK: usize = 5;
 
