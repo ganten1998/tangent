@@ -186,6 +186,19 @@ pub struct MonitorPlan {
     /// quarter of the take. A wider device brings a wider scratch, built
     /// here on the host, and the one it replaces leaves with the plan.
     pub scratch: Vec<f32>,
+    /// **The input's varispeed stretch, built at exactly this ring's
+    /// width**, with the ring (`None`: keep the one held). A stretch reads
+    /// its source and writes its destination at its own width, so one a
+    /// channel wider than the ring reads it as garbage: it was built at the
+    /// OUTPUT's width and re-widened on the audio thread, an allocation in
+    /// the first stretched chunk after every ring of another width. The one
+    /// it replaces leaves with the plan.
+    pub vs_in: Option<crate::varispeed::Stream>,
+    /// The stretch's destination, one chunk (`MAX_BLOCK` frames) of this
+    /// ring's width, with the stretch. Sized by the output, it held less
+    /// than one chunk of a sixty-four input interface, and the stretch was
+    /// skipped.
+    pub vs_in_src: Vec<f32>,
     /// A new layout for the ring already held, and no ring: the renderer
     /// keeps its ring and takes the tables.
     pub layout_only: bool,

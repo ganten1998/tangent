@@ -426,6 +426,63 @@ mod tests {
         );
     }
 
+    /// **An input narrower or wider than the desk is stretched under the
+    /// dial without allocating**, the first stretched chunk after its ring
+    /// arrives included.
+    ///
+    /// The input's varispeed stretch has to be exactly as wide as the ring
+    /// it reads, and the renderer's own one is built at the OUTPUT's width.
+    /// It was re-widened on the audio thread, in the first stretched chunk
+    /// after a ring of another width arrived (`Stream::set_channels`: two
+    /// buffers built and two let go), so plugging in a mono USB microphone
+    /// with the dial off centre went to the allocator inside the callback.
+    /// The stretch now arrives with its ring, built on the host at the
+    /// ring's own width, and the one it displaces leaves with the plan.
+    /// A mono ring and then a six-wide one, both against the baseline desk's
+    /// stereo output.
+    #[test]
+    fn an_input_narrower_or_wider_than_the_desk_is_stretched_without_allocating() {
+        let mut e = baseline_desk();
+        e.set_varispeed(0.85);
+        e.set_monitor_on(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        // Engaged and warm: the dial's own histories are cleared on the way
+        // in, and the desk's rings drain.
+        for _ in 0..16 {
+            e.render_offline(&mut out);
+        }
+        let (_, steady) = least_of(5, || {
+            for _ in 0..8 {
+                e.render_offline(&mut out);
+            }
+        });
+        assert_eq!(steady, Counted::default(), "a steady render under the dial allocated");
+        for width in [1usize, 6] {
+            // A second of input waiting, so the stretch has frames to read
+            // in the very chunk the ring arrives in.
+            let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(width * 4096);
+            for i in 0..width * 2048 {
+                let _ = tx.push((i as f32 * 0.01).sin() * 0.1);
+            }
+            let widths = vec![width as u8].into_boxed_slice();
+            e.set_monitor(Some((rx, width as u16, widths, 512, tangent_record::audio::Picks::EVERYTHING)));
+            // One-shot: the ring arrives and is first stretched in this
+            // render (see the baseline above for why only `here` is exact).
+            let (_, first) = count_allocs(|| e.render_offline(&mut out));
+            assert_eq!(
+                first.here, 0,
+                "the first stretched chunk of a {width}-wide input allocated: {first:?}"
+            );
+            let (_, after) = least_of(5, || {
+                for _ in 0..4 {
+                    e.render_offline(&mut out);
+                }
+            });
+            assert_eq!(after, Counted::default(), "a {width}-wide input under the dial allocated");
+            assert!(out.iter().all(|s| s.is_finite()), "a {width}-wide input under the dial rendered garbage");
+        }
+    }
+
     /// **Several instruments on one track allocate nothing either** (see
     /// `instrument::Layer`): a DX7 at the head, an analog layered over it,
     /// the keyboard entering at the third bay, a sampler in the extra rack,

@@ -11829,7 +11829,9 @@ struct Renderer {
     vs_dev: Vec<f32>,
     /// One reusable destination for resampling the three taps in place.
     vs_dst: Vec<f32>,
-    /// The live input at REAL rate, before it is stretched into the program.
+    /// The input stretch's destination: one chunk of the live input at
+    /// PROGRAM rate, copied back over the scratch. It arrives with the ring,
+    /// at the ring's width (`MonitorPlan::vs_in_src`).
     vs_in_src: Vec<f32>,
     /// Whether the last callback was engaged, so the histories can be
     /// dropped on the way in rather than bleeding a block from before.
@@ -14440,6 +14442,14 @@ impl Renderer {
                 if !plan.scratch.is_empty() {
                     std::mem::swap(&mut self.monitor_scratch, &mut plan.scratch);
                 }
+                // **And its varispeed stretch, built at its width** (see
+                // `MonitorPlan::vs_in`), the pair it displaces leaving with
+                // the plan. A new ring owes the old one's phase nothing.
+                if let Some(vs_in) = plan.vs_in.as_mut() {
+                    std::mem::swap(&mut self.vs_in, vs_in);
+                    std::mem::swap(&mut self.vs_in_src, &mut plan.vs_in_src);
+                    self.vs_in_phase.reset();
+                }
                 if self.monitor.is_some() {
                     self.monitor_channels = usize::from(plan.channels).max(1);
                     self.monitor_block = plan.block.max(1) as usize;
@@ -14701,8 +14711,12 @@ impl Renderer {
                 let n = frames * ch_in;
                 let frac = self.vs_in_phase.frac();
                 let mut dst = std::mem::take(&mut self.vs_in_src);
-                if dst.len() >= n && self.monitor_scratch.len() >= n {
-                    self.vs_in.set_channels(ch_in);
+                // **The stretch is the ring's own width**, built with it on
+                // the host (`MonitorPlan::vs_in`), so the width below is
+                // always the stride the ring was read at. The guard's false
+                // branch, unreachable by construction, leaves the chunk
+                // unstretched rather than building a stretch here.
+                if dst.len() >= n && self.monitor_scratch.len() >= n && self.vs_in.channels() == ch_in {
                     self.vs_in
                         .run(&self.monitor_scratch, src_frames, &mut dst, frames, frac, step);
                     self.monitor_scratch[..n].copy_from_slice(&dst[..n]);
@@ -28028,11 +28042,18 @@ impl Engine {
                     sh.block = block;
                     sh.layout = stream_layout(&widths, &picks, channels);
                     sh.columns = picks;
+                    // **The varispeed stretch at exactly the ring's own
+                    // width**, the width `mix_monitor` reads the ring at
+                    // (`monitor_channels`), and its destination one chunk
+                    // of it: built here so the callback never re-widens one.
+                    let width = usize::from(channels).max(1);
                     crate::lane_bank::MonitorPlan {
                         ring: Some(ring),
                         channels,
                         block,
                         scratch: vec![0.0; MONITOR_SCRATCH_FRAMES * usize::from(channels).max(TAP_CHANNELS)],
+                        vs_in: Some(crate::varispeed::Stream::new(width)),
+                        vs_in_src: vec![0.0; MAX_BLOCK as usize * width],
                         ..sh.plan(false)
                     }
                 }
@@ -49468,6 +49489,114 @@ mod memory_inputs {
         assert_eq!(took.len(), want.len(), "the take is not as long as the input");
         assert!(took == want, "the take is not input 40, sample for sample");
         assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+    }
+
+    /// Zero crossings per second of `x` at `RATE`, halved: a tone's
+    /// frequency, with no FFT and no window to argue about.
+    fn crossing_hz(x: &[f32]) -> f64 {
+        let crossings = x.windows(2).filter(|w| (w[0] <= 0.0) != (w[1] <= 0.0)).count();
+        crossings as f64 / 2.0 / (x.len() as f64 / f64::from(RATE))
+    }
+
+    /// **An input is stretched at its own width, whatever the width**, with
+    /// the dial alone.
+    ///
+    /// Under the dial the input ring is read at REAL rate and stretched into
+    /// the program (`mix_monitor`), and `varispeed::Stream` reads its source
+    /// and writes its destination at ITS width: a stretch one channel wider
+    /// than a mono ring reads two samples a frame and writes two, which is
+    /// no tone at all (measured: the room's crossings read 1067.9 Hz). So a
+    /// mono microphone, the ordinary USB case, is played to the room and
+    /// taped with a stretch of exactly one channel, and a six-wide interface
+    /// with one of six.
+    ///
+    /// Each width is pinned by what the stretch is FOR. The room hears the
+    /// input at its own pitch, because the stretch in and the squeeze out
+    /// cancel (1 kHz within 1 %). The arrangement tee tapes the stretched
+    /// program frames, so at the nominal rate the take reads 1000 / 0.85 =
+    /// 1176 Hz within 1 %, as today's varispeed record does.
+    ///
+    /// **And sixty-four wide, which was not stretched at all.** The
+    /// stretch's destination was sized by the OUTPUT (`MAX_CALLBACK_FRAMES`
+    /// frames of it, 16384 samples on a stereo desk), and one 512-frame
+    /// chunk of a sixty-four input interface is 32768: the size guard
+    /// declined every chunk, the ring was played unstretched with the
+    /// surplus of each chunk thrown away, and the room heard 874.5 Hz. The
+    /// destination arrives with the ring now, sized by it. The allocation
+    /// side, the stretch arriving built, is
+    /// `rt_alloc::an_input_narrower_or_wider_than_the_desk_is_stretched_without_allocating`.
+    #[test]
+    fn a_mono_input_is_stretched_at_its_own_width() {
+        const TRACK: usize = 5;
+        const HZ: f64 = 1_000.0;
+        const RATIO: f32 = 0.85;
+        const BLOCKS: usize = 40;
+        for (dev, col) in [(1usize, 0usize), (6, 3), (64, 39)] {
+            let mut e = engine_with(LEGACY_LANES, audio(), LaneFlags::MIDI_OFF);
+            let mut flags = every_lane(&e, LEGACY_LANES, LaneFlags::MIDI_OFF);
+            flags.lanes[TRACK].flags = LaneFlags::ARMED | LaneFlags::MIDI_OFF;
+            e.publish_plan(&flags).expect("the plan goes");
+            let rows: Vec<InputRow> = (0..LEGACY_LANES)
+                .map(|i| InputRow {
+                    id: TrackId(i as u32),
+                    audio: i == TRACK,
+                    spec: (i == TRACK).then_some(ChannelPick::Mono(col as u16)),
+                    armed: i == TRACK,
+                })
+                .collect();
+            let stream = InputStream { device_channels: Some(dev), picks: Picks::EVERYTHING };
+            let mut table = PickTable::default();
+            table.bind(&rows, &stream);
+            let pick = table.pick_of(TrackId(TRACK as u32)).expect("the armed track has a pick");
+            e.set_varispeed(RATIO);
+            e.set_monitor_on(true);
+            let (mut tx, rx) = RingBuffer::<f32>::new(dev * BLOCK * 8);
+            e.set_monitor(Some((rx, dev as u16, vec![dev as u8].into_boxed_slice(), BLOCK as u32, Picks::EVERYTHING)));
+            e.set_monitor_inputs(&table.monitor(lane_of(&e)), &Picks::EVERYTHING);
+            e.sync_capture_rings(&table.armed(&rows)).expect("the armed pick's ring");
+            e.set_capturing(&[pick]);
+            // The tone on its column, every other column a level of its own,
+            // one device block at a time; one block ahead, the block a
+            // device is filling while the output callback runs.
+            let mut fed = 0usize;
+            let mut feed = |tx: &mut Producer<f32>| {
+                let block: Vec<f32> = (0..BLOCK)
+                    .flat_map(|f| {
+                        let v = (std::f64::consts::TAU * HZ * (fed + f) as f64 / f64::from(RATE)).sin() as f32 * 0.5;
+                        (0..dev).map(move |c| if c == col { v } else { level(c) })
+                    })
+                    .collect();
+                let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+                fed += BLOCK;
+            };
+            feed(&mut tx);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let mut room = Vec::new();
+            let mut took = Vec::new();
+            for b in 0..BLOCKS {
+                feed(&mut tx);
+                e.render_offline(&mut out);
+                // The settled part: the room's fade and the pick's own are in.
+                if b >= 8 {
+                    room.extend(out.chunks(2).map(|f| f[0]));
+                }
+                e.drain_capture(pick, &mut took);
+            }
+            let heard = crossing_hz(&room);
+            assert!(
+                (heard - HZ).abs() / HZ < 0.01,
+                "a {dev}-wide input under the dial reached the room at {heard:.1} Hz, not {HZ}"
+            );
+            // The take's left side, past the same settling.
+            let taped: Vec<f32> = took.chunks(2).skip(8 * BLOCK).map(|f| f[0]).collect();
+            let want = HZ / f64::from(RATIO);
+            let got = crossing_hz(&taped);
+            assert!(
+                (got - want).abs() / want < 0.01,
+                "a {dev}-wide input under the dial was taped at {got:.1} Hz, not {want:.1}"
+            );
+            assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        }
     }
 
     /// Bytes of a four-second stereo ring at `RATE`: what one capture ring

@@ -82,6 +82,7 @@ fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
 /// different signal and needs its own tail. **The phase is NOT here.** All
 /// the output-side streams are read at the same positions, and one phase
 /// shared between them is what keeps them sample-aligned; see [`Varispeed`].
+#[derive(Debug)]
 pub struct Stream {
     hist: Vec<f32>,
     next: Vec<f32>,
@@ -175,23 +176,16 @@ impl Stream {
         self.hist.copy_from_slice(&self.next);
     }
 
-    /// Point this stream at a different channel count.
+    /// The interleave this stream reads and writes: its source's and its
+    /// destination's stride, fixed at construction.
     ///
     /// **The input's width is not known until a device is chosen**, and it
-    /// changes when somebody swaps interfaces mid-session. The history is
-    /// dropped rather than reinterpreted: the same bytes read as a different
-    /// number of channels are a rotation, which is every input on the wrong
-    /// strip — the failure `mix_monitor`'s own whole-frames rule exists to
-    /// prevent. A width that has not changed is left alone, so this is free
-    /// on the common path.
-    pub fn set_channels(&mut self, channels: usize) {
-        let ch = channels.max(1);
-        if ch == self.channels {
-            return;
-        }
-        self.channels = ch;
-        self.hist = vec![0.0; HIST * ch];
-        self.next = vec![0.0; HIST * ch];
+    /// changes when somebody swaps interfaces mid-session, so the input's
+    /// stretch is built for its ring, on the host, and arrives with it
+    /// (`lane_bank::MonitorPlan::vs_in`). It used to be re-widened in place
+    /// on the audio thread, which allocated there.
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     pub fn clear(&mut self) {
