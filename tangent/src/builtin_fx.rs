@@ -3540,6 +3540,13 @@ mod tests {
         for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
             assert_eq!(spec.default, want, "{} drifted from TapeParams::default", spec.symbol);
         }
+        // **And where a fresh tape opens is the owner's ruling**, which the
+        // two tables agreeing cannot hold on its own: Drive 0.5, the
+        // high-output tape's datasheet alignment (its 3 % point about 10 dB
+        // over 0 VU at 15 ips), and Roll out of circuit, because each speed
+        // has its own top. A saved bay keeps the values it was saved with.
+        assert_eq!(t.drive, 0.5, "a fresh tape's Drive is not the datasheet alignment");
+        assert_eq!(t.roll, 0.0, "a fresh tape's Roll is in circuit");
         let i = crate::units::imager::ImagerParams::default();
         for (spec, want) in IMAGER_FACE_PARAMS.iter().zip([i.width, i.ensemble, i.mono_below]) {
             assert_eq!(spec.default, want, "{} drifted from ImagerParams::default", spec.symbol);
