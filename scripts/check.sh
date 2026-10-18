@@ -276,10 +276,19 @@ echo "==> the old name is gone  (no tracked line or file name spells it)"
 # the pattern from matching its own text. A binary file that matches
 # prints a line too, and fails like any other.
 #
+# **Both searches run in the C locale.** Under a UTF-8 one the pattern
+# finds nothing on a line after a byte it cannot decode, and a binary file
+# has such bytes ahead of any text it carries (so does Latin-1 text): a
+# PNG whose text chunk named the app passed this leg while the same word
+# in a source file failed it. What no search reads is a name in a
+# picture's pixels, or text stored as UTF-16 (nothing tracked is); the two
+# screenshots that showed the name in their title bar were taken out by
+# hand.
+#
 # `git grep` exits 1 when nothing matches, which is the pass, and higher
 # when git itself fails, which is not: `|| [ $? = 1 ]` tells them apart.
-OLD_NAME="$(git grep -n -i '[i]vory' || [ $? = 1 ])"
-OLD_PATHS="$(git ls-files | grep -i '[i]vory' || [ $? = 1 ])"
+OLD_NAME="$(LC_ALL=C git grep -n -i '[i]vory' || [ $? = 1 ])"
+OLD_PATHS="$(git ls-files | LC_ALL=C grep -i '[i]vory' || [ $? = 1 ])"
 if [ -n "$OLD_NAME$OLD_PATHS" ]; then
   echo "the old name is back in the tree:" >&2
   printf '%s\n' "$OLD_NAME" "$OLD_PATHS" | grep . | sed 's/^/    /' >&2
