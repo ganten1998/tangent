@@ -598,9 +598,85 @@ pub(crate) fn step_row(
     })
 }
 
-/// The preset strip every face wears at its foot: the saved sounds, a name
-/// to save under, and the two buttons. The host scans the folder and pushes
-/// the rows; sharing a preset IS sharing the file, which is the point.
+/// **What a preset strip carries besides its menu, its name field and Save.**
+///
+/// Every face wears Init at the end of its strip and offers no delete. The
+/// Keys window is the other way round. Its Initialise sits on the SOUND row
+/// over the knobs it puts back, where it has been since the window held two
+/// sounds, so an Init in the strip would be a second button for one verb.
+/// And its menu offers a Delete, which no strip had: the host's road for
+/// one has been there since presets were (`RecorderRequest::DeletePreset`,
+/// guarded by `desktop::preset_delete_target`), with nothing on screen to
+/// take it. A press on it asks, and the window wearing the strip answers
+/// with the confirmation every delete is promised. So a strip is told which
+/// verbs it wears, and [`preset_parts`] pays for the ones on its row; the
+/// Delete costs the row nothing, inside the menu beside the row it removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StripVerbs {
+    /// Init, the last part of the row.
+    pub init: bool,
+    /// A Delete beside each of the menu's rows.
+    pub delete: bool,
+}
+
+/// The strip every face wears: Init on the row, no delete.
+pub(crate) const FACE_VERBS: StripVerbs = StripVerbs { init: true, delete: false };
+
+/// The Keys window's strip: no Init, a Delete on each row of its menu.
+pub(crate) const KEYS_VERBS: StripVerbs = StripVerbs { init: false, delete: true };
+
+/// What a preset strip was asked for this frame. Names and paths only, the
+/// bargain every ask a face makes keeps: the panel wearing the strip says
+/// what each one means for its own sound.
+pub(crate) enum PresetAsk {
+    /// Load the file at this path.
+    Load(String),
+    /// Save the panel's sound under this name, as typed and trimmed.
+    Save(String),
+    /// Delete the file at this path, once the panel has asked whether to.
+    /// Only a strip that wears [`StripVerbs::delete`] asks it.
+    Delete(String),
+    /// Every control back to what it ships with. Only a strip that wears
+    /// [`StripVerbs::init`] asks it.
+    Init,
+}
+
+/// The preset strip as a face wears it at its foot: [`preset_bar`] with
+/// [`FACE_VERBS`], its asks turned into the face's own.
+fn preset_strip(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
+    match preset_bar(ui, &st.s, &live.preset_rows, &mut live.preset_name, FACE_VERBS)? {
+        PresetAsk::Load(path) => Some(FaceAction::LoadPreset { path }),
+        PresetAsk::Save(name) => Some(FaceAction::SavePreset { name }),
+        // **INIT: every control back to what the unit ships with.**
+        //
+        // The owner asked for it on all of them — "every plugin needs an
+        // initialize button" — and it belongs here rather than on each face
+        // because this strip is the one part every face wears, so one button
+        // is one button on sixteen units instead of sixteen.
+        //
+        // The values come from the pushed parameters' own `default`, which is
+        // the unit's `ParamSpec` table arriving through `ports`. The face
+        // therefore holds no second opinion about what shipped — the same
+        // rule the EQ's double-click reset follows, and the reason both can
+        // be right when a default changes.
+        //
+        // One ask, not one per knob: `SetMany` exists for exactly this and
+        // the host applies the run through the same road a single set takes.
+        PresetAsk::Init => {
+            let sets: Vec<(u32, f32)> =
+                live.face.params.iter().map(|p| (p.id, p.default)).collect();
+            (!sets.is_empty()).then_some(FaceAction::SetMany { sets })
+        }
+        // A face's menu offers no delete (`FACE_VERBS`).
+        PresetAsk::Delete(_) => None,
+    }
+}
+
+/// The preset strip: the saved sounds, a name to save under, and the
+/// buttons. The host scans the folder and pushes the rows; sharing a preset
+/// IS sharing the file, which is the point. Every face wears it at its foot
+/// ([`preset_strip`]), and so does the Keys window, each with the
+/// [`StripVerbs`] it needs.
 ///
 /// **Every width here is a SHARE of the row, and the row wraps.** This strip
 /// used to be four fixed numbers — a caption, a 120-point menu, a 110-point
@@ -624,105 +700,127 @@ pub(crate) fn step_row(
 /// The shares moved out of this function so the one panel that has to
 /// RESERVE room for the strip can ask the same arithmetic how tall it is
 /// going to be rather than guessing. See [`preset_foot_height`].
-fn preset_strip(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
-    let mut action = None;
+pub(crate) fn preset_bar(
+    ui: &mut egui::Ui,
+    s: &crate::recorder_panel::Surface,
+    rows: &[PresetRow],
+    name: &mut String,
+    verbs: StripVerbs,
+) -> Option<PresetAsk> {
+    let mut ask = None;
     ui.add_space(PRESET_LEAD);
     let bold = |size: f32| egui::FontId::new(size, crate::fonts::courier_bold());
     let pad = ui.spacing().button_padding.x * 2.0;
     let PresetParts { captioned, combo_w, name_w, .. } =
-        preset_parts(ui, ui.available_width());
+        preset_parts(ui, ui.available_width(), verbs);
     ui.horizontal_wrapped(|ui| {
         if captioned {
             ui.label(
                 egui::RichText::new("PRESET")
                     .font(bold(10.0))
-                    .color(st.s.faint),
+                    .color(s.faint),
             );
         }
-        // `ComboBox::width` sizes the TEXT, and the arrow and the frame's
-        // padding are added on top of it, so the share has to have that
-        // taken back off or the menu is wider than the room it was given.
+        // `ComboBox::width` is the least the whole button may be, its arrow
+        // and its padding included, and it is handed the share with those
+        // taken back off. A closed menu whose words need more than that is
+        // drawn wider, and `preset_parts` counts it at the width it is drawn.
         let icon = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        // **The menu wears the strip's own style**, the one its window
+        // dressed it in. egui builds a popup from the CONTEXT's style, which
+        // this app never themes, and puts only `popup_style` on top of it,
+        // so every strip's menu was egui's stock popup whatever the theme,
+        // following the system's light or dark; and the Keys strip's Delete,
+        // dressed in the surface's raised and ink, sat in it as a second
+        // palette. Handed the strip's style, the menu's ground is the
+        // surface's and its rows wear the surface's ink, as the strip does.
+        let dressed = egui::style::StyleModifier::from((**ui.style()).clone());
         let picked = egui::ComboBox::from_id_salt("face-presets")
+            .popup_style(dressed)
             .selected_text(
-                egui::RichText::new(if live.preset_rows.is_empty() {
+                egui::RichText::new(if rows.is_empty() {
                     "none saved yet"
                 } else {
                     "load…"
                 })
                 .font(bold(10.0))
-                .color(st.s.ink),
+                .color(s.ink),
             )
             .width((combo_w - icon - pad).max(24.0));
         picked.show_ui(ui, |ui| {
-            for row_ in &live.preset_rows {
-                if ui
-                    .selectable_label(
-                        false,
-                        egui::RichText::new(&row_.name).font(bold(10.0)),
-                    )
-                    .clicked()
-                {
-                    action = Some(FaceAction::LoadPreset {
-                        path: row_.path.clone(),
-                    });
+            for row_ in rows {
+                let load = |ui: &mut egui::Ui| {
+                    ui.selectable_label(false, egui::RichText::new(&row_.name).font(bold(10.0)))
+                        .clicked()
+                };
+                if !verbs.delete {
+                    if load(ui) {
+                        ask = Some(PresetAsk::Load(row_.path.clone()));
+                    }
+                    continue;
                 }
+                // **Delete first, then the name it removes**, the way the
+                // taught chords' list lays out a row: the small button at the
+                // row's start, the wide target a hand reaches for the name,
+                // which loads. A press on Delete is an ask and not the act:
+                // the panel wearing the strip puts the question in front of
+                // it (the Keys window's `confirm_keys_preset_delete`), so a
+                // hand that meant to load and landed on it loses nothing.
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Delete").font(bold(9.0)).color(s.ink),
+                            )
+                            .fill(s.raised),
+                        )
+                        .on_hover_text("asks first, then deletes this preset's file from the Presets folder")
+                        .clicked()
+                    {
+                        ask = Some(PresetAsk::Delete(row_.path.clone()));
+                    }
+                    if load(ui) {
+                        ask = Some(PresetAsk::Load(row_.path.clone()));
+                    }
+                });
             }
         });
-        let edit = egui::TextEdit::singleline(&mut live.preset_name)
+        let edit = egui::TextEdit::singleline(&mut *name)
             .hint_text("name…")
             .font(bold(10.0))
             .desired_width((name_w - pad).max(24.0));
         ui.add(edit);
-        let can_save = !live.preset_name.trim().is_empty();
+        let can_save = !name.trim().is_empty();
         if ui
             .add_enabled(
                 can_save,
                 egui::Button::new(
-                    egui::RichText::new("Save").font(bold(10.0)).color(st.s.ink),
+                    egui::RichText::new("Save").font(bold(10.0)).color(s.ink),
                 )
-                .fill(st.s.raised),
+                .fill(s.raised),
             )
             .on_hover_text("into the Presets folder, shareable as the file")
             .clicked()
         {
-            action = Some(FaceAction::SavePreset {
-                name: live.preset_name.trim().to_owned(),
-            });
+            ask = Some(PresetAsk::Save(name.trim().to_owned()));
         }
-        // **INIT: every control back to what the unit ships with.**
-        //
-        // The owner asked for it on all of them — "every plugin needs an
-        // initialize button" — and it belongs here rather than on each face
-        // because this strip is the one part every face wears, so one button
-        // is one button on sixteen units instead of sixteen.
-        //
-        // The values come from the pushed parameters' own `default`, which is
-        // the unit's `ParamSpec` table arriving through `ports`. The face
-        // therefore holds no second opinion about what shipped — the same
-        // rule the EQ's double-click reset follows, and the reason both can
-        // be right when a default changes.
-        //
-        // One ask, not one per knob: `SetMany` exists for exactly this and
-        // the host applies the run through the same road a single set takes.
-        if ui
-            .add(
-                egui::Button::new(
-                    egui::RichText::new("Init").font(bold(10.0)).color(st.s.ink),
+        // Init, on the strips that wear it: see `preset_strip` for what it
+        // puts back and why it lives on the strip.
+        if verbs.init
+            && ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Init").font(bold(10.0)).color(s.ink),
+                    )
+                    .fill(s.raised),
                 )
-                .fill(st.s.raised),
-            )
-            .on_hover_text("every control back to what this unit ships with")
-            .clicked()
+                .on_hover_text("every control back to what this unit ships with")
+                .clicked()
         {
-            let sets: Vec<(u32, f32)> =
-                live.face.params.iter().map(|p| (p.id, p.default)).collect();
-            if !sets.is_empty() {
-                action = Some(FaceAction::SetMany { sets });
-            }
+            ask = Some(PresetAsk::Init);
         }
     });
-    action
+    ask
 }
 
 /// The narrowest the preset menu may be drawn: enough for "load…" and the
@@ -776,7 +874,7 @@ struct PresetParts {
     lines: usize,
 }
 
-fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
+fn preset_parts(ui: &egui::Ui, w: f32, verbs: StripVerbs) -> PresetParts {
     let font = egui::FontId::new(10.0, crate::fonts::courier_bold());
     // The fixed parts are MEASURED, not guessed: a button is its text plus
     // the theme's own padding, and both of those move with the font and the
@@ -794,15 +892,17 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
     // strip and not to this arithmetic at first, and the two layout sweeps
     // in this file caught it immediately: the shares still summed to a row
     // that fit, the button pushed past it, and the face painted outside the
-    // window it had reserved room in.
+    // window it had reserved room in. A strip that does not wear it
+    // (`StripVerbs::init`) pays nothing for it.
     let init_w = word("Init").width() + pad;
+    let init_part = if verbs.init { init_w + gap } else { 0.0 };
     let caption_w = word("PRESET").width();
     // The caption is the one part that is pure decoration, so it is the
     // first thing the budget spends: a narrow strip says what it is by
     // being a menu and a name field, which nobody mistakes for anything.
-    let captioned = w >= caption_w + gap + init_w + gap + PRESET_MIN_PARTS;
+    let captioned = w >= caption_w + gap + init_part + PRESET_MIN_PARTS;
     let fixed =
-        save_w + init_w + gap * 3.0 + if captioned { caption_w + gap } else { 0.0 };
+        save_w + gap * 2.0 + init_part + if captioned { caption_w + gap } else { 0.0 };
     let free = (w - fixed).max(PRESET_MIN_PARTS);
     // The menu takes a little over half of what is left; the field takes
     // the rest. Both stop growing well before the panel does — a preset
@@ -825,6 +925,23 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
     let combo_h = (row_h.max(ui.spacing().icon_width) + pad_y).max(least);
     let button_h = (row_h + pad_y).max(least);
     let line_h = combo_h.max(button_h).max(row_h + TEXT_EDIT_MARGIN.y);
+    // **The menu is walked at the width egui draws it, not at its share.**
+    // `ComboBox::width` is only the least the button may be: egui 0.33 draws
+    // it as wide as its words, its arrow and its padding when those come to
+    // more. "none saved yet" does, near the share's least, and it is what
+    // every strip says until its folder has a preset in it. Walked at its
+    // share, a face's strip of an empty folder was one line here and two on
+    // screen from 248 to 342 points across under egui's own padding and
+    // from 264 to 374 under the app's, and at a few widths under 150 with
+    // either (on Courier Prime and JetBrains Mono, swept in steps of two;
+    // Terminess, narrower, to 302 and 334): a foot reserved a whole line
+    // short, under a panel that fills whatever it is handed above it.
+    // "load…" was short as well, from 264 to 272 under the app's padding.
+    // The wider of the two closed words is counted, so neither strip is
+    // walked narrower than it draws.
+    let icon = ui.spacing().icon_width + ui.spacing().icon_spacing;
+    let closed = word("none saved yet").width().max(word("load…").width());
+    let combo_drawn = (closed + icon + pad).max((combo_w - icon - pad).max(24.0));
     // The walk, in the order the widgets are added. The field's own margin
     // is added back on because `desired_width` sizes the TEXT inside it,
     // which is why the share had it taken off in the first place.
@@ -832,7 +949,7 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
     let mut used = 0.0_f32;
     for item in [
         captioned.then_some(caption_w),
-        Some(combo_w),
+        Some(combo_drawn),
         Some((name_w - pad).max(24.0) + TEXT_EDIT_MARGIN.x),
         Some(save_w),
         // Init walks the same wrap as everything else on the row. Left out
@@ -841,7 +958,7 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
         // below the window it was given, exactly what
         // `the_foot_reserves_what_the_preset_strip_actually_takes` sweeps
         // for.
-        Some(init_w),
+        verbs.init.then_some(init_w),
     ]
     .into_iter()
     .flatten()
@@ -865,7 +982,13 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
 /// Every number in it comes off the live `Ui`, so a bigger font or a roomier
 /// theme moves the reservation with it instead of silently overrunning it.
 pub fn preset_foot_height(ui: &egui::Ui) -> f32 {
-    let p = preset_parts(ui, ui.available_width());
+    preset_foot_height_of(ui, FACE_VERBS)
+}
+
+/// [`preset_foot_height`] for a strip wearing `verbs`: the Keys window keeps
+/// its foot back with this, above a knob list that takes everything else.
+pub(crate) fn preset_foot_height_of(ui: &egui::Ui, verbs: StripVerbs) -> f32 {
+    let p = preset_parts(ui, ui.available_width(), verbs);
     let gap = ui.spacing().item_spacing.y;
     gap + PRESET_LEAD + p.lines as f32 * p.line_h + (p.lines as f32 - 1.0) * gap
 }
@@ -4291,7 +4414,7 @@ mod tests {
                             .frame(egui::Frame::NONE)
                             .show(ctx, |ui| {
                                 let reserved = preset_foot_height(ui);
-                                let lines = preset_parts(ui, ui.available_width()).lines;
+                                let lines = preset_parts(ui, ui.available_width(), FACE_VERBS).lines;
                                 let gap = ui.spacing().item_spacing.y;
                                 let drew = ui
                                     .scope(|ui| {
@@ -4343,6 +4466,262 @@ mod tests {
             "the face runs out of the window it was given:\n  {}",
             bad.join("\n  ")
         );
+    }
+
+    /// **Every strip reserves what it takes, saved presets or none.**
+    ///
+    /// `the_foot_reserves_what_the_preset_strip_actually_takes` draws a
+    /// face that always has a preset saved, so its closed menu always says
+    /// "load…". Until a folder has one it says "none saved yet", which egui
+    /// draws wider than the menu's share, and the walk counted the share, so
+    /// it reserved a line fewer than the strip drew. Swept in steps of two
+    /// points on all three fonts, a face's empty strip was short from 124 to
+    /// 132 and from 248 to 342 points across under egui's own padding, and
+    /// from 108 to 148 and from 264 to 374 under the app's, on Courier Prime
+    /// and JetBrains Mono (Terminess, narrower, to 302 and 334); "load…" was
+    /// short too, from 264 to 272 under the app's padding. What is reserved
+    /// and what is drawn have to agree at every width, the rule this file's
+    /// other sweeps hold the strip to, and 360 and 372 pin that upper edge.
+    /// It is a narrow miss for the faces that keep a foot back: the
+    /// bitcrush's strip is 376 points across at its 400-point floor, two
+    /// clear of 374, and the IR, the analog and the sampler open wider.
+    ///
+    /// **And for the Keys window's strip**, the same function with other
+    /// verbs ([`StripVerbs`]): no Init, so its row is shorter and wraps
+    /// later, and a Delete on every row of its menu, which costs the row
+    /// nothing. The window keeps this foot back above its knob list, so a
+    /// short one hands the list room the strip then takes back. The walk
+    /// that counted the share was short for it from 208 to 318 points under
+    /// the app's padding (198 to 282 on Terminess), and from 208 to 216 with
+    /// a preset saved, all narrower than its strip at the window's smallest,
+    /// 336 points across.
+    #[test]
+    fn every_strip_reserves_what_it_takes_with_presets_or_none() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let saved = vec![PresetRow {
+            name: "Warm Felt".to_owned(),
+            path: "/Presets/Tangent Keys/Warm Felt.tangentpreset".to_owned(),
+        }];
+        let mut bad: Vec<String> = Vec::new();
+        let mut wrapped = 0;
+        for (strip, verbs) in [("a face's", FACE_VERBS), ("the Keys window's", KEYS_VERBS)] {
+            for rows in [Vec::new(), saved.clone()] {
+                for pad in [Vec2::new(4.0, 1.0), Vec2::new(12.0, 4.0)] {
+                    padded(&ctx, pad);
+                    for w in [
+                        120.0f32, 140.0, 160.0, 180.0, 200.0, 220.0, 240.0, 260.0, 280.0,
+                        296.0, 300.0, 340.0, 360.0, 372.0, 400.0, 520.0, 700.0,
+                    ] {
+                        let mut seen = None;
+                        let mut name = String::new();
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    egui::pos2(0.0, 0.0),
+                                    Vec2::new(w, 620.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default()
+                                    .frame(egui::Frame::NONE)
+                                    .show(ctx, |ui| {
+                                        let reserved = preset_foot_height_of(ui, verbs);
+                                        let lines = preset_parts(ui, ui.available_width(), verbs).lines;
+                                        let gap = ui.spacing().item_spacing.y;
+                                        let drew = ui
+                                            .scope(|ui| {
+                                                let _ = preset_bar(ui, &st.s, &rows, &mut name, verbs);
+                                            })
+                                            .response
+                                            .rect;
+                                        seen = Some((reserved, lines, gap + drew.height(), drew.right()));
+                                    });
+                            },
+                        );
+                        let (reserved, lines, took, right) = seen.expect("the strip never drew");
+                        let at = format!("{strip} strip, {} rows, {pad:?}, {w} wide, on {lines}", rows.len());
+                        if lines > 1 {
+                            wrapped += 1;
+                        }
+                        if reserved < took - 0.01 {
+                            bad.push(format!("{at}: reserved {reserved:.1} for a foot that takes {took:.1}"));
+                        }
+                        if right > w + 1.0 {
+                            bad.push(format!("{at}: the strip runs to {right:.1}"));
+                        }
+                    }
+                }
+            }
+        }
+        // The Keys strip carries less on its row, so it never wraps sooner
+        // than a face's at the same width.
+        for w in [160.0f32, 200.0, 240.0, 300.0, 400.0] {
+            padded(&ctx, Vec2::new(12.0, 4.0));
+            let mut lines = (0, 0);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(w, 620.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        let at = ui.available_width();
+                        lines = (preset_parts(ui, at, FACE_VERBS).lines, preset_parts(ui, at, KEYS_VERBS).lines);
+                    });
+                },
+            );
+            if lines.1 > lines.0 {
+                bad.push(format!("{w} wide: the Keys strip is on {} lines to a face's {}", lines.1, lines.0));
+            }
+        }
+        assert!(wrapped > 0, "no width in the sweep wraps a strip, so this proves nothing");
+        assert!(bad.is_empty(), "a strip's foot is wrong:\n  {}", bad.join("\n  "));
+    }
+
+    /// **The preset menu wears the surface its strip stands on**, on every
+    /// theme in both modes, for a face's strip and for the Keys window's.
+    ///
+    /// egui builds a popup from the context's style and puts only the menu's
+    /// `popup_style` on top, and the window's dressing is on the strip's
+    /// `Ui`, so the menu was egui's stock popup on every theme: its rows in
+    /// the stock grey on the stock ground, and the Keys strip's Delete, in
+    /// the surface's raised and ink, a second palette inside it. The rows
+    /// read, which is why no sweep that read the panel saw it; the law is
+    /// that ink belongs to the surface it lands on.
+    ///
+    /// So the menu is opened by a real press and release, and every word it
+    /// paints is asked for the colour it is really drawn in (its galley's
+    /// own, or the fallback where it left the placeholder, which is how a
+    /// row's name is painted) and for the ground under it: the surface's ink,
+    /// on one of the surface's grounds, reading there. The rows are found by
+    /// name, so a menu that never opened fails rather than passes.
+    #[test]
+    fn the_preset_menu_wears_the_surface_it_opens_from() {
+        use crate::recorder_panel::contrast_ratio;
+        let ctx = a_test_ctx();
+        // A popup fades in, and a word read mid-fade is its ink at part
+        // opacity: the colour under test, not the one on screen.
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let rows: Vec<PresetRow> = ["Warm Felt", "Hard Hammers"]
+            .iter()
+            .map(|name| PresetRow {
+                name: (*name).to_owned(),
+                path: format!("/Presets/Tangent Keys/{name}.tangentpreset"),
+            })
+            .collect();
+        let ink_of = |t: &egui::epaint::TextShape| {
+            t.override_text_color.unwrap_or_else(|| {
+                t.galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| s.format.color)
+                    .filter(|c| *c != egui::Color32::PLACEHOLDER)
+                    .unwrap_or(t.fallback_color)
+            })
+        };
+        let mut bad: Vec<String> = Vec::new();
+        let mut case = 0usize;
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let p = crate::recorder_panel::palette(&set);
+                let s = FaceStyle::new(p.bg, p.lcd, p.lcd_face).s;
+                for (strip, verbs) in [("a face's", FACE_VERBS), ("the Keys window's", KEYS_VERBS)] {
+                    // A menu of its own per case, so no case finds the last
+                    // one's open.
+                    case += 1;
+                    let at = format!("{} {} {strip}", theme.name, if dark { "dark" } else { "light" });
+                    let mut name = String::new();
+                    let mut frame = |events: Vec<egui::Event>| {
+                        ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(420.0, 300.0))),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                                    face::fit::dress(ui.style_mut(), &s);
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, s.bg);
+                                    ui.push_id(case, |ui| {
+                                        let _ = preset_bar(ui, &s, &rows, &mut name, verbs);
+                                    });
+                                });
+                            },
+                        )
+                    };
+                    let shut = frame(Vec::new());
+                    let menu = shut
+                        .shapes
+                        .iter()
+                        .find_map(|cs| match &cs.shape {
+                            egui::Shape::Text(t) if t.galley.text() == "load\u{2026}" => {
+                                Some(Rect::from_min_size(t.pos, t.galley.rect.size()).center())
+                            }
+                            _ => None,
+                        })
+                        .expect("the strip has no menu");
+                    for pressed in [true, false] {
+                        let mut events = vec![egui::Event::PointerMoved(menu)];
+                        events.push(egui::Event::PointerButton {
+                            pos: menu,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        let _ = frame(events);
+                    }
+                    let _ = frame(Vec::new());
+                    let open = frame(Vec::new());
+                    // Paint order: the ground under a word is the last opaque
+                    // rectangle painted before it that holds it.
+                    let mut grounds: Vec<(Rect, egui::Color32)> = Vec::new();
+                    let mut named = 0usize;
+                    for cs in &open.shapes {
+                        match &cs.shape {
+                            egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.is_positive() => {
+                                grounds.push((r.rect, r.fill));
+                            }
+                            egui::Shape::Text(t) => {
+                                let word = t.galley.text();
+                                let in_menu = rows.iter().any(|r| r.name == word) || word == "Delete";
+                                if !in_menu {
+                                    continue;
+                                }
+                                named += usize::from(word != "Delete");
+                                let box_ = Rect::from_min_size(t.pos, t.galley.rect.size());
+                                let under = grounds
+                                    .iter()
+                                    .rev()
+                                    .find(|(r, _)| r.contains_rect(box_))
+                                    .map_or(s.bg, |&(_, c)| c);
+                                let ink = ink_of(t);
+                                if ink != s.ink {
+                                    bad.push(format!("{at}: {word:?} is {ink:?}, not the surface's ink {:?}", s.ink));
+                                }
+                                if ![s.bg, s.raised, s.hover].contains(&under) {
+                                    bad.push(format!("{at}: {word:?} lands on {under:?}, none of the surface's grounds"));
+                                }
+                                if contrast_ratio(ink, under) < 4.5 {
+                                    bad.push(format!("{at}: {word:?} reads {:.2}:1", contrast_ratio(ink, under)));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if named < rows.len() {
+                        bad.push(format!("{at}: the menu did not open, or lost a row ({named} of {})", rows.len()));
+                    }
+                }
+            }
+        }
+        bad.dedup();
+        assert!(bad.is_empty(), "the preset menu is not dressed as its strip:\n  {}", bad.join("\n  "));
     }
 
     /// **The list does not flinch when it is pressed.**

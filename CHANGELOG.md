@@ -27,6 +27,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   sostenuto holds the keys that are down when it is pressed (sounding or
   not), and the soft pedal moves the hammers. Every other sound hears the
   sustain as a switch, as before.
+- **Every Tangent Keys sound saves presets of its own.** The Keys window
+  wears the preset strip the effect panels do: type a name and Save keeps
+  every knob of the chosen sound, its menu lists that sound's presets to
+  load (one step to undo), and Delete beside each one removes it once you
+  confirm. The window opens larger, so the ten sounds, every knob and the
+  strip fit without scrolling.
 
 ### Changed
 
@@ -70,6 +76,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   its faders looked at.
 - **A Keys track holds 22.5 MB** (5.7 MB before), all of it taken when the
   track is made, never while it plays.
+
+### Fixed
+
+- **The Keys window follows an undo.** With the window open, an undo or a
+  redo put the track's sound and knobs back but left the window showing
+  the ones before it, until it was closed and opened again. It now shows
+  what the track plays after every step back or forward.
+- **The preset menu wears its panel's colours.** On every effect panel the
+  list a preset is loaded from opened in the system's own light or dark
+  grey, whatever theme was worn. It now opens on the panel's own ground,
+  in the panel's own ink.
+- **A preset that cannot be saved says why.** A save the disk refused (a
+  full disk, a folder that cannot be written) did nothing and said
+  nothing; it now says what went wrong. And a name Windows will not take
+  in a file name, such as one with a question mark or one that is a
+  device name like Con, is saved under a file name it will, keeping the
+  name as typed.
 
 ## [5.0.0] - 2026-10-12
 

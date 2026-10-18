@@ -1607,6 +1607,10 @@ pub struct TangentApp {
     /// A preset the host has read back for a face to apply, latched until
     /// [`TangentApp::take_preset_loaded`] drains it.
     preset_loaded: Option<crate::ports::PresetLoaded>,
+    /// **The Keys window's load in flight**: the track whose window asked,
+    /// and the sound it asked for. The answer comes a frame later, and lands
+    /// on that track's sound or nowhere (`land_keys_preset`).
+    keys_preset_ask: Option<(crate::desk_id::TrackId, usize)>,
     /// **A sampler preset's file, held one frame behind its knobs**: the
     /// bay, by identity, and the file the preset names. Binding a sample rebuilds
     /// the bay from the state written as it binds (`bind_insert_sample`'s
@@ -4708,6 +4712,7 @@ impl TangentApp {
             staged: vec![None; dialogs::CARTRIDGE_VOICES],
             preset_rows: HashMap::new(),
             preset_loaded: None,
+            keys_preset_ask: None,
             preset_sample: None,
             ir_rows: Vec::new(),
             ir_scan_gen: 0,
@@ -33398,6 +33403,91 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.preset_loaded.take()
     }
 
+    /// **A Keys sound's preset lands on the track and the sound that asked
+    /// for it, or nowhere.** Returns the preset when it is not a Keys
+    /// sound's, for the faces.
+    ///
+    /// The answer comes a frame after the ask, because the host reads the
+    /// file between frames, and a frame is long enough for the window to
+    /// have closed, to have been opened again on another track, or to be
+    /// showing another sound. A face has a bay to aim at; this window's knobs
+    /// are its strip's own settings, so the ask was remembered by the TRACK
+    /// and the sound (`keys_preset_ask`), and the knobs move only while the
+    /// open window, the strip's sound and the file's unit all still agree
+    /// with it. The host has already refused a file that names another
+    /// sound. Anything that does not agree is let go with no knob moved.
+    ///
+    /// Every knob of the sound is written down the road a knob's own drag
+    /// takes (`set_keys_param_of`; the engine reads the strip's knobs every
+    /// frame, so it hears them at once), those the file does not name at the
+    /// sound's defaults (`preset::keys_knobs`), and the whole load is ONE
+    /// moment: one gesture, one step back. The window shows them from this
+    /// frame, because `refresh_keys_window` copies the strip in after this
+    /// and before the window draws.
+    fn land_keys_preset(
+        &mut self,
+        loaded: crate::ports::PresetLoaded,
+    ) -> Option<crate::ports::PresetLoaded> {
+        let Some(sound) = crate::preset::keys_sound(&loaded.unit) else {
+            return Some(loaded);
+        };
+        let asked = self.keys_preset_ask.take();
+        let Some(Dialog::KeysPatch { slot, selected, .. }) = &self.dialog else {
+            return None;
+        };
+        let (slot, selected) = (*slot, *selected);
+        let here = asked == Some((self.track_id_at(slot), sound));
+        if !here || selected != sound || self.keys_patch_of(slot) != sound {
+            return None;
+        }
+        let knobs = crate::preset::keys_knobs(sound, &loaded.values);
+        for (knob, value) in knobs.into_iter().enumerate() {
+            self.set_keys_param_of(slot, knob, value);
+        }
+        self.undo_commit();
+        None
+    }
+
+    /// **The Keys window, this frame: a picture of its strip.** The sound
+    /// the strip plays, every knob of it, and what the host last found for
+    /// that sound, copied in before the window draws, the bargain a face
+    /// keeps with its push (`refreshed_face`): a dialog cannot ask the app
+    /// for anything, so the app hands it the truth every frame.
+    ///
+    /// **The sound and the knobs as well as the list**, because the window
+    /// is not the only road to them. It copied the list alone, keyed on its
+    /// own `selected`, and nothing else ever put its sound or its knobs
+    /// back: an undo or a redo moves the strip (`undo_apply` touches no
+    /// dialog), and the window went on showing what the strip no longer
+    /// played. Undoing a preset's load left the preset's knobs on screen
+    /// over the sound that was heard; undoing a sound chosen in the window
+    /// left that sound lit with its list, while Save and Load read the strip
+    /// (`SaveKeysPreset`), so a save never reached the list on screen and a
+    /// load off it was refused as another sound's file. A drag is not fought
+    /// by this: the knob writes the strip on the frame it moves
+    /// (`SetKeysParam`), so the copy here is the value the hand just set.
+    ///
+    /// A sound the window did not choose has had no list asked for, so it
+    /// is asked for here, once, as choosing one asks (`ChooseKeysPatch`).
+    fn refresh_keys_window(&mut self) {
+        let Some(Dialog::KeysPatch { slot, selected, .. }) = &self.dialog else {
+            return;
+        };
+        let (slot, shown) = (*slot, *selected);
+        let sound = self.keys_patch_of(slot);
+        let knobs = self.keys_params_of(slot);
+        let unit = crate::preset::keys_unit(sound);
+        let rows = self.preset_rows(&unit).to_vec();
+        if let Some(Dialog::KeysPatch { selected, params, preset_rows, .. }) = &mut self.dialog {
+            *selected = sound;
+            *params = knobs;
+            *preset_rows = rows;
+        }
+        if sound != shown {
+            self.request_recorder(recorder::RecorderRequest::ListPresets { unit });
+        }
+    }
+
     // ── the IR shelf and the wizard ─────────────────────────────────────────
     //
     // The preset road's shape, one shelf instead of one per unit: the host
@@ -34204,14 +34294,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Open the patch picker for the built-in in `slot`.
-    /// The modelled keyboard's window: which of the two it is being, and the
-    /// two knobs — all of it the STRIP's own state.
+    /// The modelled keyboard's window: which sound the strip is being, that
+    /// sound's knobs, all of it the STRIP's own state, and the presets saved
+    /// for the sound, which are the host's to list.
     fn open_keys_picker(&mut self, slot: usize) {
+        let sound = self.keys_patch_of(slot);
+        let unit = crate::preset::keys_unit(sound);
         self.dialog = Some(Dialog::KeysPatch {
             slot,
-            selected: self.keys_patch_of(slot),
+            selected: sound,
             params: self.keys_params_of(slot),
+            preset_rows: self.preset_rows(&unit).to_vec(),
+            preset_name: String::new(),
         });
+        // **And its presets, asked for as it opens**, as a face's shelf
+        // rides the tap it arms: what the window lists is what the folder
+        // holds now, not what it held the last time anybody looked.
+        self.request_recorder(recorder::RecorderRequest::ListPresets { unit });
     }
 
     fn open_patch_picker(&mut self, slot: usize) {
@@ -40350,6 +40449,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     slot: open_on,
                     selected,
                     params,
+                    ..
                 }) = &mut self.dialog
                 {
                     if *open_on == slot {
@@ -40357,6 +40457,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         *params = fresh;
                     }
                 }
+                // **And so do its presets.** The list under the knobs is the
+                // chosen sound's and no other's; the rows the app holds for
+                // the new sound are shown from the next frame, and this asks
+                // the host for what its folder holds now.
+                let unit = crate::preset::keys_unit(self.keys_patch_of(slot));
+                self.request_recorder(recorder::RecorderRequest::ListPresets { unit });
             }
             DialogAction::SetKeysParam { slot, knob, value, done, double } => {
                 self.set_keys_param_of(slot, knob, value);
@@ -40384,6 +40490,47 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         *params = fresh;
                     }
                 }
+            }
+            // **The Keys window's preset strip.** The sound is read off the
+            // strip, the one place it is true, and so are the knobs: the
+            // settings the engine is reading every frame, not the panel's
+            // copy of them, so what is saved is what is heard. Every knob,
+            // under the unit that names the sound by its place in the list
+            // (`preset::keys_unit`), each by its index (`preset::keys_symbol`).
+            DialogAction::SaveKeysPreset { slot, name } => {
+                let unit = crate::preset::keys_unit(self.keys_patch_of(slot));
+                let values = crate::preset::keys_values(&self.keys_params_of(slot));
+                self.request_recorder(recorder::RecorderRequest::SavePreset {
+                    unit,
+                    name,
+                    values,
+                    extra: Vec::new(),
+                });
+            }
+            // Asked for by the sound's unit, so the host refuses a file of
+            // any other sound's, and remembered by the TRACK and the sound,
+            // so the answer can land nowhere else (`land_keys_preset`).
+            DialogAction::LoadKeysPreset { slot, path } => {
+                let sound = self.keys_patch_of(slot);
+                self.keys_preset_ask = Some((self.track_id_at(slot), sound));
+                self.request_recorder(recorder::RecorderRequest::LoadPreset {
+                    unit: crate::preset::keys_unit(sound),
+                    path,
+                });
+            }
+            // The yes of the question the strip's Delete raised
+            // (`dialogs::confirm_keys_preset_delete`). **And the list again
+            // after it**, because the host's own re-push after a delete names
+            // the unit the FILE says, read before it goes, so a file already
+            // gone (moved in a file manager, taken by a folder sync) or one
+            // that no longer reads re-pushed nothing, and its row stayed on
+            // the menu with every further Delete doing nothing. The host
+            // takes the requests in order, so the scan is of the folder after
+            // the delete, whatever the delete found.
+            DialogAction::DeleteKeysPreset { slot, path } => {
+                self.request_recorder(recorder::RecorderRequest::DeletePreset { path });
+                let unit = crate::preset::keys_unit(self.keys_patch_of(slot));
+                self.request_recorder(recorder::RecorderRequest::ListPresets { unit });
             }
             DialogAction::ChoosePatch { slot, index } => {
                 // `usize::MAX` is the built-in row: no cartridge patch, the one
@@ -45191,7 +45338,9 @@ impl TangentApp {
                 }
             }
         }
-        if let Some(loaded) = self.take_preset_loaded() {
+        // **A Keys sound's preset is the Keys window's**, and lands there or
+        // nowhere (`land_keys_preset`); what is handed back is a face's.
+        if let Some(loaded) = self.take_preset_loaded().and_then(|l| self.land_keys_preset(l)) {
             // **The preset lands on the face that ASKED**, which with two
             // faces open is a question worth answering out loud. The file
             // names the unit it belongs to, and the pedal's window is the
@@ -45304,6 +45453,9 @@ impl TangentApp {
         // Both go through the one refresh — see [`Self::refreshed_face`].
         let open = self.dialog.take();
         self.dialog = self.refreshed_face(&ctx, open);
+        // And the Keys window, its strip's sound, knobs and presets, the
+        // same way.
+        self.refresh_keys_window();
         if let Some(mut st) = self.pedal_stack.take() {
             st.dialog = self.refreshed_face(&ctx, st.dialog);
             self.pedal_stack = Some(st);
@@ -48941,6 +49093,373 @@ mod tests {
             (app.keys_param_of(3, 1) - 0.9).abs() < 1.0e-6,
             "undoing the other knob's reset took this knob's click with it"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the Keys window's presets ───────────────────────────────────────
+
+    /// Every request the app has queued, in order.
+    fn drain_requests(app: &mut TangentApp) -> Vec<recorder::RecorderRequest> {
+        std::iter::from_fn(|| app.take_recorder_request()).collect()
+    }
+
+    /// Every Keys knob of every row, every sound's: what a preset may move
+    /// one sound of, and nothing else.
+    fn every_keys_knob(app: &TangentApp) -> Vec<Vec<f64>> {
+        app.settings.rows.iter().map(|r| r.keys.params.clone()).collect()
+    }
+
+    /// A Keys preset answer as the host hands it over: knobs by index.
+    fn keys_answer(sound: usize, knobs: &[f32]) -> crate::ports::PresetLoaded {
+        crate::ports::PresetLoaded {
+            unit: crate::preset::keys_unit(sound),
+            name: "Bell Tree".to_owned(),
+            values: crate::preset::keys_values(knobs),
+            sample: String::new(),
+            impulse: String::new(),
+        }
+    }
+
+    /// **Save is the strip's chosen sound, under that sound's unit, with
+    /// every knob of it.** The knobs are the strip's own settings, what the
+    /// engine is reading, each by its index; the unit names the sound by its
+    /// place in the list, so the host files it in the Keys drawer and lists
+    /// it under that sound alone.
+    #[test]
+    fn saving_a_keys_preset_sends_that_sounds_unit_and_every_knob() {
+        let root = project_scratch("keyssave");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let (strip, sound) = (3, 4);
+        app.set_keys_patch_of(strip, sound);
+        app.set_keys_param_of(strip, 2, 0.25);
+        app.set_keys_param_of(strip, 7, 0.875);
+        app.open_keys_picker(strip);
+        let _ = drain_requests(&mut app);
+        app.apply_dialog_action(DialogAction::SaveKeysPreset { slot: strip, name: "Funk Pad".to_owned() });
+        let asked = drain_requests(&mut app);
+        let _ = std::fs::remove_dir_all(&root);
+        let [recorder::RecorderRequest::SavePreset { unit, name, values, extra }] = asked.as_slice() else {
+            panic!("Save asked for {asked:?}");
+        };
+        assert_eq!((unit.as_str(), name.as_str()), ("keys:4", "Funk Pad"));
+        assert!(extra.is_empty(), "a Keys sound has no state that is not a knob: {extra:?}");
+        let symbols: Vec<&str> = values.iter().map(|(s, _)| s.as_str()).collect();
+        let want: Vec<String> = (0..dialogs::KEYS_PARAMS).map(crate::preset::keys_symbol).collect();
+        assert_eq!(symbols, want, "not every knob, by index");
+        assert_eq!(
+            crate::preset::keys_knobs(sound, values),
+            app.keys_params_of(strip),
+            "the preset is not the strip's knobs"
+        );
+        assert_eq!(values[2].1, 0.25);
+        assert_eq!(values[7].1, 0.875);
+    }
+
+    /// **A loaded Keys preset lands on the strip and the sound that asked,
+    /// and is one step back.**
+    ///
+    /// The load asks by the sound's unit, so the host refuses another
+    /// sound's file; the answer lands a frame later on every knob of that
+    /// strip's sound (a knob the file does not name at the sound's
+    /// default), the panel's own copy follows, and no other sound's knobs
+    /// and no other row's move. One gesture, so one moment, and one Ctrl+Z
+    /// puts all eight back.
+    #[test]
+    fn a_loaded_keys_preset_lands_on_its_strip_and_sound_as_one_moment() {
+        let root = project_scratch("keysload");
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let (strip, sound) = (3, 1);
+        app.set_keys_patch_of(strip, sound);
+        app.set_keys_param_of(strip, 0, 0.9);
+        app.open_keys_picker(strip);
+        let _ = drain_requests(&mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let knobs_were = app.keys_params_of(strip);
+        let every_was = every_keys_knob(&app);
+        let before = app.hist_at;
+
+        let path = "/Presets/Tangent Keys/Bell Tree.tangentpreset".to_owned();
+        app.apply_dialog_action(DialogAction::LoadKeysPreset { slot: strip, path: path.clone() });
+        let asked = drain_requests(&mut app);
+        assert_eq!(
+            asked,
+            vec![recorder::RecorderRequest::LoadPreset { unit: "keys:1".to_owned(), path }],
+            "the load did not ask for this sound's file by this sound's unit"
+        );
+        // Knob 5 is left out of the file: it lands at the sound's default.
+        let mut answer = keys_answer(sound, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        answer.values.retain(|(s, _)| s != "knob5");
+        app.set_preset_loaded(answer);
+        let _ = run_frame(&ctx, &mut app);
+        let _ = drain_requests(&mut app);
+        let default5 = dialogs::KEYS_PARAM_SPECS[sound][5].2;
+        let landed = app.keys_params_of(strip);
+        assert_eq!(landed, [0.1, 0.2, 0.3, 0.4, 0.5, default5, 0.7, 0.8], "the preset did not land whole");
+        match &app.dialog {
+            Some(Dialog::KeysPatch { params, .. }) => assert_eq!(*params, landed, "the panel still shows the old knobs"),
+            _ => panic!("the Keys window closed under the load"),
+        }
+        // Only this strip's sound moved.
+        let every_now = every_keys_knob(&app);
+        for (row, (now, was)) in every_now.iter().zip(&every_was).enumerate() {
+            for (at, (n, w)) in now.iter().zip(was).enumerate() {
+                let this_sound = row == strip && at / dialogs::KEYS_PARAMS == sound;
+                if !this_sound {
+                    assert_eq!(n, w, "row {row} slot {at} moved, which is not this strip's sound");
+                }
+            }
+        }
+        assert_eq!(app.hist_at, before + 1, "the load left {} moments", app.hist_at - before);
+        app.undo();
+        assert_eq!(app.keys_params_of(strip), knobs_were, "one step back did not put every knob back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A Keys preset lands nowhere it was not asked for.** An answer for
+    /// another sound, for a window that has closed, for a window opened since
+    /// on another track, for a window that has moved on to another sound,
+    /// with no ask behind it, or for a face's unit: in every case no knob of
+    /// any row moves and no moment is made.
+    #[test]
+    fn a_keys_preset_never_lands_where_it_was_not_asked_for() {
+        let root = project_scratch("keysnowhere");
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let (strip, other, sound) = (3, 5, 1);
+        app.set_keys_patch_of(strip, sound);
+        app.set_keys_patch_of(other, sound);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let knobs = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75];
+        let ask = |app: &mut TangentApp| {
+            app.open_keys_picker(strip);
+            app.apply_dialog_action(DialogAction::LoadKeysPreset {
+                slot: strip,
+                path: "/Presets/Tangent Keys/Bell Tree.tangentpreset".to_owned(),
+            });
+        };
+        let cases: Vec<(&str, fn(&mut TangentApp), crate::ports::PresetLoaded)> = vec![
+            ("another sound's answer", |_| {}, keys_answer(2, &knobs)),
+            ("a window that closed", |a| a.dialog = None, keys_answer(sound, &knobs)),
+            ("a window opened since on another track", |a| a.open_keys_picker(5), keys_answer(sound, &knobs)),
+            (
+                "a window showing another sound now",
+                |a| a.apply_dialog_action(DialogAction::ChooseKeysPatch { slot: 3, index: 2 }),
+                keys_answer(sound, &knobs),
+            ),
+            ("an answer nobody asked for", |a| a.keys_preset_ask = None, keys_answer(sound, &knobs)),
+            (
+                "a face's unit",
+                |_| {},
+                crate::ports::PresetLoaded {
+                    unit: "@tangent-eq".to_owned(),
+                    values: crate::preset::keys_values(&knobs),
+                    ..keys_answer(sound, &knobs)
+                },
+            ),
+        ];
+        for (what, meanwhile, answer) in cases {
+            ask(&mut app);
+            meanwhile(&mut app);
+            let _ = drain_requests(&mut app);
+            let every_was = every_keys_knob(&app);
+            let before = app.hist_at;
+            app.set_preset_loaded(answer);
+            let _ = run_frame(&ctx, &mut app);
+            let _ = drain_requests(&mut app);
+            assert_eq!(every_keys_knob(&app), every_was, "{what}: a knob moved");
+            assert_eq!(app.hist_at, before, "{what}: a moment was made");
+            // Back to the strip's own sound for the next case.
+            app.set_keys_patch_of(strip, sound);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The window lists the chosen sound's presets and no other's**, and
+    /// asks the host for them: as it opens, and each time another sound is
+    /// chosen in it. A push for a sound the window is not showing does not
+    /// reach it; a push for the one it is showing does, the next frame. And
+    /// a Delete off the list, once its question is answered, goes to the host
+    /// as the file's path, with the sound's list asked for after it.
+    #[test]
+    fn the_keys_window_lists_the_chosen_sounds_presets_alone() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let row = |name: &str| crate::ports::PresetRow {
+            name: name.to_owned(),
+            path: format!("/Presets/Tangent Keys/{name}.tangentpreset"),
+        };
+        let listed = |app: &TangentApp| match &app.dialog {
+            Some(Dialog::KeysPatch { preset_rows, .. }) => {
+                preset_rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+            }
+            _ => panic!("the Keys window is not open"),
+        };
+        app.set_preset_rows("keys:0".to_owned(), vec![row("Felt")]);
+        app.set_preset_rows("keys:3".to_owned(), vec![row("Throb"), row("Slow Throb")]);
+        let strip = 2;
+        app.set_keys_patch_of(strip, 0);
+        let _ = drain_requests(&mut app);
+        app.open_keys_picker(strip);
+        assert_eq!(
+            drain_requests(&mut app),
+            vec![recorder::RecorderRequest::ListPresets { unit: "keys:0".to_owned() }],
+            "opening the window did not ask for its sound's presets"
+        );
+        assert_eq!(listed(&app), ["Felt"], "the window opened on another list");
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(listed(&app), ["Felt"]);
+
+        app.apply_dialog_action(DialogAction::ChooseKeysPatch { slot: strip, index: 3 });
+        let asked = drain_requests(&mut app);
+        assert!(
+            asked.contains(&recorder::RecorderRequest::ListPresets { unit: "keys:3".to_owned() }),
+            "choosing a sound did not ask for its presets: {asked:?}"
+        );
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(listed(&app), ["Throb", "Slow Throb"], "the list did not follow the sound");
+
+        // A push for the sound not shown stays off the window; one for the
+        // sound shown lands.
+        app.set_preset_rows("keys:0".to_owned(), vec![row("Felt"), row("Dark Felt")]);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(listed(&app), ["Throb", "Slow Throb"], "another sound's rows reached the window");
+        app.set_preset_rows("keys:3".to_owned(), vec![row("Throb")]);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(listed(&app), ["Throb"], "a rescan of the shown sound did not reach the window");
+
+        // A Delete, answered, goes to the host as the file's path, and the
+        // sound is listed again after it: the host's own re-push names the
+        // unit the file says, and a file already gone says nothing, which
+        // left its row on the menu with every Delete after it doing nothing.
+        let _ = drain_requests(&mut app);
+        let path = row("Throb").path;
+        app.apply_dialog_action(DialogAction::DeleteKeysPreset { slot: strip, path: path.clone() });
+        assert_eq!(
+            drain_requests(&mut app),
+            vec![
+                recorder::RecorderRequest::DeletePreset { path },
+                recorder::RecorderRequest::ListPresets { unit: "keys:3".to_owned() },
+            ],
+            "a delete was not followed by its sound's list"
+        );
+    }
+
+    /// **The Keys window is a picture of its strip, through an undo and a
+    /// redo.**
+    ///
+    /// The window kept its own sound and knobs, and only a gesture made in
+    /// it ever put them back; an undo moves the strip and no dialog. So a
+    /// sound chosen and then taken back left the chosen one lit, with its
+    /// list, while Save filed under the strip's real sound and Load of a
+    /// listed row asked by that sound for another sound's file, which the
+    /// host refuses; and a preset's load taken back left the preset's knobs
+    /// on screen over the sound the strip plays. Now every frame copies the
+    /// strip in: the sound, every knob and that sound's list, with the list
+    /// asked for when the sound came back by an undo. A knob held in a drag
+    /// is not fought by it.
+    #[test]
+    fn the_keys_window_follows_its_strip_through_undo_and_redo() {
+        use recorder::RecorderRequest as R;
+        let root = project_scratch("keysundo");
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let row = |name: &str| crate::ports::PresetRow {
+            name: name.to_owned(),
+            path: format!("/Presets/Tangent Keys/{name}.tangentpreset"),
+        };
+        app.set_preset_rows("keys:1".to_owned(), vec![row("Bell Tree")]);
+        app.set_preset_rows("keys:3".to_owned(), vec![row("Throb")]);
+        let strip = 3;
+        app.set_keys_patch_of(strip, 1);
+        app.arr_save_edits();
+        app.commit_view_change();
+        app.open_keys_picker(strip);
+        let _ = drain_requests(&mut app);
+        // One frame, and everything it asked the host for.
+        let frame = |app: &mut TangentApp| {
+            let mut asked: Vec<R> = run_frame(&ctx, app).into_iter().collect();
+            asked.extend(drain_requests(app));
+            asked
+        };
+        // What the window shows, and what the strip it stands on plays.
+        type Picture = (usize, [f32; dialogs::KEYS_PARAMS], Vec<String>);
+        let shown = |app: &TangentApp| -> Picture {
+            match &app.dialog {
+                Some(Dialog::KeysPatch { selected, params, preset_rows, .. }) => {
+                    (*selected, *params, preset_rows.iter().map(|r| r.name.clone()).collect())
+                }
+                _ => panic!("the Keys window closed"),
+            }
+        };
+        let played = |app: &TangentApp| -> Picture {
+            let sound = app.keys_patch_of(strip);
+            let rows = app.preset_rows(&crate::preset::keys_unit(sound));
+            (sound, app.keys_params_of(strip), rows.iter().map(|r| r.name.clone()).collect())
+        };
+
+        // A sound chosen in the window, then taken back and given again.
+        app.apply_dialog_action(DialogAction::ChooseKeysPatch { slot: strip, index: 3 });
+        let _ = frame(&mut app);
+        assert_eq!(shown(&app).0, 3, "fixture: the window did not show the sound it chose");
+        app.undo();
+        let asked = frame(&mut app);
+        assert_eq!(app.keys_patch_of(strip), 1, "fixture: the undo did not put the sound back");
+        assert_eq!(shown(&app), played(&app), "after an undo the window shows what its strip does not play");
+        assert!(
+            asked.contains(&R::ListPresets { unit: "keys:1".to_owned() }),
+            "the sound an undo brought back was not listed: {asked:?}"
+        );
+        // Save and Load ask by the sound the list on screen is.
+        app.apply_dialog_action(DialogAction::SaveKeysPreset { slot: strip, name: "Felt".to_owned() });
+        let path = row("Bell Tree").path;
+        app.apply_dialog_action(DialogAction::LoadKeysPreset { slot: strip, path: path.clone() });
+        let asked = drain_requests(&mut app);
+        assert!(
+            matches!(asked.as_slice(), [R::SavePreset { unit, .. }, R::LoadPreset { unit: load, path: p }]
+                if unit == "keys:1" && load == "keys:1" && *p == path),
+            "Save and Load did not ask by the sound the window lists: {asked:?}"
+        );
+        app.keys_preset_ask = None;
+        app.redo();
+        let asked = frame(&mut app);
+        assert_eq!(shown(&app), played(&app), "after a redo the window shows what its strip does not play");
+        assert_eq!(shown(&app).0, 3);
+        assert!(asked.contains(&R::ListPresets { unit: "keys:3".to_owned() }), "{asked:?}");
+        app.undo();
+        let _ = frame(&mut app);
+
+        // A preset's load, then taken back and given again.
+        let before = app.keys_params_of(strip);
+        let preset = [0.11, 0.22, 0.33, 0.44, 0.55, 0.66, 0.77, 0.88];
+        app.apply_dialog_action(DialogAction::LoadKeysPreset { slot: strip, path });
+        app.set_preset_loaded(keys_answer(1, &preset));
+        let _ = frame(&mut app);
+        assert_eq!(app.keys_params_of(strip), preset, "fixture: the preset did not land");
+        assert_eq!(shown(&app), played(&app));
+        app.undo();
+        let _ = frame(&mut app);
+        assert_eq!(app.keys_params_of(strip), before, "fixture: the undo did not put the knobs back");
+        assert_eq!(shown(&app).1, before, "after undoing a load the window shows the preset's knobs");
+        app.redo();
+        let _ = frame(&mut app);
+        assert_eq!(shown(&app).1, preset, "after a redo the window does not show the preset's knobs");
+
+        // A knob held in a drag stays where the hand has it, frame to frame,
+        // and its turn taken back goes back on screen too.
+        let held = app.keys_param_of(strip, 2);
+        for value in [0.3_f32, 0.6, 0.9] {
+            app.apply_dialog_action(DialogAction::SetKeysParam { slot: strip, knob: 2, value, done: false, double: false });
+            let _ = frame(&mut app);
+            assert_eq!(shown(&app).1[2], value, "the frame moved a knob the hand is holding");
+        }
+        app.apply_dialog_action(DialogAction::SetKeysParam { slot: strip, knob: 2, value: 0.9, done: true, double: false });
+        app.undo();
+        let _ = frame(&mut app);
+        assert_eq!(shown(&app).1[2], held, "after undoing a turn the window shows the turned knob");
+        assert_eq!(shown(&app), played(&app));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -89005,6 +89524,7 @@ mod lane_refs_tests {
         ("sel_anchor", Identity),
         ("default_bank", Identity),
         ("cartridge_pick_strip", Identity),
+        ("keys_preset_ask", Identity),
         // ── (b) let go by `on_desk_shape_change` ─────────────────────────
         ("input_menu", Shape("self.input_menu = None;")),
         ("mixer_naming", Shape("self.mixer_naming = None;")),

@@ -21,6 +21,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::dialogs::{KEYS_PARAMS, KEYS_PARAM_SPECS, KEYS_PATCHES};
+
 /// The extension a saved preset wears. Ours alone — `.preset` and `.json`
 /// belong to everybody, and a scan that has to open every file to know
 /// whether it is one of ours is a scan that reads junk for a living.
@@ -178,16 +180,22 @@ impl Preset {
     }
 }
 
-/// A preset name as a file STEM the filesystem will take, and nothing more.
+/// A preset name as a file STEM that stays inside its folder.
 ///
-/// Stricter than `desktop.rs`'s `sanitize_file_stem`, on purpose: that one
-/// answers "what do I call this export", where the name came from a track.
-/// This one answers "what do I write into a folder I also DELETE from", and
-/// the name came from a text box — so as well as the separators, the
+/// This answers "what do I write into a folder I also DELETE from", where
+/// the name came from a text box, so as well as the separators, the
 /// platform-dependent `\` and `:` go (a preset synced to Windows must not
 /// change name on the way), and leading dots go (`"../evil"` must not
 /// become a dotfile, and `.` has no business starting a filename here).
 /// Empty after all that is "preset", never an empty path.
+///
+/// **Not the whole of what Windows asks of a name.** This said it was
+/// stricter than `desktop.rs`'s `sanitize_file_stem`, and was, until that
+/// one learnt Windows' refused characters (`< > " | ? *` and the controls),
+/// its trailing dots and spaces and its device names. A typed preset name
+/// goes through both on its way to a file (`desktop::preset_file_for`), so
+/// the Windows rules stay in the one place every file this app names keeps
+/// them.
 pub fn safe_stem(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -209,6 +217,81 @@ pub fn safe_stem(name: &str) -> String {
     } else {
         cleaned.to_owned()
     }
+}
+
+// ── a Keys sound's preset ───────────────────────────────────────────────────
+//
+// The built-ins name a knob by the symbol their `ParamSpec` table carries. A
+// Keys sound has no such table on this side of the wall, only
+// `dialogs::KEYS_PARAM_SPECS`, whose names are what the panel prints; what
+// the settings file has always stored a Keys knob by is its POSITION, which
+// the engine's `keys::Patch::params` keeps append-only. So a Keys preset
+// spells positions too, and these are the one place the spelling lives.
+
+/// **A Keys sound's unit identity**: `"keys:<n>"`, `n` its place in
+/// [`KEYS_PATCH_NAMES`](crate::dialogs::KEYS_PATCH_NAMES) and in the
+/// engine's `Patch::ALL`.
+///
+/// The place and never the name, for the settings file's reason: the list
+/// is appended to and never reordered, so the index is the contract the two
+/// tables keep, while a name is a label on the instrument that changes when
+/// the instrument is re-voiced. A preset saved under a sound goes on naming
+/// that sound across a rename.
+pub fn keys_unit(sound: usize) -> String {
+    format!("keys:{sound}")
+}
+
+/// The sound a unit identity names, when it is one of this build's: only
+/// the exact spelling [`keys_unit`] writes, because the host matches a
+/// file's unit as a string. `"keys:03"` names no row the host would list,
+/// and a sound past the end of the list is a newer build's.
+pub fn keys_sound(unit: &str) -> Option<usize> {
+    let n = unit.strip_prefix("keys:")?.parse::<usize>().ok()?;
+    (n < KEYS_PATCHES && keys_unit(n) == unit).then_some(n)
+}
+
+/// **A Keys knob's symbol: `knob<k>`, from the knob's INDEX.**
+///
+/// The index is what the settings file stores a knob by, and what
+/// `keys::Patch::params` promises never to reorder or reuse; the name in
+/// `KEYS_PARAM_SPECS` is display copy, free to be reworded. A preset that
+/// spelled the name would stop turning that knob the day it was renamed.
+/// This one names the same knob in every build that can read the file.
+pub fn keys_symbol(knob: usize) -> String {
+    format!("knob{knob}")
+}
+
+/// One sound's knobs as a preset's values: every one of them, by
+/// [`keys_symbol`], in knob order.
+pub fn keys_values(knobs: &[f32]) -> Vec<(String, f64)> {
+    knobs
+        .iter()
+        .enumerate()
+        .map(|(knob, v)| (keys_symbol(knob), f64::from(*v)))
+        .collect()
+}
+
+/// **A Keys preset's values as one sound's knobs.**
+///
+/// A preset is a whole sound, not an edit to whatever the knobs held, so a
+/// knob the file does not name (a file from an older build, or one edited by
+/// hand) comes back at the sound's own default, and so does one whose value
+/// is not a finite number: a NaN never reaches the engine. Every other value
+/// is clamped into the 0..=1 every Keys knob travels in. A symbol this build
+/// has no knob for turns nothing; it is a newer build's to read, and the
+/// file keeps it ([`Preset::values`]).
+pub fn keys_knobs(sound: usize, values: &[(String, f64)]) -> [f32; KEYS_PARAMS] {
+    let specs = KEYS_PARAM_SPECS.get(sound);
+    std::array::from_fn(|knob| {
+        let default = specs.map_or(0.5, |s| s[knob].2);
+        let symbol = keys_symbol(knob);
+        values
+            .iter()
+            .find(|(s, _)| *s == symbol)
+            .map(|(_, v)| *v)
+            .filter(|v| v.is_finite())
+            .map_or(default, |v| v.clamp(0.0, 1.0) as f32)
+    })
 }
 
 #[cfg(test)]
@@ -350,5 +433,86 @@ mod tests {
         let back = Preset::from_json(old).expect("an older file is still a preset");
         assert!(back.state.is_empty());
         assert_eq!(back.values, vec![("vol".to_owned(), 0.5)]);
+    }
+
+    /// **A Keys sound is named by its PLACE, and only by the spelling the
+    /// host compares.** Every sound round-trips through its identity; a
+    /// sound past the end of the list, a padded number, another unit and
+    /// the bare drawer name are no sound of this build's.
+    #[test]
+    fn a_keys_sound_is_named_by_its_place_in_the_list() {
+        for sound in 0..KEYS_PATCHES {
+            assert_eq!(keys_sound(&keys_unit(sound)), Some(sound), "sound {sound}");
+        }
+        assert_eq!(keys_unit(3), "keys:3", "the identity the module doc and the host's drawer read");
+        let past = format!("keys:{KEYS_PATCHES}");
+        for other in [past.as_str(), "keys:03", "keys:+3", "keys:-1", "keys:", "keys", "@tangent-eq", ""] {
+            assert_eq!(keys_sound(other), None, "{other:?} was read as a sound");
+        }
+    }
+
+    /// **A Keys preset names its knobs by index and gives them back whole.**
+    ///
+    /// Saved, every knob is a `knobN` and none is missing; read back, they
+    /// are the knobs it was saved from. What a hand-edited or a newer file
+    /// can hold costs nothing: a knob it does not name comes back at the
+    /// SOUND's own default (not the last sound's, not 0.5), a value that is
+    /// not a finite number does too, an out-of-range one is clamped, and a
+    /// symbol no knob has, the display name of a knob included, turns
+    /// nothing.
+    #[test]
+    fn a_keys_preset_names_its_knobs_by_index_and_lands_whole() {
+        let knobs = [0.0_f32, 0.125, 0.25, 0.5, 0.625, 0.75, 0.875, 1.0];
+        let values = keys_values(&knobs);
+        let symbols: Vec<&str> = values.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(symbols, ["knob0", "knob1", "knob2", "knob3", "knob4", "knob5", "knob6", "knob7"]);
+        for sound in 0..KEYS_PATCHES {
+            assert_eq!(keys_knobs(sound, &values), knobs, "sound {sound} did not read back what it saved");
+        }
+
+        // The clav's Mute rests at 0 and its Tone at 0.75: a default that is
+        // the sound's own is the only way a missing knob can come back right.
+        let clav = 4;
+        let defaults: Vec<f32> = KEYS_PARAM_SPECS[clav].iter().map(|s| s.2).collect();
+        assert_eq!(keys_knobs(clav, &[]).to_vec(), defaults, "an empty preset is not the sound's defaults");
+        let rubbish = vec![
+            ("knob0".to_owned(), f64::NAN),
+            ("knob1".to_owned(), f64::INFINITY),
+            ("knob2".to_owned(), 7.0),
+            ("knob3".to_owned(), -2.0),
+            ("knob9".to_owned(), 0.3),
+            ("Voicing".to_owned(), 0.9),
+            ("from_the_future".to_owned(), 0.1),
+        ];
+        let landed = keys_knobs(clav, &rubbish);
+        assert_eq!(landed[0], defaults[0], "a NaN landed");
+        assert_eq!(landed[1], defaults[1], "an infinity landed");
+        assert_eq!(landed[2], 1.0, "a value past the top was not clamped");
+        assert_eq!(landed[3], 0.0, "a value under the bottom was not clamped");
+        assert_eq!(landed[4..].to_vec(), defaults[4..].to_vec(), "a symbol no knob has turned one");
+        assert!(landed.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+    }
+
+    /// **A Keys preset file carries what this build cannot read.** A newer
+    /// build's ninth knob and a key of its own survive a read and a write,
+    /// and the knobs this build knows still come off the file.
+    #[test]
+    fn a_keys_preset_from_a_newer_build_keeps_its_extra_knob() {
+        let text = r#"{
+            "version": 2,
+            "kind": "tangent-preset",
+            "unit": "keys:1",
+            "name": "Bell Tree",
+            "values": {"knob0": 0.25, "knob3": 0.75, "knob8": 0.5},
+            "voiced_by": "somebody"
+        }"#;
+        let p = Preset::from_json(text).expect("a newer build's Keys preset");
+        assert_eq!(keys_sound(&p.unit), Some(1));
+        let again = Preset::from_json(&p.to_json()).expect("its own JSON");
+        assert_eq!(again, p, "the round trip lost something");
+        assert!(again.values.iter().any(|(s, v)| s == "knob8" && *v == 0.5), "the ninth knob was dropped");
+        let knobs = keys_knobs(1, &again.values);
+        assert_eq!((knobs[0], knobs[3]), (0.25, 0.75));
+        assert_eq!(knobs[1], KEYS_PARAM_SPECS[1][1].2, "a knob the file does not name is not at its default");
     }
 }

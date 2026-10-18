@@ -2732,6 +2732,17 @@ pub enum RecorderRequest {
         bay: crate::desk_id::SeatBay,
         ask: crate::faces_hwinsert::HwAsk,
     },
+    /// **Scan `unit`'s preset folder and push its rows**, with nothing
+    /// saved, loaded or deleted. Appended at the END, this enum's law.
+    ///
+    /// A face's shelf rides the tap it arms as it opens (`SetInsertTap`);
+    /// the Keys window has no tap to arm, and its list changes with the
+    /// sound its strip plays, so it asks for that sound's rows by name when
+    /// it opens and each time the sound changes, chosen in it or put back by
+    /// an undo. The other three preset requests re-push on their own, and a
+    /// delete re-pushes the unit its file names, which a file already gone
+    /// names to nobody: so the Keys window asks after a delete as well.
+    ListPresets { unit: String },
 }
 
 /// How hard an auditioned note is struck.

@@ -7851,6 +7851,9 @@ impl DesktopApp {
                 R::DeletePreset { path } => {
                     self.delete_unit_preset(std::path::Path::new(&path));
                 }
+                // The Keys window opening, or its sound changing: a scan
+                // and nothing else.
+                R::ListPresets { unit } => self.push_preset_rows(&unit),
                 // ── the IR wizard ───────────────────────────────────────
                 // The wizard's four asks. Requests because the capture
                 // engine, the sweep math and `IRs/` all live on this side;
@@ -8293,12 +8296,8 @@ impl DesktopApp {
     }
 
     /// Scan a unit's folder and push what is there as plain rows — the
-    /// cartridge-list pattern. Files that do not parse as presets are
-    /// skipped without a word (a preset folder is somewhere people put
-    /// junk, the user-themes rule), and so is a preset that does not name
-    /// THIS unit: it cannot be loaded from this list, so a row for it would
-    /// be a button that refuses — and requiring the match here is what lets
-    /// a delete know, from the file alone, whose list to refresh.
+    /// cartridge-list pattern. [`preset_rows_in`] is the scan, and says
+    /// which files it leaves off.
     fn push_preset_rows(&mut self, unit: &str) {
         let dir = self.unit_preset_dir(unit);
         // **The analog's factory sounds arrive as ordinary files, once.**
@@ -8311,52 +8310,13 @@ impl DesktopApp {
         if unit == crate::builtin_fx::ANALOG_PATH && !dir.exists() {
             seed_factory_presets(unit, &dir);
         }
-        let mut rows: Vec<tangent_ui::ports::PresetRow> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let mut paths: Vec<std::path::PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                        e.eq_ignore_ascii_case(tangent_ui::preset::PRESET_EXT)
-                    })
-                })
-                .collect();
-            paths.sort();
-            for path in paths {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(p) = tangent_ui::preset::Preset::from_json(&text) else {
-                    continue;
-                };
-                if p.unit != unit {
-                    continue;
-                }
-                // The file's own name when it says, the stem when it does
-                // not — the same fallback a renamed theme gets.
-                let name = if p.name.trim().is_empty() {
-                    path.file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                } else {
-                    p.name
-                };
-                rows.push(tangent_ui::ports::PresetRow {
-                    name,
-                    path: path.to_string_lossy().into_owned(),
-                });
-            }
-        }
-        self.app.set_preset_rows(unit.to_owned(), rows);
+        self.app.set_preset_rows(unit.to_owned(), preset_rows_in(&dir, unit));
     }
 
-    /// Write `values` as a named preset for `unit`, atomically — the
-    /// `Settings::save_to` model: whole file beside, then rename, so a
-    /// crash mid-write costs a `.tmp` and never a preset.
+    /// Write `values` as a named preset for `unit`, into the unit's own
+    /// folder: [`write_unit_preset`] writes it, and [`preset_file_for`]
+    /// says which file a name is.
     ///
-    /// The filename is the SANITIZED name; the typed name goes inside the
-    /// file. Same name, same unit, same file: saving "Warm Bus" twice is an
-    /// update, not a "Warm Bus (2)".
     /// **A preset remembers the FILE as well as the knobs.** `state` is the
     /// face's `extra` handed straight through — the sampler's loaded sample,
     /// the convolver's impulse. Without it a sampler patch reopens with the
@@ -8371,12 +8331,6 @@ impl DesktopApp {
         values: &[(String, f64)],
         state: &[(String, String)],
     ) {
-        let dir = self.unit_preset_dir(unit);
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let stem = tangent_ui::preset::safe_stem(name);
-        let path = dir.join(format!("{stem}.{}", tangent_ui::preset::PRESET_EXT));
         let preset = tangent_ui::preset::Preset {
             version: tangent_ui::preset::PRESET_VERSION,
             unit: unit.to_owned(),
@@ -8385,46 +8339,32 @@ impl DesktopApp {
             state: preset_state_for_disk(unit, state, self.app.kit_doc().as_deref()),
             extra: Default::default(),
         };
-        let tmp = path.with_extension("tangentpreset.tmp");
-        if std::fs::write(&tmp, preset.to_json()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        // **A save the disk refused says so**, as a load that fails does.
+        // This let the answer fall: a full disk, a folder that cannot be
+        // written, a name too long for the filesystem, and the strip's
+        // field was left full with nothing new on its list and no word why.
+        if let Err(e) = write_unit_preset(&self.unit_preset_dir(unit), &preset) {
+            self.app.notify(Kind::Error, format!("preset: {} could not be saved: {e}", preset.name));
         }
     }
 
-    /// Read a preset back and hand it to the app as plain data. The unit
-    /// check is the owner rule `shelf::write_state` keeps for plugin state:
-    /// a file that names a different unit moves nothing, out loud. A sampler
-    /// preset's file rides along (`preset_sample`), for the app to copy into
-    /// this project and bind after the knobs, and so does a convolver
-    /// preset's impulse (`preset_impulse`), which the app binds where it is.
+    /// Read a preset back and hand it to the app as plain data, or say out
+    /// loud why not ([`read_unit_preset`], which is also where a file that
+    /// names another unit is refused). A sampler preset's file rides along
+    /// (`preset_sample`), for the app to copy into this project and bind
+    /// after the knobs, and so does a convolver preset's impulse
+    /// (`preset_impulse`), which the app binds where it is.
     fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
-        let parsed = std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| tangent_ui::preset::Preset::from_json(&text));
-        let p = match parsed {
+        let p = match read_unit_preset(unit, path) {
             Ok(p) => p,
             Err(e) => {
-                self.app.notify(Kind::Error, format!("preset: {e}"));
+                self.app.notify(Kind::Error, e);
                 return;
             }
         };
-        if !p.unit.is_empty() && p.unit != unit {
-            self.app.notify(
-                Kind::Error,
-                format!("preset: that file belongs to {}", p.unit),
-            );
-            return;
-        }
-        let name = if p.name.is_empty() {
-            path.file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            p.name
-        };
         self.app.set_preset_loaded(tangent_ui::ports::PresetLoaded {
             unit: unit.to_owned(),
-            name,
+            name: preset_shown_name(path, &p.name),
             values: p.values,
             sample: preset_sample(unit, &p.state),
             impulse: preset_impulse(unit, &p.state),
@@ -17735,6 +17675,160 @@ fn preset_delete_target(
         .then_some(canon)
 }
 
+// ── a unit's folder, as files ───────────────────────────────────────────────
+//
+// What `push_preset_rows`, `save_unit_preset` and `load_unit_preset` do to the
+// disk, as functions of a folder and a unit, so a test can hold the road whole
+// against a scratch folder: a `DesktopApp` cannot be built in one.
+
+/// Every file in `dir` wearing our extension, in name order. Nothing for a
+/// folder that is not there yet: a unit's folder is made by its first save.
+#[cfg(feature = "recorder")]
+fn preset_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case(tangent_ui::preset::PRESET_EXT))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    paths
+}
+
+/// The preset at `path`, or nothing when the file is not one.
+#[cfg(feature = "recorder")]
+fn preset_file(path: &std::path::Path) -> Option<tangent_ui::preset::Preset> {
+    let text = std::fs::read_to_string(path).ok()?;
+    tangent_ui::preset::Preset::from_json(&text).ok()
+}
+
+/// **What a preset is called**: the name inside the file, or the file's
+/// stem when it gives none, the fallback a renamed theme gets. One rule for
+/// the list, the load and the save, because a save that read a nameless
+/// file another way than the list shows it would put a second row of the
+/// same name beside it.
+#[cfg(feature = "recorder")]
+fn preset_shown_name(path: &std::path::Path, name: &str) -> String {
+    if name.trim().is_empty() {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// **One unit's presets in its folder, as the rows a panel lists.**
+///
+/// Files that do not parse as presets are skipped without a word (a preset
+/// folder is somewhere people put junk, the user-themes rule), and so is a
+/// preset that does not name THIS unit: it cannot be loaded from this list,
+/// so a row for it would be a button that refuses. That is also what keeps
+/// the Keys drawer, which all ten sounds share, from listing one sound's
+/// presets under another's, and requiring the match here is what lets a
+/// delete know, from the file alone, whose list to refresh.
+#[cfg(feature = "recorder")]
+fn preset_rows_in(dir: &std::path::Path, unit: &str) -> Vec<tangent_ui::ports::PresetRow> {
+    preset_files_in(dir)
+        .into_iter()
+        .filter_map(|path| {
+            let p = preset_file(&path).filter(|p| p.unit == unit)?;
+            Some(tangent_ui::ports::PresetRow {
+                name: preset_shown_name(&path, &p.name),
+                path: path.to_string_lossy().into_owned(),
+            })
+        })
+        .collect()
+}
+
+/// **Which file a save of `name` for `unit` writes, in its folder `dir`.**
+///
+/// The filename is the SANITIZED name and the typed one goes inside the
+/// file. Same name, same unit, same file: saving "Warm Bus" twice is an
+/// update, not a second row. What that rule does not cover is a folder two
+/// units share, and the Keys drawer is one ([`preset_subfolder`]): with the
+/// stem the name alone, a grand's "Warm" and a tine piano's "Warm" would be
+/// one path, and the second save would write over the first sound's
+/// preset, which no row would offer again.
+///
+/// So: the file this unit already keeps under this name is the one written,
+/// whatever it is called on disk; failing that, the plain stem while
+/// nothing is there; failing that, the stem with a number after it, the
+/// first that is free. A save writes over nothing but this unit's own
+/// preset of this name: not another sound's, not another name's that
+/// sanitizes the same, and not a file that is no preset at all.
+#[cfg(feature = "recorder")]
+fn preset_file_for(dir: &std::path::Path, unit: &str, name: &str) -> std::path::PathBuf {
+    let name = name.trim();
+    let own = preset_files_in(dir).into_iter().find(|path| {
+        preset_file(path).is_some_and(|p| p.unit == unit && preset_shown_name(path, &p.name) == name)
+    });
+    if let Some(own) = own {
+        return own;
+    }
+    let ext = tangent_ui::preset::PRESET_EXT;
+    // `safe_stem` keeps a typed name inside its folder; the export's rule
+    // makes it a name every system will write as well, Windows' refused
+    // characters, its trailing dots and its device names included: a preset
+    // folder travels as a project's does, and on Windows a "What?" or a
+    // "Con" saved nothing.
+    let stem = sanitize_file_stem_or(&tangent_ui::preset::safe_stem(name), "preset");
+    let plain = dir.join(format!("{stem}.{ext}"));
+    if !plain.exists() {
+        return plain;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{stem} {n}.{ext}")))
+        .find(|path| !path.exists())
+        .unwrap_or(plain)
+}
+
+/// **Write `preset` into its unit's folder `dir`, atomically**, the
+/// `Settings::save_to` model: the whole file beside, then a rename, so a
+/// crash mid-write costs a `.tmp` and never a preset. The folder is made on
+/// the way, and the file is the one [`preset_file_for`] names. Answers the
+/// file written, or what the disk said when it said no, for the save to
+/// put in front of the person who pressed it.
+#[cfg(feature = "recorder")]
+fn write_unit_preset(
+    dir: &std::path::Path,
+    preset: &tangent_ui::preset::Preset,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = preset_file_for(dir, &preset.unit, &preset.name);
+    let tmp = path.with_extension("tangentpreset.tmp");
+    // A refused write or rename takes its `.tmp` with it: no crash left it.
+    let written = std::fs::write(&tmp, preset.to_json()).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// **Read the preset at `path` for `unit`**, or the sentence a person is
+/// shown instead. The unit check is the owner rule `shelf::write_state`
+/// keeps for plugin state: a file that names a different unit (another
+/// effect's, or another Keys sound's) moves nothing, out loud. A file that
+/// names no unit at all is let through, as it always has been.
+#[cfg(feature = "recorder")]
+fn read_unit_preset(unit: &str, path: &std::path::Path) -> Result<tangent_ui::preset::Preset, String> {
+    let p = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| tangent_ui::preset::Preset::from_json(&text))
+        .map_err(|e| format!("preset: {e}"))?;
+    if !p.unit.is_empty() && p.unit != unit {
+        return Err(format!("preset: that file belongs to {}", p.unit));
+    }
+    Ok(p)
+}
+
 /// **A preset names the sampler's file ABSOLUTELY**, so it plays in any
 /// project: the bay stores its sample relative to its project
 /// (`media/<name>`, see `sampler_file`), and a preset written with that
@@ -26805,6 +26899,199 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A scratch preset root of this test's own, empty.
+    fn preset_scratch(tag: &str) -> std::path::PathBuf {
+        let scratch = std::env::temp_dir().join(format!(
+            "tangent-preset-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        scratch.join("Presets")
+    }
+
+    /// A Keys preset as the app's Save sends it: every knob, by index.
+    fn keys_preset(sound: usize, name: &str, knobs: &[f32]) -> tangent_ui::preset::Preset {
+        tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: tangent_ui::preset::keys_unit(sound),
+            name: name.to_owned(),
+            values: tangent_ui::preset::keys_values(knobs),
+            state: Vec::new(),
+            extra: Default::default(),
+        }
+    }
+
+    /// **A Keys preset goes into the Keys drawer and comes back whole.**
+    ///
+    /// Through the functions the three host roads are made of (the save's
+    /// writer, the scan the list is pushed from, the load's reader), against
+    /// a scratch root: the file lands in "Tangent Keys", the folder every
+    /// sound shares and the one the drawer has been called since before the
+    /// window had presets; it is listed under its own sound; it reads back
+    /// as the knobs it was saved from; another sound's load refuses it out
+    /// loud; and the delete's guard lets it be removed, inside the root.
+    #[test]
+    fn a_keys_preset_round_trips_through_the_keys_drawer() {
+        use tangent_ui::preset::{keys_knobs, keys_unit};
+        let root = preset_scratch("keys-round-trip");
+        let last = tangent_ui::dialogs::KEYS_PATCHES - 1;
+        assert_eq!(preset_subfolder(&keys_unit(last)), "Tangent Keys", "the last sound files elsewhere");
+        let unit = keys_unit(3);
+        let dir = root.join(preset_subfolder(&unit));
+        let knobs = [0.0_f32, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1.0];
+        let path = write_unit_preset(&dir, &keys_preset(3, "Warm Throb", &knobs)).expect("the preset was not written");
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert!(dir.ends_with("Tangent Keys"), "{}", dir.display());
+        assert_eq!(
+            preset_rows_in(&dir, &unit),
+            vec![tangent_ui::ports::PresetRow {
+                name: "Warm Throb".to_owned(),
+                path: path.to_string_lossy().into_owned(),
+            }],
+            "the sound's list is not its one preset"
+        );
+        let back = read_unit_preset(&unit, &path).expect("its own sound's preset");
+        assert_eq!(keys_knobs(3, &back.values), knobs, "the knobs did not come back as they went");
+        let refused = read_unit_preset(&keys_unit(5), &path).expect_err("another sound's load took it");
+        assert!(refused.contains("keys:3"), "the refusal does not say whose it is: {refused}");
+        assert!(preset_delete_target(&root, &path).is_some(), "the delete's guard refuses the Keys drawer");
+        let _ = std::fs::remove_dir_all(root.parent().expect("the scratch"));
+    }
+
+    /// **Ten sounds share one drawer, and none of them writes over or lists
+    /// another's.**
+    ///
+    /// The file is named for the preset, so on that rule alone a grand's
+    /// "Warm" and a tine piano's "Warm" are one path in the shared drawer,
+    /// and the second save writes over the first, which no row then offers.
+    /// Each sound keeps a file of its own under the one name, a second save
+    /// of it updates that file and touches no other, and a sound's list
+    /// holds its own presets alone: not another sound's, and not a file that
+    /// is no preset.
+    #[test]
+    fn every_keys_sound_keeps_its_own_presets_in_the_shared_drawer() {
+        use tangent_ui::preset::{keys_knobs, keys_unit};
+        let root = preset_scratch("keys-shared-drawer");
+        let dir = root.join("Tangent Keys");
+        let a = [0.1_f32; 8];
+        let b = [0.9_f32; 8];
+        let grand = write_unit_preset(&dir, &keys_preset(0, "Warm", &a)).expect("the grand's");
+        let tines = write_unit_preset(&dir, &keys_preset(3, "Warm", &b)).expect("the tine piano's");
+        assert_ne!(grand, tines, "two sounds' presets of one name went to one file");
+        let knobs_of = |unit: &str, path: &std::path::Path, sound: usize| {
+            keys_knobs(sound, &read_unit_preset(unit, path).expect("a preset").values)
+        };
+        assert_eq!(knobs_of(&keys_unit(0), &grand, 0), a, "the grand's preset was written over");
+        let names = |unit: &str| preset_rows_in(&dir, unit).into_iter().map(|r| (r.name, r.path)).collect::<Vec<_>>();
+        let shown = |path: &std::path::Path| ("Warm".to_owned(), path.to_string_lossy().into_owned());
+        assert_eq!(names(&keys_unit(0)), vec![shown(&grand)]);
+        assert_eq!(names(&keys_unit(3)), vec![shown(&tines)]);
+
+        // Saving it again is an update of the sound's own file.
+        let c = [0.5_f32; 8];
+        let again = write_unit_preset(&dir, &keys_preset(3, "Warm", &c)).expect("the update");
+        assert_eq!(again, tines, "a second save of one sound's preset made another file");
+        assert_eq!(knobs_of(&keys_unit(3), &tines, 3), c);
+        assert_eq!(knobs_of(&keys_unit(0), &grand, 0), a, "updating one sound's preset touched another's");
+
+        // Another sound's file and a file that is no preset stay off the list.
+        let _ = write_unit_preset(&dir, &keys_preset(5, "Funk", &a)).expect("the clav's");
+        std::fs::write(dir.join("Notes.tangentpreset"), "not a preset at all").expect("junk");
+        assert_eq!(names(&keys_unit(3)), vec![shown(&tines)], "the list holds what is not this sound's");
+        // And the junk is never written over by a save that would take its name.
+        let notes = write_unit_preset(&dir, &keys_preset(3, "Notes", &c)).expect("a preset named like the junk");
+        assert_ne!(notes, dir.join("Notes.tangentpreset"), "a save wrote over a file that is not its own");
+        assert_eq!(std::fs::read_to_string(dir.join("Notes.tangentpreset")).unwrap(), "not a preset at all");
+        let _ = std::fs::remove_dir_all(root.parent().expect("the scratch"));
+    }
+
+    /// **A name Windows refuses still saves, under a stem Windows takes, and
+    /// a save the disk refuses answers why.**
+    ///
+    /// The stem was `safe_stem` alone, which keeps a typed name inside its
+    /// folder and nothing more, so "What?" or "Con" wrote a file here and
+    /// nothing on Windows, where a preset folder travels as a project's
+    /// does. The export's rule runs over it now (`sanitize_file_stem_or`):
+    /// the refused characters become dashes, trailing dots go, and a device
+    /// name gets its `_`, while the name inside the file, which the list
+    /// shows, is the one typed. And the writer answers the disk's own error
+    /// where it answered nothing, for the save to put on screen.
+    #[test]
+    fn a_name_windows_refuses_still_saves_and_a_refused_save_says_why() {
+        use tangent_ui::preset::keys_unit;
+        let root = preset_scratch("keys-windows-names");
+        let dir = root.join("Tangent Keys");
+        let knobs = [0.5_f32; 8];
+        for (typed, stem) in [
+            ("What? <a> \"b\" | *c*", "What- -a- -b- - -c-"),
+            ("Con", "_Con"),
+            ("nul.backup", "_nul.backup"),
+            ("Bright Tines. .", "Bright Tines"),
+        ] {
+            let path = write_unit_preset(&dir, &keys_preset(3, typed, &knobs)).expect(typed);
+            let on_disk = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+            assert_eq!(on_disk.as_deref(), Some(stem), "{typed:?} was written under a stem Windows refuses");
+            let listed = preset_rows_in(&dir, &keys_unit(3));
+            assert!(
+                listed.iter().any(|r| r.name == typed && r.path == path.to_string_lossy()),
+                "{typed:?} is not listed under the name it was typed as: {listed:?}"
+            );
+        }
+        // A folder that cannot be made: the error comes back. And the saves
+        // above left no `.tmp` in the drawer.
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(&root).expect("the root");
+        std::fs::write(&blocked, "a file where the folder would be").expect("the blocker");
+        let refused = write_unit_preset(&blocked, &keys_preset(3, "Warm", &knobs));
+        assert!(refused.is_err(), "a save into a folder that cannot be made answered {refused:?}");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the drawer")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "tmp"))
+            .collect();
+        assert!(strays.is_empty(), "a save left {strays:?}");
+        let _ = std::fs::remove_dir_all(root.parent().expect("the scratch"));
+    }
+
+    /// **The host's preset roads go through the functions held above**, and
+    /// the Keys window's list request is answered with a scan. A
+    /// `DesktopApp` cannot be built to show it, so this reads the source:
+    /// the arm for `ListPresets`, and the save, the list and the load each
+    /// handing their disk work to the tested function.
+    #[test]
+    fn the_preset_roads_reach_the_disk_through_the_tested_functions() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} is still called that"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        assert!(
+            src.contains("R::ListPresets { unit } => self.push_preset_rows(&unit),"),
+            "the Keys window's list request is not answered with a scan"
+        );
+        assert!(
+            body("fn save_unit_preset(").contains("write_unit_preset(&self.unit_preset_dir(unit), &preset)"),
+            "the save no longer writes through write_unit_preset"
+        );
+        // And a refusal is said, as a refused load is: the writer's error
+        // was once an `Option` this let fall.
+        let save = body("fn save_unit_preset(");
+        assert!(
+            save.contains("if let Err(e) = write_unit_preset(") && save.contains("self.app.notify(Kind::Error"),
+            "a save the disk refuses is not said"
+        );
+        assert!(
+            body("fn push_preset_rows(").contains("preset_rows_in(&dir, unit)"),
+            "the list no longer scans through preset_rows_in"
+        );
+        assert!(
+            body("fn load_unit_preset(").contains("read_unit_preset(unit, path)"),
+            "the load no longer reads through read_unit_preset"
+        );
     }
 
     /// **No sound allocates once the instrument is built.** Every voice of

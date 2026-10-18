@@ -255,15 +255,27 @@ pub enum Dialog {
     /// been voiced for.
     KeysPatch {
         slot: usize,
-        /// Index into [`KEYS_PATCH_NAMES`].
+        /// Index into [`KEYS_PATCH_NAMES`]: the sound the strip plays, which
+        /// the app copies in every frame (`app::refresh_keys_window`), so an
+        /// undo or a redo that moves the strip's sound moves this with it.
         selected: usize,
         /// **The chosen sound's whole rack**, normalised 0..=1 and in the
         /// order [`KEYS_PARAM_SPECS`] lists it for that sound.
         ///
         /// The panel holds its own copy so a drag is smooth, and the app
-        /// re-seeds it whenever the sound changes: the knobs BELONG to the
-        /// sound, so the rack the panel is showing has to change with it.
+        /// re-seeds it from the strip every frame before the window draws:
+        /// the knobs BELONG to the sound, and to whatever else moves the
+        /// strip's (a preset's load, an undo, a redo), so the rack the panel
+        /// is showing has to change with them. A drag writes the strip on the
+        /// frame it moves, so the copy it gets back is its own.
         params: [f32; KEYS_PARAMS],
+        /// **The chosen sound's saved presets**, as the host last found
+        /// them under that sound's unit (`preset::keys_unit`): names and
+        /// paths, pushed in by the app every frame, as a face's shelf is.
+        /// Another sound's presets are never on it.
+        preset_rows: Vec<crate::ports::PresetRow>,
+        /// The strip's save-as field, as typed.
+        preset_name: String,
     },
     /// Build a patch by hand: every number a DX7 stores, and a picture of the
     /// algorithm.
@@ -2307,6 +2319,23 @@ pub enum DialogAction {
         bay: crate::desk_id::SeatBay,
         ask: crate::faces_hwinsert::HwAsk,
     },
+    // ── the Keys window's presets ───────────────────────────────────────
+    // Appended at the END, this enum's law. The preset strip's three asks,
+    // as the Keys window raises them: by STRIP, because its knobs are the
+    // strip's own settings rather than a bay's ledger, and with the sound
+    // left for the app to read off the strip, which is the one place it is
+    // true.
+    /// Save `slot`'s chosen sound, every knob of it, under a typed name.
+    SaveKeysPreset { slot: usize, name: String },
+    /// Load the preset at `path` onto `slot`'s chosen sound.
+    LoadKeysPreset { slot: usize, path: String },
+    /// **Delete the preset at `path`, a row of `slot`'s chosen sound's
+    /// list.** The answer of the question the strip's Delete raises
+    /// ([`confirm_keys_preset_delete`]), never of the press itself: a file
+    /// gone from disk has no undo. A path off a row the host pushed; the
+    /// host deletes only inside the preset folder, and the app lists the
+    /// strip's sound again after it, so the row goes whatever the host found.
+    DeleteKeysPreset { slot: usize, path: String },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -5185,6 +5214,58 @@ fn take_ir_face(ctx: &egui::Context) -> Option<IrFaceReturn> {
     })
 }
 
+/// **Where the Keys window went while its question is up**, the IR panel's
+/// trail ([`IR_FACE_ID`]) for the other window that asks before it deletes.
+const KEYS_BACK_ID: &str = "dialog-keys-window";
+
+/// **The Keys window as it stood when its strip's Delete was pressed**: the
+/// strip it stands on, its sound and knobs, its list, and the name typed in
+/// its save field, which nothing else holds and a question must not cost.
+///
+/// The sound, the knobs and the list are the strip's and the host's, and
+/// the app copies them in again before the window draws
+/// (`app::refresh_keys_window`), so they are kept here only so the window
+/// comes back as it went, with nothing to correct.
+#[derive(Clone)]
+struct KeysReturn {
+    slot: usize,
+    selected: usize,
+    params: [f32; KEYS_PARAMS],
+    rows: Vec<crate::ports::PresetRow>,
+    name: String,
+}
+
+impl KeysReturn {
+    /// The window, ready to be put back in the dialog slot.
+    fn window(self) -> Dialog {
+        Dialog::KeysPatch {
+            slot: self.slot,
+            selected: self.selected,
+            params: self.params,
+            preset_rows: self.rows,
+            preset_name: self.name,
+        }
+    }
+}
+
+/// Leave the Keys window a way back, on the frame its question replaces it:
+/// [`remember_ir_face`]'s rule, written then and on no other frame.
+fn remember_keys_window(ctx: &egui::Context, back: KeysReturn) {
+    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(KEYS_BACK_ID), back));
+}
+
+/// Take it, once, as [`take_ir_face`] takes the IR panel's.
+fn take_keys_window(ctx: &egui::Context) -> Option<KeysReturn> {
+    ctx.memory_mut(|m| {
+        let id = egui::Id::new(KEYS_BACK_ID);
+        let held = m.data.get_temp::<KeysReturn>(id);
+        if held.is_some() {
+            m.data.remove::<KeysReturn>(id);
+        }
+        held
+    })
+}
+
 /// **The panel a closing dialog goes back to**, if one left a way back.
 ///
 /// A function rather than four lines in the `Confirm` arm, for the reason
@@ -5196,7 +5277,9 @@ fn take_ir_face(ctx: &egui::Context) -> Option<IrFaceReturn> {
 /// window it was left for. Every other `Dialog::Confirm` in the app is raised
 /// from `app.rs` with nothing left here, so for those this reads as nothing
 /// at all; and a trail that somehow outlived its window cannot be picked up
-/// twice by two of them.
+/// twice by two of them. Two windows leave one, the IR panel and the Keys
+/// window, and each question is raised by one of them, so at most one is
+/// ever held.
 ///
 /// No reveal on this road: nothing new was made, and the browser goes back to
 /// the folder the right-click happened in.
@@ -5204,7 +5287,9 @@ fn face_to_return_to(ctx: &egui::Context, closed: bool) -> Option<Dialog> {
     if !closed {
         return None;
     }
-    take_ir_face(ctx).map(|back| back.face(false))
+    take_ir_face(ctx)
+        .map(|back| back.face(false))
+        .or_else(|| take_keys_window(ctx).map(KeysReturn::window))
 }
 
 /// **The destructive button's colour in a confirmation this module raises
@@ -5213,8 +5298,9 @@ fn face_to_return_to(ctx: &egui::Context, closed: bool) -> Option<Dialog> {
 /// Every other `Dialog::Confirm` is built in `app.rs` and handed
 /// `master_knob_color` — the theme's own warning red — because that file
 /// reads settings and this one does not. The IR panel's delete confirmation
-/// is raised HERE, one frame after a right-click, and there is no settings
-/// in reach at that point.
+/// is raised HERE, one frame after a right-click, and so is the Keys
+/// window's, one frame after its Delete, and there is no settings in reach
+/// at either point.
 ///
 /// So it takes the app's fixed warning red instead, which is a real answer
 /// and not a stand-in: `CORR_RED` is the fixed-meaning family — record red,
@@ -6120,6 +6206,59 @@ pub(crate) fn face_min_size(unit: &str, size: Vec2) -> Vec2 {
     // path, so what went past the bottom was drawn, clipped and unreachable:
     // the owner's cut-off complaint wearing its other edge.
     face_window_size(unit, None).min(size)
+}
+
+// ── how big the Keys window opens ───────────────────────────────────────────
+
+/// **How big the Keys window opens: the face windows' rule, a share of the
+/// screen with a floor and a ceiling** ([`FACE_SIZES`]).
+///
+/// It opened at a fixed 392 by 520, which was already too short for a
+/// sound's eight knobs on every font, so the list scrolled; with the preset
+/// strip at its foot it would have held fewer still. The owner asked for
+/// the window to be made bigger to fit everything, so:
+///
+/// * **the floor holds the whole window with nothing scrolled**: the ten
+///   sounds, the chosen one's line, the SOUND row, all eight knobs of every
+///   sound with the line under each, and the strip, on every font. Measured
+///   off what is painted, that is 570 points of height on Courier Prime and
+///   Terminess and 592 on JetBrains Mono, at any width from 400; at 392 the
+///   guitar's Position line wraps and costs a line more. 420 by 620 leaves
+///   air on all three, and
+///   `the_keys_window_holds_every_sound_whole_at_its_floor` holds it there;
+/// * **the share** grows it by about a third across on a 14-inch laptop, as
+///   it grows the faces beside it, and the sound grid's two columns span
+///   whatever width it has;
+/// * **the ceiling is the floor scaled by 1.6 across, and the floor itself
+///   down**, so the height share never applies. What the window holds is a
+///   fixed stack, and the lowest word it paints sits at the same height at
+///   every size: 565 points down on Courier Prime and Terminess and 586 on
+///   JetBrains Mono, on a body 620, 720 or 992 tall alike. Grown taller
+///   with the screen, as it was at first, it opened 720 tall on a 2560 by
+///   1440 display and 992 on a larger one, and every point past the floor
+///   was empty ground under the strip, 134 to 155 points of it and then 406
+///   to 427, nearly half the window. A list that fits gains only air from
+///   more height, so the window takes none.
+const KEYS_SIZE: (Vec2, Vec2, Vec2) = (
+    Vec2::new(0.36, 0.5),
+    Vec2::new(420.0, 620.0),
+    Vec2::new(672.0, 620.0),
+);
+
+/// **The smallest the Keys window may be dragged to.**
+///
+/// Not its floor, which is what a face's minimum is (`face_min_size`): a
+/// face has no scroll area under it, and this window's knob list scrolls.
+/// What it must never lose is everything around the list, the grid, the
+/// SOUND row and the strip at the foot, with a knob still showing between
+/// them; `the_keys_window_keeps_its_strip_at_its_smallest` holds that.
+const KEYS_MIN: Vec2 = Vec2::new(360.0, 400.0);
+
+/// The Keys window on this display. See [`KEYS_SIZE`]; `None` before
+/// anything has been measured answers with the floor, as a face's does.
+pub fn keys_window_size(monitor: Option<Vec2>) -> Vec2 {
+    let (share, floor, ceiling) = KEYS_SIZE;
+    crate::shell::share_of_screen(monitor, share, floor, ceiling)
 }
 
 /// The window's margin, the label's line, the bar's thickness, and the air
@@ -7599,6 +7738,43 @@ fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> 
     }
 }
 
+/// **The question in front of deleting a Keys sound's preset.**
+///
+/// A preset is less than an impulse, and [`confirm_ir_delete`] says so: it
+/// can be dialled again. But only from the knobs it set, and the menu
+/// deletes any of its rows, almost always one whose knobs are not the ones
+/// on screen, while `std::fs::remove_file` has no undo; so it is in the
+/// class the app answers with a `Dialog::Confirm`, the confirmation every
+/// delete is promised. The words name the row as the menu showed it, its
+/// name and not its file, and the line under them says what the delete
+/// leaves alone: the knobs on screen, and the sound's other presets.
+fn confirm_keys_preset_delete(slot: usize, path: &str, rows: &[crate::ports::PresetRow]) -> Dialog {
+    let name = rows.iter().find(|r| r.path == path).map_or_else(
+        || {
+            Path::new(path)
+                .file_stem()
+                .map_or_else(|| path.to_owned(), |s| s.to_string_lossy().into_owned())
+        },
+        |r| r.name.clone(),
+    );
+    Dialog::Confirm {
+        title: "Delete preset".to_owned(),
+        body: format!(
+            "\u{201c}{name}\u{201d} is removed from the Presets folder, and there \
+             is no undo."
+        ),
+        kept: "Nothing else is touched. The sound keeps every knob where it is \
+               now, and its other presets stay where they are."
+            .to_owned(),
+        choices: vec![ConfirmChoice::new(
+            "Delete",
+            DialogAction::DeleteKeysPreset { slot, path: path.to_owned() },
+            true,
+        )],
+        warn: IR_DANGER,
+    }
+}
+
 /// **How tall the project-export window asks to be, and it did NOT have to
 /// grow for the STEMS row.**
 ///
@@ -7990,6 +8166,279 @@ fn quantize_grid_row(ui: &mut egui::Ui, grid_exp: &mut i8, meter: (u8, u8)) -> V
         chips
     })
     .inner
+}
+
+/// **The Keys window's body**: the ten sounds, the chosen one's line, its
+/// knobs and its presets, drawn into whatever `ui` the window hands it, and
+/// what the hand asked of them this frame.
+///
+/// A function of its own, not a closure inside [`show`], so the sweeps can
+/// draw the window at any size a hand can drag it to, the smallest
+/// included: the inline window cannot be drawn below the size it opens at,
+/// and the desktop's is another OS window.
+fn keys_panel(
+    ui: &mut egui::Ui,
+    face: Color32,
+    slot: usize,
+    selected: &mut usize,
+    params: &mut [f32; KEYS_PARAMS],
+    preset_rows: &[crate::ports::PresetRow],
+    preset_name: &mut String,
+) -> Option<DialogAction> {
+    // **The surface derives its own parts.** `surface_of` returns a ground
+    // that can carry ink, the ink that holds on it, and the raised shade a
+    // selected row sits on with the ink still holding. Picking a text colour
+    // by eye, or by a brightness test on the theme, is the bug this app has
+    // found in a screenshot seven times: ink is a property of the SURFACE and
+    // is never inherited.
+    let p = crate::recorder_panel::surface_of(face);
+    let chosen = *selected;
+    let specs = KEYS_PARAM_SPECS
+        .get(chosen)
+        .unwrap_or(&KEYS_PARAM_SPECS[0]);
+    let mut action = None;
+    apply_theme(ui.style_mut(), &theme(face));
+    ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+        .show(ui, |ui| {
+            // **Two columns, names only, the story on hover.** Full-width
+            // rows with a line of prose each were right for two sounds and
+            // would eat the whole panel at eight: the grid is for CHOOSING,
+            // and the chosen sound's own line is printed under it so the
+            // prose is never more than one glance away.
+            let cols = 2usize;
+            let rows = KEYS_PATCH_NAMES.len().div_ceil(cols);
+            for row in 0..rows {
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 6.0) / cols as f32;
+                    for col in 0..cols {
+                        let i = row * cols + col;
+                        let Some((name, about)) =
+                            KEYS_PATCH_NAMES.get(i)
+                        else {
+                            continue;
+                        };
+                        let resp = ui.allocate_response(
+                            egui::vec2(w, 28.0),
+                            egui::Sense::click(),
+                        );
+                        let ground = if i == chosen {
+                            Some(p.raised)
+                        } else if resp.hovered() {
+                            Some(p.hover)
+                        } else {
+                            None
+                        };
+                        if let Some(g) = ground {
+                            ui.painter().rect_filled(resp.rect, 3.0, g);
+                        }
+                        ui.painter().text(
+                            resp.rect.left_center() + egui::vec2(9.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            *name,
+                            bold(12.0),
+                            p.ink,
+                        );
+                        let resp = resp.on_hover_text(*about);
+                        if resp.clicked() {
+                            // **The cell lights up NOW.** Firing the action
+                            // and leaving `selected` alone is what made
+                            // choosing a sound look like it had done nothing
+                            // until the window was reopened: the panel is
+                            // drawn from its own state. The app re-seeds the
+                            // knobs behind this, because the rack belongs to
+                            // the sound.
+                            *selected = i;
+                            action = Some(
+                                DialogAction::ChooseKeysPatch { slot, index: i },
+                            );
+                            // Choosing does not close the panel: the knobs
+                            // below are half of why it is open.
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
+            // The chosen sound's line, in full.
+            if let Some((_, about)) = KEYS_PATCH_NAMES.get(chosen) {
+                ui.label(
+                    RichText::new(*about)
+                        .font(FontId::new(10.0, fonts::courier_bold()))
+                        .color(p.faint),
+                );
+            }
+            ui.add_space(6.0);
+
+            // ── the rack. Per SOUND: the list comes from the patch, so a
+            // piano shows an unison and a soundboard and an electric piano
+            // shows a bell and a pickup, rather than one fixed set with half
+            // of it lying.
+            let mut reset_all = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("SOUND")
+                        .font(FontId::new(10.0, fonts::courier_bold()))
+                        .color(p.faint),
+                );
+                ui.with_layout(
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        // The explicit one. A knob resets on a double click;
+                        // the whole sound resets here, because "put it back"
+                        // should not be eight gestures.
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new("Initialise")
+                                        .font(bold(11.0))
+                                        .color(p.ink),
+                                )
+                                .fill(p.raised),
+                            )
+                            .on_hover_text(
+                                "every knob of this sound back to the bench's own",
+                            )
+                            .clicked()
+                        {
+                            reset_all = true;
+                        }
+                    },
+                );
+            });
+            ui.add_space(4.0);
+
+            // **The preset strip's room is kept back first**, so the strip is
+            // always on screen at the foot of the knobs, where every face
+            // wears it. The list is as tall as its knobs and no taller, so in
+            // a window with room to spare the strip sits under the last one,
+            // as a face's sits under its rows; in one dragged too small to
+            // hold them all, the list scrolls inside what is left. Given all
+            // the room it asks for, it would push the strip out of the bottom
+            // of the window, the fault the IR face's foot was measured to
+            // cure (`faces::preset_foot_height`).
+            let foot = crate::faces::preset_foot_height_of(ui, crate::faces::KEYS_VERBS);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height((ui.available_height() - foot).max(0.0))
+                .show(ui, |ui| {
+                    for (knob, (name, about, default)) in
+                        specs.iter().enumerate()
+                    {
+                        let Some(cur) = params.get_mut(knob) else {
+                            continue;
+                        };
+                        let mut v = *cur;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{name:<11}"))
+                                    .font(bold(11.0))
+                                    .color(p.ink),
+                            );
+                            let resp = ui.add(
+                                egui::Slider::new(&mut v, 0.0..=1.0)
+                                    .show_value(false),
+                            );
+                            // **Double click puts it back.** On the knob
+                            // itself, which is where the hand already is.
+                            //
+                            // **Read off the pointer, not the slider**:
+                            // egui's `Slider` senses DRAG only, so its own
+                            // `double_clicked()` is never true and this never
+                            // fired. Each press of the double is a drag the
+                            // knob follows, and the second one's release -
+                            // `drag_stopped`, on THIS knob - is where the
+                            // pointer says the click was the second of two.
+                            let double = resp.drag_stopped()
+                                && ui.input(|i| {
+                                    i.pointer.button_double_clicked(
+                                        egui::PointerButton::Primary,
+                                    )
+                                });
+                            if double {
+                                v = *default;
+                            }
+                            let resp = resp.on_hover_text(format!(
+                                "{about}\ndouble-click to reset"
+                            ));
+                            // **The gesture's end**: a drag let go, a reset,
+                            // or a step from the keyboard, which no drag
+                            // frames.
+                            let done = resp.drag_stopped()
+                                || double
+                                || (resp.changed() && !resp.dragged());
+                            if resp.changed() || done {
+                                *cur = v;
+                                action = Some(DialogAction::SetKeysParam {
+                                    slot,
+                                    knob,
+                                    value: v,
+                                    done,
+                                    double,
+                                });
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:>3.0}%",
+                                    f64::from(v) * 100.0
+                                ))
+                                .font(FontId::new(10.0, fonts::courier_bold()))
+                                .color(if (v - *default).abs() < 1.0e-4 {
+                                    p.faint
+                                } else {
+                                    // Moved off the bench's value, and saying
+                                    // so is the whole reason a reset is
+                                    // findable.
+                                    p.ink
+                                }),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(*about)
+                                .font(FontId::new(9.0, fonts::courier_bold()))
+                                .color(p.faint),
+                        );
+                        ui.add_space(4.0);
+                    }
+                });
+            if reset_all {
+                for (slot_v, spec) in params.iter_mut().zip(specs.iter()) {
+                    *slot_v = spec.2;
+                }
+                action = Some(DialogAction::ResetKeysParams { slot });
+            }
+
+            // ── the chosen sound's presets. The suite's own strip, so it
+            // reads and behaves as every face's does, less its Init (the
+            // SOUND row above has one) and with a Delete in its menu: see
+            // `faces::StripVerbs`. The rows are this sound's alone, pushed in
+            // by the app; what each ask means for the strip is the app's to
+            // say.
+            use crate::faces::PresetAsk;
+            match crate::faces::preset_bar(
+                ui,
+                &p,
+                preset_rows,
+                preset_name,
+                crate::faces::KEYS_VERBS,
+            ) {
+                Some(PresetAsk::Save(name)) => {
+                    action = Some(DialogAction::SaveKeysPreset { slot, name });
+                }
+                Some(PresetAsk::Load(path)) => {
+                    action = Some(DialogAction::LoadKeysPreset { slot, path });
+                }
+                // Asked, not done: the window turns it into the question
+                // in front of it (`confirm_keys_preset_delete`).
+                Some(PresetAsk::Delete(path)) => {
+                    action = Some(DialogAction::DeleteKeysPreset { slot, path });
+                }
+                // Not a verb this strip wears.
+                Some(PresetAsk::Init) | None => {}
+            }
+        });
+    action
 }
 
 /// **The desk's own dialog window**, in the one slot the app has always had.
@@ -8606,239 +9055,46 @@ fn show_on(
             slot,
             selected,
             params,
+            preset_rows,
+            preset_name,
         } => {
-            // **The surface derives its own parts.** `surface_of` returns a
-            // ground that can carry ink, the ink that holds on it, and the
-            // raised shade a selected row sits on with the ink still holding.
-            // Picking a text colour by eye, or by a brightness test on the
-            // theme, is the bug this app has found in a screenshot seven
-            // times: ink is a property of the SURFACE and is never inherited.
-            let p = crate::recorder_panel::surface_of(face);
             let slot = *slot;
-            let chosen = *selected;
-            let specs = KEYS_PARAM_SPECS
-                .get(chosen)
-                .unwrap_or(&KEYS_PARAM_SPECS[0]);
+            // A share of the screen with a floor and a ceiling, the rule
+            // every face window opens by: see [`KEYS_SIZE`]. Taken through
+            // `held_geometry` like theirs, so a monitor change cannot resize
+            // it under a hand on the grip.
+            let size = keys_window_size(placement.monitor);
             show_dialog_viewport(
                 ctx,
                 placement,
                 KEYS_NAME,
-                Vec2::new(392.0, 520.0),
-                Vec2::new(330.0, 320.0),
+                size,
+                KEYS_MIN,
                 |ui, result| {
-                    apply_theme(ui.style_mut(), &theme(face));
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
-                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
-                        .show(ui, |ui| {
-                            // **Two columns, names only, the story on
-                            // hover.** Full-width rows with a line of prose
-                            // each were right for two sounds and would eat
-                            // the whole panel at eight: the grid is for
-                            // CHOOSING, and the chosen sound's own line is
-                            // printed under it so the prose is never more
-                            // than one glance away.
-                            let cols = 2usize;
-                            let rows = KEYS_PATCH_NAMES.len().div_ceil(cols);
-                            for row in 0..rows {
-                                ui.horizontal(|ui| {
-                                    let w = (ui.available_width() - 6.0) / cols as f32;
-                                    for col in 0..cols {
-                                        let i = row * cols + col;
-                                        let Some((name, about)) =
-                                            KEYS_PATCH_NAMES.get(i)
-                                        else {
-                                            continue;
-                                        };
-                                        let resp = ui.allocate_response(
-                                            egui::vec2(w, 28.0),
-                                            egui::Sense::click(),
-                                        );
-                                        let ground = if i == chosen {
-                                            Some(p.raised)
-                                        } else if resp.hovered() {
-                                            Some(p.hover)
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(g) = ground {
-                                            ui.painter().rect_filled(resp.rect, 3.0, g);
-                                        }
-                                        ui.painter().text(
-                                            resp.rect.left_center() + egui::vec2(9.0, 0.0),
-                                            Align2::LEFT_CENTER,
-                                            *name,
-                                            bold(12.0),
-                                            p.ink,
-                                        );
-                                        let resp = resp.on_hover_text(*about);
-                                        if resp.clicked() {
-                                            // **The cell lights up NOW.** Firing
-                                            // the action and leaving `selected`
-                                            // alone is what made choosing a sound
-                                            // look like it had done nothing until
-                                            // the window was reopened: the panel
-                                            // is drawn from its own state. The
-                                            // app re-seeds the knobs behind this,
-                                            // because the rack belongs to the
-                                            // sound.
-                                            *selected = i;
-                                            action = Some(
-                                                DialogAction::ChooseKeysPatch { slot, index: i },
-                                            );
-                                            // Choosing does not close the panel:
-                                            // the knobs below are half of why it
-                                            // is open.
-                                            result.close = false;
-                                        }
-                                    }
-                                });
-                                ui.add_space(4.0);
-                            }
-                            // The chosen sound's line, in full.
-                            if let Some((_, about)) = KEYS_PATCH_NAMES.get(chosen) {
-                                ui.label(
-                                    RichText::new(*about)
-                                        .font(FontId::new(10.0, fonts::courier_bold()))
-                                        .color(p.faint),
-                                );
-                            }
-                            ui.add_space(6.0);
-
-                            // ── the rack. Per SOUND: the list comes from the
-                            // patch, so a piano shows an unison and a soundboard
-                            // and an electric piano shows a bell and a pickup,
-                            // rather than one fixed set with half of it lying.
-                            let mut reset_all = false;
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("SOUND")
-                                        .font(FontId::new(10.0, fonts::courier_bold()))
-                                        .color(p.faint),
-                                );
-                                ui.with_layout(
-                                    Layout::right_to_left(Align::Center),
-                                    |ui| {
-                                        // The explicit one. A knob resets on a
-                                        // double click; the whole sound resets
-                                        // here, because "put it back" should
-                                        // not be eight gestures.
-                                        if ui
-                                            .add(
-                                                Button::new(
-                                                    RichText::new("Initialise")
-                                                        .font(bold(11.0))
-                                                        .color(p.ink),
-                                                )
-                                                .fill(p.raised),
-                                            )
-                                            .on_hover_text(
-                                                "every knob of this sound back to the bench's own",
-                                            )
-                                            .clicked()
-                                        {
-                                            reset_all = true;
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(4.0);
-
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for (knob, (name, about, default)) in
-                                        specs.iter().enumerate()
-                                    {
-                                        let Some(cur) = params.get_mut(knob) else {
-                                            continue;
-                                        };
-                                        let mut v = *cur;
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("{name:<11}"))
-                                                    .font(bold(11.0))
-                                                    .color(p.ink),
-                                            );
-                                            let resp = ui.add(
-                                                egui::Slider::new(&mut v, 0.0..=1.0)
-                                                    .show_value(false),
-                                            );
-                                            // **Double click puts it back.**
-                                            // On the knob itself, which is
-                                            // where the hand already is.
-                                            //
-                                            // **Read off the pointer, not the
-                                            // slider**: egui's `Slider` senses
-                                            // DRAG only, so its own
-                                            // `double_clicked()` is never true
-                                            // and this never fired. Each press
-                                            // of the double is a drag the knob
-                                            // follows, and the second one's
-                                            // release - `drag_stopped`, on THIS
-                                            // knob - is where the pointer says
-                                            // the click was the second of two.
-                                            let double = resp.drag_stopped()
-                                                && ui.input(|i| {
-                                                    i.pointer.button_double_clicked(
-                                                        egui::PointerButton::Primary,
-                                                    )
-                                                });
-                                            if double {
-                                                v = *default;
-                                            }
-                                            let resp = resp.on_hover_text(format!(
-                                                "{about}\ndouble-click to reset"
-                                            ));
-                                            // **The gesture's end**: a drag let
-                                            // go, a reset, or a step from the
-                                            // keyboard, which no drag frames.
-                                            let done = resp.drag_stopped()
-                                                || double
-                                                || (resp.changed() && !resp.dragged());
-                                            if resp.changed() || done {
-                                                *cur = v;
-                                                action = Some(DialogAction::SetKeysParam {
-                                                    slot,
-                                                    knob,
-                                                    value: v,
-                                                    done,
-                                                    double,
-                                                });
-                                            }
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{:>3.0}%",
-                                                    f64::from(v) * 100.0
-                                                ))
-                                                .font(FontId::new(10.0, fonts::courier_bold()))
-                                                .color(if (v - *default).abs() < 1.0e-4 {
-                                                    p.faint
-                                                } else {
-                                                    // Moved off the bench's
-                                                    // value, and saying so is
-                                                    // the whole reason a
-                                                    // reset is findable.
-                                                    p.ink
-                                                }),
-                                            );
-                                        });
-                                        ui.label(
-                                            RichText::new(*about)
-                                                .font(FontId::new(9.0, fonts::courier_bold()))
-                                                .color(p.faint),
-                                        );
-                                        ui.add_space(4.0);
-                                    }
-                                });
-                            if reset_all {
-                                for (slot_v, spec) in params.iter_mut().zip(specs.iter()) {
-                                    *slot_v = spec.2;
-                                }
-                                action = Some(DialogAction::ResetKeysParams { slot });
-                            }
-                        });
+                    match keys_panel(ui, face, slot, selected, params, preset_rows, preset_name) {
+                        // **A Delete is a question first**, the app's one
+                        // answer for a gesture that cannot be taken back,
+                        // which the IR panel's Delete takes the same way
+                        // (`FaceAction::DeleteIr`): the window steps aside
+                        // for it, leaves itself a way back, and comes back
+                        // on either answer (`face_to_return_to`).
+                        Some(DialogAction::DeleteKeysPreset { path, .. }) => {
+                            result.close = true;
+                            remember_keys_window(
+                                ui.ctx(),
+                                KeysReturn {
+                                    slot,
+                                    selected: *selected,
+                                    params: *params,
+                                    rows: preset_rows.clone(),
+                                    name: preset_name.clone(),
+                                },
+                            );
+                            becomes = Some(confirm_keys_preset_delete(slot, &path, preset_rows));
+                        }
+                        Some(asked) => action = Some(asked),
+                        None => {}
+                    }
                 },
             )
         }
@@ -23535,6 +23791,85 @@ at: None,
         );
     }
 
+    /// **A Keys preset is deleted only once the question is answered, and
+    /// the window comes back on either answer.**
+    ///
+    /// Through `show` itself, by pressing what it paints, as
+    /// `the_dialog_slot_is_handed_from_one_window_to_the_next` drives the IR
+    /// panel's delete. The strip's Delete asks the app for nothing and puts
+    /// the question in the window's place, naming the row as the menu shows
+    /// it. The question's Delete is `DeleteKeysPreset` for that strip and
+    /// that row's file, and Cancel asks nothing; and either puts the window
+    /// back as it went, the half-typed name in its save field included,
+    /// with the way back taken, so no later question finds it.
+    #[test]
+    fn a_keys_preset_is_deleted_only_once_the_question_is_answered() {
+        let rows: Vec<crate::ports::PresetRow> = ["Warm Felt", "Hard Hammers"]
+            .iter()
+            .map(|name| crate::ports::PresetRow {
+                name: (*name).to_owned(),
+                path: format!("/Presets/Tangent Keys/{name}.tangentpreset"),
+            })
+            .collect();
+        let keys = || Dialog::KeysPatch {
+            slot: 4,
+            selected: 6,
+            params: [0.25; KEYS_PARAMS],
+            preset_rows: rows.clone(),
+            preset_name: "half typed".to_owned(),
+        };
+        for answer in ["Delete", "Cancel"] {
+            let mut slot = Slot::new(keys());
+            // Open the menu, and press the Delete on the first row's line.
+            let _ = slot.click("load\u{2026}");
+            let words = slot.settle();
+            let first = words
+                .iter()
+                .find(|(_, _, w)| w == "Warm Felt")
+                .expect("the menu did not open")
+                .0;
+            let delete = words
+                .iter()
+                .filter(|(_, _, w)| w == "Delete")
+                .find(|(r, _, _)| r.center().y > first.top() && r.center().y < first.bottom())
+                .expect("no Delete on the first row's line")
+                .0;
+            let asked = slot.press_at(delete.center(), egui::PointerButton::Primary);
+            assert!(asked.is_none(), "the strip's Delete asked the app for something before the question");
+            let Some(Dialog::Confirm { body, choices, .. }) = &slot.dialog else {
+                panic!("the strip's Delete raised no question");
+            };
+            assert!(body.contains("\u{201c}Warm Felt\u{201d}"), "the question is about another row: {body}");
+            assert!(body.contains("no undo"), "the question does not say it is final: {body}");
+            let gated = matches!(
+                choices.as_slice(),
+                [c] if c.destructive && matches!(
+                    &c.action,
+                    DialogAction::DeleteKeysPreset { slot: 4, path } if *path == rows[0].path
+                )
+            );
+            assert!(gated, "the question's one answer is not this strip's delete of this row");
+
+            let asked = slot.click(answer);
+            match (answer, &asked) {
+                ("Delete", Some(DialogAction::DeleteKeysPreset { slot: 4, path })) => {
+                    assert_eq!(path, &rows[0].path, "the delete is of another row");
+                }
+                ("Cancel", None) => {}
+                _ => panic!("{answer} asked for the wrong thing"),
+            }
+            match &slot.dialog {
+                Some(Dialog::KeysPatch { slot: 4, selected: 6, params, preset_rows, preset_name }) => {
+                    assert_eq!(preset_name, "half typed", "{answer} lost the name being typed");
+                    assert_eq!(*params, [0.25; KEYS_PARAMS]);
+                    assert_eq!(preset_rows.len(), rows.len());
+                }
+                _ => panic!("{answer} did not put the Keys window back on its strip"),
+            }
+            assert!(take_keys_window(&slot.ctx).is_none(), "the way back is still there for another question");
+        }
+    }
+
     /// **Every theme dresses the delete confirmation, in both modes —
     /// measured off the picture that was painted.**
     ///
@@ -23864,6 +24199,8 @@ at: None,
                     slot: 0,
                     selected: 0,
                     params: [0.5; KEYS_PARAMS],
+                    preset_rows: Vec::new(),
+                    preset_name: String::new(),
                 },
             ),
             (
@@ -24000,6 +24337,8 @@ at: None,
             slot: 0,
             selected: 0,
             params: [0.5; KEYS_PARAMS],
+            preset_rows: Vec::new(),
+            preset_name: String::new(),
         });
         let mut frame = |events: Vec<egui::Event>| {
             let mut action = None;
@@ -24114,6 +24453,8 @@ at: None,
             slot: 0,
             selected: 0,
             params: [0.5; KEYS_PARAMS],
+            preset_rows: Vec::new(),
+            preset_name: String::new(),
         });
         let mut frame = |events: Vec<egui::Event>| {
             let mut action = None;
@@ -24219,6 +24560,8 @@ at: None,
             slot: 0,
             selected: 0,
             params: [0.5; KEYS_PARAMS],
+            preset_rows: Vec::new(),
+            preset_name: String::new(),
         });
         let mut action = None;
         for events in [
@@ -24773,5 +25116,392 @@ mod picker_tests {
         // And a picker that has been typed into still sends its INDEX: the
         // row text is for the eye, never parsed back.
         assert_eq!(picker_rows(&desk(), "room"), vec![(39, "Room (Ch 40)".to_owned())]);
+    }
+}
+
+/// The Keys window: its size, its parts held apart, and its preset strip's
+/// asks.
+#[cfg(test)]
+mod keys_window_tests {
+    use super::*;
+
+    /// The desk face the other Keys tests in this file draw on.
+    const FACE: Color32 = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+
+    /// Two saved presets, for a strip whose menu has rows to show.
+    fn two_rows() -> Vec<crate::ports::PresetRow> {
+        ["Warm Felt", "Hard Hammers"]
+            .iter()
+            .map(|name| crate::ports::PresetRow {
+                name: (*name).to_owned(),
+                path: format!("/Presets/Tangent Keys/{name}.tangentpreset"),
+            })
+            .collect()
+    }
+
+    /// One painted word: its text, where it landed, and the clip it was
+    /// painted under.
+    #[derive(Debug)]
+    struct Word {
+        text: String,
+        rect: Rect,
+        clip: Rect,
+    }
+
+    /// Every word one frame painted, off the shape stream.
+    fn words_of(out: &egui::FullOutput) -> Vec<Word> {
+        fn walk(shape: &egui::Shape, clip: Rect, words: &mut Vec<Word>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, words)),
+                egui::Shape::Text(t) => words.push(Word {
+                    text: t.galley.text().to_owned(),
+                    rect: t.galley.rect.translate(t.pos.to_vec2()),
+                    clip,
+                }),
+                _ => {}
+            }
+        }
+        let mut words = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, cs.clip_rect, &mut words);
+        }
+        words
+    }
+
+    /// **The Keys window's body at `body`, showing `sound`**, drawn the way
+    /// the window draws it (`keys_panel`, into the whole of a body that
+    /// size), and every word the last of three frames painted: egui sizes a
+    /// layer on the first and paints what it measured after.
+    fn keys_words(
+        ctx: &egui::Context,
+        body: Vec2,
+        sound: usize,
+        rows: &[crate::ports::PresetRow],
+    ) -> Vec<Word> {
+        let mut selected = sound;
+        let mut params: [f32; KEYS_PARAMS] = std::array::from_fn(|k| KEYS_PARAM_SPECS[sound][k].2);
+        let mut name = String::new();
+        let mut words = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, body)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        let _ = keys_panel(ui, FACE, 0, &mut selected, &mut params, rows, &mut name);
+                    });
+                },
+            );
+            words = words_of(&out);
+        }
+        words
+    }
+
+    /// The words a sound's window must show, in three bands from the top:
+    /// the grid with the chosen sound's line and the SOUND row, the knob
+    /// list (each knob's name as the row prints it, and its line), and the
+    /// strip.
+    fn bands(sound: usize, rows: &[crate::ports::PresetRow]) -> [Vec<String>; 3] {
+        let mut top: Vec<String> = KEYS_PATCH_NAMES.iter().map(|(n, _)| (*n).to_owned()).collect();
+        top.push(KEYS_PATCH_NAMES[sound].1.to_owned());
+        top.extend(["SOUND".to_owned(), "Initialise".to_owned()]);
+        let knobs = KEYS_PARAM_SPECS[sound]
+            .iter()
+            .flat_map(|(name, about, _)| [format!("{name:<11}"), (*about).to_owned()])
+            .collect();
+        let menu = if rows.is_empty() { "none saved yet" } else { "load\u{2026}" };
+        let strip = vec![menu.to_owned(), "Save".to_owned()];
+        [top, knobs, strip]
+    }
+
+    /// What is wrong with `words` as a picture of one sound's window in a
+    /// body of `body`: each word of `want` that was not painted, or was
+    /// painted cut off by its clip or by the window, and any band that
+    /// reaches into the one below it.
+    fn whole(words: &[Word], want: &[Vec<String>], body: Vec2) -> Vec<String> {
+        let slack = crate::face::fit::SLACK;
+        let window = Rect::from_min_size(Pos2::ZERO, body).expand(slack);
+        let mut bad = Vec::new();
+        let mut spans: Vec<Option<(f32, f32)>> = Vec::new();
+        for band in want {
+            let mut span: Option<(f32, f32)> = None;
+            for text in band {
+                let Some(w) = words.iter().find(|w| w.text == *text) else {
+                    bad.push(format!("{text:?} is not painted"));
+                    continue;
+                };
+                if !w.clip.expand(slack).contains_rect(w.rect) || !window.contains_rect(w.rect) {
+                    bad.push(format!("{text:?} is cut off: {:?} under a clip of {:?}", w.rect, w.clip));
+                }
+                span = Some(span.map_or((w.rect.top(), w.rect.bottom()), |(t, b)| {
+                    (t.min(w.rect.top()), b.max(w.rect.bottom()))
+                }));
+            }
+            spans.push(span);
+        }
+        for pair in spans.windows(2) {
+            if let [Some((_, above)), Some((below, _))] = pair {
+                if *above > below + slack {
+                    bad.push(format!("a band ends at {above:.1}, under the top of the next at {below:.1}"));
+                }
+            }
+        }
+        bad
+    }
+
+    /// **The Keys window holds every sound whole at the size it opens at**,
+    /// on every font, with a menu that is empty and one that is not.
+    ///
+    /// The owner asked for the window to be made bigger to fit everything,
+    /// and "everything" is read off what is PAINTED, the `face::fit`
+    /// harness's rule: the ten sounds, the chosen one's line, the SOUND row
+    /// and its Initialise, every knob's name and the line under it, and the
+    /// strip, each painted whole inside its clip and inside the window. A
+    /// knob list that had to scroll fails it, because its last rows are
+    /// clipped or never painted; a strip pushed out of the bottom fails it;
+    /// and the three bands, the grid, the knobs and the strip, may not reach
+    /// into one another.
+    #[test]
+    fn the_keys_window_holds_every_sound_whole_at_its_floor() {
+        let floor = keys_window_size(None);
+        assert_eq!(floor, KEYS_SIZE.1, "the window opens at its floor before a screen is measured");
+        let mut bad: Vec<String> = Vec::new();
+        for font in crate::face::fit::FONTS {
+            let ctx = crate::face::fit::a_ctx(font);
+            for sound in 0..KEYS_PATCHES {
+                for rows in [Vec::new(), two_rows()] {
+                    let words = keys_words(&ctx, floor, sound, &rows);
+                    let at = format!("{} {} ({} rows)", font.key(), KEYS_PATCH_NAMES[sound].0, rows.len());
+                    bad.extend(whole(&words, &bands(sound, &rows), floor).into_iter().map(|b| format!("{at}: {b}")));
+                    // The strip wears no Init: the SOUND row's Initialise is
+                    // the window's one way to put the sound back.
+                    if words.iter().any(|w| w.text == "Init") {
+                        bad.push(format!("{at}: the strip wears an Init beside the SOUND row's"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the Keys window does not hold a sound whole:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Dragged to its smallest, the window still has its grid, its SOUND
+    /// row, its strip and a knob.** The knob list is what scrolls, inside
+    /// the room the rest leaves it, so what has to survive is everything
+    /// around it, with the first knob still there to turn and the strip
+    /// below the list rather than under it.
+    #[test]
+    fn the_keys_window_keeps_its_strip_at_its_smallest() {
+        let mut bad: Vec<String> = Vec::new();
+        for font in crate::face::fit::FONTS {
+            let ctx = crate::face::fit::a_ctx(font);
+            for sound in 0..KEYS_PATCHES {
+                let rows = two_rows();
+                let words = keys_words(&ctx, KEYS_MIN, sound, &rows);
+                let at = format!("{} {}", font.key(), KEYS_PATCH_NAMES[sound].0);
+                let [top, knobs, strip] = bands(sound, &rows);
+                let first = vec![knobs[0].clone()];
+                bad.extend(
+                    whole(&words, &[top, first.clone(), strip.clone()], KEYS_MIN)
+                        .into_iter()
+                        .map(|b| format!("{at}: {b}")),
+                );
+                // The strip starts below the list's own clip, so no knob row
+                // the list scrolls into view can be drawn behind it.
+                let list = words.iter().find(|w| w.text == first[0]).map(|w| w.clip);
+                let strip_top = words
+                    .iter()
+                    .filter(|w| strip.contains(&w.text))
+                    .map(|w| w.rect.top())
+                    .fold(f32::INFINITY, f32::min);
+                if let Some(list) = list {
+                    if strip_top < list.bottom() - crate::face::fit::SLACK {
+                        bad.push(format!(
+                            "{at}: the strip starts at {strip_top:.1}, inside a list that ends at {:.1}",
+                            list.bottom()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the smallest Keys window lost a part:\n  {}", bad.join("\n  "));
+    }
+
+    /// **The window opens at its floor, and follows the screen across by the
+    /// faces' rule.** Through `show` itself, inline: the surface it draws is
+    /// the floor's body with the in-house bar on top. And the share does what
+    /// [`KEYS_SIZE`] says of it: a 14-inch laptop opens it about a third
+    /// wider, a large display and a larger one wider still, up to the
+    /// ceiling, and every one of them at the floor's height, which holds the
+    /// whole window, so more of it is only empty ground under the strip.
+    /// Nothing lets it be dragged below a minimum that is itself inside the
+    /// floor.
+    #[test]
+    fn the_keys_window_opens_at_its_floor_and_follows_the_screen() {
+        let ctx = crate::face::fit::a_ctx(fonts::FontChoice::default());
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::NONE,
+            chrome: None,
+            surface: None,
+        };
+        let mut dialog = Some(Dialog::KeysPatch {
+            slot: 0,
+            selected: 0,
+            params: [0.5; KEYS_PARAMS],
+            preset_rows: two_rows(),
+            preset_name: String::new(),
+        });
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1200.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, &mut dialog, FACE, placement);
+                },
+            );
+        }
+        let drawn = crate::shell::inline_rect(&ctx, DIALOG_ID).expect("the window left no rect");
+        let floor = KEYS_SIZE.1;
+        assert_eq!(drawn.size(), floor + Vec2::new(0.0, crate::shell::CHROME_BAR_H), "the window did not open at its floor");
+
+        let (_, floor, ceiling) = KEYS_SIZE;
+        let laptop = keys_window_size(Some(Vec2::new(1512.0, 982.0)));
+        assert!(
+            (laptop.x / floor.x - 1.3).abs() < 0.03 && laptop.y == floor.y,
+            "a 14-inch laptop opens it at {laptop:?}"
+        );
+        for screen in [Vec2::new(1920.0, 1080.0), Vec2::new(2560.0, 1440.0), Vec2::new(5120.0, 2880.0)] {
+            let large = keys_window_size(Some(screen));
+            assert!(
+                large.x > laptop.x && large.x <= ceiling.x && large.y == floor.y,
+                "a {screen:?} display opens it at {large:?}, not wider at the floor's height"
+            );
+        }
+        assert_eq!(ceiling.x, floor.x * 1.6, "the ceiling is not the faces' 1.6 of the floor across");
+        assert_eq!(ceiling.y, floor.y, "the window can open taller than the floor that holds all of it");
+        assert!(KEYS_MIN.x <= floor.x && KEYS_MIN.y <= floor.y, "the smallest window is larger than the one it opens as");
+    }
+
+    /// One frame of a window driven by hand: what it asked, what it painted,
+    /// and what its name field holds.
+    type Driven<'a> = dyn FnMut(Vec<egui::Event>) -> (Option<DialogAction>, Vec<Word>, String) + 'a;
+
+    /// A click at `pos`: the press, then the release, which is where egui
+    /// says it was one, then a frame for whatever it opened to be painted.
+    /// What either of the first two asked is the answer.
+    fn click(frame: &mut Driven<'_>, pos: Pos2) -> (Option<DialogAction>, Vec<Word>) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (pressed, ..) = frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+        let (released, ..) = frame(vec![button(false)]);
+        let (_, words, _) = frame(Vec::new());
+        (released.or(pressed), words)
+    }
+
+    /// **The strip's three asks come back as the window's own, for its
+    /// strip.** A typed name and Save is `SaveKeysPreset` with the name as
+    /// typed; a row of the menu is `LoadKeysPreset` with that row's file;
+    /// the Delete beside a row is `DeleteKeysPreset` with that row's file and
+    /// no other's, which the window turns into a question before anything
+    /// is deleted (`a_keys_preset_is_deleted_only_once_the_question_is_answered`).
+    /// And Save with nothing typed asks nothing.
+    #[test]
+    fn the_keys_strip_saves_loads_and_deletes_for_its_strip() {
+        let ctx = crate::face::fit::a_ctx(fonts::FontChoice::default());
+        let body = KEYS_SIZE.1;
+        let rows = two_rows();
+        let slot = 4;
+        let mut selected = 6;
+        let mut params: [f32; KEYS_PARAMS] = [0.5; KEYS_PARAMS];
+        let mut name = String::new();
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut asked = None;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, body)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        asked = keys_panel(ui, FACE, slot, &mut selected, &mut params, &rows, &mut name);
+                    });
+                },
+            );
+            (asked, words_of(&out), name.clone())
+        };
+        // `DialogAction` has no `Debug`; what a failure needs to say is this.
+        let say = |a: &Option<DialogAction>| match a {
+            Some(DialogAction::SaveKeysPreset { slot, name }) => format!("save {name:?} on {slot}"),
+            Some(DialogAction::LoadKeysPreset { slot, path }) => format!("load {path:?} on {slot}"),
+            Some(DialogAction::DeleteKeysPreset { slot, path }) => format!("delete {path:?} on {slot}"),
+            Some(_) => "another action".to_owned(),
+            None => "nothing".to_owned(),
+        };
+        let at = |words: &[Word], text: &str| {
+            words
+                .iter()
+                .find(|w| w.text == text)
+                .map(|w| w.rect.center())
+                .unwrap_or_else(|| panic!("{text:?} is not on the window"))
+        };
+        let mut words = Vec::new();
+        for _ in 0..3 {
+            words = frame(Vec::new()).1;
+        }
+
+        let (asked, after) = click(&mut frame, at(&words, "Save"));
+        assert!(asked.is_none(), "Save with no name asked for {}", say(&asked));
+        let _ = click(&mut frame, at(&after, "name\u{2026}"));
+        let (_, after, typed) = frame(vec![egui::Event::Text("Bright Tines".to_owned())]);
+        assert_eq!(typed, "Bright Tines", "the name field did not take the typing");
+        let (asked, _) = click(&mut frame, at(&after, "Save"));
+        match &asked {
+            Some(DialogAction::SaveKeysPreset { slot: s, name }) => {
+                assert_eq!((*s, name.as_str()), (slot, "Bright Tines"), "{}", say(&asked));
+            }
+            _ => panic!("Save asked for {}", say(&asked)),
+        }
+
+        // Open the menu, then press the second row's name.
+        let menu = at(&frame(Vec::new()).1, "load\u{2026}");
+        let (_, words) = click(&mut frame, menu);
+        let (asked, _) = click(&mut frame, at(&words, "Hard Hammers"));
+        match &asked {
+            Some(DialogAction::LoadKeysPreset { slot: s, path }) => {
+                assert_eq!((*s, path.as_str()), (slot, rows[1].path.as_str()), "{}", say(&asked));
+            }
+            _ => panic!("a row of the menu asked for {}", say(&asked)),
+        }
+
+        // Open it again, and press the Delete on the FIRST row's line.
+        let menu = at(&frame(Vec::new()).1, "load\u{2026}");
+        let (_, words) = click(&mut frame, menu);
+        let first = words.iter().find(|w| w.text == "Warm Felt").expect("the first row").rect;
+        let delete = words
+            .iter()
+            .filter(|w| w.text == "Delete")
+            .find(|w| w.rect.center().y > first.top() && w.rect.center().y < first.bottom())
+            .expect("no Delete on the first row's line")
+            .rect;
+        let (asked, _) = click(&mut frame, delete.center());
+        match &asked {
+            Some(DialogAction::DeleteKeysPreset { slot: s, path }) => {
+                assert_eq!((*s, path.as_str()), (slot, rows[0].path.as_str()), "{}", say(&asked));
+            }
+            _ => panic!("the first row's Delete asked for {}", say(&asked)),
+        }
     }
 }
