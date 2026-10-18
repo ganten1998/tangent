@@ -334,6 +334,13 @@ pub struct FaceLive {
     /// one mouse notch is one event, a trackpad flick is thirty, and both
     /// have to mean the same amount of walking.
     pub samp_wheel: crate::app::WheelSteps,
+    /// **Tape start and stop, for the Tape face's pointer**: the desk's own
+    /// per-project setting (`Settings::start_stop`), pushed each frame for
+    /// the tape and for no other face. `None` on every other face, and on a
+    /// tape nobody pushed it to, where the pointer says where the setting
+    /// lives and nothing about its state. Appended at the END, this struct's
+    /// law.
+    pub start_stop: Option<crate::motor::StartStop>,
 }
 
 /// One row of the IR browser: a folder to walk into, or an impulse to load.
@@ -542,6 +549,11 @@ pub enum FaceAction {
     /// device, writes the bay's state and answers on the pushed lines. See
     /// `faces_hwinsert`.
     HwInsert(crate::faces_hwinsert::HwAsk),
+    /// **The Tape face's pointer was pressed: take the hand to tape start
+    /// and stop.** Appended at the END, this enum's law. The setting is the
+    /// desk's, per project, under the varispeed dial's range; the face owns
+    /// nothing of it and asks to be taken there.
+    OpenStartStop,
 }
 
 /// What a slider row asked for, as the action the face raises: a value is
@@ -3010,6 +3022,9 @@ mod tests {
             ir_root: "/m/IRs".to_owned(),
             ir_dir: "/m/IRs".to_owned(),
             ir_entries: a_folder(),
+            // The longest line the tape's pointer can say: both times at
+            // their longest reading, nine point nine nine seconds.
+            start_stop: Some(crate::motor::StartStop::new(true, 9.99, 9.99)),
             ..Default::default()
         }
     }

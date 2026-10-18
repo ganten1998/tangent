@@ -2336,6 +2336,11 @@ pub enum DialogAction {
     /// host deletes only inside the preset folder, and the app lists the
     /// strip's sound again after it, so the row goes whatever the host found.
     DeleteKeysPreset { slot: usize, path: String },
+    /// **The Tape face's pointer was pressed: take the hand to tape start
+    /// and stop.** Appended at the END, this enum's law. The bay is the
+    /// window that asked, so the app closes that window and no other; the
+    /// setting itself is the project's.
+    OpenStartStop { bay: crate::desk_id::SeatBay },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -8960,6 +8965,11 @@ fn show_on(
                                     }
                                     crate::faces::FaceAction::HwInsert(ask) => {
                                         Some(DialogAction::HwInsert { bay, ask })
+                                    }
+                                    // The window stays up: which one steps
+                                    // aside for the range is the app's call.
+                                    crate::faces::FaceAction::OpenStartStop => {
+                                        Some(DialogAction::OpenStartStop { bay })
                                     }
                                     // No bay: one default folder
                                     // for the app, shared with the drumpad's
@@ -22781,6 +22791,38 @@ at: None,
                 }
             }
         }
+    }
+
+    /// **The Tape face's pointer asks to be taken to tape start and stop**,
+    /// for the bay its window was opened over, and the window stays up.
+    ///
+    /// The setting is the desk's, so the face carries a row that says how it
+    /// stands and where it is set, and a press there leaves this file as an
+    /// ask naming the window's own bay. The bay is the whole point: which
+    /// window steps aside for the range panel is the app's decision, and a
+    /// Tape in an amp's pedal seat must close its own stacked window and not
+    /// the amp's, which only the bay can tell apart. So the face does not
+    /// close itself on the way out, and the next frame still shows it.
+    #[test]
+    fn the_tapes_pointer_asks_to_be_taken_to_start_and_stop() {
+        let mut live = crate::faces::FaceLive {
+            start_stop: Some(crate::motor::StartStop::default()),
+            ..Default::default()
+        };
+        live.face.path = crate::faces_tape::TAPE_PATH.to_owned();
+        let mut slot = Slot::new(Dialog::InsertFace { bay: tb(0, 0), live: Box::new(live) });
+        assert!(slot.says("Start and stop: off"), "the tape's transport does not say how start and stop stands");
+        assert!(
+            matches!(
+                slot.click("Start and stop: off"),
+                Some(DialogAction::OpenStartStop { bay }) if bay == tb(0, 0)
+            ),
+            "the pointer did not ask to be taken to start and stop for its own bay"
+        );
+        assert!(
+            slot.says("TRANSPORT"),
+            "the face closed itself; which window steps aside is the app's to decide"
+        );
     }
 
     /// **The amp keeps its footer for the preset strip.** The other half of

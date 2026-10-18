@@ -3476,6 +3476,11 @@ const BUS_TAKES_NO_INPUT: &str =
 /// What a bus says when a clip is aimed at it.
 const BUS_HOLDS_NO_CLIPS: &str = "A bus holds no clips. Put them on a track, and route or send it to the bus.";
 
+/// What the Tape face's pointer says when the band is not drawing the dial
+/// it points at: the band is hidden, or too short to hold its dials.
+const START_STOP_ON_THE_BAND: &str =
+    "Tape start and stop is set on the Recorder band: with the band showing and tall enough for its dials, right-click its PITCH CONT dial.";
+
 /// **The rows' ids of the document at `doc`**, lane by lane, as many as it
 /// has: what its kit sidecar's `track_kits` keys name. The identity desk
 /// when the document has no desk this build reads (missing, damaged,
@@ -8585,9 +8590,7 @@ impl TangentApp {
                     // custom range". Same gesture, same place, different
                     // thing behind it because there is no effect here.
                     if matches!(hit, recorder_panel::Hit::SetVarispeed(_)) {
-                        self.vari_open = true;
-                        self.fx_open = None;
-                        self.fx_drag = None;
+                        self.open_vari_range();
                     } else if let Some(fx) = self.fx_under(recorder_rect, pos) {
                         self.fx_open = Some(fx);
                         self.vari_open = false;
@@ -9630,6 +9633,14 @@ impl TangentApp {
             recorder_panel::Hit::SetVarispeed(0.5),
         )
         .unwrap_or(Rect::NOTHING)
+    }
+
+    /// **Open the varispeed dial's range panel**, the one way it opens: the
+    /// dial's own right-click and the Tape face's pointer both come here.
+    fn open_vari_range(&mut self) {
+        self.vari_open = true;
+        self.fx_open = None;
+        self.fx_drag = None;
     }
 
     /// A press inside the open varispeed range panel, or outside it, which
@@ -34240,6 +34251,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The bay's bypass, pushed like every other fact the face draws.
         live.bypassed = self.bay_bypassed(sb);
+        // **Tape start and stop, for the Tape face's pointer**: the desk's
+        // setting, read where the face cannot reach it. Only the tape asks.
+        live.start_stop = (live.face.path == crate::faces_tape::TAPE_PATH).then_some(self.start_stop());
         // The meters breathe even when the hand is still.
         ctx.request_repaint_after(Duration::from_millis(33));
         Some(Dialog::InsertFace { bay: sb, live })
@@ -40583,6 +40597,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.request_recorder(recorder::RecorderRequest::DeletePreset { path });
                 let unit = crate::preset::keys_unit(self.keys_patch_of(slot));
                 self.request_recorder(recorder::RecorderRequest::ListPresets { unit });
+            }
+            // **The Tape face's pointer.** When the band is drawing the dial,
+            // the panel opens and the window that asked steps aside: a plugin
+            // window floats over the desk and would cover the panel it points
+            // at. Only that window: a Tape in an amp's pedal seat closes its
+            // own stacked window and the amp stays, so the slot is written
+            // only when the asking face is the one in it. With no dial on
+            // screen there is nothing to open: say where it is, and leave the
+            // face up.
+            DialogAction::OpenStartStop { bay } => {
+                if self.vari_anchor().is_positive() {
+                    if self.pedal_stack_covers(bay) {
+                        if let Some(st) = self.pedal_stack.as_mut() {
+                            st.dialog = None;
+                        }
+                    } else if matches!(self.dialog, Some(Dialog::InsertFace { bay: b, .. }) if b == bay) {
+                        self.dialog = None;
+                    }
+                    self.open_vari_range();
+                } else {
+                    self.notify(crate::notify::Kind::Info, START_STOP_ON_THE_BAND);
+                }
             }
             DialogAction::ChoosePatch { slot, index } => {
                 // `usize::MAX` is the built-in row: no cartridge patch, the one
@@ -69822,6 +69858,151 @@ mod tests {
         app.set_live_bay_face(sb, None);
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(shown(&app, 22).map(|p| p.0), Some(0.2), "the overlay outlived its curve");
+    }
+
+    /// **The Tape face's pointer opens the range its setting lives in**, and
+    /// the face that asked steps aside for it.
+    ///
+    /// Tape start and stop is set under the varispeed dial's range, which
+    /// hangs off the band's PITCH CONT dial, and a face is a window floating
+    /// over the desk: left up, it would cover the very panel it opened. So
+    /// the press opens the range by the one road the dial's own right-click
+    /// takes (an effect panel that was open goes, as it does there), closes
+    /// the face, and the range is still up a frame later.
+    ///
+    /// With the band hidden there is no dial to hang the range from, and the
+    /// draw path closes a range whose dial is gone on the next frame. So
+    /// there the press opens nothing and says where the setting is instead,
+    /// once however often it is pressed (a note the same as one standing is
+    /// refreshed, never stacked), and leaves the face up: a face that closed
+    /// on a press that opened nothing would be a door into a wall.
+    #[test]
+    fn the_tape_faces_pointer_opens_the_range_its_setting_lives_in() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
+        let (seat, bay) = app.legacy_seat(sb).expect("a seat");
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
+            path: crate::faces_tape::TAPE_PATH.into(),
+            ..Default::default()
+        });
+        let open = |app: &mut TangentApp| {
+            app.dialog = Some(Dialog::InsertFace { bay: sb, live: Box::default() });
+        };
+        open(&mut app);
+        app.fx_open = Some(recorder_panel::Fx::Reverb);
+        app.fx_drag = Some("mix");
+        assert!(app.vari_anchor().is_positive(), "fixture: the band is not drawing its PITCH CONT dial");
+        app.apply_dialog_action(DialogAction::OpenStartStop { bay: sb });
+        assert!(app.vari_open, "the pointer did not open the range its setting lives in");
+        assert!(
+            app.fx_open.is_none() && app.fx_drag.is_none(),
+            "the effect panel stayed up beside the range, which the dial's right-click never allows"
+        );
+        assert!(app.dialog.is_none(), "the face that asked stayed up over the panel it points at");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.vari_open, "the range the pointer opened closed on the next frame");
+
+        // The band hidden: no dial, so no range.
+        app.settings.show_recorder = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(!app.vari_open, "fixture: the range outlived the band it hangs from");
+        open(&mut app);
+        for _ in 0..2 {
+            app.apply_dialog_action(DialogAction::OpenStartStop { bay: sb });
+        }
+        assert!(!app.vari_open, "a range with no dial to hang from was opened");
+        assert!(
+            matches!(app.dialog, Some(Dialog::InsertFace { bay, .. }) if bay == sb),
+            "the face went down on a press that opened nothing"
+        );
+        let said = app.said().notes().iter().filter(|n| n.text == START_STOP_ON_THE_BAND).count();
+        assert_eq!(said, 1, "two presses with the band hidden said where the setting is {said} times");
+    }
+
+    /// **A Tape in a pedal seat closes only its own window on the way
+    /// there.**
+    ///
+    /// An amp's pedal opens its face in a stacked window over the amp's, and
+    /// a press in that window reaches the same `apply_dialog_action` the
+    /// desk's dialog slot does. The slot holds the AMP: closing it would take
+    /// down a window the hand never touched, and the sweep at the top of the
+    /// next frame would take the pedal's with it. So the ask carries its
+    /// bay, and the answer empties the stacked window when the stack is over
+    /// that bay and leaves the slot alone; the frame tail drops the emptied
+    /// stack, the amp stays up, and the range is open.
+    #[test]
+    fn a_tape_in_a_pedal_seat_closes_only_its_own_window_on_the_way_there() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let amp = app.row_bay(2, 0).expect("a bay");
+        let pedal = crate::desk_id::SeatBay::new(app.row_node(2), crate::desk_id::Rack::Pedal(0), 0);
+        let face = |path: &str| crate::ports::BuiltinFace { path: path.into(), ..Default::default() };
+        app.set_bay_face(amp, face(crate::faces_amp::AMP_PATH));
+        app.set_bay_face(pedal, face(crate::faces_tape::TAPE_PATH));
+        app.dialog = Some(Dialog::InsertFace { bay: amp, live: Box::default() });
+        app.pedal_stack = Some(PedalStack {
+            over: amp,
+            pedal,
+            dialog: Some(Dialog::InsertFace { bay: pedal, live: Box::default() }),
+        });
+        assert!(app.vari_anchor().is_positive(), "fixture: the band is not drawing its PITCH CONT dial");
+        app.apply_dialog_action(DialogAction::OpenStartStop { bay: pedal });
+        assert!(app.vari_open, "the pedal's pointer did not open the range");
+        assert!(
+            app.pedal_stack.as_ref().is_some_and(|st| st.dialog.is_none()),
+            "the Tape's own window stayed up over the range"
+        );
+        assert!(
+            matches!(app.dialog, Some(Dialog::InsertFace { bay, .. }) if bay == amp),
+            "the amp's face went down for its pedal's ask"
+        );
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.pedal_stack.is_none(), "the emptied stack outlived the frame");
+        assert!(
+            matches!(app.dialog, Some(Dialog::InsertFace { bay, .. }) if bay == amp),
+            "the amp's face went down a frame after its pedal's ask"
+        );
+        assert!(app.vari_open, "the range closed under the amp's face");
+    }
+
+    /// **Only the Tape face is told about tape start and stop**, and it is
+    /// told every frame.
+    ///
+    /// The setting is the desk's, and a face reads only what it is pushed,
+    /// so the tape's pointer can say how it stands only if the app hands it
+    /// over: on the frame a face opens, and again on every frame after, so
+    /// the switch thrown in the range panel is on the pointer by the next
+    /// frame. Every other face is told nothing, and the push says so every
+    /// frame rather than only filling the field for the tape: an EQ face
+    /// whose live state was holding a value comes back holding none.
+    #[test]
+    fn only_the_tape_face_is_told_about_tape_start_and_stop() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
+        let face = |path: &str| crate::ports::BuiltinFace { path: path.into(), ..Default::default() };
+        let told = |app: &TangentApp| match app.dialog.as_ref() {
+            Some(Dialog::InsertFace { live, .. }) => live.start_stop,
+            _ => panic!("the face did not stay open"),
+        };
+        app.set_bay_face(sb, face(crate::faces_tape::TAPE_PATH));
+        app.dialog = Some(Dialog::InsertFace { bay: sb, live: Box::default() });
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(told(&app), Some(app.start_stop()), "the tape's face was not told how start and stop stands");
+        app.settings.start_stop.set_on(true);
+        let _ = run_frame(&ctx, &mut app);
+        assert!(
+            told(&app).is_some_and(crate::motor::StartStop::on) && told(&app) == Some(app.start_stop()),
+            "the switch thrown on the desk did not reach the open face by the next frame"
+        );
+        app.set_bay_face(sb, face("@tangent-eq"));
+        app.dialog = Some(Dialog::InsertFace {
+            bay: sb,
+            live: Box::new(crate::faces::FaceLive {
+                start_stop: Some(crate::motor::StartStop::new(true, 2.0, 2.0)),
+                ..Default::default()
+            }),
+        });
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(told(&app), None, "an EQ face was told about tape start and stop");
     }
 
     /// **The Setup panel marks the system that is RUNNING.** The setting is

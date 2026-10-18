@@ -844,6 +844,91 @@ pub fn stepped_row(
     out
 }
 
+/// The hair between [`pointer_row`]'s two lines, so the second reads as the
+/// first one's footnote and not as a line of its own.
+const POINTER_GAP: f32 = 1.0;
+
+/// How tall [`pointer_row`] is drawn: its two lines and the hair between
+/// them, never less than a kit row. One function for drawing and for
+/// reserving, so a panel that budgets its height asks this rather than
+/// guessing (the `preset_foot_height` bargain).
+pub fn pointer_row_height(ui: &egui::Ui) -> f32 {
+    let line = |f: FontId| {
+        ui.painter()
+            .layout_no_wrap("Xg".to_owned(), f, Color32::WHITE)
+            .rect
+            .height()
+    };
+    ROW_H.max(
+        line(FontId::new(10.0, fonts::courier_bold()))
+            + POINTER_GAP
+            + line(FontId::new(9.0, fonts::courier())),
+    )
+}
+
+/// **A row that takes the hand to a setting that lives somewhere else.**
+/// What the setting is now on the first line, where it lives on the second,
+/// a chevron at the end, and the whole row one target. It owns nothing: the
+/// panel says what the lines read and what a click means. Its click goes
+/// through [`note_click`] like every click a face row takes, so the slider
+/// clicked next cannot pair it with a click of its own and read a reset.
+///
+/// One exact allocation, [`pointer_row_height`] tall and as wide as the
+/// panel, with both lines and the chevron painted into it, so the row is the
+/// same size and takes the same one auto id whatever its lines say: a
+/// setting that changes under it moves nothing below. Each line is cut to
+/// the room left of the chevron and never wraps. There is no hover fill,
+/// because ink on the hover ground is a pair no sweep measures; the pointing
+/// hand and the chevron say it is a door. To the keyboard and to a screen
+/// reader it is the button it is, named by its two lines.
+pub fn pointer_row(ui: &mut egui::Ui, st: &FaceStyle, line: &str, sub: &str, hover: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), pointer_row_height(ui)),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let first = FontId::new(10.0, fonts::courier_bold());
+        let second = FontId::new(9.0, fonts::courier());
+        // The stepped row's chevron family, the other way: this one leads
+        // out of the panel rather than back through a list.
+        let chevron = painter.text(
+            rect.right_center(),
+            Align2::RIGHT_CENTER,
+            "\u{203A}",
+            FontId::new(11.0, fonts::courier_bold()),
+            st.s.faint,
+        );
+        let room = (chevron.left() - rect.left() - ui.spacing().item_spacing.x).max(0.0);
+        let top = painter.text(
+            rect.left_top(),
+            Align2::LEFT_TOP,
+            crate::drumpad_panel::cut_text(painter, room, line, &first),
+            first,
+            st.s.ink,
+        );
+        painter.text(
+            egui::pos2(rect.left(), top.bottom() + POINTER_GAP),
+            Align2::LEFT_TOP,
+            crate::drumpad_panel::cut_text(painter, room, sub, &second),
+            second,
+            st.s.faint,
+        );
+    }
+    let enabled = resp.enabled();
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, format!("{line}, {sub}"))
+    });
+    let resp = resp
+        .on_hover_text(hover)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        note_click(&resp);
+        return true;
+    }
+    false
+}
+
 // ── meters ──────────────────────────────────────────────────────────────────
 
 /// Correlation's red: the fixed-meaning family (record red, limiter red) —
@@ -1725,6 +1810,9 @@ pub(crate) mod fit {
                     seconds: 0.5,
                 })
                 .collect(),
+            // The longest line the tape's pointer can say, both times at
+            // their longest reading. Only the tape draws it.
+            start_stop: Some(crate::motor::StartStop::new(true, 9.99, 9.99)),
             ..Default::default()
         }
     }
@@ -3197,6 +3285,84 @@ mod tests {
         assert!(
             !matches!(landed, Some((1, v)) if (v - 0.25).abs() < 1.0e-6),
             "clicking one row reset the NEXT one: {landed:?}"
+        );
+    }
+
+    /// **A click on a pointer row cannot turn the next slider click into a
+    /// reset.**
+    ///
+    /// The pointer is a door, not a control, so its click means nothing to
+    /// the row itself; it is reported to [`note_click`] anyway, because the
+    /// answer that function keeps is "what did the hand touch last", and a
+    /// click nobody reported leaves the next row believing the pair before
+    /// it was its own. So: click a slider, click the pointer over it, click
+    /// the slider again, a frame apart, so the last release lands inside
+    /// egui's double-click window of the pointer's and its triple-click
+    /// window of the slider's first. egui's clock reads it as a double or a
+    /// triple either way; only the kit's memory of the pointer keeps it from
+    /// being the slider's, and the slider from going home.
+    #[test]
+    fn a_click_on_a_pointer_row_cannot_turn_the_next_slider_click_into_a_reset() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let mut clock = 0.0_f64;
+        // One frame of the panel: the pointer, then the slider under it, at
+        // 0.8 with its home at 0.25. What each asked, and how tall the
+        // pointer was drawn, so the presses can find the slider under it.
+        let mut frame = |events: Vec<egui::Event>| -> (bool, Option<SliderAsk>, f32) {
+            clock += 1.0 / 60.0;
+            let mut out = (false, None, 0.0);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(clock),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let tall = pointer_row_height(ui);
+                            let went = pointer_row(ui, &st, "Start and stop: off", "set somewhere else", "go there");
+                            let asked = slider_row(ui, &st, "KNOB", "80%", 0.80, 0.25);
+                            out = (went, asked, tall);
+                        });
+                },
+            );
+            out
+        };
+
+        let (_, _, tall) = frame(Vec::new());
+        let pointer = egui::pos2(60.0, tall / 2.0);
+        // Rows sit one item spacing apart, and the middle of the slider is
+        // the middle of its track, well off the 0.8 it holds, so a press
+        // there is a change the row reports.
+        let slider = egui::pos2(230.0, tall + 3.0 + ROW_H / 2.0);
+        let mut went = false;
+        let mut last: Vec<Option<SliderAsk>> = Vec::new();
+        for (k, at) in [slider, pointer, slider].into_iter().enumerate() {
+            let mut asks = Vec::new();
+            for events in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![press_at(at, true)],
+                vec![press_at(at, false)],
+            ] {
+                let (pressed, asked, _) = frame(events);
+                went |= pressed && k == 1;
+                asks.push(asked);
+            }
+            last = asks;
+        }
+        assert!(went, "the pointer was never clicked, so this proves nothing");
+        assert!(
+            last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.5).abs() < 0.05)),
+            "the last click never landed on the slider, so this proves nothing: {last:?}"
+        );
+        assert!(
+            !last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.25).abs() < 1.0e-6)),
+            "a click on the pointer made the slider's next click a reset: {last:?}"
         );
     }
 

@@ -21,6 +21,15 @@
 //! leads the tape, the one a fresh slot engages; Age and Damage open at
 //! nothing. And the reproduce chain is in its own order, the output last.
 //!
+//! **Tape start and stop is pointed at, never held.** The tape spinning up
+//! on Play and winding down on Stop is the whole desk's, a setting saved
+//! with the project and kept under the varispeed dial's range, and an insert
+//! that held a copy of it would be a second switch onto one motor. So the
+//! transport closes on a row that says how the setting stands and where it
+//! is set, and a click there asks the app to take the hand to it; which
+//! window steps aside is the app's to decide. The row is drawn every frame
+//! whether or not the setting was pushed, so its arriving moves nothing.
+//!
 //! **Kinds come from the push, never from the id.** A control the push
 //! gives steps is the kit's selector, wearing the words `builtin_fx::choices`
 //! pushes; every other is the kit's slider, reading what `builtin_fx::describe`
@@ -99,11 +108,22 @@ pub const SECTIONS: [(&str, &[u32]); 4] = [
 /// between its groups.
 const GROUP_AIR: f32 = 6.0;
 
-/// **The panel**: four captioned sections in signal order, then any control
-/// no section places, all above the footer `faces::draw` appends. Every
-/// caption and every pushed control is drawn every frame and their asks are
-/// folded with [`face::keep`], the kit's law, so a hand on one row never
-/// moves the rows under it. At most one ask per frame, the face contract.
+/// Where tape start and stop is set, as the pointer's second line says it:
+/// on the band, by the name the band prints on the dial (its `PITCH CONT`),
+/// so the word a hand reads here is the word it looks for there.
+pub const START_STOP_WHERE: &str = "set on the PITCH CONT dial";
+
+/// What the pointer says to a hand resting on it: what the setting does,
+/// where it is kept, and what a click here does.
+const START_STOP_HOVER: &str = "the whole desk spins up on Play and winds down on Stop or Pause, saved with the project. It is set under the varispeed dial's range (right-click the band's PITCH CONT dial); click here to go there";
+
+/// **The panel**: four captioned sections in signal order, the transport
+/// closing on its pointer to tape start and stop, then any control no
+/// section places, all above the footer `faces::draw` appends. Every
+/// caption, every pushed control and the pointer are drawn every frame and
+/// their asks are folded with [`face::keep`], the kit's law, so a hand on
+/// one row never moves the rows under it. At most one ask per frame, the
+/// face contract.
 pub fn draw_tape(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     let air = section_air(ui, live);
     let mut out = None;
@@ -114,6 +134,11 @@ pub fn draw_tape(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Opti
         caption(ui, st, title);
         for &id in *ids {
             face::keep(&mut out, control(ui, st, live, id));
+        }
+        // Start and stop is the transport's too, and the desk's: the
+        // section's last row points at where it is set.
+        if k == 0 {
+            face::keep(&mut out, start_stop_pointer(ui, st, live));
         }
     }
     // Whatever the engine has grown that no section places yet, in id
@@ -146,6 +171,30 @@ fn control(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive, id: u32) -> Optio
 /// Whether one of the four sections draws `id`.
 fn placed(id: u32) -> bool {
     SECTIONS.iter().any(|(_, ids)| ids.contains(&id))
+}
+
+/// **The transport's pointer to tape start and stop**: the kit's pointer
+/// row, reading how the desk's setting stands and where it is set, and a
+/// click on it is the ask to be taken there. See the module header for why
+/// it is a pointer and not a control.
+fn start_stop_pointer(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive) -> Option<FaceAction> {
+    face::pointer_row(ui, st, &start_stop_line(live.start_stop), START_STOP_WHERE, START_STOP_HOVER)
+        .then_some(FaceAction::OpenStartStop)
+}
+
+/// The pointer's first line: where tape start and stop stands. Its two times
+/// as the range panel prints them, through the setting's own reading, and
+/// nothing but the name when nobody pushed it.
+pub fn start_stop_line(ss: Option<crate::motor::StartStop>) -> String {
+    match ss {
+        None => "Start and stop".to_owned(),
+        Some(s) if !s.on() => "Start and stop: off".to_owned(),
+        Some(s) => format!(
+            "Start and stop: {} up, {} down",
+            crate::motor::StartStop::reading(s.start_cs()),
+            crate::motor::StartStop::reading(s.stop_cs()),
+        ),
+    }
 }
 
 /// One caption line: the section's title in the caption tier, faint on the
@@ -190,20 +239,21 @@ fn line(ui: &egui::Ui, size: f32, family: egui::FontFamily) -> f32 {
 
 /// **What the panel may not spend**, in points, on the font and spacing this
 /// frame is drawn with: four captions, every pushed control at the height
-/// its kind is drawn at, and the footer `faces::draw` appends under it. It
-/// is exactly the distance from the panel's top to the bottom of the preset
-/// strip with no air anywhere, so whatever the room holds past it is air the
-/// panel can prove it has.
+/// its kind is drawn at, the transport's pointer, and the footer
+/// `faces::draw` appends under it. It is exactly the distance from the
+/// panel's top to the bottom of the preset strip with no air anywhere, so
+/// whatever the room holds past it is air the panel can prove it has.
 ///
 /// Every figure is the one egui sizes the part at. A slider row is the
 /// tallest of the kit's row floor, its eleven-point name and the slider's
-/// own thickness; a selector row the tallest of the row floor and its two
-/// buttons, each its text and the theme's padding; and the footer is asked
-/// of the two functions that reserve it, [`crate::faces::bypass_foot_height`]
-/// stopping at its button and [`crate::faces::preset_foot_height`] opening
-/// with the gap under it. A control is counted only when it is pushed, so
-/// the panel lands at any prefix of the engine's table with its air worked
-/// out for what is there.
+/// own thickness; a selector row its two buttons, each its text and the
+/// theme's padding, set side by side the way egui sets them; the pointer is
+/// asked of [`face::pointer_row_height`], the height it is drawn at; and the
+/// footer is asked of the two functions that reserve it,
+/// [`crate::faces::bypass_foot_height`] stopping at its button and
+/// [`crate::faces::preset_foot_height`] opening with the gap under it. A
+/// control is counted only when it is pushed, so the panel lands at any
+/// prefix of the engine's table with its air worked out for what is there.
 fn floor_cost(ui: &egui::Ui, live: &FaceLive) -> f32 {
     let gap = ui.spacing().item_spacing.y;
     let pad_y = ui.spacing().button_padding.y * 2.0;
@@ -212,7 +262,16 @@ fn floor_cost(ui: &egui::Ui, live: &FaceLive) -> f32 {
     let slider = least
         .max(bold(11.0))
         .max(ui.text_style_height(&egui::TextStyle::Body));
-    let selector = least.max(bold(10.0) + pad_y).max(bold(11.0) + pad_y);
+    // **A selector is the kit's stepped row**: its name, the body wearing
+    // the choice, then the chevron, side by side. egui hands each part a
+    // frame a row's floor tall, centred on the row as it stands when the
+    // part arrives, and a part taller than its frame grows down from the
+    // frame's top. So a body taller than the floor sets the chevron, the
+    // tallest part, half its overhang down, and the row comes out that much
+    // taller than its tallest button: half a point on two of the three
+    // fonts, a point and a half on the third.
+    let beside = |row: f32, part: f32| row.max((row - face::ROW_H) / 2.0 + part.max(face::ROW_H));
+    let selector = beside(beside(least, bold(10.0) + pad_y), bold(11.0) + pad_y);
     let rows: f32 = live
         .face
         .params
@@ -221,6 +280,8 @@ fn floor_cost(ui: &egui::Ui, live: &FaceLive) -> f32 {
         .sum();
     SECTIONS.len() as f32 * (caption_height(ui) + gap)
         + rows
+        + face::pointer_row_height(ui)
+        + gap
         + crate::faces::bypass_foot_height(ui)
         + crate::faces::preset_foot_height(ui)
 }
@@ -427,15 +488,20 @@ mod tests {
     /// display, the drag minimum is that floor, and the shared sweeps'
     /// restated pair in `fit::FACES` is held to exactly these two, so a
     /// floor moved in `FACE_SIZES` cannot leave the sweeps measuring the old
-    /// one. Then the fullest panel the engine can push, through
-    /// `faces::draw` so the footer is counted, stays inside both windows on
-    /// all three fonts.
+    /// one. Then the fullest panel the engine can push, with the pointer at
+    /// its longest line, through `faces::draw` so the footer is counted,
+    /// stays inside both windows on all three fonts.
     ///
-    /// Two claims stand on the floor alone. **The section air is whole
+    /// Three claims stand on the floor alone. **The section air is whole
     /// there**, on every font: a panel squeezed at the size it opens at is a
     /// floor set too low, and the air is the first thing a short window
-    /// takes, so it is the first thing to measure. **And the preset strip is
-    /// one line there**, with a preset saved and with an empty folder, whose
+    /// takes, so it is the first thing to measure. **The count the air is
+    /// worked out from is the face drawn there**: the panel and its footer,
+    /// less the air, come to exactly `floor_cost`, so the air is spent out of
+    /// room the window really has, and a part the count leaves out or counts
+    /// shorter than egui lays it out fails here rather than as a strip
+    /// pushed down by points nobody had. **And the preset strip is one line
+    /// there**, with a preset saved and with an empty folder, whose
     /// closed menu says "none saved yet", the widest thing it says. The strip
     /// clears its wrap at this width by under half a point on two of the
     /// three fonts (it holds one line at 375.75 points of content and wraps
@@ -475,14 +541,30 @@ mod tests {
                 }
             }
             // The air, read where the panel reads it: at the top of the room
-            // the face is handed, inside the window it opens at.
-            let live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
-            let mut air = f32::NAN;
+            // the face is handed, inside the window it opens at. And the
+            // count it is worked out from, held to the face drawn there.
+            let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
+            let (mut air, mut cost, mut took) = (f32::NAN, f32::NAN, f32::NAN);
             let _ = fit::escape(&ctx, floor, about, &st.s, &mut |ui| {
                 air = section_air(ui, &live);
+                cost = floor_cost(ui, &live);
+                took = ui
+                    .scope(|ui| {
+                        let _ = crate::faces::draw(ui, &st, &mut live);
+                    })
+                    .response
+                    .rect
+                    .height();
             });
             if air != GROUP_AIR {
                 bad.push(format!("{} at the floor: the section air is {air:.2}, not {GROUP_AIR}", font.key()));
+            }
+            if (took - 3.0 * air - cost).abs() > 0.01 {
+                bad.push(format!(
+                    "{} at the floor: the panel and its footer take {:.2} points past the air, and floor_cost counts {cost:.2}",
+                    font.key(),
+                    took - 3.0 * air
+                ));
             }
             for saved in [true, false] {
                 let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
@@ -518,9 +600,10 @@ mod tests {
     /// The order is the design (see the module header): read down the panel
     /// and the signal's road is read with it. So the walk is the painted one,
     /// word by word, and every caption and control must stand strictly below
-    /// the one before it, the footer's BYPASS last. Three tables, because
-    /// the panel lands before the engine is whole: all thirteen ids, the ten
-    /// the table holds before Bias is appended, and the six it holds today,
+    /// the one before it, the transport closing on its pointer to tape start
+    /// and stop and the footer's BYPASS last. Three tables, because the
+    /// panel lands before the engine is whole: all thirteen ids, the ten the
+    /// table holds before Bias is appended, and the six it holds today,
     /// where TRANSPORT holds Wow alone and TAPE holds Hiss alone. A section
     /// whose ids are not pushed yet keeps its caption, so the panel reads the
     /// same with a control missing as with it present.
@@ -529,13 +612,14 @@ mod tests {
         let st = style();
         let ctx = fit::a_ctx(fonts::FontChoice::default());
         let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
-        let walk: [(&str, Option<u32>); 18] = [
+        let walk: [(&str, Option<u32>); 19] = [
             ("TRANSPORT", None),
             ("KNOB 6", Some(P_SPEED)),
             ("KNOB 3", Some(P_WOBBLE)),
             ("KNOB 9", Some(P_WOW_RANGE)),
             ("KNOB 7", Some(P_FLUTTER)),
             ("KNOB 8", Some(P_RATE)),
+            ("Start and stop", None),
             ("RECORD", None),
             ("KNOB 0", Some(P_DRIVE)),
             ("KNOB 10", Some(P_BIAS)),
@@ -572,7 +656,7 @@ mod tests {
                 last = Some((text, y));
                 drawn += 1;
             }
-            assert_eq!(drawn, count as usize + 5, "with {count} pushed the walk found {drawn} words");
+            assert_eq!(drawn, count as usize + 6, "with {count} pushed the walk found {drawn} words");
         }
     }
 
@@ -745,12 +829,13 @@ mod tests {
     ///
     /// The kit's law (`face::keep`), held on this panel because this panel
     /// has more under a hand than any generic face: the captions, the air
-    /// between the sections, and every row below Wow. A face that skipped
-    /// drawing anything on the frames a slider spoke would flash all of it in
-    /// and out at pointer rate and lose the double-click with it. So Wow's
-    /// slider is pressed and dragged travel, rest, travel, and the auto ids
-    /// the face consumes and the rect it fills must be identical on every
-    /// frame, with the asks counted so a drag that never landed cannot pass.
+    /// between the sections, the pointer and every row below Wow. A face
+    /// that skipped drawing anything on the frames a slider spoke would
+    /// flash all of it in and out at pointer rate and lose the double-click
+    /// with it. So Wow's slider is pressed and dragged travel, rest, travel,
+    /// and the auto ids the face consumes and the rect it fills must be
+    /// identical on every frame, with the asks counted so a drag that never
+    /// landed cannot pass.
     #[test]
     fn a_dragged_tape_row_never_moves_the_rows_under_it() {
         let st = style();
@@ -905,12 +990,14 @@ mod tests {
     /// there the air goes and nothing else does. So the panel alone, at a
     /// room with plenty to spare and at one far too short for it, differs by
     /// exactly the three seams of air and no more, and the squeezed panel
-    /// still holds four captions and thirteen rows at the kit's own height.
+    /// still holds four captions, thirteen rows at the kit's own height and
+    /// the pointer at its own.
     #[test]
     fn a_squeezed_tape_gives_up_its_air_and_never_its_rows() {
         let st = style();
         let ctx = fit::a_ctx(fonts::FontChoice::default());
         let mut caption_h = 0.0_f32;
+        let mut pointer_h = 0.0_f32;
         let mut height = |h: f32| {
             let mut live = fit::a_worst_case_face(TAPE_PATH, ID_CEILING, STEPPED, false);
             let mut took = 0.0_f32;
@@ -925,6 +1012,7 @@ mod tests {
                         .show(ctx, |ui| {
                             fit::dress(ui.style_mut(), &st.s);
                             caption_h = caption_height(ui);
+                            pointer_h = face::pointer_row_height(ui);
                             took = ui
                                 .scope(|ui| {
                                     let _ = draw_tape(ui, &st, &mut live);
@@ -946,8 +1034,123 @@ mod tests {
             3.0 * GROUP_AIR
         );
         assert!(
-            squeezed >= 4.0 * caption_h + ID_CEILING as f32 * face::ROW_H,
-            "the squeezed panel is {squeezed:.1} points, which cannot hold four captions and {ID_CEILING} rows"
+            squeezed >= 4.0 * caption_h + ID_CEILING as f32 * face::ROW_H + pointer_h,
+            "the squeezed panel is {squeezed:.1} points, which cannot hold four captions, {ID_CEILING} rows and the pointer"
+        );
+    }
+
+    /// **The transport points at tape start and stop, and holds no copy of
+    /// it.**
+    ///
+    /// The setting is the desk's, so the panel carries one row for it and no
+    /// control: how it stands, in the setting's own readings, and where it is
+    /// set, by the name the band prints on the dial. Nobody pushed it, it is
+    /// off, it is on: three first lines, each spelled here because the words
+    /// are the pointer's contract, the times through `StartStop::reading`
+    /// (trailing zeros trimmed, so ten seconds is "10 s"). Painted, the row
+    /// closes the transport, under Rate and over RECORD, and it is the same
+    /// row whatever it says: the panel's extent and the auto ids it takes are
+    /// identical for the three, so the setting arriving or moving shifts
+    /// nothing under the hand. A press on either line is the ask to be taken
+    /// there; a press on Rate's slider, directly above it, is Rate's.
+    ///
+    /// The band's own spelling of the dial is held as well, off its source,
+    /// so a band that renamed it would leave this line pointing at a word
+    /// nobody can find and fail here by name.
+    #[test]
+    fn the_transport_section_points_at_tape_start_and_stop() {
+        use crate::motor::StartStop;
+        assert_eq!(start_stop_line(None), "Start and stop");
+        assert_eq!(start_stop_line(Some(StartStop::default())), "Start and stop: off");
+        assert_eq!(
+            start_stop_line(Some(StartStop::new(true, 0.5, 0.7))),
+            "Start and stop: 0.5 s up, 0.7 s down"
+        );
+        assert_eq!(
+            start_stop_line(Some(StartStop::new(true, 1.25, 10.0))),
+            "Start and stop: 1.25 s up, 10 s down"
+        );
+        assert!(
+            include_str!("recorder_panel.rs").contains("const PITCH_LABEL: &str = \"PITCH CONT\";"),
+            "the band no longer prints its dial as PITCH CONT, and the pointer says {START_STOP_WHERE:?}"
+        );
+
+        let st = style();
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
+        let none = egui::Modifiers::NONE;
+        let mut seen: Vec<(String, u64, Rect)> = Vec::new();
+        for (k, ss) in [None, Some(StartStop::default()), Some(StartStop::new(true, 0.5, 0.7))]
+            .into_iter()
+            .enumerate()
+        {
+            let mut live = a_tape_of(0..ID_CEILING as u32);
+            live.start_stop = ss;
+            let said = start_stop_line(ss);
+            let shown = show(&ctx, floor, &st, &mut live, 1.0 + k as f64, none, Vec::new());
+            let (rate, line, sub, record) = (
+                word(&shown.shapes, "KNOB 8"),
+                word(&shown.shapes, &said),
+                word(&shown.shapes, START_STOP_WHERE),
+                word(&shown.shapes, "RECORD"),
+            );
+            assert!(
+                rate.bottom() <= line.top() && line.bottom() <= sub.top() && sub.bottom() <= record.top(),
+                "{said:?} at y {:.1} to {:.1} and {START_STOP_WHERE:?} at y {:.1} to {:.1} are not between Rate \
+                 (ending at {:.1}) and RECORD (starting at {:.1})",
+                line.top(),
+                line.bottom(),
+                sub.top(),
+                sub.bottom(),
+                rate.bottom(),
+                record.top()
+            );
+            seen.push((said, shown.consumed, shown.took));
+        }
+        assert!(
+            seen.iter().all(|(_, ids, took)| (*ids, *took) == (seen[0].1, seen[0].2)),
+            "the panel is not the same panel whatever the pointer says (line, auto ids, extent): {seen:#?}"
+        );
+
+        let mut live = a_tape_of(0..ID_CEILING as u32);
+        live.start_stop = Some(StartStop::new(true, 0.5, 0.7));
+        let shown = show(&ctx, floor, &st, &mut live, 10.0, none, Vec::new());
+        let line = word(&shown.shapes, "Start and stop: 0.5 s up, 0.7 s down").center();
+        let sub = word(&shown.shapes, START_STOP_WHERE).center();
+        // Rate's slider: three fifths across the window is past the middle
+        // of its track, off the half it holds, so a press there is a change.
+        let rate = Pos2::new(floor.x * 0.6, word(&shown.shapes, "KNOB 8").center().y);
+        // A click at `at`, a whole second after the last so no two of them
+        // can be read as one: the ask the frames of it raised.
+        let mut clock = 10.0_f64;
+        let mut click = |live: &mut FaceLive, at: Pos2| -> Vec<Option<FaceAction>> {
+            clock += 1.0;
+            let mut asked = Vec::new();
+            for (dt, events) in [
+                (0.02, vec![egui::Event::PointerMoved(at)]),
+                (0.04, vec![press(at, egui::PointerButton::Primary, true, none)]),
+                (0.06, vec![press(at, egui::PointerButton::Primary, false, none)]),
+            ] {
+                asked.push(show(&ctx, floor, &st, live, clock + dt, none, events).asked);
+            }
+            asked
+        };
+        for (what, at) in [("first line", line), ("second line", sub)] {
+            let asked = click(&mut live, at);
+            assert_eq!(
+                asked.iter().filter(|a| matches!(a, Some(FaceAction::OpenStartStop))).count(),
+                1,
+                "a press on the pointer's {what} did not ask, once, to be taken to start and stop"
+            );
+        }
+        let asked = click(&mut live, rate);
+        assert!(
+            !asked.iter().any(|a| matches!(a, Some(FaceAction::OpenStartStop))),
+            "a press on Rate's slider asked to be taken to start and stop"
+        );
+        assert!(
+            asked.iter().any(|a| matches!(a, Some(FaceAction::Set { id: P_RATE, .. }))),
+            "the press on Rate's slider never landed on it, so it proves nothing"
         );
     }
 }
