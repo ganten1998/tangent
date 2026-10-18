@@ -1819,7 +1819,8 @@ mod tests {
     /// next pass, from 1. The same from a start (it winds down from where
     /// the start had got to), and with the motor not allowed while it
     /// ramps: the pass coasts and holds, the next one snaps to rest, and
-    /// the held return applies in its first chunk.
+    /// the held return applies in its first chunk, whether that next pass
+    /// is still refused or allowed again (the refusal belongs to the edge).
     #[test]
     fn the_pass_that_meets_stop_coasts_on_and_holds_its_return() {
         let i = inp(48_000.0, 256);
@@ -1870,6 +1871,18 @@ mod tests {
         let p = m.plan(&PlanIn { ok: false, ..i });
         assert_eq!(p.show, MotorShow::Parked, "the refused Stop did not snap to rest");
         assert_eq!(m.chunk(false, false, true), Chunk::default(), "the held return did not apply in the next pass's first chunk");
+
+        // **The refusal belongs to the edge.** Refused mid-start, then the
+        // next pass planned allowed (the reason gone by then, as a record's
+        // is a frame after its stop): the edge is still the hard one it was
+        // read as, so it snaps to rest and does not wind down.
+        let mut m = spinning(&i);
+        m.plan(&i);
+        assert_eq!(m.chunk(false, false, true), coast, "a refused Stop in a start did not coast and hold");
+        m.stage(256, false, false, 0.0);
+        let p = m.plan(&i);
+        assert_eq!(p.show, MotorShow::Parked, "a refused Stop wound down once the motor was allowed again");
+        assert_eq!(m.chunk(false, true, true), Chunk::default(), "the held return did not apply in the next pass's first chunk");
     }
 
     /// **A cut asked outside a coast is forgotten.**
@@ -2077,6 +2090,27 @@ mod tests {
         assert!(released - last <= (HOLD_SPAN + 1) as f64 * HOLD_WINDOW_S, "held {:.3} s past the last repeat it heard", released - last);
         let (released, _) = hold_against(echo(0.5), PARK_FLOOR);
         assert!(released < 0.5, "repeats 0.5 s apart held across the first gap, to {released:.3} s");
+    }
+
+    /// **A drift slower than a tail's fall is the desk's own floor.**
+    ///
+    /// `HOLD_FALL` is the house's line between a floor and a decay, 1.5 dB
+    /// a span of windows (`SETTLE_FALL_RATIO`, written as amplitude). A
+    /// level sinking 1.2 dB every 0.3 s from -40 dBFS (an amplifier settling,
+    /// a tape unit's hiss) is on the floor's side of it: the hold lets go at
+    /// the earliest a floor can be told, two spans after the stop, within a
+    /// window, and does not sit through it to the racks' park. With
+    /// `the_hold_never_outlasts_the_racks_park`, whose 2 dB a span is a tail,
+    /// this brackets the line between 1.2 and 2 dB.
+    #[test]
+    fn a_drift_slower_than_a_tails_fall_is_the_desks_own_floor() {
+        let top = 10f64.powf(-40.0 / 20.0);
+        let (released, _) = hold_against(|t| top * 10f64.powf(-(1.2 / 0.3) * t / 20.0), PARK_FLOOR);
+        let earliest = 2.0 * HOLD_SPAN as f64 * HOLD_WINDOW_S;
+        assert!(
+            released >= earliest && released <= earliest + HOLD_WINDOW_S,
+            "a floor drifting 1.2 dB a span let go at {released:.3} s, not within a window of {earliest:.1} s"
+        );
     }
 
     /// **The hold never outlasts the racks' park.**
