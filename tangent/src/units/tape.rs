@@ -108,9 +108,11 @@ pub struct TapeParams {
     /// pinch roller and the servo's drift ([`ROTOR_HZ_PER_IPS`],
     /// [`DRIFT_MS`]). The symbol is 5.0's `wobble`, which drove wow and
     /// flutter together; it drives the wow alone now, and Flutter the rest.
-    /// 0.3 is the specified machine, linear from there. Wow and Flutter at 0
-    /// stop the transport, and the head then moves only by the tape's own
-    /// modulation noise, which is the hiss's ([`JITTER_UM`]).
+    /// 0.3 is the specified machine, linear from there. On the deep head
+    /// ([`WowRange`]) it is the cassette's depth instead, linear too, 3 % of
+    /// the speed at the top. Wow and Flutter at 0 stop the transport, and the
+    /// head then moves only by the tape's own modulation noise, which is the
+    /// hiss's ([`JITTER_UM`]).
     pub wobble: f32,
     /// Tape hiss, and the modulation noise that rides the music. 0 is silent
     /// tape, which no real reel ever was; see [`HISS_GAIN`] and
@@ -131,6 +133,11 @@ pub struct TapeParams {
     /// as built. The resonance, the scrape and the drift keep their own
     /// time.
     pub rate: f32,
+    /// **Wow Range**, a selector of two ([`WowRange`]): the studio
+    /// transport's wow on the studio head, or a worn cassette's on the deep
+    /// head, [`DEEP_MS`] back. The only control that moves the delay the
+    /// host is told. A fresh tape opens on the studio head.
+    pub wow_range: f32,
 }
 
 impl Default for TapeParams {
@@ -159,6 +166,8 @@ impl Default for TapeParams {
             flutter: 0.3,
             // The parts turning at their own speed.
             rate: 0.5,
+            // The studio head.
+            wow_range: WowRange::Studio.dial(),
         }
     }
 }
@@ -179,6 +188,7 @@ impl TapeParams {
         speed: TapeSpeed::Ips15.dial(),
         flutter: 0.0,
         rate: 0.5,
+        wow_range: WowRange::Studio.dial(),
     };
 }
 
@@ -246,6 +256,71 @@ impl TapeSpeed {
     pub const fn dial(self) -> f32 {
         self as usize as f32 / (TapeSpeed::ALL.len() - 1) as f32
     }
+}
+
+/// **The wow range**, a selector of two: which play head the tape plays from,
+/// and so which wow it carries.
+///
+/// The studio head sits [`BASE_MS`] behind the record head and carries a
+/// studio transport's wow; the deep head sits [`DEEP_MS`] back and carries a
+/// worn cassette's warble instead. Flutter rides both. Switching crossfades
+/// the heads over [`HEAD_FADE_MS`]; the latency the host is told follows
+/// the selection at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WowRange {
+    Studio,
+    Deep,
+}
+
+/// How many positions the wow range has. A literal so `builtin_fx`'s table
+/// can stay `const`; a test there pins it to [`WowRange::ALL`].
+pub const WOW_RANGE_STEPS: i32 = 2;
+
+impl WowRange {
+    /// Selector order, frozen: append-only, like the ids.
+    pub const ALL: [WowRange; 2] = [WowRange::Studio, WowRange::Deep];
+
+    /// What the panel calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            WowRange::Studio => "studio",
+            WowRange::Deep => "deep",
+        }
+    }
+
+    /// Decode the normalised dial: nearest of the two positions wins.
+    pub fn from_dial(x: f32) -> Self {
+        let last = (Self::ALL.len() - 1) as f32;
+        let at = ((x.clamp(0.0, 1.0) * last).round() as usize).min(Self::ALL.len() - 1);
+        Self::ALL[at]
+    }
+
+    /// Where this range sits on the 0..=1 dial: the inverse of
+    /// [`WowRange::from_dial`].
+    pub const fn dial(self) -> f32 {
+        self as usize as f32 / (WowRange::ALL.len() - 1) as f32
+    }
+
+    /// How far behind the record head this range's play head rests, in
+    /// milliseconds.
+    fn head_ms(self) -> f32 {
+        match self {
+            WowRange::Studio => BASE_MS,
+            WowRange::Deep => DEEP_MS,
+        }
+    }
+}
+
+/// **The delay a tape built at `sample_rate` tells the host, in
+/// milliseconds**, at a wow range: the frames [`Tape::latency_frames`]
+/// reports there, its head's rest and the record stage's oversampler
+/// together, over the rate. 2 ms on the studio head and 25 ms on the deep
+/// one at every rate an engine runs at; a pure function, so a face can print
+/// it from the dials alone.
+pub fn latency_ms(range: WowRange, sample_rate: f32) -> f32 {
+    let frames = head_rest(sample_rate, range.head_ms()) + OS_LATENCY;
+    let rate = if sample_rate > 0.0 { sample_rate } else { 8_000.0 };
+    frames as f32 * 1_000.0 / rate
 }
 
 /// **Rate, as the multiple of its own speed every rotating part turns at**:
@@ -521,18 +596,67 @@ const ERASE_POINTS: usize = 129;
 const ERASE_ATTACK_MS: f32 = 1.0;
 const ERASE_RELEASE_MS: f32 = 80.0;
 
-/// The play-head line: its capacity and where the head sits in it, in
-/// milliseconds. Two milliseconds of base delay is enough for the sway to
-/// never run the head off either end and short enough that the unit stays an
-/// insert rather than a slap; [`Tape::latency_frames`] reports it.
+/// The play-head line: its capacity and where the two heads sit in it, in
+/// milliseconds. The studio head's two milliseconds are enough for its sway
+/// to never run it off either end and short enough that the unit stays an
+/// insert rather than a slap; the deep head sits [`DEEP_MS`] back, for a
+/// cassette's warble. [`Tape::latency_frames`] reports the one the range
+/// selects.
 ///
-/// The head's REST position is this less [`OS_LATENCY`], because the record
+/// A head's REST position is this less [`OS_LATENCY`], because the record
 /// stage's oversampler is already holding that many samples: the two together
-/// come to [`BASE_MS`] and that is what the host is told. The head may sway
-/// [`STUDIO_TRAVEL_MS`] either way of it, which is more than a fresh machine
-/// asks for at any speed and less than the line holds at any rate.
-const LINE_MS: f32 = 15.0;
+/// come to [`BASE_MS`] (or [`DEEP_MS`]) and that is what the host is told.
+/// The studio head may sway [`STUDIO_TRAVEL_MS`] either way of its rest,
+/// which is more than a fresh machine asks for at any speed, and the deep
+/// head [`DEEP_TRAVEL_MS`]; the line holds both at any rate the tape can be
+/// built at.
+const LINE_MS: f32 = 50.0;
 const BASE_MS: f32 = 2.0;
+
+/// **The deep range: a second play head, 25 ms behind the record head**, its
+/// own sway a worn cassette's rather than a studio transport's.
+///
+/// A studio head two milliseconds long cannot carry a cassette's warble,
+/// which swings the pitch by percent, not tenths of one: at full Wow the
+/// cassette's pack sways the head by over eight milliseconds. So the
+/// warble plays from a head of its own, which may sway 22 ms either way of
+/// its rest, and only it carries the cassette's parts; Flutter's parts,
+/// governed by the studio head's travel, ride both heads, so either can take
+/// over at any moment. Switching the range crossfades the heads over
+/// [`HEAD_FADE_MS`], and delay compensation hears the deep head's figure
+/// only while the range selects it. Its parts' excursions may change by up
+/// to [`DEEP_SLEW`] between them, 3 % of the speed, the deep range's own
+/// scale: entering it, the warble builds up over about half a second.
+const DEEP_MS: f32 = 25.0;
+const DEEP_TRAVEL_MS: f64 = 22.0;
+const DEEP_SLEW: f64 = 0.03;
+
+/// **The cassette transport**, the deep head's own parts: the tape pack once
+/// around at 0.45 Hz and the pinch roller at 1.5 Hz, both times Rate and
+/// neither following the tape speed (a cassette has its own), sharing
+/// 0.55 and 0.30 of [`CASSETTE_DEPTH`]; and the belt drifting, a
+/// sample-and-hold every 2.5 s through two poles at 0.2 Hz, both at Rate's
+/// pace, a delay of up to [`BELT_MS`]. Depths are linear in Wow's dial (the
+/// owner's ruling): at the default 0.3 the deep range already swings the
+/// pitch about 0.8 % at its peak, and at full Wow about 2.7 %.
+const CASSETTE_HZ: [f64; 2] = [0.45, 1.5];
+const CASSETTE_SHARE: [f64; 2] = [0.55, 0.30];
+const CASSETTE_DEPTH: f64 = 0.03;
+const BELT_MS: f64 = 3.5;
+const BELT_HOLD_S: f64 = 2.5;
+const BELT_POLE_HZ: f64 = 0.2;
+const BELT_SEED: u32 = 0xCA55_E77E;
+
+/// The cassette's parts as the deep governor's arrays hold them, slowest
+/// first: the belt's drift, the pack, the roller.
+const BELT: usize = 0;
+const PACK: usize = 1;
+const ROLLER: usize = 2;
+
+/// How long a range switch takes, as the length of the equal-power
+/// crossfade between the two heads, in milliseconds. A switch arriving
+/// mid-fade turns the fade round from where it is.
+const HEAD_FADE_MS: f64 = 25.0;
 
 /// **The transport's depth scale**: the unweighted peak speed deviation, as
 /// a fraction of the speed, that a part of relative depth one sways the tape
@@ -1826,8 +1950,43 @@ struct Transport {
     wander_hold: [u32; 2],
     wander_frames: [u32; 2],
     a_wander: f64,
-    /// The sway this frame, in samples.
+    /// The cassette, the deep head's own parts: the pack's and the roller's
+    /// rotators, their rotation a frame and its angle, and every cassette
+    /// part's excursion, target, ask and gift, slowest first ([`BELT`],
+    /// [`PACK`], [`ROLLER`]), with how far each may move a frame.
+    cas_turn: [[f64; 2]; 2],
+    cas_step: [[f64; 2]; 2],
+    cas_omega: [f64; 2],
+    cas_exc: [f64; 3],
+    cas_aim: [f64; 3],
+    cas_asked: [f64; 3],
+    cas_given: [f64; 3],
+    cas_slew: f64,
+    /// The deep head's travel either way of its rest, and what the cassette
+    /// may use of it once the reserve and Flutter's shared parts have
+    /// theirs, in samples.
+    deep_travel: f64,
+    deep_room: f64,
+    /// The belt's drift: its noise, its hold's countdown, the value it holds,
+    /// and its two poles with their coefficient at Rate's pace.
+    belt_rng: u32,
+    belt_hold: u32,
+    belt_held: f64,
+    belt_lp: [f64; 2],
+    a_belt: f64,
+    /// Whether the dials select the deep head, and whether the cassette is
+    /// running: it starts from nothing when the deep head is selected and
+    /// stops, reset silent, once the deep head has faded out.
+    deep: bool,
+    cassette: bool,
+    /// The two heads' sway this frame, in samples: the studio head's and the
+    /// deep head's.
     sway: f64,
+    deep_sway: f64,
+    /// The cassette's pack alone this frame, for the test that holds it to
+    /// its own depth.
+    #[cfg(test)]
+    pack_sway: f64,
     /// Whether the next design is the first since `new` or `clear`, which
     /// puts every part at its target at once: a fresh tape is a running
     /// machine, not one spinning up.
@@ -1835,7 +1994,7 @@ struct Transport {
 }
 
 impl Transport {
-    fn new(sample_rate: f64, base: usize) -> Self {
+    fn new(sample_rate: f64, base: usize, base_deep: usize) -> Self {
         let sr = sample_rate;
         let step = |ms: f64| 1.0 - (-1.0 / (sr * ms * 1.0e-3)).exp();
         // The resonance: a two-pole at 44 Hz and Q 5 driven by uniform noise,
@@ -1889,11 +2048,47 @@ impl Transport {
             wander_hold: [0; 2],
             wander_frames: [(WOW_HOLD_S * sr) as u32, (FLUTTER_HOLD_S * sr) as u32],
             a_wander: step(WANDER_SLEW_S * 1.0e3),
+            cas_turn: [[1.0, 0.0]; 2],
+            cas_step: [[1.0, 0.0]; 2],
+            cas_omega: [0.0; 2],
+            cas_exc: [0.0; 3],
+            cas_aim: [0.0; 3],
+            cas_asked: [0.0; 3],
+            cas_given: [0.0; 3],
+            cas_slew: (DEEP_SLEW - 4.0 * STUDIO_SLEW / STUDIO_PARTS as f64) / 3.0,
+            deep_travel: (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(base_deep as f64 - 2.0).max(0.0),
+            deep_room: 0.0,
+            belt_rng: BELT_SEED,
+            belt_hold: 0,
+            belt_held: 0.0,
+            belt_lp: [0.0; 2],
+            a_belt: 0.0,
+            deep: false,
+            cassette: false,
             sway: 0.0,
+            deep_sway: 0.0,
+            #[cfg(test)]
+            pack_sway: 0.0,
             fresh: true,
         };
         t.clear();
         t
+    }
+
+    /// The cassette from nothing: its rotators at a phase of zero, no
+    /// excursion, the belt's noise back at its seed. Where the deep head
+    /// starts when it is selected, and what it is reset to, silent, when it
+    /// has faded out.
+    fn reset_cassette(&mut self) {
+        self.cas_turn = [[1.0, 0.0]; 2];
+        self.cas_step = [[1.0, 0.0]; 2];
+        self.cas_omega = [0.0; 2];
+        self.cas_exc = [0.0; 3];
+        self.cas_aim = [0.0; 3];
+        self.belt_rng = BELT_SEED;
+        self.belt_hold = 0;
+        self.belt_held = 0.0;
+        self.belt_lp = [0.0; 2];
     }
 
     /// Back to the moment the machine was built: every phase, noise and
@@ -1916,7 +2111,11 @@ impl Transport {
         self.wander = [0.5; 2];
         self.wander_target = [0.5; 2];
         self.wander_hold = [0; 2];
+        self.reset_cassette();
+        self.deep = false;
+        self.cassette = false;
         self.sway = 0.0;
+        self.deep_sway = 0.0;
         self.fresh = true;
     }
 
@@ -1932,6 +2131,13 @@ impl Transport {
             for g in [&mut self.wow, &mut self.flutter, &mut self.rate] {
                 g.settle();
             }
+        }
+        // The deep head's cassette starts from nothing the moment the deep
+        // range is selected, and grows at the deep slew.
+        self.deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
+        if self.deep && !self.cassette {
+            self.reset_cassette();
+            self.cassette = true;
         }
     }
 
@@ -1983,13 +2189,73 @@ impl Transport {
             self.asked[j] = asked[j];
             self.given[j] = asked[j] * keep[j];
         }
+        if self.cassette {
+            self.design_cassette(r, reserve);
+        }
         if self.fresh {
             let (w, f) = self.breaths();
             for j in 0..STUDIO_PARTS {
                 self.exc[j] = self.aim[j] * Self::breath(j, w, f);
             }
+            let deep = w / DEPTH_WANDER.1;
+            for (j, e) in self.cas_exc.iter_mut().enumerate() {
+                *e = self.cas_aim[j] * if j == BELT { 1.0 } else { deep };
+            }
             self.fresh = false;
         }
+    }
+
+    /// **Once a design, the cassette's turns and targets**, at Rate's
+    /// multiple `r`. Its depths are linear in Wow's own dial and ignore the
+    /// tape speed; the wow wander breathes them too, scaled so its top is
+    /// the full depth. The deep head's room is its travel less the reserve
+    /// and less what Flutter's shared parts were given on the studio head,
+    /// which ride this one too; were the cassette ever to ask for more, the
+    /// slowest of its parts would give way first, the belt, then the pack,
+    /// then the roller. It never does: at full Wow and the bottom of Rate it
+    /// asks for under 18 ms of the 22.
+    fn design_cassette(&mut self, r: f64, reserve: f64) {
+        let sr = self.sample_rate;
+        for k in 0..2 {
+            let target = std::f64::consts::TAU * CASSETTE_HZ[k] * r / sr;
+            let held = self.cas_exc[PACK + k];
+            self.cas_omega[k] = if self.fresh || target <= self.cas_omega[k] || held <= 0.0 {
+                target
+            } else {
+                target.min(self.cas_omega[k] * (1.0 + SUB_BLOCK as f64 * self.cas_slew / held))
+            };
+            self.cas_step[k] = rotation(self.cas_omega[k]);
+            let [c, s] = self.cas_turn[k];
+            let g = 1.5 - 0.5 * (c * c + s * s);
+            self.cas_turn[k] = [c * g, s * g];
+        }
+        let dial = self.wow.cur * f64::from(DIAL_AT_SPEC);
+        let want = [
+            BELT_MS * 1.0e-3 * sr * dial,
+            CASSETTE_DEPTH * CASSETTE_SHARE[0] * dial / self.cas_omega[0],
+            CASSETTE_DEPTH * CASSETTE_SHARE[1] * dial / self.cas_omega[1],
+        ];
+        let shared: f64 = [GUIDES, CAPSTAN, RESONANCE, SCRAPE].iter().map(|&j| self.given[j]).sum();
+        self.deep_room = (self.deep_travel - reserve - shared).max(0.0);
+        let mut keep = [1.0_f64; 3];
+        let mut over = want.iter().sum::<f64>() - self.deep_room;
+        for j in [BELT, PACK, ROLLER] {
+            if over <= 0.0 {
+                break;
+            }
+            let cut = want[j].min(over);
+            keep[j] = if want[j] > 0.0 { (want[j] - cut) / want[j] } else { 1.0 };
+            over -= cut;
+        }
+        for j in 0..3 {
+            self.cas_aim[j] = want[j] * keep[j];
+            self.cas_asked[j] = want[j];
+            self.cas_given[j] = want[j] * keep[j];
+        }
+        // The belt's two poles at 0.2 Hz times Rate: `1 - e^-w` by its
+        // series, `w` being a few ten-thousandths.
+        let w = std::f64::consts::TAU * BELT_POLE_HZ * r / sr;
+        self.a_belt = w * (1.0 - w * (0.5 - w / 6.0));
     }
 
     /// The depth wander's scales now, Wow's and Flutter's.
@@ -2062,16 +2328,72 @@ impl Transport {
             *lp += (x - *lp) * a;
         }
 
+        // Flutter's parts ride both heads; Wow's studio parts only the
+        // studio head.
         let [c, s] = self.turn[3];
         let harmonic = 2.0 * s * c * self.harmonic[0] + (c * c - s * s) * self.harmonic[1];
-        self.sway = -(self.exc[REEL] * self.turn[0][1]
-            + self.exc[PINCH] * self.turn[1][1]
-            + self.exc[GUIDES] * self.turn[2][1]
+        let common = -(self.exc[GUIDES] * self.turn[2][1]
             + self.exc[CAPSTAN] / PEAK[CAPSTAN] * (s + CAPSTAN_2ND_EXC * harmonic))
-            + self.exc[DRIFT] * self.drift_lp[1]
             + self.exc[RESONANCE] / PEAK[RESONANCE] * self.res_unit * y
             + self.exc[SCRAPE] / (PEAK[SCRAPE] * self.scrape_rms) * (self.scrape_lp[1] - self.scrape_lp[0]);
+        let wow = -(self.exc[REEL] * self.turn[0][1] + self.exc[PINCH] * self.turn[1][1])
+            + self.exc[DRIFT] * self.drift_lp[1];
+        self.sway = common + wow;
+        self.deep_sway = if self.cassette { common + self.cassette_tick(w) } else { common };
         self.sway
+    }
+
+    /// One frame of the cassette, given Wow's wander scale `w`: its parts'
+    /// excursions moved toward their targets (shrinking first, growing only
+    /// into the deep head's room), its parts turned, the belt's drift, and
+    /// the sway they add up to, in samples.
+    #[inline]
+    fn cassette_tick(&mut self, w: f64) -> f64 {
+        let deep = w / DEPTH_WANDER.1;
+        let mut used = 0.0;
+        let mut asking = 0.0;
+        let mut grow = [0.0_f64; 3];
+        for j in 0..3 {
+            let target = self.cas_aim[j] * if j == BELT { 1.0 } else { deep };
+            if target < self.cas_exc[j] {
+                self.cas_exc[j] = (self.cas_exc[j] - self.cas_slew).max(target);
+            } else {
+                grow[j] = (target - self.cas_exc[j]).min(self.cas_slew);
+                asking += grow[j];
+            }
+            used += self.cas_exc[j];
+        }
+        if asking > 0.0 {
+            let fit = ((self.deep_room - used) / asking).clamp(0.0, 1.0);
+            for (e, g) in self.cas_exc.iter_mut().zip(grow) {
+                *e += g * fit;
+            }
+        }
+        for (turn, step) in self.cas_turn.iter_mut().zip(self.cas_step) {
+            let [c, s] = *turn;
+            *turn = [c * step[0] - s * step[1], s * step[0] + c * step[1]];
+        }
+        if self.belt_hold == 0 {
+            self.belt_held = f64::from(white(&mut self.belt_rng));
+            let r = self.rate.cur.exp2();
+            self.belt_hold = (BELT_HOLD_S * self.sample_rate / r).max(1.0) as u32;
+        }
+        self.belt_hold -= 1;
+        self.belt_lp[0] += (self.belt_held - self.belt_lp[0]) * self.a_belt;
+        self.belt_lp[1] += (self.belt_lp[0] - self.belt_lp[1]) * self.a_belt;
+        #[cfg(test)]
+        {
+            self.pack_sway = -self.cas_exc[PACK] * self.cas_turn[0][1];
+        }
+        -(self.cas_exc[PACK] * self.cas_turn[0][1] + self.cas_exc[ROLLER] * self.cas_turn[1][1])
+            + self.cas_exc[BELT] * self.belt_lp[1]
+    }
+
+    /// The deep head carries no weight any more: the cassette stops, reset
+    /// silent, until the deep range is selected again.
+    fn stop_cassette(&mut self) {
+        self.reset_cassette();
+        self.cassette = false;
     }
 }
 
@@ -2080,16 +2402,27 @@ impl Transport {
 pub struct Tape {
     sample_rate: f32,
     /// The tape: one line per channel, because the two tracks are magnetised
-    /// independently, but read by one head at one place, which is why the
-    /// transport's sway below is shared; only the modulation noise, which
-    /// is each track's own grain, differs between them.
+    /// independently, but read by one head at one place (two while a range
+    /// switch fades between the heads), which is why the transport's sway
+    /// below is shared; only the modulation noise, which is each track's own
+    /// grain, differs between them.
     line: [Vec<f32>; 2],
     at: usize,
-    /// The play head's rest position in whole samples. Whole on purpose:
-    /// with Wow, Flutter and Hiss at zero the tap interpolates at exactly
-    /// zero fraction and hands samples through untouched. Shortened by
-    /// [`OS_LATENCY`], for the reason [`BASE_MS`] gives.
+    /// The studio head's rest position in whole samples, and the deep
+    /// head's. Whole on purpose: with Wow, Flutter and Hiss at zero the tap
+    /// interpolates at exactly zero fraction and hands samples through
+    /// untouched. Shortened by [`OS_LATENCY`], for the reason [`BASE_MS`]
+    /// gives.
     base: usize,
+    base_deep: usize,
+    /// The two heads' share of what is heard, as the cosine and sine of an
+    /// angle from 0 (the studio head alone) to a quarter turn (the deep head
+    /// alone): an equal-power crossfade over [`HEAD_FADE_MS`], turned a step
+    /// a frame by the rotation `fade_step` and snapped exact at either end.
+    fade: f64,
+    fade_w: [f64; 2],
+    fade_step: [f64; 2],
+    fade_delta: f64,
     /// The input transformer, per channel, and its coefficient.
     transformer: [OnePole; 2],
     g_transformer: f32,
@@ -2136,10 +2469,10 @@ pub struct Tape {
     /// keeps every sway inside the head's travel, so this is a safety net
     /// the tests require never to catch anything.
     clamp_hits: u64,
-    /// The furthest a head has been asked to sit from its rest, either way,
-    /// in samples: what the travel test reads.
+    /// The furthest each head has been asked to sit from its rest, either
+    /// way, while it carried weight, in samples: what the travel test reads.
     #[cfg(test)]
-    deepest: f32,
+    deepest: [f32; 2],
     // Per-rate coefficients, fixed at construction: the sample rate is, too,
     // per the house law.
     a_att: f32,
@@ -2200,6 +2533,8 @@ impl Tape {
         let sr = sample_rate.max(8_000.0);
         let cap = (LINE_MS * 1.0e-3 * sr) as usize + 8;
         let base = head_rest(sr, BASE_MS);
+        let base_deep = head_rest(sr, DEEP_MS);
+        let fade_delta = std::f64::consts::FRAC_PI_2 / (HEAD_FADE_MS * 1.0e-3 * f64::from(sr)).max(1.0);
         let rate = f64::from(sr);
         let step = |ms: f64| 1.0 - (-1.0 / (rate * ms * 1.0e-3)).exp();
         Self {
@@ -2207,6 +2542,11 @@ impl Tape {
             line: [vec![0.0; cap], vec![0.0; cap]],
             at: 0,
             base,
+            base_deep,
+            fade: 0.0,
+            fade_w: [1.0, 0.0],
+            fade_step: [fade_delta.cos(), fade_delta.sin()],
+            fade_delta,
             transformer: [OnePole::default(); 2],
             g_transformer: tpt_g(TRANSFORMER_HZ, rate) as f32,
             nab_in: [0.0; 2],
@@ -2228,10 +2568,10 @@ impl Tape {
             jitter: Glide::new(1.0e-9),
             jitter_rng: JITTER_SEEDS,
             jitter_lp: [0.0; 2],
-            transport: Transport::new(rate, base),
+            transport: Transport::new(rate, base, base_deep),
             clamp_hits: 0,
             #[cfg(test)]
-            deepest: 0.0,
+            deepest: [0.0; 2],
             a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
             a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
             a_glide: step(GLIDE_MS),
@@ -2277,22 +2617,27 @@ impl Tape {
     /// left behind: a seat that has just restored a bay, or holds one
     /// bypassed, has run no block, and the figure has to be right then too
     /// (the denoiser learned that the hard way, see
-    /// `builtin_fx::DenoiseUnit::set_param`). No setting moves the head
-    /// today, so every setting answers the same, the speed included: record
-    /// and playback change speed together. One that does will answer here.
+    /// `builtin_fx::DenoiseUnit::set_param`). **Only the wow range moves
+    /// it**, the owner's ruling: the studio head reports [`BASE_MS`] and the
+    /// deep head [`DEEP_MS`], and every other setting answers the same, the
+    /// speed included, because record and playback change speed together. A
+    /// range switch re-times the lane at once, while the heads' own
+    /// crossfade keeps the tape's output clean.
     pub fn latency_frames(&self, p: &TapeParams) -> usize {
-        let _ = p;
-        self.base + OS_LATENCY
+        let head = match WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) {
+            WowRange::Studio => self.base,
+            WowRange::Deep => self.base_deep,
+        };
+        head + OS_LATENCY
     }
 
     /// The most a tape built at `sample_rate` can ever report, at any
     /// setting: what a seat sizes a line by when it has to hold the tape's
     /// delay itself, which a bypassed bay does (`builtin_fx::TapeUnit`
     /// keeps the dry signal as late as the tape, so switching it out
-    /// compares two sounds and not two timings). One head today, so it is
-    /// the figure [`Tape::latency_frames`] gives at every setting.
+    /// compares two sounds and not two timings). The deep head's figure.
     pub fn max_latency_frames(sample_rate: f32) -> usize {
-        head_rest(sample_rate, BASE_MS) + OS_LATENCY
+        head_rest(sample_rate, DEEP_MS) + OS_LATENCY
     }
 
     /// Hand every glide its target from the dials, once per block, and on
@@ -2336,6 +2681,12 @@ impl Tape {
         self.jitter.target = (JITTER_UM * taper).min(JITTER_CAP_UM);
         self.transport.aim(p, self.fresh);
         if self.fresh {
+            // And the heads stand where the range is, not fading to it.
+            if self.transport.deep {
+                (self.fade, self.fade_w) = (std::f64::consts::FRAC_PI_2, [0.0, 1.0]);
+            } else {
+                (self.fade, self.fade_w) = (0.0, [1.0, 0.0]);
+            }
             // The first block after `new` or `clear` starts AT its controls,
             // not gliding to them from wherever the glides were left.
             for g in [
@@ -2420,12 +2771,38 @@ impl Tape {
         self.transport.design(v, reserve);
     }
 
-    /// **The two tracks' play-head delays this frame**, in samples: the
-    /// transport's sway, shared, plus each track's own modulation noise,
-    /// held inside the line, and counted when they had to be.
+    /// **The two heads this frame**: each track's delay on the studio head
+    /// and on the deep head, in samples (the transport's sway for that head,
+    /// shared, plus the track's own modulation noise, held inside the line
+    /// and counted when it had to be), and the two heads' shares of what is
+    /// heard. The range's crossfade turns a step here every frame; a head
+    /// that carries no weight is neither placed nor counted, and once the
+    /// deep head has faded out its cassette stops, reset silent.
     #[inline]
-    fn heads(&mut self) -> [f32; 2] {
-        let sway = self.transport.tick() as f32;
+    fn heads(&mut self) -> ([[f32; 2]; 2], [f32; 2]) {
+        self.transport.tick();
+        let deep = self.transport.deep;
+        let half = std::f64::consts::FRAC_PI_2;
+        let [cos, sin] = self.fade_step;
+        if deep && self.fade < half {
+            let [c, s] = self.fade_w;
+            self.fade_w = [c * cos - s * sin, s * cos + c * sin];
+            self.fade += self.fade_delta;
+            if self.fade + 0.5 * self.fade_delta >= half {
+                (self.fade, self.fade_w) = (half, [0.0, 1.0]);
+            }
+        } else if !deep && self.fade > 0.0 {
+            let [c, s] = self.fade_w;
+            self.fade_w = [c * cos + s * sin, s * cos - c * sin];
+            self.fade -= self.fade_delta;
+            if self.fade - 0.5 * self.fade_delta <= 0.0 {
+                (self.fade, self.fade_w) = (0.0, [1.0, 0.0]);
+            }
+        }
+        if !deep && self.fade == 0.0 && self.transport.cassette {
+            self.transport.stop_cassette();
+        }
+
         // The modulation noise: each channel's head jitters by its own
         // band-limited noise, unit-RMS, times the depth in samples. At Hiss 0
         // the depth glides to exactly nothing and no noise is drawn, so a
@@ -2439,20 +2816,29 @@ impl Tape {
                 *j = self.jitter_lp[ch] * self.jitter_norm * depth;
             }
         }
-        let rest = self.base as f32;
+        let sways = [self.transport.sway as f32, self.transport.deep_sway as f32];
+        let rests = [self.base as f32, self.base_deep as f32];
+        let weights = self.fade_w.map(|w| w as f32);
         let last = (self.line[0].len() - 4) as f32;
-        jitter.map(|j| {
-            let want = rest + sway + j;
-            let held = want.clamp(2.0, last);
-            if held != want {
-                self.clamp_hits += 1;
+        let mut delays = [[0.0_f32; 2]; 2];
+        for h in 0..2 {
+            if weights[h] == 0.0 {
+                continue;
             }
-            #[cfg(test)]
-            {
-                self.deepest = self.deepest.max((want - rest).abs());
+            for (d, j) in delays[h].iter_mut().zip(jitter) {
+                let want = rests[h] + sways[h] + j;
+                let held = want.clamp(2.0, last);
+                if held != want {
+                    self.clamp_hits += 1;
+                }
+                #[cfg(test)]
+                {
+                    self.deepest[h] = self.deepest[h].max((want - rests[h]).abs());
+                }
+                *d = held;
             }
-            held
-        })
+        }
+        (delays, weights)
     }
 
     /// In place on an interleaved buffer; `channels` is the stride. Stereo
@@ -2489,7 +2875,7 @@ impl Tape {
             let inv_d = 1.0 / d;
 
             // ── the heads: the transport's sway and each track's noise ───
-            let delays = self.heads();
+            let (delays, [studio, deep]) = self.heads();
             let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain;
 
             for ch in 0..2 {
@@ -2523,8 +2909,16 @@ impl Tape {
                 self.erase_lp[ch] = flush(y + b * (self.erase_lp[ch] - y));
                 self.line[ch][self.at] = self.erase_lp[ch];
 
-                // The play head, swaying, and the head's own top.
-                let v = tap(&self.line[ch], self.at, delays[ch]);
+                // The play head, swaying, and the head's own top. Both heads
+                // are read only while a range switch fades between them.
+                let v = if deep == 0.0 {
+                    tap(&self.line[ch], self.at, delays[0][ch])
+                } else if studio == 0.0 {
+                    tap(&self.line[ch], self.at, delays[1][ch])
+                } else {
+                    studio * tap(&self.line[ch], self.at, delays[0][ch])
+                        + deep * tap(&self.line[ch], self.at, delays[1][ch])
+                };
                 self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
                 let mut v = self.top[ch];
 
@@ -2587,6 +2981,7 @@ impl Tape {
         self.jitter_rng = JITTER_SEEDS;
         self.jitter_lp = [0.0; 2];
         self.transport.clear();
+        (self.fade, self.fade_w) = (0.0, [1.0, 0.0]);
         self.voiced_at = f64::NAN;
         self.bells_for = (f64::NAN, f64::NAN, f64::NAN);
         self.roll_for = f64::NAN;
@@ -2610,6 +3005,17 @@ impl Tape {
     /// on, so a test can automate it block by block.
     #[cfg(test)]
     pub(crate) fn transport_trace(&mut self, p: &TapeParams, frames: usize) -> Vec<f64> {
+        self.trace_of(p, frames, |t| if t.deep { t.deep_sway } else { t.sway })
+    }
+
+    /// [`Tape::transport_trace`], reading the cassette's pack alone.
+    #[cfg(test)]
+    pub(crate) fn pack_trace(&mut self, p: &TapeParams, frames: usize) -> Vec<f64> {
+        self.trace_of(p, frames, |t| t.pack_sway)
+    }
+
+    #[cfg(test)]
+    fn trace_of(&mut self, p: &TapeParams, frames: usize, read: impl Fn(&Transport) -> f64) -> Vec<f64> {
         self.aim(p);
         let roll_wanted = norm(p.roll) > 1.0e-3;
         let mut sway = Vec::with_capacity(frames);
@@ -2625,12 +3031,12 @@ impl Tape {
             self.drive.tick(self.a_glide);
             self.heads();
             self.hiss_level.tick(self.a_glide);
-            sway.push(self.transport.sway);
+            sway.push(read(&self.transport));
         }
         sway
     }
 
-    /// What the governor asked of the head and gave each part at its last
+    /// What the governor asked of the heads and gave each part at its last
     /// design.
     #[cfg(test)]
     pub(crate) fn governed(&self) -> GovernorView {
@@ -2641,7 +3047,18 @@ impl Tape {
             omega: t.omega,
             travel: t.travel,
             room: t.room,
+            cassette_asked: t.cas_asked,
+            cassette_given: t.cas_given,
+            cassette_omega: t.cas_omega,
+            deep_travel: t.deep_travel,
+            deep_room: t.deep_room,
         }
+    }
+
+    /// The two heads' shares of what is heard now, studio and deep.
+    #[cfg(test)]
+    pub(crate) fn head_weights(&self) -> (f32, f32) {
+        (self.fade_w[0] as f32, self.fade_w[1] as f32)
     }
 
     /// How many times a head has had to be held inside the line.
@@ -2650,19 +3067,22 @@ impl Tape {
         self.clamp_hits
     }
 
-    /// The furthest a head has been asked to sit from its rest, in samples.
+    /// The furthest each head, studio and deep, has been asked to sit from
+    /// its rest while it carried weight, in samples.
     #[cfg(test)]
-    pub(crate) fn deepest(&self) -> f32 {
+    pub(crate) fn deepest(&self) -> [f32; 2] {
         self.deepest
     }
 }
 
-/// **What the governor did at its last design**, for the tests: every part's
-/// excursion as it asked for it and as it was given it, in samples at the
-/// top of the depth wander, in the governor's order (`DRIFT..=SCRAPE`); the
-/// rotating parts' turns in radians a frame (`REEL..=CAPSTAN` as 0..4); the
-/// head's travel either way of its rest, and the room the parts share after
-/// the per-channel reserve.
+/// **What the governor did at its last design**, for the tests: every
+/// studio part's excursion as it asked for it and as it was given it, in
+/// samples at the top of the depth wander, in the governor's order
+/// (`DRIFT..=SCRAPE`); the rotating parts' turns in radians a frame
+/// (`REEL..=CAPSTAN` as 0..4); the studio head's travel either way of its
+/// rest, and the room the parts share after the per-channel reserve; and the
+/// same for the cassette on the deep head (`BELT..=ROLLER`, the pack's and
+/// the roller's turns), its room what is left after Flutter's shared parts.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GovernorView {
@@ -2671,6 +3091,11 @@ pub(crate) struct GovernorView {
     pub omega: [f64; 4],
     pub travel: f64,
     pub room: f64,
+    pub cassette_asked: [f64; 3],
+    pub cassette_given: [f64; 3],
+    pub cassette_omega: [f64; 2],
+    pub deep_travel: f64,
+    pub deep_room: f64,
 }
 
 // ── what a face shows ───────────────────────────────────────────────────────
@@ -2792,9 +3217,15 @@ fn weighted_parts(p: &TapeParams) -> f64 {
     let noise_um = (JITTER_UM * taper).min(JITTER_CAP_UM);
     let reserve = 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0;
     let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
+    let deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
     let mut sum = 0.0;
     for k in 0..4 {
         let part = REEL + k;
+        // The deep head carries Flutter's parts and its own cassette, not
+        // the studio head's wow.
+        if deep && part <= PINCH {
+            continue;
+        }
         let depth = asked[part] * keep[part] / PEAK[part] * omega[k];
         sum += (depth * flutter_weight(hz[k])).powi(2);
         if part == CAPSTAN {
@@ -2805,6 +3236,29 @@ fn weighted_parts(p: &TapeParams) -> f64 {
     let ladder = (15.0 / v).powf(SPEED_LADDER);
     let resonance = std::f64::consts::SQRT_2 * TRANSPORT_K * RESONANCE_DEPTH * ladder * m[1] * DEPTH_WANDER.1;
     sum += (resonance * flutter_weight(RESONANCE_HZ)).powi(2);
+    if deep {
+        // The cassette, governed by the deep head's own room, at the top of
+        // its wander, which is its full depth. The belt drifts too slowly
+        // for the weighting to see.
+        let dial = f64::from(norm(p.wobble));
+        let cassette_hz = CASSETTE_HZ.map(|f| f * r);
+        let want = [
+            BELT_MS * 1.0e-3 * sr * dial,
+            CASSETTE_DEPTH * CASSETTE_SHARE[0] * dial / (std::f64::consts::TAU * cassette_hz[0] / sr),
+            CASSETTE_DEPTH * CASSETTE_SHARE[1] * dial / (std::f64::consts::TAU * cassette_hz[1] / sr),
+        ];
+        let shared: f64 = [GUIDES, CAPSTAN, RESONANCE, SCRAPE].iter().map(|&j| asked[j] * keep[j]).sum();
+        let travel = (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(head_rest(sr as f32, DEEP_MS) as f64 - 2.0);
+        let mut over = want.iter().sum::<f64>() - (travel - reserve - shared).max(0.0);
+        for (j, w) in want.iter().enumerate() {
+            let kept = w - w.min(over.max(0.0));
+            over -= w - kept;
+            if j > BELT {
+                let depth = kept * std::f64::consts::TAU * cassette_hz[j - PACK] / sr;
+                sum += (depth * flutter_weight(cassette_hz[j - PACK])).powi(2);
+            }
+        }
+    }
     sum.sqrt()
 }
 
@@ -2821,9 +3275,13 @@ fn weighted_parts(p: &TapeParams) -> f64 {
 /// ([`WEIGHTED_SPEC_PCT`]). Away from it the figure follows the parts:
 /// `the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed`
 /// holds it within 15 % of a meter on the head's own sway, at every speed
-/// and where Wow, Flutter and the governor have all moved it.
+/// and where Wow, Flutter and the governor have all moved it. On the deep
+/// head the parts are Flutter's and the cassette's, under the same fit, and
+/// `the_deep_range_swings_the_pitch_like_a_worn_cassette` holds it within
+/// 15 % there at Wow 0.3 and 1.
 pub fn wow_flutter_weighted_pct(p: &TapeParams) -> f32 {
     let i = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())) as usize;
+
     let fresh = TapeParams {
         speed: TapeSpeed::ALL[i].dial(),
         ..TapeParams::default()
@@ -3372,8 +3830,8 @@ mod tests {
     /// at their defaults, against a signal with a step in the middle of every
     /// block, on one unit whose state rides through the whole sweep: a knob
     /// drag, not a bench test. Then NaN params, the end-to-end jumps, the
-    /// speed thrown between 3.75 and 30 ips every block, and a clear that
-    /// must actually clear.
+    /// speed thrown between 3.75 and 30 ips and the range between the heads
+    /// every block, and a clear that must actually clear.
     #[test]
     fn no_setting_the_six_knobs_can_reach_makes_it_explode() {
         let sr = 48_000.0_f32;
@@ -3422,6 +3880,7 @@ mod tests {
             speed: f32::NAN,
             flutter: f32::NEG_INFINITY,
             rate: f32::NAN,
+            wow_range: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -3459,6 +3918,7 @@ mod tests {
                     speed: end,
                     flutter: end,
                     rate: end,
+                    wow_range: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -3493,13 +3953,16 @@ mod tests {
             blocks[11]
         );
 
-        // The speed thrown between its two ends every block, slammed: every
-        // per-speed table blended mid-glide, two hundred times over.
+        // The speed and the range thrown between their ends every block,
+        // slammed and at full Wow: every per-speed table blended mid-glide
+        // and the heads turned round mid-fade, two hundred times over.
         let mut thrown = Tape::new(sr);
         for k in 0..200 {
             let p = TapeParams {
                 drive: 1.0,
+                wobble: 1.0,
                 speed: (k % 2) as f32,
+                wow_range: (k % 2) as f32,
                 ..TapeParams::default()
             };
             let mut buf = block.clone();
@@ -4034,53 +4497,85 @@ mod tests {
     }
 
     /// **The oversampler is invisible to the host.** The record stage's
-    /// filter pair delays the signal by [`OS_LATENCY`] samples, and the play
+    /// filter pair delays the signal by [`OS_LATENCY`] samples, and each play
     /// head gives up exactly that many, so what a host is told to compensate
-    /// is still [`BASE_MS`] — at every rate an engine runs at. A unit that
-    /// quietly grew three quarters of a millisecond would slide against every
-    /// other track in the session and nothing would say why.
+    /// is still [`BASE_MS`] on the studio head and [`DEEP_MS`] on the deep
+    /// one, at every rate an engine runs at. A unit that quietly grew three
+    /// quarters of a millisecond would slide against every other track in
+    /// the session and nothing would say why.
     ///
     /// The figure is asked of the settings, so it is also pinned against
-    /// them: the head and the pair add up to it exactly, and no position of
-    /// any of the seven dials moves it, the speed included, because a report
-    /// that moved with a character dial would re-time the lane in the
-    /// compensation graph every time somebody turned that dial.
+    /// them: each head and the pair add up to its figure exactly, and of
+    /// every position of the ten dials only the wow range moves it (the
+    /// owner's ruling), the speed included, because a report that moved with
+    /// a character dial would re-time the lane in the compensation graph
+    /// every time somebody turned it. And the figure a face prints
+    /// ([`latency_ms`]) is the same frames, at 22.05 kHz too.
     #[test]
     fn the_oversampler_costs_the_host_no_latency() {
         let positions = [0.0_f32, 0.5, 1.0];
         for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
-            let want = (BASE_MS * 1.0e-3 * sr).round() as usize;
             let unit = Tape::new(sr);
-            let got = unit.latency_frames(&TapeParams::default());
-            assert_eq!(
-                got, want,
-                "at {sr} Hz the tape reports {got} frames of latency, not the \
-                 {want} that BASE_MS promises"
-            );
-            assert_eq!(
-                unit.base + OS_LATENCY,
-                got,
-                "at {sr} Hz the head ({}) and the pair ({OS_LATENCY}) do not add up \
-                 to the {got} frames reported",
-                unit.base
-            );
-            for combo in 0..3_usize.pow(9) {
-                let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
+            for (range, ms, head) in [
+                (WowRange::Studio, BASE_MS, unit.base),
+                (WowRange::Deep, DEEP_MS, unit.base_deep),
+            ] {
+                let want = (ms * 1.0e-3 * sr).round() as usize;
+                let got = unit.latency_frames(&TapeParams {
+                    wow_range: range.dial(),
+                    ..TapeParams::default()
+                });
+                assert_eq!(
+                    got,
+                    want,
+                    "at {sr} Hz the {} head reports {got} frames of latency, not the {want} its \
+                     head promises",
+                    range.label()
+                );
+                assert_eq!(
+                    head + OS_LATENCY,
+                    got,
+                    "at {sr} Hz the {} head ({head}) and the pair ({OS_LATENCY}) do not add up \
+                     to the {got} frames reported",
+                    range.label()
+                );
+                for combo in 0..3_usize.pow(9) {
+                    let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
+                    let p = TapeParams {
+                        drive: at(0),
+                        bump: at(1),
+                        roll: at(2),
+                        wobble: at(3),
+                        hiss: at(4),
+                        trim: at(5),
+                        speed: at(6),
+                        flutter: at(7),
+                        rate: at(8),
+                        wow_range: range.dial(),
+                    };
+                    assert_eq!(
+                        unit.latency_frames(&p),
+                        want,
+                        "dial combination {combo} moved the {} head's report at {sr} Hz",
+                        range.label()
+                    );
+                }
+            }
+        }
+        for sr in [22_050.0_f32, 44_100.0, 48_000.0, 96_000.0] {
+            let unit = Tape::new(sr);
+            for range in WowRange::ALL {
                 let p = TapeParams {
-                    drive: at(0),
-                    bump: at(1),
-                    roll: at(2),
-                    wobble: at(3),
-                    hiss: at(4),
-                    trim: at(5),
-                    speed: at(6),
-                    flutter: at(7),
-                    rate: at(8),
+                    wow_range: range.dial(),
+                    ..TapeParams::default()
                 };
                 assert_eq!(
+                    (latency_ms(range, sr) * sr / 1_000.0).round() as usize,
                     unit.latency_frames(&p),
-                    want,
-                    "dial combination {combo} moved the report at {sr} Hz"
+                    "at {sr} Hz the face is told {} ms for the {} head, and the host {} frames",
+                    latency_ms(range, sr),
+                    range.label(),
+                    unit.latency_frames(&p)
                 );
             }
         }
@@ -4255,9 +4750,9 @@ mod tests {
     ///
     /// So a lone impulse after a second of silence must peak on exactly the
     /// reported frame at every rate an engine runs at and at every speed,
-    /// with every colour off and at a fresh tape's settings with the
-    /// transport (Wow and Flutter) and the hiss still. Minimum-phase stages
-    /// add their delay after the peak without moving it.
+    /// with every colour off on either head and at a fresh tape's settings
+    /// with the transport (Wow and Flutter) and the hiss still. Minimum-phase
+    /// stages add their delay after the peak without moving it.
     ///
     /// With every colour off at 15 and 30 ips its three-point parabolic
     /// centre must also sit within a twentieth of a sample of the report at
@@ -4289,6 +4784,11 @@ mod tests {
             let centred = matches!(speed, TapeSpeed::Ips15 | TapeSpeed::Ips30);
             cases.push((speed.label(), "every colour off", neutral, centred));
             cases.push((speed.label(), "a fresh tape, transport and hiss still", still, false));
+            let deep = TapeParams {
+                wow_range: WowRange::Deep.dial(),
+                ..neutral
+            };
+            cases.push((speed.label(), "every colour off on the deep head", deep, centred));
         }
         for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
             for &(speed, what, p, centred) in &cases {
@@ -4605,7 +5105,7 @@ mod tests {
         // Each floor is 3 dB under what the knob measured from a fresh
         // tape, rounded down to the whole decibel; the measured figure is
         // beside it.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 9] = [
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 10] = [
             // -3.7 dB.
             ("drive", |p, v| p.drive = v, -7.0),
             // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
@@ -4636,6 +5136,9 @@ mod tests {
             // +3.1 dB: the parts turning at half or twice their speed sway
             // the head through other samples.
             ("rate", |p, v| p.rate = v, 0.0),
+            // +3.0 dB: the deep head plays the tape 23 ms later, with a
+            // cassette's sway on it.
+            ("wow_range", |p, v| p.wow_range = v, 0.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -5152,42 +5655,74 @@ mod tests {
         );
     }
 
-    /// **The play head never runs off its tape at any setting.** Every speed
-    /// and Rate at its ends and middle, with Wow, Flutter and Hiss at their
-    /// tops, ten seconds of the transport at 44.1 kHz each: the head is never
-    /// held inside the line (the safety net catches nothing), and no track's
-    /// head, its sway and its own modulation noise together, ever sits
-    /// further from its rest than the head's travel. Where the parts ask for
-    /// more than that, the governor shares it; nothing is clipped.
+    /// **The play head never runs off its tape at any setting.**
+    ///
+    /// (a) Every speed, on either head, at the ends and middle of Rate, with
+    /// Wow, Flutter and Hiss at their tops, ten seconds of the transport at
+    /// 44.1 kHz each: no head is ever held inside the line (the safety net
+    /// catches nothing), and no track's head, its sway and its own modulation
+    /// noise together, ever sits further from its rest than that head's
+    /// travel. Where the parts ask for more than that, the governor shares
+    /// it; nothing is clipped. (b) And the switch between the heads, which is
+    /// where a cassette's excursion could land on a studio head: the range
+    /// thrown every half second while Rate and Speed jump every second, from
+    /// the bottom of Rate at full Wow, starting at every speed, at 44.1, 48
+    /// and 96 kHz, five seconds each, under the same two bars. The cassette
+    /// stays on the deep head until that head has faded out, and starts
+    /// from nothing when it fades back in. Measured at worst: 33.2 of the
+    /// studio head's 39.7 samples (3.75 ips, Rate as built) and 563 of the
+    /// deep head's 970 (Rate at its bottom) at 44.1 kHz; thrown, 35.4 of
+    /// 43.2 and 410.9 of 2112 at 48 and 96 kHz.
     #[test]
     fn the_play_head_never_runs_off_its_tape_at_any_setting() {
+        let held = |unit: &Tape, what: &str| {
+            let g = unit.governed();
+            assert_eq!(unit.clamp_hits(), 0, "{what}: a head was held inside the line");
+            for (h, travel) in [(0, g.travel), (1, g.deep_travel)] {
+                assert!(
+                    f64::from(unit.deepest()[h]) <= travel + 1.0e-3,
+                    "{what}: the {} head sat {:.3} samples from its rest, past its {travel:.3} \
+                     of travel",
+                    ["studio", "deep"][h],
+                    unit.deepest()[h]
+                );
+            }
+        };
         let sr = 44_100.0_f32;
         for speed in TapeSpeed::ALL {
-            for rate in [0.0, 0.5, 1.0] {
-                let p = TapeParams {
-                    wobble: 1.0,
-                    flutter: 1.0,
-                    hiss: 1.0,
-                    rate,
-                    speed: speed.dial(),
-                    ..TapeParams::default()
-                };
+            for range in WowRange::ALL {
+                for rate in [0.0, 0.5, 1.0] {
+                    let p = TapeParams {
+                        wobble: 1.0,
+                        flutter: 1.0,
+                        hiss: 1.0,
+                        rate,
+                        speed: speed.dial(),
+                        wow_range: range.dial(),
+                        ..TapeParams::default()
+                    };
+                    let mut unit = Tape::new(sr);
+                    unit.transport_trace(&p, (sr * 10.0) as usize);
+                    held(&unit, &format!("{} on the {} head at Rate {rate}", speed.label(), range.label()));
+                }
+            }
+        }
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            for (k, start) in TapeSpeed::ALL.into_iter().enumerate() {
                 let mut unit = Tape::new(sr);
-                unit.transport_trace(&p, (sr * 10.0) as usize);
-                let travel = unit.governed().travel;
-                assert_eq!(
-                    unit.clamp_hits(),
-                    0,
-                    "at {} and Rate {rate} the head was held inside the line",
-                    speed.label()
-                );
-                assert!(
-                    f64::from(unit.deepest()) <= travel + 1.0e-3,
-                    "at {} and Rate {rate} a head sat {:.3} samples from its rest, past its \
-                     {travel:.3} of travel",
-                    speed.label(),
-                    unit.deepest()
-                );
+                let half = (sr * 0.5) as usize;
+                for step in 0..10 {
+                    let second = step / 2;
+                    let p = TapeParams {
+                        wobble: 1.0,
+                        rate: (second % 2) as f32,
+                        speed: TapeSpeed::ALL[(k + second) % 4].dial(),
+                        wow_range: (step % 2) as f32,
+                        ..TapeParams::default()
+                    };
+                    unit.transport_trace(&p, half);
+                }
+                held(&unit, &format!("the range thrown from {} at {sr} Hz", start.label()));
             }
         }
     }
@@ -5318,6 +5853,244 @@ mod tests {
                  {bound:.3} % and the head's {slew} % of slew"
             );
         }
+
+        // The deep head: Rate from its bottom to its top at full Wow, under
+        // the deep head's own 3 % of slew; and the cassette's pack alone,
+        // whose excursion is the largest any part carries, never bends the
+        // pitch past 1.2 times its own depth, 3.0 % of Wow's dial times its
+        // share (model 1.11). Measured: 2.88 % against the settings' 2.59,
+        // and the pack 1.075 times its depth.
+        let deep = |rate: f32| TapeParams {
+            wobble: 1.0,
+            rate,
+            wow_range: WowRange::Deep.dial(),
+            ..TapeParams::default()
+        };
+        let mut unit = Tape::new(sr);
+        let mut sway = unit.transport_trace(&deep(0.0), (sr * 6.0) as usize);
+        let switch = sway.len();
+        sway.extend(unit.transport_trace(&deep(1.0), (sr * 6.0) as usize));
+        let moved = demodulated(&sway, srf)[switch - 1..]
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        let bound = steady(&deep(0.0)).max(steady(&deep(1.0)));
+        assert!(
+            moved <= bound + 3.0,
+            "the deep head through Rate 0 to 1: the pitch bent {moved:.3} % past the settings' own \
+             {bound:.3} % and the deep head's 3 % of slew"
+        );
+        let mut unit = Tape::new(sr);
+        let mut pack = unit.pack_trace(&deep(0.0), (sr * 6.0) as usize);
+        pack.extend(unit.pack_trace(&deep(1.0), (sr * 6.0) as usize));
+        let own = 100.0 * CASSETTE_DEPTH * CASSETTE_SHARE[0];
+        let worst = flutter_peak(&pack, srf, (sr * 0.5) as usize);
+        assert!(
+            worst <= 1.2 * own,
+            "the cassette's pack bent the pitch {worst:.3} %, past 1.2 times its own {own:.3} %"
+        );
     }
 
+
+    /// **The deep range swings the pitch like a worn cassette.**
+    ///
+    /// The deep head carries a cassette's warble, linear in Wow's dial (the
+    /// owner's ruling): at full Wow, Rate as built, 120 s of its sway at
+    /// 44.1 kHz swings the speed by up to 2.0 to 3.05 % at its peak through
+    /// the meter's demodulator, and reads 0.6 to 1.0 % weighted (the model
+    /// of the same parts in the speed domain: 2.70 and 0.80 %); at the
+    /// default Wow 0.3 it already reads 0.16 to 0.34 % weighted (0.243) and
+    /// peaks 0.6 to 1.1 % (0.83), a plainly cassette-like swing. The figure
+    /// the face prints is within 15 % of both readings. With Wow and Flutter
+    /// at 0 the deep head does not move at all. The cassette ignores the
+    /// tape speed: its pack turns at 0.45 Hz within 5 % at 3.75 and at
+    /// 30 ips. And nothing is ever held inside the line. Measured: 2.615 %
+    /// and 0.899 % at full Wow, 0.981 % and 0.275 % at 0.3, the face 3.2 and
+    /// 4.4 % under; the pack at 0.448 Hz at both speeds. The weighted
+    /// readings sit above the model because a part's excursion carries the
+    /// depth wander, and on the pack's long excursion the wander's own
+    /// movement bends the pitch too, up to the deep slew's share; the model
+    /// breathes the depth of pitch instead.
+    #[test]
+    fn the_deep_range_swings_the_pitch_like_a_worn_cassette() {
+        let sr = 44_100.0_f32;
+        let srf = f64::from(sr);
+        let skip = (sr * 10.0) as usize;
+        let deep = |wobble: f32| TapeParams {
+            wobble,
+            wow_range: WowRange::Deep.dial(),
+            ..TapeParams::default()
+        };
+        for (wobble, peak_band, weighted_band) in [(1.0, 2.0..=3.05, 0.6..=1.0), (0.3, 0.6..=1.1, 0.16..=0.34)] {
+            let p = deep(wobble);
+            let mut unit = Tape::new(sr);
+            let sway = unit.transport_trace(&p, (sr * 120.0) as usize);
+            let peak = flutter_peak(&sway, srf, skip);
+            let weighted = flutter_2sigma(&sway, srf, skip, true);
+            let told = f64::from(wow_flutter_weighted_pct(&p));
+            assert!(
+                peak_band.contains(&peak),
+                "the deep head at Wow {wobble} peaks at {peak:.3} %, outside {peak_band:?}"
+            );
+            assert!(
+                weighted_band.contains(&weighted),
+                "the deep head at Wow {wobble} reads {weighted:.4} % weighted, outside {weighted_band:?}"
+            );
+            assert!(
+                (told / weighted - 1.0).abs() < 0.15,
+                "the deep head at Wow {wobble}: the face is told {told:.4} % weighted, and a meter \
+                 reads {weighted:.4} %"
+            );
+            assert_eq!(unit.clamp_hits(), 0, "the deep head at Wow {wobble} was held inside the line");
+        }
+
+        let still = TapeParams {
+            wobble: 0.0,
+            flutter: 0.0,
+            ..deep(0.0)
+        };
+        let sway = Tape::new(sr).transport_trace(&still, (sr * 5.0) as usize);
+        assert!(sway.iter().all(|d| *d == 0.0), "the deep head moved with Wow and Flutter at 0");
+
+        // The pack's line: the deep head's sway at full Wow with Flutter
+        // still, averaged to a millisecond and scanned from 0.3 to 0.6 Hz.
+        for speed in [TapeSpeed::Ips3_75, TapeSpeed::Ips30] {
+            let p = TapeParams {
+                flutter: 0.0,
+                speed: speed.dial(),
+                ..deep(1.0)
+            };
+            let sway = Tape::new(sr).transport_trace(&p, (sr * 40.0) as usize);
+            let ms = (sr / 1_000.0) as usize;
+            let slow: Vec<f64> = sway.chunks_exact(ms).map(|c| c.iter().sum::<f64>() / ms as f64).collect();
+            // A Goertzel's power at `hz`, then a coarse scan and a fine one
+            // around its best.
+            let power = |hz: f64| {
+                let coeff = 2.0 * (std::f64::consts::TAU * hz / 1_000.0).cos();
+                let (mut s1, mut s2) = (0.0_f64, 0.0_f64);
+                for x in &slow {
+                    let s0 = x + coeff * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                s1 * s1 + s2 * s2 - coeff * s1 * s2
+            };
+            let best = |from: f64, step: f64, n: i32| {
+                (0..=n)
+                    .map(|k| from + step * f64::from(k))
+                    .max_by(|a, b| power(*a).total_cmp(&power(*b)))
+                    .expect("a line")
+            };
+            let coarse = best(0.3, 0.005, 60);
+            let line = best(coarse - 0.005, 0.000_5, 20);
+            assert!(
+                (line / 0.45 - 1.0).abs() < 0.05,
+                "at {} the cassette's pack turns at {line:.3} Hz, not 0.45",
+                speed.label()
+            );
+        }
+    }
+
+    /// **A moving control never clicks.**
+    ///
+    /// A 1 kHz tone at -18 dBFS through a fresh tape, and each control
+    /// thrown from one end of its travel to the other at a block boundary
+    /// and back: Speed from 15 to 3.75 ips and back, the wow range from the
+    /// studio head to the deep one and back, every other control 0 to 1 and
+    /// 1 to 0. A click is energy the band above 12 kHz did not carry before
+    /// or after, so the 20 ms after each throw may carry no more there than
+    /// the louder of the two settings' own steady state, plus 6 dB. And the
+    /// range switch fades the heads with equal power, two copies of the tone
+    /// 23 ms apart, so its level never rises past the steady tone's by more
+    /// than 3.2 dB. (Bias, Age and Damage join this when they land.)
+    /// Measured: at most +0.85 dB above 12 kHz, the range into the deep
+    /// head, and every other throw under the louder steady state; the
+    /// heads' fade swells the tone +2.48 dB into the deep head, whose
+    /// cassette starts from nothing so the two copies nearly agree, and not
+    /// at all on the way back.
+    #[test]
+    fn a_moving_control_never_clicks() {
+        let sr = 48_000.0_f32;
+        let srf = f64::from(sr);
+        let block = 480;
+        let amp = 10.0_f64.powf(-18.0 / 20.0);
+        let tone = |i: usize| (amp * (std::f64::consts::TAU * 1_000.0 * i as f64 / srf).sin()) as f32;
+        let settle = (sr * 1.0) as usize;
+        let after = (sr * 1.5) as usize;
+        let window = (sr * 0.02) as usize;
+        // The tone through a fresh tape at `from`, thrown to `to` on the
+        // block at one second: the left channel.
+        let thrown = |from: &TapeParams, to: &TapeParams| {
+            let mut unit = Tape::new(sr);
+            let total = settle + after;
+            let mut heard = Vec::with_capacity(total);
+            for b in 0..total / block {
+                let mut buf: Vec<f32> = (b * block..(b + 1) * block).flat_map(|i| [tone(i), tone(i)]).collect();
+                let p = if b * block < settle { from } else { to };
+                unit.process(&mut buf, block, 2, p);
+                heard.extend(buf.chunks_exact(2).map(|f| f[0]));
+            }
+            heard
+        };
+        // The power above 12 kHz, frame by frame, through an eighth-order
+        // high-pass run over the whole render so it has settled by the
+        // throw.
+        let treble = |heard: &[f32]| {
+            let mut hp = Butter::new(8, srf, 12_000.0, true);
+            heard.iter().map(|v| hp.run(f64::from(*v)).powi(2)).collect::<Vec<f64>>()
+        };
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let set = |k: usize, v: f32| {
+            let mut p = TapeParams::default();
+            match k {
+                0 => p.drive = v,
+                1 => p.bump = v,
+                2 => p.roll = v,
+                3 => p.wobble = v,
+                4 => p.hiss = v,
+                5 => p.trim = v,
+                6 => p.speed = v,
+                7 => p.flutter = v,
+                8 => p.rate = v,
+                _ => p.wow_range = v,
+            }
+            p
+        };
+        let ends = |k: usize| match k {
+            6 => (TapeSpeed::Ips15.dial(), TapeSpeed::Ips3_75.dial()),
+            _ => (0.0, 1.0),
+        };
+        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range"];
+        for k in 0..10 {
+            let (a, b) = ends(k);
+            for (x, y) in [(a, b), (b, a)] {
+                let heard = thrown(&set(k, x), &set(k, y));
+                let hf = treble(&heard);
+                let before = mean(&hf[settle - window..settle]);
+                let steady = mean(&hf[heard.len() - window..]);
+                let at = mean(&hf[settle..settle + window]);
+                let rise = 10.0 * (at / before.max(steady).max(1.0e-30)).log10();
+                assert!(
+                    rise <= 6.0,
+                    "{} thrown from {x} to {y}: the 20 ms after carried {rise:+.1} dB above 12 kHz \
+                     over the louder steady state",
+                    names[k]
+                );
+                if k == 9 {
+                    let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+                    let steady = rms(&heard[settle - 4 * window..settle]).max(rms(&heard[heard.len() - 4 * window..]));
+                    let ms = (sr / 1_000.0) as usize;
+                    let worst = heard[settle..settle + 2 * window]
+                        .chunks_exact(ms)
+                        .map(|c| rms(c))
+                        .fold(0.0_f64, f64::max);
+                    let swell = 20.0 * (worst / steady).log10();
+                    assert!(
+                        swell <= 3.2,
+                        "the wow range thrown from {x} to {y} swelled the tone {swell:+.2} dB through \
+                         the heads' fade"
+                    );
+                }
+            }
+        }
+    }
 }

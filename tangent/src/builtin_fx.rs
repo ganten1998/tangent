@@ -236,10 +236,12 @@ const EQ_KNOBS_PER_NODE: u32 = 5;
 ///
 /// Id 3 keeps 5.0's symbol, `wobble`, and is named Wow: it drove wow and
 /// flutter together and drives the slow half alone now, Flutter (id 7) the
-/// fast half, and Rate (id 8) how fast every rotating part turns. A session
-/// saved before those two existed reads them at their defaults, which is
-/// the owner's ruling for every appended control: nothing is pinned to how
-/// 5.0 sounded.
+/// fast half, and Rate (id 8) how fast every rotating part turns. Wow Range
+/// (id 9) moves the wow onto a second play head 25 ms back, a cassette's,
+/// and is the one control that moves the delay the seat reports. A session
+/// saved before these existed reads them at their defaults, which is the
+/// owner's ruling for every appended control: nothing is pinned to how 5.0
+/// sounded.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.5, steps: 0 },
     ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
@@ -250,6 +252,7 @@ const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 6, symbol: "speed", name: "Speed", units: "ips", default: 2.0 / 3.0, steps: crate::units::tape::TAPE_SPEED_STEPS },
     ParamSpec { id: 7, symbol: "flutter", name: "Flutter", units: "%", default: 0.3, steps: 0 },
     ParamSpec { id: 8, symbol: "rate", name: "Rate", units: "x", default: 0.5, steps: 0 },
+    ParamSpec { id: 9, symbol: "wow_range", name: "Wow Range", units: "", default: 0.0, steps: crate::units::tape::WOW_RANGE_STEPS },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -988,6 +991,7 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // half at the bottom, the machine as built at the middle, twice at
         // the top.
         (TAPE_PATH, 8) => format!("{:.2}x", crate::units::tape::rate_multiplier(v)),
+        (TAPE_PATH, 9) => crate::units::tape::WowRange::from_dial(v).label().to_owned(),
         // The rest of the tape speaks in percent on purpose: those knobs are
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
@@ -1130,6 +1134,10 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::ALL
             .iter()
             .map(|v| v.label().to_owned())
+            .collect(),
+        (TAPE_PATH, 9) => crate::units::tape::WowRange::ALL
+            .iter()
+            .map(|r| r.label().to_owned())
             .collect(),
         (ANALOG_PATH, id) => analog_choices(id),
         (SAMPLER_PATH, id) => sampler_choices(id),
@@ -1521,13 +1529,14 @@ impl BuiltinUnit {
             BuiltinUnit::Eq(_) => 0,
             // Width, floor and velvet all read the sample they write.
             BuiltinUnit::Imager(_) => 0,
-            // **The play head's delay, reported.** The head sits
-            // `units::tape::BASE_MS` behind the record head with the record
-            // stage's oversampler inside that figure, and an impulse leaves
-            // on exactly the frame the kernel names, so the number is the
-            // real delay rather than a nominal one: the wobble sways the head
-            // around it, never off it on average. The kernel answers from
-            // the params alone, so the figure is right straight after
+            // **The play head's delay, reported.** The studio head sits
+            // `units::tape::BASE_MS` behind the record head and the deep head
+            // `units::tape::DEEP_MS`, the record stage's oversampler inside
+            // either figure, and an impulse leaves on exactly the frame the
+            // kernel names, so the number is the real delay rather than a
+            // nominal one: the transport sways the head around it, never off
+            // it on average. Only the wow range moves it. The kernel answers
+            // from the params alone, so the figure is right straight after
             // `UnitSpec::create` and for a bay restored bypassed, whose
             // kernel never runs (the denoiser's lesson, in
             // `DenoiseUnit::set_param`). `Backend::reported_latency`
@@ -2077,6 +2086,12 @@ impl ImagerUnit {
 /// hear as a fade and long enough that neither end can click.
 const TAPE_BYPASS_FADE_MS: f32 = 10.0;
 
+/// How long the dry line takes to move from one head's delay to the other's
+/// when the wow range is switched while the bay is bypassed, in
+/// milliseconds: the kernel's own head crossfade, so a switch sounds the same
+/// in circuit and out.
+const TAPE_DRY_FADE_MS: f32 = 25.0;
+
 /// How long a kernel started again after a bypass plays dry beyond the
 /// tape's own delay, before the fade back to it, in milliseconds.
 ///
@@ -2111,6 +2126,7 @@ fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32
         6 => Some(&mut p.speed),
         7 => Some(&mut p.flutter),
         8 => Some(&mut p.rate),
+        9 => Some(&mut p.wow_range),
         _ => None,
     }
 }
@@ -2125,6 +2141,17 @@ pub struct TapeUnit {
     /// have been. Sized at build for the most a tape can ever report.
     dry: [Vec<f32>; 2],
     dry_at: usize,
+    /// **The dry line's two taps**: the delay it is reading at, the one it
+    /// is fading from, and how far through that equal-power fade it is (1 is
+    /// settled). A wow range switch moves the report between the two heads'
+    /// delays, and the dry follows it over [`TAPE_DRY_FADE_MS`], as the
+    /// kernel's heads do; a switch back mid-fade turns it round from where it
+    /// is. The first block after `new` or `clear` starts on the report.
+    dry_late: usize,
+    dry_was: usize,
+    dry_fade: f32,
+    dry_step: f32,
+    dry_fresh: bool,
     /// How much of the output is the dry: 0 in circuit, 1 bypassed, and
     /// between while one fades into the other.
     mix: f32,
@@ -2160,6 +2187,11 @@ impl TapeUnit {
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             dry: [vec![0.0; line], vec![0.0; line]],
             dry_at: 0,
+            dry_late: 0,
+            dry_was: 0,
+            dry_fade: 1.0,
+            dry_step: 1.0 / (TAPE_DRY_FADE_MS * 1.0e-3 * sr).max(1.0),
+            dry_fresh: true,
             mix: 0.0,
             stale: false,
             live: false,
@@ -2194,7 +2226,8 @@ impl TapeUnit {
     /// [`TAPE_BYPASS_FADE_MS`] while the output fades to the dry, then
     /// stops and costs nothing; a bay opened bypassed has no tape to fade
     /// from and goes to the dry at once. Coming back, see
-    /// [`TAPE_REFILL_MS`].
+    /// [`TAPE_REFILL_MS`]. A wow range switch while bypassed moves the dry
+    /// between the two heads' delays over [`TAPE_DRY_FADE_MS`].
     pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
         self.run(input, frames, out, true);
     }
@@ -2211,6 +2244,19 @@ impl TapeUnit {
             return;
         }
         let late = self.kernel.latency_frames(&self.params);
+        if self.dry_fresh {
+            // Nothing has left the line since it was cleared, so there is no
+            // fade to have been in: start on the report.
+            (self.dry_late, self.dry_was, self.dry_fade) = (late, late, 1.0);
+            self.dry_fresh = false;
+        } else if late != self.dry_late {
+            if late == self.dry_was && self.dry_fade < 1.0 {
+                std::mem::swap(&mut self.dry_late, &mut self.dry_was);
+                self.dry_fade = 1.0 - self.dry_fade;
+            } else {
+                (self.dry_was, self.dry_late, self.dry_fade) = (self.dry_late, late, 0.0);
+            }
+        }
         if bypassed && !self.live {
             self.mix = 1.0;
             self.stale = true;
@@ -2234,11 +2280,19 @@ impl TapeUnit {
         }
         let line = self.dry[0].len();
         for f in 0..frames {
-            let back = (self.dry_at + line - late) % line;
             for (ch, d) in self.dry.iter_mut().enumerate() {
                 d[self.dry_at] = input[ch].get(f).copied().unwrap_or(0.0);
             }
-            let dry = [self.dry[0][back], self.dry[1][back]];
+            let back = (self.dry_at + line - self.dry_late) % line;
+            let mut dry = [self.dry[0][back], self.dry[1][back]];
+            if self.dry_fade < 1.0 {
+                let then = (self.dry_at + line - self.dry_was) % line;
+                let (now, was) = (self.dry_fade * std::f32::consts::FRAC_PI_2).sin_cos();
+                for (d, line) in dry.iter_mut().zip(&self.dry) {
+                    *d = was * line[then] + now * *d;
+                }
+                self.dry_fade = (self.dry_fade + self.dry_step).min(1.0);
+            }
             self.dry_at = (self.dry_at + 1) % line;
             if bypassed {
                 self.mix = (self.mix + self.fade).min(1.0);
@@ -2269,6 +2323,7 @@ impl TapeUnit {
             d.fill(0.0);
         }
         self.dry_at = 0;
+        self.dry_fresh = true;
         self.mix = 0.0;
         self.stale = false;
         self.live = false;
@@ -3563,7 +3618,7 @@ mod tests {
     fn the_face_tables_open_at_the_kernels_shipped_defaults() {
         let t = crate::units::tape::TapeParams::default();
         let fields = [
-            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate,
+            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate, t.wow_range,
         ];
         assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
         for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
@@ -3807,36 +3862,112 @@ mod tests {
     ///
     /// So it is read through the real load path, `state_text`,
     /// `values_from_state`, `create`, with no block processed: two
-    /// milliseconds at 44.1, 48 and 96 kHz, which is 88, 96 and 192 frames.
-    /// And no dial moves it: every id driven to both ends of its travel on
-    /// the live unit leaves the figure where it was, because a report that
+    /// milliseconds at 44.1, 48 and 96 kHz, which is 88, 96 and 192 frames,
+    /// and on the deep head 25, which is 1103, 1200 and 2400. And only Wow
+    /// Range moves it, the owner's ruling: set on a live unit it moves the
+    /// report at once, both ways, and every other id driven to both ends of
+    /// its travel leaves the figure where it was, because a report that
     /// moved with a character dial would re-time the lane every time
     /// somebody turned it.
     #[test]
     fn the_tape_reports_its_head_to_delay_compensation_before_its_first_block() {
         let spec = spec_for(TAPE_PATH).unwrap();
-        for (sr, want) in [(44_100.0_f32, 88_u32), (48_000.0, 96), (96_000.0, 192)] {
-            let text = state_text(spec, &spec.defaults(), &[]);
-            let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
-            let mut unit = spec.create(sr, &back);
-            assert_eq!(
-                unit.latency(),
-                want,
-                "a tape seated at {sr} Hz reported {} frames before its first block",
-                unit.latency()
-            );
-            for p in spec.params {
+        for (sr, studio, deep) in [(44_100.0_f32, 88_u32, 1_103_u32), (48_000.0, 96, 1_200), (96_000.0, 192, 2_400)] {
+            for (range, want) in [(0.0_f32, studio), (1.0, deep)] {
+                let mut values = spec.defaults();
+                values[9] = range;
+                let text = state_text(spec, &values, &[]);
+                let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+                let unit = spec.create(sr, &back);
+                assert_eq!(
+                    unit.latency(),
+                    want,
+                    "a tape seated at {sr} Hz on Wow Range {range} reported {} frames before its \
+                     first block",
+                    unit.latency()
+                );
+            }
+            let mut unit = spec.create(sr, &spec.defaults());
+            for p in spec.params.iter().filter(|p| p.id != 9) {
                 for end in [0.0_f32, 1.0] {
                     unit.set_param(p.id, end);
                     assert_eq!(
                         unit.latency(),
-                        want,
+                        studio,
                         "{} at {end} moved the tape's report at {sr} Hz",
                         p.symbol
                     );
                 }
             }
+            unit.set_param(9, 1.0);
+            assert_eq!(unit.latency(), deep, "the deep range did not move the report at {sr} Hz");
+            unit.set_param(9, 0.0);
+            assert_eq!(unit.latency(), studio, "the studio range did not move it back at {sr} Hz");
         }
+    }
+
+    /// **The tape changes heads without the allocator**, in circuit and out.
+    /// A wow range switch starts the deep head's cassette from nothing,
+    /// fades the heads, and moves the bypassed dry line between its two
+    /// taps, all on the audio thread, so every one of those roads is walked
+    /// inside the counting window (full Wow, so the cassette runs): into the
+    /// deep head and out of it in circuit, each fade to its end so the
+    /// cassette starts and stops; switched mid-block, bypassed mid-fade,
+    /// switched back while bypassed, and back in circuit.
+    #[test]
+    fn the_tape_switches_heads_without_the_allocator() {
+        use crate::rt_alloc::{least_of, Counted};
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let mut values = spec.defaults();
+        values[3] = 1.0;
+        let mut unit = spec.create(48_000.0, &values);
+        let frames = 1_500;
+        let input: Vec<Vec<f32>> = (0..2)
+            .map(|c| (0..frames).map(|i| ((i + c) as f32 * 0.01).sin() * 0.5).collect())
+            .collect();
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        let ((), counted) = least_of(3, || {
+            // Into the deep head and out again in circuit, each fade run to
+            // its end, so the cassette starts and stops.
+            unit.set_param(9, 1.0);
+            unit.process(&input, frames, &mut out);
+            unit.set_param(9, 0.0);
+            unit.process(&input, frames, &mut out);
+            // Switched mid-block, then bypassed mid-fade, switched back while
+            // bypassed, and back in circuit.
+            unit.set_param(9, 1.0);
+            unit.process(&input, 256, &mut out);
+            unit.bypassed(&input, frames, &mut out);
+            unit.set_param(9, 0.0);
+            unit.bypassed(&input, 256, &mut out);
+            unit.bypassed(&input, frames, &mut out);
+            unit.process(&input, frames, &mut out);
+        });
+        assert_eq!(counted, Counted::default(), "the tape went to the allocator to change heads");
+    }
+
+    /// **A tape saved by 5.0 reads the new controls at their defaults.**
+    ///
+    /// The owner's ruling: a 5.0 or 5.1 session is not pinned to how it
+    /// sounded. Its blob carries the six symbols 5.0 had, and every control
+    /// appended since reads at its spec default, the studio speed, a
+    /// specified transport's Flutter, the parts' own Rate and the studio
+    /// head among them, with no `absent_reads_as` entry to say otherwise; so
+    /// the bay opens on the studio head's two milliseconds. The literal blob
+    /// is the one a fresh 5.0 Tape saved.
+    #[test]
+    fn a_5_0_tape_blob_reads_the_new_controls_at_their_defaults() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let blob = b"tangentfx 1\ndrive=0.6\nbump=0.5\nroll=0.12\nwobble=0.3\nhiss=0.25\ntrim=0.5\n";
+        let values = values_from_state(spec, blob).expect("a 5.0 blob reads");
+        assert_eq!(&values[..6], &[0.6, 0.5, 0.12, 0.3, 0.25, 0.5], "the six 5.0 values moved");
+        assert_eq!(&values[6..10], &[2.0 / 3.0, 0.3, 0.5, 0.0], "an appended control read off its default");
+        for p in &spec.params[6..] {
+            assert_eq!(values[p.id as usize], p.default, "{} read off its default", p.symbol);
+            assert!(absent_reads_as(TAPE_PATH, p.symbol).is_none(), "{} is pinned to 5.0", p.symbol);
+        }
+        assert_eq!(spec.create(48_000.0, &values).latency(), 96, "a 5.0 tape opened off the studio head");
     }
 
     /// **Every tape id reaches its own field, and an id the table does not
@@ -3861,7 +3992,7 @@ mod tests {
             panic!("the tape path built something that is not a tape");
         };
         let fields = |p: &crate::units::tape::TapeParams| {
-            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate]
+            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range]
         };
         assert_eq!(
             fields(&u.params).len(),
@@ -3942,6 +4073,15 @@ mod tests {
     /// crossing by 13. 440 Hz and not 1 kHz, because a 1 kHz period at
     /// 48 kHz is 48 frames, which 96 is two of, and a lane that slipped by
     /// exactly the report would cross zero where it always had.
+    ///
+    /// **And on the deep head.** Opened bypassed on it, the bay is the input
+    /// 1200 frames late, to a millionth, and the kernel never runs. Switched
+    /// to it while bypassed, the report moves to 1200 on that very block,
+    /// and the dry follows over the heads' own 25 ms equal-power fade with
+    /// no step past the same bar, after which it is the input 1200 frames
+    /// late again, to a millionth. Measured: the worst step through that
+    /// fade 1.30 times the sine's own, the equal-power fade of two copies of
+    /// one sine swelling it.
     #[test]
     fn a_bypassed_tape_keeps_its_delay_and_switches_without_a_click() {
         const BLOCK: usize = 512;
@@ -4026,6 +4166,63 @@ mod tests {
             off < 1.0e-3,
             "40 ms after the switch back the tape is {off:.2e} from the one that never left"
         );
+
+        // The deep head, bypassed: opened on it, and switched to it at
+        // block 20.
+        let mut on_deep = neutral.to_vec();
+        on_deep.extend([0.5, 1.0]);
+        let bypassed_run = |values: &[f32], switch: Option<usize>| {
+            let mut unit = spec.create(sr, values);
+            let (mut heard, mut late) = (Vec::with_capacity(sine.len()), Vec::with_capacity(BLOCKS));
+            let mut out = vec![vec![0.0_f32; BLOCK]; 2];
+            for k in 0..BLOCKS {
+                if Some(k) == switch {
+                    unit.set_param(9, 1.0);
+                }
+                let block = sine[k * BLOCK..(k + 1) * BLOCK].to_vec();
+                unit.bypassed(&[block.clone(), block], BLOCK, &mut out);
+                heard.extend_from_slice(&out[0]);
+                late.push(unit.latency() as usize);
+            }
+            let BuiltinUnit::Tape(t) = &unit else {
+                panic!("the tape path built something that is not a tape");
+            };
+            (heard, late, t.kernel_blocks)
+        };
+        let delayed = |i: usize, by: usize| if i < by { 0.0 } else { sine[i - by] };
+        let (deep, late, ran) = bypassed_run(&on_deep, None);
+        assert_eq!(late[0], 1_200, "a deep tape reports {} frames at 48 kHz", late[0]);
+        for (i, v) in deep.iter().enumerate() {
+            assert!(
+                (v - delayed(i, 1_200)).abs() < 1.0e-6,
+                "frame {i} of a deep bay bypassed since creation read {v}, not the input 1200 back"
+            );
+        }
+        assert_eq!(ran, 0, "a deep bay bypassed since creation ran its kernel");
+        let (switched, late, _) = bypassed_run(&neutral, Some(20));
+        assert_eq!((late[19], late[20]), (96, 1_200), "the report did not move with the range at once");
+        for (i, w) in switched.windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= 1.5 * largest,
+                "frame {i}: a step of {step:.4} against the sine's own {largest:.4}, so the range \
+                 switch clicked"
+            );
+        }
+        let settled = 20 * BLOCK + (0.025 * sr) as usize + 1;
+        for (i, v) in switched.iter().enumerate() {
+            let want = if i < 20 * BLOCK {
+                delayed(i, 96)
+            } else if i >= settled {
+                delayed(i, 1_200)
+            } else {
+                continue;
+            };
+            assert!(
+                (v - want).abs() < 1.0e-6,
+                "frame {i} of the bay switched to the deep head while bypassed read {v}, not {want}"
+            );
+        }
     }
 
     /// **A bypassed tape keeps its lane in time, through the real rack.**
@@ -4150,10 +4347,11 @@ mod tests {
     /// reopened would move off the studio speed by a rounding.
     #[test]
     fn the_tape_selectors_offer_exactly_their_positions() {
-        use crate::units::tape::{TapeSpeed, TAPE_SPEED_STEPS};
+        use crate::units::tape::{TapeSpeed, WowRange, TAPE_SPEED_STEPS, WOW_RANGE_STEPS};
         let spec = spec_for(TAPE_PATH).unwrap();
         assert_eq!(TAPE_SPEED_STEPS as usize, TapeSpeed::ALL.len());
-        for (id, positions) in [(6_u32, TapeSpeed::ALL.len())] {
+        assert_eq!(WOW_RANGE_STEPS as usize, WowRange::ALL.len());
+        for (id, positions) in [(6_u32, TapeSpeed::ALL.len()), (9, WowRange::ALL.len())] {
             let row = &TAPE_FACE_PARAMS[id as usize];
             assert_eq!(row.steps as usize, positions, "{} steps", row.symbol);
             let offered = choices(TAPE_PATH, id);
@@ -4171,6 +4369,11 @@ mod tests {
             assert_eq!(choices(TAPE_PATH, 6)[k], v.label());
         }
         assert_eq!(TAPE_FACE_PARAMS[6].default, TapeSpeed::Ips15.dial());
+        for (k, r) in WowRange::ALL.iter().enumerate() {
+            assert_eq!(WowRange::from_dial(r.dial()), *r, "{} does not round-trip", r.label());
+            assert_eq!(choices(TAPE_PATH, 9)[k], r.label());
+        }
+        assert_eq!(TAPE_FACE_PARAMS[9].default, WowRange::Studio.dial());
         let text = state_text(spec, &spec.defaults(), &[]);
         let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
         for (want, got) in spec.defaults().iter().zip(&back) {
@@ -4820,6 +5023,10 @@ mod tests {
         let v = value_for_reading(TAPE_PATH, 8, "1.5x", &[]).expect("a rate");
         assert_eq!(describe(TAPE_PATH, 8, v, &[]), "1.50x");
         assert!(choices(TAPE_PATH, 8).is_empty(), "Rate grew steps");
+        // The range in the selector's words.
+        assert_eq!(describe(TAPE_PATH, 9, 0.0, &[]), "studio");
+        assert_eq!(describe(TAPE_PATH, 9, 1.0, &[]), "deep");
+        assert_eq!(choices(TAPE_PATH, 9), vec!["studio", "deep"]);
         // And the four that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
