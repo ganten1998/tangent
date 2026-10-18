@@ -828,16 +828,20 @@ fn sat_makeup(d: f64) -> f32 {
 /// is 64 hyperbolic tangents in f64. Once a block that was affordable, but
 /// the line-up has to follow the record level wherever it goes, and a level
 /// that moves every frame cannot pay a quadrature every frame. 161 points
-/// are 0.054 of an octave apart, and linear interpolation between them
-/// stays within 0.0015 dB of the direct solve everywhere in the range;
+/// are 0.065 of an octave apart, and linear interpolation between them
+/// stays within 0.0021 dB of the direct solve everywhere in the range;
 /// `the_line_up_table_is_the_direct_solve` pins a hundredth.
 const MAKEUP_POINTS: usize = 161;
 
-/// The record levels the line-up table spans: the dial's whole travel
-/// ([`DRIVE_TANH`]) and an octave under its bottom, where the line-up is
-/// unity to a thousandth of a decibel anyway, so a level that lands below
-/// the dial still reads a true entry rather than a clamp.
-const MAKEUP_D: (f64, f64) = (0.05, 20.0);
+/// The record levels the line-up table spans, as `d`: from an octave under
+/// the dial's bottom ([`DRIVE_TANH`]), where the line-up is unity to a
+/// thousandth of a decibel anyway, up to 64, a little over three times the
+/// dial's top. The room above the dial is for the record level the curve
+/// is actually asked for, which is the dial's `d` scaled by what the
+/// machine records on: a slower tape saturates sooner and an under-biased
+/// head sooner still, so the same dial asks the curve for more, and the
+/// line-up has to read a true entry there rather than a clamp.
+const MAKEUP_D: (f64, f64) = (0.05, 64.0);
 
 /// The record level `d` that line-up entry `i` is solved at.
 fn makeup_d(i: usize) -> f64 {
@@ -2200,8 +2204,8 @@ mod tests {
     /// fed back) within a hundred-thousandth, which is what the same
     /// additions in another order can leave in f32.
     ///
-    /// The same reference keeping the samples the pair used to keep, the
-    /// later of each pair, peaks a frame early: the three quarters of a
+    /// The same direct-form model keeping the samples the pair used to keep,
+    /// the later of each pair, peaks a frame early: the three quarters of a
     /// sample the head was wrong by ([`OS_LATENCY`]). Keeping the earlier
     /// ones it peaks on [`OS_LATENCY`], and so does the polyphase pair. And
     /// the arithmetic is counted from the tap tables the dot products run:
@@ -2255,7 +2259,7 @@ mod tests {
             loudest(&late),
             OS_LATENCY - 1,
             "the direct form keeping the later samples no longer peaks a frame early, \
-             so this reference is not the pair that shipped"
+             so this model is not the pair that shipped"
         );
 
         let d = DRIVE_TANH.1;
@@ -2292,10 +2296,13 @@ mod tests {
     /// reported frame at every rate an engine runs at, with every colour off
     /// and at the shipped settings with the transport and the hiss still.
     /// With every colour off its three-point parabolic centre must also sit
-    /// within a tenth of a sample of the report. What is left there is the
-    /// self-erasure one-pole, whose 22 kHz rest corner is minimum-phase and
-    /// pulls the centre late: measured +0.012, +0.016 and +0.079 of a sample
-    /// at 44.1, 48 and 96 kHz, where the old picks read 0.73 to 0.82 early.
+    /// within a twentieth of a sample of the report at 44.1 and 48 kHz, and
+    /// within a tenth at 96. What is left there is the self-erasure
+    /// one-pole, whose 22 kHz rest corner is minimum-phase and pulls the
+    /// centre late, by more of a sample the higher the rate, because the
+    /// same corner in hertz is more samples of delay there: measured +0.012,
+    /// +0.016 and +0.079 of a sample at 44.1, 48 and 96 kHz, where the old
+    /// picks read 0.73 to 0.82 early.
     /// The shipped settings are not held to the centre, only to the frame:
     /// their Roll is a 15.6 kHz one-pole, minimum-phase too, and it pulls the
     /// centre +0.29 late at 96 kHz without moving the peak.
@@ -2331,11 +2338,12 @@ mod tests {
                     f64::from(out[peak + 1]),
                 );
                 let centre = 0.5 * (a - c) / (a - 2.0 * b + c);
+                let bar = if sr > 48_000.0 { 0.1 } else { 0.05 };
                 if centred {
                     assert!(
-                        centre.abs() < 0.1,
+                        centre.abs() < bar,
                         "{what} at {sr} Hz: the impulse is centred {centre:+.3} of a \
-                         sample off the frame the host was told"
+                         sample off the frame the host was told (bar {bar})"
                     );
                 }
             }
@@ -2347,7 +2355,7 @@ mod tests {
     /// between them, so the table may only ever be a faster way to the same
     /// answer: at a thousand and one levels spread evenly in octaves across
     /// [`MAKEUP_D`], it reads within a hundredth of a decibel of solving
-    /// afresh. Measured: 0.0015 dB at worst.
+    /// afresh. Measured: 0.0021 dB at worst.
     #[test]
     fn the_line_up_table_is_the_direct_solve() {
         let unit = Tape::new(48_000.0);
