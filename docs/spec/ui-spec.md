@@ -1,7 +1,7 @@
-# Ivory — Definitive UI/UX Specification for Rust Rewrite
+# Tangent — Definitive UI/UX Specification for Rust Rewrite
 
-Source of truth: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/ivory.py` (PySide6, VERSION = "1.1.0", 2035 lines, read in full).
-Secondary: `ivory_pyqt5.py` (older PyQt5 Windows port — differences noted in §14; NOT authoritative).
+Source of truth: the Python 1.1.0 main script, in the Python 1.x archive outside this repo (PySide6, VERSION = "1.1.0", 2035 lines, read in full).
+Secondary: the PyQt5 port script (older PyQt5 Windows port — differences noted in §14; NOT authoritative).
 Chord names come from `chord_detector.py` (`ChordDetector` class); its detection algorithm is out of scope here, but its *output text format* affects rendering (§5.6).
 
 Every color below is given exactly as in source. All pixel values are logical (Qt device-independent) pixels. All timings in ms.
@@ -10,10 +10,10 @@ Every color below is given exactly as in source. All pixel values are logical (Q
 
 ## 1. Application identity
 
-- App/window title: **"Ivory"** (exact string; set on the main window at init, re-set on every `showEvent`, and re-set after borderless toggles; also set on the detached chord window).
-- `QApplication.applicationName = "Ivory"`, `organizationName = "Ivory"`.
+- App/window title: **"Tangent"** (exact string; set on the main window at init, re-set on every `showEvent`, and re-set after borderless toggles; also set on the detached chord window).
+- `QApplication.applicationName` and `organizationName` = the app name.
 - Version string: `"1.1.0"` (shown in About dialog as `Version 1.1.0`).
-- App/window icon: `icons/ivory.png` relative to the executable/script dir (PyInstaller `_MEIPASS`-aware via `resource_path()`). Set both as the application-wide window icon and on the main window. If the file is missing, silently no icon.
+- App/window icon: the app PNG in `icons/` relative to the executable/script dir (PyInstaller `_MEIPASS`-aware via `resource_path()`). Set both as the application-wide window icon and on the main window. If the file is missing, silently no icon.
 - No native menu bar, no toolbar, no status bar, no tray icon, no dock-specific code. All commands live in a right-click context menu (§6).
 
 ## 2. Process behavior
@@ -30,17 +30,17 @@ Every color below is given exactly as in source. All pixel values are logical (Q
   or `  No MIDI input ports found!` if none. (Two-space indent, `index: name`.)
 
 ### 2.2 Single instance
-- Mechanism: `QSharedMemory` with key **`"ivory-midi-monitor"`**.
+- Mechanism: `QSharedMemory` with key **`"tangent-midi-monitor"`**.
   - Try `attach()`: success ⇒ another instance is running.
   - Else try `create(1)` (1 byte): success ⇒ this is first instance; failure ⇒ treat as already-running.
-- If already running: show warning `QMessageBox` titled **"Ivory Already Running"** with text:
-  `"Ivory is already running.\n\nOnly one instance can run at a time."` then `exit(0)`. No message passing/activation of the existing instance.
+- If already running: show warning `QMessageBox` titled **"Tangent Already Running"** with text:
+  `"Tangent is already running.\n\nOnly one instance can run at a time."` then `exit(0)`. No message passing/activation of the existing instance.
 - On normal quit: detach shared memory, then `sys.exit(exit_code)`.
 - (A `QSystemSemaphore` is imported but never used.)
 
 ### 2.3 Startup / shutdown
 - After constructing the main window: `show()`, `raise_()`, `activateWindow()`.
-- Top-level exception handler: any uncaught exception shows a critical `QMessageBox` titled **"Ivory Error"** with body `"Ivory encountered an error:\n\n{err}\n\n{traceback}"` (falls back to stderr), exit code 1.
+- Top-level exception handler: any uncaught exception shows a critical `QMessageBox` titled **"Tangent Error"** with body `"Tangent encountered an error:\n\n{err}\n\n{traceback}"` (falls back to stderr), exit code 1.
 - Window close (`closeEvent`): set MIDI thread stop flag, close the MIDI input port (ignore errors), close the detached chord window if open, accept. Closing the main window quits the app (default Qt behavior; `quitOnLastWindowClosed` untouched).
 - Two harmless debug prints at init: `DEBUG init_ui: Set fixed size: {w}x{h}` and `DEBUG init_ui: Window visible: {bool}` (need not be reproduced).
 
@@ -73,7 +73,7 @@ There is no exposed window background: the two child widgets exactly tile the wi
 
 ### 3.4 Borderless mode
 - Toggled from context menu; persisted.
-- On: `setWindowFlags(FramelessWindowHint)`; Off: `setWindowFlags(Qt.Window)`. After either, re-set title "Ivory" and `show()` (flag changes hide the window in Qt). Applied identically to the detached chord window if it exists.
+- On: `setWindowFlags(FramelessWindowHint)`; Off: `setWindowFlags(Qt.Window)`. After either, re-set title "Tangent" and `show()` (flag changes hide the window in Qt). Applied identically to the detached chord window if it exists.
 - Dragging while borderless: left-button press anywhere (window or any child, via event filter) records `dragPos = globalPos − frameGeometry.topLeft`; mouse-move with left button moves window to `globalPos − dragPos`; release clears. In the event filter, press returns "not consumed" (so keytoggle clicks still work), move returns "consumed". Note interplay: when keytoggle is on and borderless is on, a click both toggles a key and arms dragging.
 
 ## 4. PianoWidget (88-key keyboard)
@@ -150,7 +150,7 @@ Let `W = widget width`, `H = widget height`.
 ### 5.4 Font
 - Point size: `max(12, int(height * 0.6))` (at 50 px height → 30 pt).
 - Family selection, in order, using Qt `exactMatch()` (i.e., must resolve exactly, else next): **"Courier Prime"** → **"Courier New"** → **"monospace"**. Weight: **Normal (non-bold)**.
-- Bundled font files exist in repo `fonts/CourierPrime-Regular.ttf` (+Bold/Italic/BoldItalic) but ivory.py never registers them with the font database — it relies on system installation. A faithful Rust port should bundle/load Courier Prime Regular.
+- Bundled font files exist in repo `fonts/CourierPrime-Regular.ttf` (+Bold/Italic/BoldItalic) but the Python main script never registers them with the font database — it relies on system installation. A faithful Rust port should bundle/load Courier Prime Regular.
 
 ### 5.5 Text layout / scaling
 - Measure with font metrics `boundingRect(text)`.
@@ -164,7 +164,7 @@ Let `W = widget width`, `H = widget height`.
 - Displayed chord is None (blank) when no notes are held.
 
 ### 5.7 Detached chord window
-- Separate top-level `QMainWindow`, title **"Ivory"**, min size 300×100, margins 0, containing one ChordLabelWidget (minHeight 50, maxHeight unbounded 16777215, Expanding×Expanding). **User-resizable**, unlike the main window.
+- Separate top-level `QMainWindow`, title **"Tangent"**, min size 300×100, margins 0, containing one ChordLabelWidget (minHeight 50, maxHeight unbounded 16777215, Expanding×Expanding). **User-resizable**, unlike the main window.
 - Initial size: width = current main-window width; height = persisted `detached_chord_height` (default 150 used if the persisted value ≤ 0; persisted default is 50 — code path: `default_height = 150` overridden by `_detached_chord_height` when `> 0`, and it is initialized to 50 at UI init, so effectively 50 unless changed).
 - Honors borderless mode (frameless + drag-anywhere with same drag logic; drag handlers installed via event filter on the central widget and chord widget).
 - Right-click anywhere in it opens the main app context menu (right-button press is converted to a context-menu event and forwarded; the chord widget itself has NoContextMenu).
@@ -234,12 +234,12 @@ QMenu::separator { height: 1px; background-color: <sep>; margin: 1px 0px 1px 0px
 ### 7.2 Already-running warning — see §2.2.
 
 ### 7.3 About dialog
-- Modal `QDialog`, title **"About Ivory"**, min 400×150, themed by dark mode:
+- Modal `QDialog`, title **"About Tangent"**, min 400×150, themed by dark mode:
   - Dark: bg `#000000`, text `#E8DCC0`, button bg `#1a1a1a`, button hover `#2a2a2a`, button border `#E8DCC0`.
   - Light: bg `#E8DCC0`, text `#000000`, button bg `#d4c8b0`, button hover `#c0b49c`, button border `#000000`.
   - Stylesheet: QDialog/QLabel get bg+text colors; labels use font-family `"Courier Prime", "Courier New", Courier, monospace`, bold; QPushButton: themed bg/text, `border: 1px solid <buttonBorder>`, `padding: 4px 12px`, same bold monospace family, hover bg as above.
 - Vertical layout, all fonts chosen with exactMatch fallback chain **Courier Prime → Courier New → Courier → monospace**, all **Bold**:
-  1. `Ivory` — 16 pt, centered.
+  1. `Tangent` — 16 pt, centered.
   2. `Simple MIDI Keyboard Monitor with Advanced Chord Detection` — 10 pt, centered.
   3. Link label, 10 pt, centered, external-link enabled, HTML: `<a href="https://ganten.neocities.org" style="color: <text>;">ganten.neocities.org</a>` (was shambhaline until 2.3.1; the spec records the Python app, the app itself is the authority).
   4. Stretch.
@@ -248,7 +248,7 @@ QMenu::separator { height: 1px; background-color: <sep>; margin: 1px 0px 1px 0px
 
 ## 8. Settings persistence
 
-- File: **`~/.config/tangent/settings.json`** (all platforms — literally `Path.home()/".config"/"ivory"/"settings.json"`; parent dirs created on save). JSON, `indent=2`. Read once at startup; **any** parse/read error ⇒ all defaults. Written after every mutation (each toggle, color pick, size change, detach/attach, reset). Write errors silently ignored.
+- File: **`~/.config/tangent/settings.json`** (all platforms — literally `Path.home()/".config"/"tangent"/"settings.json"`; parent dirs created on save). JSON, `indent=2`. Read once at startup; **any** parse/read error ⇒ all defaults. Written after every mutation (each toggle, color pick, size change, detach/attach, reset). Write errors silently ignored.
 - Keys (exact names), types, defaults:
 
 | key | type | default |
@@ -311,12 +311,12 @@ Keytoggle clicks additionally trigger an immediate (off-timer) GUI + chord-detec
 - Disabling detection blanks and hides the label; the 100 ms timer keeps running but returns early.
 
 ## 13. macOS specifics
-- **There is no mac-specific code whatsoever** in ivory.py: no native menu bar entries, no dock/tray handling, no `.icns`/bundle metadata, no Cmd-key shortcuts, no `AA_*` attributes, no style/Fusion forcing, no HiDPI code (Qt6 handles DPR automatically — a Rust port must draw in logical pixels and honor the display scale factor). Repo ships only `icons/ivory.png` and Linux `.deb` packaging.
+- **There is no mac-specific code whatsoever** in the Python main script: no native menu bar entries, no dock/tray handling, no `.icns`/bundle metadata, no Cmd-key shortcuts, no `AA_*` attributes, no style/Fusion forcing, no HiDPI code (Qt6 handles DPR automatically — a Rust port must draw in logical pixels and honor the display scale factor). Repo ships only the `icons/` PNG and Linux `.deb` packaging.
 - Consequences to preserve on mac: default system menu bar shows just the app menu Qt auto-generates (About/Quit are NOT wired there — About only exists in the context menu); Cmd+Q from the system menu quits via normal close path; fixed-size window means the zoom (green) button behavior is disabled/no-op; frameless mode removes traffic lights entirely.
 - Right-click = `contextMenuEvent`; ctrl-click on mac also triggers it (Qt default) — keep that.
 
-## 14. ivory_pyqt5.py differences (older Windows port — for awareness only, do NOT copy)
-- Window title `"Ivory - MIDI Keyboard Monitor"`; window is **resizable**, initial `resize(1300, 200)`, min 200×150.
+## 14. PyQt5 port script differences (older Windows port — for awareness only, do NOT copy)
+- Window title: the app name, then `" - MIDI Keyboard Monitor"`; window is **resizable**, initial `resize(1300, 200)`, min 200×150.
 - Chord font chain: Courier Prime → **Courier** → monospace, **Bold** (PySide6 version is Normal weight and inserts Courier New).
 - Lacks: size % submenu, borderless mode, keytoggle, detached chord window, and the related settings keys (settings file has only dark_mode, 5 colors, prefer_flats, chord_detection_enabled).
 - Same colors, same aspect math, same key drawing, same timers (50/100 ms), same single-instance key, same MIDI logic. Nothing mac-relevant in it.

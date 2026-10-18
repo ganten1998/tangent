@@ -1,4 +1,4 @@
-# DIVERGENCES — where Ivory 2.0 intentionally differs from the Python engine
+# DIVERGENCES — where Tangent 2.0 intentionally differs from the Python engine
 
 Policy: the rewrite reproduces the Python engine's *shipped* behavior exactly,
 except where that behavior is a documented bug (the B-catalog in
@@ -290,7 +290,7 @@ renderings of every affected row.
   correction that cannot be made is rolled back rather than left as a
   partial nudge. Learning state stays in overrides.json (never
   settings.json). The `learning` cargo feature is now always enabled by the
-  `ivory` GUI crate, so every packaged binary ships the option; the engine
+  `tangent` GUI crate, so every packaged binary ships the option; the engine
   crate keeps the feature gate so `cargo test -p tangent-core` still
   exercises the stock path.
 - **D-UI-6**: About dialog shows "Version &lt;crate version&gt;" (read from

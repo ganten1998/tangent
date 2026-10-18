@@ -29,14 +29,10 @@ needed was done the same day (commits listed in section B).
   `## [Unreleased]` heading sits above it as at every earlier cut.
   `copy_scan.rs` now reads the newest version's section when
   `[Unreleased]` is empty, so the gate scans the 5.0.0 copy.
-- [x] **D4. 4.x users lose their config folder. DECIDED: accept and
-  document, no import.** `purge_pre_5_0()` (tangent-core/src/config.rs,
-  called from tangent/src/main.rs) deletes `~/.config/ivory` unread at
-  first launch; it held `license.key`, `overrides.json` (taught chord
-  names) and `settings.json`. CHANGELOG.md 5.0.0 "Removed" and the release
-  notes' "Before you upgrade" say what is lost and what to do (paste the
-  key again; back up the folder before the first 5.0 launch to keep taught
-  names). F6 still verifies that advice on a real 4.4.1 machine.
+- [x] **D4. 4.x users start fresh. DECIDED: no import.** 5.x does not read
+  the 4.x settings folder; CHANGELOG.md 5.0.0 and the release notes say to
+  paste the key again. F6 still verifies that advice on a real 4.4.1
+  machine.
 - [ ] **D5. FreeBSD timing.** The owner wants Gumroad live only after
   FreeBSD is built and verified. bsdbox is unreachable; there is no FreeBSD
   build path off the box (scripts/build-freebsd.sh refuses any other OS;
@@ -73,7 +69,7 @@ needed was done the same day (commits listed in section B).
 ## B. Repository edits before the cut
 
 - [x] **B1. CHANGELOG. DONE** (D3), with two new "Removed" entries: Tangent
-  as a VST3 plugin (added in 3.0.0) and the `~/.config/ivory` purge with
+  as a VST3 plugin (added in 3.0.0) and the 4.x settings note with
   what a 4.x user should do. release.sh refusal 3 now matches only the
   2026-10-12 heading.
 - [x] **B2. First-run Welcome card. DONE:** "Welcome to Tangent 5.0!"
@@ -90,7 +86,6 @@ needed was done the same day (commits listed in section B).
 - [x] **B5. docs/RELEASE.md step 8. DONE:** pushes `main` and the release
   tag only (`git push origin main v<v>`, `git push github main v<v>`),
   never `--tags`.
-- [x] **B6. DONE:** the log line says it removed `~/.config/ivory`.
 - [x] **C3 (moved here). The dmg. DONE:** release.sh now requires
   `Tangent-<v>-macos-universal.dmg` with the pkg and zip (it is a README
   link, and publish-github.sh refuses a release without it);
@@ -109,7 +104,7 @@ needed was done the same day (commits listed in section B).
 - [ ] **B8. Version.** `Cargo.toml` line 78: `version = "5.0.0"`, then
   `cargo check` so Cargo.lock follows (release.sh:77-79 cross-checks). The
   bump does not stale THIRD-PARTY-LICENSES (it lists no workspace crate).
-- [ ] **B9. Commit** B7 and B8 together (B1 to B6 and these drafts are
+- [ ] **B9. Commit** B7 and B8 together (B1 to B5 and these drafts are
   already committed; release.sh notes a dirty tree).
 - [ ] **B10. Tag.** `git tag -a v5.0.0 -m 'Tangent 5.0.0'` (release.sh:110
   refuses without it).
@@ -210,10 +205,8 @@ Expected in `dist/`: `Tangent-5.0.0-macos.pkg`,
   on a FreeBSD 15 machine, launch, sound, MIDI from /dev/umidi; one bundle
   on a machine without a network if available.
 - [ ] **F6. Upgrade from 4.4.1: OWNER.** On a machine (or account) with a
-  4.4.1 `~/.config/ivory` holding a key: install 5.0.0, confirm the folder
-  is removed, the key pastes and activates, and copying `license.key` and
-  `overrides.json` back into `~/.config/tangent/` restores the key and the
-  taught names (the release notes promise this; cut the sentence if not).
+  4.4.1 config holding a key: install 5.0.0, confirm the key pastes and
+  activates.
 - [ ] **F7. Superior Drummer follows the host: OWNER.** Load SD3 on a track,
   set it to follow host tempo, play a tempo ramp and a loop, and export.
 - [ ] **F8. Tangent Insert on real hardware: OWNER.** Patch a send/return
@@ -299,10 +292,10 @@ Latest and carries the aliases, which publish-github.sh uploads):
   README.md:177 (issues).
 - The supporter-key email: tools/tangent-fulfil/src/main.rs:286,294,296, in
   every email already sent, plus the older pre-rename asset names and the
-  `github.com/ganten1998/ivory/...` slug in emails from before the rename.
+  pre-rename repository slug in emails from before the rename.
 - The Gumroad post-purchase page and description (STORE-CONTENT.md:160-238,
   GUMROAD.md).
-- The website card (old slug `ganten1998/ivory`, projects.html:134,168).
+- The website card (pre-rename slug, projects.html:134,168).
 - LICENSING.md ("Where the source is"): the `third-party-src-*` source
   releases live in this same repository and must never be deleted while
   binaries are offered.
@@ -325,7 +318,7 @@ copies already handed out (D6; LICENSING.md notes the residual
 question for copies already handed out).
 
 Unsafe meaning: delete and recreate the repository. It drops GitHub's
-redirect from the old `ganten1998/ivory` name (pre-rename emails and the
+redirect from the pre-rename repository name (pre-rename emails and the
 website card use it), the issue tracker, and every release at once; there is
 a window where every buyer link 404s until 5.0.0 is published again; and
 the redirect is not guaranteed to come back for a new repository of the

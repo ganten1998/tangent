@@ -1,10 +1,10 @@
-# Audit: abandoned Rust rewrite of Ivory (`ivory-rust`)
+# Audit: abandoned first Rust rewrite of Tangent
 
 Audited 2026-07-28.
 Rust code: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent-rust/`
-Python original: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/` (PySide6, `ivory.py` 2035 lines, `chord_detector.py` 2153 lines)
+Python original: the Python 1.x archive outside this repo (PySide6, main script 2035 lines, `chord_detector.py` 2153 lines)
 
-Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree, remote `dropbox`.
+Repo state: single git commit (the initial Rust-rewrite commit), clean tree, remote `dropbox`.
 
 ---
 
@@ -13,7 +13,7 @@ Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree
 **Layout: sound.** Two-crate workspace:
 
 - `tangent-core` — pure, zero-dependency library (patterns.rs 391 lines, detector.rs 1265 lines incl. 42 unit tests). Fully testable without a GUI. This separation is the single best structural decision in the attempt and should be kept in any rewrite.
-- `ivory` — binary: `main.rs` (20 lines), `app.rs` (317), `piano_widget.rs` (184), `midi.rs` (67), `settings.rs` (95).
+- `tangent` — binary: `main.rs` (20 lines), `app.rs` (317), `piano_widget.rs` (184), `midi.rs` (67), `settings.rs` (95).
 
 **Dependencies (Cargo.toml → locked → current on crates.io):**
 
@@ -94,7 +94,7 @@ Caveat: 42 tests is thin coverage for a 95-pattern engine whose behavior is defi
 
 ## 5. UI-parity gaps vs the PySide6 app
 
-Python `ivory.py` features absent from the Rust GUI:
+Python main-script features absent from the Rust GUI:
 
 | Feature | Python | Rust status |
 |---|---|---|

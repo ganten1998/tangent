@@ -30,11 +30,11 @@ number is the only way to tell whether the fix did anything.
 | `ReadBufferView::sequence()` | `src/stream.rs` | The driver's frame counter for this buffer, already read by `dequeue` and previously discarded. |
 
 `Cargo.toml` additionally carries a note and is excluded from the workspace by
-the root `Cargo.toml`, so it stays out of ivory's lints and `cargo test
---workspace`.
+the root `Cargo.toml`, so it stays out of the workspace's lints and
+`cargo test --workspace`.
 
 It also now carries `[lints.rust] dead_code = "allow"`. Being excluded from the
-workspace keeps ivory's lints off this crate but not rustc's own defaults, and
+workspace keeps its lints off this crate but not rustc's own defaults, and
 `dead_code` is on by default — so `ffi_enum!` declaring every V4L2 constant the
 kernel defines, against the handful we call, produced six warnings on every
 build (`PowerLineFrequency`, `ColorFx`, `TunerType` and their associated

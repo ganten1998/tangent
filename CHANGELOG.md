@@ -1,7 +1,6 @@
 # Changelog
 
-All notable changes to Tangent are documented in this file. Entries before 2.3.0
-refer to the app under its former name, Ivory.
+All notable changes to Tangent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -139,20 +138,14 @@ published.
   folder; on Linux, delete `~/.vst3/Tangent.vst3` (or the one under your
   install prefix's `lib/vst3`) yourself. A DAW project that used it will report the plugin as missing. Tangent still
   hosts VST3 plugins on every platform, and LV2 on Linux and FreeBSD.
-- **4.x settings are cleared on the first launch.** Before 5.0, Tangent kept
-  its settings in `~/.config/ivory/` (on Windows,
-  `%USERPROFILE%\.config\ivory`). 5.0 keeps them in `~/.config/tangent/`
-  and deletes the old `ivory` folder, without reading it, the first time it
-  starts. That folder held your supporter key, the chord names you taught
-  Tangent, and your settings. Your projects and recordings were never in it
-  and are not touched. What to do when upgrading from 4.x:
+- **4.x settings do not carry over.** Before 5.0, Tangent kept its settings
+  in another folder; 5.0 keeps them in `~/.config/tangent/` and does not
+  read the old ones. Your supporter key, the chord names you taught Tangent
+  and your settings start fresh; your projects and recordings are not
+  affected. What to do when upgrading from 4.x:
   - Paste your supporter key again: right-click anywhere, Support
     Tangent..., Activate. The key is in the email it came in; if you cannot
     find it, reply to your Gumroad receipt and it will be sent again.
-  - To keep chord names you taught 4.x, copy the `ivory` folder somewhere
-    safe **before you start 5.0 for the first time**; the file that holds
-    them is `overrides.json`. Bringing it back into 5.0 has not been tested
-    on every 4.x version, so keep the copy until you have checked.
 
 ### Security
 
@@ -4530,7 +4523,7 @@ take is now simply the window it was played in.
 
 ### Changed
 
-- **Renamed from Ivory to Tangent.** Synthogy's Ivory is a well-known virtual
+- **Renamed to Tangent.** The old name was already a well-known virtual
   piano instrument, and a plugin build would have put this app in the same
   browser. The clavichord's tangent is the blade at the back of each key that
   strikes the string and stays in contact with it for as long as the note
@@ -4557,7 +4550,7 @@ take is now simply the window it was played in.
 
 ### Added
 
-- **Supporter keys.** Ivory stays free and complete; a supporter key is a thank
+- **Supporter keys.** Tangent stays free and complete; a supporter key is a thank
   you, not a gate. Nothing is removed from the free app — chord detection,
   Chord Learning, every font and setting all stay exactly as they are. Keys are
   verified entirely offline: no network call, no account, no expiry, no machine
@@ -4604,7 +4597,7 @@ take is now simply the window it was played in.
   merely contains — it reads `Dm11`. Genuine pentatonics and exact six-note
   scales are unchanged; all twelve pitch classes together read
   `Chromatic Scale`.
-- The Dock showed a generic hexagon instead of Ivory's icon on macOS, and the
+- The Dock showed a generic hexagon instead of Tangent's icon on macOS, and the
   icon itself is now a properly rounded, padded squircle rather than a
   full-bleed square.
 
@@ -4612,7 +4605,7 @@ take is now simply the window it was played in.
 
 ### Added
 
-- **Chord Learning.** *Correct Chord Name…* lists the readings Ivory actually
+- **Chord Learning.** *Correct Chord Name…* lists the readings Tangent actually
   weighed for the voicing you are holding, with their scores, and trains a
   general preference toward the one you pick — so similar voicings shift too,
   rather than just the chord in front of you. Measured reach: one correction
@@ -4624,7 +4617,7 @@ take is now simply the window it was played in.
   corrections have been made, and which leanings have been picked up.
 - Every training attempt reports its outcome in plain language: learned,
   already wins, outranked by a later naming rule, too far behind to nudge, or
-  not one of the readings Ivory weighed.
+  not one of the readings Tangent weighed.
 
 ### Fixed
 
@@ -4661,13 +4654,13 @@ Python runtime, no Qt, a single self-contained executable per platform.
 - `custom_font_path` — an optional settings key pointing at any TTF/OTF on your
   machine, loaded ahead of the bundled fonts in every text style.
 - Courier Prime (Regular and Bold) is embedded in the binary on all three
-  platforms, so Ivory looks identical everywhere. `OFL.txt` and the font files
+  platforms, so Tangent looks identical everywhere. `OFL.txt` and the font files
   ship in every release artifact.
 - Real application icons: an `.icns` bundle on macOS and an embedded `.ico` on
   Windows.
 - Single-instance handling via a lock file. A crashed instance no longer blocks
   relaunch.
-- Any panic now surfaces as an "Ivory Error" dialog with the message and a
+- Any panic now surfaces as a "Tangent Error" dialog with the message and a
   backtrace instead of vanishing.
 
 ### Changed
@@ -4694,7 +4687,7 @@ Python runtime, no Qt, a single self-contained executable per platform.
   Linux build no longer needs a `pip install` to start.
 - Courier New is never bundled or redistributed. Courier Prime replaces it.
 
-> **One-way caveat when downgrading.** Ivory 2.x reads Python 1.1.0's
+> **One-way caveat when downgrading.** Tangent 2.x reads Python 1.1.0's
 > `~/.config/tangent/settings.json` in place, so upgrading is seamless. Going back
 > to Python 1.1.0 is not: it rewrites that file with its own fixed set of 13
 > keys, discarding `custom_font_path` and any other key it does not recognize.

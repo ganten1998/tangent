@@ -1,6 +1,6 @@
 # Font Licensing Research: Courier New vs. Courier Prime for a Commercial Cross-Platform App
 
-Context: commercial macOS/Linux/Windows desktop app (Ivory), sold pay-what-you-can including $0.
+Context: commercial macOS/Linux/Windows desktop app (Tangent), sold pay-what-you-can including $0.
 The app currently styles text as `"Courier Prime", "Courier New", Courier, monospace` and the repo
 already vendors `CourierPrime-{Regular,Bold,Italic,BoldItalic}.ttf` plus the full upstream
 `CourierPrime-master` repo (including `OFL.txt`). The Linux `.deb` staging tree installs the four
@@ -73,7 +73,7 @@ all three OSes (it will simply not resolve on most Linux systems).
 - The official page: "released under the [OFL] license"
   ([quoteunquoteapps.com/courierprime](https://quoteunquoteapps.com/courierprime/)).
 - The vendored copy in this repo:
-  `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/fonts/CourierPrime-master/OFL.txt`.
+  the Python 1.x archive's `fonts/CourierPrime-master/OFL.txt`.
 
 Designed by **Alan Dague-Greene** for **John August**, published by **Quote-Unquote Apps**. Family =
 Regular, Bold, Italic, Bold Italic (exactly the four TTFs already in the repo).
@@ -138,7 +138,7 @@ Sources: [Wikipedia – Croscore fonts](https://en.wikipedia.org/wiki/Croscore_f
 
 ---
 
-## 4. Recommendation for Ivory
+## 4. Recommendation for Tangent
 
 The safe, zero-cost, zero-negotiation strategy — and the app is already 90% there:
 
@@ -212,4 +212,4 @@ From the [OFL FAQ](https://openfontlicense.org/ofl-faq/) (SIL, also at scripts.s
 - https://en.wikipedia.org/wiki/Liberation_fonts
 - https://wiki.archlinux.org/title/Metric-compatible_fonts
 - https://github.com/ArtifexSoftware/urw-base35-fonts (raw LICENSE: AGPLv3 + embedding exception)
-- Local verification: /Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/fonts/CourierPrime-master/OFL.txt
+- Local verification: the Python 1.x archive's fonts/CourierPrime-master/OFL.txt

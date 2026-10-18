@@ -13,19 +13,13 @@ facts a 4.x user needs before upgrading. No third-party product is named,
 except BtbN in the licences paragraph, which is attribution the GPL source
 offer needs.
 
-Two sentences in here depend on things not yet verified on a real machine:
-  1. "copy license.key and overrides.json back" (the ~/.config/ivory section).
-     Verify on a machine with a 4.4.1 config before publishing, or cut it
-     down to "paste your key again".
-  2. The FreeBSD line assumes bsdbox builds the set. If FreeBSD ships later,
-     change that line to "FreeBSD packages follow shortly".
-Required by docs/RELEASE.md step 9: the SmartScreen note and the
-~/.config/ivory note. Both are below. No em dashes (the owner's rule).
+One sentence in here depends on something not yet verified on a real
+machine: the FreeBSD line assumes bsdbox builds the set. If FreeBSD ships
+later, change that line to "FreeBSD packages follow shortly".
+Required by docs/RELEASE.md step 9: the SmartScreen note. It is below. No em
+dashes (the owner's rule).
 
 Owner decisions of 2026-10-12, folded in here and in CHECKLIST.md:
-  - The ~/.config/ivory purge is ACCEPTED and documented, not migrated: no
-    import code. "Before you upgrade" below and CHANGELOG.md's 5.0.0
-    "Removed" section say what a 4.x user loses and what to do.
   - The GitHub repository is made PUBLIC at publish time (not before). The
     download links and the ffmpeg source links below 404 until it is.
   - Old GitHub releases are deleted only after 5.0.0 is published and
@@ -173,21 +167,15 @@ yourself** (or the one under your install prefix's `lib/vst3`). A project in
 another DAW that used it will report the plugin as missing. Tangent still
 hosts VST3 plugins on every platform, and LV2 on Linux and FreeBSD.
 
-**Settings from 4.x are cleared.** Before 5.0, Tangent kept its settings in
-`~/.config/ivory/` (on Windows, `%USERPROFILE%\.config\ivory`). 5.0 uses
-`~/.config/tangent/` and **deletes the old folder the first time it
-starts**, without reading it. That folder held your settings, the chord
-names you taught Tangent, and your supporter key. Your projects and
-recordings were never in it and are not touched.
+**Settings from 4.x do not carry over.** 5.0 keeps its settings in
+`~/.config/tangent/` and does not read the ones 4.x kept: your settings, the
+chord names you taught Tangent and your supporter key start fresh. Your
+projects and recordings are not touched.
 
 - **Enter your supporter key again:** right-click anywhere, Support
   Tangent..., paste it, Activate. It is in the email it first came in. If
   you cannot find that email, reply to your Gumroad receipt and it will be
   sent again.
-- To keep chord names you taught 4.x, copy the `ivory` folder somewhere
-  safe **before you start 5.0 for the first time**; the file that holds
-  them is `overrides.json`. Bringing it back into 5.0 has not been tested
-  on every 4.x version, so keep the copy until you have checked.
 
 **Files saved by 5.0 do not open in older versions.** The first time 5.0
 saves over a settings file, a project or a template written by an earlier

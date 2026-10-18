@@ -1,11 +1,11 @@
 # The 4.4.0 announcement email
 
 Draft for the people who already hold a supporter key. Sent from
-`keys@ivorymidi.com` via Resend, the same way 3.0.0 went out. Gumroad still
+`keys@tangentdaw.org` via Resend, the same way 3.0.0 went out. Gumroad still
 refuses customer email below a payout.
 
-`keys@ivorymidi.com` **can send but cannot receive**, so Reply-To must be a
-real inbox or every reply disappears silently.
+The sender address of that time **could send but not receive**, so Reply-To
+must be a real inbox or every reply disappears silently.
 
 ## Read this before sending
 
@@ -126,7 +126,7 @@ cd tools/tangent-fulfil                                        # 2. DRY RUN firs
 cargo run -- announce --subject "Tangent 4.4 writes down what you play" \
   --body /tmp/body.txt --ledger ~/ledger.jsonl
 
-RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
+RESEND_API_KEY=... MAIL_FROM='Tangent <keys@tangentdaw.org>' \
   REPLY_TO='ganten7@gmail.com' \
   cargo run -- announce --subject "Tangent 4.4 writes down what you play" \
     --body /tmp/body.txt --ledger ~/ledger.jsonl --send      # 3. and only then

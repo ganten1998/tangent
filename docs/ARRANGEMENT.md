@@ -1057,7 +1057,7 @@ channels play back their clips and nothing else. "Ready to play" and
   no redist, no app-local DLLs, no installer step. The bundled
   `tangent-ffmpeg.exe` is BtbN's mingw-static build and needs no
   redist either. And the NSIS installer wears the app's own logo now:
-  `MUI_ICON`/`MUI_UNICON` point at the same `ivory.ico` build.rs
+  `MUI_ICON`/`MUI_UNICON` point at the same `tangent.ico` build.rs
   embeds into the exe, so the setup, the app, and the Add/Remove
   entry are one mark instead of NSIS's placeholder.
 

@@ -1,16 +1,16 @@
-# Ivory 2.0 — Design
+# Tangent 2.0 — Design
 
-Rust rewrite of Ivory (MIDI keyboard monitor with chord detection). Goals, in
-priority order:
+Rust rewrite of Tangent (MIDI keyboard monitor with chord detection). Goals,
+in priority order:
 
-1. **UI/UX parity** with the last working Python mac build (`ivory.py`,
+1. **UI/UX parity** with the last working Python mac build (its main script,
    PySide6, v1.1.0) — same look, same behaviors, same settings file.
 2. **Solidified chord engine** — the Python engine's *intended* behavior with
    every documented bug fixed and every edge case pinned by tests
    (per-bug policy in `DIVERGENCES.md`).
 3. **Teachable chord naming** — exact voicing overrides ship in 2.0; the
    learned re-ranker became a user-facing option in 2.1.0 (D-UI-9). The
-   `learning` cargo feature is always enabled by the `ivory` GUI crate, so
+   `learning` cargo feature is always enabled by the `tangent` GUI crate, so
    every packaged binary carries it, and it stays inert (adjustment exactly
    0.0) until the user turns Chord Learning on.
 4. **Sellable** under pay-what-you-can: clean licensing (bundled Courier
@@ -19,18 +19,18 @@ priority order:
 5. **Clean and lean** — two crates, no speculative abstractions, minimal deps.
 
 Reference specs live in `docs/spec/` (extracted and machine-verified from the
-Python source at `~/Dropbox/Archive/Ivory`). The prior Rust attempt
-(`ivory-rust`) was audited; its `tangent-core` is the engine base (42 green
-tests), and its GUI was kept for reference in `docs/reference/` until that
-folder was deleted (git history keeps it). This design was adversarially
-reviewed by a three-lens critic panel; decisions below are post-review.
+Python 1.x source archive, outside this repo). The prior Rust attempt was
+audited; its `tangent-core` is the engine base (42 green tests), and its GUI
+was kept for reference in `docs/reference/` until that folder was deleted (git
+history keeps it). This design was adversarially reviewed by a three-lens
+critic panel; decisions below are post-review.
 
 ## Workspace
 
 ```
-ivory/
-├── Cargo.toml            workspace: tangent-core, ivory
-├── tangent-core/           pure engine — no GUI deps, fully testable
+tangent/
+├── Cargo.toml            workspace: tangent-core, tangent
+├── tangent-core/         pure engine — no GUI deps, fully testable
 │   └── src/
 │       ├── lib.rs        public API: ChordDetector, Detection, prefs
 │       ├── patterns.rs   chord patterns (95 − 2 hygiene deletions, D14),
@@ -39,7 +39,7 @@ ivory/
 │       ├── naming.rs     pitch-class → note names, display formatting
 │       └── overrides.rs  teach layer (exact overrides; re-ranker behind
 │                         the `learning` cargo feature)
-├── ivory/                GUI binary
+├── tangent/              GUI binary
 │   └── src/
 │       ├── main.rs       entry, single-instance, CLI, panic-hook dialog
 │       ├── app.rs        eframe App: layout, timers, resize mechanics
@@ -50,8 +50,8 @@ ivory/
 │       ├── midi.rs       midir thread → mpsc, auto-connect priority chain
 │       ├── settings.rs   ~/.config/tangent/settings.json — Python-compatible
 │       └── fonts.rs      embed Courier Prime (two families), custom font
-├── tangent/build.rs        Windows-only: icon + version resource (winres)
-├── assets/               ivory.png (128×128), ivory.ico, ivory.desktop, fonts/{CourierPrime-*.ttf, OFL.txt}
+├── tangent/build.rs      Windows-only: icon + version resource (winres)
+├── assets/               tangent.png (128×128), tangent.ico, tangent.desktop, fonts/{CourierPrime-*.ttf, OFL.txt}
 ├── tests/                golden corpus + differential harness
 ├── scripts/              build-macos.sh, build-cross.sh, build-linux-native.sh (navi pattern)
 └── docs/                 DESIGN.md, DIVERGENCES.md, RELEASE.md, spec/
@@ -99,7 +99,7 @@ ivory/
   `~/.config/tangent/overrides.json` (schema versioned; also carries
   `learning_mode` — Python never touches this file).
 - **Learned re-ranker (cargo feature `learning`; since 2.1.0 always enabled
-  by the `ivory` GUI crate, and OFF at runtime until the user turns it on)**:
+  by the `tangent` GUI crate, and OFF at runtime until the user turns it on)**:
   online perceptron re-scorer over candidate features (pattern class,
   root-vs-bass interval, span, note count, cluster flag, inversion);
   corrections are training examples; bounded adjustment (±100 against raw
@@ -118,12 +118,12 @@ ivory/
   Taught Chords...` (list + delete), placed inside the detection block
   after Detach/Attach with their own separator.
 
-## GUI (`ivory` crate)
+## GUI (`tangent` crate)
 
 - **Stack**: eframe/egui 0.35, glow backend, x11+wayland features, **no
   eframe persistence** (settings.json is the sole geometry/state
-  authority). `rfd` for pre-event-loop native message boxes ("Ivory
-  Already Running", MIDI errors, panic-hook "Ivory Error" dialog). midir
+  authority). `rfd` for pre-event-loop native message boxes ("Tangent
+  Already Running", MIDI errors, panic-hook "Tangent Error" dialog). midir
   0.11, dirs 6, fd-lock 4.
 - **Window mechanics**: fixed-size; on any size change send
   `ViewportCommand::{MinInnerSize, MaxInnerSize, InnerSize}` together
@@ -144,7 +144,7 @@ ivory/
   close_requested → save height, clear detached flag (that IS
   close-to-reattach). Width-sync: 100ms debounce (restarted on changes),
   fires `InnerSize(main_width, last_known_height)` when |Δw| > 5px.
-  Min size 300×100; title "Ivory". A first-milestone spike confirms a
+  Min size 300×100; title "Tangent". A first-milestone spike confirms a
   second glow viewport renders cleanly on macOS before the full build-out.
   **Gone (2026-10-04):** nothing has detached since 4.82.0, and round five of
   the 2026-10-02 audit removed this window, the other three popouts, their
@@ -187,18 +187,19 @@ ivory/
 - **Lifecycle**: single instance via fd-lock (same dialog + exit UX).
   macOS Cmd+Q runs the same shutdown as window close (MIDI thread stopped,
   detached viewport closed, settings saved). Note: README/marketing claims
-  of Ctrl+D/C/W shortcuts are stale — ivory.py has none; do not "restore".
+  of Ctrl+D/C/W shortcuts are stale — the Python main script has none; do
+  not "restore".
 - **Windows specifics**: `#![windows_subsystem = "windows"]`; build.rs
   (target-gated) embeds icon + version via winres; AttachConsole on launch
   from a terminal so `-l`/`-p` output still prints (navi pattern).
 
 ## Packaging & release
 
-- `scripts/build-macos.sh`: release build → `Ivory.app` (bundle id
-  `com.github.ganten7.ivory`, .icns from icon asset) → always ad-hoc
+- `scripts/build-macos.sh`: release build → `Tangent.app` (bundle id
+  `org.codeberg.ganten1998.tangent`, .icns from icon asset) → always ad-hoc
   `codesign --force --deep -s -` → zip + DMG, both wrapping a staging folder
-  that holds `Ivory.app` + `READ-ME-FIRST.md` (since 2.1.0). OFL.txt + LICENSE +
-  THIRD-PARTY-LICENSES in Contents/Resources.
+  that holds `Tangent.app` + `READ-ME-FIRST.md` (since 2.1.0). OFL.txt +
+  LICENSE + THIRD-PARTY-LICENSES in Contents/Resources.
 - `scripts/build-cross.sh`: navi-proven — `cargo zigbuild` for
   x86_64/aarch64 Linux (glibc 2.32 floor) → tar.gz with .desktop, icon,
   license files; `cargo xwin` for Windows x86_64 → zip. `.deb` (with
@@ -212,7 +213,7 @@ ivory/
   notarization (macOS 15+ has no right-click-Open bypass — practical
   blocker for distributing to strangers; $99/yr decision), Windows
   SmartScreen note for unsigned exes, MIT-retention implications for
-  pay-what-you-can, the Synthogy "Ivory" trademark-collision note, the icon
+  pay-what-you-can, the old name's trademark-collision note, the icon
   note (the 543-byte PNG is the ORIGINAL 128×128 art, byte-identical to the
   Python app's — small, so it upscales soft; explicitly NOT a gate), and the
   settings one-way caveat.
@@ -249,8 +250,8 @@ anywhere public.
 
 **2.1.0.** The single authority is `[workspace.package] version` in the root
 `Cargo.toml`; both crates inherit it, the build scripts read it, and the About
-dialog renders `env!("CARGO_PKG_VERSION")` (ivory/src/dialogs.rs). 2.0.0 was
-the new major (new implementation language, teach layer); 2.1.0 made Chord
+dialog renders `env!("CARGO_PKG_VERSION")` (tangent-ui/src/dialogs.rs). 2.0.0
+was the new major (new implementation language, teach layer); 2.1.0 made Chord
 Learning a user-facing option (D-UI-9). The Python line ends at 1.1.0. About
 dialog per D-UI-6. Nothing in the 2.x line has been publicly released yet —
 the newest tags are the Python-era `v1.0.0` / `v1.1`.

@@ -192,17 +192,6 @@ program, so what it connects to is up to its maker.
 
 ## A note on the name
 
-Tangent was called **Ivory** until 2.3.0. For a while the rename was surface
-deep, and this file used to claim the internals would never follow, so that
-nobody's settings would be orphaned. That stopped being true in 5.0, which
-finished the job deliberately: the crates are `tangent-*`, the macOS bundle
-identifier is Tangent's own, and configuration moved to `~/.config/tangent/`.
-5.0 treats the old `~/.config/ivory/` directory as a clean break rather than
-migrating it, and removes it at first launch; 5.0 was also the point where
-projects, desks and themes made the old files historical. What survives of
-"ivory" in the source (some type names, the `IVORY_*` developer switches) is
-internal and on its way out.
-
 The clavichord's tangent is the brass blade at the back of each key. It
 strikes the string and stays in contact with it for as long as the note
 sounds, which is what the display does with a held note.

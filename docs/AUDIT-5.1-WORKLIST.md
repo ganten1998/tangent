@@ -78,10 +78,11 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 - [ ] **W15 · `docs/RELEASE.md` is the stalest doc in the repo and it is the release checklist.**
   Old product name in the title, "ad-hoc signed only" (contradicted for many releases), old artifact
   names, and a trademark gate about the *previous* name. Following it ships the wrong thing.
-- [ ] **W16 · "That does not look like an Ivory supporter key."** `license.rs:96, :102, :106` — the
-  first thing a new supporter sees when a paste goes wrong.
-- [ ] **W17 · Store copy names the wrong sender.** `STORE-CONTENT.md:174` tells buyers the key
-  arrives from `keys@ivorymidi.com`.
+- [X] **W16 · The key-paste error named the old product.** `license.rs:96, :102, :106` — the
+  first thing a new supporter sees when a paste goes wrong. *(2026-08-31, 99c658ee: it says "a
+  Tangent supporter key", and a test holds it there.)*
+- [X] **W17 · Store copy names the wrong sender.** `STORE-CONTENT.md:174` tells buyers the key
+  arrives from the old sender domain. *(2026-08-31, 2cf184b5: it names keys@tangentdaw.org.)*
 - [ ] **W18 · `vst3_locations()` points FreeBSD at a path the scanner excludes.** `dialogs.rs:2222`
   else-arm names `/usr/lib/vst3`; `scan.rs:158` deliberately excludes it. Never mentions LV2, which
   on FreeBSD is the only format that exists.
@@ -130,8 +131,9 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 - [ ] **W33 · Ledger backup stale since 11 August**, Dropbox-only (violating the keygen tool's own
   threat model), and the folder still carries the old name.
 - [ ] **W34 · Fulfilment runbook drifted from the service.** `SETUP.md` step 4 says
-  `fly volumes create ivory_data`; `fly.toml` mounts `tangent_data`. Following the runbook stands up
-  a service whose ledger is ephemeral. Confirm the historical ledger rode across the rename.
+  `fly volumes create` with the pre-rename volume name; `fly.toml` mounts `tangent_data`.
+  Following the runbook stands up a service whose ledger is ephemeral. Confirm the historical
+  ledger rode across the rename.
 - [ ] **W35 · Double-minting bug.** `tangent-fulfil/src/main.rs:113` uses `?` on a per-line parse
   *inside* the loop, so one blank or malformed row makes every later sale look unfulfilled and mint
   a second key. The sibling function skips bad lines deliberately.
@@ -201,8 +203,9 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   warning-free (it emits ~670, or 998 with `--all-targets`, mostly one cosmetic lint it enabled
   itself), claims 33 unwraps against 242, and cites version 2.1.0. `cargo fmt --check` is 2,169
   hunks against a documented 171.
-- [ ] **W60 · The rename is incomplete in code.** `IvoryApp` (164 refs), `IVORY_*` env vars,
-  `rustfmt.toml:1` "Ivory formatting config", `tests/golden/README.md`.
+- [X] **W60 · The rename is incomplete in code.** The app struct (now `TangentApp`), the
+  old-prefix env vars (now `TANGENT_*`), `rustfmt.toml:1`'s old-name header,
+  `tests/golden/README.md`. *(2026-10-18: all four are done.)*
 - [ ] **W61 · Stray tracked files:** `docs/FREEBSD-5.0-FINDINGS.md-e`,
   `tangent-record/examples/rtlatency.rs-e`, four `Cargo.toml.orig` under vendor/.
 - [ ] **W62 · ~25 dead items**, including `fn luma` defined twice and dead in both
@@ -214,7 +217,7 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   telemetry (deliberate), no update check (deliberate), **no contact address anywhere in the app**,
   no issue link in the README, and no purchase link in the Supporter Key dialog.
 - [X] **W65 · Settings migrations 0–18 are now unreachable.** DECIDED KEEP 2026-08-31 (migrate_from doc says why). The only place a pre-19 file could live
-  was the directory `purge_pre_5_0` deletes unread. Decide whether to keep them.
+  was the 4.x directory, which 5.x never reads. Decide whether to keep them.
 - [ ] **W66 · `main.rs:524` says plugin editors are not implemented on Windows and Linux.** False on
   all four platforms — and that false premise is what keeps those platforms on the glow renderer.
   Re-evaluate the renderer choice once the comment is corrected.

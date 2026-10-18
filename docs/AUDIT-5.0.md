@@ -159,7 +159,7 @@ Everything structural is missing: no web/Chromebook build (Chromebook fleets dom
 
 ## 4. Proprietary Candidates
 
-**The governing fact, verified on disk:** the entire repo is MIT (LICENSE, © 2025-2026 Ganten) — including the chord engine (`tangent-core/src/detector.rs`, `patterns.rs`, `overrides.rs`), the golden corpus (`tests/golden/corpus.json`), the acceptance contract (`tangent-core/tests/acceptance.rs`, `examples/diffcorpus.rs`), the keygen/fulfilment tools (`tools/tangent-keygen`, `tools/tangent-fulfil`), and Factory Bank 01 (`ivory/assets/Tangent-01-Tines-and-Boxes.syx`). MIT is irrevocable for everything already shipped. "Becoming proprietary" can therefore only mean: (a) *future* work kept out of the repo, (b) assets that never enter it, (c) non-copyright moats (trademark, services, private keys). `LICENSING.md`'s trademark section covers only Steinberg's VST mark; there is **no Tangent trademark claim anywhere**.
+**The governing fact, verified on disk:** the entire repo is MIT (LICENSE, © 2025-2026 Ganten) — including the chord engine (`tangent-core/src/detector.rs`, `patterns.rs`, `overrides.rs`), the golden corpus (`tests/golden/corpus.json`), the acceptance contract (`tangent-core/tests/acceptance.rs`, `examples/diffcorpus.rs`), the keygen/fulfilment tools (`tools/tangent-keygen`, `tools/tangent-fulfil`), and Factory Bank 01 (`tangent/assets/Tangent-01-Tines-and-Boxes.syx`). MIT is irrevocable for everything already shipped. "Becoming proprietary" can therefore only mean: (a) *future* work kept out of the repo, (b) assets that never enter it, (c) non-copyright moats (trademark, services, private keys). `LICENSING.md`'s trademark section covers only Steinberg's VST mark; there is **no Tangent trademark claim anywhere**.
 
 Candidates, ranked by value-per-goodwill:
 
@@ -801,7 +801,7 @@ Versions **4.30–4.42** have no doc-level changelog; from release-commit messag
 
 # UI Surface Catalog — views, dialogs, every shortcut (Q6, manual material)
 
-# Tangent (Ivory) UI Catalog - every view, control, dialog, shortcut, and mouse gesture
+# Tangent UI Catalog - every view, control, dialog, shortcut, and mouse gesture
 
 Sources: `tangent-ui/src/` - `keys.rs`, `recorder_panel.rs`, `mixer_panel.rs`, `arrangement_panel.rs`, `midi_editor.rs`, `drumpad_panel.rs`, `dialogs.rs`, `settings.rs`, `chord_strip.rs`, `theory_panel.rs`, `fretboard_panel.rs`, `staff.rs`, `piano.rs`, `menu.rs`, plus gesture handlers in `app.rs`. All paths relative to `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/`.
 
@@ -1357,7 +1357,7 @@ Communication is exec + command-line args + byte pipes (raw BGRA in, rgba out). 
 
 ### Two more repo facts that matter
 
-- The `ivory` repo **is public on GitHub** (`github.com/ganten1998/tangent` returns 200 unauthenticated; Codeberg copy is private). That makes LGPL relink/source obligations for the app satisfiable by pointing at the repo.
+- The repo **is public on GitHub** (`github.com/ganten1998/tangent` returns 200 unauthenticated; Codeberg copy is private). That makes LGPL relink/source obligations for the app satisfiable by pointing at the repo.
 - `docs/RECORDER-PLAN.md` (lines 1091-1140) contains an earlier analysis that *rejected* bundling GPL ffmpeg and analyzed openh264 (including why Cisco's patent grant does not cover a self-compiled openh264). The shipped 4.x implementation went the other way (GPL sidecar); the two documents now disagree and 5.0 should reconcile them.
 
 ## Part 2: What the licenses actually require
@@ -1684,11 +1684,11 @@ From Microsoft's own doc: no published threshold, no consumer submission process
 - **The installer** carries the Mark-of-the-Web and is what SmartScreen judges at download/run time. Must be signed.
 - **The inner app .exe** must also be signed: Microsoft's guidance is "sign every release / all of your files"; Smart App Control checks **all** executables regardless of download origin; unsigned inner binaries also trip AV heuristics and look wrong in Task Manager/firewall prompts. ([SmartScreen doc](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation))
 - **The NSIS uninstaller** is a third binary, generated at build time. NSIS 3.08+ handles all of this cleanly: sign the app exe first, then use `!uninstfinalize 'signtool ... "%1"'` for the uninstaller and `!finalize 'signtool ... "%1"'` for the installer itself ([NSIS wiki: Signing an Uninstaller](https://nsis.sourceforge.io/Signing_an_Uninstaller), [external signing variant](https://nsis.sourceforge.io/Signing_an_Uninstaller_externally)). Order: sign inner exe -> makensis (uninstfinalize fires) -> sign outer installer.
-- Practical note for your cross-build: Artifact Signing's supported signing paths run on Windows (signtool + dlib) or CI (GitHub Actions `azure/trusted-signing-action`). Since Ivory's Windows exe is cross-built on the Mac, the realistic flow is either a signing step on the Windows canary box (sign exe, rebuild/sign installer there) or a small GitHub Actions Windows job that signs the three binaries. `!finalize`/`!uninstfinalize` only work where signtool can run, so if makensis runs on macOS, plan to assemble/sign on Windows instead.
+- Practical note for your cross-build: Artifact Signing's supported signing paths run on Windows (signtool + dlib) or CI (GitHub Actions `azure/trusted-signing-action`). Since Tangent's Windows exe is cross-built on the Mac, the realistic flow is either a signing step on the Windows canary box (sign exe, rebuild/sign installer there) or a small GitHub Actions Windows job that signs the three binaries. `!finalize`/`!uninstfinalize` only work where signtool can run, so if makensis runs on macOS, plan to assemble/sign on Windows instead.
 
 ## 7. macOS: yes, settled
 
-Developer ID signing + notarization + stapling is the complete, final story for direct distribution on macOS in 2026. Nothing new is required; Gatekeeper accepts notarized+stapled apps without warnings. You already do this for Ivory/Tangent. No action.
+Developer ID signing + notarization + stapling is the complete, final story for direct distribution on macOS in 2026. Nothing new is required; Gatekeeper accepts notarized+stapled apps without warnings. You already do this for Tangent. No action.
 
 ## 8. Recommendation
 
@@ -1703,7 +1703,7 @@ Developer ID signing + notarization + stapling is the complete, final story for 
 4. Assign yourself the **Artifact Signing Identity Verifier** role, then create an **Individual / Public** identity validation. Complete the AU10TIX flow: email PIN, phone, photo of government ID, face check, Verified ID in Microsoft Authenticator.
 5. Create a **Public Trust certificate profile** bound to that identity.
 6. Assign the **Artifact Signing Certificate Profile Signer** role to whatever identity signs (you, or a service principal for CI).
-7. Wire signing into the Windows-side build: sign `ivory.exe` (signtool + Artifact Signing dlib + `metadata.json`, or `azure/trusted-signing-action` in CI), build the NSIS installer with `!uninstfinalize` and `!finalize` invoking the same signing command, upload the signed installer to Gumroad.
+7. Wire signing into the Windows-side build: sign `tangent.exe` (signtool + Artifact Signing dlib + `metadata.json`, or `azure/trusted-signing-action` in CI), build the NSIS installer with `!uninstfinalize` and `!finalize` invoking the same signing command, upload the signed installer to Gumroad.
 8. Expect the "unrecognized app" prompt for the first weeks of sales; tell early buyers it's expected and shows your verified name. It fades and never returns for later releases.
 
 **The do-nothing consequence, plainly:** every buyer who pays you $0-50 hits an Edge download warning followed by a full-screen "Windows protected your PC" block with "Unknown publisher," where the run-anyway path is deliberately hidden behind "More info." A meaningful fraction of non-technical buyers will conclude your paid software is malware, refund, or email support instead; buyers on Smart App Control machines or locked-down PCs may be unable to run it at all; and because unsigned reputation is per-file-hash, this repeats from zero on **every update you ship, forever**. For ~$10/month that entire failure mode goes away.
@@ -1738,20 +1738,20 @@ Developer ID signing + notarization + stapling is the complete, final story for 
 
 # FreeBSD Portability Catalog
 
-# FreeBSD-port worklist — platform-seam sweep of the ivory workspace
+# FreeBSD-port worklist — platform-seam sweep of the Tangent workspace
 
 Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (all paths below are absolute). Assumed FreeBSD runtime: cpal's ALSA host via the alsa-lib-over-OSS shim, X11 (no Wayland), V4L2 via webcamd, ffmpeg from ports. Verified against the locked crate versions in `Cargo.lock` (cpal 0.16.0, midir 0.11.0, rfd 0.15.4, winit 0.30.13).
 
 Two upstream facts frame everything:
 
 - **cpal 0.16.0 explicitly supports FreeBSD** and selects the ALSA host there (`~/.cargo/registry/.../cpal-0.16.0/src/platform/mod.rs:595-597, 721-723` gate on `linux|dragonfly|freebsd|netbsd`). So every `#[cfg(target_os = "linux")]` in this repo that really means "the cpal ALSA backend" is a trap: FreeBSD gets ALSA's *semantics* but falls into the *else* arm written for macOS.
-- **midir 0.11.0 has NO FreeBSD backend at all** — its backend table (`midir-0.11.0/src/backend/mod.rs`) covers windows/macos/ios/linux/wasm/android plus a `jack` feature; on FreeBSD without `--features jack` no backend module is declared and the crate **fails to compile**. This alone stops the whole `ivory` binary from building.
+- **midir 0.11.0 has NO FreeBSD backend at all** — its backend table (`midir-0.11.0/src/backend/mod.rs`) covers windows/macos/ios/linux/wasm/android plus a `jack` feature; on FreeBSD without `--features jack` no backend module is declared and the crate **fails to compile**. This alone stops the whole `tangent` binary from building.
 
 ---
 
 ## A. Hard build breaks (the port does not compile until these are fixed)
 
-### A1. midir has no FreeBSD backend — `ivory` crate fails to build
+### A1. midir has no FreeBSD backend — `tangent` crate fails to build
 - `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/Cargo.toml:93` — `midir = "0.11"`, unconditional.
 - On FreeBSD: no cfg arm in midir's backend table matches → missing types/modules → compile error in midir itself.
 - Options: (a) build midir with its `jack` feature (needs libjack from ports; JACK is healthy on FreeBSD); (b) vendor-patch midir to widen its ALSA arm to FreeBSD — **but** note the linux backend uses the ALSA *sequencer* API, and FreeBSD's alsa-lib shim sits over OSS; whether `snd_seq_*` works through it needs a runtime probe before committing to that route.
@@ -1898,7 +1898,7 @@ The repeating pattern for the fix pass: nearly every `target_os = "linux"` gate 
 
 # Release Machinery Findings
 
-# Release machinery review (read-only) — ivory/Tangent, toward a paid 5.0
+# Release machinery review (read-only) — Tangent, toward a paid 5.0
 
 Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (all `file:line` refs below are relative to it). Current `Cargo.toml` version: **4.92.0**. `dist/` currently holds the 4.92 set: macOS universal zip+dmg, Windows setup.exe, Linux x86_64 tarball, `Tangent.app` — **no .pkg, no Windows zip, no SHA256SUMS**.
 
@@ -1942,7 +1942,7 @@ Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (a
 
 ### 8. Settings migrations: upgrade path is solid; downgrade-then-upgrade is destructive
 - **Where:** `tangent-ui/src/settings.rs:38` (`SETTINGS_VERSION = 19`), `:2986-2989` (every save unconditionally re-stamps with the **running build's** version), `:2346` (v15 migration flips `lpf_mix = 1.0 - lpf_mix`, non-idempotent), `:2359-2367` (v18 pad-seat move: re-running takes now-empty seats and overwrites seats 48..63, wiping user-placed pad inserts).
-- **What's good for 5.0:** fresh install with no file skips migration cleanly (`load()`, :1391-1398); unreadable files are renamed aside, not overwritten (:1418-1424); unknown keys survive round-trips via `extra`; the Windows uninstaller deliberately preserves `%USERPROFILE%\.config\ivory` (`tangent.nsi:147-149`) — taught chords and the supporter key survive uninstall/reinstall. Upgrade 4.x → 5.0 is well covered.
+- **What's good for 5.0:** fresh install with no file skips migration cleanly (`load()`, :1391-1398); unreadable files are renamed aside, not overwritten (:1418-1424); unknown keys survive round-trips via `extra`; the Windows uninstaller deliberately preserves `%USERPROFILE%\.config\tangent` (`tangent.nsi:166-186`) — taught chords and the supporter key survive uninstall/reinstall. Upgrade 4.x → 5.0 is well covered.
 - **The risk:** a buyer who keeps an old build around (old installer on disk, second machine, portable copy) launches old-then-new: the old build re-stamps the file to its lower version, and the new build then **re-runs** migrations 15..19 against an already-migrated file — the low-pass dial audibly inverts and pad inserts get cleared. Plausible in a paid population that hoards installers.
 - **Fix direction:** never lower the stamp — in `from_map` keep `max(file_stamp, SETTINGS_VERSION)` around (e.g. carry a higher-than-known stamp through `extra` or a dedicated field) so a newer file passing through an older build keeps its version. That's a change for 5.0's settings.rs, cheap now, impossible to retrofit into builds already shipped.
 - **Process note:** if any default changes for 5.0, SETTINGS_VERSION must bump to 20 — the freeze rules in the file are good, just don't ship a default change without the bump.
@@ -1952,7 +1952,7 @@ Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (a
 - **Fix direction:** add a running-process check (FindWindow / `tasklist` loop) in `.onInit`; delete known files/subdirs explicitly instead of `RMDir /r $INSTDIR`, or at least verify `$INSTDIR` looks like a Tangent install (tangent.exe present) before recursing.
 
 ### 10. docs/RELEASE.md misdescribes the current artifact set
-- **Where:** `docs/RELEASE.md:230-239` — artifact table still says `Ivory-<v>-*` names, lists the Windows zip as a deliverable, and has no row for the .pkg or setup.exe; `:269-271` step 5 says build-cross.sh "emits the Windows zip" (it deletes it); `:283` step 6 says `open dist/Ivory.app`; `:295-298` step 9's alias examples name the zip. The procedure never mentions `build-installer.sh` (either platform).
+- **Where:** `docs/RELEASE.md:230-239` — artifact table still says the pre-rename artifact names, lists the Windows zip as a deliverable, and has no row for the .pkg or setup.exe; `:269-271` step 5 says build-cross.sh "emits the Windows zip" (it deletes it); `:283` step 6 opens the pre-rename app bundle in `dist/`; `:295-298` step 9's alias examples name the zip. The procedure never mentions `build-installer.sh` (either platform).
 - **Why:** this is the checklist the 5.0 release will be driven from; every stale line is a chance to reproduce findings 1-3 by following instructions.
 - **Fix direction:** rewrite the table to the 5.0 deliverable set (pkg, setup.exe, tarball, macOS zip/dmg, SHA256SUMS) and add build-installer steps with the sums-ordering constraint from finding 3.
 

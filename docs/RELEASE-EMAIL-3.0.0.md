@@ -1,11 +1,11 @@
 # The 3.0.0 announcement email
 
 Draft for the people who have already bought a supporter key. Send from
-`keys@ivorymidi.com` via Resend, the same way the 2.3.0 note went out — Gumroad
-still refuses customer email below a payout or $100 in sales.
+`keys@tangentdaw.org` via Resend, the same way the 2.3.0 note went out —
+Gumroad still refuses customer email below a payout or $100 in sales.
 
-`keys@ivorymidi.com` can send but cannot receive, so **Reply-To must be a real
-inbox** or a reply disappears.
+The sender address of that time could send but not receive, so **Reply-To
+must be a real inbox** or a reply disappears.
 
 **Send it AFTER the release is published.** Every link below resolves by exact
 asset name against whatever release is currently latest, so they 404 until the
@@ -81,7 +81,7 @@ sed -n '/^Hello,$/,/^Ganten$/p' docs/RELEASE-EMAIL-3.0.0.md > /tmp/body.txt
 cd tools/tangent-fulfil                                       # 2. DRY RUN first
 cargo run -- announce --subject "..." --body /tmp/body.txt --ledger ~/ledger.jsonl
 
-RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
+RESEND_API_KEY=... MAIL_FROM='Tangent <keys@tangentdaw.org>' \
   cargo run -- announce --subject "..." --body /tmp/body.txt \
     --ledger ~/ledger.jsonl --send                          # 3. and only then
 ```

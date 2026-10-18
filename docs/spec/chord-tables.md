@@ -1,6 +1,6 @@
 # Chord Detector Data Tables — Lossless Extraction Spec
 
-Source: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/chord_detector.py` (2153 lines, all read).
+Source: `chord_detector.py` in the Python 1.x archive (2153 lines, all read).
 Purpose: transcribe to Rust WITHOUT consulting the Python.
 
 **Counts (verify after transcription):**

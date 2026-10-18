@@ -59,13 +59,13 @@ counted. Do not rewrite history to tidy burnt numbers away.
    on drift.
 
 3. **The name is Tangent everywhere a buyer looks.** The old trademark gate
-   here was about "Ivory" colliding with Synthogy Ivory; the 2.3.0 rename
-   retired that collision, and reviving the old name in copy is the only way
-   to get it back. New marketing text, release notes and store edits say
-   Tangent. The Gumroad short link and the download names were the last
-   places the old name survived, and neither does now: the Gumroad permalink
-   is `/l/tangent` (the old one redirects to it), and `publish-github.sh` no
-   longer uploads the pre-rename asset names.
+   here was about the old name colliding with a commercial piano instrument;
+   the 2.3.0 rename retired that collision, and reviving the old name in copy
+   is the only way to get it back. New marketing text, release notes and store
+   edits say Tangent. The Gumroad short link and the download names were the
+   last places the old name survived, and neither does now: the Gumroad
+   permalink is `/l/tangent` (the old one redirects to it), and
+   `publish-github.sh` no longer uploads the pre-rename asset names.
 
 4. **Store links resolve.** See the last section; the check is
    `scripts/check-store-links.sh` and the rule is publish, check, paste,

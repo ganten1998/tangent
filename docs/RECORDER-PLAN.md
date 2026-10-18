@@ -45,7 +45,7 @@ defect**: see §10 item 6.
 | Every panel is a pure painter | **Yes, and this is the fact the compositor is built on.** `piano::draw`, `chord_strip::draw`, `fretboard_panel::draw` and `theory_panel::draw` all take `&egui::Painter` + `Rect` and paint absolutely. **None of them allocates a widget.** So the same code can paint the 88-key piano into a 1920×1080 offscreen surface at video resolution with no changes at all. §6. |
 | The layout can absorb a 16:9 band | **No.** `band_sizes_at` (`app.rs:1724-1745`) makes every height a fixed fraction of the width. Full-width 16:9 at w=1300 is **731 pt tall**, larger than the entire app at maximum (632). Nothing clamps total height against the monitor; the window is `with_resizable(false)` (`main.rs:214`). The preview must be letterboxed into a width-proportional band via `Painter::image`'s `uv` argument, so the camera's aspect never reaches the window. |
 | `Caps` has a field that covers recording | No. `persist_global_settings` is about `~/.config/tangent/settings.json` specifically; conflating it with "may write a 2 GB video into Movies" is exactly the mistake `host.rs:13-16` warns against. New fields needed. Blast radius is **2 consts plus 1 test** — there are no other `Caps` literals in the tree. |
-| `rfd` can be called from `tangent-ui` | No, and the firewall says so. Use the `take_pending_*` request pattern that `pending_resize` already establishes (`app.rs:150-152, 383-386`), not a blocking trait call. *Corrected by review:* only `main.rs:188` and `:252` are outside the event loop — `:138` is inside the **panic hook**, so it fires wherever the panic does, overwhelmingly inside `IvoryApp::frame`. And the request pattern alone does not move a modal out of the egui pass, because eframe calls `App::update` from inside `egui_ctx.run`. See the §14 row. |
+| `rfd` can be called from `tangent-ui` | No, and the firewall says so. Use the `take_pending_*` request pattern that `pending_resize` already establishes (`app.rs:150-152, 383-386`), not a blocking trait call. *Corrected by review:* only `main.rs:188` and `:252` are outside the event loop — `:138` is inside the **panic hook**, so it fires wherever the panic does, overwhelmingly inside `TangentApp::frame`. And the request pattern alone does not move a modal out of the egui pass, because eframe calls `App::update` from inside `egui_ctx.run`. See the §14 row. |
 | The macOS build can access a camera | **No, and it fails silently.** `scripts/build-macos.sh:217-218` signs with `--options runtime` and **passes no `--entitlements` at all** — `grep -rn "entitlement"` over the repo returns zero hits, and `codesign -d --entitlements -` on the shipped 3.0.0 bundle prints no entitlements dictionary. Without `com.apple.security.device.camera` the request is refused with **no prompt and no System Settings row**. Separately, a missing `NSCameraUsageDescription` is not a denial — TCC **kills the process**. |
 | `cargo run` is a valid camera test on macOS | **No.** TCC attributes a child process's request to the responsible ancestor, so `cargo run` from Ghostty is checked against *Ghostty's* Info.plist and *Ghostty's* grant. The dev loop must be build-the-`.app`, sign with entitlements, `open` it. Budget for this. |
 | Raw frames now, encode at stop | **Not a design, a bug.** One 20-minute 1080p30 take is **112 GB** as NV12 and needs 89 MiB/s sustained. Encode-while-recording is the only viable shape: ~1.5 MB/s to disk and the file is finished when Stop is pressed. |
@@ -123,14 +123,14 @@ touches it.
 
 ```toml
 [workspace]
-members  = ["tangent-core", "tangent-ui", "ivory", "tangent-record", "tangent-host"]
+members  = ["tangent-core", "tangent-ui", "tangent", "tangent-record", "tangent-host"]
 exclude  = ["plugin"]
 resolver = "2"
 ```
 
 ### `tangent-record` — capture, clock, encode, mux, files
 
-Depended on **only** by `ivory`. It owns everything platform and everything
+Depended on **only** by `tangent`. It owns everything platform and everything
 real-time:
 
 | module | what |
@@ -227,7 +227,7 @@ the Windows cross-build.
 Separate from `tangent-record` on purpose. It is the largest risk in the feature,
 it is the only part that loads foreign code into the process, and keeping it a
 separate crate means it can be cut, feature-gated, or moved out of process
-without touching the recorder. Depended on only by `ivory`.
+without touching the recorder. Depended on only by `tangent`.
 
 ```toml
 vst3  = "0.3"      # MIT OR Apache-2.0, pre-generated bindings, no libclang
@@ -642,7 +642,7 @@ Two rules that are not obvious:
   `Arc<RawMidiTap>` field, cloned into each `connect_by_name` closure. Switching
   ports drops the old connection and makes a new closure holding a clone of the
   *same* `Arc`, so a port switch mid-session does not lose the ring or the
-  controller-state snapshot. **This is entirely inside the `ivory` crate** —
+  controller-state snapshot. **This is entirely inside the `tangent` crate** —
   `MidiPorts` and `tangent-ui` do not change.
 - Add `input.ignore(Ignore::TimeAndActiveSense)` at `midi.rs:54`. Keeps SysEx,
   drops the ~300 ms Active Sensing heartbeat that would otherwise dominate the
@@ -696,7 +696,7 @@ hoped: commit `eac5a93` added the theory band with exactly this edit set and
 touched no size test.
 
 **Zeroing the band under `Caps::PLUGIN` needs no signature changes.** Clear
-`show_recorder` on the local `settings` copy in `IvoryApp::new(ctx, mut
+`show_recorder` on the local `settings` copy in `TangentApp::new(ctx, mut
 settings, caps)`, exactly as `app.rs:257-260` already clears
 `chord_window_detached` and `fretboard_detached`. Every plugin path goes through
 it (`plugin/src/lib.rs:194`, `tangent/src/desktop.rs:92`, and the test helper at
@@ -951,7 +951,7 @@ window, **with no changes to any of them**.
 
 **Rewritten after review**, which correctly found that the first draft gave the
 compositor no crate, no module, and no route to the state it must paint. Every
-field of `IvoryApp` is private (`app.rs:130-232`) and every helper that produces
+field of `TangentApp` is private (`app.rs:130-232`) and every helper that produces
 a draw argument is a private `fn` — `display_notes` (`:595`), `theory_input`
 (`:627`), `barre_to_draw` (`:549`), `heart_color` (`:762`). From outside
 `tangent-ui` there was nothing to paint.
@@ -1899,7 +1899,7 @@ a 10.73 MB zip), the entire recorder plus plugin host is on the order of
 **a few hundred KB of our own code**. Tangent goes from ~21 MB to ~22 MB.
 
 **Measured end to end once both variants existed:** `cargo build --release -p
-ivory` is **10.42 MB** and `--no-default-features` is **10.40 MB**. The Full
+tangent` is **10.42 MB** and `--no-default-features` is **10.40 MB**. The Full
 build is **16 KB larger than Minimal.**
 
 Stated honestly, because the number will move: that is with the clock, the SMF
@@ -1952,7 +1952,7 @@ tangent-record = { path = "../tangent-record", optional = true }
 tangent-host   = { path = "../tangent-host",   optional = true }
 ```
 
-**`#[cfg(feature = ...)]` goes in the `ivory` binary crate and NOWHERE else.**
+**`#[cfg(feature = ...)]` goes in the `tangent` binary crate and NOWHERE else.**
 That is not a preference; `tangent-ui` has a standing rule against feature cfgs
 (PLUGIN-PLAN §1) precisely because they are the seed of the two-GUI fork the
 egui 0.33 pin exists to prevent. So:
@@ -1977,7 +1977,7 @@ egui 0.33 pin exists to prevent. So:
   `!caps.capture_devices` (§5), so the layout, the geometry tests and the menu
   gating all work unchanged. The menu row is absent rather than inert, which is
   the same rule the plugin follows.
-* **The `ivory` binary** does not link `cpal`, `vst3`, `objc2-av-foundation` or
+* **The `tangent` binary** does not link `cpal`, `vst3`, `objc2-av-foundation` or
   any camera code in a Minimal build. The exclusion is the compiler's, not a
   flag's — which is the same argument the `tangent-ui` firewall rests on.
 
@@ -2031,7 +2031,7 @@ the megabyte.
 | App notarizes, launches, finds no camera, reports nothing | The entitlements file. Assert its presence in `release.sh` with `codesign -d --entitlements -`. |
 | Launch breaks on macOS 11–13 after the camera lands | objc2 emits macOS-14 device-type statics as non-weak imports. Link only 10.15 symbols; build 14+ type strings at runtime. |
 | The **recorder band** makes the window taller than the screen | The band's height stays a pure function of width and the camera aspect is absorbed by `Painter::image`'s `uv` — 200 pt instead of 731. Assert it in the existing `app.rs` geometry tests. **Scoped by review:** this bounds the recorder's own contribution, not the stack's total, and nothing in the tree bounds the total. At 200% with theory and fretboard on, **shipped 3.0.0 is already 1264 pt tall** with no recorder at all. That is a pre-existing gap this feature discloses rather than introduces, and closing it (clamp `window_size_percent` against `monitor_size`) is its own small change that should not be smuggled in here. |
-| `NSOpenPanel` is raised from inside an egui pass | *Corrected by review — the first draft's mechanism was wrong.* eframe calls `App::update` from **inside** `egui_ctx.run` (`native/epi_integration.rs:273-282`), so draining a request in `impl eframe::App for DesktopApp` after `self.0.frame(ctx)` returns is **still inside the egui pass**. The request pattern is still right for keeping `tangent-ui` free of `rfd`, but it does not by itself move the modal out of the frame. Use `rfd::AsyncFileDialog` and deliver the result back over a channel, so nothing blocks the main thread inside `run`. (Also correct the §0 row: `main.rs:138`'s dialog is in the **panic hook**, which fires wherever the panic does — overwhelmingly inside `IvoryApp::frame`. Only `:188` and `:252` are genuinely outside the loop. It survives today because with no parent set, rfd 0.15.4 routes it to the out-of-process `CFUserNotificationDisplayAlert` rather than a nested `NSRunLoop`.) |
+| `NSOpenPanel` is raised from inside an egui pass | *Corrected by review — the first draft's mechanism was wrong.* eframe calls `App::update` from **inside** `egui_ctx.run` (`native/epi_integration.rs:273-282`), so draining a request in `impl eframe::App for DesktopApp` after `self.0.frame(ctx)` returns is **still inside the egui pass**. The request pattern is still right for keeping `tangent-ui` free of `rfd`, but it does not by itself move the modal out of the frame. Use `rfd::AsyncFileDialog` and deliver the result back over a channel, so nothing blocks the main thread inside `run`. (Also correct the §0 row: `main.rs:138`'s dialog is in the **panic hook**, which fires wherever the panic does — overwhelmingly inside `TangentApp::frame`. Only `:188` and `:252` are genuinely outside the loop. It survives today because with no parent set, rfd 0.15.4 routes it to the out-of-process `CFUserNotificationDisplayAlert` rather than a nested `NSRunLoop`.) |
 | The plugin build gains a camera | Band height must be exactly 0 when `!caps.capture_devices`, or `fit_bands` shrinks the piano for a band the plugin never draws. Test it under `Caps::PLUGIN`. |
 | 20-minute takes drift by ~60 ms | The `(1+ε)` map, and Test A's assertion **at t=1200 s specifically**. An assertion only at t=0 passes on a broken pipeline. |
 | A `.mid` with hanging notes or a stuck pedal | The stop sequence in §7, counter-based held tracking keyed on `(channel, key)`, and the explicit tests. |

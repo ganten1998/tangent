@@ -678,6 +678,8 @@ The code itself is careful and the decision is argued. The failure is that it is
 source comments**.
 *Close it:* copy `license.key` forward before the delete (six lines), and write the upgrade note
 into the CHANGELOG, the release notes and the store page.
+*Closed 2026-10-18 the other way, by the owner's ruling: the purge is gone, so a launch now leaves
+the 4.x folder alone, read by nothing and deleted by nothing.*
 
 **B3. A corrupt project opens as a silent empty one, and four code paths then overwrite it.**
 Found during this audit; it was not in scope for any of the nine sweeps. `from_json` returns a
