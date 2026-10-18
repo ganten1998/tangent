@@ -294,6 +294,21 @@ fn section_air(ui: &egui::Ui, live: &FaceLive) -> f32 {
     ((ui.available_height() - floor_cost(ui, live)) / seams).clamp(0.0, GROUP_AIR)
 }
 
+/// **The word the band prints on the dial the pointer names**, read off the
+/// band's own source, where it is private (`recorder_panel`'s
+/// `PITCH_LABEL`). The pointer's line and the app's notice are held to it,
+/// so both name the dial a hand will find on the band, and a rename there
+/// fails their tests by name instead of leaving them pointing at a word the
+/// band no longer prints.
+#[cfg(test)]
+pub(crate) fn the_bands_word_for_its_pitch_dial() -> &'static str {
+    const AT: &str = "const PITCH_LABEL: &str = \"";
+    let src = include_str!("recorder_panel.rs");
+    let from = src.find(AT).map(|at| at + AT.len()).expect("the band no longer declares its PITCH_LABEL");
+    let len = src[from..].find('"').expect("the band's PITCH_LABEL never closes its quote");
+    &src[from..from + len]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,9 +1076,12 @@ mod tests {
     /// nothing under the hand. A press on either line is the ask to be taken
     /// there; a press on Rate's slider, directly above it, is Rate's.
     ///
-    /// The band's own spelling of the dial is held as well, off its source,
-    /// so a band that renamed it would leave this line pointing at a word
-    /// nobody can find and fail here by name.
+    /// The second line's words are ruled, and both halves of them are held:
+    /// the line itself, spelled in full, so a reworded pointer fails here by
+    /// name; and the dial in it, against the word the band prints on the
+    /// dial, read off the band's own source, so a band that renamed it
+    /// would leave this line pointing at a word nobody can find and fail
+    /// here by name as well.
     #[test]
     fn the_transport_section_points_at_tape_start_and_stop() {
         use crate::motor::StartStop;
@@ -1077,9 +1095,15 @@ mod tests {
             start_stop_line(Some(StartStop::new(true, 1.25, 10.0))),
             "Start and stop: 1.25 s up, 10 s down"
         );
-        assert!(
-            include_str!("recorder_panel.rs").contains("const PITCH_LABEL: &str = \"PITCH CONT\";"),
-            "the band no longer prints its dial as PITCH CONT, and the pointer says {START_STOP_WHERE:?}"
+        assert_eq!(
+            START_STOP_WHERE, "set on the PITCH CONT dial",
+            "the pointer's second line is not the ruled one"
+        );
+        let dial = the_bands_word_for_its_pitch_dial();
+        assert_eq!(
+            START_STOP_WHERE,
+            format!("set on the {dial} dial"),
+            "the band prints its dial as {dial:?}, and the pointer says {START_STOP_WHERE:?}"
         );
 
         let st = style();

@@ -69875,7 +69875,11 @@ mod tests {
     /// there the press opens nothing and says where the setting is instead,
     /// once however often it is pressed (a note the same as one standing is
     /// refreshed, never stacked), and leaves the face up: a face that closed
-    /// on a press that opened nothing would be a door into a wall.
+    /// on a press that opened nothing would be a door into a wall. Where is
+    /// the band, by the menu's name for it, and a right-click on its dial, by
+    /// the word the band prints on the dial, which is read off the band's
+    /// own source, so a renamed dial fails here by name rather than leaving
+    /// the notice sending a hand to a word it cannot find.
     #[test]
     fn the_tape_faces_pointer_opens_the_range_its_setting_lives_in() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -69917,6 +69921,13 @@ mod tests {
         );
         let said = app.said().notes().iter().filter(|n| n.text == START_STOP_ON_THE_BAND).count();
         assert_eq!(said, 1, "two presses with the band hidden said where the setting is {said} times");
+        let dial = crate::faces_tape::the_bands_word_for_its_pitch_dial();
+        assert!(
+            START_STOP_ON_THE_BAND.contains("Recorder band")
+                && START_STOP_ON_THE_BAND.contains(&format!("right-click its {dial} dial")),
+            "the notice does not send the hand to the Recorder band and a right-click on its {dial} dial: \
+             {START_STOP_ON_THE_BAND:?}"
+        );
     }
 
     /// **A Tape in a pedal seat closes only its own window on the way
