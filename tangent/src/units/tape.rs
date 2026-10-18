@@ -1,10 +1,13 @@
-//! A record/repro tape path, after the Tascam 388 at its fixed 7½ IPS.
+//! A record/repro tape path: a quarter-inch two-track at four speeds.
 //!
-//! Eight tracks on quarter-inch tape is under a sixteenth of an inch each, and
-//! the narrow track at a middling speed is the whole voicing: a top end that
-//! the spec sheet stops quoting a hair under 16 kHz, a head bump low around
-//! 70 Hz, hiss a person can actually hear, and a transport whose wow is part
-//! of why anybody still wants one.
+//! The machine is a servo-capstan studio two-track with 2 mm tracks on a
+//! high-output mastering tape, NAB equalised, its bias at the recommended
+//! over-bias, its heads new and its transport inside its published spec. It
+//! runs at 3.75, 7.5, 15 and 30 inches per second, and each speed is its own
+//! machine ([`TapeSpeed`]): the head bump sits an octave higher with every
+//! doubling, slower tape saturates sooner and loses its treble sooner, and
+//! each speed's top end stops where studio machines are specified. A fresh
+//! tape opens at 15 ips, lined up at the tape's datasheet level.
 //!
 //! # An insert, not an echo
 //!
@@ -24,23 +27,30 @@
 //! written — the freshly-magnetised domains sit in the write field long enough
 //! to be turned back. The result is program-dependent treble loss: hit the
 //! machine hard and the attack loses its 8 kHz before it loses any level at
-//! all. That is why a snare through a 388 sounds rounded rather than turned
+//! all. That is why a snare hit hard onto tape sounds rounded rather than turned
 //! down, and it is a thing no gain element — no compressor — can do, because a
 //! gain element takes the same decibels from every band. Here it is a
 //! dual-rate envelope follower on the record level driving a one-pole corner
 //! downward, and the test proves the band ratio a gain could not produce.
+//! The loss is a short-wavelength one, so it lives in wavelength: the same
+//! record level costs a slow tape far more of its top than a fast one, and
+//! the corner and its floor move with the speed ([`ERASE_TOP_HZ`]). At rest
+//! the stage is an exact wire at every speed.
 //!
 //! # Signal flow
 //!
-//! sub roll (one-pole high-pass, the transformer bottom) → record, at four
-//! times the session rate: bias-linearised tanh with the refused flux fed
-//! back, then the repro line-up trim → HF self-erasure (the envelope-driven
+//! The input transformer (a one-pole high-pass at [`TRANSFORMER_HZ`]) → the
+//! NAB record shelf → record, at four times the session rate: a
+//! bias-linearised tanh with the refused flux fed back → the repro line-up →
+//! the NAB shelf's exact inverse → HF self-erasure (the envelope-driven
 //! corner above) → the tape: a short Hermite-interpolated play head swayed by
 //! wow and flutter whose depths are themselves noise-modulated, plus a
-//! whisper of scrape → repro EQ: head-bump peak and HF roll → shaped hiss,
-//! level-tracked → output trim. The `drive` knob is also the record level,
-//! and the repro trim that follows it is the machine's line-up, not a knob;
-//! the only trim a person turns is on the way out.
+//! whisper of scrape → the head's own top → the hiss, level-tracked → the
+//! head contour: the bump, its dip an octave above, and the head's low-end
+//! roll-off → Roll → output trim. The `drive` knob is the record level, as
+//! the speed's own headroom scales it, and the repro trim that follows it is
+//! the machine's line-up, not a knob; the only trim a person turns is on the
+//! way out.
 //!
 //! # Why the record stage runs at four times the rate
 //!
@@ -74,19 +84,21 @@
 
 // ── what a person can change ────────────────────────────────────────────────
 
-/// The six knobs. Defaults are the shipped sound: a track of the machine at a
-/// healthy record level, not a bypass and not a caricature.
+/// The controls, in id order: the six 5.0 shipped, then the ones appended
+/// after them. Defaults are a fresh machine: lined up, healthy, at the studio
+/// speed, not a bypass and not a caricature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TapeParams {
     /// Record level into the saturation, and with it how hard the
-    /// self-erasure leans on attacks. **0 is the wire** — a record level's
-    /// "off" is the bottom of its travel, not the middle of it — and the
-    /// shipped 0.6 is the machine at a healthy 0 VU. See [`DRIVE_TANH`].
+    /// self-erasure leans on attacks. **0 is the wire**: a record level's
+    /// "off" is the bottom of its travel, not the middle of it. A fresh tape
+    /// opens at 0.5, the datasheet alignment, where at 15 ips the 3 %
+    /// distortion point sits about 10 dB over 0 VU. See [`DRIVE_TANH`].
     pub drive: f32,
     /// How much head bump. 0 is flat; see [`BUMP_DB`].
     pub bump: f32,
-    /// How much high end the repro chain gives up. 0 is out of circuit; see
-    /// [`ROLL_HZ`].
+    /// How much high end a worn head gives up, on top of the speed's own top.
+    /// 0 is out of circuit, and a fresh tape opens there; see [`ROLL_HZ`].
     pub roll: f32,
     /// Wow and flutter together, one master. 0 parks the play head; see
     /// [`WOW_DEPTH_MS`].
@@ -96,23 +108,32 @@ pub struct TapeParams {
     pub hiss: f32,
     /// Output trim. 0.5 is unity; see [`TRIM_DB`].
     pub trim: f32,
+    /// The tape speed, a selector of four ([`TapeSpeed`]). A fresh tape runs
+    /// at 15 ips.
+    pub speed: f32,
 }
 
 impl Default for TapeParams {
     fn default() -> Self {
         Self {
-            // A healthy 0 VU: the peaks round audibly, the body does not.
-            drive: 0.6,
-            // +2.5 dB at 70 Hz, which is the machine's own figure.
+            // The high-output tape's datasheet alignment (the owner's
+            // ruling): at 15 ips the 3 % distortion point sits about 10 dB
+            // over 0 VU and a 0 VU tone carries a quarter of a percent of
+            // third harmonic, so programme peaking ten over the needle meets
+            // the shoulder while the body stays clean.
+            drive: 0.5,
+            // +2.5 dB on the contour's bell, which at 15 ips sits near 35 Hz.
             bump: 0.5,
-            // Parks the repro corner where the spec sheet stops, just under
-            // 16 kHz.
-            roll: 0.12,
+            // Out of circuit: each speed has its own top end now, and Roll
+            // is what a worn head takes on top of it.
+            roll: 0.0,
             // Present on sustained piano, invisible on speech.
             wobble: 0.3,
             // Audible in the gaps if you listen for it, like the real thing.
             hiss: 0.25,
             trim: 0.5,
+            // The studio speed.
+            speed: TapeSpeed::Ips15.dial(),
         }
     }
 }
@@ -120,8 +141,9 @@ impl Default for TapeParams {
 #[cfg(test)]
 impl TapeParams {
     /// Every colour off: the record level at the bottom of its travel, no
-    /// bump, no roll, a parked head, silent tape, unity trim. The recipe the
-    /// neutrality tests here and at the seat spell out, in one place.
+    /// bump, no roll, a parked head, silent tape, unity trim, at the studio
+    /// speed. The recipe the neutrality tests here and at the seat spell
+    /// out, in one place.
     pub(crate) const NEUTRAL: TapeParams = TapeParams {
         drive: 0.0,
         bump: 0.0,
@@ -129,7 +151,74 @@ impl TapeParams {
         wobble: 0.0,
         hiss: 0.0,
         trim: 0.5,
+        speed: TapeSpeed::Ips15.dial(),
     };
+}
+
+/// **The tape speed**, a selector of four, in inches per second.
+///
+/// Each speed is its own machine. Everything the tape does in length is the
+/// same at every speed (the head bump's wavelength, self-erasure's shortest
+/// wavelengths, the head's gap), so in hertz it moves an octave with every
+/// doubling; the curve takes more level at a faster speed ([`DMOL_DB`]); and
+/// each speed has its own top end ([`HEAD_TOP_EDGE_HZ`]). A change of speed
+/// glides the voicing over [`SPEED_GLIDE_MS`] and never moves the track in
+/// time or bends its pitch: record and playback run at the same speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapeSpeed {
+    Ips3_75,
+    Ips7_5,
+    Ips15,
+    Ips30,
+}
+
+/// How many positions the speed selector has. A literal so `builtin_fx`'s
+/// table can stay `const`; a test there pins it to [`TapeSpeed::ALL`].
+pub const TAPE_SPEED_STEPS: i32 = 4;
+
+impl TapeSpeed {
+    /// Selector order, and therefore the order every persisted value and the
+    /// face's cycling row use. Frozen at four: append-only, like the ids.
+    pub const ALL: [TapeSpeed; 4] = [
+        TapeSpeed::Ips3_75,
+        TapeSpeed::Ips7_5,
+        TapeSpeed::Ips15,
+        TapeSpeed::Ips30,
+    ];
+
+    /// What the panel calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            TapeSpeed::Ips3_75 => "3.75 ips",
+            TapeSpeed::Ips7_5 => "7.5 ips",
+            TapeSpeed::Ips15 => "15 ips",
+            TapeSpeed::Ips30 => "30 ips",
+        }
+    }
+
+    /// The speed in inches per second.
+    pub fn ips(self) -> f64 {
+        match self {
+            TapeSpeed::Ips3_75 => 3.75,
+            TapeSpeed::Ips7_5 => 7.5,
+            TapeSpeed::Ips15 => 15.0,
+            TapeSpeed::Ips30 => 30.0,
+        }
+    }
+
+    /// Decode the normalised dial: four positions across the travel, nearest
+    /// wins, the convention every selector in the suite uses.
+    pub fn from_dial(v: f32) -> Self {
+        let last = (Self::ALL.len() - 1) as f32;
+        let at = ((v.clamp(0.0, 1.0) * last).round() as usize).min(Self::ALL.len() - 1);
+        Self::ALL[at]
+    }
+
+    /// Where this speed sits on the 0..=1 dial: the inverse of
+    /// [`TapeSpeed::from_dial`], so a default can be written as a speed.
+    pub const fn dial(self) -> f32 {
+        self as usize as f32 / (TapeSpeed::ALL.len() - 1) as f32
+    }
 }
 
 // ── the voicing ─────────────────────────────────────────────────────────────
@@ -154,7 +243,7 @@ const DESIGN_RATE: f32 = 44_100.0;
 /// machine uses — line the repro amplifier up so the alignment tone comes
 /// back at the level it went in at, and let everything hotter than the tone
 /// pay the compression, which is the effect. What the dial costs now is in
-/// [`sat_makeup`]'s own note, pinned by a test at the shipped default. The
+/// [`sat_makeup`]'s own note, pinned by a test at a fresh tape's Drive. The
 /// shoulder sits at `x ≈ 1/d`: at the bottom of the travel that is +20 dBFS,
 /// which nothing can reach, and at the top it is −26 dBFS, which is under
 /// where a track's BODY sits. Bias is why the curve is a smooth tanh at all:
@@ -176,23 +265,24 @@ const DESIGN_RATE: f32 = 44_100.0;
 /// or hotter, where the knob DID work, so nothing here saw it.
 ///
 /// The bottom of the travel is untouched, so "0 is a wire" still means what it
-/// said. The top now reaches the saturation the unit is named after at the
-/// level people actually record at: the same sweep runs to 17 % and tilts the
-/// band by 8 dB, the shipped position rounds a −6 dBFS peak by several percent
-/// and pulls its top to around 4 kHz while leaving the body alone, and full
-/// travel is a machine being slammed.
+/// said. The top reaches the saturation the unit is named after at the level
+/// people actually record at: on the 7.5 ips machine 5.0 shipped, the same
+/// sweep ran to 17 % and tilted the band by 8 dB, its 0.6 rounded a -6 dBFS
+/// peak by several percent and pulled its top to around 4 kHz while leaving
+/// the body alone, and full travel was a machine being slammed.
 ///
-/// # What the range change did to saved values, and why nothing migrates it
+/// # What a saved Drive means now, and why nothing migrates it
 ///
-/// The dial persists as its raw 0..=1 position under a state header that did
-/// not change with it, so a `drive` saved by a build from before this reads
-/// back as a hotter record level: the old top, `d = 4`, now sits at 0.696 of
-/// the travel (`ln(10·4)/ln(200)`, the new mapping inverted), and a stored
-/// 1.0 that used to mean 1.5 % distortion means 21.9 % today. That is
-/// deliberate and it is stated in the changelog rather than migrated,
-/// because this unit has never appeared in a tagged build — there is no
-/// session in the world holding the old meaning. The day one ships, this
-/// paragraph becomes a migration instead.
+/// The dial persists as its raw 0..=1 position under a state header that has
+/// not changed, and this range is the one 5.0 shipped, so a saved Drive still
+/// names the same `d`. What moved under it is the machine: `d` is the record
+/// level at 7.5 ips, and each speed scales it by its own headroom
+/// ([`DMOL_DB`]), so a session from 5.0 or 5.1, which opens at 15 ips, records
+/// 2.3 dB cooler at the same dial, and 7.5 ips gives it back its old curve.
+/// By the owner's ruling that is stated in the changelog rather than
+/// migrated: an old session meets the new machine at its saved dials. Its
+/// Drive and Roll keep their saved values, too, because a state blob writes
+/// every symbol; only a fresh tape opens at the new defaults.
 const DRIVE_TANH: (f32, f32) = (0.1, 20.0);
 
 /// How much of the flux the tape refused comes back one SESSION sample later.
@@ -321,25 +411,69 @@ const OS_LATENCY: usize = (OS_A_TAPS - 1) / 2 + (OS_B_TAPS - 1) / 4;
 /// not to be a volume control.
 const ALIGN_DBFS: f64 = -18.0;
 
-/// The record chain's bottom, as a one-pole high-pass corner in hertz.
+/// The input transformer's bottom, as a one-pole high-pass corner in hertz.
 ///
-/// Input transformers and the head's own low-end limit: nothing below the
-/// mid-30s comes back off a narrow track, and letting it into the saturation
-/// just wastes headroom on rumble.
-const SUB_ROLL_HZ: f32 = 35.0;
+/// It keeps DC and subsonics out of the saturation, where they would only
+/// spend headroom. The low end a person hears is the head's, which moves
+/// with the speed ([`BUMP_WAVELENGTH_MM`]): studio two-tracks are within
+/// 2 dB down to 20 Hz at 15 ips, so the transformer sits well under that.
+const TRANSFORMER_HZ: f64 = 10.0;
 
-/// Where the self-erasure corner sits with nothing on the tape, in hertz.
+/// The NAB record shelf: its zero in hertz and its low-frequency lift at
+/// each speed in dB, slowest first, undone exactly after the tape.
 ///
-/// Above the audio band on purpose: at rest the stage is a wire. As the
-/// record level rises the corner falls by [`ERASE_OCTAVES`], and the audible
-/// "16 kHz-and-falling" tape top arrives around a quarter of full level.
-const ERASE_TOP_HZ: f32 = 22_000.0;
+/// NAB's 3180 µs record boost, capped at the 3 to 4 dB shelf that practice
+/// recommends, is how the low end goes onto the tape: the long wavelengths
+/// reach the curve that much hotter, so a bass note saturates sooner than a
+/// midrange one at the same level, and the playback side takes the lift back
+/// off with the shelf's exact inverse. 30 ips is AES-equalised, which has no
+/// such term, so its shelf is a wire. Both run at the session rate; they are
+/// low-frequency stages, so the alias guarantee is untouched.
+const NAB_ZERO_HZ: f64 = 62.9;
+const NAB_SHELF_DB: [f64; 4] = [4.0, 4.0, 4.0, 0.0];
 
-/// How far the corner falls, in octaves per unit of record-level envelope,
-/// and the floor it can never pass. Two octaves at full level puts a slammed
-/// track's top near 5 kHz, which is what a pinned VU meter sounds like.
-const ERASE_OCTAVES: f32 = 2.0;
-const ERASE_FLOOR_HZ: f32 = 2_500.0;
+/// How much more level each speed takes before it saturates, relative to
+/// 7.5 ips, in dB, slowest first.
+///
+/// The curve is the 7.5 ips machine's, and the dial's `d` is that speed's
+/// record level. A faster tape writes the same flux over a longer wavelength
+/// and takes more of it before its 3 % distortion point: the datasheets put
+/// 15 ips 2.0 to 2.5 dB over 7.5, and 30 ips a little over that. So each
+/// speed divides `d` by its figure; 3.75 ips is the step to 15 mirrored,
+/// which no datasheet quotes. **No cap:** the dial's top at 3.75 ips asks the
+/// curve for `d` = 26.1, and the alias guarantee is stated for exactly that
+/// (`full_drive_on_a_high_note_does_not_fold_the_band_back_on_itself`), so
+/// Drive has no dead travel at any speed.
+const DMOL_DB: [f64; 4] = [-2.3, 0.0, 2.3, 2.7];
+
+/// Where the self-erasure corner falls to at each speed, in hertz, slowest
+/// first, and how fast it falls with the record level.
+///
+/// The corner is `TOP / (2^(k e) - 1)` for the record-level envelope `e`,
+/// clamped at [`ERASE_CLAMP`], with `k` octaves of [`ERASE_OCTAVES`]: at rest
+/// it is infinitely high and the stage an exact wire at every speed, and as
+/// the level rises it falls, steeply at a slow speed and hardly at all at a
+/// fast one. Fitted to where the datasheets put the 10 kHz compression point
+/// against 1 kHz's: 7.5 to 9.5 dB lower at 7.5 ips, 1.5 to 2 at 15 and 1 to
+/// 1.5 at 30 (`slower_tape_saturates_its_treble_first_as_the_datasheets_say`).
+const ERASE_TOP_HZ: [f64; 4] = [10_000.0, 16_000.0, 100_000.0, 200_000.0];
+const ERASE_OCTAVES: f64 = 3.0;
+const ERASE_CLAMP: f64 = 1.4;
+
+/// The longest wavelength self-erasure may reach, in micrometres: its corner
+/// never falls below the frequency that is this long on the tape.
+///
+/// Self-erasure is a short-wavelength loss, and its corner may not reach the
+/// long wavelengths the line-up tone and the music's body live at. 76.2 µm
+/// is 2.5 kHz at 7.5 ips, the floor 5.0 shipped, made a wavelength: 1.25,
+/// 2.5, 5 and 10 kHz at the four speeds. It never binds where the 10 kHz
+/// compression point is measured.
+const ERASE_FLOOR_UM: f64 = 76.2;
+
+/// How many points each speed's self-erasure table holds, evenly spaced in
+/// the envelope from 0 to [`ERASE_CLAMP`]. [`Tape::new`] designs the corner's
+/// one-pole at every point, so the audio thread only ever interpolates.
+const ERASE_POINTS: usize = 129;
 
 /// The dual rates of the envelope that drives the corner.
 ///
@@ -401,23 +535,56 @@ const WANDER_SLEW_S: f32 = 0.1;
 const SCRAPE_MS: f32 = 0.000_5;
 const SCRAPE_BAND_HZ: (f32, f32) = (800.0, 3_000.0);
 
-/// The head bump: where and how much, as a single peaking biquad.
+/// The head's own top at each speed, slowest first: the band edge, in hertz,
+/// where a studio two-track's response is specified 2 dB down.
 ///
-/// A record head is a magnetic circuit with a physical length, and at the
-/// wavelength that matches it the response lifts. On this machine the lift
-/// is centred near 70 Hz and the service data calls it about +2.5 dB, which
-/// the knob's midpoint reproduces; full travel doubles it for effect.
-const BUMP_HZ: f64 = 70.0;
+/// The healthy residual spacing, the gap loss and the electronics, which a
+/// real machine is calibrated to at its nominal speed, as one matched
+/// one-pole per speed with its corner where it is 2 dB down at the edge the
+/// plus-or-minus-2-dB specifications quote: 10, 15.5, 21 and 25 kHz, which
+/// are corners of 13.1, 20.3, 27.5 and 32.7 kHz.
+const HEAD_TOP_EDGE_HZ: [f64; 4] = [10_000.0, 15_500.0, 21_000.0, 25_000.0];
+
+/// The head contour: the bump's wavelength and Q, the dip an octave above
+/// it, and the head's low-end roll-off.
+///
+/// A play head is a magnetic circuit with a physical length, and at the
+/// wavelength that matches it the response lifts: about 10.9 mm on studio
+/// heads, measured at two speeds, so the bump is a wavelength and its
+/// frequency is the speed over it, 8.7, 17.5, 35 and 70 Hz at the four
+/// speeds. An octave above it the response dips by about half the lift
+/// ([`DIP_SHARE`], between theory's 0.6 and one measured machine), and below
+/// it the head's response falls away, here a one-pole high-pass at
+/// [`HEAD_LF_SHARE`] of the bump frequency and never under
+/// [`HEAD_LF_FLOOR_HZ`]. The bump's size is [`BUMP_DB`] across its dial.
+const BUMP_WAVELENGTH_MM: f64 = 10.9;
 const BUMP_Q: f64 = 1.1;
+const DIP_Q: f64 = 1.4;
+const DIP_SHARE: f64 = -0.5;
+const HEAD_LF_SHARE: f64 = 0.4;
+const HEAD_LF_FLOOR_HZ: f64 = 4.0;
 pub const BUMP_DB: (f32, f32) = (0.0, 5.0);
 
 /// The repro HF roll, as a one-pole corner swept geometrically.
 ///
-/// Gap loss and spacing loss, the fixed part of playing back a narrow track.
-/// Zero is out of circuit; the default parks the corner just under 16 kHz,
-/// which is where this machine's own response quietly stops; full travel is
-/// a worn head that never saw a cotton swab.
+/// What a worn head and its spacing take from the top, on top of the speed's
+/// own top ([`HEAD_TOP_EDGE_HZ`]). Zero is out of circuit, and a fresh tape
+/// opens there; full travel is a worn head that never saw a cotton swab.
 pub const ROLL_HZ: (f32, f32) = (20_000.0, 2_500.0);
+
+/// How long a speed change takes, as the time constant of the glide every
+/// per-speed constant follows, in milliseconds.
+///
+/// A servo transport re-locks to a new speed in about a third of a second,
+/// and a 100 ms one-pole is 95 % of the way there in 0.3 s. Record and
+/// playback move together, so the change re-voices the machine without
+/// bending the pitch or moving the latency.
+const SPEED_GLIDE_MS: f64 = 100.0;
+
+/// How often the voicing is designed again while something glides, in
+/// frames. Counted from `new` or `clear` across every block, so a render
+/// redesigns on the same frames at any block size.
+const SUB_BLOCK: u64 = 32;
 
 /// The hiss shaper: three one-pole corners in hertz and their injection
 /// gains, plus a direct white term.
@@ -439,8 +606,8 @@ const PINK_WHITE: f64 = 0.184_8;
 /// **The floor is why silence still sounds like tape.** The tracker raises
 /// the hiss with the music — the machine's electronics and the tape's own
 /// modulation noise ride the level — and lets it fall back when the music
-/// stops, but never to nothing: a stopped mix on a 388 still has tape
-/// against the head. Squared knob taper, because ears meet noise in dB.
+/// stops, but never to nothing: a stopped machine still has tape against
+/// the head. Squared knob taper, because ears meet noise in dB.
 ///
 /// The level is the white source's scale at [`DESIGN_RATE`]; `process`
 /// rescales it so every other rate puts the same hiss in every hertz.
@@ -476,6 +643,19 @@ fn norm(x: f32) -> f32 {
         x.clamp(0.0, 1.0)
     } else {
         0.5
+    }
+}
+
+/// [`norm`] for a control appended after 5.0: a NaN reads as that control's
+/// own default rather than the midpoint, because for a selector the midpoint
+/// is a real position (15 ips is 2/3 of the speed dial) or worse, a
+/// rounding that picks one the dial never meant.
+#[inline]
+fn norm_or(x: f32, default: f32) -> f32 {
+    if x.is_finite() {
+        x.clamp(0.0, 1.0)
+    } else {
+        default
     }
 }
 
@@ -823,13 +1003,14 @@ impl OsChannel {
 /// See [`OS`] for why it runs at 4×, [`DRIVE_TANH`] for the curve and
 /// [`SAT_FB`] for the refusal: the value read at a sub-phase is the one that
 /// sub-phase left one session sample ago, read BEFORE it is written, which
-/// is the `z⁻¹` [`SAT_FB`] has always meant.
+/// is the `z⁻¹` [`SAT_FB`] has always meant. `inv_d` is `1 / d`, worked out
+/// once per frame by the caller rather than four times here.
 #[inline]
-fn record(st: &mut OsChannel, t: &OsTaps, err: &mut [f32; OS], d: f32, u: f32) -> f32 {
+fn record(st: &mut OsChannel, t: &OsTaps, err: &mut [f32; OS], d: f32, inv_d: f32, u: f32) -> f32 {
     let s4 = st.up(t, u);
     let mut w = [0.0_f32; OS];
     for ((w, s), e) in w.iter_mut().zip(s4).zip(err.iter_mut()) {
-        *w = (d * (s + SAT_FB * *e)).tanh() / d;
+        *w = (d * (s + SAT_FB * *e)).tanh() * inv_d;
         *e = flush(s - *w);
     }
     st.down(t, w)
@@ -852,18 +1033,19 @@ fn record(st: &mut OsChannel, t: &OsTaps, err: &mut [f32; OS], d: f32, u: f32) -
 /// music sits and nowhere else, which is the whole of its job: quieter than
 /// the tone rides up, hotter than the tone still pays, and the difference
 /// between those two IS the compression the dial exists to buy. Measured on a
-/// programme at the line-up level the dial now costs 0.27 dB at the shipped
-/// 0.6 and 1.71 dB at the very top, where before it cost 0.65 and 10.6. On
-/// FLAT white noise the same sweep still costs 1.4 dB and 5.6 — and that
-/// difference is the whole point: white noise puts a third of its energy
-/// above 8 kHz, where no tape has any, and what it is losing up there is the
-/// self-erasure taking the top off the band. That is a tone change, it is the
-/// effect the unit is named for, and a line-up that chased it would be
-/// undoing the thing it is meant to make audible.
+/// programme at the line-up level at 15 ips, the dial costs 0.07 dB at a
+/// fresh tape's 0.5 and 1.43 dB at the very top, where before there was a
+/// line-up the top cost over ten. On FLAT white noise the same sweep costs
+/// more, and that difference is the whole point: white noise puts a third of
+/// its energy above 8 kHz, where no tape has any, and what it is losing up
+/// there is the self-erasure taking the top off the band. That is a tone
+/// change, it is the effect the unit is named for, and a line-up that
+/// chased it would be undoing the thing it is meant to make audible.
 ///
-/// [`SAT_FB`] is deliberately absent from the calculation. Its entire purpose
-/// is to make the curve depend on what came before it, and a calibration that
-/// depended on the program would not be a calibration.
+/// This is the open-loop answer, the curve alone with [`SAT_FB`] left out.
+/// The table [`Tape::new`] fills corrects it for the refused flux the way a
+/// steady tone actually meets it; see [`sat_makeup_refused`] for that, and
+/// for why the correction is only ever allowed to fall.
 fn sat_makeup(d: f64) -> f32 {
     const STEPS: usize = 64;
     let amp = 10.0_f64.powf(ALIGN_DBFS / 20.0) * std::f64::consts::SQRT_2;
@@ -878,11 +1060,69 @@ fn sat_makeup(d: f64) -> f32 {
     (in_rms / out_rms.max(1.0e-12)) as f32
 }
 
+/// [`sat_makeup`] with the refused flux in it: the same quadrature over the
+/// line-up tone, each point the steady state of the feedback loop as a
+/// sustained tone meets it, `w = tanh(d ((1 + SAT_FB) x - SAT_FB w)) / d`.
+///
+/// Solved by Newton's method from the open-loop answer. The loop's slope,
+/// `1 + SAT_FB sech^2`, is bounded in `[1, 1 + SAT_FB]`, so the iteration
+/// converges from anywhere and eight steps land it to the last bit.
+///
+/// **Why the line-up needs it, and why only its running minimum.** The
+/// refused flux lifts a steady tone's output a little (the loop hands the
+/// curve back some of what it refused), so 5.0's open-loop line-up let a 0 VU
+/// tone come back up to 0.26 dB hot at high Drive, rising by up to 0.12 dB
+/// per tenth of the dial: a record level doubling as a volume control, on
+/// exactly the tone the line-up is meant to hold. This solve holds a steady
+/// tone exactly. But the lift fades on a sine in deep saturation faster
+/// than on a dense programme, so with the full correction a programme would
+/// rise on the dial's last step instead. The table takes the correction's
+/// running minimum from the bottom of the dial up: a factor that never rises
+/// with `d`, so a programme that was monotone under 5.0's line-up stays
+/// monotone, and a steady tone is held exactly up to where the lift peaks
+/// (`d` near 7) and falls a little beyond it. The correction reads -0.02,
+/// -0.09, -0.20 and -0.30 dB at `d` = 1, 2.4, 4.1 and 6.9, and holds -0.30
+/// from there up.
+fn sat_makeup_refused(d: f64) -> f64 {
+    const STEPS: usize = 64;
+    let fb = f64::from(SAT_FB);
+    let amp = 10.0_f64.powf(ALIGN_DBFS / 20.0) * std::f64::consts::SQRT_2;
+    let mut sum = 0.0_f64;
+    for i in 0..STEPS {
+        let th = std::f64::consts::FRAC_PI_2 * (i as f64 + 0.5) / STEPS as f64;
+        let x = amp * th.sin();
+        let mut w = (d * x).tanh() / d;
+        for _ in 0..8 {
+            let t = (d * ((1.0 + fb) * x - fb * w)).tanh();
+            w -= (w - t / d) / (1.0 + fb * (1.0 - t * t));
+        }
+        sum += w * w;
+    }
+    let out_rms = (sum / STEPS as f64).sqrt();
+    let in_rms = amp / std::f64::consts::SQRT_2;
+    in_rms / out_rms.max(1.0e-12)
+}
+
+/// The line-up table [`Tape::new`] fills: at each of [`MAKEUP_POINTS`] record
+/// levels, [`sat_makeup`] times the refused flux's correction, the
+/// correction replaced by its running minimum from the lowest level up. See
+/// [`sat_makeup_refused`].
+fn makeup_table() -> [f32; MAKEUP_POINTS] {
+    let mut held = 0.0_f64;
+    std::array::from_fn(|i| {
+        let d = makeup_d(i);
+        let open = f64::from(sat_makeup(d));
+        held = held.min(20.0 * (sat_makeup_refused(d) / open).log10());
+        (open * 10.0_f64.powf(held / 20.0)) as f32
+    })
+}
+
 /// How many record levels [`Tape::new`] solves the line-up at, evenly
 /// spaced in octaves of `d` across [`MAKEUP_D`].
 ///
 /// **A table, so the record level can move without a solve.** [`sat_makeup`]
-/// is 64 hyperbolic tangents in f64. Once a block that was affordable, but
+/// is 64 hyperbolic tangents in f64, and the refused flux's correction nine
+/// times that. Once a block that was affordable, but
 /// the line-up has to follow the record level wherever it goes, and a level
 /// that moves every frame cannot pay a quadrature every frame. 161 points
 /// are 0.065 of an octave apart, and linear interpolation between them
@@ -966,49 +1206,166 @@ fn tap(buf: &[f32], at: usize, delay: f32) -> f32 {
     hermite(buf[i0], buf[i1], buf[i2], buf[i3], frac)
 }
 
-/// One peaking biquad, transposed direct form II — the same form as
-/// `effects::Biquad`, which only knows low-pass and high-pass. Coefficients
-/// from the analog peaking prototype via the bilinear transform, designed in
-/// f64 because a 70 Hz centre at 96 kHz puts `cos w0` five decimals from 1.
-#[derive(Debug, Clone, Copy, Default)]
-struct Peak {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    z1: f32,
-    z2: f32,
+/// The matched one-pole low-pass for a corner of `fc` hertz: the `b` of
+/// `y = (1 - b) x + b y1` whose magnitude at `f_m = min(10 kHz, rate / 4)` is
+/// the analog one-pole's, with unity at DC.
+///
+/// **Matched, not mapped,** so a stage costs the same decibels at 10 kHz at
+/// every rate, which is where every top-end figure in this file is
+/// specified; a mapped corner near the top of the band would cost more at
+/// 44.1 kHz than at 96. An infinite corner is an exact wire (`b = 0`), and a
+/// blend of two of these stays in `[0, 1)`, so a table of them can be
+/// interpolated without ever going unstable. Design time only.
+fn matched_b(fc: f64, sample_rate: f64) -> f64 {
+    let fm = 10_000.0_f64.min(0.25 * sample_rate);
+    let g = 1.0 / (1.0 + (fm / fc).powi(2));
+    if 1.0 - g < 1.0e-9 {
+        return 0.0;
+    }
+    let p = 1.0 - g * (std::f64::consts::TAU * fm / sample_rate).cos();
+    (p - (p * p - (1.0 - g).powi(2)).max(0.0).sqrt()) / (1.0 - g)
 }
 
-impl Peak {
-    fn set(&mut self, sample_rate: f64, hz: f64, q: f64, db: f64) {
-        let a = 10.0_f64.powf(db / 40.0);
-        let w0 = std::f64::consts::TAU * (hz / sample_rate).clamp(1.0e-5, 0.49);
-        let alpha = w0.sin() / (2.0 * q);
-        let cs = w0.cos();
-        let a0 = 1.0 + alpha / a;
-        // At 0 dB the numerator and denominator are the same polynomial, so
-        // the section is exactly a wire — no epsilon bypass needed.
-        self.b0 = ((1.0 + alpha * a) / a0) as f32;
-        self.b1 = ((-2.0 * cs) / a0) as f32;
-        self.b2 = ((1.0 - alpha * a) / a0) as f32;
-        self.a1 = ((-2.0 * cs) / a0) as f32;
-        self.a2 = ((1.0 - alpha / a) / a0) as f32;
-    }
+/// A one-pole's coefficient in the topology-preserving (trapezoidal) form,
+/// `g / (1 + g)` with `g = tan(pi fc / rate)`: the bilinear transform warped
+/// at the corner, stable for any corner and any change of it.
+fn tpt_g(fc: f64, sample_rate: f64) -> f64 {
+    let g = (std::f64::consts::PI * (fc / sample_rate).min(0.49)).tan();
+    g / (1.0 + g)
+}
 
+/// A first-order section in its trapezoidal form: one state, a low-pass out
+/// of it and the high-pass as what the low-pass leaves.
+#[derive(Debug, Clone, Copy, Default)]
+struct OnePole {
+    s: f32,
+}
+
+impl OnePole {
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = flush(self.b1 * x - self.a1 * y + self.z2);
-        self.z2 = flush(self.b2 * x - self.a2 * y);
+    fn low(&mut self, x: f32, g: f32) -> f32 {
+        let v = (x - self.s) * g;
+        let y = v + self.s;
+        self.s = flush(y + v);
         y
     }
 
-    fn clear(&mut self) {
-        self.z1 = 0.0;
-        self.z2 = 0.0;
+    #[inline]
+    fn high(&mut self, x: f32, g: f32) -> f32 {
+        x - self.low(x, g)
     }
+}
+
+/// A first-order section's coefficients, `y = b0 x + s`, `s = b1 x - a1 y`
+/// (transposed direct form II, one state).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Section {
+    b0: f32,
+    b1: f32,
+    a1: f32,
+}
+
+impl Section {
+    const WIRE: Section = Section {
+        b0: 1.0,
+        b1: 0.0,
+        a1: 0.0,
+    };
+
+    /// The NAB record shelf `(s + wz) / (s + wp)`, its zero at
+    /// [`NAB_ZERO_HZ`] and its pole `db` decibels under it, by the bilinear
+    /// transform warped at 1 kHz: unity at the top, `db` of lift at DC, and
+    /// at 0 dB the zero and the pole are one, so the section is a wire.
+    fn nab_shelf(db: f64, sample_rate: f64) -> [f64; 3] {
+        let wz = std::f64::consts::TAU * NAB_ZERO_HZ;
+        let wp = wz / 10.0_f64.powf(db / 20.0);
+        let w1k = std::f64::consts::TAU * 1_000.0;
+        let k = w1k / (w1k / (2.0 * sample_rate)).tan();
+        [(k + wz) / (k + wp), (wz - k) / (k + wp), (wp - k) / (k + wp)]
+    }
+
+    /// The section whose coefficients are `c`, and its exact inverse: a
+    /// first-order section's inverse swaps its numerator and denominator, so
+    /// what goes onto the tape through one comes off it through the other
+    /// with nothing left over.
+    fn and_inverse(c: [f64; 3]) -> (Section, Section) {
+        let [b0, b1, a1] = c;
+        (
+            Section {
+                b0: b0 as f32,
+                b1: b1 as f32,
+                a1: a1 as f32,
+            },
+            Section {
+                b0: (1.0 / b0) as f32,
+                b1: (a1 / b0) as f32,
+                a1: (b1 / b0) as f32,
+            },
+        )
+    }
+
+    #[inline]
+    fn run(&self, s: &mut f32, x: f32) -> f32 {
+        let y = self.b0 * x + *s;
+        *s = flush(self.b1 * x - self.a1 * y);
+        y
+    }
+}
+
+/// A peaking bell as a trapezoidal state-variable filter (the bitcrusher's
+/// sections, as a bell): the analog bell `(s^2 + s A/Q + 1) / (s^2 + s/(A Q)
+/// + 1)`, `A^2` of gain at its centre, warped at the centre.
+///
+/// **A state-variable section, not a biquad,** because these bells move: the
+/// bump's frequency follows a speed glide and its depth the Bump dial, and a
+/// direct-form biquad retuned under a signal can ring or blow up where this
+/// form stays stable for any sequence of its coefficients. At 0 dB `m1` is
+/// zero and the bell is an exact wire.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bell {
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    m1: f32,
+}
+
+impl Bell {
+    const WIRE: Bell = Bell {
+        a1: 1.0,
+        a2: 0.0,
+        a3: 0.0,
+        m1: 0.0,
+    };
+
+    /// The bell at `g = tan(pi f / rate)`, `q`, and `db` at its centre.
+    fn design(g: f64, q: f64, db: f64) -> Self {
+        let a = 10.0_f64.powf(db / 40.0);
+        let k = 1.0 / (q * a);
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        Self {
+            a1: a1 as f32,
+            a2: a2 as f32,
+            a3: (g * a2) as f32,
+            m1: (k * (a * a - 1.0)) as f32,
+        }
+    }
+
+    #[inline]
+    fn run(&self, st: &mut [f32; 2], x: f32) -> f32 {
+        let v3 = x - st[1];
+        let v1 = self.a1 * st[0] + self.a2 * v3;
+        let v2 = st[1] + self.a2 * st[0] + self.a3 * v3;
+        st[0] = flush(2.0 * v1 - st[0]);
+        st[1] = flush(2.0 * v2 - st[1]);
+        x + self.m1 * v1
+    }
+}
+
+/// `tan(pi f / rate)` for a bell's centre, its frequency capped short of the
+/// rate's Nyquist.
+fn bell_g(hz: f64, sample_rate: f64) -> f64 {
+    (std::f64::consts::PI * (hz / sample_rate).min(0.49)).tan()
 }
 
 /// The pinking ladder: white noise into three one-poles whose corners are in
@@ -1063,12 +1420,65 @@ impl Pink {
 
 // ── the machine ─────────────────────────────────────────────────────────────
 
+/// One speed's voicing: every coefficient that depends on the speed,
+/// designed by [`Tape::new`] at the unit's rate. A speed glide blends the two
+/// speeds it is between, so nothing is designed on the audio thread while
+/// the speed moves; see [`Tape::design`].
+#[derive(Clone)]
+struct Voicing {
+    /// How far this speed moves the dial's `log2 d`: [`DMOL_DB`], in octaves.
+    dmol: f64,
+    /// The NAB record shelf ([`Section::nab_shelf`]).
+    nab: [f64; 3],
+    /// The self-erasure one-pole's `b` ([`matched_b`]) at each of
+    /// [`ERASE_POINTS`] envelopes, with the floor in it.
+    erase: [f64; ERASE_POINTS],
+    /// The head's own top, a matched one-pole's `b`.
+    top: f64,
+    /// The contour bells' `tan(pi f / rate)`: the bump and its dip.
+    bump_g: f64,
+    dip_g: f64,
+    /// The head's low-end roll-off, a trapezoidal one-pole's coefficient.
+    low: f64,
+}
+
+impl Voicing {
+    fn at(speed: TapeSpeed, sample_rate: f64) -> Self {
+        let i = speed as usize;
+        // The tape's speed in metres per second: every wavelength below is a
+        // length on the tape, and its frequency is this over it.
+        let v_m = 0.0254 * speed.ips();
+        let floor = v_m / (ERASE_FLOOR_UM * 1.0e-6);
+        let f_b = v_m / (BUMP_WAVELENGTH_MM * 1.0e-3);
+        Self {
+            dmol: -DMOL_DB[i] / 20.0 * std::f64::consts::LOG2_10,
+            nab: Section::nab_shelf(NAB_SHELF_DB[i], sample_rate),
+            erase: std::array::from_fn(|k| {
+                let e = ERASE_CLAMP * k as f64 / (ERASE_POINTS - 1) as f64;
+                let x = (ERASE_OCTAVES * e).exp2() - 1.0;
+                let fc = if x > 0.0 {
+                    (ERASE_TOP_HZ[i] / x).max(floor)
+                } else {
+                    f64::INFINITY
+                };
+                matched_b(fc, sample_rate)
+            }),
+            // 2 dB down at the band edge: a one-pole's corner is the edge
+            // over `sqrt(10^0.2 - 1)`.
+            top: matched_b(HEAD_TOP_EDGE_HZ[i] / (10.0_f64.powf(0.2) - 1.0).sqrt(), sample_rate),
+            bump_g: bell_g(f_b, sample_rate),
+            dip_g: bell_g(2.0 * f_b, sample_rate),
+            low: tpt_g((HEAD_LF_SHARE * f_b).max(HEAD_LF_FLOOR_HZ), sample_rate),
+        }
+    }
+}
+
 /// One stereo pair of tracks through the record and repro chain. See the
 /// module header for the signal flow.
 pub struct Tape {
     sample_rate: f32,
     /// The tape: one line per channel, because the two tracks are magnetised
-    /// independently — but read by one head at one place, which is why the
+    /// independently, but read by one head at one place, which is why the
     /// sway below is shared.
     line: [Vec<f32>; 2],
     at: usize,
@@ -1077,8 +1487,13 @@ pub struct Tape {
     /// and hands samples through untouched. Shortened by [`OS_LATENCY`], for
     /// the reason [`BASE_MS`] gives.
     base: usize,
-    /// Sub-roll one-pole state, per channel; the high-pass is `x` minus it.
-    sub_lp: [f32; 2],
+    /// The input transformer, per channel, and its coefficient.
+    transformer: [OnePole; 2],
+    g_transformer: f32,
+    /// The NAB shelf's state on the way onto the tape and off it, per
+    /// channel.
+    nab_in: [f32; 2],
+    nab_out: [f32; 2],
     /// The record stage's oversampler: one designed set of taps, and the
     /// histories each channel reads them against. See [`OS`].
     os_taps: OsTaps,
@@ -1093,10 +1508,14 @@ pub struct Tape {
     /// erasure one-pole itself.
     erase_env: [f32; 2],
     erase_lp: [f32; 2],
-    /// Repro EQ state.
-    bump: [Peak; 2],
+    /// The head's own top, the contour's two bells and its low-end roll-off,
+    /// and Roll: the repro chain's states, per channel.
+    top: [f32; 2],
+    bump: [[f32; 2]; 2],
+    dip: [[f32; 2]; 2],
+    low: [OnePole; 2],
     roll_lp: [f32; 2],
-    /// Hiss: a pinking ladder per channel — two tracks, two noises — and the
+    /// Hiss: a pinking ladder per channel (two tracks, two noises) and the
     /// shared program tracker that rides them up and down.
     pink: [Pink; 2],
     hiss_env: f32,
@@ -1117,9 +1536,8 @@ pub struct Tape {
     /// Scrape band-limit states.
     scrape_lo: f32,
     scrape_hi: f32,
-    // Per-rate coefficients, fixed at construction — the sample rate is,
-    // too, per the house law.
-    a_sub: f32,
+    // Per-rate coefficients, fixed at construction: the sample rate is, too,
+    // per the house law.
     a_att: f32,
     a_rel: f32,
     a_hatt: f32,
@@ -1127,8 +1545,45 @@ pub struct Tape {
     a_scrape_lo: f32,
     a_scrape_hi: f32,
     a_wander: f32,
-    /// Every [`Glide`]'s per-frame step, [`GLIDE_MS`] at this rate.
+    /// Every [`Glide`]'s per-frame step, [`GLIDE_MS`] at this rate, and the
+    /// speed's, [`SPEED_GLIDE_MS`].
     a_glide: f64,
+    a_speed: f64,
+    /// The four speeds' voicings, slowest first, designed here at this rate.
+    voicings: [Voicing; 4],
+    /// The voicing in use, blended from `voicings` at the speed it was
+    /// designed for (`voiced_at`, the speed's position on [`TapeSpeed::ALL`];
+    /// NaN until the first design).
+    voiced_at: f64,
+    dmol: f64,
+    nab: Section,
+    nab_inv: Section,
+    erase: [f32; ERASE_POINTS],
+    top_b: f32,
+    bump_g: f64,
+    dip_g: f64,
+    low_g: f32,
+    /// The contour's two bells, and the `(bump g, dip g, bump dB)` they were
+    /// designed at.
+    bump_bell: Bell,
+    dip_bell: Bell,
+    bells_for: (f64, f64, f64),
+    /// Roll's coefficient, the corner it was designed at (`log2` Hz), and
+    /// whether the stage is in circuit.
+    roll_a: f32,
+    roll_for: f64,
+    roll_on: bool,
+    /// The glides: the speed as its position on [`TapeSpeed::ALL`] (which is
+    /// `log2` of the speed, since the speeds are octaves apart), the dial's
+    /// record level as `log2 d`, the bump in dB, Roll's corner as `log2` Hz,
+    /// and the output trim as a gain.
+    speed: Glide,
+    drive: Glide,
+    bump_db: Glide,
+    roll: Glide,
+    trim: Glide,
+    /// Frames since `new` or `clear`: the grid [`SUB_BLOCK`] counts on.
+    frame: u64,
     /// Whether the next block is the first since `new` or `clear`, which
     /// snaps every glide to that block's controls.
     fresh: bool,
@@ -1139,19 +1594,27 @@ impl Tape {
         let sr = sample_rate.max(8_000.0);
         let cap = (LINE_MS * 1.0e-3 * sr) as usize + 8;
         let base = head_rest(sr, BASE_MS);
+        let rate = f64::from(sr);
+        let step = |ms: f64| 1.0 - (-1.0 / (rate * ms * 1.0e-3)).exp();
         Self {
             sample_rate: sr,
             line: [vec![0.0; cap], vec![0.0; cap]],
             at: 0,
             base,
-            sub_lp: [0.0; 2],
+            transformer: [OnePole::default(); 2],
+            g_transformer: tpt_g(TRANSFORMER_HZ, rate) as f32,
+            nab_in: [0.0; 2],
+            nab_out: [0.0; 2],
             os_taps: OsTaps::new(),
             os: [OsChannel::new(), OsChannel::new()],
-            makeup: std::array::from_fn(|i| sat_makeup(makeup_d(i))),
+            makeup: makeup_table(),
             sat_err: [[0.0; OS]; 2],
             erase_env: [0.0; 2],
             erase_lp: [0.0; 2],
-            bump: [Peak::default(); 2],
+            top: [0.0; 2],
+            bump: [[0.0; 2]; 2],
+            dip: [[0.0; 2]; 2],
+            low: [OnePole::default(); 2],
             roll_lp: [0.0; 2],
             pink: [Pink::new(sr, 0xA5A5_0001), Pink::new(sr, 0x5EED_C0DE)],
             hiss_env: 0.0,
@@ -1168,15 +1631,37 @@ impl Tape {
             flutter_hold: 0,
             scrape_lo: 0.0,
             scrape_hi: 0.0,
-            a_sub: lp_a(f64::from(sr), f64::from(SUB_ROLL_HZ)),
-            a_att: env_a(f64::from(sr), f64::from(ERASE_ATTACK_MS)),
-            a_rel: env_a(f64::from(sr), f64::from(ERASE_RELEASE_MS)),
-            a_hatt: env_a(f64::from(sr), f64::from(HISS_ATTACK_MS)),
-            a_hrel: env_a(f64::from(sr), f64::from(HISS_RELEASE_MS)),
-            a_scrape_lo: lp_a(f64::from(sr), f64::from(SCRAPE_BAND_HZ.0)),
-            a_scrape_hi: lp_a(f64::from(sr), f64::from(SCRAPE_BAND_HZ.1)),
-            a_wander: env_a(f64::from(sr), f64::from(WANDER_SLEW_S * 1_000.0)),
-            a_glide: 1.0 - (-1.0 / (f64::from(sr) * GLIDE_MS * 1.0e-3)).exp(),
+            a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
+            a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
+            a_hatt: env_a(rate, f64::from(HISS_ATTACK_MS)),
+            a_hrel: env_a(rate, f64::from(HISS_RELEASE_MS)),
+            a_scrape_lo: lp_a(rate, f64::from(SCRAPE_BAND_HZ.0)),
+            a_scrape_hi: lp_a(rate, f64::from(SCRAPE_BAND_HZ.1)),
+            a_wander: env_a(rate, f64::from(WANDER_SLEW_S * 1_000.0)),
+            a_glide: step(GLIDE_MS),
+            a_speed: step(SPEED_GLIDE_MS),
+            voicings: TapeSpeed::ALL.map(|v| Voicing::at(v, rate)),
+            voiced_at: f64::NAN,
+            dmol: 0.0,
+            nab: Section::WIRE,
+            nab_inv: Section::WIRE,
+            erase: [0.0; ERASE_POINTS],
+            top_b: 0.0,
+            bump_g: 0.0,
+            dip_g: 0.0,
+            low_g: 0.0,
+            bump_bell: Bell::WIRE,
+            dip_bell: Bell::WIRE,
+            bells_for: (f64::NAN, f64::NAN, f64::NAN),
+            roll_a: 0.0,
+            roll_for: f64::NAN,
+            roll_on: false,
+            speed: Glide::new(1.0e-7),
+            drive: Glide::new(1.0e-7),
+            bump_db: Glide::new(1.0e-6),
+            roll: Glide::new(1.0e-6),
+            trim: Glide::new(1.0e-9),
+            frame: 0,
             fresh: true,
         }
     }
@@ -1192,8 +1677,8 @@ impl Tape {
     /// bypassed, has run no block, and the figure has to be right then too
     /// (the denoiser learned that the hard way, see
     /// `builtin_fx::DenoiseUnit::set_param`). No setting moves the head
-    /// today, so every setting answers the same; one that does will answer
-    /// here.
+    /// today, so every setting answers the same, the speed included: record
+    /// and playback change speed together. One that does will answer here.
     pub fn latency_frames(&self, p: &TapeParams) -> usize {
         let _ = p;
         self.base + OS_LATENCY
@@ -1209,45 +1694,31 @@ impl Tape {
         head_rest(sample_rate, BASE_MS) + OS_LATENCY
     }
 
-    /// In place on an interleaved buffer; `channels` is the stride. Stereo
-    /// only: anything past the first two channels is left alone, and a mono
-    /// buffer is returned untouched rather than half-processed — the same
-    /// contract as `Effects::process`.
-    pub fn process(&mut self, buf: &mut [f32], frames: usize, channels: usize, p: &TapeParams) {
-        if channels < 2 {
-            return;
-        }
-        debug_assert!(buf.len() >= frames * channels);
-        let sr = self.sample_rate;
-
-        // ── per-block design math, f64, then down to f32 ────────────────
-        let drive = norm(p.drive);
-        let bump = norm(p.bump);
-        let roll = norm(p.roll);
-        let wobble = norm(p.wobble);
-        let hiss = norm(p.hiss);
-        let trim = norm(p.trim);
-
-        let d64 = f64::from(DRIVE_TANH.0)
-            * f64::from(DRIVE_TANH.1 / DRIVE_TANH.0).powf(f64::from(drive));
-        let d = d64 as f32;
-        // The repro amplifier, lined up for this record level: read from the
-        // table [`Tape::new`] solved, see [`MAKEUP_POINTS`] and
-        // [`sat_makeup`].
-        let makeup = makeup_at(&self.makeup, d64.log2());
-        let bump_db = f64::from(BUMP_DB.0 + (BUMP_DB.1 - BUMP_DB.0) * bump);
-        for b in &mut self.bump {
-            b.set(f64::from(sr), BUMP_HZ, BUMP_Q, bump_db);
-        }
-        let roll_on = roll > 1.0e-3;
-        let roll_a = if roll_on {
-            let hz = f64::from(ROLL_HZ.0) * f64::from(ROLL_HZ.1 / ROLL_HZ.0).powf(f64::from(roll));
-            lp_a(f64::from(sr), hz)
+    /// Hand every glide its target from the dials, once per block, and on
+    /// the first block after `new` or `clear` arrive there at once.
+    fn aim(&mut self, p: &TapeParams) {
+        let (drive, bump, roll, hiss, trim) = (
+            norm(p.drive),
+            norm(p.bump),
+            norm(p.roll),
+            norm(p.hiss),
+            norm(p.trim),
+        );
+        let speed = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial()));
+        self.speed.target = speed as usize as f64;
+        self.drive.target = f64::from(DRIVE_TANH.0).log2()
+            + f64::from(drive) * f64::from(DRIVE_TANH.1 / DRIVE_TANH.0).log2();
+        self.bump_db.target = f64::from(BUMP_DB.0 + (BUMP_DB.1 - BUMP_DB.0) * bump);
+        // Out of circuit, Roll's corner heads for the top of its sweep, and
+        // the stage leaves the circuit only once it is there.
+        let top = f64::from(ROLL_HZ.0).log2();
+        self.roll.target = if roll > 1.0e-3 {
+            top + f64::from(roll) * f64::from(ROLL_HZ.1 / ROLL_HZ.0).log2()
         } else {
-            0.0
+            top
         };
-        let trim_gain =
-            10.0_f64.powf(f64::from((trim - 0.5) * (TRIM_DB.1 - TRIM_DB.0)) / 20.0) as f32;
+        self.trim.target =
+            10.0_f64.powf(f64::from((trim - 0.5) * (TRIM_DB.1 - TRIM_DB.0)) / 20.0);
         // **White noise carries its power in bandwidth.** The same sample
         // variance spread over twice the band is half the power per hertz,
         // so at 96 kHz every hertz of the audible band gets 44.1/96 of what
@@ -1255,17 +1726,88 @@ impl Tape {
         // the rates to hand it back. The root used to be the other way up,
         // which doubled the fault where it meant to cancel it: the hiss was
         // 0.74 dB quiet at 48 kHz and 6.8 dB quiet at 96.
-        // `the_same_machine_runs_at_every_sample_rate` holds it.
-        let noise_rate = (sr / DESIGN_RATE).sqrt();
-        // The hiss's level glides, and as a linear gain: see [`Glide`] for
-        // why it may not glide in decibels.
+        // `the_same_machine_runs_at_every_sample_rate` holds it. The level
+        // glides as a linear gain: see [`Glide`] for why it may not glide in
+        // decibels.
+        let noise_rate = (self.sample_rate / DESIGN_RATE).sqrt();
         self.hiss_level.target = f64::from(hiss * hiss * HISS_MAX * noise_rate);
         if self.fresh {
             // The first block after `new` or `clear` starts AT its controls,
             // not gliding to them from wherever the glides were left.
-            self.hiss_level.settle();
+            for g in [
+                &mut self.speed,
+                &mut self.drive,
+                &mut self.bump_db,
+                &mut self.roll,
+                &mut self.trim,
+                &mut self.hiss_level,
+            ] {
+                g.settle();
+            }
             self.fresh = false;
         }
+    }
+
+    /// **The voicing for where the glides are now**, once per [`SUB_BLOCK`].
+    ///
+    /// Everything here is a blend of tables [`Tape::new`] designed, or a
+    /// design that happens only while its control moves, so a settled
+    /// machine spends three comparisons here and nothing else. Between two
+    /// speeds every constant is blended at the glide's position, which is
+    /// `log2` of the speed: piecewise-linear in `log2 v` between the four
+    /// speeds the tables are exact at. A blend of two one-poles' `b` is a
+    /// one-pole, and of two state-variable bells' `g` a bell, so no blend
+    /// can go unstable.
+    fn design(&mut self, roll_wanted: bool) {
+        let pos = self.speed.cur;
+        if pos != self.voiced_at {
+            let lo = (pos.floor().max(0.0) as usize).min(TapeSpeed::ALL.len() - 2);
+            let t = (pos - lo as f64).clamp(0.0, 1.0);
+            let (a, b) = (&self.voicings[lo], &self.voicings[lo + 1]);
+            let mix = |x: f64, y: f64| x * (1.0 - t) + y * t;
+            self.dmol = mix(a.dmol, b.dmol);
+            (self.nab, self.nab_inv) = Section::and_inverse([
+                mix(a.nab[0], b.nab[0]),
+                mix(a.nab[1], b.nab[1]),
+                mix(a.nab[2], b.nab[2]),
+            ]);
+            for ((e, x), y) in self.erase.iter_mut().zip(&a.erase).zip(&b.erase) {
+                *e = mix(*x, *y) as f32;
+            }
+            self.top_b = mix(a.top, b.top) as f32;
+            self.bump_g = mix(a.bump_g, b.bump_g);
+            self.dip_g = mix(a.dip_g, b.dip_g);
+            self.low_g = mix(a.low, b.low) as f32;
+            self.voiced_at = pos;
+        }
+        let bells = (self.bump_g, self.dip_g, self.bump_db.cur);
+        if bells != self.bells_for {
+            self.bump_bell = Bell::design(bells.0, BUMP_Q, bells.2);
+            self.dip_bell = Bell::design(bells.1, DIP_Q, DIP_SHARE * bells.2);
+            self.bells_for = bells;
+        }
+        let corner = self.roll.cur;
+        if corner != self.roll_for {
+            self.roll_a = lp_a(f64::from(self.sample_rate), corner.exp2());
+            self.roll_for = corner;
+        }
+        self.roll_on = roll_wanted || self.roll.cur != self.roll.target;
+    }
+
+    /// In place on an interleaved buffer; `channels` is the stride. Stereo
+    /// only: anything past the first two channels is left alone, and a mono
+    /// buffer is returned untouched rather than half-processed, the same
+    /// contract as `Effects::process`.
+    pub fn process(&mut self, buf: &mut [f32], frames: usize, channels: usize, p: &TapeParams) {
+        if channels < 2 {
+            return;
+        }
+        debug_assert!(buf.len() >= frames * channels);
+        let sr = self.sample_rate;
+        self.aim(p);
+        let roll_wanted = norm(p.roll) > 1.0e-3;
+        let wobble = norm(p.wobble);
+        let noise_rate = (sr / DESIGN_RATE).sqrt();
         let wow_amp = WOW_DEPTH_MS * 1.0e-3 * sr * wobble;
         let flutter_amp = (
             FLUTTER_DEPTH_MS.0 * 1.0e-3 * sr * wobble,
@@ -1279,9 +1821,27 @@ impl Tape {
         let scrape_amp = SCRAPE_MS * 1.0e-3 * sr * wobble * noise_rate;
         let n = self.line[0].len();
         let tau = std::f32::consts::TAU;
+        let e_scale = (ERASE_POINTS - 1) as f32 / ERASE_CLAMP as f32;
 
         for i in 0..frames {
             let f = i * channels;
+            if self.frame.is_multiple_of(SUB_BLOCK) {
+                self.design(roll_wanted);
+            }
+            self.frame += 1;
+
+            // ── the glides, and the record level they make ─────────────────
+            self.speed.tick(self.a_speed);
+            self.bump_db.tick(self.a_glide);
+            self.roll.tick(self.a_glide);
+            let trim_gain = self.trim.tick(self.a_glide) as f32;
+            // The dial's record level, scaled by this speed's headroom: the
+            // `d` the curve is asked for, and the line-up for it, read from
+            // the table [`Tape::new`] solved (see [`sat_makeup_refused`]).
+            let log2_d = self.drive.tick(self.a_glide) + self.dmol;
+            let makeup = makeup_at(&self.makeup, log2_d);
+            let d = log2_d.exp2() as f32;
+            let inv_d = 1.0 / d;
 
             // ── the transport, shared by both channels ──────────────────
             self.wow += WOW_HZ / sr;
@@ -1332,14 +1892,12 @@ impl Tape {
                 hiss_level * (HISS_FLOOR + (1.0 - HISS_FLOOR) * self.hiss_env.min(1.0));
 
             for ch in 0..2 {
-                let x = buf[f + ch];
+                // The input transformer: keep DC and rumble out of the
+                // headroom.
+                let u = self.transformer[ch].high(buf[f + ch], self.g_transformer);
 
-                // The sub roll: keep the rumble out of the headroom.
-                self.sub_lp[ch] = flush(self.sub_lp[ch] + self.a_sub * (x - self.sub_lp[ch]));
-                let u = x - self.sub_lp[ch];
-
-                // The record level, dual-rate. This envelope — not any gain
-                // element — is what rounds the attacks, spectrally, below.
+                // The record level, dual-rate. This envelope, not any gain
+                // element, is what rounds the attacks, spectrally, below.
                 let lvl = (u * d).abs();
                 let a = if lvl > self.erase_env[ch] {
                     self.a_att
@@ -1348,35 +1906,44 @@ impl Tape {
                 };
                 self.erase_env[ch] = flush(self.erase_env[ch] + (lvl - self.erase_env[ch]) * a);
 
-                // The record amplifier and the tape, at 4×: see [`record`].
-                let y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, u);
-                // The repro amplifier's line-up, not a knob. See
-                // [`sat_makeup`].
-                let y = y * makeup;
+                // Onto the tape through the NAB record shelf, the record
+                // amplifier and the tape at 4× (see [`record`]), the repro
+                // amplifier's line-up (not a knob: see [`sat_makeup`]), and
+                // off it through the shelf's exact inverse.
+                let r = self.nab.run(&mut self.nab_in[ch], u);
+                let y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r);
+                let y = self.nab_inv.run(&mut self.nab_out[ch], y * makeup);
 
-                // HF self-erasure: the corner falls as the level rises.
-                let corner = (ERASE_TOP_HZ
-                    * (-(ERASE_OCTAVES * self.erase_env[ch].min(1.4))).exp2())
-                .max(ERASE_FLOOR_HZ);
-                let ae = 1.0 - (-tau * corner / sr).exp();
-                self.erase_lp[ch] = flush(self.erase_lp[ch] + ae * (y - self.erase_lp[ch]));
+                // HF self-erasure: the corner falls as the level rises, read
+                // from this speed's table. At rest `b` is zero: a wire.
+                let e = self.erase_env[ch].min(ERASE_CLAMP as f32) * e_scale;
+                let k = (e as usize).min(ERASE_POINTS - 2);
+                let b = self.erase[k] + (self.erase[k + 1] - self.erase[k]) * (e - k as f32);
+                self.erase_lp[ch] = flush(y + b * (self.erase_lp[ch] - y));
                 self.line[ch][self.at] = self.erase_lp[ch];
 
-                // The play head, swaying.
-                let mut v = tap(&self.line[ch], self.at, delay);
+                // The play head, swaying, and the head's own top.
+                let v = tap(&self.line[ch], self.at, delay);
+                self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
+                let mut v = self.top[ch];
 
-                // Repro EQ: the bump, then the roll.
-                v = self.bump[ch].process(v);
-                if roll_on {
-                    self.roll_lp[ch] = flush(self.roll_lp[ch] + roll_a * (v - self.roll_lp[ch]));
-                    v = self.roll_lp[ch];
-                }
-
-                // The hiss, after the EQ: it is the repro chain's noise, and
-                // the tone knobs of the machine do not touch it much. A level
-                // glided to exactly nothing skips the stage.
+                // The hiss: the repro chain's noise, which the head contour
+                // and Roll shape as they shape the music. A level glided to
+                // exactly nothing skips the stage.
                 if hiss_level > 0.0 {
                     v += self.pink[ch].step() * hiss_gain;
+                }
+
+                // The head contour, then Roll. Out of circuit, Roll's state
+                // follows the signal, so it comes back in without a step.
+                v = self.bump_bell.run(&mut self.bump[ch], v);
+                v = self.dip_bell.run(&mut self.dip[ch], v);
+                v = self.low[ch].high(v, self.low_g);
+                if self.roll_on {
+                    self.roll_lp[ch] = flush(self.roll_lp[ch] + self.roll_a * (v - self.roll_lp[ch]));
+                    v = self.roll_lp[ch];
+                } else {
+                    self.roll_lp[ch] = v;
                 }
 
                 buf[f + ch] = v * trim_gain;
@@ -1389,30 +1956,33 @@ impl Tape {
         }
     }
 
-    /// Forget everything: the tape, the envelopes, the noise. What was
-    /// ringing when the unit left circuit must not be waiting when it comes
-    /// back half an hour later.
+    /// Forget everything: the tape, the envelopes, the noise, the glides.
+    /// What was ringing when the unit left circuit must not be waiting when
+    /// it comes back half an hour later, and the next block starts at its
+    /// controls.
     pub fn clear(&mut self) {
         for l in &mut self.line {
             l.fill(0.0);
         }
         self.at = 0;
-        self.sub_lp = [0.0; 2];
+        self.transformer = [OnePole::default(); 2];
+        self.nab_in = [0.0; 2];
+        self.nab_out = [0.0; 2];
         for c in &mut self.os {
             c.clear();
         }
         self.sat_err = [[0.0; OS]; 2];
         self.erase_env = [0.0; 2];
         self.erase_lp = [0.0; 2];
-        for b in &mut self.bump {
-            b.clear();
-        }
+        self.top = [0.0; 2];
+        self.bump = [[0.0; 2]; 2];
+        self.dip = [[0.0; 2]; 2];
+        self.low = [OnePole::default(); 2];
         self.roll_lp = [0.0; 2];
         for p in &mut self.pink {
             p.clear();
         }
         self.hiss_env = 0.0;
-        self.fresh = true;
         self.wow = 0.0;
         self.flutter = [0.0, 0.37];
         self.wander_rng = 0x1B0F_5EED;
@@ -1424,6 +1994,19 @@ impl Tape {
         self.flutter_hold = 0;
         self.scrape_lo = 0.0;
         self.scrape_hi = 0.0;
+        self.voiced_at = f64::NAN;
+        self.bells_for = (f64::NAN, f64::NAN, f64::NAN);
+        self.roll_for = f64::NAN;
+        self.frame = 0;
+        self.fresh = true;
+    }
+
+    /// The speed the voicing is at right now, in inches per second: the
+    /// glide's position, for the test that holds the glide to a servo's
+    /// re-lock.
+    #[cfg(test)]
+    pub(crate) fn speed_now(&self) -> f64 {
+        TapeSpeed::Ips3_75.ips() * self.speed.cur.exp2()
     }
 }
 
@@ -1485,9 +2068,12 @@ mod tests {
     }
 
     /// Every colour switched off is a wire, to within a tenth of a decibel
-    /// of broadband level. Not bit-exact — the play head is a real delay and
-    /// the sub roll is always in circuit — but level-transparent, which is
-    /// what "off" has to mean for an insert.
+    /// of broadband level. Not bit-exact (the play head is a real delay, and
+    /// the transformer and the head's own top are always in circuit) but
+    /// level-transparent, which is what "off" has to mean for an insert. At
+    /// the studio speed a fresh tape opens at, and at 7.5 ips, the speed the
+    /// record curve is the machine of. Measured: -0.031 and -0.018 dB at
+    /// 15 ips (Drive 0, and a fresh tape's 0.5), -0.051 and -0.057 at 7.5.
     #[test]
     fn neutral_settings_pass_the_audio_within_a_tenth_of_a_decibel() {
         let sr = 44_100.0_f32;
@@ -1504,49 +2090,56 @@ mod tests {
         // Steady state only: skip the envelope settling and the line fill.
         let lo = ((sr * 0.25) as usize) * 2;
         let hi = ((sr * 1.15) as usize) * 2;
-        let at = |drive: f32| {
+        let at = |drive: f32, speed: TapeSpeed| {
             let p = TapeParams {
                 drive,
-                bump: 0.0,
-                roll: 0.0,
-                wobble: 0.0,
-                hiss: 0.0,
-                trim: 0.5,
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
             };
             let out = feed(&mut Tape::new(sr), &input, &p);
             db(rms(&out[lo..hi]) / rms(&input[lo..hi]))
         };
 
-        // **Drive at the BOTTOM, not the middle.** It is a record level, and
-        // a record level's off is the end of its travel — the same place
-        // every other knob here parks. This used to read 0.5 and pass only
-        // because the drive's top was too low to matter at 0.5; see
-        // [`DRIVE_TANH`].
-        let off = at(0.0);
-        assert!(
-            off.abs() < 0.1,
-            "neutral settings moved the broadband level by {off:.3} dB"
-        );
+        for speed in [TapeSpeed::Ips15, TapeSpeed::Ips7_5] {
+            // **Drive at the BOTTOM, not the middle.** It is a record level,
+            // and a record level's off is the end of its travel, the same
+            // place every other knob here parks. This used to read 0.5 and
+            // pass only because the drive's top was too low to matter at 0.5;
+            // see [`DRIVE_TANH`].
+            let off = at(0.0, speed);
+            assert!(
+                off.abs() < 0.1,
+                "neutral settings moved the broadband level by {off:.3} dB at {}",
+                speed.label()
+            );
 
-        // **And at the setting the unit actually ships at**, which is the
-        // check that was missing. Moving this test's drive from the middle to
-        // the bottom was correct and it was also where the level regression
-        // got through: with the guard anchored at an end of the travel,
-        // nothing on the bench was watching the position every new bay opens
-        // at. [`sat_makeup`] is what holds it.
-        let shipped = at(TapeParams::default().drive);
-        assert!(
-            shipped.abs() < 0.4,
-            "the SHIPPED drive moved a programme at record level by \
-             {shipped:.3} dB — the record level is doubling as a volume \
-             control"
-        );
+            // **And at the setting a fresh tape opens at**, which is the
+            // check that was missing. Moving this test's drive from the
+            // middle to the bottom was correct and it was also where the
+            // level regression got through: with the guard anchored at an
+            // end of the travel, nothing on the bench was watching the
+            // position every new bay opens at. The line-up is what holds it.
+            let fresh = at(TapeParams::default().drive, speed);
+            assert!(
+                fresh.abs() < 0.4,
+                "the fresh drive moved a programme at record level by {fresh:.3} dB \
+                 at {}: the record level is doubling as a volume control",
+                speed.label()
+            );
+        }
     }
 
     /// **An attack loses treble before it loses level, which no gain element
     /// could do.** A gain takes the same decibels from every band; here the
     /// loud first milliseconds lose far more at 8 kHz than at 500 Hz, and
-    /// the 8 kHz comes back as the level settles — the self-erasure, working.
+    /// the 8 kHz comes back as the level settles: the self-erasure, working.
+    ///
+    /// Measured at 7.5 ips, the speed the record curve is the machine of:
+    /// -7.7, -11.3, -12.1 and -2.0 dB against the four bars (model -5.8,
+    /// -11.1, -11.9 and -2.0). And the loss is a wavelength's, so the settled
+    /// 8 kHz-against-500 Hz loss is ordered by speed, deepest at the slowest:
+    /// -17.4, -11.3, -1.0 and -0.4 dB at 3.75, 7.5, 15 and 30 ips (model
+    /// -17.2, -11.1, -0.9 and -0.4).
     #[test]
     fn an_attack_loses_treble_before_it_loses_level_which_no_gain_could_do() {
         let sr = 48_000.0_f32;
@@ -1565,36 +2158,39 @@ mod tests {
             })
             .collect();
         let input = to_stereo(&mono);
-        // Half travel, on a −6 dBFS attack. The knob used to read 0.7 here
+        let win = 240; // the first 5 ms
+        let sus = pre + (sr * 0.25) as usize; // well after the step down
+        // Half travel, on a -6 dBFS attack. The knob used to read 0.7 here
         // and it is the SAME record level: [`DRIVE_TANH`]'s top moved from 4
         // to 20, so the factor that used to sit at 0.7 now sits just under
         // half. The claim being measured is about the erasure, not about the
-        // dial, so the operating point is what had to be preserved.
-        let p = TapeParams {
-            drive: 0.5,
-            bump: 0.0,
-            roll: 0.0,
-            wobble: 0.0,
-            hiss: 0.0,
-            trim: 0.5,
+        // dial, so the operating point is what had to be preserved. The
+        // windows line up by the latency the host is told, which is exact.
+        let at_speed = |speed: TapeSpeed| {
+            let p = TapeParams {
+                drive: 0.5,
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            let mut unit = Tape::new(sr);
+            let lat = unit.latency_frames(&p);
+            let out = left(&feed(&mut unit, &input, &p));
+            let ratio = |at: usize, hz: f64| {
+                band(&out[at + lat..at + lat + win], sr.into(), hz)
+                    / band(&mono[at..at + win], sr.into(), hz)
+            };
+            // The window after the first: the corner has finished falling
+            // and sits where the level put it.
+            [
+                ratio(pre, 8_000.0),
+                ratio(pre, 500.0),
+                ratio(pre + win, 8_000.0),
+                ratio(pre + win, 500.0),
+                ratio(sus, 8_000.0),
+            ]
         };
-        let mut unit = Tape::new(sr);
-        let lat = unit.latency_frames(&p);
-        let out = left(&feed(&mut unit, &input, &p));
-
-        let win = 240; // the first 5 ms
-        let sus = pre + (sr * 0.25) as usize; // well after the step down
-        let ratio = |at: usize, hz: f64| {
-            band(&out[at + lat..at + lat + win], sr.into(), hz)
-                / band(&mono[at..at + win], sr.into(), hz)
-        };
-        let r8_attack = ratio(pre, 8_000.0);
-        let r500_attack = ratio(pre, 500.0);
-        // The window after the first: the corner has finished falling and
-        // sits where the level put it.
-        let r8_settled = ratio(pre + win, 8_000.0);
-        let r500_settled = ratio(pre + win, 500.0);
-        let r8_sustain = ratio(sus, 8_000.0);
+        let [r8_attack, r500_attack, r8_settled, r500_settled, r8_sustain] =
+            at_speed(TapeSpeed::Ips7_5);
 
         // The spectral claim, in the first 5 ms: 8 kHz already loses at
         // least 1.5 dB MORE than 500 Hz. A pure gain element gives every
@@ -1628,6 +2224,22 @@ mod tests {
             "500 Hz lost more than 6 dB in the attack (x{r500_attack:.3}) — \
              that is a gain change, not a spectral one"
         );
+
+        // The same attack at every speed: the settled loss of 8 kHz against
+        // 500 Hz is deepest on the slowest tape, where 8 kHz is the shortest
+        // wavelength, and ordered all the way up.
+        let settled: Vec<f64> = TapeSpeed::ALL
+            .iter()
+            .map(|v| {
+                let r = at_speed(*v);
+                db(r[2] / r[3])
+            })
+            .collect();
+        assert!(
+            settled.windows(2).all(|w| w[0] < w[1]),
+            "the settled 8 kHz-against-500 Hz loss is not ordered by speed: {settled:.2?} dB \
+             at 3.75, 7.5, 15 and 30 ips"
+        );
     }
 
     /// A steady 1 kHz through full wobble bends by a believable transport's
@@ -1643,11 +2255,8 @@ mod tests {
         let input = to_stereo(&mono);
         let p = TapeParams {
             drive: 0.5,
-            bump: 0.0,
-            roll: 0.0,
             wobble: 1.0,
-            hiss: 0.0,
-            trim: 0.5,
+            ..TapeParams::NEUTRAL
         };
         let mut unit = Tape::new(sr);
         let out = left(&feed(&mut unit, &input, &p));
@@ -1691,11 +2300,8 @@ mod tests {
         let sr = 48_000.0_f32;
         let p = TapeParams {
             drive: 0.5,
-            bump: 0.0,
-            roll: 0.0,
-            wobble: 0.0,
             hiss: 1.0,
-            trim: 0.5,
+            ..TapeParams::NEUTRAL
         };
 
         // The slope, on silence: nothing in the output but the shaper.
@@ -1760,10 +2366,12 @@ mod tests {
     }
 
     /// **Nothing the six knobs can reach may blow up.** Every combination of
-    /// bottom, middle and top on all six at once, against a signal with a
-    /// step in the middle of every block, on one unit whose state rides
-    /// through the whole sweep — a knob drag, not a bench test. Then NaN
-    /// params, then a clear that must actually clear.
+    /// bottom, middle and top on all six at once, the controls appended since
+    /// at their defaults, against a signal with a step in the middle of every
+    /// block, on one unit whose state rides through the whole sweep: a knob
+    /// drag, not a bench test. Then NaN params, the end-to-end jumps, the
+    /// speed thrown between 3.75 and 30 ips every block, and a clear that
+    /// must actually clear.
     #[test]
     fn no_setting_the_six_knobs_can_reach_makes_it_explode() {
         let sr = 48_000.0_f32;
@@ -1788,6 +2396,7 @@ mod tests {
                 wobble: at(3),
                 hiss: at(4),
                 trim: at(5),
+                ..TapeParams::default()
             };
             let mut buf = block.clone();
             unit.process(&mut buf, 128, 2, &p);
@@ -1808,6 +2417,7 @@ mod tests {
             wobble: f32::NAN,
             hiss: 2.0,
             trim: f32::NAN,
+            speed: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -1842,6 +2452,7 @@ mod tests {
                     wobble: end,
                     hiss: end,
                     trim: end,
+                    speed: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -1876,6 +2487,24 @@ mod tests {
             blocks[11]
         );
 
+        // The speed thrown between its two ends every block, slammed: every
+        // per-speed table blended mid-glide, two hundred times over.
+        let mut thrown = Tape::new(sr);
+        for k in 0..200 {
+            let p = TapeParams {
+                drive: 1.0,
+                speed: (k % 2) as f32,
+                ..TapeParams::default()
+            };
+            let mut buf = block.clone();
+            thrown.process(&mut buf, 128, 2, &p);
+            assert!(
+                buf.iter().all(|v| v.is_finite() && v.abs() < 16.0),
+                "block {k} of the speed thrown end to end left the audio at {:?}",
+                buf.iter().find(|v| !v.is_finite() || v.abs() >= 16.0)
+            );
+        }
+
         // And the tail dies when told to.
         unit.clear();
         let quiet = TapeParams {
@@ -1900,7 +2529,11 @@ mod tests {
 
     /// A 96 kHz machine is the same machine: the head bump lifts the same
     /// hertz by the same decibels and the roll costs the same at the same
-    /// probe, at 44.1, 48 and 96.
+    /// probe, at 44.1, 48 and 96. At 30 ips, where the contour's bell sits at
+    /// 69.9 Hz: Bump 1 there reads its +5 dB less the dip an octave up and
+    /// the head's own roll-off below it (model +3.8 dB, measured +3.79 at
+    /// every rate), and Roll at half travel costs its corner's 1.8 dB at
+    /// 5 kHz with the head's own top (model -1.86, measured -1.70 to -1.83).
     #[test]
     fn the_bump_and_the_roll_sit_at_the_same_hertz_at_every_rate() {
         let rates = [44_100.0_f32, 48_000.0, 96_000.0];
@@ -1919,14 +2552,12 @@ mod tests {
                 / band(&mono[lo..hi], sr.into(), hz.into()))
         };
 
-        // The bump, wide open: +5 dB at 70 Hz less the sub roll's ~1 dB.
+        // The bump, wide open, at the speed that puts it at 70 Hz.
         let bump = TapeParams {
             drive: 0.5,
             bump: 1.0,
-            roll: 0.0,
-            wobble: 0.0,
-            hiss: 0.0,
-            trim: 0.5,
+            speed: TapeSpeed::Ips30.dial(),
+            ..TapeParams::NEUTRAL
         };
         let bumps: Vec<f64> = rates.iter().map(|sr| probe(*sr, 70.0, 0.2, &bump)).collect();
         for (sr, g) in rates.iter().zip(&bumps) {
@@ -1946,12 +2577,9 @@ mod tests {
         // should cost the same couple of dB everywhere. Drive at the bottom
         // keeps the self-erasure parked so only the roll is being measured.
         let roll = TapeParams {
-            drive: 0.0,
-            bump: 0.0,
             roll: 0.5,
-            wobble: 0.0,
-            hiss: 0.0,
-            trim: 0.5,
+            speed: TapeSpeed::Ips30.dial(),
+            ..TapeParams::NEUTRAL
         };
         let rolls: Vec<f64> = rates
             .iter()
@@ -1997,7 +2625,10 @@ mod tests {
     /// So the claim is pinned where it can be heard: at a level people
     /// record at, the bottom of the dial is a wire, the middle is a machine
     /// running clean, and the top is saturating AND dulling — the two halves
-    /// of tape, both of them, at once.
+    /// of tape, both of them, at once. At the studio speed a fresh tape opens
+    /// at (model: the bottom far under 1e-4, half travel about 0.12 %, the
+    /// top over 5 %; the tilt -0.34 dB at the bottom, -5.35 dB at the top;
+    /// measured 6e-6, 0.12 % and 17.8 %, and -0.34 and -5.49 dB).
     #[test]
     fn the_drive_knob_saturates_at_the_level_people_actually_record_at() {
         let sr = 48_000.0_f32;
@@ -2105,8 +2736,20 @@ mod tests {
     ///
     /// Un-oversampled this reads −9.7 dB at full drive — a third of the
     /// output. The stated bar is 30 dB down, which the 4× stage clears with
-    /// room to spare (it measures −35.9), and which reverting the
-    /// oversampler fails by twenty.
+    /// room to spare, and which reverting the oversampler fails by twenty.
+    ///
+    /// **And against the tone that went in, at every speed.** The dial has no
+    /// cap: the speeds scale its record level, so its top asks the curve for
+    /// up to 26.1 at 3.75 ips where 5.0's top was 20. The guarantee is stated
+    /// absolutely, then: full drive folds no more hash into the band than
+    /// 5.0's top did, which read -52.3 dB against the input tone; every
+    /// speed must read under -50 (model -54.3, -53.9, -56.3 and -55.3 at
+    /// 3.75, 7.5, 15 and 30 ips; measured -55.1, -54.6, -56.9 and -55.9).
+    /// Against the OUTPUT tone 3.75 ips reads far worse, -29.0, only because
+    /// a slow tape's self-erasure takes more from the 7 kHz fundamental than
+    /// from the folds below it: the honest measure of the record stage is
+    /// the input. At 15 ips against the output: -43.5 at the top, -95.5 at
+    /// a fresh tape's Drive.
     #[test]
     fn full_drive_on_a_high_note_does_not_fold_the_band_back_on_itself() {
         let sr = 48_000.0_f32;
@@ -2116,25 +2759,28 @@ mod tests {
         // read as aliasing by a measurement that cannot tell them apart.
         let clean = TapeParams {
             drive: 1.0,
-            bump: 0.0,
-            roll: 0.0,
-            wobble: 0.0,
-            hiss: 0.0,
-            trim: 0.5,
+            ..TapeParams::NEUTRAL
         };
         // −6 dBFS: loud, because the fold gets worse the harder the curve is
         // driven and the claim is about the worst case a person can reach.
         let mono: Vec<f32> = (0..frames)
             .map(|i| 0.5 * (std::f32::consts::TAU * 7_000.0 * i as f32 / sr).sin())
             .collect();
+        let (lo, hi) = ((sr * 0.25) as usize, (sr * 0.65) as usize);
+        let tone_in = band(&mono[lo..hi], sr.into(), 7_000.0);
 
-        let residue = |drive: f32| -> f64 {
+        // The fold against the output tone, and against the input tone.
+        let fold = |drive: f32, speed: TapeSpeed| -> (f64, f64) {
             let out = left(&feed(
                 &mut Tape::new(sr),
                 &to_stereo(&mono),
-                &TapeParams { drive, ..clean },
+                &TapeParams {
+                    drive,
+                    speed: speed.dial(),
+                    ..clean
+                },
             ));
-            let seg = &out[(sr * 0.25) as usize..(sr * 0.65) as usize];
+            let seg = &out[lo..hi];
             let fund = band(seg, sr.into(), 7_000.0);
             let mut alias = 0.0_f64;
             for k in 1..24 {
@@ -2147,8 +2793,9 @@ mod tests {
                 let m = band(seg, sr.into(), hz);
                 alias += m * m;
             }
-            db(alias.sqrt() / fund.max(1.0e-12))
+            (db(alias.sqrt() / fund.max(1.0e-12)), db(alias.sqrt() / tone_in))
         };
+        let residue = |drive: f32| fold(drive, TapeSpeed::Ips15).0;
 
         let slammed = residue(1.0);
         assert!(
@@ -2156,13 +2803,22 @@ mod tests {
             "full drive on a 7 kHz tone folded {slammed:.1} dB of inharmonic \
              hash back into the band — the record stage is aliasing"
         );
-        // And at the position it ships at, where the curve is barely bent,
-        // the fold has to be nowhere at all.
-        let shipped = residue(TapeParams::default().drive);
+        // And at the position a fresh tape opens at, where the curve is
+        // barely bent, the fold has to be nowhere at all.
+        let fresh = residue(TapeParams::default().drive);
         assert!(
-            shipped < -55.0,
-            "the shipped drive folded {shipped:.1} dB of hash into the band"
+            fresh < -55.0,
+            "the fresh drive folded {fresh:.1} dB of hash into the band"
         );
+        for speed in TapeSpeed::ALL {
+            let (_, against_input) = fold(1.0, speed);
+            assert!(
+                against_input < -50.0,
+                "full drive at {} folded {against_input:.1} dB of hash against the \
+                 tone that went in, more than 5.0's top did",
+                speed.label()
+            );
+        }
     }
 
     /// **The record level is not a volume control at the level the machine is
@@ -2180,6 +2836,20 @@ mod tests {
     /// thing being measured. What the top of the dial still costs is stated
     /// rather than trimmed away, because it is the erasure taking the top off
     /// the band, and a makeup that chased THAT would be undoing the effect.
+    /// At the studio speed (model: within 0.15 dB up to Drive 0.6, -1.37 dB
+    /// at the top, a largest rise of +0.001; measured -0.15, -1.43 and no
+    /// rise).
+    ///
+    /// **And the dial is never louder for a step up, at any speed.** The
+    /// programme's monotone law holds at 7.5 and 3.75 ips too (model rises
+    /// -0.001 and +0.002 dB, measured none), where the slow tape's erasure
+    /// takes more of the top at the dial's end. And a steady 0 VU tone at
+    /// 100 Hz, the long wavelength a line-up that chased the erasure would
+    /// have lifted, rises by no more than 0.05 dB from any tenth of Drive to
+    /// the next at any of the four speeds (model +0.002 dB at most, measured
+    /// +0.002 at 30 ips and none at the others). Not pinned: the
+    /// programme at 30 ips, whose last step rises +0.037 dB in the model,
+    /// too near the bar to be a fair pin.
     #[test]
     fn the_record_level_holds_its_level_where_the_machine_is_lined_up() {
         let sr = 48_000.0_f32;
@@ -2197,27 +2867,26 @@ mod tests {
             .collect();
         let input = to_stereo(&mono);
         let (lo, hi) = ((sr * 0.3) as usize * 2, (sr * 1.15) as usize * 2);
-        let at = |drive: f32| {
+        let programme = |drive: f32, speed: TapeSpeed| {
             let p = TapeParams {
                 drive,
-                bump: 0.0,
-                roll: 0.0,
-                wobble: 0.0,
-                hiss: 0.0,
-                trim: 0.5,
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
             };
             let out = feed(&mut Tape::new(sr), &input, &p);
             db(rms(&out[lo..hi]) / rms(&input[lo..hi]))
         };
+        let at = |drive: f32| programme(drive, TapeSpeed::Ips15);
 
-        // The bottom is a wire and the shipped default is within a quarter of
-        // a decibel of it. Between them the knob is character only.
-        for drive in [0.0_f32, 0.2, 0.4, TapeParams::default().drive] {
+        // The bottom is a wire, and a fresh tape's Drive and the 0.6 that
+        // 5.0 shipped are within a few hundredths of it (measured -0.07 and
+        // -0.15 dB). Between them the knob is character only.
+        for drive in [0.0_f32, 0.2, 0.4, TapeParams::default().drive, 0.6] {
             let delta = at(drive);
             assert!(
                 delta.abs() < 0.4,
-                "drive {drive} moved a 0 VU program by {delta:.3} dB — up to \
-                 the shipped setting this dial may not touch the level"
+                "drive {drive} moved a 0 VU program by {delta:.3} dB: up to \
+                 the old default this dial may not touch the level"
             );
         }
         // Past the default it costs, and the cost is bounded and stated: the
@@ -2231,16 +2900,47 @@ mod tests {
         );
         // Monotone downward: no setting of a record level may make a track
         // LOUDER than the one below it, which a mis-signed trim would.
-        let mut last = f64::INFINITY;
-        for step in 0..=10 {
-            let here = at(step as f32 / 10.0);
-            assert!(
-                here <= last + 0.05,
-                "drive {} read {here:.3} dB against {last:.3} dB the step \
-                 before — the line-up is running the wrong way",
-                step as f32 / 10.0
-            );
-            last = here;
+        for speed in [TapeSpeed::Ips15, TapeSpeed::Ips7_5, TapeSpeed::Ips3_75] {
+            let mut last = f64::INFINITY;
+            for step in 0..=10 {
+                let here = programme(step as f32 / 10.0, speed);
+                assert!(
+                    here <= last + 0.05,
+                    "at {} drive {} read {here:.3} dB against {last:.3} dB the step \
+                     before: the line-up is running the wrong way",
+                    speed.label(),
+                    step as f32 / 10.0
+                );
+                last = here;
+            }
+        }
+
+        // A steady 0 VU tone at 100 Hz, at every speed.
+        let low = 10.0_f32.powf(-18.0 / 20.0) * 2.0_f32.sqrt();
+        let hundred: Vec<f32> = (0..(sr * 0.6) as usize)
+            .map(|i| low * (std::f32::consts::TAU * 100.0 * i as f32 / sr).sin())
+            .collect();
+        let (t_lo, t_hi) = ((sr * 0.3) as usize, (sr * 0.6) as usize);
+        let tone_in = band(&hundred[t_lo..t_hi], sr.into(), 100.0);
+        for speed in TapeSpeed::ALL {
+            let mut last = f64::INFINITY;
+            for step in 0..=10 {
+                let p = TapeParams {
+                    drive: step as f32 / 10.0,
+                    speed: speed.dial(),
+                    ..TapeParams::NEUTRAL
+                };
+                let out = left(&feed(&mut Tape::new(sr), &to_stereo(&hundred), &p));
+                let here = db(band(&out[t_lo..t_hi], sr.into(), 100.0) / tone_in);
+                assert!(
+                    here <= last + 0.05,
+                    "at {} a 0 VU 100 Hz tone read {here:.3} dB at drive {}, against \
+                     {last:.3} dB the step before: the dial is a bass volume control",
+                    speed.label(),
+                    step as f32 / 10.0
+                );
+                last = here;
+            }
         }
     }
 
@@ -2253,9 +2953,9 @@ mod tests {
     ///
     /// The figure is asked of the settings, so it is also pinned against
     /// them: the head and the pair add up to it exactly, and no position of
-    /// any of the six dials moves it, because a report that moved with a
-    /// character dial would re-time the lane in the compensation graph every
-    /// time somebody turned that dial.
+    /// any of the seven dials moves it, the speed included, because a report
+    /// that moved with a character dial would re-time the lane in the
+    /// compensation graph every time somebody turned that dial.
     #[test]
     fn the_oversampler_costs_the_host_no_latency() {
         let positions = [0.0_f32, 0.5, 1.0];
@@ -2275,7 +2975,7 @@ mod tests {
                  to the {got} frames reported",
                 unit.base
             );
-            for combo in 0..3_usize.pow(6) {
+            for combo in 0..3_usize.pow(7) {
                 let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
                 let p = TapeParams {
                     drive: at(0),
@@ -2284,6 +2984,7 @@ mod tests {
                     wobble: at(3),
                     hiss: at(4),
                     trim: at(5),
+                    speed: at(6),
                 };
                 assert_eq!(
                     unit.latency_frames(&p),
@@ -2437,7 +3138,7 @@ mod tests {
         let mut direct = DirectPair::new((0, 0));
         let worst = noise
             .iter()
-            .map(|&x| (record(&mut poly, &taps, &mut err, d, x) - direct.run(x, Some(d))).abs())
+            .map(|&x| (record(&mut poly, &taps, &mut err, d, 1.0 / d, x) - direct.run(x, Some(d))).abs())
             .fold(0.0_f32, f32::max);
         assert!(
             worst < 1.0e-5,
@@ -2462,31 +3163,43 @@ mod tests {
     /// centre three quarters of a sample ahead ([`OS_LATENCY`]).
     ///
     /// So a lone impulse after a second of silence must peak on exactly the
-    /// reported frame at every rate an engine runs at, with every colour off
-    /// and at the shipped settings with the transport and the hiss still.
-    /// With every colour off its three-point parabolic centre must also sit
-    /// within a twentieth of a sample of the report at 44.1 and 48 kHz, and
-    /// within a tenth at 96. What is left there is the self-erasure
-    /// one-pole, whose 22 kHz rest corner is minimum-phase and pulls the
-    /// centre late, by more of a sample the higher the rate, because the
-    /// same corner in hertz is more samples of delay there: measured +0.012,
-    /// +0.016 and +0.079 of a sample at 44.1, 48 and 96 kHz, where the old
-    /// picks read 0.73 to 0.82 early.
-    /// The shipped settings are not held to the centre, only to the frame:
-    /// their Roll is a 15.6 kHz one-pole, minimum-phase too, and it pulls the
-    /// centre +0.29 late at 96 kHz without moving the peak.
+    /// reported frame at every rate an engine runs at and at every speed,
+    /// with every colour off and at a fresh tape's settings with the
+    /// transport and the hiss still. Minimum-phase stages add their delay
+    /// after the peak without moving it.
+    ///
+    /// With every colour off at 15 and 30 ips its three-point parabolic
+    /// centre must also sit within a twentieth of a sample of the report at
+    /// 44.1 and 48 kHz, and within a tenth at 96. Self-erasure is an exact
+    /// wire at rest, so what is left there is the head's own top, a
+    /// minimum-phase one-pole that pulls the centre late, by more of a
+    /// sample the higher the rate, because the same corner in hertz is more
+    /// samples of delay there: measured +0.020, +0.023 and +0.066 of a sample
+    /// at 15 ips and +0.013, +0.016 and +0.051 at 30, at 44.1, 48 and 96 kHz,
+    /// where the old picks read 0.73 to 0.82 early. The slower speeds' tops,
+    /// 13.1 and 20.3 kHz, are held to the frame only (up to +0.17 at
+    /// 3.75 ips at 96 kHz), and so is a fresh tape, whose contour is all
+    /// below 100 Hz.
     #[test]
     fn an_impulse_leaves_exactly_when_the_host_is_told_it_will() {
-        let still = TapeParams {
-            wobble: 0.0,
-            hiss: 0.0,
-            ..TapeParams::default()
-        };
+        let mut cases = Vec::new();
+        for speed in TapeSpeed::ALL {
+            let neutral = TapeParams {
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            let still = TapeParams {
+                wobble: 0.0,
+                hiss: 0.0,
+                speed: speed.dial(),
+                ..TapeParams::default()
+            };
+            let centred = matches!(speed, TapeSpeed::Ips15 | TapeSpeed::Ips30);
+            cases.push((speed.label(), "every colour off", neutral, centred));
+            cases.push((speed.label(), "a fresh tape, transport and hiss still", still, false));
+        }
         for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
-            for (what, p, centred) in [
-                ("every colour off", TapeParams::NEUTRAL, true),
-                ("the shipped settings, transport and hiss still", still, false),
-            ] {
+            for &(speed, what, p, centred) in &cases {
                 let mut unit = Tape::new(sr);
                 let lat = unit.latency_frames(&p);
                 let at = sr as usize;
@@ -2497,8 +3210,8 @@ mod tests {
                 assert_eq!(
                     peak,
                     at + lat,
-                    "{what} at {sr} Hz: the impulse peaked {} frames after it went \
-                     in, and the host was told {lat}",
+                    "{what} at {speed}, {sr} Hz: the impulse peaked {} frames after it \
+                     went in, and the host was told {lat}",
                     peak as i64 - at as i64
                 );
                 let (a, b, c) = (
@@ -2511,35 +3224,64 @@ mod tests {
                 if centred {
                     assert!(
                         centre.abs() < bar,
-                        "{what} at {sr} Hz: the impulse is centred {centre:+.3} of a \
-                         sample off the frame the host was told (bar {bar})"
+                        "{what} at {speed}, {sr} Hz: the impulse is centred {centre:+.3} \
+                         of a sample off the frame the host was told (bar {bar})"
                     );
                 }
             }
         }
     }
 
-    /// **The line-up table is the direct solve.** [`Tape::new`] solves
-    /// [`sat_makeup`] at [`MAKEUP_POINTS`] record levels and every block reads
-    /// between them, so the table may only ever be a faster way to the same
-    /// answer: at a thousand and one levels spread evenly in octaves across
-    /// [`MAKEUP_D`], it reads within a hundredth of a decibel of solving
-    /// afresh. Measured: 0.0021 dB at worst.
+    /// **The line-up table is the direct solve.** [`Tape::new`] fills the
+    /// table from [`sat_makeup`] and the refused flux's correction
+    /// ([`sat_makeup_refused`]), the correction held at its running minimum
+    /// from the lowest record level up, and every frame reads between its
+    /// points, so the table may only ever be a faster way to the same answer:
+    /// at a thousand and one record levels spread evenly in octaves across
+    /// [`MAKEUP_D`], it reads within a hundredth of a decibel of the same
+    /// thing solved afresh, its running minimum taken on a grid four times
+    /// as fine. And its correction never rises with the record level: every
+    /// entry's is at or under the one below's, to a ten-thousandth of a
+    /// decibel, which is the property that keeps a step up the dial from
+    /// being louder. Measured: 0.0021 dB at worst, and the correction holds
+    /// -0.30 dB from `d` = 7 up.
     #[test]
     fn the_line_up_table_is_the_direct_solve() {
         let unit = Tape::new(48_000.0);
         let (lo, hi) = (MAKEUP_D.0.log2(), MAKEUP_D.1.log2());
+        let fine = 4_000_usize;
+        let mut held = 0.0_f64;
+        let minimum: Vec<f64> = (0..=fine)
+            .map(|j| {
+                let d = (lo + (hi - lo) * j as f64 / fine as f64).exp2();
+                held = held.min(db(sat_makeup_refused(d) / f64::from(sat_makeup(d))));
+                held
+            })
+            .collect();
         let mut worst = 0.0_f64;
-        for k in 0..=1_000 {
-            let l = lo + (hi - lo) * f64::from(k) / 1_000.0;
+        for k in 0..=1_000_usize {
+            let l = lo + (hi - lo) * k as f64 / 1_000.0;
             let table = f64::from(makeup_at(&unit.makeup, l));
-            let direct = f64::from(sat_makeup(l.exp2()));
+            let direct = f64::from(sat_makeup(l.exp2())) * 10.0_f64.powf(minimum[4 * k] / 20.0);
             worst = worst.max(db(table / direct).abs());
         }
         assert!(
             worst < 0.01,
             "the line-up table is {worst:.4} dB from the direct solve"
         );
+        let correction: Vec<f64> = (0..MAKEUP_POINTS)
+            .map(|i| db(f64::from(unit.makeup[i]) / f64::from(sat_makeup(makeup_d(i)))))
+            .collect();
+        for (i, w) in correction.windows(2).enumerate() {
+            assert!(
+                w[1] <= w[0] + 1.0e-4,
+                "the line-up's correction rises from {:+.4} to {:+.4} dB at entry {}: \
+                 a step up the dial would be louder",
+                w[0],
+                w[1],
+                i + 1
+            );
+        }
     }
 
     /// A Butterworth low- or high-pass of even order to measure with: a
@@ -2706,8 +3448,8 @@ mod tests {
 
     /// **No knob on this unit may be a decoration.**
     ///
-    /// The generic net under the five specific tests above: sweep each
-    /// control from the shipped setting to each end of its travel and demand
+    /// The generic net under the specific tests above: sweep each control
+    /// from a fresh tape's setting to each end of its travel and demand
     /// that the OUTPUT moves — not that the parameter was stored, which is
     /// what a field assignment proves and what a dead control also passes.
     ///
@@ -2727,18 +3469,28 @@ mod tests {
         let input = to_stereo(&mono);
 
         // symbol, what it does, and the floor in dB relative to the program.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 6] = [
-            ("drive", |p, v| p.drive = v, -6.0),
-            // A 70 Hz peak is a thin slice of broadband noise; the bump's
-            // own size is pinned in hertz by the sample-rate test.
-            ("bump", |p, v| p.bump = v, -30.0),
-            ("roll", |p, v| p.roll = v, -8.0),
-            ("wobble", |p, v| p.wobble = v, -3.0),
-            // Hiss is meant to sit under the music. Its shape and its
-            // ducking are pinned by their own test; this only says it is
-            // there.
+        // Each floor is 3 dB under what the knob measured from a fresh
+        // tape, rounded down to the whole decibel; the measured figure is
+        // beside it.
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 7] = [
+            // -3.8 dB.
+            ("drive", |p, v| p.drive = v, -7.0),
+            // -36.4 dB: at 15 ips the contour's bell sits near 35 Hz, a
+            // thin slice of broadband noise; the bump's own size is pinned
+            // in hertz by its octave test and by the sample-rate test.
+            ("bump", |p, v| p.bump = v, -40.0),
+            // -2.6 dB.
+            ("roll", |p, v| p.roll = v, -6.0),
+            // +2.8 dB.
+            ("wobble", |p, v| p.wobble = v, -1.0),
+            // -38.5 dB. Hiss is meant to sit under the music. Its shape and
+            // its ducking are pinned by their own test; this only says it
+            // is there.
             ("hiss", |p, v| p.hiss = v, -42.0),
-            ("trim", |p, v| p.trim = v, 0.0),
+            // +9.5 dB.
+            ("trim", |p, v| p.trim = v, 6.0),
+            // -5.0 dB: 15 ips to either end of the selector.
+            ("speed", |p, v| p.speed = v, -9.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -2762,6 +3514,355 @@ mod tests {
                 "{name} moved the output by only {best:.2} dB from the shipped \
                  setting — it is wired to nothing a person could hear"
             );
+        }
+    }
+
+    /// A sine at `hz` of peak `amp`, through a fresh unit at `p`: its gain
+    /// through the tape in dB, Hann-measured in the window from `settle` to
+    /// `settle + measure` seconds, output against input. With `harmonic`,
+    /// that harmonic's level against the output's fundamental instead.
+    fn tone_through(p: &TapeParams, sr: f32, hz: f64, amp: f32, settle: f32, measure: f32, harmonic: Option<f64>) -> f64 {
+        let frames = (sr * (settle + measure)) as usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| amp * (std::f64::consts::TAU * hz * i as f64 / f64::from(sr)).sin() as f32)
+            .collect();
+        let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), p));
+        let (lo, hi) = ((sr * settle) as usize, frames);
+        let fund = band(&out[lo..hi], sr.into(), hz);
+        match harmonic {
+            Some(h) => db(band(&out[lo..hi], sr.into(), hz * h) / fund.max(1.0e-30)),
+            None => db(fund / band(&mono[lo..hi], sr.into(), hz)),
+        }
+    }
+
+    /// 0 VU, as a sine's peak: the RMS [`ALIGN_DBFS`] names, times root two.
+    fn zero_vu() -> f32 {
+        10.0_f32.powf(ALIGN_DBFS as f32 / 20.0) * std::f32::consts::SQRT_2
+    }
+
+    /// **The head bump moves an octave with every doubling of speed.**
+    ///
+    /// The bump is a wavelength on the tape, 10.9 mm, so what it adds at a
+    /// frequency at one speed it adds at twice the frequency at twice the
+    /// speed. Bump 1 against Bump 0 cancels everything else in the chain (the
+    /// transformer, the head's own roll-off, the top), leaving the contour's
+    /// two bells: measured at the bump's own frequency and an octave above it
+    /// at every speed, each pair of speeds an octave apart agrees within
+    /// 0.15 dB, and the bump adds 4.2 to 4.9 dB at its frequency and takes
+    /// 0.8 to 1.5 dB an octave above (model +4.53 and -1.13: the +5 dB bell
+    /// less the dip's skirt, and the dip less the bell's). Measured +4.535
+    /// and -1.132 at every speed.
+    ///
+    /// **And with the bump at 0 the low end is the head's alone.** The NAB
+    /// record shelf lifts the bass by up to 4 dB onto the tape and its
+    /// inverse must take exactly that back off, so a quiet tone at the
+    /// bump's frequency and an octave above it reads what the input
+    /// transformer and the head's own roll-off give it, two one-poles whose
+    /// response is known exactly, within 0.1 dB at every speed.
+    #[test]
+    fn the_head_bump_moves_an_octave_with_every_doubling_of_speed() {
+        let sr = 48_000.0_f32;
+        let amp = 0.1_f32;
+        let at = |speed: TapeSpeed| {
+            let f_b = 0.0254 * speed.ips() / (BUMP_WAVELENGTH_MM * 1.0e-3);
+            [f_b, 2.0 * f_b].map(|hz| {
+                let gain = |bump: f32| {
+                    let p = TapeParams {
+                        bump,
+                        speed: speed.dial(),
+                        ..TapeParams::NEUTRAL
+                    };
+                    tone_through(&p, sr, hz, amp, 1.0, 2.0, None)
+                };
+                // A trapezoidal one-pole high-pass at `fc` passes
+                // `t / sqrt(t^2 + g^2)`, `t = tan(pi f / rate)`.
+                let high = |fc: f64| {
+                    let (t, g) = (
+                        (std::f64::consts::PI * hz / f64::from(sr)).tan(),
+                        (std::f64::consts::PI * fc / f64::from(sr)).tan(),
+                    );
+                    db(t / (t * t + g * g).sqrt())
+                };
+                let head = high(TRANSFORMER_HZ) + high((HEAD_LF_SHARE * f_b).max(HEAD_LF_FLOOR_HZ));
+                let flat = gain(0.0);
+                assert!(
+                    (flat - head).abs() < 0.1,
+                    "at {} a quiet {hz:.1} Hz tone reads {flat:+.2} dB with the bump off, \
+                     where the transformer and the head's roll-off give {head:+.2}: the \
+                     record shelf did not come off",
+                    speed.label()
+                );
+                gain(1.0) - flat
+            })
+        };
+        let adds: Vec<[f64; 2]> = TapeSpeed::ALL.iter().map(|v| at(*v)).collect();
+        for (speed, [bump, dip]) in TapeSpeed::ALL.iter().zip(&adds) {
+            assert!(
+                (4.2..=4.9).contains(bump),
+                "at {} the bump adds {bump:+.2} dB at its own frequency",
+                speed.label()
+            );
+            assert!(
+                (-1.5..=-0.8).contains(dip),
+                "at {} the bump adds {dip:+.2} dB an octave above it",
+                speed.label()
+            );
+        }
+        for (k, w) in adds.windows(2).enumerate() {
+            for j in 0..2 {
+                assert!(
+                    (w[0][j] - w[1][j]).abs() < 0.15,
+                    "the bump's {} reads {:+.2} dB at {} and {:+.2} dB an octave up at {}: \
+                     it did not move with the speed",
+                    ["peak", "dip"][j],
+                    w[0][j],
+                    TapeSpeed::ALL[k].label(),
+                    w[1][j],
+                    TapeSpeed::ALL[k + 1].label()
+                );
+            }
+        }
+    }
+
+    /// **A speed change glides like a servo relocking.**
+    ///
+    /// A studio transport re-locks to a new speed in about a third of a
+    /// second, and the voicing follows the same way: 20 ms after a switch
+    /// from 15 to 3.75 ips the glide is under 30 % of the way there in octaves
+    /// and by 0.6 s within 0.5 % of it. And everything per-speed follows it
+    /// to the end: 0.6 s after a switch from 15 to 7.5 ips, two quiet tones
+    /// at 1 kHz and 10 kHz (Drive 0, so self-erasure is a wire and only the
+    /// voicing is measured) read within 0.05 dB of a unit that ran at
+    /// 7.5 ips all along. Every per-speed constant is blended in `log2` of
+    /// the speed, so there is no corner in that path that lags behind the
+    /// rest. Measured: 18 % of the way at 20 ms, 3.763 ips at 0.6 s, and
+    /// +0.0000 and +0.0002 dB.
+    #[test]
+    fn a_speed_change_glides_like_a_servo_relocking() {
+        let sr = 48_000.0_f32;
+        let at = |speed: TapeSpeed| TapeParams {
+            speed: speed.dial(),
+            ..TapeParams::NEUTRAL
+        };
+        let mut unit = Tape::new(sr);
+        let mut silence = vec![0.0_f32; 480 * 2];
+        unit.process(&mut silence, 480, 2, &at(TapeSpeed::Ips15));
+        let mut quiet = vec![0.0_f32; 960 * 2];
+        unit.process(&mut quiet, 960, 2, &at(TapeSpeed::Ips3_75));
+        let way = |v: f64| (15.0 / v).log2() / 2.0;
+        let early = way(unit.speed_now());
+        assert!(
+            (0.0..0.3).contains(&early),
+            "20 ms after 15 -> 3.75 ips the glide is {:.0} % of the way there",
+            early * 100.0
+        );
+        let mut rest = vec![0.0_f32; 27_840 * 2];
+        unit.process(&mut rest, 27_840, 2, &at(TapeSpeed::Ips3_75));
+        let off = (unit.speed_now() / 3.75).ln().abs();
+        assert!(
+            off < 1.005_f64.ln(),
+            "0.6 s after 15 -> 3.75 ips the speed is {:.3} ips",
+            unit.speed_now()
+        );
+
+        // Two quiet tones through a switch, against a unit that never moved.
+        let amp = 10.0_f32.powf(-30.0 / 20.0);
+        let frames = (sr * 1.5) as usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f64 / f64::from(sr);
+                (f64::from(amp) * ((std::f64::consts::TAU * 1_000.0 * t).sin()
+                    + (std::f64::consts::TAU * 10_000.0 * t).sin())) as f32
+            })
+            .collect();
+        let input = to_stereo(&mono);
+        let switch = (sr * 0.5) as usize;
+        let mut moved = Tape::new(sr);
+        let mut a = input[..switch * 2].to_vec();
+        moved.process(&mut a, switch, 2, &at(TapeSpeed::Ips15));
+        let mut b = input[switch * 2..].to_vec();
+        let n = frames - switch;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(512);
+            moved.process(&mut b[done * 2..(done + k) * 2], k, 2, &at(TapeSpeed::Ips7_5));
+            done += k;
+        }
+        let moved: Vec<f32> = left(&[a, b].concat());
+        let still = left(&feed(&mut Tape::new(sr), &input, &at(TapeSpeed::Ips7_5)));
+        let (lo, hi) = (switch + (sr * 0.6) as usize, frames);
+        for hz in [1_000.0, 10_000.0] {
+            let gap = db(band(&moved[lo..hi], sr.into(), hz) / band(&still[lo..hi], sr.into(), hz));
+            assert!(
+                gap.abs() < 0.05,
+                "0.6 s after 15 -> 7.5 ips, {hz} Hz reads {gap:+.3} dB from a 7.5 ips tape"
+            );
+        }
+    }
+
+    /// **Slower tape saturates sooner, by its published headroom.**
+    ///
+    /// A faster tape writes the same flux over a longer wavelength and takes
+    /// more of it before its 3 % point: the datasheets put 15 ips 2.0 to
+    /// 2.5 dB over 7.5. So the same 0 VU tone at the same Drive carries more
+    /// third harmonic the slower the tape: a 220 Hz tone at Drive 0.6 reads
+    /// 1.4 to 2.1 times the HD3 at 7.5 ips that it does at 15, the same again
+    /// from 7.5 to 3.75, and a little less at 30 than at 15 (model 1.70, 1.69
+    /// and 0.85; measured 1.68, 1.67 and 0.86, from 2.00, 1.20, 0.71 and
+    /// 0.61 % at 3.75, 7.5, 15 and 30 ips).
+    #[test]
+    fn slower_tape_saturates_sooner_by_its_published_headroom() {
+        let sr = 48_000.0_f32;
+        let hd3 = |speed: TapeSpeed| {
+            let p = TapeParams {
+                drive: 0.6,
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            10.0_f64.powf(tone_through(&p, sr, 220.0, zero_vu(), 0.3, 0.6, Some(3.0)) / 20.0)
+        };
+        let [s3, s7, s15, s30] = TapeSpeed::ALL.map(hd3);
+        for (what, ratio, range) in [
+            ("7.5 over 15 ips", s7 / s15, 1.4..=2.1),
+            ("3.75 over 7.5 ips", s3 / s7, 1.4..=2.1),
+            ("30 over 15 ips", s30 / s15, 0.8..=1.0),
+        ] {
+            assert!(
+                range.contains(&ratio),
+                "HD3 of a 0 VU tone at Drive 0.6, {what}: {ratio:.2} \
+                 ({:.2} %, {:.2} %, {:.2} %, {:.2} % at 3.75, 7.5, 15 and 30 ips)",
+                s3 * 100.0,
+                s7 * 100.0,
+                s15 * 100.0,
+                s30 * 100.0
+            );
+        }
+    }
+
+    /// **Each speed tops out where studio machines are specified.**
+    ///
+    /// A studio two-track's response is quoted within 2 dB to 10, 15.5, 21
+    /// and 25 kHz at 3.75, 7.5, 15 and 30 ips, and each speed's own top is a
+    /// one-pole matched to it ([`HEAD_TOP_EDGE_HZ`]). So with every colour
+    /// off a quiet 10 kHz tone, against 1 kHz, loses 1.5 to 2.5 dB at
+    /// 3.75 ips, 0.5 to 1.4 at 7.5, 0.2 to 0.9 at 15 and 0.1 to 0.7 at 30
+    /// (model -2.00, -0.95, -0.54 and -0.39; measured -1.97, -0.93, -0.53
+    /// and -0.38).
+    #[test]
+    fn each_speed_tops_out_where_studio_machines_are_specified() {
+        let sr = 48_000.0_f32;
+        let amp = 10.0_f32.powf(-30.0 / 20.0);
+        for (speed, range) in TapeSpeed::ALL.into_iter().zip([
+            -2.5..=-1.5,
+            -1.4..=-0.5,
+            -0.9..=-0.2,
+            -0.7..=-0.1,
+        ]) {
+            let p = TapeParams {
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            let top = tone_through(&p, sr, 10_000.0, amp, 0.2, 0.3, None)
+                - tone_through(&p, sr, 1_000.0, amp, 0.2, 0.3, None);
+            assert!(
+                range.contains(&top),
+                "at {} a quiet 10 kHz tone reads {top:+.2} dB against 1 kHz",
+                speed.label()
+            );
+        }
+    }
+
+    /// The input level, in dB re 0 VU, at which a tone at `hz` through `p`
+    /// comes out 1 dB under its own small-signal gain: its 1 dB compression
+    /// point, by bisection.
+    fn compression_point(p: &TapeParams, sr: f32, hz: f64) -> f64 {
+        let gain = |level_db: f64| {
+            let amp = zero_vu() * 10.0_f32.powf(level_db as f32 / 20.0);
+            tone_through(p, sr, hz, amp, 0.1, 0.05, None)
+        };
+        let small = gain(-30.0);
+        let (mut lo, mut hi) = (-20.0_f64, 30.0_f64);
+        for _ in 0..16 {
+            let mid = 0.5 * (lo + hi);
+            if gain(mid) > small - 1.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// **Slower tape saturates its treble first, as the datasheets say.**
+    ///
+    /// A tape's saturation at 10 kHz comes in sooner than at 1 kHz, and much
+    /// sooner on slow tape, where 10 kHz is a short wavelength that
+    /// self-erasure takes first: the datasheets put the 10 kHz ceiling 7.5 to
+    /// 9.5 dB under the 1 kHz one at 7.5 ips, 1.5 to 2 at 15 and 1 to 1.5 at
+    /// 30. So at Drive 0.6 the 10 kHz 1 dB compression point sits 6.5 to
+    /// 9.5 dB under 1 kHz's at 7.5 ips, 0.5 to 3 under at 15, at most 2.5
+    /// under (and a quarter over) at 30, and at least 8 under at 3.75, in that
+    /// order (model -8.26, -1.86, -0.88 and -10.40; measured -8.14, -1.85,
+    /// -0.88 and -10.21), which is the self-erasure fit [`ERASE_TOP_HZ`]
+    /// states.
+    #[test]
+    fn slower_tape_saturates_its_treble_first_as_the_datasheets_say() {
+        let sr = 48_000.0_f32;
+        let gap: Vec<f64> = TapeSpeed::ALL
+            .iter()
+            .map(|v| {
+                let p = TapeParams {
+                    drive: 0.6,
+                    speed: v.dial(),
+                    ..TapeParams::NEUTRAL
+                };
+                compression_point(&p, sr, 10_000.0) - compression_point(&p, sr, 1_000.0)
+            })
+            .collect();
+        for (k, range) in [(1, -9.5..=-6.5), (2, -3.0..=-0.5), (3, -2.5..=0.25)] {
+            assert!(
+                range.contains(&gap[k]),
+                "at {} the 10 kHz compression point is {:+.2} dB from 1 kHz's",
+                TapeSpeed::ALL[k].label(),
+                gap[k]
+            );
+        }
+        assert!(gap[0] <= -8.0, "at 3.75 ips the 10 kHz compression point is only {:+.2} dB under 1 kHz's", gap[0]);
+        assert!(
+            gap[0] < gap[1] && gap[1] < gap[2] && gap[2] <= gap[3],
+            "the 10 kHz compression points are not ordered by speed: {gap:.2?} dB"
+        );
+    }
+
+    /// **The line-up tone comes back at its level at every speed.**
+    ///
+    /// A machine is lined up with a 1 kHz tone at 0 VU, and the line-up's
+    /// whole job is that tone: from the bottom of the dial to the Drive a
+    /// fresh tape opens at and a tenth past it, at all four speeds, it comes
+    /// back within 0.35 dB of where it went in (model 0.23 at most; measured
+    /// -0.24 dB at 3.75 ips at Drive 0.6, and 0.05 or under at the other
+    /// three). What is left over is the self-erasure the slow speeds already
+    /// do at that level, and the refused flux's lift past where its
+    /// correction holds.
+    #[test]
+    fn the_line_up_tone_comes_back_at_its_level_at_every_speed_and_bias() {
+        let sr = 48_000.0_f32;
+        let amp = 10.0_f32.powf(-18.0 / 20.0) * std::f32::consts::SQRT_2;
+        for speed in TapeSpeed::ALL {
+            for step in 0..=6 {
+                let p = TapeParams {
+                    drive: step as f32 / 10.0,
+                    speed: speed.dial(),
+                    ..TapeParams::NEUTRAL
+                };
+                let level = tone_through(&p, sr, 1_000.0, amp, 0.2, 0.2, None);
+                assert!(
+                    level.abs() < 0.35,
+                    "at {} Drive {} the 0 VU line-up tone comes back {level:+.3} dB",
+                    speed.label(),
+                    step as f32 / 10.0
+                );
+            }
         }
     }
 }

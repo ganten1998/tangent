@@ -225,16 +225,22 @@ const EQ_KIND_STEPS: i32 = 6;
 const EQ_FACE_NODES: usize = 5;
 const EQ_KNOBS_PER_NODE: u32 = 5;
 
-/// One knob per `units::tape::TapeParams` field, ids in declaration order.
-/// Defaults are `TapeParams::default()` verbatim — the shipped 388 at a
-/// healthy record level — and a test holds the two tables together.
+/// One knob per `units::tape::TapeParams` field, ids in declaration order:
+/// the six 5.0 shipped, then the ones appended after them, which never move.
+/// Defaults are `TapeParams::default()` verbatim, a fresh machine at the
+/// studio speed lined up at its tape's datasheet level, and a test holds the
+/// two tables together. Drive opens at 0.5 and Roll at 0 (out of circuit)
+/// for a fresh bay only: a saved one keeps every value it was saved with,
+/// because its state writes every symbol, so neither needs an
+/// [`absent_reads_as`] entry.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
-    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.6, steps: 0 },
+    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.5, steps: 0 },
     ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
-    ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.12, steps: 0 },
+    ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 3, symbol: "wobble", name: "Wobble", units: "%", default: 0.3, steps: 0 },
     ParamSpec { id: 4, symbol: "hiss", name: "Hiss", units: "%", default: 0.25, steps: 0 },
     ParamSpec { id: 5, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 6, symbol: "speed", name: "Speed", units: "ips", default: 2.0 / 3.0, steps: crate::units::tape::TAPE_SPEED_STEPS },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -946,14 +952,16 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         }
         (HWINSERT_PATH, 0 | 1) => fmt_db(lerp(crate::units::hwinsert::GAIN_DB)),
         (HWINSERT_PATH, 3) => (if v >= 0.5 { "inverted" } else { "normal" }).to_owned(),
-        // **The three tape dials that have an honest number.** Their
-        // `ParamSpec`s promise dB, Hz and dB, and the automation lane prints
-        // that promise beside the curve; the face used to fall through to
+        // **The tape dials that have an honest number.** Their `ParamSpec`s
+        // promise dB, Hz, dB and ips, and the automation lane prints that
+        // promise beside the curve; the face used to fall through to
         // percent, so the lane said "dB" and the panel said "50 %" about the
         // same knob. Which of the two was wrong is settled by the machine:
-        // the head bump is +2.5 dB at 70 Hz on the service data, the repro
-        // corner is a frequency, and a trim is decibels. The other three —
-        // drive, wobble, hiss — stay percent below, and their specs say so.
+        // the bump is the decibels its bell adds at the head's own bump
+        // frequency, the repro corner is a frequency, a trim is decibels,
+        // and the speed is the selector's own words, the same strings
+        // `choices` offers. Drive, wobble and hiss stay percent below, and
+        // their specs say so.
         (TAPE_PATH, 1) => fmt_db(lerp(crate::units::tape::BUMP_DB)),
         (TAPE_PATH, 2) => {
             // Zero is the stage out of circuit, not a 20 kHz corner: naming
@@ -966,6 +974,7 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
             }
         }
         (TAPE_PATH, 5) => fmt_db(lerp(crate::units::tape::TRIM_DB)),
+        (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::from_dial(v).label().to_owned(),
         // The rest of the tape speaks in percent on purpose: those knobs are
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
@@ -1105,6 +1114,10 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
         (HWINSERT_PATH, 3) => vec!["normal".to_owned(), "inverted".to_owned()],
+        (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::ALL
+            .iter()
+            .map(|v| v.label().to_owned())
+            .collect(),
         (ANALOG_PATH, id) => analog_choices(id),
         (SAMPLER_PATH, id) => sampler_choices(id),
         _ => Vec::new(),
@@ -2135,6 +2148,7 @@ impl TapeUnit {
             3 => self.params.wobble = v,
             4 => self.params.hiss = v,
             5 => self.params.trim = v,
+            6 => self.params.speed = v,
             _ => {}
         }
     }
@@ -3521,10 +3535,9 @@ mod tests {
     #[test]
     fn the_face_tables_open_at_the_kernels_shipped_defaults() {
         let t = crate::units::tape::TapeParams::default();
-        for (spec, want) in TAPE_FACE_PARAMS
-            .iter()
-            .zip([t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim])
-        {
+        let fields = [t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed];
+        assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
+        for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
             assert_eq!(spec.default, want, "{} drifted from TapeParams::default", spec.symbol);
         }
         let i = crate::units::imager::ImagerParams::default();
@@ -3711,6 +3724,9 @@ mod tests {
         };
         // Steady state only: past the envelope settling and the line fill.
         let (lo, hi) = ((sr * 0.25) as usize, (sr * 1.15) as usize);
+        // The six values are the 5.0 controls; `create` leaves every row it
+        // is not handed at the spec's default, so the speed is the studio
+        // 15 ips a fresh bay opens at.
         let at = |drive: f32| {
             let mut unit = spec.create(sr, &[drive, 0.0, 0.0, 0.0, 0.0, 0.5]);
             let mut out = vec![vec![0.0f32; frames]; 2];
@@ -3809,7 +3825,7 @@ mod tests {
             panic!("the tape path built something that is not a tape");
         };
         let fields = |p: &crate::units::tape::TapeParams| {
-            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim]
+            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed]
         };
         assert_eq!(
             fields(&u.params).len(),
@@ -3875,20 +3891,21 @@ mod tests {
     /// never runs. Switched out at block 10 and back at block 40, against
     /// the same sine left in circuit: no sample-to-sample step is more than
     /// half as big again as the sine's own largest, so neither fade clicks;
-    /// every zero crossing stays within a sample and a half of the
-    /// in-circuit run's, so the bypass never moved the lane; the kernel does
-    /// not run once its fade out is done; and 40 ms after the switch back
-    /// the output is the in-circuit run's within a thousandth, so the tape
-    /// it went back to plays as if it had never left. Measured: the worst
-    /// step 1.02 times the sine's own, the crossings 1.31 samples, the
-    /// kernel idle from block 11 to 39, and 2.8e-7 at 40 ms.
+    /// every zero crossing stays within a sample of the in-circuit run's, so
+    /// the bypass never moved the lane; the kernel does not run once its
+    /// fade out is done; and 40 ms after the switch back the output is the
+    /// in-circuit run's within a thousandth, so the tape it went back to
+    /// plays as if it had never left. Measured: the worst step 1.02 times
+    /// the sine's own, the crossings 0.86 of a sample, the kernel idle from
+    /// block 11 to 39, and 4.5e-5 at 40 ms (the input transformer and the
+    /// head's roll-off settling from the clean start).
     ///
     /// The crossings' bar is the tape's own phase and not its timing: its
-    /// 35 Hz sub roll leads a pure delay by 1.31 samples at 440 Hz, while a
-    /// bypass that dropped the tape's 96 frames would move a crossing by 13.
-    /// 440 Hz and not 1 kHz, because a 1 kHz period at 48 kHz is 48 frames,
-    /// which 96 is two of, and a lane that slipped by exactly the report
-    /// would cross zero where it always had.
+    /// low-end high-passes lead a pure delay by most of a sample at 440 Hz,
+    /// while a bypass that dropped the tape's 96 frames would move a
+    /// crossing by 13. 440 Hz and not 1 kHz, because a 1 kHz period at
+    /// 48 kHz is 48 frames, which 96 is two of, and a lane that slipped by
+    /// exactly the report would cross zero where it always had.
     #[test]
     fn a_bypassed_tape_keeps_its_delay_and_switches_without_a_click() {
         const BLOCK: usize = 512;
@@ -3952,7 +3969,7 @@ mod tests {
         assert_eq!(was.len(), now.len(), "the switched run crossed zero a different number of times");
         let moved = was.iter().zip(&now).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
         assert!(
-            moved < 1.5,
+            moved < 1.0,
             "a zero crossing moved {moved:.3} of a sample, so the bypass moved the lane"
         );
         assert_eq!(
@@ -4084,6 +4101,42 @@ mod tests {
                 "frame {k} after the onset stepped by {step:.4}, against the tone's own \
                  {largest:.4}: the lane jumped when the tape came back"
             );
+        }
+    }
+
+    /// **The tape's selectors offer exactly their positions.** A stepped row
+    /// cycles through `choices`, so the list must be as long as the steps
+    /// the spec declares and in the kernel's own order, the reading of the
+    /// default must be the choice the default lands on, and the default
+    /// must survive the state road bit for bit, or a fresh bay saved and
+    /// reopened would move off the studio speed by a rounding.
+    #[test]
+    fn the_tape_selectors_offer_exactly_their_positions() {
+        use crate::units::tape::{TapeSpeed, TAPE_SPEED_STEPS};
+        let spec = spec_for(TAPE_PATH).unwrap();
+        assert_eq!(TAPE_SPEED_STEPS as usize, TapeSpeed::ALL.len());
+        for (id, positions) in [(6_u32, TapeSpeed::ALL.len())] {
+            let row = &TAPE_FACE_PARAMS[id as usize];
+            assert_eq!(row.steps as usize, positions, "{} steps", row.symbol);
+            let offered = choices(TAPE_PATH, id);
+            assert_eq!(offered.len(), positions, "{} offers {offered:?}", row.symbol);
+            let at = (row.default * (positions - 1) as f32).round() as usize;
+            assert_eq!(
+                offered[at],
+                describe(TAPE_PATH, id, row.default, &[]),
+                "{}'s default reads as a position its choices do not name",
+                row.symbol
+            );
+        }
+        for (k, v) in TapeSpeed::ALL.iter().enumerate() {
+            assert_eq!(TapeSpeed::from_dial(v.dial()), *v, "{} does not round-trip", v.label());
+            assert_eq!(choices(TAPE_PATH, 6)[k], v.label());
+        }
+        assert_eq!(TAPE_FACE_PARAMS[6].default, TapeSpeed::Ips15.dial());
+        let text = state_text(spec, &spec.defaults(), &[]);
+        let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+        for (want, got) in spec.defaults().iter().zip(&back) {
+            assert_eq!(want.to_bits(), got.to_bits(), "a default changed on the state road");
         }
     }
 
@@ -4707,14 +4760,21 @@ mod tests {
         assert_eq!(describe(DRIVE_PATH, 2, 0.71, &[]), "+0.1 dB");
         assert_eq!(describe(DRIVE_PATH, 3, 0.0, &[]), "matched");
         assert_eq!(describe(IR_PATH, 1, 0.5, &[]), "+0.0 dB");
-        // The tape's three calibrated dials, at the positions it ships at:
-        // the bump's own +2.5 dB, the repro corner just under 16 kHz, unity
-        // trim. A face that printed "50 %" for any of these disagreed with
-        // the automation lane's declared unit about the same knob.
+        // The tape's calibrated dials, at the positions it opens at and the
+        // Roll 5.0 shipped: the bump's own +2.5 dB, the repro corner just
+        // under 16 kHz and off, unity trim, and the studio speed in the
+        // selector's words. A face that printed "50 %" for any of these
+        // disagreed with the automation lane's declared unit about the same
+        // knob.
         assert_eq!(describe(TAPE_PATH, 1, 0.5, &[]), "+2.5 dB");
         assert_eq!(describe(TAPE_PATH, 2, 0.12, &[]), "15.6 kHz");
         assert_eq!(describe(TAPE_PATH, 2, 0.0, &[]), "off");
         assert_eq!(describe(TAPE_PATH, 5, 0.5, &[]), "+0.0 dB");
+        assert_eq!(describe(TAPE_PATH, 6, 2.0 / 3.0, &[]), "15 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 0.0, &[]), "3.75 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 1.0 / 3.0, &[]), "7.5 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 1.0, &[]), "30 ips");
+        assert_eq!(choices(TAPE_PATH, 6), vec!["3.75 ips", "7.5 ips", "15 ips", "30 ips"]);
         // And the three that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
@@ -4857,7 +4917,8 @@ mod tests {
     /// The floor is deliberately low. This test's job is "did the value
     /// arrive"; whether the move is worth HEARING is pinned per knob in each
     /// kernel's own module, where the right measurement for a bump is dB at
-    /// 70 Hz and the right one for a drive is harmonic content.
+    /// the head's own bump frequency and the right one for a drive is
+    /// harmonic content.
     #[test]
     fn every_imager_and_tape_control_moves_the_audio_through_the_seat() {
         const FRAMES: usize = 24_000;
