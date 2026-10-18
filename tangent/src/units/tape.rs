@@ -59,7 +59,11 @@
 //! The pair costs [`OS_LATENCY`] samples of group delay, and it costs the
 //! unit nothing, because this unit already had a play head: the head's rest
 //! position is shortened by exactly that many samples, so the reported and
-//! the real latency are both still [`BASE_MS`].
+//! the real latency are both [`BASE_MS`]. That was three quarters of a
+//! sample untrue until the decimators kept the samples [`OS_LATENCY`] names;
+//! now an impulse leaves on the very frame [`Tape::latency_frames`] reports,
+//! at every rate, and `an_impulse_leaves_exactly_when_the_host_is_told_it_will`
+//! holds it there.
 //!
 //! # Params
 //!
@@ -111,6 +115,21 @@ impl Default for TapeParams {
             trim: 0.5,
         }
     }
+}
+
+#[cfg(test)]
+impl TapeParams {
+    /// Every colour off: the record level at the bottom of its travel, no
+    /// bump, no roll, a parked head, silent tape, unity trim. The recipe the
+    /// neutrality tests here and at the seat spell out, in one place.
+    pub(crate) const NEUTRAL: TapeParams = TapeParams {
+        drive: 0.0,
+        bump: 0.0,
+        roll: 0.0,
+        wobble: 0.0,
+        hiss: 0.0,
+        trim: 0.5,
+    };
 }
 
 // ── the voicing ─────────────────────────────────────────────────────────────
@@ -207,10 +226,15 @@ const SAT_FB: f32 = 0.35;
 /// So `A` gets more taps and a cutoff shaded to [`OS_A_CUTOFF`], which moves
 /// the whole fold region into true stopband.
 ///
-/// Restated here rather than imported because those items are private to that
-/// module, the same reason [`DESIGN_RATE`], [`flush`] and [`TINY`] are
-/// restated at the top of this file. Two numbers are deliberately NOT the
-/// amp's:
+/// The designer ([`windowed_sinc`]) is restated below rather than imported,
+/// like [`DESIGN_RATE`], [`flush`] and [`TINY`] at the top of this file: the
+/// kernel imports nothing from another unit, so no edit to a pedal's file
+/// can move the tape's sound. A second oversampler is a second place for an
+/// alias to hide, which is why this one has its own fold test
+/// (`full_drive_on_a_high_note_does_not_fold_the_band_back_on_itself`) and
+/// its own proof that it is the drive's direct form, sample for sample
+/// (`the_oversampler_is_the_direct_form_pair_at_less_than_half_the_arithmetic`).
+/// Two numbers are deliberately NOT the drive's:
 ///
 /// - **The 4× stage is 21 taps, not 23**, so that the pair's total group
 ///   delay is a whole number of session samples ([`OS_LATENCY`]) and the play
@@ -225,20 +249,43 @@ const SAT_FB: f32 = 0.35;
 ///   24 kHz, 42 at 25, past 80 by 26, so the worst alias it can pass sits at
 ///   23 kHz, 42 dB down, and everything below 22 kHz is 80 dB down or
 ///   better.
-/// **The tape borrows the drive's delay line** rather than keeping a second
-/// copy of the same code. They were identical, and both were the slow
-/// shape: a `split_at` and a `chain` that no compiler can vectorise.
-use crate::units::drive::Fir;
-
+///
+/// **The pair runs polyphase, which is less than half the arithmetic.** Half
+/// of what each interpolator reads is the zeros it stuffs in, half of what
+/// each decimator computes is thrown away, and every second off-centre tap of
+/// the halfband is zero. The direct form multiplied all of it: 484
+/// multiply-adds per channel-sample, the bulk of what the unit cost. Split
+/// into the phases each filter actually reads ([`OsTaps`],
+/// [`OsChannel`]), it is 200, or 226 with the padding that keeps every dot
+/// product on the vector path, on the Analog's precedent in
+/// `analog/filter.rs`. Every multiply-add goes through [`fma`], which is
+/// never a function call; see there for why the drive's own loop is not
+/// borrowed for it.
 const OS: usize = 4;
 const OS_A_TAPS: usize = 79;
 const OS_B_TAPS: usize = 21;
 
-/// The double-written window lengths for the shared `Fir`: twice the taps,
-/// so the newest `N` samples are one contiguous slice and the tap loop is a
-/// straight dot product.
-const OS_A_WIN: usize = OS_A_TAPS * 2;
-const OS_B_WIN: usize = OS_B_TAPS * 2;
+/// The tap counts each dot product of the polyphase pair runs, padded with
+/// zeros to a multiple of eight so it stays on the vector path. The 2×
+/// interpolator reads the even taps for the sample that lands on a session
+/// sample and the odd ones for the one between; the 2× decimator reads all
+/// of them, but only for the output it keeps; the 4× stages read the
+/// halfband's odd taps, because its even ones are the centre and zeros.
+/// A padded tap multiplies a real history sample by zero.
+const OS_A_EVEN: usize = pad8(OS_A_TAPS.div_ceil(2));
+const OS_A_ODD: usize = pad8(OS_A_TAPS / 2);
+const OS_A_FULL: usize = pad8(OS_A_TAPS);
+const OS_B_ODD: usize = pad8(OS_B_TAPS / 2);
+
+/// Where the halfband's centre tap reads in a history that holds every
+/// second 4× sample: the centre is tap `(21 - 1) / 2 = 10`, and ten 4×
+/// samples back on one phase's stream is five entries back.
+const OS_B_HALF: usize = (OS_B_TAPS - 1) / 4;
+
+/// `n` rounded up to a multiple of eight.
+const fn pad8(n: usize) -> usize {
+    n.div_ceil(8) * 8
+}
 
 /// Stage A's cutoff as a fraction of its own running rate; 0.25 would be the
 /// exact halfband. Shaded below the fold for the reason [`OS`] gives.
@@ -253,6 +300,16 @@ const OS_A_CUTOFF: f64 = 0.235;
 /// 48 kHz session. Whole, by the tap counts chosen in [`OS`]: a half-sample
 /// here would have to be rounded away somewhere, and the place it would land
 /// is the head position that keeps the unit's reported latency honest.
+///
+/// **Whole only if the decimators keep the right samples.** Each keeps one
+/// output in two, and the later of a pair has seen one more input: a quarter
+/// of a session sample further along at 4×, a half at 2×. The pair used to
+/// keep the later of both, so an impulse peaked on 43 with its phase delay
+/// at 43.25 across the band, three quarters of a sample ahead of the 44 the
+/// head gives up. Keeping the earlier of both (sub-phase `q == 0` at 4×,
+/// `h == 0` at 2×, in [`OsChannel::down`]) lands it on 44 exactly and
+/// symmetric about its peak; the filters, and so the magnitude and the
+/// aliasing, are the same ones.
 const OS_LATENCY: usize = (OS_A_TAPS - 1) / 2 + (OS_B_TAPS - 1) / 4;
 
 /// The line-up level the repro trim is calibrated at, in dBFS.
@@ -487,32 +544,238 @@ fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
     taps
 }
 
-/// One channel's four delay lines: up through 2× then 4×, and back down the
-/// same way.
+/// A multiply-add: fused where the machine fuses, a multiply and an add
+/// where it does not. Every tap of the record stage's pair goes through it.
+///
+/// **`f32::mul_add` is an instruction on one target and a call on the
+/// rest.** It is the `llvm.fma` intrinsic: one `fmadd` on arm64, but on the
+/// x86-64 baseline the Windows, Linux and FreeBSD builds use (no FMA, so
+/// every processor can run them) LLVM cannot inline it, and each one becomes
+/// a CALL into compiler-builtins' `fmaf`, one per tap. The drive's dot
+/// product calls the intrinsic, which is why this pair does not borrow it;
+/// the Analog measured what that costs a 4× pair and keeps this shim for it
+/// (`analog/filter.rs`), restated here because it is private there. A
+/// multiply and an add vectorise on SSE2 and round differently from the
+/// fused form in the last bit, so a render is the same bits on one machine,
+/// which is all the house ever promises of floats.
+#[inline(always)]
+fn fma(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+    {
+        a * b + c
+    }
+}
+
+/// A dot product the compiler will vectorise: eight accumulators, tap `t`
+/// into accumulator `t % 8`, each an explicit [`fma`], and a tree at the end
+/// so the compiler does not rebuild one long chain of adds. Eight because
+/// the pair's cost is latency: eight independent chains of `N / 8` each.
+/// `b` must be at least `N` long and `N` a multiple of eight, which the
+/// padding in [`OsTaps`] gives and the compiler checks.
+#[inline(always)]
+fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
+    const { assert!(N % 8 == 0, "a dot product runs whole chunks of eight") };
+    let (ac, _) = a.as_chunks::<8>();
+    let (bc, _) = b[..N].as_chunks::<8>();
+    let mut acc = [0.0_f32; 8];
+    for (x, y) in ac.iter().zip(bc) {
+        for k in 0..8 {
+            acc[k] = fma(x[k], y[k], acc[k]);
+        }
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+}
+
+/// A history a dot product reads as one contiguous slice, newest first.
+/// Every sample is written twice, `H` apart, so the window `z[pos..pos + H]`
+/// never wraps; `H2` is twice `H`, spelled out because `2 * H` is not a type
+/// on stable Rust. The Analog's `History`, restated for the same privacy
+/// reason as [`fma`].
+#[derive(Clone, Copy)]
+struct History<const H: usize, const H2: usize> {
+    z: [f32; H2],
+    pos: usize,
+}
+
+impl<const H: usize, const H2: usize> History<H, H2> {
+    const fn new() -> Self {
+        const { assert!(H2 == 2 * H, "a history is written twice") };
+        Self { z: [0.0; H2], pos: 0 }
+    }
+
+    #[inline]
+    fn push(&mut self, x: f32) {
+        self.pos = if self.pos == 0 { H - 1 } else { self.pos - 1 };
+        self.z[self.pos] = x;
+        self.z[self.pos + H] = x;
+    }
+
+    /// The newest `H` samples, newest first.
+    #[inline]
+    fn window(&self) -> &[f32] {
+        &self.z[self.pos..self.pos + H]
+    }
+
+    fn clear(&mut self) {
+        self.z = [0.0; H2];
+        self.pos = 0;
+    }
+}
+
+/// The two designed filters, split into the phases the polyphase pair reads
+/// them by: designed once per unit and shared by both channels. See
+/// [`OS_A_EVEN`] for which phase reads what.
 #[derive(Clone)]
+struct OsTaps {
+    /// `A[0], A[2], .., A[78]`.
+    a_even: [f32; OS_A_EVEN],
+    /// `A[1], A[3], .., A[77]`, then zeros.
+    a_odd: [f32; OS_A_ODD],
+    /// `A[0..79]`, then zeros.
+    a_full: [f32; OS_A_FULL],
+    /// `B[1], B[3], .., B[19]`, then zeros.
+    b_odd: [f32; OS_B_ODD],
+    /// `B[10]`, exactly one half: an ideal halfband's centre is `2 · 0.25`
+    /// and its window is one there.
+    b_centre: f32,
+}
+
+impl OsTaps {
+    fn new() -> Self {
+        let a: [f32; OS_A_TAPS] = windowed_sinc(8.0, OS_A_CUTOFF);
+        let b: [f32; OS_B_TAPS] = windowed_sinc(8.0, 0.25);
+        let mut t = Self {
+            a_even: [0.0; OS_A_EVEN],
+            a_odd: [0.0; OS_A_ODD],
+            a_full: [0.0; OS_A_FULL],
+            b_odd: [0.0; OS_B_ODD],
+            b_centre: b[(OS_B_TAPS - 1) / 2],
+        };
+        for (k, v) in a.iter().enumerate() {
+            t.a_full[k] = *v;
+            if k % 2 == 0 {
+                t.a_even[k / 2] = *v;
+            } else {
+                t.a_odd[k / 2] = *v;
+            }
+        }
+        // The halfband's even taps are its centre and true zeros (1e-17 in
+        // f32, rounding residue of `sin(k·π/2)`), so only the odd ones are
+        // kept; the test that proves this form equals the direct one also
+        // pins that what is dropped is nothing.
+        for (j, v) in b.iter().skip(1).step_by(2).enumerate() {
+            t.b_odd[j] = *v;
+        }
+        t
+    }
+}
+
+/// One channel's record-stage pair, polyphase: a history per filter phase,
+/// and nothing for the zeros an interpolator stuffs in or the outputs a
+/// decimator throws away.
+#[derive(Clone, Copy)]
 struct OsChannel {
-    up_a: Fir<OS_A_TAPS, OS_A_WIN>,
-    up_b: Fir<OS_B_TAPS, OS_B_WIN>,
-    dn_b: Fir<OS_B_TAPS, OS_B_WIN>,
-    dn_a: Fir<OS_A_TAPS, OS_A_WIN>,
+    /// `2u`, one push per session sample: both phases of the 2× interpolator
+    /// read it, the even taps for the 2× sample on the session sample and
+    /// the odd ones for the sample between.
+    up_a: History<OS_A_EVEN, { 2 * OS_A_EVEN }>,
+    /// `2 s2`, two pushes per session sample, read the same way at 4×: the
+    /// centre tap for the sub-phase on a 2× sample, the odd taps between.
+    up_b: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+    /// The tape's 4× output on the sub-phases the 4× decimator keeps
+    /// (`q == 0`): its kept output reads the centre tap here, five entries
+    /// back.
+    dn_b_kept: History<8, 16>,
+    /// The tape's 4× output on the sub-phases between (`q == 1`), which the
+    /// kept output reads through the halfband's odd taps.
+    dn_b_between: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+    /// The 4× decimator's kept outputs at 2×, which the 2× decimator reads
+    /// whole, once per session sample.
+    dn_a: History<OS_A_FULL, { 2 * OS_A_FULL }>,
 }
 
 impl OsChannel {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            up_a: Fir::new(),
-            up_b: Fir::new(),
-            dn_b: Fir::new(),
-            dn_a: Fir::new(),
+            up_a: History::new(),
+            up_b: History::new(),
+            dn_b_kept: History::new(),
+            dn_b_between: History::new(),
+            dn_a: History::new(),
         }
+    }
+
+    /// One session sample in, its four 4× sub-phases out, in order. The ×2
+    /// on each push restores the amplitude an interpolator's zeros dilute.
+    #[inline]
+    fn up(&mut self, t: &OsTaps, x: f32) -> [f32; OS] {
+        self.up_a.push(2.0 * x);
+        let w = self.up_a.window();
+        let s2 = [dot(&t.a_even, w), dot(&t.a_odd, w)];
+        let mut s4 = [0.0_f32; OS];
+        for (h, s) in s2.into_iter().enumerate() {
+            self.up_b.push(2.0 * s);
+            let w = self.up_b.window();
+            s4[2 * h] = t.b_centre * w[OS_B_HALF];
+            s4[2 * h + 1] = dot(&t.b_odd, w);
+        }
+        s4
+    }
+
+    /// The four 4× sub-phases of one session sample in, one session sample
+    /// out. Each decimator keeps the EARLIER output of its pair (sub-phase
+    /// `q == 0`, then `h == 0`), which is what puts the pair's delay on
+    /// [`OS_LATENCY`] exactly; see there.
+    #[inline]
+    fn down(&mut self, t: &OsTaps, w: [f32; OS]) -> f32 {
+        let mut y = 0.0;
+        for h in 0..2 {
+            self.dn_b_kept.push(w[2 * h]);
+            let d4 = fma(
+                t.b_centre,
+                self.dn_b_kept.window()[OS_B_HALF],
+                dot(&t.b_odd, self.dn_b_between.window()),
+            );
+            self.dn_a.push(d4);
+            if h == 0 {
+                y = dot(&t.a_full, self.dn_a.window());
+            }
+            self.dn_b_between.push(w[2 * h + 1]);
+        }
+        y
     }
 
     fn clear(&mut self) {
         self.up_a.clear();
         self.up_b.clear();
-        self.dn_b.clear();
+        self.dn_b_kept.clear();
+        self.dn_b_between.clear();
         self.dn_a.clear();
     }
+}
+
+/// One session sample through the record amplifier and the tape at 4×: up
+/// through the pair, saturated with the refused flux fed back per sub-phase,
+/// and down again. `process` runs exactly this, and so does the test that
+/// holds it to the direct form.
+///
+/// See [`OS`] for why it runs at 4×, [`DRIVE_TANH`] for the curve and
+/// [`SAT_FB`] for the refusal: the value read at a sub-phase is the one that
+/// sub-phase left one session sample ago, read BEFORE it is written, which
+/// is the `z⁻¹` [`SAT_FB`] has always meant.
+#[inline]
+fn record(st: &mut OsChannel, t: &OsTaps, err: &mut [f32; OS], d: f32, u: f32) -> f32 {
+    let s4 = st.up(t, u);
+    let mut w = [0.0_f32; OS];
+    for ((w, s), e) in w.iter_mut().zip(s4).zip(err.iter_mut()) {
+        *w = (d * (s + SAT_FB * *e)).tanh() / d;
+        *e = flush(s - *w);
+    }
+    st.down(t, w)
 }
 
 /// The repro amplifier's line-up: the gain that puts a 0 VU tone back where
@@ -556,6 +819,41 @@ fn sat_makeup(d: f64) -> f32 {
     let out_rms = (sum / STEPS as f64).sqrt();
     let in_rms = amp / std::f64::consts::SQRT_2;
     (in_rms / out_rms.max(1.0e-12)) as f32
+}
+
+/// How many record levels [`Tape::new`] solves the line-up at, evenly
+/// spaced in octaves of `d` across [`MAKEUP_D`].
+///
+/// **A table, so the record level can move without a solve.** [`sat_makeup`]
+/// is 64 hyperbolic tangents in f64. Once a block that was affordable, but
+/// the line-up has to follow the record level wherever it goes, and a level
+/// that moves every frame cannot pay a quadrature every frame. 161 points
+/// are 0.054 of an octave apart, and linear interpolation between them
+/// stays within 0.0015 dB of the direct solve everywhere in the range;
+/// `the_line_up_table_is_the_direct_solve` pins a hundredth.
+const MAKEUP_POINTS: usize = 161;
+
+/// The record levels the line-up table spans: the dial's whole travel
+/// ([`DRIVE_TANH`]) and an octave under its bottom, where the line-up is
+/// unity to a thousandth of a decibel anyway, so a level that lands below
+/// the dial still reads a true entry rather than a clamp.
+const MAKEUP_D: (f64, f64) = (0.05, 20.0);
+
+/// The record level `d` that line-up entry `i` is solved at.
+fn makeup_d(i: usize) -> f64 {
+    let (lo, hi) = (MAKEUP_D.0.log2(), MAKEUP_D.1.log2());
+    (lo + (hi - lo) * i as f64 / (MAKEUP_POINTS - 1) as f64).exp2()
+}
+
+/// The line-up for a record level given as `log2 d`: the two nearest
+/// entries of the table, linearly interpolated, held at the ends.
+fn makeup_at(table: &[f32; MAKEUP_POINTS], log2_d: f64) -> f32 {
+    let (lo, hi) = (MAKEUP_D.0.log2(), MAKEUP_D.1.log2());
+    let last = (MAKEUP_POINTS - 1) as f64;
+    let x = ((log2_d - lo) / (hi - lo) * last).clamp(0.0, last);
+    let i = (x as usize).min(MAKEUP_POINTS - 2);
+    let t = (x - i as f64) as f32;
+    table[i] + (table[i + 1] - table[i]) * t
 }
 
 /// Four-point third-order Hermite, the polynomial from `varispeed.rs`.
@@ -702,16 +1000,15 @@ pub struct Tape {
     /// and hands samples through untouched. Shortened by [`OS_LATENCY`], for
     /// the reason [`BASE_MS`] gives.
     base: usize,
-    /// What the head and the record stage's oversampler delay BETWEEN them,
-    /// which is what a host with delay compensation has to be told.
-    latency: usize,
     /// Sub-roll one-pole state, per channel; the high-pass is `x` minus it.
     sub_lp: [f32; 2],
-    /// The record stage's oversampler: one designed set of taps, and the four
-    /// delay lines each channel walks them with. See [`OS`].
-    taps_a: [f32; OS_A_TAPS],
-    taps_b: [f32; OS_B_TAPS],
+    /// The record stage's oversampler: one designed set of taps, and the
+    /// histories each channel reads them against. See [`OS`].
+    os_taps: OsTaps,
     os: [OsChannel; 2],
+    /// The repro line-up across the whole record-level range, solved once
+    /// here so no block solves it again. See [`MAKEUP_POINTS`].
+    makeup: [f32; MAKEUP_POINTS],
     /// The flux the tape refused one session sample ago, held per oversampled
     /// sub-phase. See [`SAT_FB`] for why it is a sub-phase and not a sample.
     sat_err: [[f32; OS]; 2],
@@ -771,11 +1068,10 @@ impl Tape {
             line: [vec![0.0; cap], vec![0.0; cap]],
             at: 0,
             base,
-            latency: base + OS_LATENCY,
             sub_lp: [0.0; 2],
-            taps_a: windowed_sinc(8.0, OS_A_CUTOFF),
-            taps_b: windowed_sinc(8.0, 0.25),
+            os_taps: OsTaps::new(),
             os: [OsChannel::new(), OsChannel::new()],
+            makeup: std::array::from_fn(|i| sat_makeup(makeup_d(i))),
             sat_err: [[0.0; OS]; 2],
             erase_env: [0.0; 2],
             erase_lp: [0.0; 2],
@@ -807,11 +1103,21 @@ impl Tape {
     }
 
     /// The structural delay of the record stage and the play head together,
-    /// in frames — what a host with delay compensation should be told. It is
+    /// in frames: what a host with delay compensation should be told. It is
     /// [`BASE_MS`] at every rate an engine actually runs at, oversampler and
-    /// all; see that constant.
-    pub fn latency_frames(&self) -> usize {
-        self.latency
+    /// all; see that constant. An impulse peaks on exactly this frame.
+    ///
+    /// **A pure function of the settings and the rate this unit was built
+    /// at,** asked of the params rather than of whatever the last block
+    /// left behind: a seat that has just restored a bay, or holds one
+    /// bypassed, has run no block, and the figure has to be right then too
+    /// (the denoiser learned that the hard way, see
+    /// `builtin_fx::DenoiseUnit::set_param`). No setting moves the head
+    /// today, so every setting answers the same; one that does will answer
+    /// here.
+    pub fn latency_frames(&self, p: &TapeParams) -> usize {
+        let _ = p;
+        self.base + OS_LATENCY
     }
 
     /// In place on an interleaved buffer; `channels` is the stride. Stereo
@@ -836,10 +1142,10 @@ impl Tape {
         let d64 = f64::from(DRIVE_TANH.0)
             * f64::from(DRIVE_TANH.1 / DRIVE_TANH.0).powf(f64::from(drive));
         let d = d64 as f32;
-        // The repro amplifier, lined up for this record level. See
-        // [`sat_makeup`]: solved once per block, in f64, like every other
-        // design number here.
-        let makeup = sat_makeup(d64);
+        // The repro amplifier, lined up for this record level: read from the
+        // table [`Tape::new`] solved, see [`MAKEUP_POINTS`] and
+        // [`sat_makeup`].
+        let makeup = makeup_at(&self.makeup, d64.log2());
         let bump_db = f64::from(BUMP_DB.0 + (BUMP_DB.1 - BUMP_DB.0) * bump);
         for b in &mut self.bump {
             b.set(f64::from(sr), BUMP_HZ, BUMP_Q, bump_db);
@@ -933,39 +1239,8 @@ impl Tape {
                 };
                 self.erase_env[ch] = flush(self.erase_env[ch] + (lvl - self.erase_env[ch]) * a);
 
-                // The record amplifier and the tape, at 4×. See [`OS`] for
-                // why, [`DRIVE_TANH`] for the curve and [`SAT_FB`] for the
-                // refusal fed back into it. Two 2× steps per session sample,
-                // two 4× steps per 2× step; the ×2 on each zero-stuffed push
-                // restores the amplitude an interpolator's inserted zeros
-                // dilute.
-                let st = &mut self.os[ch];
-                let mut y = 0.0_f32;
-                for h in 0..2 {
-                    let s2 = st.up_a.run(&self.taps_a, if h == 0 { 2.0 * u } else { 0.0 });
-                    for q in 0..2 {
-                        let s4 = st.up_b.run(&self.taps_b, if q == 0 { 2.0 * s2 } else { 0.0 });
-
-                        // Read the refusal from this sub-phase BEFORE writing
-                        // it: what is there is what this sub-phase left one
-                        // session sample ago, which is the z⁻¹ SAT_FB has
-                        // always meant.
-                        let phase = h * 2 + q;
-                        let e = self.sat_err[ch][phase];
-                        let w = (d * (s4 + SAT_FB * e)).tanh() / d;
-                        self.sat_err[ch][phase] = flush(s4 - w);
-
-                        // Decimate: filter at 4×, keep every second sample
-                        // into the 2× filter, keep every second of those.
-                        let d4 = st.dn_b.run(&self.taps_b, w);
-                        if q == 1 {
-                            let d2 = st.dn_a.run(&self.taps_a, d4);
-                            if h == 1 {
-                                y = d2;
-                            }
-                        }
-                    }
-                }
+                // The record amplifier and the tape, at 4×: see [`record`].
+                let y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, u);
                 // The repro amplifier's line-up, not a knob. See
                 // [`sat_makeup`].
                 let y = y * makeup;
@@ -1044,6 +1319,7 @@ impl Tape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::drive::Fir;
 
     /// Hann-weighted Goertzel magnitude. **Hann-weighted, and that is the
     /// lesson written in blood elsewhere in this repo**: a rectangular
@@ -1190,7 +1466,7 @@ mod tests {
             trim: 0.5,
         };
         let mut unit = Tape::new(sr);
-        let lat = unit.latency_frames();
+        let lat = unit.latency_frames(&p);
         let out = left(&feed(&mut unit, &input, &p));
 
         let win = 240; // the first 5 ms
@@ -1801,17 +2077,292 @@ mod tests {
     /// is still [`BASE_MS`] — at every rate an engine runs at. A unit that
     /// quietly grew three quarters of a millisecond would slide against every
     /// other track in the session and nothing would say why.
+    ///
+    /// The figure is asked of the settings, so it is also pinned against
+    /// them: the head and the pair add up to it exactly, and no position of
+    /// any of the six dials moves it, because a report that moved with a
+    /// character dial would re-time the lane in the compensation graph every
+    /// time somebody turned that dial.
     #[test]
     fn the_oversampler_costs_the_host_no_latency() {
+        let positions = [0.0_f32, 0.5, 1.0];
         for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
             let want = (BASE_MS * 1.0e-3 * sr).round() as usize;
-            let got = Tape::new(sr).latency_frames();
+            let unit = Tape::new(sr);
+            let got = unit.latency_frames(&TapeParams::default());
             assert_eq!(
                 got, want,
                 "at {sr} Hz the tape reports {got} frames of latency, not the \
                  {want} that BASE_MS promises"
             );
+            assert_eq!(
+                unit.base + OS_LATENCY,
+                got,
+                "at {sr} Hz the head ({}) and the pair ({OS_LATENCY}) do not add up \
+                 to the {got} frames reported",
+                unit.base
+            );
+            for combo in 0..3_usize.pow(6) {
+                let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
+                let p = TapeParams {
+                    drive: at(0),
+                    bump: at(1),
+                    roll: at(2),
+                    wobble: at(3),
+                    hiss: at(4),
+                    trim: at(5),
+                };
+                assert_eq!(
+                    unit.latency_frames(&p),
+                    want,
+                    "dial combination {combo} moved the report at {sr} Hz"
+                );
+            }
         }
+    }
+
+    /// The record stage's pair the way it shipped: four of the drive's
+    /// direct-form FIRs over the zero-stuffed streams, every output computed
+    /// and the ones a decimator does not want dropped, keeping sub-phase
+    /// `keep.0` at 4× and `keep.1` at 2×. Given a record level it is the
+    /// whole record stage, the refused flux per sub-phase included.
+    struct DirectPair {
+        a: [f32; OS_A_TAPS],
+        b: [f32; OS_B_TAPS],
+        up_a: Fir<OS_A_TAPS, { 2 * OS_A_TAPS }>,
+        up_b: Fir<OS_B_TAPS, { 2 * OS_B_TAPS }>,
+        dn_b: Fir<OS_B_TAPS, { 2 * OS_B_TAPS }>,
+        dn_a: Fir<OS_A_TAPS, { 2 * OS_A_TAPS }>,
+        err: [f32; OS],
+        keep: (usize, usize),
+    }
+
+    impl DirectPair {
+        fn new(keep: (usize, usize)) -> Self {
+            Self {
+                a: windowed_sinc(8.0, OS_A_CUTOFF),
+                b: windowed_sinc(8.0, 0.25),
+                up_a: Fir::new(),
+                up_b: Fir::new(),
+                dn_b: Fir::new(),
+                dn_a: Fir::new(),
+                err: [0.0; OS],
+                keep,
+            }
+        }
+
+        fn run(&mut self, u: f32, d: Option<f32>) -> f32 {
+            let mut y = 0.0_f32;
+            for h in 0..2 {
+                let s2 = self.up_a.run(&self.a, if h == 0 { 2.0 * u } else { 0.0 });
+                for q in 0..2 {
+                    let s4 = self.up_b.run(&self.b, if q == 0 { 2.0 * s2 } else { 0.0 });
+                    let phase = h * 2 + q;
+                    let w = match d {
+                        Some(d) => {
+                            let w = (d * (s4 + SAT_FB * self.err[phase])).tanh() / d;
+                            self.err[phase] = flush(s4 - w);
+                            w
+                        }
+                        None => s4,
+                    };
+                    let d4 = self.dn_b.run(&self.b, w);
+                    if q == self.keep.0 {
+                        let d2 = self.dn_a.run(&self.a, d4);
+                        if h == self.keep.1 {
+                            y = d2;
+                        }
+                    }
+                }
+            }
+            y
+        }
+    }
+
+    /// Where a buffer is loudest, by magnitude.
+    fn loudest(v: &[f32]) -> usize {
+        (0..v.len())
+            .max_by(|a, b| v[*a].abs().total_cmp(&v[*b].abs()))
+            .expect("a buffer to look in")
+    }
+
+    /// **The oversampler is the direct-form pair, at less than half the
+    /// arithmetic.**
+    ///
+    /// The polyphase pair skips three things the direct form multiplied:
+    /// the zeros each interpolator stuffs in, the outputs each decimator
+    /// throws away, and the halfband's even taps, which are its centre and
+    /// zeros. Skipping them is a speed-up only if what is skipped is
+    /// nothing, so the pair is held to the direct form it replaced, built
+    /// from the drive's own FIR: on an impulse and on four thousand frames
+    /// of noise at half scale the linear pair agrees within a millionth, and
+    /// the whole record stage slammed (the top of the dial, the refused flux
+    /// fed back) within a hundred-thousandth, which is what the same
+    /// additions in another order can leave in f32.
+    ///
+    /// The same reference keeping the samples the pair used to keep, the
+    /// later of each pair, peaks a frame early: the three quarters of a
+    /// sample the head was wrong by ([`OS_LATENCY`]). Keeping the earlier
+    /// ones it peaks on [`OS_LATENCY`], and so does the polyphase pair. And
+    /// the arithmetic is counted from the tap tables the dot products run:
+    /// 226 multiply-adds per channel-sample, padding included, against 484.
+    #[test]
+    fn the_oversampler_is_the_direct_form_pair_at_less_than_half_the_arithmetic() {
+        let taps = OsTaps::new();
+        // What the polyphase form leaves out is nothing: the halfband's
+        // centre is exactly a half and its other even taps are residue.
+        let b: [f32; OS_B_TAPS] = windowed_sinc(8.0, 0.25);
+        assert_eq!(taps.b_centre, 0.5, "the halfband's centre is not a half");
+        for (k, v) in b.iter().enumerate().step_by(2) {
+            if k != (OS_B_TAPS - 1) / 2 {
+                assert!(v.abs() < 1.0e-16, "halfband tap {k} is {v:e}, not a zero");
+            }
+        }
+
+        let linear = |input: &[f32], keep: (usize, usize)| -> (Vec<f32>, Vec<f32>) {
+            let mut poly = OsChannel::new();
+            let mut direct = DirectPair::new(keep);
+            input
+                .iter()
+                .map(|&x| {
+                    let s4 = poly.up(&taps, x);
+                    (poly.down(&taps, s4), direct.run(x, None))
+                })
+                .unzip()
+        };
+        let mut impulse = vec![0.0_f32; 256];
+        impulse[0] = 1.0;
+        let mut seed = 0x0B5E_ED01_u32;
+        let noise: Vec<f32> = (0..4_096).map(|_| 0.5 * white(&mut seed)).collect();
+        for (what, input) in [("an impulse", &impulse), ("noise", &noise)] {
+            let (poly, direct) = linear(input, (0, 0));
+            let worst = poly
+                .iter()
+                .zip(&direct)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                worst < 1.0e-6,
+                "on {what} the polyphase pair is {worst:e} from the direct form"
+            );
+        }
+
+        let (poly, early) = linear(&impulse, (0, 0));
+        assert_eq!(loudest(&poly), OS_LATENCY, "the polyphase pair peaks off its delay");
+        assert_eq!(loudest(&early), OS_LATENCY, "the direct form keeping q0/h0 peaks off it");
+        let (_, late) = linear(&impulse, (1, 1));
+        assert_eq!(
+            loudest(&late),
+            OS_LATENCY - 1,
+            "the direct form keeping the later samples no longer peaks a frame early, \
+             so this reference is not the pair that shipped"
+        );
+
+        let d = DRIVE_TANH.1;
+        let mut poly = OsChannel::new();
+        let mut err = [0.0_f32; OS];
+        let mut direct = DirectPair::new((0, 0));
+        let worst = noise
+            .iter()
+            .map(|&x| (record(&mut poly, &taps, &mut err, d, x) - direct.run(x, Some(d))).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst < 1.0e-5,
+            "the slammed record stage is {worst:e} from the direct form's"
+        );
+
+        let direct_macs = 2 * OS_A_TAPS + 4 * OS_B_TAPS + 4 * OS_B_TAPS + 2 * OS_A_TAPS;
+        let polyphase_macs = (OS_A_EVEN + OS_A_ODD + 2 * OS_B_ODD) + (2 * (OS_B_ODD + 1) + OS_A_FULL);
+        assert_eq!(direct_macs, 484);
+        assert_eq!(polyphase_macs, 226);
+        assert!(2 * polyphase_macs < direct_macs, "the polyphase pair is not half the work");
+    }
+
+    /// **An impulse leaves exactly when the host is told it will.**
+    ///
+    /// Delay compensation moves every other track by the figure a unit
+    /// reports, so a unit whose real delay is not its report is a flam that
+    /// nothing in the session explains: a fraction of a sample is a comb
+    /// across the top of the band against the same signal on another track.
+    /// The pair used to keep the later sample of each decimation, and an
+    /// impulse through the tape peaked a whole frame before the report, its
+    /// centre three quarters of a sample ahead ([`OS_LATENCY`]).
+    ///
+    /// So a lone impulse after a second of silence must peak on exactly the
+    /// reported frame at every rate an engine runs at, with every colour off
+    /// and at the shipped settings with the transport and the hiss still.
+    /// With every colour off its three-point parabolic centre must also sit
+    /// within a tenth of a sample of the report. What is left there is the
+    /// self-erasure one-pole, whose 22 kHz rest corner is minimum-phase and
+    /// pulls the centre late: measured +0.012, +0.016 and +0.079 of a sample
+    /// at 44.1, 48 and 96 kHz, where the old picks read 0.73 to 0.82 early.
+    /// The shipped settings are not held to the centre, only to the frame:
+    /// their Roll is a 15.6 kHz one-pole, minimum-phase too, and it pulls the
+    /// centre +0.29 late at 96 kHz without moving the peak.
+    #[test]
+    fn an_impulse_leaves_exactly_when_the_host_is_told_it_will() {
+        let still = TapeParams {
+            wobble: 0.0,
+            hiss: 0.0,
+            ..TapeParams::default()
+        };
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            for (what, p, centred) in [
+                ("every colour off", TapeParams::NEUTRAL, true),
+                ("the shipped settings, transport and hiss still", still, false),
+            ] {
+                let mut unit = Tape::new(sr);
+                let lat = unit.latency_frames(&p);
+                let at = sr as usize;
+                let mut mono = vec![0.0_f32; at + lat + 4_096];
+                mono[at] = 0.5;
+                let out = left(&feed(&mut unit, &to_stereo(&mono), &p));
+                let peak = loudest(&out);
+                assert_eq!(
+                    peak,
+                    at + lat,
+                    "{what} at {sr} Hz: the impulse peaked {} frames after it went \
+                     in, and the host was told {lat}",
+                    peak as i64 - at as i64
+                );
+                let (a, b, c) = (
+                    f64::from(out[peak - 1]),
+                    f64::from(out[peak]),
+                    f64::from(out[peak + 1]),
+                );
+                let centre = 0.5 * (a - c) / (a - 2.0 * b + c);
+                if centred {
+                    assert!(
+                        centre.abs() < 0.1,
+                        "{what} at {sr} Hz: the impulse is centred {centre:+.3} of a \
+                         sample off the frame the host was told"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The line-up table is the direct solve.** [`Tape::new`] solves
+    /// [`sat_makeup`] at [`MAKEUP_POINTS`] record levels and every block reads
+    /// between them, so the table may only ever be a faster way to the same
+    /// answer: at a thousand and one levels spread evenly in octaves across
+    /// [`MAKEUP_D`], it reads within a hundredth of a decibel of solving
+    /// afresh. Measured: 0.0015 dB at worst.
+    #[test]
+    fn the_line_up_table_is_the_direct_solve() {
+        let unit = Tape::new(48_000.0);
+        let (lo, hi) = (MAKEUP_D.0.log2(), MAKEUP_D.1.log2());
+        let mut worst = 0.0_f64;
+        for k in 0..=1_000 {
+            let l = lo + (hi - lo) * f64::from(k) / 1_000.0;
+            let table = f64::from(makeup_at(&unit.makeup, l));
+            let direct = f64::from(sat_makeup(l.exp2()));
+            worst = worst.max(db(table / direct).abs());
+        }
+        assert!(
+            worst < 0.01,
+            "the line-up table is {worst:.4} dB from the direct solve"
+        );
     }
 
     /// **No knob on this unit may be a decoration.**
