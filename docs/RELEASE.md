@@ -47,8 +47,9 @@ counted. Do not rewrite history to tidy burnt numbers away.
    This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (the
    three commands above, a compile of the Minimal build with
    `cargo check -p tangent --no-default-features`, the crate firewall
-   `scripts/check-firewall.sh`, the clippy lint policy, and the check that
-   three scripts spell the FreeBSD version alike) and
+   `scripts/check-firewall.sh`, the clippy lint policy, the check that
+   three scripts spell the FreeBSD version alike, and the check that no
+   tracked line or file name spells the old name) and
    refuses to cut a release on any failure. The checklist entry remains so
    a human knows what the refusal means.
 
@@ -65,7 +66,10 @@ counted. Do not rewrite history to tidy burnt numbers away.
    edits say Tangent. The Gumroad short link and the download names were the
    last places the old name survived, and neither does now: the Gumroad
    permalink is `/l/tangent` (the old one redirects to it), and
-   `publish-github.sh` no longer uploads the pre-rename asset names.
+   `publish-github.sh` no longer uploads the pre-rename asset names. Also
+   ENFORCED now: `scripts/check.sh` fails on any tracked line or file name
+   that spells the old name, the colour word spelled the same included, so
+   the tree cannot take it back by accident.
 
 4. **Store links resolve.** See the last section; the check is
    `scripts/check-store-links.sh` and the rule is publish, check, paste,

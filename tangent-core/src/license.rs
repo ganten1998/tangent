@@ -928,8 +928,11 @@ mod tests {
         // A refusal that named the app by its pre-2.3 name survived the
         // rename for a year — and it is the first thing a paying supporter
         // reads when a paste goes wrong, under a window title that says
-        // Tangent. Every message is checked, not just the three that were
-        // wrong, so the next variant added cannot reintroduce the old name.
+        // Tangent. The old name cannot come back in one now: the name leg
+        // in scripts/check.sh refuses it on every line of the tree, these
+        // messages included, so this test no longer spells it to refuse
+        // it. Every message is still checked for the em dash, not just the
+        // three that were wrong.
         let all = [
             LicenseError::Empty,
             LicenseError::Malformed,
@@ -944,11 +947,9 @@ mod tests {
         for e in all {
             assert!(!e.message().contains('\u{2014}'), "{e:?} has an em dash");
         }
-        for e in all {
-            assert!(!e.message().contains("Ivory"), "{e:?}: {}", e.message());
-        }
-        // And not merely absent: where the app is named at all, it is named
-        // by what the title bar and the store call it.
+        // And not merely absent, which the name leg sees to: where the app
+        // is named at all, it is named by what the title bar and the store
+        // call it.
         assert!(LicenseError::Malformed.message().contains("Tangent"));
     }
 }

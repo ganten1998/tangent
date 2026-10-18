@@ -206,7 +206,8 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   hunks against a documented 171.
 - [X] **W60 · The rename is incomplete in code.** The app struct (now `TangentApp`), the
   old-prefix env vars (now `TANGENT_*`), `rustfmt.toml:1`'s old-name header,
-  `tests/golden/README.md`. *(2026-10-18: all four are done.)*
+  `tests/golden/README.md`. *(2026-10-18: all four are done, and `scripts/check.sh` now fails on
+  any tracked line or file name that spells the old name.)*
 - [ ] **W61 · Stray tracked files:** `docs/FREEBSD-5.0-FINDINGS.md-e`,
   `tangent-record/examples/rtlatency.rs-e`, four `Cargo.toml.orig` under vendor/.
 - [ ] **W62 · ~25 dead items**, including `fn luma` defined twice and dead in both
