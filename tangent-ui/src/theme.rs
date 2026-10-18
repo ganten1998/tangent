@@ -56,7 +56,7 @@ pub struct Theme {
     /// **The app's own background** — behind the keyboard, and the field every
     /// theory module is drawn on.
     ///
-    /// It was two fixed values, one per mode: near-black dark, ivory light,
+    /// It was two fixed values, one per mode: near-black dark, cream light,
     /// the same on all sixteen themes. The owner's words were that no theme
     /// changes the theory view's background, and they were right — it was the
     /// one surface with no role at all.
@@ -735,7 +735,7 @@ pub fn factory() -> Vec<Theme> {
         },
         // ── Reed: the reed electric piano this app models (keys/reed.rs), in
         // the avocado the 200 wore. Aurora's slot (retired 2026-09-18). An
-        // olive band, the lid's black-olive strips, ivory keys, the script's
+        // olive band, the lid's black-olive strips, cream keys, the script's
         // coral for what sounds, a pale sage for what is held, the amber
         // pilot lamp on the master and bone knobs. The coral is a step paler
         // than the script's own: #ff7a62 read 2.92:1 on the band.

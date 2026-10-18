@@ -389,7 +389,7 @@ channels play back their clips and nothing else. "Ready to play" and
     clip, Delete; draw previews audition through the live path.
   - **Right-click a channel** (either view) → Remove Track / colour
     swatches / auto-palette. Auto-palette is ON by default (five staged:
-    IVORY, EMBER, TIDE, MOSS, NEON), colours are per SLOT, and manual
+    SPECTRUM, EMBER, TIDE, MOSS, NEON), colours are per SLOT, and manual
     paint overrides per strip. The mixer × retired with it.
   - **The dial standard**: every dial in the program — band, mixer
     strips, arrange headers, drumpad inspector — reads VALUE on top,
@@ -432,7 +432,7 @@ channels play back their clips and nothing else. "Ready to play" and
   adds the track, instruments bind midi:all, the kind ask and cycle are
   gone, v16 migrates); arrange headers wear the chip on every lane,
   double-click renames, the header seam drags (persisted); dark mode
-  scoped to THEORY+ARRANGE (arrange defaults grey-ivory); the band's
+  scoped to THEORY+ARRANGE (arrange defaults grey-cream); the band's
   columns reach the camera's line; mixer knob caps live inside their
   band; drumpad explorer follows symlinks (~/Dropbox!) at a readable
   size; **EXPORT**: one dialog (source master/stems/both, rate,

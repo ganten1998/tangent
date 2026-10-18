@@ -88,7 +88,7 @@ def hexs(c):
 
 
 # Four tones, named by the luminance they land on. The top one sits under
-# the 0.119 ceiling where 4.5:1 against the ivory ink runs out.
+# the 0.119 ceiling where 4.5:1 against the light ink runs out.
 TONES = [0.016, 0.038, 0.068, 0.104]
 
 
@@ -609,7 +609,7 @@ EXT2_RUNS = {
 # colour the first sixteen already wear (Nocturne's channel 17 is its
 # channel 9 to within a dE). Halfway between tones, with the hue nudged ten
 # degrees, is family without twinning. The top half-tone, 0.112, sits under
-# the 0.119 ceiling where the ivory ink runs out.
+# the 0.119 ceiling where the light ink runs out.
 #
 # The click is the control panel's own slate — a cool neutral, because the
 # warm-neutral family already owns every tone a warm click could take. The
@@ -1431,7 +1431,7 @@ def ext_lines(name, label, lo, hi, base, run):
 
 def master_ok(c, slots, click, others):
     """The per-palette master's gates, one function so `--check` and
-    `make_master` cannot drift: readable under the ivory ink, at least 22 dE
+    `make_master` cannot drift: readable under the light ink, at least 22 dE
     from its OWN palette's channels and click (a master that reads as track
     seventeen is no master), and spread from the other fifteen."""
     return (
@@ -1775,8 +1775,8 @@ def design_redo(spec, others):
 def desk_errors(p, others):
     """The whole thirty-two-channel desk against every floor the Rust holds
     a live palette to, in one list. The floors are the tests' own:
-    `every_auto_palette_colour_can_carry_the_ink_printed_on_it` (4.5:1
-    under the ivory), `adjacent_channels_never_wear_the_same_colour_twice_over`
+    `every_auto_palette_colour_can_carry_the_ink_printed_on_it` (4.5:1 under
+    the light ink), `adjacent_channels_never_wear_the_same_colour_twice_over`
     (10 dE across all thirty-two, seams included),
     `every_auto_palette_dresses_all_sixteen_channels_differently`,
     `the_click_and_the_master_stand_apart_from_every_channel` (the click 8
@@ -2319,7 +2319,7 @@ REDO_THEMES = {
     ),
     # Reed: the reed electric piano this app models (keys/reed.rs), in the
     # avocado the 200 wore: an olive band, the lid's black-olive strips,
-    # ivory keys, the script's coral for what sounds, a pale sage for what
+    # cream keys, the script's coral for what sounds, a pale sage for what
     # is held, an amber pilot lamp on the master, bone knobs.
     "Reed": T(
         background="#f3efdc", white_key="#f3efdc", black_key="#171a10",

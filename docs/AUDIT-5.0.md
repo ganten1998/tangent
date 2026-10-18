@@ -921,7 +921,7 @@ Each used channel strip, top to bottom:
 - **Insert rack** - three full-width stacked bays. Click an empty bay (+) to open the plugin picker; click a loaded bay to open the plugin's window (the built-in DX7 opens the patch picker; the drum kit opens the drumpad). **Alt+click a loaded bay empties it.** **Right-click a loaded bay** opens a two-row modal menu: **DELETE FX / REPLACE FX** (anywhere else dismisses and does nothing).
 - **Send knob** (left) and **Pan knob** (right) - vertical relative drag, 420 pt full travel, Shift = fine; double-click resets; readout above each.
 - **Meter** (beside the fader): one bar for mono sources, two for stereo; ticks at 0/-12/-24/-48; gain-reduction strip from the top.
-- **Fader** - ivory cap in a black slot, vertical relative drag (420 pt travel = 0.1 dB per point), Shift fine, double-click resets to shipped level.
+- **Fader** - cream cap in a black slot, vertical relative drag (420 pt travel = 0.1 dB per point), Shift fine, double-click resets to shipped level.
 - **dB readout** - click to type an exact figure (Enter commits, Esc abandons, clicking elsewhere commits).
 - **M / S / R switches** - mute (amber), solo (crimson; soloing dims/silences the others), arm (red; record-ready and live). **Shift+click R arms this lane exclusively** (every other arm stands down). The click strip has M/S only; the master has neither.
 
@@ -975,7 +975,7 @@ Each dialog is its own decorated viewport (or an in-canvas layer in a plugin).
 |---|---|
 | **Project** | Session name field (Save keeps the typed name) + rows: New (from default template), Open..., Save, Save As... (copy whole session and open the copy), Save As Template... (Projects/Templates; name it `default` to replace the default), Export..., Done. |
 | **Export (project)** | SOURCE Master mix/Stems/Both; TIME Entire project/Time selection; SAMPLE RATE 44.1/48/88.2/96k; CHANNELS Stereo/Mono; DEPTH 16/24/32-float (with advice line); RENDER Full speed/Realtime; PRIMARY wav/mp3; SECONDARY off/wav/mp3; FILE NAME; DIRECTORY + Browse; Export / Cancel. |
-| **Track** | Right-click on a mixer strip or lane header. Remove Track; ICON picker (auto/drum/guitar/bass); COLOUR 27-swatch grid (hues x tones; slot 0 = auto/wood); AUTO-PALETTE choice (IVORY, EMBER, TIDE, MOSS, NEON) with swatch previews; Done. |
+| **Track** | Right-click on a mixer strip or lane header. Remove Track; ICON picker (auto/drum/guitar/bass); COLOUR 27-swatch grid (hues x tones; slot 0 = auto/wood); AUTO-PALETTE choice (SPECTRUM, EMBER, TIDE, MOSS, NEON) with swatch previews; Done. |
 | **MIDI picker** | Select MIDI input port (list, current marked). |
 | **Device picker** | One dialog for camera or audio input; rows by stable UID; a real "None" row (close the camera / record audio-only). |
 | **Input Channels** | Which of an interface's inputs the mic picker offers: MONO tick per input, STEREO tick per adjacent pair; any number at once; each becomes a picker row. |

@@ -177,8 +177,9 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 
 - [ ] **W49 · The drum machine reaches no theme** — `drumpad_panel.rs:78` hard-codes face and ink.
   On Porcelain or Iris the whole app moves and it stays walnut.
-- [ ] **W50 · The export progress window is hard-coded ivory** (`dialogs.rs:2877`) and is on screen
+- [X] **W50 · The export progress window is hard-coded bone** (`dialogs.rs:2877`) and is on screen
   for minutes, with no stated rationale (unlike the ReaStream dialog, which has one).
+  *(2026-08-31, 99c658ee: it wears the desk's face, and a test holds it there.)*
 - [ ] **W51 · There is no dark theme.** All sixteen factory backgrounds are light; "Dusk" is a pale
   lilac. Decide the light/dark question and add two or three.
 - [ ] **W52 · The 16 px icon is an illegible smudge** — the source art has no silhouette at that

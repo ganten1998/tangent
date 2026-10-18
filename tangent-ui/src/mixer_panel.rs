@@ -700,7 +700,7 @@ pub const STRIP_COLORS: [(u8, u8, u8); 1388] = [
     // a target luminance under a chroma ceiling, because the two things that
     // went wrong when these were picked by hand are exactly the two things a
     // person cannot do by eye. Every colour here is dark enough that the
-    // ivory ink wins on it at 4.5:1 or better, and no more colourful than its
+    // light ink wins on it at 4.5:1 or better, and no more colourful than its
     // neighbours — equal luminance is NOT equal vividness, and a violet
     // forced onto an ochre's luminance climbs to a neon #7736c1 to get there.
     //
@@ -813,7 +813,7 @@ pub const STRIP_COLORS: [(u8, u8, u8); 1388] = [
     // its own, and index 27 stays exactly what it was for every desk that
     // already points at it.
     //
-    // Generated against three floors rather than eyeballed: the ivory ink
+    // Generated against three floors rather than eyeballed: the light ink
     // wins on each at 4.5:1 (the rule every colour in this table follows),
     // each is at least 22 ΔE from its OWN palette's sixteen channels and its
     // click — a master that reads as track seventeen is no master — and they
@@ -3010,8 +3010,8 @@ fn ink(view: &MixerView<'_>) -> Ink {
         // Dark enough to read as a well rather than as a lighter panel: at
         // rest a meter should look like somewhere a level would go.
         track: Color32::from_rgb(0x1A, 0x17, 0x12),
-        // **Ivory on black, from the owner's photograph of the real desk** —
-        // and the SAME ivory and the same black the band's faders run in, out
+        // **Cream on black, from the owner's photograph of the real desk** —
+        // and the SAME cream and the same black the band's faders run in, out
         // of the one place they are written down. Two views of one desk that
         // disagreed about what a fader is made of would be two desks.
         slot: crate::recorder_panel::CAP_SLOT,
@@ -3744,7 +3744,7 @@ fn strip(
             word(painter, pl, "PAN", false);
         }
     }
-    // **A rack: an ivory field with three strips down it.**
+    // **A rack: a bone field with three strips down it.**
     //
     // On the ordinary face rather than in the channel's own colour, for the
     // reason the name plate is: a plugin's name is text to be read, and text
@@ -4259,8 +4259,8 @@ fn meter(
     heard: bool,
     ticks: &[f32],
     // **The strip's own face**, because the scale is printed on it. The
-    // numbers used to be a faded ivory, which is legible on a channel somebody
-    // painted and completely invisible on one they did not: ivory on ivory.
+    // numbers used to be a faded cream, which is legible on a channel somebody
+    // painted and completely invisible on one they did not: cream on bone.
     // Every unpainted channel on the desk had a meter with no scale beside it,
     // and the two kinds of strip looked like two different controls.
     face: Color32,
@@ -4429,7 +4429,7 @@ fn pan_knob(painter: &Painter, r: Rect, pan: f32, p: &Ink, master: bool) {
 }
 
 /// A vertical fader: a track, and a cap on it.
-/// A fader: an ivory cap, ribbed, riding in a black slot.
+/// A fader: a cream cap, ribbed, riding in a black slot.
 ///
 /// **Modelled on the real thing** — the owner's photograph of a period desk,
 /// where the slot is a dark channel cut into the face and the cap is a bone
@@ -6477,9 +6477,9 @@ mod tests {
 
     /// **The scale beside a meter can be read on every channel.**
     ///
-    /// The numbers were a faded ivory, chosen against the walnut the desk sits
-    /// on — and every UNPAINTED channel has an ivory face, so on eight strips
-    /// out of twelve the scale was ivory on ivory and simply absent. The
+    /// The numbers were a faded cream, chosen against the walnut the desk sits
+    /// on — and every UNPAINTED channel has a bone face, so on eight strips
+    /// out of twelve the scale was cream on bone and simply absent. The
     /// owner's words were "ensure every single track has legible readout
     /// ticks", and the fault was never the size.
     ///
@@ -6856,7 +6856,7 @@ mod tests {
     /// why the check is on `master()`, the thing the desk actually asks.
     ///
     /// Two of the three old floors survive and are the ones that matter:
-    /// the ivory ink has to land on it, and it has to stand off every
+    /// the light ink has to land on it, and it has to stand off every
     /// palette's own sixteen tracks, or a master that reads as track
     /// seventeen is no master. The third — that the masters differ from each
     /// other — is what has been deliberately given up.

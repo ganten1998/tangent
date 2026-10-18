@@ -374,7 +374,7 @@ Three decisions would make a Tangent screenshot recognisable at a glance:
    theory rather than decoration.
 2. **The palette as one sweep.** Sixteen channels each with its own colour, generated so luminance
    climbs monotonically from track 1 to 16 while hue walks an arc, every one dark enough to carry
-   ivory text at 4.5:1 and every neighbour at least 10 dE apart. Most DAWs give you eight colours
+   light-ink text at 4.5:1 and every neighbour at least 10 dE apart. Most DAWs give you eight colours
    that cycle; this reads as one instrument.
 3. **The wordmark.** "TANGENT" spelled across two rows of a Tonnetz lattice, the bottom row offset
    exactly between the top, drawn as pure vector at runtime, with lines running off the crop so it
@@ -418,7 +418,7 @@ a defence of a *deliberate* split, and what ships reads as an incomplete one.
    ink at low mean luminance, so it has no silhouette.
 4. **Decide the light/dark question** and add two or three genuinely dark factory themes.
 5. **Theme the two panels that no theme reaches:** the drum machine (hard-coded walnut) and the
-   export progress window (hard-coded ivory, on screen for minutes).
+   export progress window (hard-coded bone, on screen for minutes).
 6. Put the wordmark at the top of the README, and make the theme-template writer actually run: it
    is dead code, so the "user themes" folder is empty until you save one.
 

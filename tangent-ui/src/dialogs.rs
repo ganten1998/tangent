@@ -5004,7 +5004,7 @@ struct DialogTheme {
 /// A dialog is a floating panel like any other — **made of the desk's own
 /// face**, through the one derivation every panel now shares.
 ///
-/// It was the frozen pair: black-on-ivory and its inverse, reachable by no
+/// It was the frozen pair: black-on-cream and its inverse, reachable by no
 /// theme. Worse, the only caller passed `false` forever, so a dialog never
 /// went dark either — it was a light card over a dark app.
 fn theme(face: Color32) -> DialogTheme {
@@ -5039,8 +5039,8 @@ const FALLBACK_FACE: Color32 = Color32::from_rgb(0xE3, 0xD9, 0xBD);
 ///
 /// The export window is the customer: it is deliberately not a `Dialog` — it
 /// answers no question and takes no turn in the one dialog slot — so it never
-/// sees the `face` parameter and hard-coded the old ivory instead. That held
-/// for exactly as long as ivory was the only face; sixteen themes later it
+/// sees the `face` parameter and hard-coded the shipped bone instead. That
+/// held for exactly as long as bone was the only face; sixteen themes later it
 /// was the one surface that stayed beige, on screen for minutes at a time.
 /// `show` runs every frame whether or not a dialog is up, and runs before the
 /// export window draws, so what it leaves here is always THIS frame's answer.
@@ -6664,7 +6664,7 @@ pub fn show_export_progress(
 ) {
     // The desk's own face, like every dialog — read from the frame's record
     // rather than taken as a parameter, because this window does not come
-    // through `show`. It hard-coded ivory here long after the dialogs
+    // through `show`. It hard-coded the bone here long after the dialogs
     // learned to follow the theme, and it is on screen for minutes at a
     // stretch. See `remember_face`.
     let t = theme(live_face(ctx));
@@ -14290,7 +14290,7 @@ fn show_on(
             focus,
         } => {
             // ALWAYS the light theme — the owner's word ("keep the obs
-            // stream menu light"): ivory ground, black text, whatever the
+            // stream menu light"): bone ground, black text, whatever the
             // rest of the app is wearing.
             let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
             let dim = t.text.gamma_multiply(0.62);
@@ -16338,7 +16338,7 @@ mod tests {
     ///
     /// The owner's rule, and it needs no special case to hold. A FIRST
     /// install has no settings file, so it comes up on the Default theme,
-    /// whose strip face IS the shipped bone — the card is black on ivory and
+    /// whose strip face IS the shipped bone — the card is black on bone and
     /// matches the default right-click menus exactly, which is what a first
     /// launch should look like.
     ///
@@ -16360,7 +16360,7 @@ mod tests {
         );
         assert!(
             !crate::recorder_panel::wants_light_ink(card.bg),
-            "a first-install Welcome card is not black on ivory"
+            "a first-install Welcome card is not black on bone"
         );
         // And it is the SAME surface the default right-click menu is, which
         // is the whole of "matches the default theme's context menus".
@@ -20531,7 +20531,7 @@ at: None,
         }
     }
 
-    /// The export window wears the desk's face, not the retired ivory.
+    /// The export window wears the desk's face, not the bone it hard-coded.
     ///
     /// It is not a `Dialog`, so it never sees `show`'s `face` parameter — it
     /// reads the face `show` remembered this frame instead (see
@@ -20539,7 +20539,7 @@ at: None,
     /// first with no dialog open, the export window after — and then asks
     /// what the window's ground was painted with.
     #[test]
-    fn the_export_window_wears_the_desks_face_not_ivory() {
+    fn the_export_window_wears_the_desks_face_not_the_old_bone() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
@@ -20548,7 +20548,7 @@ at: None,
         // still the fade never finishes and every fill compares unequal at
         // two-thirds opacity. No animation, no multiplication.
         ctx.style_mut(|s| s.animation_time = 0.0);
-        // Before `show` has ever run, the historical ivory — a frame the app
+        // Before `show` has ever run, the old hard-coded bone — a frame the app
         // cannot produce, because `show` is called unconditionally ahead of
         // the export window every update.
         assert_eq!(live_face(&ctx), FALLBACK_FACE);
@@ -20593,7 +20593,7 @@ at: None,
         );
         assert!(
             !fills.contains(&theme_of(FALLBACK_FACE).bg),
-            "ivory is still painted somewhere in the export window"
+            "the old hard-coded bone is still painted somewhere in the export window"
         );
     }
 

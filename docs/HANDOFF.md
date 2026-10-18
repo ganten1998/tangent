@@ -824,7 +824,7 @@ per-platform too; it was macOS text on all three.
 ### Six knobs, in two rows
 
 `Fx` grew from three to six: REVERB / DELAY / CHORUS on top in Tascam blue,
-then HPF and LPF in ivory and LIMITER in red. `METER_SHARE` went 0.62 → 0.46 to
+then HPF and LPF in cream and LIMITER in red. `METER_SHARE` went 0.62 → 0.46 to
 pay for the second row — the meters gave up the height, because six knobs that
 do not fit are worse than a shorter VU.
 
@@ -1027,7 +1027,7 @@ travel.
 
 ### The filters are violet, and the GR ladder is gone
 
-The filter caps were ivory, which made two of the eight read as blank caps with
+The filter caps were cream, which made two of the eight read as blank caps with
 no colour rather than as a pair. Violet sits opposite the panel's warm brown
 and competes with nothing else on it.
 

@@ -44,7 +44,7 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
 /// colour down was an improvement on not responding at all, but it is not
 /// what this toggle used to do and not what it should do: the naturals go to
 /// the sharps' colour and the sharps to the naturals', so a stock keyboard
-/// reads as ivory sharps on black naturals - the same ivory-on-black the
+/// reads as cream sharps on black naturals - the same cream-on-black the
 /// theory panel above it wears, out of the same two colours the user already
 /// chose. A themed or hand-painted keyboard inverts with its own pair, so it
 /// stays recognisably itself.
@@ -60,7 +60,7 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     // **What the theme SAYS, before what dark mode would derive.**
     //
     // The swap below is the derivation, and it is a good one: the owner asked
-    // for a pure inversion to ivory on black and that is what it gives. But a
+    // for a pure inversion to cream on black and that is what it gives. But a
     // theme that names its own dark keyboard means it, and a theme is allowed
     // to disagree with the transform — that is what naming a colour is for.
     let naturals = s.dark_role("white_key").map_or(black, |c| c.to_color32());
@@ -154,8 +154,8 @@ const KEYS_APART: f32 = 9.0;
 /// itself.**
 ///
 /// In light mode the naturals are the theme's `white_key` and the sharps its
-/// `black_key`, and on seventeen themes that is a near-black sharp on an
-/// ivory natural — nothing to derive. On the two dark-designed themes
+/// `black_key`, and on seventeen themes that is a near-black sharp on a
+/// cream natural — nothing to derive. On the two dark-designed themes
 /// (Nocturne, Phosphor) both are near-black and the whole piano band was one
 /// slab: 1.10:1 and 1.04:1 measured, which is not a dim keyboard but an
 /// absent one. The owner photographed it twice.
@@ -463,9 +463,9 @@ fn draw_names(
     // and 0xD0 on a sharp — which is right on exactly one keyboard: the bone
     // one this app shipped with. A theme that picks its own key colours
     // breaks it, and DARK MODE breaks it twice over, because the naturals and
-    // the sharps SWAP (`idle_colors`): the dark grey meant for ivory lands on
+    // the sharps SWAP (`idle_colors`): the dark grey meant for cream lands on
     // a near-black natural and the light grey meant for a black key lands on
-    // an ivory one. Both illegible at once, which is what the owner
+    // a cream one. Both illegible at once, which is what the owner
     // photographed.
     //
     // A lit key was already measured, by a brightness sum. That is the rule
@@ -603,7 +603,7 @@ mod tests {
     /// The owner's screenshot: names printed in two fixed greys chosen for
     /// the bone keyboard this app shipped with. A theme picking its own key
     /// colours breaks that, and dark mode breaks it twice over, because the
-    /// naturals and the sharps swap — so the grey meant for ivory lands on a
+    /// naturals and the sharps swap — so the grey meant for cream lands on a
     /// near-black key and vice versa.
     ///
     /// Four fills per keyboard (natural and sharp, idle and lit) times two
@@ -652,7 +652,7 @@ mod tests {
     /// sharps' colour, which is why on every theme they equal the theory
     /// ground (`themed_bg`, the sharps' near-black), so the SHARPS — the
     /// inverted naturals — are what carry the keyboard. On the sixteen light
-    /// themes the sharps invert to a bright ivory and stand 9–15:1 clear of
+    /// themes the sharps invert to a bright cream and stand 9–15:1 clear of
     /// the ground. The three dark-designed themes shipped naming only
     /// `dark.background`, so their already-dark `white_key` became a
     /// near-black sharp and BOTH idle key colours fell onto the ground at

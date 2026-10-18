@@ -1086,7 +1086,7 @@ pub struct Settings {
     /// Its own role rather than a shade of `fx_knob_color`, because it is not
     /// one of the six: it is the one control on the band that changes the
     /// PITCH of everything, and a theme has to be able to say so. Ships as
-    /// the app's own ivory, which is what the owner asked the default to be.
+    /// the app's own cream, which is what the owner asked the default to be.
     pub varispeed_color: Rgb,
     /// **The velocity lane's two ends**: the colour a note at 127 wears and
     /// the colour one at 1 does, with every velocity between them on the line.
@@ -1198,7 +1198,7 @@ pub struct Settings {
     /// different KIND of surface — a set of controls rather than an instrument
     /// — and telling them apart at a glance while playing is worth a colour.
     /// Warm rather than neutral because everything else in this app already is,
-    /// from the ivory ink to the rosewood fretboard.
+    /// from the light ink to the rosewood fretboard.
     pub recorder_bg_color: Rgb,
     /// Show the welcome/support note at startup. Cleared by its own checkbox.
     pub show_welcome: bool,
@@ -2282,7 +2282,7 @@ impl Default for Settings {
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
             // The leather trim on a Tascam 388, sampled from a photograph of
             // one: the median of the hide rather than its mean, because the
-            // photograph is lit and the mean carries the lamp. The ivory ink is
+            // photograph is lit and the mean carries the lamp. The light ink is
             // chosen against it at better than 6:1, so the band is comfortable
             // and not merely legible. See `SUPERSEDED_RECORDER_BG`.
             // 97, 55, 58 — the owner's wine, shipped and reset to.

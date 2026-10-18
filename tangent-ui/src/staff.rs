@@ -781,7 +781,7 @@ struct Palette {
 /// The page the music is printed on — **the THEME's ground**, and ink
 /// measured against it.
 ///
-/// It was black on ivory and its inverse, frozen, exactly as the theory band
+/// It was black on cream and its inverse, frozen, exactly as the theory band
 /// was: a cream card that stayed cream on all sixteen themes while the
 /// background behind it moved, which is the owner's screenshot. A page of
 /// music that does not match the app it is in reads as a screenshot of

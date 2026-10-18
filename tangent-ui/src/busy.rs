@@ -542,7 +542,7 @@ pub fn may_close_after(shown_for: Option<Duration>, min_visible: Duration) -> bo
 /// undimmed self.
 ///
 /// A ratio rather than an alpha, because an alpha is not a dimming: 30% black
-/// over ivory is a clear veil and 30% black over the near-black desk every
+/// over cream is a clear veil and 30% black over the near-black desk every
 /// dark theme ships is nothing at all. This is the amount of CHANGE the eye
 /// has to be able to see; the alpha that delivers it is solved for below.
 const SCRIM_TARGET: f32 = 2.2;

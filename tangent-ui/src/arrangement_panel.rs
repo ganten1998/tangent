@@ -5063,7 +5063,7 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         empty_ground,
         seam,
         // Clips wear PALETTE colours, and every one of those is generated
-        // dark enough to carry the ivory ink at 4.5:1 — that is the palette's
+        // dark enough to carry the light ink at 4.5:1 — that is the palette's
         // own contract, held by `every_auto_palette_colour_can_carry_the_ink`.
         // So the ink on a clip answers to the clip, not to the field behind
         // it — and the clip loop MEASURES its own (`on_ink` on the guarded
