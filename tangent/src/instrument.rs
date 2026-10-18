@@ -27374,8 +27374,10 @@ impl Engine {
     }
 
     /// **The motor has done what the level asked**: at speed for a
-    /// `playing` transport, at rest (holding or not) for a stopped one. What
-    /// the host's exempt-edge latch (`Recorder::motor_hold`) waits for.
+    /// `playing` transport, at rest (holding or not) for a stopped one, as
+    /// the last pass showed it at its top. Half of what the host's
+    /// exempt-edge latch (`Recorder::motor_hold`) waits for; the locate's
+    /// ack is the other (`Transport::caught_up`).
     pub fn motor_settled(&self, playing: bool) -> bool {
         self.motor_show().settled(playing)
     }

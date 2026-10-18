@@ -141,6 +141,29 @@ impl Transport {
         self.playing
     }
 
+    /// **The engine has done what this transport last asked**: it has
+    /// applied the latest locate (`Engine::transport_acked`), and its motor
+    /// stands where the level asks, at speed or at rest
+    /// (`Engine::motor_settled`). What the host's exempt-edge latch
+    /// (`Recorder::motor_hold`) waits for before it lets the motor move.
+    ///
+    /// **Both, because what the motor shows is a pass behind.** The show is
+    /// published at a pass's TOP, before its chunks act on the level, so the
+    /// pass that applies an edge still shows the state before it. A record
+    /// started from rest and stopped before the next pass shows Parked from
+    /// its start's own pass, which a stopped level accepts: released on
+    /// that, the next frame let the motor move and the record's stop wound
+    /// down. A Stop's return is acked only by the chunk that parks the tape,
+    /// so the ack says the edge is done, and the show of the pass after it
+    /// says where the motor stands. While the latch holds the motor is not
+    /// allowed, so the edge and its locate land in one chunk and this
+    /// cannot wait for ever on an engine that renders. An edge with no
+    /// locate (a record's start from rest, a count's go) is acked already,
+    /// and its show cannot be stale the right way: it was at rest before.
+    pub fn caught_up(&self, e: &Engine) -> bool {
+        e.transport_acked(self.generation) && e.motor_settled(self.playing)
+    }
+
     /// The playhead, for the readout and the waveform.
     ///
     /// One authority at a time: the pending locate until the engine has
@@ -789,6 +812,64 @@ mod tests {
             "a rebuilt engine was located at {}, not where the tape stopped ({rested})",
             fresh.transport_position()
         );
+    }
+
+    /// **A record's stop is instant however soon it follows its start**
+    /// (the host's exempt-edge latch, `Recorder::motor_hold`, released on
+    /// `caught_up`).
+    ///
+    /// The host holds the motor off from a record's start until the engine
+    /// has done what the level asked, and again from its stop, because the
+    /// record that kept the motor quiet is gone a frame after it. What the
+    /// motor shows is published at a pass's top, so the pass that applies
+    /// the start still shows Parked. With callbacks longer than a UI frame
+    /// (2048 frames at 48 kHz against a 33 ms frame), a Stop pressed before
+    /// the next pass found that Parked when its frame looked, the latch let
+    /// go on it, the next frame let the motor move, and the record's stop
+    /// wound down. Driven as `after_frame` drives it: each frame the motor's
+    /// word (off while the record runs or the latch holds), the push, then
+    /// the latch's release on `caught_up`; two frames to a callback. The
+    /// stop never coasts, it returns to the cursor, and the latch lets go
+    /// once it has.
+    #[test]
+    fn a_records_stop_is_instant_however_soon_it_follows_its_start() {
+        let (mut e, mut t) = armed();
+        let mut out = vec![0.0f32; 2 * 256];
+        for _ in 0..8 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        assert_eq!(e.motor_show(), crate::motor::MotorShow::Parked);
+        let frame = |e: &Engine, t: &mut Transport, hold: &mut bool, recording: bool| {
+            e.set_tape_motor(!(recording || *hold), 0.5, 0.7);
+            t.push(Some(e));
+            if *hold && t.caught_up(e) {
+                *hold = false;
+            }
+        };
+        // A frame's request loop: the record, from rest (`start_arr_record`
+        // parks the motor, plays, and holds).
+        e.park_tape_motor();
+        t.toggle_play();
+        let mut hold = true;
+        frame(&e, &mut t, &mut hold, true);
+        assert!(hold, "the latch let go before the engine saw the start");
+        frame(&e, &mut t, &mut hold, true);
+        e.render_offline(&mut out);
+        // The next frame's request loop: Stop under the record (`R::Stop`'s
+        // `quiet_stop`), which finishes the record.
+        t.stop();
+        hold = true;
+        let mut shows = Vec::new();
+        for _ in 0..16 {
+            frame(&e, &mut t, &mut hold, false);
+            frame(&e, &mut t, &mut hold, false);
+            e.render_offline(&mut out);
+            shows.push(e.motor_show());
+        }
+        assert!(!shows.iter().any(|s| s.coasting()), "a record's stop wound down: {shows:?}");
+        assert_eq!(e.transport_position(), 0, "the record's stop did not return to the cursor");
+        assert!(!hold, "the latch never let go: {shows:?}");
     }
 
     /// **Pinning the playhead leaves the cursor where the hand put it** (the

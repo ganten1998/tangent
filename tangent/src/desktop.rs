@@ -545,7 +545,7 @@ struct Recorder {
     /// tape's motor is held off (`push_monitor_settings`) from a press that
     /// must start or stop at once (an arrangement record's start and stop, a
     /// count-in's go, a realtime export's start and end) until the engine
-    /// has done what the level asked (`Engine::motor_settled`). Without it
+    /// has done what the level asked (`Transport::caught_up`). Without it
     /// the reason to stand aside (the record, the count, the export) is gone
     /// a frame later, before a callback longer than a frame has seen the
     /// level move, and a record's stop would wind down. Released in
@@ -6539,11 +6539,13 @@ impl DesktopApp {
             // frame): without it the reason to stand aside goes (the count
             // cleared, the record finished, the export filed) before the
             // callback sees the level move, and a record's stop would wind
-            // down. While it is held the motor is not allowed, so it is
-            // always at rest or at speed and this cannot stick.
-            if self.recorder.motor_hold
-                && engine.is_none_or(|e| e.motor_settled(self.recorder.transport.playing()))
-            {
+            // down. And until it has applied the latest locate as well: what
+            // the motor shows is a pass behind, so a record stopped before
+            // the pass after its start read that start's Parked as the stop
+            // done (`Transport::caught_up`). While it is held the motor is
+            // not allowed, so it is always at rest or at speed, the edge and
+            // its locate land together, and this cannot stick.
+            if self.recorder.motor_hold && engine.is_none_or(|e| self.recorder.transport.caught_up(e)) {
                 self.recorder.motor_hold = false;
             }
             // **The loop region, pushed every frame from the time
@@ -33574,14 +33576,16 @@ mod tests {").expect("the tests module")];
         let located = locate.find("self.recorder.transport.locate(seconds);").expect("the locate");
         let cut = locate.find("e.cut_motor();").expect("a locate does not cut a coasting tape");
         assert!(located < cut, "the cut is asked before the locate");
-        // Released once the engine has done what the level asked, beside the
-        // push, and forgotten with the engine.
+        // Released once the engine has done what the level asked and applied
+        // the latest locate (`Transport::caught_up`, whose behaviour
+        // `transport::tests::a_records_stop_is_instant_however_soon_it_follows_its_start`
+        // holds), beside the push, and forgotten with the engine.
         let pushed = src.find("            self.recorder.transport.push(engine);\n").expect("the transport's push");
         assert!(
-            src[pushed..pushed + 1200].contains(
-                "if self.recorder.motor_hold\n                && engine.is_none_or(|e| e.motor_settled(self.recorder.transport.playing()))\n            {\n                self.recorder.motor_hold = false;"
+            src[pushed..pushed + 1600].contains(
+                "if self.recorder.motor_hold && engine.is_none_or(|e| self.recorder.transport.caught_up(e)) {\n                self.recorder.motor_hold = false;"
             ),
-            "the latch is not released beside the transport's push"
+            "the latch is not released beside the transport's push, on the engine having caught up"
         );
         assert!(body("fn forget_counts(&mut self)").contains("self.recorder.motor_hold = false;"), "the latch outlives its engine");
     }
