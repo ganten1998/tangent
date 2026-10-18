@@ -292,7 +292,7 @@ pub struct MenuColors {
 /// `face` is the theme's strip face — the same role the mixer's bays and the
 /// arrangement's chips wear — so a menu opened over any surface in the app is
 /// made of the same material as that surface. On the DEFAULT theme that face
-/// is the shipped bone, so the menu keeps the cream-and-black signature it
+/// is the shipped bone, so the menu keeps the bone-and-black signature it
 /// has always had; every other theme gets its own, and the text is measured
 /// rather than assumed.
 ///
@@ -2817,7 +2817,7 @@ mod tests {
 
 
     /// **Every right-click menu is readable, on every theme, in both modes —
-    /// and the DEFAULT theme keeps its cream-and-black signature.**
+    /// and the DEFAULT theme keeps its bone-and-black signature.**
     ///
     /// The owner's ruling: the shipped look stays the shipped look, and the
     /// rest are themed and checked. It was a frozen pair before, black on

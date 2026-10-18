@@ -3010,8 +3010,8 @@ fn ink(view: &MixerView<'_>) -> Ink {
         // Dark enough to read as a well rather than as a lighter panel: at
         // rest a meter should look like somewhere a level would go.
         track: Color32::from_rgb(0x1A, 0x17, 0x12),
-        // **Cream on black, from the owner's photograph of the real desk** —
-        // and the SAME cream and the same black the band's faders run in, out
+        // **Bone on black, from the owner's photograph of the real desk** —
+        // and the SAME bone and the same black the band's faders run in, out
         // of the one place they are written down. Two views of one desk that
         // disagreed about what a fader is made of would be two desks.
         slot: crate::recorder_panel::CAP_SLOT,
@@ -4429,7 +4429,7 @@ fn pan_knob(painter: &Painter, r: Rect, pan: f32, p: &Ink, master: bool) {
 }
 
 /// A vertical fader: a track, and a cap on it.
-/// A fader: a cream cap, ribbed, riding in a black slot.
+/// A fader: a bone cap, ribbed, riding in a black slot.
 ///
 /// **Modelled on the real thing** — the owner's photograph of a period desk,
 /// where the slot is a dark channel cut into the face and the cap is a bone

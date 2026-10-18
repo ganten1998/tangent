@@ -5160,7 +5160,7 @@ pub(crate) const CAP_BONE: Color32 = Color32::from_rgb(0xE8, 0xDE, 0xC4);
 
 /// The channel the cap runs in: black, and the same black in every view.
 ///
-/// **From the owner's photograph of the real desk**, where the caps are cream
+/// **From the owner's photograph of the real desk**, where the caps are bone
 /// and the slots they run in are cut black into the panel — not a shade of the
 /// panel, which is what a slider tinted from `well` produced: a pale line with
 /// a slightly-less-pale block on it, a diagram of a fader rather than a fader.

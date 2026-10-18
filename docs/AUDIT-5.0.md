@@ -921,7 +921,7 @@ Each used channel strip, top to bottom:
 - **Insert rack** - three full-width stacked bays. Click an empty bay (+) to open the plugin picker; click a loaded bay to open the plugin's window (the built-in DX7 opens the patch picker; the drum kit opens the drumpad). **Alt+click a loaded bay empties it.** **Right-click a loaded bay** opens a two-row modal menu: **DELETE FX / REPLACE FX** (anywhere else dismisses and does nothing).
 - **Send knob** (left) and **Pan knob** (right) - vertical relative drag, 420 pt full travel, Shift = fine; double-click resets; readout above each.
 - **Meter** (beside the fader): one bar for mono sources, two for stereo; ticks at 0/-12/-24/-48; gain-reduction strip from the top.
-- **Fader** - cream cap in a black slot, vertical relative drag (420 pt travel = 0.1 dB per point), Shift fine, double-click resets to shipped level.
+- **Fader** - bone cap in a black slot, vertical relative drag (420 pt travel = 0.1 dB per point), Shift fine, double-click resets to shipped level.
 - **dB readout** - click to type an exact figure (Enter commits, Esc abandons, clicking elsewhere commits).
 - **M / S / R switches** - mute (amber), solo (crimson; soloing dims/silences the others), arm (red; record-ready and live). **Shift+click R arms this lane exclusively** (every other arm stands down). The click strip has M/S only; the master has neither.
 
