@@ -778,6 +778,13 @@ mod tests {
     /// more when it settles, so an engine rebuilt after the Pause (a device
     /// change, the band reopening) is re-located where the tape stopped and
     /// not where Pause was pressed: up to 0.39 of the stop time apart.
+    ///
+    /// Pushed as the host pushes, once a UI frame, about six 256-frame
+    /// passes at 48 kHz: the last push that sees the coast reads the tape a
+    /// frame before it came to rest, so it is the copy made once more as it
+    /// settles that remembers where it stopped. (Pushed every pass, the last
+    /// coasting push already read the resting place, and the settle's copy
+    /// went untested.)
     #[test]
     fn a_pause_coast_is_remembered_where_the_tape_stopped() {
         let (mut e, mut t) = armed();
@@ -790,10 +797,13 @@ mod tests {
         }
         let pressed = e.transport_position();
         t.toggle_play();
-        for _ in 0..400 {
-            t.push(Some(&e));
+        for k in 0..402 {
+            if k % 6 == 0 {
+                t.push(Some(&e));
+            }
             e.render_offline(&mut out);
         }
+        t.push(Some(&e));
         assert!(!e.motor_coasting());
         let rested = e.transport_position();
         assert!(rested > pressed + 10_000, "the pause did not coast");
