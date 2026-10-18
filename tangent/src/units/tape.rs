@@ -2062,6 +2062,86 @@ impl Tape {
     }
 }
 
+// ── what a face shows ───────────────────────────────────────────────────────
+
+/// **The figures a face prints beside the dials, from the dials alone.**
+///
+/// The face cannot reach this crate, so the host asks these of a bay's
+/// values on every push and every automated frame, and hands the face the
+/// answers. That is why each is a pure function of the params and nothing
+/// else: no allocation, no noise, no tape to run, and a few dozen
+/// multiply-adds at most, so a drag that asks sixty times a second costs
+/// nothing. Each reads the speed a dial is heading for, not the glide's
+/// position, because the face shows where the machine is going.
+///
+/// The centre of the head contour's bell, in hertz: the speed over the
+/// bump's wavelength ([`BUMP_WAVELENGTH_MM`]), 8.74, 17.48, 34.95 and
+/// 69.91 Hz at the four speeds. Bump only sizes the bell, so it does not
+/// move this.
+pub fn bump_hz(p: &TapeParams) -> f32 {
+    let speed = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial()));
+    (0.0254 * speed.ips() / (BUMP_WAVELENGTH_MM * 1.0e-3)) as f32
+}
+
+/// The A-weighted level of the tape's hiss on silence, in dBFS: what an
+/// A-weighted meter across the audible band, 20 Hz to 20 kHz, reads at the
+/// output with nothing playing. Minus infinity at Hiss 0, which is silent
+/// tape.
+///
+/// The bias noise is white at [`HISS_GAIN`] behind the speed's playback
+/// shelf ([`HISS_EQ_US`]), and the rate law in `aim` puts the same noise in
+/// every hertz at every rate, so this is the same figure at every rate an
+/// engine runs at. The shelf, Roll's one-pole when it is in circuit and the
+/// A-weighting are summed over the band's third octaves in octaves of
+/// frequency, which agrees with the integral to a hundredth of a decibel,
+/// and Trim adds its own decibels. The contour leaves it alone: its bell and
+/// its low end sit where the A-weighting has already taken thirty decibels.
+/// A fresh tape reads -87.0 dBFS(A), 0 VU less 69.0 dB(A), the datasheet
+/// figure [`HISS_GAIN`] is set to.
+pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
+    let hiss = norm(p.hiss);
+    if hiss <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    let i = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())) as usize;
+    let gain = HISS_GAIN[i] * f64::from(hiss / 0.25).powi(2);
+    // Uniform noise in -1..1 has a variance of a third, spread over half the
+    // design rate's band of hertz.
+    let density = gain * gain / 3.0 / (0.5 * f64::from(DESIGN_RATE));
+    let roll = norm(p.roll);
+    let corner = if roll > 1.0e-3 {
+        f64::from(ROLL_HZ.0) * f64::from(ROLL_HZ.1 / ROLL_HZ.0).powf(f64::from(roll))
+    } else {
+        f64::INFINITY
+    };
+    let (t2, t1) = (HISS_EQ_US[i] * 1.0e-6, 50.0e-6);
+    // Thirty third-octave steps from 20 Hz to 20 kHz, trapezoidal in octaves:
+    // the integral of the density over `df` is of `density x f` over `ln f`.
+    const STEPS: i32 = 30;
+    let step = 1_000.0_f64.ln() / f64::from(STEPS);
+    let rise = step.exp();
+    let mut f = 20.0_f64;
+    let mut sum = 0.0;
+    for k in 0..=STEPS {
+        let (f2, w2) = (f * f, (std::f64::consts::TAU * f).powi(2));
+        let a_weight = 12_194.0_f64.powi(4) * f2 * f2 * f2 * f2
+            / ((f2 + 20.6_f64.powi(2)).powi(2)
+                * (f2 + 107.7_f64.powi(2))
+                * (f2 + 737.9_f64.powi(2))
+                * (f2 + 12_194.0_f64.powi(2)).powi(2));
+        let shelf = (1.0 + w2 * t2 * t2) / (1.0 + w2 * t1 * t1);
+        let roll = 1.0 / (1.0 + f2 / (corner * corner));
+        let end = if k == 0 || k == STEPS { 0.5 } else { 1.0 };
+        sum += end * a_weight * shelf * roll * f;
+        f *= rise;
+    }
+    // The A curve is normalised to unity at 1 kHz, where its raw form reads
+    // 2 dB low.
+    let a_norm = 10.0_f64.powf(0.2);
+    let trim = f64::from((norm(p.trim) - 0.5) * (TRIM_DB.1 - TRIM_DB.0));
+    (10.0 * (density * sum * step * a_norm).log10() + trim) as f32
+}
+
 // ── proof ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2476,6 +2556,21 @@ mod tests {
     /// -87.0 dBFS(A), -69.0 dB(A) re 0 VU, within 0.7 dB, measured as the
     /// A-weighted sum of the third-octave bands the output actually carries.
     /// Measured: -128.7, -129.3, -127.8 and -127.2 dB/Hz, and -86.9 dBFS(A).
+    ///
+    /// **And the figure a face prints is the one a meter reads.**
+    /// [`hiss_dbfs_a`] works the same level out from the dials alone, and it
+    /// must agree with the measured A-weighted level within half a decibel
+    /// at every speed, at Hiss 0.1, 0.5 and 1 as well as 0.25, with Roll at
+    /// half travel and with Trim at +6 dB; it reads minus infinity at Hiss
+    /// 0, and a fresh tape reads the datasheet's -87.0 within a fifth of a
+    /// decibel. The meter's bands are each scaled to the noise bandwidth they
+    /// really pass, or their overlapping skirts would read a tenth of a
+    /// decibel hot. Measured: the meter 0.00 to 0.12 dB over the helper at
+    /// 3.75, 7.5 and 15 ips, at every Hiss and with the Trim (its sum reaches
+    /// past 20 kHz, where the helper's band stops), 0.37 over at 30 ips and
+    /// 0.32 with Roll at half travel, where the shelf's bilinear warp and
+    /// Roll's one-pole pass a little more treble at 44.1 kHz than the
+    /// analogue figures the helper sums; and -87.05 dBFS(A) for a fresh tape.
     #[test]
     fn the_hiss_floor_and_colour_follow_each_speeds_datasheet() {
         let sr = 44_100.0_f32;
@@ -2490,13 +2585,54 @@ mod tests {
                     * (f2 + 12_194.0_f64.powi(2)));
             ra * 10.0_f64.powf(2.0 / 20.0)
         };
+        // The third-octave bands, each with the noise bandwidth it really
+        // passes: its eighth-order skirts reach into its neighbours, so a
+        // band gathers a little more than its edges hold, and summed as they
+        // are the bands read white noise a tenth of a decibel hot. The noise
+        // bandwidth is the energy of the band's own impulse response through
+        // the filters `band_power` runs.
+        let bands: Vec<(f64, f64, f64, f64)> = (-17..=13)
+            .map(|k| {
+                let centre = 1_000.0 * 2.0_f64.powf(f64::from(k) / 3.0);
+                let (lo, hi) = (
+                    centre * 2.0_f64.powf(-1.0 / 6.0),
+                    (centre * 2.0_f64.powf(1.0 / 6.0)).min(0.495 * f64::from(sr)),
+                );
+                let (mut hp, mut lp) = (
+                    Butter::new(8, sr.into(), lo, true),
+                    Butter::new(8, sr.into(), hi, false),
+                );
+                let energy: f64 = (0..sr as usize)
+                    .map(|n| lp.run(hp.run(if n == 0 { 1.0 } else { 0.0 })).powi(2))
+                    .sum();
+                (centre, lo, hi, 0.5 * energy * f64::from(sr))
+            })
+            .collect();
+        let dba = |out: &[f32]| {
+            let weighted: f64 = bands
+                .iter()
+                .map(|&(centre, lo, hi, enbw)| {
+                    band_power(out, sr.into(), lo, hi, skip) * (hi - lo) / enbw * a_weight(centre).powi(2)
+                })
+                .sum();
+            10.0 * weighted.log10()
+        };
+        let silence = vec![0.0; frames * 2];
+        let face_agrees = |p: &TapeParams, measured: f64, what: &str| {
+            let told = f64::from(hiss_dbfs_a(p));
+            assert!(
+                (told - measured).abs() < 0.5,
+                "{what}: the face is told the hiss reads {told:+.2} dBFS(A), and a meter \
+                 reads {measured:+.2}"
+            );
+        };
         for (speed, want) in TapeSpeed::ALL.into_iter().zip([-128.7, -129.5, -128.0, -127.5]) {
             let p = TapeParams {
                 hiss: 0.25,
                 speed: speed.dial(),
                 ..TapeParams::NEUTRAL
             };
-            let out = left(&feed(&mut Tape::new(sr), &vec![0.0; frames * 2], &p));
+            let out = left(&feed(&mut Tape::new(sr), &silence, &p));
             let density = 10.0 * (band_power(&out, sr.into(), 900.0, 1_100.0, skip) / 200.0).log10();
             assert!(
                 (density - want).abs() < 1.0,
@@ -2504,24 +2640,35 @@ mod tests {
                  datasheet puts {want:+.1}",
                 speed.label()
             );
+            let level = dba(&out);
+            face_agrees(&p, level, speed.label());
             if speed == TapeSpeed::Ips15 {
-                let weighted: f64 = (-17..=13)
-                    .map(|k| {
-                        let centre = 1_000.0 * 2.0_f64.powf(f64::from(k) / 3.0);
-                        let (lo, hi) = (
-                            centre * 2.0_f64.powf(-1.0 / 6.0),
-                            (centre * 2.0_f64.powf(1.0 / 6.0)).min(0.495 * f64::from(sr)),
-                        );
-                        band_power(&out, sr.into(), lo, hi, skip) * a_weight(centre).powi(2)
-                    })
-                    .sum();
-                let dba = 10.0 * weighted.log10();
                 assert!(
-                    (dba + 87.0).abs() < 0.7,
-                    "at 15 ips the hiss reads {dba:+.2} dBFS(A), where the datasheet puts -87.0"
+                    (level + 87.0).abs() < 0.7,
+                    "at 15 ips the hiss reads {level:+.2} dBFS(A), where the datasheet puts -87.0"
                 );
             }
         }
+        for (what, p) in [
+            ("Hiss 0.1", TapeParams { hiss: 0.1, ..TapeParams::NEUTRAL }),
+            ("Hiss 0.5", TapeParams { hiss: 0.5, ..TapeParams::NEUTRAL }),
+            ("Hiss 1", TapeParams { hiss: 1.0, ..TapeParams::NEUTRAL }),
+            ("Roll at half travel", TapeParams { hiss: 0.25, roll: 0.5, ..TapeParams::NEUTRAL }),
+            ("Trim at +6 dB", TapeParams { hiss: 0.25, trim: 0.75, ..TapeParams::NEUTRAL }),
+        ] {
+            let out = left(&feed(&mut Tape::new(sr), &silence, &p));
+            face_agrees(&p, dba(&out), what);
+        }
+        assert_eq!(
+            hiss_dbfs_a(&TapeParams { hiss: 0.0, ..TapeParams::default() }),
+            f32::NEG_INFINITY,
+            "silent tape is not silent to the face"
+        );
+        let fresh = hiss_dbfs_a(&TapeParams::default());
+        assert!(
+            (fresh + 87.0).abs() < 0.2,
+            "a fresh tape tells the face its hiss reads {fresh:+.2} dBFS(A), not the datasheet's -87.0"
+        );
     }
 
     /// **Nothing the six knobs can reach may blow up.** Every combination of
@@ -3719,12 +3866,35 @@ mod tests {
     /// bump's frequency and an octave above it reads what the input
     /// transformer and the head's own roll-off give it, two one-poles whose
     /// response is known exactly, within 0.1 dB at every speed.
+    ///
+    /// The bump's frequency is the one the face prints, [`bump_hz`], so the
+    /// figure a face shows is the frequency the bell is measured to lift:
+    /// 8.74, 17.48, 34.95 and 69.91 Hz, at any Bump.
     #[test]
     fn the_head_bump_moves_an_octave_with_every_doubling_of_speed() {
         let sr = 48_000.0_f32;
         let amp = 0.1_f32;
+        for (speed, want) in TapeSpeed::ALL.into_iter().zip([8.74, 17.48, 34.95, 69.91]) {
+            for bump in [0.0, 0.5, 1.0] {
+                let p = TapeParams {
+                    bump,
+                    speed: speed.dial(),
+                    ..TapeParams::default()
+                };
+                let got = f64::from(bump_hz(&p));
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "at {} and Bump {bump} the face is told the bump sits at {got:.3} Hz, \
+                     not {want}",
+                    speed.label()
+                );
+            }
+        }
         let at = |speed: TapeSpeed| {
-            let f_b = 0.0254 * speed.ips() / (BUMP_WAVELENGTH_MM * 1.0e-3);
+            let f_b = f64::from(bump_hz(&TapeParams {
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            }));
             [f_b, 2.0 * f_b].map(|hz| {
                 let gain = |bump: f32| {
                     let p = TapeParams {
