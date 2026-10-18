@@ -3194,6 +3194,92 @@ mod tests {
         assert!(changed.is_empty(), "these exports are not the files they were: {changed:?}");
     }
 
+    /// **An export is the same file with tape start and stop on.**
+    ///
+    /// The setting is the live desk's and only the live desk's: an export
+    /// renders its span as fast as it can and must never spin, and a project
+    /// exports the same file whatever the switch says. The first corpus
+    /// project exported through the real road (`full_build_with`, then the
+    /// span rendered as `start_offline_render` renders it) with the setting
+    /// off and with it on at its fastest, 0.1 s up and 0.1 s down: the same
+    /// bytes, file for file.
+    #[test]
+    fn an_export_is_the_same_file_with_tape_start_and_stop_on() {
+        let render = |on: bool| {
+            let mut c = corpus().into_iter().next().expect("a corpus project");
+            c.settings.start_stop = tangent_ui::motor::StartStop::new(on, 0.1, 0.1);
+            let dir = scratch(&format!("tape-motor-{on}"));
+            let app = open(&c, &dir);
+            assert_eq!(app.start_stop().on(), on, "the setting did not reach the app");
+            let (live, live_bridge) = live_engine(&c, &app);
+            let spec = tangent_ui::ports::ProjectExportSpec { rate: RATE, ..Default::default() };
+            let mut ctx = Furnish { live: Some((&live, &live_bridge)), ..Furnish::default() };
+            let built = full_build_with(&app, RATE, Timebase::new(), BuildFor::Export(spec.clone()), &mut ctx)
+                .expect("an offline engine");
+            let files = render_files(built, &app, &spec, None, &dir.join("out"));
+            let _ = std::fs::remove_dir_all(&dir);
+            files
+        };
+        let off = render(false);
+        let on = render(true);
+        assert!(off.iter().any(|(_, _, loud)| *loud), "the export was silent, so nothing was proved");
+        assert_eq!(off.len(), on.len(), "the setting changed which files an export writes");
+        for ((name, a, _), (_, b, _)) in off.iter().zip(&on) {
+            assert!(a == b, "{name} is not the same file with tape start and stop on");
+        }
+    }
+
+    /// **No offline build arms the tape motor.**
+    ///
+    /// Every offline road (an export, a freeze, the probe) comes through
+    /// `full_build_with`, and an offline engine's motor starts not allowed
+    /// (`Shared::motor_ok`), so the one way an export could spin is this
+    /// builder telling it: its body names no `set_tape_motor`. And a built
+    /// engine, from an app whose setting is on, takes a Play and a Stop at
+    /// once: the press's own pass rolls, the stop's own pass is parked, and
+    /// the motor shows only rest and speed.
+    #[test]
+    fn no_offline_build_arms_the_tape_motor() {
+        let src = include_str!("engine_bridge.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests module")];
+        let at = src.find("pub fn full_build_with(").expect("full_build_with");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+        assert!(!body.contains("set_tape_motor"), "the offline builder arms the tape motor");
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        s.start_stop = tangent_ui::motor::StartStop::new(true, 0.1, 0.1);
+        let app = app_with(s);
+        assert!(app.start_stop().on());
+        let Built { engine: mut e, .. } = full_build(&app, RATE, Timebase::new(), BuildFor::Probe).expect("an offline engine");
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut shows = Vec::new();
+        e.set_transport(1, 0);
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+            shows.push(e.motor_show());
+        }
+        e.set_rolling(true);
+        e.render_offline(&mut out);
+        assert_eq!(e.transport_position(), 256, "Play did not roll in its own pass");
+        for _ in 0..40 {
+            e.render_offline(&mut out);
+            shows.push(e.motor_show());
+        }
+        let at = e.transport_position();
+        e.set_rolling(false);
+        e.render_offline(&mut out);
+        assert_eq!(e.transport_position(), at, "Stop did not park in its own pass");
+        for _ in 0..40 {
+            e.render_offline(&mut out);
+            shows.push(e.motor_show());
+        }
+        use crate::motor::MotorShow;
+        assert!(
+            shows.iter().all(|s| matches!(s, MotorShow::Parked | MotorShow::Running)),
+            "an offline engine's motor moved: {shows:?}"
+        );
+    }
+
     /// **The corpus is not vacuous**, on every platform: every master and
     /// every freeze has sound in it, and so does every stem of a lane that
     /// is heard. A golden of silence would pin nothing.

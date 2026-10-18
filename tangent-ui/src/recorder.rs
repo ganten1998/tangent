@@ -1751,6 +1751,12 @@ pub struct RecorderState {
     /// The playhead, in seconds from 0:00 — what the readout and the waveform
     /// draw. Filled by the host once a frame; `tangent-ui` never advances a
     /// clock of its own, so this is a measurement, not a prediction.
+    ///
+    /// **The drawn AND the edited playhead.** With tape start and stop on, a
+    /// stopping tape coasts, and this is the coasting tape until it stops
+    /// (the host's `Transport::shown_s`): a split, a paste, an automation
+    /// point or a nudge at the playhead acts at the line the user sees, and
+    /// at the cursor once a Stop's coast has ended there.
     pub position_s: f64,
     /// Whether the green button's audition is running. Distinct from
     /// `state`, which is the TAKE's machine — play is the transport's.

@@ -81,7 +81,7 @@ fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
 /// scope-and-ReaStream pair, the live input — because each carries a
 /// different signal and needs its own tail. **The phase is NOT here.** All
 /// the output-side streams are read at the same positions, and one phase
-/// shared between them is what keeps them sample-aligned; see [`Varispeed`].
+/// shared between them is what keeps them sample-aligned; see [`Phase`].
 #[derive(Debug)]
 pub struct Stream {
     hist: Vec<f32>,
@@ -156,6 +156,50 @@ impl Stream {
         self.keep_tail(src, src_frames);
     }
 
+    /// **Resample with a ratio that moves**: `run`, with the ratio linear in
+    /// output time from `r0` at the first frame towards `r1`, `r_j = r0 +
+    /// (r1 - r0) j / dst_frames`, so the read position is its exact sum,
+    /// `x_j = frac + j r0 + j (j - 1) (r1 - r0) / (2 dst_frames)`.
+    ///
+    /// **Per sample, not a staircase.** The tape's motor changes the speed
+    /// every pass, and one ratio a call steps it by whole percent of full
+    /// speed at a time: at 512 frames and 48 kHz a 0.5 s start moves 2.6 %
+    /// a callback, a 0.85-semitone jump every 10.7 ms at half speed (a
+    /// 94 Hz zipper), and near the bottom whole octaves a callback. With
+    /// equal ends the correction is exactly zero and this is `run`, bit for
+    /// bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_ramp(
+        &mut self,
+        src: &[f32],
+        src_frames: usize,
+        dst: &mut [f32],
+        dst_frames: usize,
+        frac: f64,
+        r0: f64,
+        r1: f64,
+    ) {
+        let bend = (r1 - r0) / (2.0 * dst_frames.max(1) as f64);
+        for j in 0..dst_frames {
+            let jf = j as f64;
+            let x = frac + jf * r0 + jf * (jf - 1.0) * bend;
+            let floor = x.floor();
+            let t = (x - floor) as f32;
+            let i = floor as isize;
+            for ch in 0..self.channels {
+                let y0 = self.at(src, src_frames, i - 1, ch);
+                let y1 = self.at(src, src_frames, i, ch);
+                let y2 = self.at(src, src_frames, i + 1, ch);
+                let y3 = self.at(src, src_frames, i + 2, ch);
+                let Some(slot) = dst.get_mut(j * self.channels + ch) else {
+                    return;
+                };
+                *slot = hermite(y0, y1, y2, y3, t);
+            }
+        }
+        self.keep_tail(src, src_frames);
+    }
+
     /// The last [`HIST`] frames of what was just read.
     ///
     /// Built into a second buffer and then swapped in, because a block
@@ -202,7 +246,10 @@ impl Stream {
 /// came out of the speakers.
 pub struct Phase {
     /// Where the next output frame reads from, relative to the next program
-    /// frame that will be rendered. In `(-(HIST as f64), 1.0)`.
+    /// frame that will be rendered. In `(-(HIST as f64), max(ratio, 1.0)]`:
+    /// at most 1 on the output side, where the ratio is at most 2 and the
+    /// count rounds up, and up to a step ahead on the input side's large
+    /// steps near the tape motor's floor (see [`Phase::advance`]).
     frac: f64,
 }
 
@@ -220,13 +267,31 @@ impl Phase {
     ///
     /// The last output frame reads at `frac + (dst-1)·ratio` and the
     /// interpolator wants two frames past that, so the answer is that
-    /// position's floor plus three. It is never negative and never above the
-    /// bound in `Varispeed::MAX_PROGRAM_FRAMES`.
+    /// position's floor plus three. It is never negative, and for a callback
+    /// the renderer's cap allows never above its `MAX_CALLBACK_FRAMES`.
     pub fn program_frames(&self, dst: usize, ratio: f64) -> usize {
         if dst == 0 {
             return 0;
         }
         let last = self.frac + (dst - 1) as f64 * ratio;
+        let need = last.floor() + 3.0;
+        if need <= 0.0 {
+            0
+        } else {
+            need as usize
+        }
+    }
+
+    /// **How many program frames a ramped read needs**: `program_frames`
+    /// for [`Stream::run_ramp`], the floor of its last read position,
+    /// `x_(dst-1)`, plus three. With equal ends it is `program_frames`, bit
+    /// for bit.
+    pub fn program_frames_ramp(&self, dst: usize, r0: f64, r1: f64) -> usize {
+        if dst == 0 {
+            return 0;
+        }
+        let j = (dst - 1) as f64;
+        let last = self.frac + j * r0 + j * (j - 1.0) * ((r1 - r0) / (2.0 * dst as f64));
         let need = last.floor() + 3.0;
         if need <= 0.0 {
             0
@@ -244,10 +309,33 @@ impl Phase {
     /// reach further back than there is history to reach into: a phase that
     /// did would read zeros and put a hole in the audio, and the only way to
     /// get there is a ratio outside the dial's own limits.
+    ///
+    /// **And never further ahead than one step** (`ratio.max(1.0)`), which
+    /// only the input side reaches. There the ratio is a STEP, real frames
+    /// per program frame, and the result lies in `[step - 3, step - 2)`:
+    /// never above zero for the dial's steps (at most 2), but up to 125
+    /// frames ahead near the tape motor's floor, where a step is up to 127.
+    /// That lead is a read position, not slack: clamped to 1, as it was, it
+    /// threw away `step - 4` real frames and more every chunk. A NaN ratio
+    /// is 1 to `f64::max`, so the clamp's bounds are always in order.
     pub fn advance(&mut self, dst: usize, src: usize, ratio: f64) {
         let moved = self.frac + dst as f64 * ratio - src as f64;
         self.frac = if moved.is_finite() {
-            moved.clamp(-(HIST as f64) + 1.0, 1.0)
+            moved.clamp(-(HIST as f64) + 1.0, ratio.max(1.0))
+        } else {
+            0.0
+        };
+    }
+
+    /// `advance` past a ramped block: the read position one past its last
+    /// frame, `x_dst = frac + dst r0 + (dst - 1) (r1 - r0) / 2`, less the
+    /// program frames rendered, held to the history behind and the larger
+    /// end's step ahead. With equal ends it is `advance`, bit for bit.
+    pub fn advance_ramp(&mut self, dst: usize, src: usize, r0: f64, r1: f64) {
+        let n = dst as f64;
+        let moved = self.frac + n * r0 + (n - 1.0) * (r1 - r0) / 2.0 - src as f64;
+        self.frac = if moved.is_finite() {
+            moved.clamp(-(HIST as f64) + 1.0, r0.max(r1).max(1.0))
         } else {
             0.0
         };
@@ -481,5 +569,176 @@ mod tests {
             dst.iter().all(|v| v.abs() < 1e-6),
             "the old block bled through a clear"
         );
+    }
+
+    /// The read map of a ramped block: where output frame `j` reads, from a
+    /// phase of `frac`, with the ratio linear from `r0` across `dst` frames.
+    fn read_at(frac: f64, j: usize, dst: usize, r0: f64, r1: f64) -> f64 {
+        let j = j as f64;
+        frac + j * r0 + j * (j - 1.0) * (r1 - r0) / (2.0 * dst as f64)
+    }
+
+    /// **A ramp with equal ends is the constant ratio, bit for bit.**
+    ///
+    /// The renderer takes the ramped calls only while the tape's motor is
+    /// changing speed and the constant ones otherwise, so the dial alone
+    /// runs today's arithmetic; and where the two meet (a motor at a steady
+    /// speed under a ramp's road) they must be the same samples, the same
+    /// count and the same phase, or the switch between them is a step.
+    /// Held over three blocks from four phases the dial leaves behind, so
+    /// the history each keeps is compared too.
+    #[test]
+    fn a_ramp_with_equal_ends_is_the_constant_ratio_bit_for_bit() {
+        let src: Vec<f32> = (0..8192 * 2).map(|i| ((i / 2) as f32 * 0.37).sin() * if i % 2 == 0 { 1.0 } else { -0.5 }).collect();
+        for ratio in [0.5_f64, 0.85, 1.0, 1.15, 2.0] {
+            for frac in [0.0_f64, -1.75, -0.4, 0.6] {
+                let (mut a, mut b) = (Phase { frac }, Phase { frac });
+                for dst in [1_usize, 64, 256, 4_092] {
+                    assert_eq!(a.program_frames(dst, ratio), b.program_frames_ramp(dst, ratio, ratio), "ratio {ratio}, {dst} frames");
+                }
+                let (mut s1, mut s2) = (Stream::new(2), Stream::new(2));
+                let mut at = 0usize;
+                for block in 0..3 {
+                    let n = a.program_frames(256, ratio);
+                    assert_eq!(n, b.program_frames_ramp(256, ratio, ratio));
+                    let (mut d1, mut d2) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+                    s1.run(&src[at * 2..], n, &mut d1, 256, a.frac(), ratio);
+                    s2.run_ramp(&src[at * 2..], n, &mut d2, 256, b.frac(), ratio, ratio);
+                    assert!(
+                        d1.iter().zip(&d2).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "ratio {ratio} from {frac}: block {block} differs between run and run_ramp"
+                    );
+                    a.advance(256, n, ratio);
+                    b.advance_ramp(256, n, ratio, ratio);
+                    assert_eq!(a.frac().to_bits(), b.frac().to_bits(), "ratio {ratio}: the phases parted");
+                    at += n;
+                }
+            }
+        }
+    }
+
+    /// **A ramped read lands on the integrated position.**
+    ///
+    /// A ramp source is the case an interpolator cannot fudge, as in
+    /// `a_ramp_resamples_to_a_ramp`: frame `j` must read exactly the read
+    /// map's `x_j`, the sum of every ratio before it, or the speed the tape
+    /// plays is not the speed the motor decided. Each frame's step from the
+    /// last is the ratio itself, linear across the block, and the count asked
+    /// for covers the last read with the interpolator's reach and no more.
+    #[test]
+    fn a_ramped_read_lands_on_the_integrated_position() {
+        let (r0, r1) = (0.2_f64, 0.6_f64);
+        let src = ramp(512, 1, 0.0);
+        let n = Phase::new().program_frames_ramp(256, r0, r1);
+        let last = read_at(0.0, 255, 256, r0, r1);
+        assert!((n as f64) >= last + 2.0 && (n as f64) <= last + 4.0, "{n} program frames for a last read at {last}");
+        let mut s = Stream::new(1);
+        let mut dst = vec![0.0f32; 256];
+        s.run_ramp(&src, n, &mut dst, 256, 0.0, r0, r1);
+        for j in 0..256 {
+            let want = read_at(0.0, j, 256, r0, r1);
+            // Skip the frames whose window reaches the empty history.
+            if want.floor() < 1.0 {
+                continue;
+            }
+            assert!((f64::from(dst[j]) - want).abs() < 1e-3, "frame {j}: read {} where {want} was the position", dst[j]);
+            if read_at(0.0, j - 1, 256, r0, r1).floor() >= 1.0 {
+                let ratio = r0 + (r1 - r0) * (j - 1) as f64 / 256.0;
+                assert!((f64::from(dst[j] - dst[j - 1]) - ratio).abs() < 1e-3, "frame {j}: the step is not the ratio");
+            }
+        }
+    }
+
+    /// **Two ramped blocks join without a step.**
+    ///
+    /// The seam a single call cannot show: one continuous change of speed
+    /// read in two passes, each with its own two ends, must be the same
+    /// samples as the one read, or every pass boundary of a start or a stop
+    /// is a click. Across a rise and a fall, and down to the motor's floor.
+    #[test]
+    fn two_ramped_blocks_join_without_a_step() {
+        let floor = crate::motor::FLOOR;
+        for (ra, rb) in [(0.3_f64, 0.9_f64), (0.9, 0.3), (0.05, 1.0), (1.0, floor)] {
+            let src = ramp(4096, 1, 0.0);
+            let mut whole = vec![0.0f32; 200];
+            Stream::new(1).run_ramp(&src, 4096, &mut whole, 200, 0.0, ra, rb);
+            let mid = ra + (rb - ra) * 0.5;
+            let (mut ph, mut s) = (Phase::new(), Stream::new(1));
+            let (mut out, mut consumed) = (Vec::new(), 0usize);
+            for (r0, r1) in [(ra, mid), (mid, rb)] {
+                let n = ph.program_frames_ramp(100, r0, r1);
+                let mut part = vec![0.0f32; 100];
+                s.run_ramp(&src[consumed..], n, &mut part, 100, ph.frac(), r0, r1);
+                ph.advance_ramp(100, n, r0, r1);
+                consumed += n;
+                out.extend_from_slice(&part);
+            }
+            for j in 0..200 {
+                assert!(
+                    (out[j] - whole[j]).abs() < 1e-3,
+                    "{ra} to {rb}, frame {j}: two blocks gave {}, one gave {}",
+                    out[j],
+                    whole[j]
+                );
+            }
+        }
+    }
+
+    /// **The phase keeps its place down to the motor's floor**, on both
+    /// sides of the path.
+    ///
+    /// The output side plays the desk at ratios down to the floor with the
+    /// dial at its slowest (`0.5 x FLOOR`, 0.00786), where a pass may need
+    /// no program at all; its phase stays inside the history and never
+    /// passes 1. The input side STRETCHES by the inverse, steps up to 127.2
+    /// real frames per program frame, and there the phase leads by up to
+    /// the step: what it consumes over a thousand passes must equal what the
+    /// read map moved, the integral of the step, to within that lead and the
+    /// interpolator's reach (`max step + 3`). The clamp at 1 it replaces
+    /// lost over 120 real frames a chunk at the floor. Constant passes use
+    /// the constant calls, as the renderer does, and ramped ones the ramps.
+    #[test]
+    fn the_phase_keeps_its_place_down_to_the_floor() {
+        let slowest = 0.5 * crate::motor::FLOOR;
+        let max_step = 1.0 / slowest;
+        for frames in [32_usize, 256] {
+            // A thousand passes: held at the floor, a rise from it to full
+            // speed, a fall back, and held at the floor again.
+            let ratio = |k: usize| -> f64 {
+                match k / 250 {
+                    0 => slowest,
+                    1 => slowest + (1.0 - slowest) * (k - 250) as f64 / 250.0,
+                    2 => 1.0 - (1.0 - slowest) * (k - 500) as f64 / 250.0,
+                    _ => slowest,
+                }
+            };
+            let mut out = Phase::new();
+            let mut inp = Phase::new();
+            let (mut consumed, mut moved) = (0.0_f64, 0.0_f64);
+            for k in 0..1_000 {
+                let (r0, r1) = (ratio(k), ratio(k + 1));
+                let n = if r0 == r1 { out.program_frames(frames, r0) } else { out.program_frames_ramp(frames, r0, r1) };
+                if r0 == r1 {
+                    out.advance(frames, n, r0);
+                } else {
+                    out.advance_ramp(frames, n, r0, r1);
+                }
+                assert!(out.frac().is_finite() && out.frac() > -(HIST as f64) && out.frac() <= 1.0, "pass {k} of {frames}: the output phase is {}", out.frac());
+                let (s0, s1) = (1.0 / r0, 1.0 / r1);
+                let real = if s0 == s1 { inp.program_frames(frames, s0) } else { inp.program_frames_ramp(frames, s0, s1) };
+                if s0 == s1 {
+                    inp.advance(frames, real, s0);
+                } else {
+                    inp.advance_ramp(frames, real, s0, s1);
+                }
+                consumed += real as f64;
+                moved += frames as f64 * s0 + (frames as f64 - 1.0) * (s1 - s0) / 2.0;
+                assert!(inp.frac().is_finite() && inp.frac() > -(HIST as f64) && inp.frac() <= max_step, "pass {k} of {frames}: the input phase is {}", inp.frac());
+            }
+            assert!(
+                (consumed - moved).abs() <= max_step + 3.0,
+                "{frames}-frame passes: the input consumed {consumed} real frames where the read map moved {moved:.1}"
+            );
+        }
     }
 }

@@ -42,7 +42,11 @@ pub struct Transport {
     /// Monotonic locate counter. Starts at 1 so a fresh engine (ack 0) always
     /// re-locates on the first push.
     generation: u64,
-    /// Whether the transport rolls. **The only thing that decides it.**
+    /// Whether the transport rolls. **The only thing that decides whether
+    /// the song is meant to roll.** With tape start and stop on, the engine
+    /// keeps a stopping tape rolling until it has stopped
+    /// (`Engine::motor_coasting`); that is the stop finishing, not a second
+    /// switch.
     ///
     /// A take used to be ORed in: the session's rolling state made the engine
     /// roll whatever this said, so pressing TAKE played the song and nothing
@@ -57,6 +61,10 @@ pub struct Transport {
     /// returns to it, the owner's third and final ruling on the pair: the
     /// music always starts again from where the hand last pointed.
     cursor_s: f64,
+    /// **The engine's tape was coasting to a stop at the last push**
+    /// (`Engine::motor_coasting`), so the push after it carries where the
+    /// tape came to rest back once more. See `push`.
+    coasting: bool,
 }
 
 impl Transport {
@@ -66,6 +74,7 @@ impl Transport {
             generation: 1,
             playing: false,
             cursor_s: 0.0,
+            coasting: false,
         }
     }
 
@@ -80,7 +89,12 @@ impl Transport {
 
     /// Move the playhead WITHOUT moving the edit cursor — the return-to-
     /// cursor stop uses it, or stopping twice would walk the cursor.
-    fn locate_playhead(&mut self, seconds: f64) {
+    ///
+    /// **And an arrangement record pressed while the tape coasts to a stop**
+    /// pins the record's start with it (`start_arr_record`): the engine
+    /// applies that seek as the motor snaps to speed, and the edit cursor
+    /// stays where the hand put it.
+    pub fn locate_playhead(&mut self, seconds: f64) {
         self.pos_s = seconds.max(0.0);
         self.generation += 1;
     }
@@ -122,12 +136,34 @@ impl Transport {
     /// applied it, the sample clock after, the remembered position with no
     /// engine. `rate` is the engine's own, asked at the call site so this
     /// module never caches a number the device owns.
+    ///
+    /// **The REQUESTED position, for the host's own logic**: a record's start
+    /// and finish, the take's facts, an export's end. Through a Stop's coast
+    /// (`Engine::motor_coasting`) that is the cursor the stop returns to,
+    /// unacked until the tape has stopped; what is DRAWN then is
+    /// [`Transport::shown_s`].
     pub fn position_s(&self, engine: Option<&Engine>, rate: f64) -> f64 {
         match engine {
             Some(e) if e.transport_acked(self.generation) && rate > 0.0 => {
                 e.transport_position() as f64 / rate
             }
             _ => self.pos_s,
+        }
+    }
+
+    /// **The playhead as it is drawn, and as the hand edits it**: the
+    /// engine's own clock while its tape coasts to a stop, otherwise
+    /// [`Transport::position_s`].
+    ///
+    /// One authority at a time, extended by one case: through a coast the
+    /// line follows the tape as it slows, and every action at the playhead
+    /// (a split, a paste, an automation point, the readouts, a nudge) acts
+    /// at the line the user sees; when a Stop's coast ends, the line jumps
+    /// to the cursor and they act there.
+    pub fn shown_s(&self, engine: Option<&Engine>, rate: f64) -> f64 {
+        match engine {
+            Some(e) if e.motor_coasting() && rate > 0.0 => e.transport_position() as f64 / rate,
+            _ => self.position_s(engine, rate),
         }
     }
 
@@ -156,6 +192,17 @@ impl Transport {
         };
         let rate = f64::from(e.output().sample_rate).max(1.0);
         let acked = e.transport_acked(self.generation);
+        // **A tape coasting to a stop is still the truth**, and so is where
+        // it came to rest: carried back while it coasts and once when it
+        // settles, so an engine rebuilt after a Pause is re-located where
+        // the tape stopped and not where Pause was pressed. A Stop's coast is
+        // not acked (its return is held), so this never overwrites the
+        // cursor.
+        let coasting = e.motor_coasting();
+        if acked && !self.playing && (coasting || self.coasting) {
+            self.pos_s = e.transport_position() as f64 / rate;
+        }
+        self.coasting = coasting;
         for store in self.stores(acked, e.transport_position(), rate).into_iter().flatten() {
             match store {
                 Store::Locate { generation, frames } => e.set_transport(generation, frames),
@@ -537,6 +584,119 @@ mod tests {
         assert!(
             (t.position_s(None, 0.0) - 83.0).abs() < 1e-9,
             "stop moved the playhead away from where the music stopped"
+        );
+    }
+
+    /// An offline engine whose tape motor is armed, 0.5 s up and 0.7 s down,
+    /// and the transport that drives it.
+    fn armed() -> (Engine, Transport) {
+        let e = Engine::offline(48_000, tangent_record::audio::Timebase::new())
+            .expect("an offline engine needs no device");
+        e.set_tape_motor(true, 0.5, 0.7);
+        (e, Transport::new())
+    }
+
+    /// **The shown playhead follows a coasting tape, and the cursor holds
+    /// the host's logic.**
+    ///
+    /// Through a Stop's coast the tape is still moving and its return is
+    /// held, unacked: what is DRAWN is where the tape is (`shown_s`, the
+    /// engine's clock, climbing), and what the host's own logic reads is the
+    /// position it asked for, the cursor (`position_s`), so a record started
+    /// or a take placed then is placed at the cursor. When the tape stops,
+    /// both are the cursor.
+    #[test]
+    fn the_shown_playhead_follows_a_coasting_tape_and_the_cursor_holds_the_logic() {
+        let (mut e, mut t) = armed();
+        let rate = 48_000.0;
+        t.locate(1.0);
+        t.toggle_play();
+        let mut out = vec![0.0f32; 2 * 256];
+        for _ in 0..40 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        t.stop();
+        let mut shown = Vec::new();
+        for _ in 0..400 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+            if e.motor_coasting() {
+                assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9, "the host's logic left the cursor mid-coast");
+                shown.push(t.shown_s(Some(&e), rate));
+            } else if !shown.is_empty() {
+                break;
+            }
+        }
+        assert!(shown.len() > 10, "the stop did not coast");
+        assert!(shown.windows(2).all(|w| w[1] >= w[0]), "the drawn playhead went backwards through the coast");
+        assert!(shown[0] > 1.0 + 40.0 * 256.0 / rate - 1e-9, "the drawn playhead jumped to the cursor mid-coast");
+        assert!((t.shown_s(Some(&e), rate) - 1.0).abs() < 1e-9, "the drawn playhead is not at the cursor after the stop");
+        assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9);
+    }
+
+    /// **A Pause's coast is remembered where the tape stopped** (the
+    /// review's C11).
+    ///
+    /// Pause holds no return, so the tape comes to rest a coast past the
+    /// press. The host's own copy is carried back while it coasts and once
+    /// more when it settles, so an engine rebuilt after the Pause (a device
+    /// change, the band reopening) is re-located where the tape stopped and
+    /// not where Pause was pressed: up to 0.39 of the stop time apart.
+    #[test]
+    fn a_pause_coast_is_remembered_where_the_tape_stopped() {
+        let (mut e, mut t) = armed();
+        t.locate(1.0);
+        t.toggle_play();
+        let mut out = vec![0.0f32; 2 * 256];
+        for _ in 0..40 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        let pressed = e.transport_position();
+        t.toggle_play();
+        for _ in 0..400 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        assert!(!e.motor_coasting());
+        let rested = e.transport_position();
+        assert!(rested > pressed + 10_000, "the pause did not coast");
+        let remembered = t.position_s(None, 0.0);
+        assert!(
+            (remembered * 48_000.0 - rested as f64).abs() <= 1.0,
+            "the host remembers {remembered} s, the tape stopped at {rested}"
+        );
+        // A fresh engine, pushed afterwards, is located there.
+        let mut fresh = Engine::offline(48_000, tangent_record::audio::Timebase::new())
+            .expect("an offline engine needs no device");
+        t.push(Some(&fresh));
+        fresh.render_offline(&mut out);
+        assert!(
+            (fresh.transport_position() as f64 - rested as f64).abs() <= 1.0,
+            "a rebuilt engine was located at {}, not where the tape stopped ({rested})",
+            fresh.transport_position()
+        );
+    }
+
+    /// **Pinning the playhead leaves the cursor where the hand put it** (the
+    /// review's C12).
+    ///
+    /// A record pressed while the tape coasts pins its own start
+    /// (`start_arr_record`), and that pin must not become the place the next
+    /// Stop returns to: the cursor is the hand's alone.
+    #[test]
+    fn pinning_the_playhead_leaves_the_cursor_where_the_hand_put_it() {
+        let mut t = Transport::new();
+        t.locate(1.0);
+        t.toggle_play();
+        t.locate_playhead(5.0);
+        assert!((t.position_s(None, 0.0) - 5.0).abs() < 1e-9, "the pin did not move the playhead");
+        t.stop();
+        assert!(
+            (t.position_s(None, 0.0) - 1.0).abs() < 1e-9,
+            "Stop returned to {} rather than the cursor the hand put at 1.0",
+            t.position_s(None, 0.0)
         );
     }
 }

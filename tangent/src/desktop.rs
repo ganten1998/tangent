@@ -541,6 +541,17 @@ struct Recorder {
     /// on purpose, and nothing clicks over a song on the wrong grid. Pause
     /// takes it back, and the band shows it waiting (`play_pending`).
     play_on_go: bool,
+    /// **An edge that must be instant, not yet acted on by the engine**: the
+    /// tape's motor is held off (`push_monitor_settings`) from a press that
+    /// must start or stop at once (an arrangement record's start and stop, a
+    /// count-in's go, a realtime export's start and end) until the engine
+    /// has done what the level asked (`Engine::motor_settled`). Without it
+    /// the reason to stand aside (the record, the count, the export) is gone
+    /// a frame later, before a callback longer than a frame has seen the
+    /// level move, and a record's stop would wind down. Released in
+    /// `after_frame` beside the transport's push; cleared with the engine
+    /// (`forget_counts`).
+    motor_hold: bool,
     /// **A take counted on the count whose downbeat has just come** - its
     /// own, or one it joined - so a song started on that downbeat started at
     /// the take's head: `head_seconds` into a file with the count in it, or
@@ -6149,10 +6160,12 @@ impl DesktopApp {
         } else {
             None
         };
+        // **The playhead as drawn**: the coasting tape while it coasts to a
+        // stop (`Transport::shown_s`), and the requested position otherwise.
         state.position_s = {
             let engine = self.recorder.engine.as_ref();
             let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
-            self.recorder.transport.position_s(engine, rate)
+            self.recorder.transport.shown_s(engine, rate)
         };
         // **One strip per input, filled from the selection.** The names and
         // the widths come from the same function the picks do, so the column
@@ -6498,6 +6511,8 @@ impl DesktopApp {
             // And the song comes in on it, if Play was pressed during it.
             if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {
                 self.recorder.transport.toggle_play();
+                // A count-in's go rolls at once, tape motor or not.
+                self.recorder.motor_hold = true;
                 self.song_started_on_take_downbeat();
             }
         }
@@ -6518,6 +6533,19 @@ impl DesktopApp {
         {
             let engine = self.recorder.engine.as_ref();
             self.recorder.transport.push(engine);
+            // **The exempt edge, seen.** Held until the engine has acted on
+            // the level it was set for, because a callback can be longer than
+            // a UI frame (8192 frames at 44.1 kHz is 186 ms against a 33 ms
+            // frame): without it the reason to stand aside goes (the count
+            // cleared, the record finished, the export filed) before the
+            // callback sees the level move, and a record's stop would wind
+            // down. While it is held the motor is not allowed, so it is
+            // always at rest or at speed and this cannot stick.
+            if self.recorder.motor_hold
+                && engine.is_none_or(|e| e.motor_settled(self.recorder.transport.playing()))
+            {
+                self.recorder.motor_hold = false;
+            }
             // **The loop region, pushed every frame from the time
             // selection.** Frames off the engine's own rate; cleared to
             // (0,0) when there is no selection. Suppressed during a realtime
@@ -7149,6 +7177,13 @@ impl DesktopApp {
                     // seek would write the wrong bars into the file.
                     if self.recorder.bounce.is_none() {
                         self.recorder.transport.locate(seconds);
+                        // **A tape coasting to a stop is stopped where it
+                        // is** (`Engine::cut_motor`), so the locate lands now
+                        // rather than when the coast ends. Ignored by an
+                        // engine that is not coasting.
+                        if let Some(e) = self.recorder.engine.as_ref() {
+                            e.cut_motor();
+                        }
                     }
                 }
                 // **The red button is the ARRANGEMENT's.** Armed lanes in,
@@ -7339,6 +7374,9 @@ impl DesktopApp {
                 // sends the playhead home. Play's own second press is a PAUSE
                 // now, so this is the only button that returns to 0:00.
                 R::Stop => {
+                    // **A record's or an export's stop is instant**, tape
+                    // motor or not: asked before either is finished below.
+                    let quiet_stop = self.recorder.arr_rec.is_some() || self.recorder.bounce.is_some();
                     // The arrangement's count-in still clicking dies quietly
                     // with the rest - unless a take is counting on the same
                     // click, which only the cassette may cancel.
@@ -7365,6 +7403,9 @@ impl DesktopApp {
                         self.recorder.session.stop();
                     }
                     self.recorder.transport.stop();
+                    if quiet_stop {
+                        self.recorder.motor_hold = true;
+                    }
                 }
                 // **Every latch, or the light does not go out.** The warning
                 // is an OR across the input tracker, the take summary and the
@@ -10641,11 +10682,26 @@ impl DesktopApp {
             return;
         }
         let rate = f64::from(e.output().sample_rate).max(1.0);
+        // **A record starts and stops at once, tape motor or not.** Asked
+        // before the start is read: a press during a coast pins the record's
+        // start below.
+        let coasting = e.motor_coasting();
         let start_s = self.recorder.transport.position_s(Some(e), rate);
         let start_ns = e.timebase().now();
+        // Parked BEFORE the tee opens, so a pass that sees the capture flag
+        // sees the park (`Renderer::motor_plan`).
+        e.park_tape_motor();
         ArrRec::open_tee(&audio, &mut self.bridge, self.recorder.engine.as_mut());
+        // **Pressed while the tape coasts**: the record starts where it was
+        // pressed, and the engine applies that seek as the motor snaps to
+        // speed. The playhead alone: the edit cursor stays where the hand
+        // put it.
+        if coasting {
+            self.recorder.transport.locate_playhead(start_s);
+        }
         if !self.recorder.transport.playing() {
             self.recorder.transport.toggle_play();
+            self.recorder.motor_hold = true;
         }
         // **What the foot was already doing at T0**, restated at the take's
         // own zero. Rule 8: without it a pedal held from before the press is
@@ -11028,11 +11084,17 @@ impl DesktopApp {
                 let _ = self.bridge.sync(&self.app, e);
             }
         }
+        // **A realtime export starts at once, tape motor or not**, and the
+        // pass keeps it off for as long as it runs (`push_monitor_settings`).
+        if let Some(e) = self.recorder.engine.as_ref() {
+            e.park_tape_motor();
+        }
         // From the span's head, rolling before the take opens — the same
         // press-order the transport itself keeps.
         self.recorder.transport.stop();
         self.recorder.transport.locate(from_s);
         self.recorder.transport.toggle_play();
+        self.recorder.motor_hold = true;
         // **The take's first sample is the desk as it stands**: every level
         // landed on its target by the first block that rolls from this
         // locate (`Engine::land_gains_at`, tied to its generation: the
@@ -11220,6 +11282,8 @@ impl DesktopApp {
             if lost || pos >= b.until_s || !self.recorder.session.is_recording() {
                 self.recorder.session.stop();
                 self.recorder.transport.stop();
+                // And it ends at once: held past the pass's filing.
+                self.recorder.motor_hold = true;
                 b.finishing = true;
                 b.engine_lost = lost;
             }
@@ -15330,6 +15394,8 @@ impl DesktopApp {
         self.recorder.count_from = None;
         self.recorder.take_count_pending = false;
         self.recorder.play_on_go = false;
+        // And the motor's latch: the edge it waited on was that engine's.
+        self.recorder.motor_hold = false;
     }
 
     /// Start the monitor output, once, when the band opens.
@@ -16458,6 +16524,16 @@ impl DesktopApp {
             .iter()
             .map(|(row, slot)| (*slot, self.voice_for_strip(*row)))
             .collect();
+        // **The tape's start and stop**, live only and only where a tape may
+        // move: never under an export, a freeze, an arrangement record or a
+        // count, and never for the edge one of those makes
+        // (`Recorder::motor_hold`). Offline engines are never told
+        // (`engine_bridge::full_build_with`), which is the other half. **A
+        // take is not on that list** (the owner's ruling): a take films the
+        // desk as the room hears it, the tape's spin included. Read before
+        // the engine is borrowed: `running` takes the whole app.
+        let run = self.running();
+        let motor_quiet = run.realtime || run.full_speed || run.arr_record || run.counting || self.recorder.motor_hold;
         let Some(e) = self.recorder.engine.as_mut() else {
             return;
         };
@@ -16553,6 +16629,10 @@ impl DesktopApp {
         // exports when engaged", and it does so by being one more thing the
         // desk is pushed rather than a special case anywhere.
         e.set_varispeed(self.app.varispeed_ratio());
+        // The setting, pushed every frame like the dial beside it, and held
+        // off whenever the tape must not move (see `motor_quiet`).
+        let ss = self.app.start_stop();
+        e.set_tape_motor(ss.on() && !motor_quiet, ss.start_s(), ss.stop_s());
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
@@ -16712,7 +16792,9 @@ impl DesktopApp {
         if let (Some(engine), Some(auto)) = (self.recorder.engine.as_ref(), self.pushed_auto.as_ref())
         {
             let rate = engine.output().sample_rate;
-            let at = self.recorder.transport.position_s(Some(engine), f64::from(rate));
+            // Where the tape IS, a coasting one included, which is where the
+            // engine resolves the curves too (`Transport::shown_s`).
+            let at = self.recorder.transport.shown_s(Some(engine), f64::from(rate));
             for (sb, face) in open_live_faces(&self.app, &self.bridge, engine, auto, at) {
                 self.app.set_live_bay_face(sb, Some(face));
                 now.push(sb);
@@ -21032,6 +21114,7 @@ impl DesktopApp {
                 take_count_pending: false,
                 count_from: None,
                 play_on_go: false,
+                motor_hold: false,
                 take_downbeat: false,
                 take_head_s: 0.0,
                 session: crate::record::Session::new(tap, timebase),
@@ -21565,9 +21648,9 @@ impl eframe::App for DesktopApp {
             least(&mut self.pace_app_min, self.app.debug_asked());
             least(&mut self.pace_host_min, self.host_due);
             /// The bits of `host_frame_due`'s mask, in its order.
-            const LIVE_TERMS: [&str; 11] = [
+            const LIVE_TERMS: [&str; 12] = [
                 "playing", "take", "meters", "camera", "click", "ir_pending", "ir_worker",
-                "ir_capture", "recent", "events", "midi",
+                "ir_capture", "recent", "events", "midi", "coast",
             ];
             let _ = LIVE_TERMS;
             if now.duration_since(since).as_secs_f32() >= 1.0 {
@@ -21586,9 +21669,9 @@ impl eframe::App for DesktopApp {
                     .map(|(c, n)| format!("{c}x{n}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                const LIVE_TERMS: [&str; 11] = [
+                const LIVE_TERMS: [&str; 12] = [
                     "playing", "take", "meters", "camera", "click", "ir_pending", "ir_worker",
-                    "ir_capture", "recent", "events", "midi",
+                    "ir_capture", "recent", "events", "midi", "coast",
                 ];
                 let live = LIVE_TERMS
                     .iter()
@@ -22491,6 +22574,9 @@ impl DesktopApp {
             recent,
             events,
             midi,
+            // A tape coasting to a stop moves the playhead on its own.
+            // Holding asks nothing: nothing moves on screen during a hold.
+            self.recorder.engine.as_ref().is_some_and(crate::instrument::Engine::motor_coasting),
         ];
         let mask = terms.iter().enumerate().fold(0u16, |m, (i, t)| m | (u16::from(*t) << i));
         self.pace_live |= mask;
@@ -33098,7 +33184,7 @@ mod tests {").expect("the tests module")];
             .find("fn the_minimal_builds_gates_sit_on_their_own_items")
             .expect("this test");
         let mut broken: Vec<String> = Vec::new();
-        for m in ["mod transient;", "mod warp;", "mod shelf;"] {
+        for m in ["mod transient;", "mod warp;", "mod shelf;", "mod motor;"] {
             if !gated(main, m, usize::MAX) {
                 broken.push(format!("main.rs: `{m}` is compiled into Minimal"));
             }
@@ -33373,9 +33459,17 @@ mod tests {").expect("the tests module")];
             "self.recorder.engine_retry",
             "sooner(LIVE_TICK)",
             "sooner(ENGINE_IDLE_POLL)",
+            // A tape coasting to a stop moves the playhead on its own.
+            "Engine::motor_coasting",
         ] {
             assert!(ledger.contains(arm), "host_frame_due no longer consults `{arm}`");
         }
+        // And the pace probe names that twelfth term, in both of its lists.
+        assert_eq!(
+            src.matches("\"ir_capture\", \"recent\", \"events\", \"midi\", \"coast\",").count(),
+            2,
+            "the pace probe's two LIVE_TERMS lists do not both name the coast"
+        );
         let update_at = src.find("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)").expect("update");
         let update = &src[update_at..];
         let busy = update.find("self.paint_busy(ctx);").expect("the busy cover is painted in update");
@@ -33386,6 +33480,150 @@ mod tests {").expect("the tests module")];
         assert!(
             !after_body.contains("self.recorder.session.is_recording() || open"),
             "the unconditional band tick is back in after_frame"
+        );
+    }
+
+    /// **The tape motor is held off for every road that must not spin.**
+    ///
+    /// Tape start and stop is the live desk's: an export, a freeze, an
+    /// arrangement record (its start and its stop) and every count-in start
+    /// and stop at once, and so does the edge one of those makes, which a
+    /// callback longer than a UI frame may not have seen when the reason goes
+    /// (`Recorder::motor_hold`). **A take is not one of them** (the owner's
+    /// ruling): a take films the desk as the room hears it, the tape's spin
+    /// included, so no take term holds the motor and the cassette parks
+    /// nothing. A scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_tape_motor_is_held_off_for_every_road_that_must_not_spin() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body = |name: &str| -> &str {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            &src[at..at + src[at + 1..].find("\n    fn ").map_or(src.len() - at, |n| n + 1)]
+        };
+        let arm = |from: &str, to: &str| -> &str {
+            let a = src.find(from).unwrap_or_else(|| panic!("no arm {from}"));
+            &src[a..a + src[a..].find(to).expect("the arm's end")]
+        };
+        // The word, from the running passes and the latch, before the engine
+        // is borrowed, pushed after the dial and outside the meter's take gate.
+        let push = body("fn push_monitor_settings(&mut self)");
+        let quiet = push
+            .find("let motor_quiet = run.realtime || run.full_speed || run.arr_record || run.counting || self.recorder.motor_hold;")
+            .expect("the motor's quiet is not built from the passes and the latch");
+        assert!(push[..quiet].contains("let run = self.running();"), "the passes are not read before the quiet");
+        assert!(!push.contains("run.take"), "a take holds the motor off again: a take films the spin");
+        let borrow = push.find("let Some(e) = self.recorder.engine.as_mut() else {").expect("the engine borrow");
+        assert!(quiet < borrow, "the quiet is read under the engine's borrow");
+        let dial = push.find("e.set_varispeed(self.app.varispeed_ratio());").expect("the dial's push");
+        let told = push
+            .find("e.set_tape_motor(ss.on() && !motor_quiet, ss.start_s(), ss.stop_s());")
+            .expect("the setting is not pushed");
+        assert!(dial < told, "the motor is pushed before the dial");
+        let gate = push.find("if !self.recorder.session.is_recording() {").expect("the meter's take gate");
+        assert!(told < gate, "the motor is pushed inside the meter's take gate");
+        // The latch, set at every exempt edge.
+        let go = "if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {";
+        let at = src.find(go).expect("the count's go");
+        assert!(
+            src[at..at + 400].contains("self.recorder.motor_hold = true;"),
+            "a count-in's go is not held instant"
+        );
+        let record = body("fn start_arr_record(&mut self)");
+        let park = record.find("e.park_tape_motor();").expect("a record does not park the motor");
+        let tee = record.find("ArrRec::open_tee(").expect("the tee");
+        assert!(park < tee, "the tee opens before the motor is parked");
+        let coasting = record.find("let coasting = e.motor_coasting();").expect("a record does not ask for a coast");
+        assert!(coasting < record.find("let start_s =").expect("the record's start"), "the coast is asked after the start is read");
+        assert!(
+            record.contains("if coasting {\n            self.recorder.transport.locate_playhead(start_s);"),
+            "a record pressed during a coast does not pin its start"
+        );
+        assert!(
+            record.contains("self.recorder.transport.toggle_play();\n            self.recorder.motor_hold = true;"),
+            "a record's start is not held instant"
+        );
+        let bounce = body("fn start_bounce(");
+        let parked = bounce.find("e.park_tape_motor();").expect("an export does not park the motor");
+        let stopped = bounce.find("self.recorder.transport.stop();").expect("the export's stop");
+        assert!(parked < stopped, "the export parks the motor after its own stop");
+        assert!(
+            bounce.contains("self.recorder.transport.toggle_play();\n        self.recorder.motor_hold = true;"),
+            "an export's start is not held instant"
+        );
+        assert!(
+            body("fn tick_bounce(&mut self").contains("self.recorder.transport.stop();\n                // And it ends at once: held past the pass's filing.\n                self.recorder.motor_hold = true;"),
+            "an export's end is not held instant"
+        );
+        let stop = arm("                R::Stop => {", "                R::DismissClip => {");
+        let asked = stop
+            .find("let quiet_stop = self.recorder.arr_rec.is_some() || self.recorder.bounce.is_some();")
+            .expect("Stop does not ask whether it ends a record or an export");
+        let finished = stop.find("self.finish_arr_record();").expect("Stop finishes the record");
+        assert!(asked < finished, "Stop asks after the record is finished");
+        assert!(
+            stop.contains("self.recorder.transport.stop();\n                    if quiet_stop {\n                        self.recorder.motor_hold = true;"),
+            "a record's or an export's stop is not held instant"
+        );
+        // A take parks nothing: the cassette's arm leaves the motor alone.
+        let capture = arm("                R::Capture => {", "                R::Stop => {");
+        assert!(!capture.contains("park_tape_motor"), "a take parks the motor again: a take films the spin");
+        assert!(!capture.contains("motor_hold"), "a take holds the motor again: a take films the spin");
+        // A ruler click cuts a coast.
+        let locate = arm("                R::Locate(seconds) => {", "                R::Toggle => {");
+        let located = locate.find("self.recorder.transport.locate(seconds);").expect("the locate");
+        let cut = locate.find("e.cut_motor();").expect("a locate does not cut a coasting tape");
+        assert!(located < cut, "the cut is asked before the locate");
+        // Released once the engine has done what the level asked, beside the
+        // push, and forgotten with the engine.
+        let pushed = src.find("            self.recorder.transport.push(engine);\n").expect("the transport's push");
+        assert!(
+            src[pushed..pushed + 1200].contains(
+                "if self.recorder.motor_hold\n                && engine.is_none_or(|e| e.motor_settled(self.recorder.transport.playing()))\n            {\n                self.recorder.motor_hold = false;"
+            ),
+            "the latch is not released beside the transport's push"
+        );
+        assert!(body("fn forget_counts(&mut self)").contains("self.recorder.motor_hold = false;"), "the latch outlives its engine");
+    }
+
+    /// **The band shows where the tape is while it coasts, and the host's
+    /// logic asks where it was sent.**
+    ///
+    /// Through a Stop's coast the drawn playhead, and the automated faces
+    /// beside it, follow the tape as it slows (`Transport::shown_s`), while
+    /// every reading the host decides on (a record's start and end, a take's
+    /// place, an export's end, a song started on a take's downbeat) is the
+    /// position it asked for (`Transport::position_s`), which through that
+    /// coast is the cursor. Every reader in this file is one or the other,
+    /// and each is named.
+    #[test]
+    fn the_band_shows_where_the_tape_is_while_it_coasts() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let mut shown = Vec::new();
+        let mut asked = Vec::new();
+        for (needle, into) in [(".shown_s(", &mut shown), (".position_s(", &mut asked)] {
+            for (at, _) in src.match_indices(needle) {
+                if !src[..at].trim_end().ends_with("transport") {
+                    continue;
+                }
+                let head = src[..at].rfind("\n    fn ").expect("a reader outside any method") + "\n    fn ".len();
+                let name = &src[head..head + src[head..].find('(').expect("its name")];
+                into.push(name.to_owned());
+            }
+        }
+        shown.sort();
+        asked.sort();
+        assert_eq!(shown, ["fill_recorder_state", "push_live_faces"], "the band draws the playhead from somewhere else");
+        assert_eq!(
+            asked,
+            ["finish_arr_record", "push_monitor_settings", "song_started_on_take_downbeat", "start_arr_record", "tick_bounce"],
+            "a reader of the requested position is not one of the host's own decisions"
+        );
+        let fill = &src[src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state")..];
+        assert!(
+            squash(fill).contains("state.position_s = { let engine = self.recorder.engine.as_ref(); let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate)); self.recorder.transport.shown_s(engine, rate) };"),
+            "the band's playhead is not the shown one"
         );
     }
 

@@ -483,6 +483,75 @@ mod tests {
         }
     }
 
+    /// **A whole start and stop of the tape allocates nothing on the
+    /// callback**, the first ramp after each input ring arrives included.
+    ///
+    /// The motor and its hold are plain fields with fixed arrays, the
+    /// reproducer's state is built with the renderer, and the input's stretch
+    /// arrives built with its ring (`MonitorPlan::vs_in`), so nothing on the
+    /// motor's road may reach the allocator: not a start, a run at speed, a
+    /// stop, the hold after it, a re-spin from the hold, a cut, nor a count
+    /// snapping a coast. The baseline desk armed at 0.1 s each way with a mono
+    /// input ring monitored, then a six-wide one, against its stereo output.
+    #[test]
+    fn a_whole_start_and_stop_allocate_nothing_on_the_callback() {
+        use crate::motor::MotorShow;
+        let mut e = baseline_desk();
+        e.set_tape_motor(true, 0.1, 0.1);
+        e.set_monitor_on(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..16 {
+            e.render_offline(&mut out);
+        }
+        // Passes until the motor shows `show`, every one counted.
+        let mut pass = vec![0.0f32; 512 * 2];
+        let mut until = |e: &mut Engine, show: MotorShow, what: &str| {
+            for _ in 0..400 {
+                let (_, c) = count_allocs(|| e.render_offline(&mut pass));
+                assert_eq!(c.here, 0, "{what} allocated on the callback: {c:?}");
+                if e.motor_show() == show {
+                    return;
+                }
+            }
+            panic!("{what}: the motor never showed {show:?}");
+        };
+        for width in [1usize, 6] {
+            let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(width * 48_000);
+            for i in 0..width * 24_000 {
+                let _ = tx.push((i as f32 * 0.01).sin() * 0.1);
+            }
+            let widths = vec![width as u8].into_boxed_slice();
+            e.set_monitor(Some((rx, width as u16, widths, 512, tangent_record::audio::Picks::EVERYTHING)));
+            let w = format!("a {width}-wide ring");
+            e.set_rolling(false);
+            until(&mut e, MotorShow::WindingDown, &format!("{w}: the first stop after it arrived"));
+            until(&mut e, MotorShow::Holding, &format!("{w}: the stop"));
+            e.set_rolling(true);
+            until(&mut e, MotorShow::SpinningUp, &format!("{w}: the re-spin from the hold"));
+            until(&mut e, MotorShow::Running, &format!("{w}: the start"));
+            e.set_rolling(false);
+            until(&mut e, MotorShow::WindingDown, &format!("{w}: the second stop"));
+            e.cut_motor();
+            until(&mut e, MotorShow::Holding, &format!("{w}: the cut"));
+            e.set_rolling(true);
+            until(&mut e, MotorShow::Running, &format!("{w}: the start after the cut"));
+            e.set_rolling(false);
+            until(&mut e, MotorShow::WindingDown, &format!("{w}: the third stop"));
+            e.start_count_in(4, 120.0);
+            until(&mut e, MotorShow::Parked, &format!("{w}: the count's snap"));
+            e.cancel_count_in();
+            e.set_rolling(true);
+            until(&mut e, MotorShow::Running, &format!("{w}: the roll after the count"));
+            let (_, after) = least_of(5, || {
+                for _ in 0..4 {
+                    e.render_offline(&mut out);
+                }
+            });
+            assert_eq!(after, Counted::default(), "{w}: the render after the ramps allocated");
+            assert!(out.iter().all(|s| s.is_finite()), "{w}: the ramps rendered garbage");
+        }
+    }
+
     /// **Several instruments on one track allocate nothing either** (see
     /// `instrument::Layer`): a DX7 at the head, an analog layered over it,
     /// the keyboard entering at the third bay, a sampler in the extra rack,

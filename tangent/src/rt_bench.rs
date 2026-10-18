@@ -2793,6 +2793,87 @@ fn varispeed_and_stems_fall_back_to_the_chunk_mid_roll() {
     }
 }
 
+/// **A tape stop lets the plate ring out unheard.**
+///
+/// The desk is the tape: a plate's tail was slowed with it, and with no
+/// reset for a hosted plugin it would come back at full pitch the moment the
+/// parked desk played on. Eight lanes through a plate, the stop at 0.2 s:
+/// once the tape is at the floor the output stays below -90 dBFS while the
+/// plate's own strip meter, which reads before the motor, says it still
+/// rings above the park floor; and a live note is a player, so it lets go
+/// of the hold within the house's 10 ms declick and a pass, the tail heard
+/// again.
+#[test]
+fn a_tape_stop_lets_the_plate_ring_out_unheard() {
+    use crate::motor::MotorShow;
+    let mut e = audio_desk(8, &["@tangent-plate"]);
+    e.set_tape_motor(true, 0.5, 0.2);
+    let mut out = vec![0.0f32; BLOCK * 2];
+    for _ in 0..WARMUP {
+        e.render_offline(&mut out);
+    }
+    e.set_rolling(false);
+    let mut k = 0;
+    while e.motor_show() != MotorShow::Holding {
+        e.render_offline(&mut out);
+        k += 1;
+        assert!(k < 1000, "the stop never reached the floor");
+    }
+    let _ = e.strip_peaks();
+    for k in 0..20 {
+        e.render_offline(&mut out);
+        assert_eq!(e.motor_show(), MotorShow::Holding, "the hold let go {k} passes in, with the plate still ringing");
+        let heard = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(dbfs(heard) < -90.0, "a held tail was heard at {:.1} dBFS", dbfs(heard));
+        let plate = e.strip_peaks().iter().take(8).fold(0.0f32, |m, p| m.max(p[0]).max(p[1]));
+        assert!(plate > 1.0e-4, "the plate stopped ringing {k} passes into the hold, so nothing was proved");
+    }
+    e.send_midi(0, &[0x90, 60, 100]);
+    let within = (0.010 * f64::from(RATE) / BLOCK as f64).ceil() as usize + 1;
+    for _ in 0..within {
+        e.render_offline(&mut out);
+    }
+    assert_ne!(e.motor_show(), MotorShow::Holding, "a live note did not let go of the hold");
+    e.render_offline(&mut out);
+    let heard = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(dbfs(heard) > -80.0, "the tail was not heard once let go: {:.1} dBFS", dbfs(heard));
+}
+
+/// **The tape motor falls back to the chunk, and comes back.**
+///
+/// While the tape changes speed the varispeed path is in circuit, so the
+/// grain render stands aside for the whole desk, as it does under the dial,
+/// and resumes when the tape is at rest or at speed again. A stop at 100
+/// and a Play at 160, at 0.1 s each way, through a plate, against the
+/// chunked reference: within the transitions' own two bars.
+#[test]
+fn the_tape_motor_falls_back_to_the_chunk_and_comes_back() {
+    for grain in [240.0f64, 512.0] {
+        let t = transition(
+            || {
+                let e = audio_desk(8, &["@tangent-plate"]);
+                e.set_tape_motor(true, 0.1, 0.1);
+                e
+            },
+            grain,
+            |e, on| e.set_rolling(!on),
+            100,
+            160,
+            300,
+            None,
+        );
+        let what = format!("the plate at a {grain:.0}-frame grain, stopped at 100 and rolling at 160");
+        assert!(t.peak > 0.001, "{what}: the render was silent");
+        assert!(t.exact_before, "{what}: the two differed BEFORE the stop");
+        assert!(
+            t.total_db < TRANSITION_TOTAL_DB && t.window_db < TRANSITION_WINDOW_DB,
+            "{what}: {:.2} dB of total energy and {:.2} dB in the worst window",
+            t.total_db,
+            t.window_db
+        );
+    }
+}
+
 /// **The pins that arrive mid-roll do not make a rack re-run.**
 ///
 /// `a_lane_that_becomes_pinned_mid_roll_does_not_re_run_its_rack` proves
@@ -3078,6 +3159,77 @@ fn the_grain_knob_may_be_turned_while_the_transport_rolls() {
 /// the rung uses them, `TANGENT_AB_FRAMES` (the callback, default 64),
 /// `TANGENT_AB_GRAINS` (frames, comma separated, default `0,240,512`),
 /// `TANGENT_AB_REPEATS` (default 7) and `TANGENT_AB_BLOCKS` (default 400).
+/// `MEASURED` passes of `block` frames, each timed, after `warmup` untimed,
+/// with `between(e, k)` before pass `k`.
+fn timed(name: &str, e: &mut Engine, block: usize, warmup: usize, mut between: impl FnMut(&Engine, usize)) -> Stats {
+    let mut out = vec![0.0f32; block * 2];
+    for k in 0..warmup {
+        between(e, k);
+        e.render_offline(&mut out);
+    }
+    let mut us = Vec::with_capacity(MEASURED);
+    for k in warmup..warmup + MEASURED {
+        between(e, k);
+        let t = Instant::now();
+        e.render_offline(&mut out);
+        us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+    }
+    let s = Stats::from(name, block, us);
+    println!("{}", s.line());
+    s
+}
+
+/// **What tape start and stop costs, against what the dial costs.**
+///
+/// While the tape changes speed the desk is the varispeed path's, at a ratio
+/// that moves every pass, so it costs what the dial engaged costs, and the
+/// dearest passes are the near-unity ends: the first passes of a stop, the
+/// last tenth of a start, the hand-back. The bench's sixteen-lane desk
+/// through a plate, grains on, at 64 and 128 frames and 48 kHz: rolling at
+/// rest, rolling with the dial at 0.75, and repeated starts and stops at
+/// 0.1 s each way with every pass measured. **Fails** unless the cycles'
+/// p99 is at most 1.10 times the dial's and their worst at most 1.25 times
+/// the dial's; prints p99 against the deadline for all three.
+///
+/// `cargo test --release -p tangent --bin tangent -- tape_start_and_stop_costs --ignored --nocapture`
+#[test]
+#[ignore = "a bench: run it deliberately with --ignored --nocapture"]
+fn tape_start_and_stop_costs_what_the_dial_costs_probe() {
+    let desk = || {
+        let e = audio_desk(16, &[PLATE_PATH]);
+        e.set_grain_ms(-1.0);
+        e
+    };
+    let mut failed = Vec::new();
+    for block in [64usize, 128] {
+        println!("{block} frames, deadline {:.1} us:", deadline_us(block));
+        let rest = timed("rolling at rest, grains on", &mut desk(), block, WARMUP, |_, _| {});
+        let mut e = desk();
+        e.set_varispeed(0.75);
+        let dial = timed("rolling with the dial at 0.75", &mut e, block, WARMUP, |_, _| {});
+        let mut e = desk();
+        e.set_tape_motor(true, 0.1, 0.1);
+        // A start or a stop every 0.15 s: the 0.1 s ramp and a little either
+        // side of it, so most measured passes are ramping.
+        let half = (0.15 * f64::from(RATE)) as usize / block;
+        let cycles = timed("start and stop, 0.1 s each way", &mut e, block, WARMUP, |e, k| {
+            if k % half == 0 {
+                e.set_rolling((k / half) % 2 == 0);
+            }
+        });
+        for s in [&rest, &dial, &cycles] {
+            println!("  {:<34} p99 {:6.1}% of the deadline, worst {:6.1}%", s.name, s.p99 / s.deadline * 100.0, s.max / s.deadline * 100.0);
+        }
+        if cycles.p99 > 1.10 * dial.p99 {
+            failed.push(format!("{block} frames: the cycles' p99 {:.1} us is over 1.10 x the dial's {:.1}", cycles.p99, dial.p99));
+        }
+        if cycles.max > 1.25 * dial.max {
+            failed.push(format!("{block} frames: the cycles' worst {:.1} us is over 1.25 x the dial's {:.1}", cycles.max, dial.max));
+        }
+    }
+    assert!(failed.is_empty(), "tape start and stop costs more than the dial: {failed:#?}");
+}
+
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn grain_ab() {

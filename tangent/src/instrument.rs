@@ -221,7 +221,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
 
@@ -300,7 +300,7 @@ pub const TAP_CHANNELS: usize = 2;
 /// fader and long enough that a jump from 0.0 to 1.0 is a fade rather than a
 /// step discontinuity, which is a click in exactly the way the metronome is
 /// supposed to have a monopoly on.
-const GAIN_TAU_SECONDS: f64 = 0.010;
+pub(crate) const GAIN_TAU_SECONDS: f64 = 0.010;
 
 /// Release velocity for a note-off that carries none of its own.
 ///
@@ -3059,6 +3059,25 @@ struct Shared {
     /// The varispeed ratio, as `f32` bits. **1.0 is off**, and the whole
     /// resampling path is skipped there — see `crate::varispeed`.
     varispeed: AtomicU32,
+    /// **Whether the tape's motor may move** (`crate::motor`): the setting
+    /// on, a live host, nothing that must start and stop at once. False
+    /// until a live host says otherwise, so `Engine::offline` and every
+    /// test that does not arm it never ramps. Read at the top of every pass
+    /// (false snaps a ramping motor to its steady state) and after the level
+    /// in `run_transport` (false makes that chunk's edge a hard one). See
+    /// `Engine::set_tape_motor`.
+    motor_ok: AtomicBool,
+    /// The start and the stop time, in seconds, as `f32` bits, sanitised on
+    /// the way in. Latched by the motor at each ramp's start.
+    motor_start_s: AtomicU32,
+    motor_stop_s: AtomicU32,
+    /// **The cut generation**, bumped by `Engine::cut_motor`: a new one cuts
+    /// a tape coasting to a stop, so a locate lands now. The motor latches it
+    /// every pass, so one asked outside a coast is forgotten.
+    motor_cut: AtomicU32,
+    /// What the motor shows (`motor::MotorShow` as a byte), published once a
+    /// pass for the host's playhead, its frame ledger and its latch.
+    motor_show: AtomicU8,
     max_latency: AtomicU32,
     /// **What is SHOWN** — the whole delay somebody is actually paying,
     /// master included.
@@ -3837,6 +3856,11 @@ impl Shared {
             }),
             lufs_reset: AtomicU32::new(0),
             varispeed: AtomicU32::new(1.0f32.to_bits()),
+            motor_ok: AtomicBool::new(false),
+            motor_start_s: AtomicU32::new(crate::motor::START_DEFAULT_S.to_bits()),
+            motor_stop_s: AtomicU32::new(crate::motor::STOP_DEFAULT_S.to_bits()),
+            motor_cut: AtomicU32::new(0),
+            motor_show: AtomicU8::new(crate::motor::MotorShow::Parked as u8),
             max_latency: AtomicU32::new(0),
             total_latency: AtomicU32::new(0),
             soloed: AtomicU64::new(0),
@@ -5080,7 +5104,7 @@ impl Rack {
 /// on its send, and out of a parked desk at about -40 dBFS for as long as the
 /// project is open. "A chorusy buzz constant at around -40dB on the master
 /// meter", with nothing armed, nothing playing and nothing to hear.
-const RACK_PARK_S: f64 = 8.0;
+pub(crate) const RACK_PARK_S: f64 = 8.0;
 
 /// **How long a lane carrying an INSTRUMENT must be silent at its output
 /// before its rack may stop**, in seconds.
@@ -5115,7 +5139,7 @@ const VOICE_PARK_S: f64 = 30.0;
 /// model idles at, so a resting instrument reads as silent and a real tail
 /// does not. Compared against the lane's PRE-fader output, so a muted or
 /// faded-down instrument still holding a note is still heard by this test.
-const PARK_FLOOR: f32 = 1.0e-4;
+pub(crate) const PARK_FLOOR: f32 = 1.0e-4;
 
 /// **What a strip's meter shows: the fader's output, or the INPUT while the
 /// strip is armed.**
@@ -11218,6 +11242,99 @@ thread_local! {
     pub(crate) static OFFLINE_WIDTH: Cell<u16> = const { Cell::new(2) };
 }
 
+/// **One pass's varispeed facts**, latched once at the top of
+/// `Renderer::render_inner` and read by every site inside the pass that
+/// used to ask `Renderer::varispeed_ratio` for itself.
+///
+/// The dial alone gives each of those sites the value it re-read (the dial
+/// is constant inside a pass), and one latch closes the race in which a dial
+/// move landing mid-pass gave the top of the pass and `plan_grains`
+/// different answers. With the tape's motor the ratio also MOVES across a
+/// pass, linear in device time from `r0` to `r1`, and the input's stretch
+/// needs to know where on that read map each chunk of program lies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VsNow {
+    /// The varispeed path is in circuit this pass: the dial, the motor, or
+    /// the motor's hand-back.
+    engaged: bool,
+    /// The read ratio, program frames per device frame, at the pass's first
+    /// device frame and towards its last: `dial x s`.
+    r0: f64,
+    r1: f64,
+    /// Where the output phase stood at the pass's top: device frame 0 reads
+    /// program frame `frac0`.
+    frac0: f64,
+    /// The pass's device frames.
+    dev: usize,
+    /// **The motor's own return to rest, heard**: the pass renders exactly
+    /// its device frames of program, and every destination, the input
+    /// included, crossfades from the resampled path into the direct one, so
+    /// the next pass at rest continues it with no skip. See the seams in
+    /// `crate::motor` and `Renderer::render_inner`.
+    handback: bool,
+}
+
+impl VsNow {
+    /// At rest: nothing is resampled.
+    const REST: Self = Self {
+        engaged: false,
+        r0: 1.0,
+        r1: 1.0,
+        frac0: 0.0,
+        dev: 0,
+        handback: false,
+    };
+
+    /// **The input stretch's two steps for a chunk** of `n` program frames
+    /// starting at program frame `q` of this pass: real frames per program
+    /// frame at either end, `1 / r(p)`.
+    ///
+    /// The ratio at program frame `p` follows from the pass's read map, the
+    /// ratio linear in device time: `r(p)^2 = r0^2 + 2 (r1 - r0) (p - frac0)
+    /// / dev`, held between the pass's two ends. With equal ends this is
+    /// `1 / r0` exactly, the dial's own step, so the dial's stretch runs
+    /// today's arithmetic bit for bit; the hand-back reads at step 1. Never
+    /// zero, never NaN: the ends are at least the dial's half times the
+    /// motor's floor.
+    fn steps(&self, q: usize, n: usize) -> (f64, f64) {
+        if self.handback {
+            return (1.0, 1.0);
+        }
+        if self.r0 == self.r1 {
+            let step = 1.0 / self.r0;
+            return (step, step);
+        }
+        let (lo, hi) = (self.r0.min(self.r1), self.r0.max(self.r1));
+        let dev = self.dev.max(1) as f64;
+        let at = |p: usize| {
+            let sq = self.r0 * self.r0 + 2.0 * (self.r1 - self.r0) * (p as f64 - self.frac0) / dev;
+            // `max` and `min`, not `clamp`: neither can panic, whatever a
+            // NaN on either side might do.
+            1.0 / sq.max(0.0).sqrt().max(lo).min(hi)
+        };
+        (at(q), at(q + n))
+    }
+}
+
+/// **The hand-back's crossfade**: `into` (the resampled path, interleaved at
+/// `ch`) becomes `direct` over `frames` frames, the weight of the direct path
+/// `smoothstep((from + i + 1) / over)` at frame `i`, so the frame at `over`
+/// is the direct path exactly. A time-varying delay of a frame or two, which
+/// is what a path switch that skipped them instead would have been as a step.
+fn crossfade_into(into: &mut [f32], direct: &[f32], ch: usize, frames: usize, from: usize, over: usize) {
+    let ch = ch.max(1);
+    let over = over.max(1) as f32;
+    for (i, (a, b)) in into.chunks_exact_mut(ch).zip(direct.chunks_exact(ch)).take(frames).enumerate() {
+        let x = ((from + i + 1) as f32 / over).clamp(0.0, 1.0);
+        let w = x * x * (3.0 - 2.0 * x);
+        // Written as two weights, so the last frame is `direct` bit for bit
+        // and not `y + (d - y)`, which can round off it.
+        for (y, d) in a.iter_mut().zip(b) {
+            *y = *y * (1.0 - w) + *d * w;
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The renderer: everything that runs on the audio thread
 // ───────────────────────────────────────────────────────────────────────────
@@ -11836,6 +11953,50 @@ struct Renderer {
     /// Whether the last callback was engaged, so the histories can be
     /// dropped on the way in rather than bleeding a block from before.
     vs_was_engaged: bool,
+
+    // ── the tape's motor ───────────────────────────────────────────────────
+    //
+    // Idle (the setting off, or nothing ramping) these cost the plan's few
+    // loads a pass and a steady stage that touches no sample. See
+    // `crate::motor`.
+    /// **The tape's start and stop**: a speed in `[FLOOR, 1]`, decided once
+    /// a pass in device frames and played through the varispeed path as
+    /// `dial x s`. It never moves unless `Shared::motor_ok` lets it.
+    motor: crate::motor::Motor,
+    /// The reproducer's state for each destination the output stage puts
+    /// through it, each carrying its own signal: the device output, the
+    /// take's tap, the scope's pair, the network send's pair.
+    motor_tone: [crate::motor::Tone; 4],
+    /// **The pass's varispeed facts, latched once at its top**, for every
+    /// site inside the pass that used to ask `varispeed_ratio` again.
+    vs_now: VsNow,
+    /// The last pass was engaged by the motor alone, the dial at rest: the
+    /// motor's own return to rest is then a path switch, and the hand-back
+    /// pass smooths it (`VsNow::handback`).
+    vs_motor_was: bool,
+    /// The program frame of this pass that the chunk `mix_monitor` is
+    /// mixing starts at: where on the pass's read map its input stretch is.
+    vs_chunk_from: usize,
+    /// **Both ends of this pass at exactly full speed**: the song's click
+    /// may sound, and the arrangement's tee may tape.
+    motor_at_speed: bool,
+    /// The count-in generation this pass's plan read, handed to
+    /// `render_program` so the plan and the count's restart act on one load.
+    count_gen: Option<u64>,
+    /// **A live note-on or pad hit arrived this pass**: a player, so a hold
+    /// lets go at once.
+    live_struck: bool,
+    /// **An armed input, bound to a lane and heard, with monitoring on**, in
+    /// the last chunk `mix_monitor` mixed: a tracking desk, where the motor
+    /// stands aside (the owner's ruling) and Play and Stop are instant.
+    room_tracking: bool,
+    /// The pass landed every level on its target (`Engine::land_gains_at`),
+    /// and the motor's gain with them.
+    motor_landed: bool,
+    /// **The master meter's scale for this pass**: the motor's gain at the
+    /// pass's start, so the meter reads what the speakers play through a
+    /// fade and silence through a hold. 1.0 leaves the meter untouched.
+    meter_scale: f32,
     /// The routing table, copied out of `Shared` once per block so the inner
     /// loops read plain values rather than atomics: (from, target, hardware,
     /// stereo, gain).
@@ -12725,6 +12886,9 @@ impl Renderer {
                                     velocity: f32::from(velocity) / 127.0,
                                     lane,
                                 });
+                                // A player: a tape's held tails let go at
+                                // once (`motor::Motor::stage`).
+                                self.live_struck = true;
                             }
                         }
                     }
@@ -12747,6 +12911,8 @@ impl Renderer {
                     if pitch < 128 {
                         if note.on {
                             self.live_sounding |= 1 << pitch;
+                            // A player, as a pad hit is.
+                            self.live_struck = true;
                         } else {
                             self.live_sounding &= !(1 << pitch);
                         }
@@ -13030,7 +13196,15 @@ impl Renderer {
         // generation is seen with its OWN beat count — the beats are read
         // once per generation and a stale zero here is a count-in that never
         // clicks.
-        let req = self.shared.count_in_req.load(Ordering::Acquire);
+        //
+        // **The generation the pass's motor plan read, when there was one**
+        // (`Renderer::motor_plan`): the plan and the restart act on one
+        // load, so a count landing between them can never restart in a pass
+        // the motor did not snap for it. A direct caller loads its own.
+        let req = self
+            .count_gen
+            .take()
+            .unwrap_or_else(|| self.shared.count_in_req.load(Ordering::Acquire));
         if req != self.beats.seen_req {
             self.beats.seen_req = req;
             let want = self.shared.count_in_beats.load(Ordering::Relaxed);
@@ -13127,6 +13301,9 @@ impl Renderer {
             if land_at != 0 && rolling && self.seen_req >= land_at {
                 self.gain_coeff = 1.0;
                 landed = true;
+                // And the motor's gain with them: an export's head is never
+                // under a glide (`motor::Motor::stage`).
+                self.motor_landed = true;
                 let _ = self.shared.land_at.compare_exchange(land_at, 0, Ordering::AcqRel, Ordering::Relaxed);
                 land_at = 0;
             }
@@ -13339,6 +13516,9 @@ impl Renderer {
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
             //
+            // Where on the pass's read map this chunk's program lies, for
+            // the input's stretch (`VsNow::steps`).
+            self.vs_chunk_from = done;
             self.mix_monitor(n, at, rolling);
             self.mix_preview(n);
             // The drumpad, upstream of the bus return, the room split and
@@ -13430,7 +13610,13 @@ impl Renderer {
                     self.bar_clock.idle(self.rate);
                     self.beats.tick(metro_on && rolling, bpb)
                 } else if metro_on {
-                    self.bar_clock.tick(at + frame_index as u64, &self.maps, self.rate)
+                    // **The song's click waits for the tape.** It is not on
+                    // the tape: a beat crossed while the motor is spinning
+                    // up or winding down is dropped, and the clock still
+                    // ticks, so it is in step the moment the tape reaches
+                    // speed (`Renderer::motor_at_speed`).
+                    let beat = self.bar_clock.tick(at + frame_index as u64, &self.maps, self.rate);
+                    beat.filter(|_| self.motor_at_speed)
                 } else {
                     // Not heard, but still followed: leaving the clock
                     // un-ticked would make the next frame look like a locate
@@ -14168,7 +14354,23 @@ impl Renderer {
         self.shared
             .out_block_seen
             .store(dev_frames as u32, Ordering::Relaxed);
-        let Some(ratio) = self.varispeed_ratio() else {
+        let dial = self.varispeed_ratio();
+        // **The tape's motor, once a pass, before anything sizes the
+        // program**: its speed at the pass's two ends, composed with the
+        // dial. At rest and at speed both are exactly 1, and `dial x 1` is
+        // the dial bit for bit.
+        let plan = self.motor_plan(dev_frames);
+        let d = dial.unwrap_or(1.0);
+        let (r0, r1) = (d * plan.s0, d * plan.s1);
+        let engaged = dial.is_some() || plan.s0 != 1.0 || plan.s1 != 1.0;
+        // **The motor's own return to rest, heard**: a start reaching speed,
+        // or a snap out of a ramp, with the dial at rest. Disengaging there
+        // the way the dial does skips the phase's frame or two, a step in
+        // whatever is playing; one hand-back pass crossfades the two paths
+        // instead. A stop's end is not one: it parks at the floor, where
+        // nothing is heard, and the path switches silently.
+        let handback = !engaged && self.vs_motor_was && self.motor.gain_now() > 0.0;
+        if !(engaged || handback) {
             if self.vs_was_engaged {
                 // **Dropped on the way OUT, not on the way in.** The
                 // histories hold the last few frames of a signal that was
@@ -14178,34 +14380,60 @@ impl Renderer {
                 self.clear_varispeed();
             }
             self.vs_was_engaged = false;
+            self.vs_motor_was = false;
+            self.vs_now = VsNow { dev: dev_frames, ..VsNow::REST };
             let tap_frames = self.render_program(out, dev_frames, now, heard);
+            // A steady pass returns at once and touches no sample.
+            self.motor_stage(out, dev_frames);
             self.push_taps(tap_frames);
             return;
-        };
+        }
         if !self.vs_was_engaged {
             self.clear_varispeed();
         }
         self.vs_was_engaged = true;
+        self.vs_motor_was = engaged && dial.is_none();
+        let frac = self.vs_phase.frac();
+        self.vs_now = VsNow {
+            engaged: true,
+            r0,
+            r1,
+            frac0: frac,
+            dev: dev_frames,
+            handback,
+        };
+        // **One ratio, or a ratio that moves.** The dial alone, or a motor
+        // at a steady speed, reads at one ratio with today's arithmetic, bit
+        // for bit; a ramp reads at its exact integrated position, linear in
+        // device time across the pass (`Stream::run_ramp`).
+        let ramp = r0 != r1;
         // How much program this callback needs, bounded by what the
         // program-rate scratches were sized for. The caller keeps the device
-        // side small enough that the cap is never the binding one — see
-        // `Renderer::max_device_frames`.
-        let program = self
-            .vs_phase
-            .program_frames(dev_frames, ratio)
-            .min(MAX_CALLBACK_FRAMES);
-        if program == 0 {
-            out.fill(0.0);
-            return;
+        // side small enough that the cap is never the binding one: see
+        // `Renderer::max_callback_frames`. The hand-back renders exactly the
+        // device's frames, so the pass at rest after it continues from them.
+        let program = if handback {
+            dev_frames
+        } else if ramp {
+            self.vs_phase.program_frames_ramp(dev_frames, r0, r1)
+        } else {
+            self.vs_phase.program_frames(dev_frames, r0)
         }
-        let frac = self.vs_phase.frac();
+        .min(MAX_CALLBACK_FRAMES);
+        // **No early return when the pass needs no program.** Near the
+        // motor's floor a short pass can read entirely inside the history,
+        // and returning silent there skipped the whole render: no callback
+        // counted (the stall watch's heartbeat), no op drained, no count
+        // restarted, and the take, the scope and the sends got a hole. The
+        // render below runs at zero frames (its chunk loop runs none), every
+        // read falls in the history, and `keep_tail` keeps it.
         // Out of `self` so the render below can borrow the rest of it. A
         // move, not an allocation.
         let mut dev = std::mem::take(&mut self.vs_dev);
         let need = program * dev_ch;
         if dev.len() < need {
-            // Unreachable — it is sized for `MAX_CALLBACK_FRAMES * widest` at
-            // construction — and written down because the alternative to
+            // Unreachable (it is sized for `MAX_CALLBACK_FRAMES * widest` at
+            // construction) and written down because the alternative to
             // noticing is a panic on the audio thread.
             self.vs_dev = dev;
             out.fill(0.0);
@@ -14213,11 +14441,19 @@ impl Renderer {
         }
         let tap_frames = self.render_program(&mut dev[..need], program, now, heard);
         out.fill(0.0);
-        self.vs_out.run(&dev, program, out, dev_frames, frac, ratio);
+        if ramp {
+            self.vs_out.run_ramp(&dev, program, out, dev_frames, frac, r0, r1);
+        } else {
+            self.vs_out.run(&dev, program, out, dev_frames, frac, r0);
+        }
+        if handback {
+            crossfade_into(out, &dev[..need], dev_ch, dev_frames, 0, dev_frames);
+        }
         self.vs_dev = dev;
-        // The three taps, from the SAME phase and the same ratio: a take a
-        // fraction of a frame away from what came out of the speakers is a
-        // take that will not line up with anything.
+        // The three taps, from the SAME phase and the same ratios, and the
+        // same crossfade on a hand-back: a take a fraction of a frame away
+        // from what came out of the speakers is a take that will not line up
+        // with anything.
         let mut dst = std::mem::take(&mut self.vs_dst);
         for (stream, src, ch) in [
             (&mut self.vs_tap, &mut self.tap_scratch, TAP_CHANNELS),
@@ -14228,12 +14464,131 @@ impl Renderer {
             if dst.len() < n || src.len() < n {
                 continue;
             }
-            stream.run(src, tap_frames, &mut dst, dev_frames, frac, ratio);
+            if ramp {
+                stream.run_ramp(src, tap_frames, &mut dst, dev_frames, frac, r0, r1);
+            } else {
+                stream.run(src, tap_frames, &mut dst, dev_frames, frac, r0);
+            }
+            if handback {
+                crossfade_into(&mut dst[..n], &src[..n], ch, dev_frames, 0, dev_frames);
+            }
             src[..n].copy_from_slice(&dst[..n]);
         }
         self.vs_dst = dst;
-        self.vs_phase.advance(dev_frames, program, ratio);
+        if ramp {
+            self.vs_phase.advance_ramp(dev_frames, program, r0, r1);
+        } else {
+            self.vs_phase.advance(dev_frames, program, r0);
+        }
+        if handback {
+            // Handed back: the next pass is at rest, and the histories go
+            // on the way out, as the dial's do.
+            self.vs_was_engaged = false;
+            self.vs_motor_was = false;
+            self.clear_varispeed();
+        }
+        self.motor_stage(out, dev_frames);
         self.push_taps(dev_frames);
+    }
+
+    /// **The tape's motor, planned for one pass** (`motor::Motor::plan`),
+    /// from what the pass reads once at its top.
+    ///
+    /// The capture flags first, Acquire: a host that parks the motor and then
+    /// opens a tee stores in that order (`start_arr_record`), so a pass that
+    /// sees a flag sees the park. Only as many words as the pick table can
+    /// hold, the words `apply_queued_ops` latches. The count's generation is
+    /// loaded once here and handed to `render_program` (`count_gen`), so the
+    /// motor snaps in the very pass whose render restarts the count; a cancel
+    /// is a generation of zero beats and leaves the motor alone.
+    fn motor_plan(&mut self, frames: usize) -> crate::motor::Plan {
+        let words = self.spine.capturing.capacity() / 64;
+        let capturing = self
+            .shared
+            .arr_capture
+            .iter()
+            .take(words)
+            .any(|w| w.load(Ordering::Acquire) != 0);
+        let ok = !capturing && self.motor_allowed();
+        let gen = self.shared.count_in_req.load(Ordering::Acquire);
+        self.count_gen = Some(gen);
+        let count = gen != self.beats.seen_req && self.shared.count_in_beats.load(Ordering::Relaxed) > 0;
+        let plan = self.motor.plan(&crate::motor::PlanIn {
+            frames: frames as u64,
+            rate: self.rate,
+            ok,
+            count,
+            cut: self.shared.motor_cut.load(Ordering::Acquire),
+            start_s: f64::from(Shared::f32_of(&self.shared.motor_start_s)),
+            stop_s: f64::from(Shared::f32_of(&self.shared.motor_stop_s)),
+        });
+        self.shared.motor_show.store(plan.show as u8, Ordering::Relaxed);
+        self.motor_at_speed = plan.at_speed;
+        // The gain the last pass ended at, which is where this one begins.
+        self.meter_scale = self.motor.gain_now() as f32;
+        self.live_struck = false;
+        self.motor_landed = false;
+        plan
+    }
+
+    /// **Whether the tape's motor may move**, as the pass's top and each
+    /// chunk's transport ask it: the host's word (`Shared::motor_ok`), no
+    /// hardware loop claimed, no IR job held, and no tracking desk.
+    ///
+    /// **The motor stands aside on a tracking desk** (the owner's ruling):
+    /// with monitoring on and an armed track's bound input heard by the room,
+    /// Play and Stop are instant, so a player hears themselves straight.
+    /// Asked here and not on the host because the room's own answer is
+    /// computed each chunk in `mix_monitor`, from the very facts it hears by
+    /// (the monitoring switch, the arm, the pick bound to its lane by slot
+    /// and generation, the mute and the solo); the host would have to build a
+    /// second copy of that answer a frame late. An arm or a monitoring switch
+    /// landing mid-ramp makes the next pass not allowed, and it snaps.
+    fn motor_allowed(&self) -> bool {
+        self.shared.motor_ok.load(Ordering::Acquire)
+            && self.rate > 0.0
+            && self.hw_lane_n == 0
+            && self.ir.is_none()
+            && !self.room_tracking
+    }
+
+    /// **The pass's output stage** (`motor::Motor::stage`), on the device
+    /// output and the three tap scratches, after the resampler (or after the
+    /// render at rest) and before the taps are pushed, so the speakers, the
+    /// take, the scope, the network send and the device send stay one
+    /// instant. A steady pass returns at once: no arithmetic touches a
+    /// sample.
+    ///
+    /// A player is live when a note or a pad was struck this pass or a
+    /// preview is playing; while the tails are held, the hold hears the
+    /// pass's loudest pre-gain sample of the device output.
+    fn motor_stage(&mut self, out: &mut [f32], dev_frames: usize) {
+        if self.motor.last().steady {
+            return;
+        }
+        let dev_ch = self.dev_channels.max(1);
+        let n = (dev_frames * dev_ch).min(out.len());
+        let preview = self
+            .preview
+            .as_deref()
+            .is_some_and(|c| self.preview_pos < c.frames());
+        let live = self.live_struck || preview;
+        let peak = if self.motor.holding() {
+            out[..n].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        } else {
+            0.0
+        };
+        let stage = self.motor.stage(dev_frames, live, self.motor_landed, peak);
+        let [dev_tone, tap_tone, scope_tone, ra_tone] = &mut self.motor_tone;
+        stage.apply(dev_tone, &mut out[..n], dev_ch);
+        for (tone, buf, ch) in [
+            (tap_tone, &mut self.tap_scratch, TAP_CHANNELS),
+            (scope_tone, &mut self.scope_scratch, TAP_CHANNELS),
+            (ra_tone, &mut self.reastream_scratch, 2),
+        ] {
+            let m = (dev_frames * ch).min(buf.len());
+            stage.apply(tone, &mut buf[..m], ch);
+        }
     }
 
     /// Hand the take, the scope, the ReaStream send and the device send what
@@ -14269,10 +14624,17 @@ impl Renderer {
     /// speed one device frame costs two program frames — so the device side
     /// has to be halved or the mix buffer is the thing that runs out. A few
     /// frames of slack for the interpolator's reach past the last read.
+    ///
+    /// **And while the tape's motor is not idle** (`motor::Motor::idle`): a
+    /// ramp is the same path at no more than the dial's own ratio, and a
+    /// pending edge counts, because the next pass may begin a wind-down at
+    /// ratio 1, whose first pass needs the device's frames and three more.
+    /// A motor at rest or at speed, holding or not, leaves the cap alone.
     fn max_callback_frames(&self) -> usize {
-        match self.varispeed_ratio() {
-            None => MAX_CALLBACK_FRAMES,
-            Some(_) => (MAX_CALLBACK_FRAMES - 8) / 2,
+        if self.varispeed_ratio().is_some() || !self.motor.idle() {
+            (MAX_CALLBACK_FRAMES - 8) / 2
+        } else {
+            MAX_CALLBACK_FRAMES
         }
     }
 
@@ -14363,7 +14725,9 @@ impl Renderer {
             out_block: self.shared.out_block_seen.load(Ordering::Relaxed),
             in_block: u32::try_from(self.monitor_block).unwrap_or(u32::MAX),
             rate: self.rate as u32,
-            varispeed: self.varispeed_ratio().is_some(),
+            // The pass's latch (`VsNow`): the dial, the motor or its
+            // hand-back, one answer for the whole pass.
+            varispeed: self.vs_now.engaged,
             in_backlog: self
                 .monitor
                 .as_ref()
@@ -14383,6 +14747,9 @@ impl Renderer {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
         self.room_live = false;
+        // And no tracking desk until this chunk says so (see the foot, and
+        // `Renderer::motor_allowed`): no ring, no player.
+        self.room_tracking = false;
         // **And no channel's board belongs to the room until this pass says
         // so.** Cleared here rather than beside `board_ran` at the head of
         // the chunk, because this is the only writer: an interface that is
@@ -14465,9 +14832,12 @@ impl Renderer {
                 std::mem::swap(&mut self.monitor_fades, &mut plan.fades);
             }
         }
-        // Read before the ring is borrowed: `varispeed_ratio` takes `&self`
-        // and the ring is a `&mut` into the same struct.
-        let vs = self.varispeed_ratio();
+        // Read before the ring is borrowed: the steps take `&self` and the
+        // ring is a `&mut` into the same struct. The pass's latch
+        // (`VsNow`), so the stretch reads the pass the output squeezes, and
+        // where on its read map this chunk's program lies.
+        let vs = self.vs_now;
+        let steps = vs.engaged.then(|| vs.steps(self.vs_chunk_from, frames));
         let Some(ring) = self.monitor.as_mut() else {
             return;
         };
@@ -14487,12 +14857,19 @@ impl Renderer {
         // which also means the two resamplings cancel: a player hears
         // themselves unshifted while the tape runs fast, which is what
         // monitoring through a varispeed'd machine does.
-        let (real_frames, step) = match vs {
-            Some(ratio) => {
-                let step = 1.0 / ratio;
-                (self.vs_in_phase.program_frames(frames, step), step)
-            }
-            None => (frames, 1.0),
+        //
+        // **With the tape's motor the step moves**, from one end of the
+        // chunk to the other (`VsNow::steps`), and the read is the ramped
+        // one. Near the motor's floor a step is up to 127 real frames a
+        // program frame; the phase keeps its lead (`Phase::advance`), so
+        // what is consumed is what was delivered. The hand-back reads
+        // exactly the chunk's own frames, the count at rest, so the pass at
+        // rest after it reads the ring with no skip.
+        let real_frames = match steps {
+            None => frames,
+            Some(_) if vs.handback => frames,
+            Some((s0, s1)) if s0 == s1 => self.vs_in_phase.program_frames(frames, s0),
+            Some((s0, s1)) => self.vs_in_phase.program_frames_ramp(frames, s0, s1),
         };
         let want = real_frames * ch_in;
         // **What is heard has to be what is HAPPENING, and it was not.**
@@ -14704,9 +15081,9 @@ impl Renderer {
         // Stretched into the program's timeline, in place, so everything
         // below reads the same buffer it always did. `got` becomes the CHUNK
         // length: whatever arrived covers this chunk now.
-        let got = match vs {
+        let got = match steps {
             None => got,
-            Some(_) => {
+            Some((s0, s1)) => {
                 let src_frames = got / ch_in;
                 let n = frames * ch_in;
                 let frac = self.vs_in_phase.frac();
@@ -14717,8 +15094,30 @@ impl Renderer {
                 // branch, unreachable by construction, leaves the chunk
                 // unstretched rather than building a stretch here.
                 if dst.len() >= n && self.monitor_scratch.len() >= n && self.vs_in.channels() == ch_in {
-                    self.vs_in
-                        .run(&self.monitor_scratch, src_frames, &mut dst, frames, frac, step);
+                    if s0 == s1 {
+                        self.vs_in
+                            .run(&self.monitor_scratch, src_frames, &mut dst, frames, frac, s0);
+                    } else {
+                        self.vs_in
+                            .run_ramp(&self.monitor_scratch, src_frames, &mut dst, frames, frac, s0, s1);
+                    }
+                    if vs.handback {
+                        // **The hand-back, on the input too**: the stretch
+                        // at step 1, a frame or two behind, crossfaded into
+                        // the raw frames over the pass, so its last frame is
+                        // the raw one the pass at rest continues from. Only
+                        // over the frames that arrived: past them the raw
+                        // scratch is stale, and the stretch holds the last.
+                        let real = src_frames.min(frames);
+                        crossfade_into(
+                            &mut dst[..real * ch_in],
+                            &self.monitor_scratch[..real * ch_in],
+                            ch_in,
+                            real,
+                            self.vs_chunk_from,
+                            vs.dev,
+                        );
+                    }
                     self.monitor_scratch[..n].copy_from_slice(&dst[..n]);
                 }
                 self.vs_in_src = dst;
@@ -14728,7 +15127,11 @@ impl Renderer {
                 // and slipping it by the shortfall would leave the input
                 // permanently behind by however many frames were once
                 // missing.
-                self.vs_in_phase.advance(frames, real_frames, step);
+                if s0 == s1 {
+                    self.vs_in_phase.advance(frames, real_frames, s0);
+                } else {
+                    self.vs_in_phase.advance_ramp(frames, real_frames, s0, s1);
+                }
                 n
             }
         };
@@ -14811,7 +15214,16 @@ impl Renderer {
             // pick's ring whether or not the pick still feeds a lane this
             // block, so a take is never at the mercy of a layout change
             // (design A5).
-            if self.spine.capturing.contains(input) {
+            //
+            // **And only at speed.** A tee is only ever open while the motor
+            // is not allowed, and the pass reads the capture flags before the
+            // host's word, so this matters only in the race where a tee's
+            // flag lands between the pass's plan and the op door's latch:
+            // that one pass is not taped rather than taped at a ramp's speed,
+            // and the record's first frame is the first steady pass's, as it
+            // would be had the flag landed a moment later. The ring still
+            // drains.
+            if self.spine.capturing.contains(input) && self.motor_at_speed {
                 // **The pick's ring on the spine** (design 7.4, `Capture`):
                 // the host swaps it by `Engine::set_capture_ring`, which the
                 // callback refuses while this pick's capture runs.
@@ -15385,6 +15797,9 @@ impl Renderer {
         // player hears the room's undelayed chain rather than the file's. See
         // `live_in_room`.
         self.room_live = withheld > 1.0e-4 || live_in_room;
+        // **A tracking desk**: an armed input, bound and heard, with the room
+        // listening. The tape's motor stands aside for it (`motor_allowed`).
+        self.room_tracking = monitoring && live_in_room;
     }
 
     /// **The gain lane `i` is actually playing at.**
@@ -15873,6 +16288,18 @@ impl Renderer {
     /// Returns `(at, rolling, jumped, wrap_from)`. A jump, or the level
     /// falling, is what ends the notes the move strands; see the flush at
     /// the call site.
+    ///
+    /// **With the tape's motor, the level and the locate are held** while
+    /// the tape changes speed (`motor::Motor::chunk`): after Stop the chunk
+    /// that first sees the level fall, and every chunk after it, COASTS, the
+    /// clock rolling on at the slowing program rate, the return to the
+    /// cursor unapplied and unacked, a hosted plugin told the tape plays,
+    /// until the tape has stopped; then the seek lands, acks, and the flush
+    /// ends every stranded note at the true stop. Play from a parked desk
+    /// holds the start through a short dip. With the motor never allowed
+    /// (every offline engine, every test that does not arm it) every edge is
+    /// applied in the chunk that sees it, and this is the transport as it
+    /// always was.
     fn run_transport(&mut self, frames: usize) -> (u64, bool, bool, Option<u64>) {
         // **The generation, the level, and the generation again.** See the
         // doc above; the seek is the second generation's.
@@ -15883,11 +16310,35 @@ impl Renderer {
         #[cfg(test)]
         meet_transport(&self.shared, 2);
         let req = self.shared.transport_req.load(Ordering::Acquire);
-        let seek = req != self.seen_req;
+        // **The motor's word, read AFTER the level**: the host stores its
+        // word before the level (`push_monitor_settings` runs before
+        // `Transport::push` in a frame), and the level's Release carries it
+        // here. Not allowed, and this chunk's edge is applied now, a hard
+        // one, exactly as without a motor.
+        let ok = self.motor_allowed() && self.spine.capturing.is_empty();
+        // **A read the host's stores tore, over a moving tape.** Stop's two
+        // stores landing between the level's load and the generation's
+        // second one show a level still up with the return already there:
+        // applied here, as a locate under a playing transport is, the tape
+        // would jump to the cursor and then wind down from it when the next
+        // chunk read the level down, coming to rest past the cursor. So a
+        // moving tape rolls this one chunk on, at its planned speed, and the
+        // next chunk reads the two whole: a Stop then coasts and holds its
+        // return, a locate lands. A parked tape, or one not allowed to move,
+        // keeps today's rule (this chunk held on the new place, stopped).
+        let torn = req != first && level && ok && self.motor.moving();
+        let word = if torn {
+            crate::motor::Chunk { hold_start: false, coast: true, hold_seek: true }
+        } else {
+            self.motor.chunk(level, ok, req != self.seen_req)
+        };
+        let seek = req != self.seen_req && !word.hold_seek;
         if seek {
             self.seen_req = req;
             self.pos = self.shared.transport_at.load(Ordering::Relaxed);
             self.shared.transport_ack.store(req, Ordering::Release);
+            // A seek held through a coast is waiting no longer.
+            self.motor.seek_applied();
             // **A locate empties every lane's grain ring.**
             //
             // The key alone would not do it. A grain covering 0..256 and a
@@ -15936,8 +16387,11 @@ impl Renderer {
             }
         }
         // Only a level read between two loads of ONE generation: a locate
-        // that landed mid-read holds this chunk on its place, stopped.
-        let rolling = level && req == first;
+        // that landed mid-read holds this chunk on its place, stopped. And
+        // the motor's word on it: a start held for the motor's dip stays
+        // parked, and a tape coasting to a stop rolls whatever the level
+        // says.
+        let rolling = (level && req == first && !word.hold_start) || word.coast;
         // **And the transport STARTING empties them, the third edge.**
         //
         // A stopped chunk renders too, at the parked position, and its
@@ -17386,7 +17840,7 @@ impl Renderer {
         // that rolls from there would be served a stopped desk's render;
         // `run_transport` empties the rings once more on the edge where the
         // transport starts, and that is the catch-up the start pays.
-        if !rolling || self.stems_live || self.varispeed_ratio().is_some() {
+        if !rolling || self.stems_live || self.vs_now.engaged {
             for l in self.spine.lanes.iter_mut().flatten() {
                 l.body_mut().grain.clear();
             }
@@ -17959,7 +18413,7 @@ impl Renderer {
         // in its ring is the chunk, or the grain `plan_grains` widens it to
         // from the playhead (its catch-up arm, from `at`, cut at the loop's
         // end) while grains are being served.
-        let grained = grain > frames && rolling && !self.stems_live && self.varispeed_ratio().is_none();
+        let grained = grain > frames && rolling && !self.stems_live && !self.vs_now.engaged;
         self.rest_inc = if grained {
             let loop_end = (loop_b > loop_a && at < loop_b).then_some(loop_b);
             Self::clip_grain(at, Self::to_grid(at, grain.max(frames)), loop_end).max(frames) as u64
@@ -17975,7 +18429,7 @@ impl Renderer {
             coeff: self.gain_coeff.to_bits(),
             grain,
             stems: self.stems_live,
-            varispeed: self.varispeed_ratio().is_some(),
+            varispeed: self.vs_now.engaged,
             probe: self.probe,
             keys: self.keys_live,
         };
@@ -19215,7 +19669,7 @@ impl Renderer {
         for set in &mut self.spine.ext.probe_sets {
             set.clear();
         }
-        if self.probe && rolling && self.varispeed_ratio().is_none() && !self.stems_live {
+        if self.probe && rolling && !self.vs_now.engaged && !self.stems_live {
             pinned_lanes(
                 &self.shared,
                 &self.spine.ext.desk,
@@ -22116,6 +22570,19 @@ impl Renderer {
         clipped: bool,
     ) {
         let s = &self.shared;
+        // **The master meter reads what the speakers play** through the
+        // tape's fade, and silence through its hold: scaled by the motor's
+        // gain at the pass's start (`Renderer::meter_scale`), a branch, so
+        // a desk with no motor moving stores exactly what it always did.
+        // The strip meters stay before the motor, as a console's channel
+        // meters do while the machine's output is muted.
+        let (peak_l, peak_r, sumsq_l, sumsq_r) = if self.meter_scale == 1.0 {
+            (peak_l, peak_r, sumsq_l, sumsq_r)
+        } else {
+            let g = self.meter_scale.clamp(0.0, 1.0);
+            let g2 = f64::from(g) * f64::from(g);
+            (peak_l * g, peak_r * g, sumsq_l * g2, sumsq_r * g2)
+        };
         s.peak_l.fetch_max(peak_l.to_bits(), Ordering::Relaxed);
         s.peak_r.fetch_max(peak_r.to_bits(), Ordering::Relaxed);
         if frames > 0 {
@@ -24495,6 +24962,22 @@ impl Engine {
             vs_dst: vec![0.0; MAX_CALLBACK_FRAMES * widest],
             vs_in_src: vec![0.0; MAX_CALLBACK_FRAMES * widest],
             vs_was_engaged: false,
+            motor: crate::motor::Motor::new(),
+            motor_tone: [
+                crate::motor::Tone::new(widest),
+                crate::motor::Tone::new(TAP_CHANNELS),
+                crate::motor::Tone::new(TAP_CHANNELS),
+                crate::motor::Tone::new(2),
+            ],
+            vs_now: VsNow::REST,
+            vs_motor_was: false,
+            vs_chunk_from: 0,
+            motor_at_speed: true,
+            count_gen: None,
+            live_struck: false,
+            room_tracking: false,
+            motor_landed: false,
+            meter_scale: 1.0,
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             devsend_tx,
@@ -26804,6 +27287,72 @@ impl Engine {
             .store((r as f32).to_bits(), Ordering::Relaxed);
     }
 
+    /// **The tape's start and stop, as the live desk asks for it**
+    /// (`crate::motor`): `ok` is whether the motor may move at all (the
+    /// setting on, and nothing running that must start and stop at once),
+    /// and the two times are the setting's. Pushed every frame by the live
+    /// host; an offline engine is never told, so it never ramps.
+    ///
+    /// Sanitised on the way in, as the dial is: a time that is not a number
+    /// is the default, and every other is held to the reach the UI offers
+    /// (`motor::MIN_S..=motor::MAX_S`). The times are Relaxed, and `ok` is
+    /// stored last with Release, so a pass that Acquires it reads the times
+    /// that came with it.
+    pub fn set_tape_motor(&self, ok: bool, start_s: f32, stop_s: f32) {
+        let sane = |s: f32, default: f32| {
+            if s.is_finite() {
+                s.clamp(crate::motor::MIN_S, crate::motor::MAX_S)
+            } else {
+                default
+            }
+        };
+        self.shared
+            .motor_start_s
+            .store(sane(start_s, crate::motor::START_DEFAULT_S).to_bits(), Ordering::Relaxed);
+        self.shared
+            .motor_stop_s
+            .store(sane(stop_s, crate::motor::STOP_DEFAULT_S).to_bits(), Ordering::Relaxed);
+        self.shared.motor_ok.store(ok, Ordering::Release);
+    }
+
+    /// **The motor stands aside now**, before the frame's own push says so:
+    /// a press that must start or stop at once (a realtime export, an
+    /// arrangement record) parks it here, so the next pass snaps a ramp to
+    /// its steady state and the level the press changes is a hard edge.
+    /// Stored before anything the press stores after it (a capture flag),
+    /// with Release, so a pass that sees the later store sees this one.
+    pub fn park_tape_motor(&self) {
+        self.shared.motor_ok.store(false, Ordering::Release);
+    }
+
+    /// **A tape coasting to a stop is stopped where it is**: the coast cuts
+    /// to silence over the house's declick, parks, and the locate waiting on
+    /// it lands. A new generation every call; a motor that is not coasting
+    /// latches it and does nothing, so every locate may ask.
+    pub fn cut_motor(&self) {
+        self.shared.motor_cut.fetch_add(1, Ordering::Release);
+    }
+
+    /// What the motor showed for the last pass.
+    pub(crate) fn motor_show(&self) -> crate::motor::MotorShow {
+        crate::motor::MotorShow::from_u8(self.shared.motor_show.load(Ordering::Relaxed))
+    }
+
+    /// **A tape coasting to a stop**: the host draws the playhead at the
+    /// coasting tape (`Transport::shown_s`), carries a Pause's coast back
+    /// (`Transport::push`) and asks for frames while it moves
+    /// (`host_frame_due`).
+    pub fn motor_coasting(&self) -> bool {
+        self.motor_show().coasting()
+    }
+
+    /// **The motor has done what the level asked**: at speed for a
+    /// `playing` transport, at rest (holding or not) for a stopped one. What
+    /// the host's exempt-edge latch (`Recorder::motor_hold`) waits for.
+    pub fn motor_settled(&self, playing: bool) -> bool {
+        self.motor_show().settled(playing)
+    }
+
 
 
     // ── health ──────────────────────────────────────────────────────────────
@@ -27789,8 +28338,10 @@ impl Engine {
         self.shared.set_transport(generation, frames);
     }
 
-    /// The transport level: rolling or stopped. Safe to re-assert every frame;
-    /// nothing keys off its edges.
+    /// The transport level: rolling or stopped. Safe to re-assert every
+    /// frame. The one thing that keys off its edges is the tape motor
+    /// (`crate::motor`), on the audio thread, and only while
+    /// `Shared::motor_ok` lets it.
     ///
     /// **Released**, so a callback that Acquires the level up sees the
     /// locate `Transport::stores` puts before it: `run_transport` loads the
@@ -31485,6 +32036,22 @@ mod tests {
             vs_dst: vec![0.0; MAX_CALLBACK_FRAMES * dev_ch.max(TAP_CHANNELS)],
             vs_in_src: vec![0.0; MAX_CALLBACK_FRAMES * dev_ch.max(TAP_CHANNELS)],
             vs_was_engaged: false,
+            motor: crate::motor::Motor::new(),
+            motor_tone: [
+                crate::motor::Tone::new(dev_ch.max(TAP_CHANNELS)),
+                crate::motor::Tone::new(TAP_CHANNELS),
+                crate::motor::Tone::new(TAP_CHANNELS),
+                crate::motor::Tone::new(2),
+            ],
+            vs_now: VsNow::REST,
+            vs_motor_was: false,
+            vs_chunk_from: 0,
+            motor_at_speed: true,
+            count_gen: None,
+            live_struck: false,
+            room_tracking: false,
+            motor_landed: false,
+            meter_scale: 1.0,
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             devsend_tx: RingBuffer::<f32>::new(1 << 15).0,
@@ -50968,5 +51535,1093 @@ mod hw_insert_road {
         let again = rig.live(MASTER_SEAT);
         assert!(again.measured && again.connected);
         assert_eq!(again.latency, live.latency);
+    }
+}
+
+#[cfg(test)]
+mod tape_motor {
+    //! **The tape's start and stop through the whole renderer**
+    //! (`crate::motor`): the speed it plays the desk at, where the transport
+    //! is while it changes, what is heard at every seam, and what never
+    //! spins. The machine's own laws are pinned in `motor`'s tests; these
+    //! hold the wiring to them.
+    //!
+    //! Most desks here carry one tone on [`LANE`] as an ANALYTIC pair, the
+    //! sine on the left and the cosine on the right: the desk treats the two
+    //! sides alike, so `L^2 + R^2` is the tone's level at every frame with no
+    //! ripple however few of its periods a pass holds, and `atan2(L, R)` is
+    //! its phase, so the speed it is played at is read exactly.
+    use super::*;
+    use crate::motor::MotorShow;
+    use crate::transport::Transport;
+
+    const RATE: u32 = 48_000;
+    /// The pass every test renders unless it says otherwise.
+    const PASS: usize = 256;
+    /// Not lane 0, so nothing about the first lane stands in for the rule.
+    const LANE: usize = 1;
+
+    /// `seconds` of a tone at `hz` and `rate`, the analytic pair at half
+    /// scale.
+    fn tone(hz: f64, seconds: f64, rate: u32) -> Arc<tangent_record::decode::Clip> {
+        let n = (seconds * f64::from(rate)) as usize;
+        Arc::new(tangent_record::decode::Clip {
+            samples: (0..n)
+                .flat_map(|f| {
+                    let p = std::f64::consts::TAU * hz * f as f64 / f64::from(rate);
+                    [(p.sin() * 0.5) as f32, (p.cos() * 0.5) as f32]
+                })
+                .collect(),
+            rate,
+            source: PathBuf::from("tone.wav"),
+        })
+    }
+
+    /// An offline desk at `rate` playing [`tone`] on [`LANE`] from 0:00:
+    /// nothing armed, nothing sending, the tape motor not yet told.
+    fn tone_desk(rate: u32, hz: f64, seconds: f64) -> Engine {
+        let mut e = Engine::offline(rate, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&tangent_ui::desk_legacy::V32Desk {
+            send: std::array::from_fn(|_| 0.0),
+            muted: std::array::from_fn(|_| false),
+            soloed: std::array::from_fn(|_| false),
+        });
+        let clip = tone(hz, seconds, rate);
+        let len = clip.frames() as u64;
+        e.set_clips(vec![Placed { clip, strip: LANE, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 1.0 }]);
+        e
+    }
+
+    /// What one pass gave: its device frames (interleaved stereo), what the
+    /// motor showed for it, and where the transport stood after it.
+    struct Pass {
+        out: Vec<f32>,
+        show: MotorShow,
+        pos: u64,
+    }
+
+    /// One pass of `frames`, the host's transport reconciled before it as
+    /// the app reconciles it once a frame.
+    fn one(e: &mut Engine, t: &mut Transport, frames: usize) -> Pass {
+        t.push(Some(&*e));
+        let mut out = vec![0.0f32; frames * 2];
+        e.render_offline(&mut out);
+        Pass { out, show: e.motor_show(), pos: e.transport_position() }
+    }
+
+    /// `n` passes of `frames`.
+    fn run(e: &mut Engine, t: &mut Transport, n: usize, frames: usize) -> Vec<Pass> {
+        (0..n).map(|_| one(e, t, frames)).collect()
+    }
+
+    /// Passes of `frames` until one shows `show`, at most `limit`; every
+    /// pass rendered, that one last.
+    fn until(e: &mut Engine, t: &mut Transport, frames: usize, show: MotorShow, limit: usize) -> Vec<Pass> {
+        let mut passes = Vec::new();
+        for _ in 0..limit {
+            let p = one(e, t, frames);
+            let done = p.show == show;
+            passes.push(p);
+            if done {
+                return passes;
+            }
+        }
+        panic!("the motor never showed {show:?} in {limit} passes");
+    }
+
+    /// Every frame of `passes`, end to end.
+    fn tape(passes: &[Pass]) -> Vec<f32> {
+        passes.iter().flat_map(|p| p.out.iter().copied()).collect()
+    }
+
+    /// The analytic pair's level over `out`: `sqrt(mean(L^2 + R^2))`.
+    fn level(out: &[f32]) -> f64 {
+        let n = (out.len() / 2).max(1) as f64;
+        (out.chunks_exact(2).map(|f| f64::from(f[0]).powi(2) + f64::from(f[1]).powi(2)).sum::<f64>() / n).sqrt()
+    }
+
+    /// The loudest sample of `out`.
+    fn peak(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// The analytic pair's mean frequency over frames `from..to` of `out`:
+    /// its phase unwrapped, in cycles per second at `rate`.
+    fn freq(out: &[f32], from: usize, to: usize, rate: u32) -> f64 {
+        let phase = |f: usize| f64::from(out[f * 2]).atan2(f64::from(out[f * 2 + 1]));
+        let mut turned = 0.0;
+        let mut last = phase(from);
+        for f in from + 1..to {
+            let p = phase(f);
+            let mut d = p - last;
+            if d < -std::f64::consts::PI {
+                d += std::f64::consts::TAU;
+            } else if d > std::f64::consts::PI {
+                d -= std::f64::consts::TAU;
+            }
+            turned += d;
+            last = p;
+        }
+        turned / std::f64::consts::TAU * f64::from(rate) / (to - from - 1) as f64
+    }
+
+    fn db(ratio: f64) -> f64 {
+        20.0 * ratio.log10()
+    }
+
+    /// **Play spins the desk up from a standstill, and the playhead follows
+    /// the speed.**
+    ///
+    /// The start out of the box, 0.5 s, at 48 kHz in 256-frame passes, Play
+    /// at a pass boundary. The press pass holds parked (the start waits for
+    /// the motor), then a 10 ms dip, both silent because the desk is parked;
+    /// then the start law from the floor. Through it the tone's level only
+    /// rises (the final fade, the reproducer's sinking bass and dull top all
+    /// lift together as the tape comes up) and never passes the level at
+    /// speed by more than 0.5 dB (the start never overshoots, so the
+    /// pitch never passes the dial either). The tape plays the tone at the
+    /// speed the law says: at u = 0.5 of the start the 500 Hz tone is heard
+    /// at 500 x 0.60605 within 3 % (the mean over u = 0.45 to 0.55, where
+    /// the law is linear, is its value at the middle), and at 500 Hz within
+    /// 1 % once at speed. And the clock moves at the program's rate: over
+    /// the start the playhead advances the law's integral, 0.587713 of a
+    /// 24000-frame start, 14105 frames, within one pass.
+    #[test]
+    fn play_spins_the_desk_up_and_the_playhead_follows_the_speed() {
+        let mut e = tone_desk(RATE, 500.0, 6.0);
+        e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        let parked = run(&mut e, &mut t, 4, PASS);
+        assert!(parked.iter().all(|p| p.show == MotorShow::Parked), "a fresh desk did not adopt its stopped transport");
+        t.toggle_play();
+        let mut passes = until(&mut e, &mut t, PASS, MotorShow::Running, 1000);
+        passes.extend(run(&mut e, &mut t, 120, PASS));
+        let spin = passes.iter().position(|p| p.show == MotorShow::SpinningUp).expect("the tape never spun up");
+        let ran = passes.iter().position(|p| p.show == MotorShow::Running).expect("the tape never reached speed");
+        assert!(passes[..spin].iter().any(|p| p.show == MotorShow::Dipping), "the start did not dip first");
+        for (i, p) in passes[..spin].iter().enumerate() {
+            assert!(
+                db(f64::from(peak(&p.out)).max(1e-12)) < -60.0,
+                "pass {i} before the start was heard: the desk is parked"
+            );
+        }
+        let at_speed = level(&tape(&passes[ran + 8..ran + 72]));
+        let climb: Vec<f64> = passes[spin..ran].iter().map(|p| level(&p.out)).collect();
+        for (k, w) in climb.windows(2).enumerate() {
+            assert!(w[1] >= w[0], "the level fell at pass {} of the start: {} then {}", k + 1, w[0], w[1]);
+        }
+        for (k, l) in climb.iter().enumerate() {
+            assert!(db(l / at_speed) <= 0.5, "pass {k} of the start was {:.2} dB over the level at speed", db(l / at_speed));
+        }
+        let len = 0.5 * f64::from(RATE);
+        let start = tape(&passes[spin..]);
+        let heard = freq(&start, (0.45 * len) as usize, (0.55 * len) as usize, RATE);
+        let want = 500.0 * 0.60605;
+        assert!((heard - want).abs() / want < 0.03, "at u = 0.5 the tone was heard at {heard:.2} Hz, not {want:.2}");
+        let after = tape(&passes[ran + 8..]);
+        let heard = freq(&after, 0, after.len() / 2, RATE);
+        assert!((heard - 500.0).abs() / 500.0 < 0.01, "at speed the tone was heard at {heard:.2} Hz");
+        let moved = passes[ran - 1].pos as f64 - passes[spin - 1].pos as f64;
+        assert!((moved - 14105.0).abs() <= 256.0, "the start moved the playhead {moved} frames, not 14105");
+    }
+
+    /// The DX7 lane a clip note plays on, beside the tone's.
+    const NOTE_LANE: usize = 3;
+
+    /// [`tone_desk`] at 48 kHz, plus a DX7 on [`NOTE_LANE`] holding one
+    /// note from the cursor at one second for four.
+    fn note_desk() -> Engine {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        e.set_builtin_strips(1 << NOTE_LANE);
+        e.sync_instrument_lanes(1 << NOTE_LANE, 0);
+        e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: NOTE_LANE,
+            start: 0,
+            len: 8 * u64::from(RATE),
+            notes: Arc::new(vec![ClipNote { at: u64::from(RATE), dur: 4 * u64::from(RATE), key: 60, vel: 110 }]),
+        }]);
+        e
+    }
+
+    /// Whether [`NOTE_LANE`]'s instrument has been told its note sounds.
+    fn told(e: &Engine) -> bool {
+        e.offline.as_ref().is_some_and(|r| r.sounding_notes().contains(&(NOTE_LANE, 60)))
+    }
+
+    /// An armed desk rolling from the cursor at one second, as a fresh
+    /// renderer adopts a playing transport: it rolls from its first pass,
+    /// at speed, and never spins up because it was built.
+    fn rolling_from_one_second(e: &mut Engine, t: &mut Transport) {
+        e.set_tape_motor(true, 0.5, 0.7);
+        t.locate(1.0);
+        t.toggle_play();
+        let passes = run(e, t, 40, PASS);
+        assert_eq!(passes[0].pos, u64::from(RATE) + PASS as u64, "a fresh renderer did not roll from its first pass");
+        assert!(passes[1..].iter().all(|p| p.show == MotorShow::Running), "a fresh renderer spun up for a rebuild");
+    }
+
+    /// **Stop winds the tape down, then returns to the cursor.**
+    ///
+    /// Rolling from the cursor at one second, Stop's two stores land at a
+    /// pass boundary. The press pass rolls on at speed (its speed was fixed
+    /// when it began), then the brakes' law brings the tape to the floor:
+    /// 0.385656 of a 0.7 s stop, 12958 frames. Through the coast the return
+    /// to the cursor is held, unacked, while the clock climbs by the press
+    /// pass and the law's integral, within a pass; on the first parked pass
+    /// the playhead is at the cursor exactly. And a clip note sounding at
+    /// Stop is ended there, at the true stop, and not before: the tape was
+    /// still playing it.
+    #[test]
+    fn stop_winds_down_then_returns_to_the_cursor() {
+        let mut e = note_desk();
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        assert!(told(&e), "the clip note never sounded");
+        let press = e.transport_position();
+        t.stop();
+        let passes = until(&mut e, &mut t, PASS, MotorShow::Holding, 400);
+        let (coast, parked) = passes.split_at(passes.len() - 1);
+        assert!(coast.len() > 2, "the stop did not coast");
+        for p in coast {
+            assert_ne!(p.show, MotorShow::Holding);
+        }
+        let farthest = coast.last().map(|p| p.pos).expect("a coast");
+        let climbed = farthest as f64 - press as f64;
+        assert!(
+            (climbed - (256.0 + 12958.0)).abs() <= 256.0,
+            "the coast climbed {climbed} frames past the press, not the press pass and the law's 12958"
+        );
+        assert_eq!(parked[0].pos, u64::from(RATE), "the first parked pass is not at the cursor");
+        assert!(e.transport_acked(t.generation()), "the return to the cursor was never acked");
+        assert!(!told(&e), "the clip note outlived the stop");
+        // Not before: through the coast it was still sounding, and the
+        // return still held.
+        let mut e = note_desk();
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        t.stop();
+        loop {
+            let p = one(&mut e, &mut t, PASS);
+            if p.show == MotorShow::Holding {
+                break;
+            }
+            assert!(told(&e), "the clip note was ended while the tape still coasted");
+            assert!(!e.transport_acked(t.generation()), "the return to the cursor was acked mid-coast");
+        }
+    }
+
+    /// **Wherever a callback meets Stop, the tape coasts on from where it
+    /// was** (the review's B1).
+    ///
+    /// The host's two stores can land between a callback's passes, or inside
+    /// the first chunk's own read of the transport
+    /// (`meet_transport_loads_for_test`, the transport tests' harness). The
+    /// pass that first sees the level fall had its speed fixed when it
+    /// began, so it rolls on at it: never silent (its level within 0.5 dB of
+    /// the pass before), no seek applied, nothing acked, nothing flushed (a
+    /// hosted plugin is still told the tape plays). The wind-down starts at
+    /// the next pass from where the tape is, so the coast's farthest point is
+    /// the press plus that pass plus the law's 12958, within a pass, and one
+    /// pass later for a meet the pass's read did not see whole: the stores
+    /// after the callback, or both inside it after the level's load. That
+    /// read is torn, its level still up with the return already landed; it
+    /// rolls on and leaves both to the next chunk, because applying the
+    /// return there as the locate it looks like jumped the tape to the
+    /// cursor and wound it down from there, to rest 13000 frames past it.
+    /// The first parked pass is at the cursor. Pause the same, with no seek:
+    /// the tape settles where its coast ends and stays there.
+    #[test]
+    fn wherever_a_callback_meets_stop_the_tape_coasts_from_where_it_was() {
+        use crate::instrument::{meet_transport_loads_for_test, TransportStores};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        #[derive(Clone, Copy, Debug)]
+        enum Meet {
+            Between(usize),
+            Inside(u32),
+        }
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Store {
+            Locate(u64, u64),
+            Rolling(bool),
+        }
+        for stop in [true, false] {
+            for meet in [Meet::Between(0), Meet::Between(1), Meet::Between(2), Meet::Inside(1), Meet::Inside(2), Meet::Inside(3)] {
+                let what = format!("{} met at {meet:?}", if stop { "Stop" } else { "Pause" });
+                let mut e = tone_desk(RATE, 500.0, 8.0);
+                let mut t = Transport::new();
+                rolling_from_one_second(&mut e, &mut t);
+                let before = one(&mut e, &mut t, PASS);
+                let was = before.pos;
+                if stop {
+                    t.stop();
+                } else {
+                    t.toggle_play();
+                }
+                // The push's stores in its own order: the level first on the
+                // way down, then the return (Stop only).
+                let acked = e.transport_acked(t.generation());
+                let mut stores = vec![Store::Rolling(false)];
+                if !acked {
+                    stores.push(Store::Locate(t.generation(), u64::from(RATE)));
+                }
+                let apply = |e: &Engine, s: Store| match s {
+                    Store::Locate(g, f) => e.set_transport(g, f),
+                    Store::Rolling(r) => e.set_rolling(r),
+                };
+                let mut out = vec![0.0f32; PASS * 2];
+                // Whether the pass's read missed the level's fall: the
+                // stores came after it, or (`Inside(2)`) both landed after
+                // the level's load, a torn read that rolls on.
+                let late = match meet {
+                    Meet::Between(k) => {
+                        for &s in stores.iter().take(k) {
+                            apply(&e, s);
+                        }
+                        e.render_offline(&mut out);
+                        for &s in stores.iter().skip(k) {
+                            apply(&e, s);
+                        }
+                        k == 0
+                    }
+                    Meet::Inside(n) => {
+                        let fired = Rc::new(Cell::new(false));
+                        let (landed, all) = (Rc::clone(&fired), stores.clone());
+                        meet_transport_loads_for_test(Some(Box::new(move |loads: u32, host: &TransportStores<'_>| {
+                            if loads != n || landed.get() {
+                                return;
+                            }
+                            landed.set(true);
+                            for &s in &all {
+                                match s {
+                                    Store::Locate(g, f) => host.set_transport(g, f),
+                                    Store::Rolling(r) => host.set_rolling(r),
+                                }
+                            }
+                        })));
+                        e.render_offline(&mut out);
+                        meet_transport_loads_for_test(None);
+                        if !fired.get() {
+                            for &s in &stores {
+                                apply(&e, s);
+                            }
+                        }
+                        !fired.get() || n >= 2
+                    }
+                };
+                // The pass that met it.
+                let gap = db(level(&out) / level(&before.out)).abs();
+                assert!(gap < 0.5, "{what}: the pass that met it was {gap:.2} dB off the pass before");
+                assert_eq!(e.transport_position(), was + PASS as u64, "{what}: the pass that met it did not roll on at speed");
+                assert!(!stop || !e.transport_acked(t.generation()), "{what}: the pass that met it acked the return");
+                assert!(e.shared.transport_rolling.load(Ordering::Relaxed), "{what}: a hosted plugin was told the tape stopped");
+                // The pass the press is first seen in: the one that met it,
+                // or the next for a meet it only saw after.
+                let press = if late { was + PASS as u64 } else { was };
+                let passes = until(&mut e, &mut t, PASS, MotorShow::Holding, 400);
+                let farthest = passes[..passes.len() - 1].iter().map(|p| p.pos).max().unwrap_or(press);
+                let climbed = farthest as f64 - press as f64;
+                assert!(
+                    (climbed - (256.0 + 12958.0)).abs() <= 256.0,
+                    "{what}: the coast climbed {climbed} frames past the press"
+                );
+                let rest = passes.last().map(|p| p.pos).expect("a parked pass");
+                if stop {
+                    assert_eq!(rest, u64::from(RATE), "{what}: the first parked pass is not at the cursor");
+                } else {
+                    assert_eq!(rest, farthest, "{what}: the paused tape did not settle where its coast ended");
+                    let after = run(&mut e, &mut t, 8, PASS);
+                    assert!(after.iter().all(|p| p.pos == farthest), "{what}: the paused tape moved after it settled");
+                }
+            }
+        }
+    }
+
+    /// **Pause winds the tape down, and Play spins it up again in place.**
+    ///
+    /// Pause holds no return, so the tape coasts and the playhead never
+    /// moves backwards. Play halfway through the stop (u = 0.5, where the
+    /// law has the tape at 0.32633 of speed) takes the tape up again from
+    /// the speed it is at, continuously: the start's first pass begins at
+    /// the stop's last speed bit for bit, with no seek and no dip.
+    #[test]
+    fn pause_winds_down_and_a_play_spins_up_in_place() {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        let plan = |e: &Engine| e.offline.as_ref().map(|r| r.motor.last()).expect("the renderer");
+        t.toggle_play();
+        let len = 0.7 * f64::from(RATE);
+        let mut passes = Vec::new();
+        let mut wound = 0.0;
+        while wound < 0.5 * len {
+            let p = one(&mut e, &mut t, PASS);
+            if p.show == MotorShow::WindingDown {
+                wound += PASS as f64;
+            }
+            passes.push(p);
+        }
+        let at_play = plan(&e).s1;
+        assert!((at_play - 0.32633).abs() < 0.01, "the tape was at {at_play} at u = 0.5 of the stop");
+        t.toggle_play();
+        // The press pass coasts on at its planned speed; the start begins
+        // where it ended.
+        let mut last_stop = at_play;
+        loop {
+            let p = one(&mut e, &mut t, PASS);
+            let show = p.show;
+            passes.push(p);
+            if show == MotorShow::SpinningUp {
+                break;
+            }
+            assert_eq!(show, MotorShow::WindingDown, "Play during a Pause's coast did not go straight up");
+            last_stop = plan(&e).s1;
+        }
+        let first = plan(&e);
+        assert_eq!(first.s0.to_bits(), last_stop.to_bits(), "the start did not begin at the stop's last speed");
+        assert!(first.s0 < at_play && at_play - first.s0 < 0.02, "the start began at {} against {at_play}", first.s0);
+        passes.extend(until(&mut e, &mut t, PASS, MotorShow::Running, 400));
+        assert!(!passes.iter().any(|p| matches!(p.show, MotorShow::Dipping | MotorShow::Cutting)), "the re-spin dipped or cut");
+        for w in passes.windows(2) {
+            assert!(w[1].pos >= w[0].pos, "the playhead moved backwards: {} then {}", w[0].pos, w[1].pos);
+        }
+    }
+
+    /// **Play during a Stop's coast cuts it, and spins up from the cursor.**
+    ///
+    /// The return to the cursor is waiting, so the tape cannot simply turn
+    /// round: the coast cuts to silence over the house's 10 ms, the held
+    /// seek lands, and the start runs from the floor at the cursor. The
+    /// press pass rolls on, the cut takes 480 frames from the next, so the
+    /// desk is below -60 dBFS from 480 + 256 frames after the Play until
+    /// the start lifts it again, and the start's first chunk plays from the
+    /// cursor.
+    #[test]
+    fn play_during_a_stop_coast_cuts_it_and_spins_up_from_the_cursor() {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        t.stop();
+        let coast = run(&mut e, &mut t, 6, PASS);
+        assert!(coast.iter().skip(1).all(|p| p.show == MotorShow::WindingDown), "the stop did not wind down");
+        t.toggle_play();
+        let passes = until(&mut e, &mut t, PASS, MotorShow::SpinningUp, 20);
+        assert!(passes.iter().any(|p| p.show == MotorShow::Cutting), "the coast was not cut");
+        let heard = tape(&passes);
+        let quiet_from = 480 + 256;
+        let spin_from = (passes.len() - 1) * PASS;
+        assert!(spin_from > quiet_from, "the start began before the cut could end");
+        let loud = peak(&heard[quiet_from * 2..spin_from * 2]);
+        assert!(db(f64::from(loud).max(1e-12)) < -60.0, "the cut left {loud} after 480 + 256 frames");
+        // The start's first chunk plays from the cursor.
+        assert_eq!(
+            e.shared.transport_anchor.load(Ordering::Relaxed),
+            u64::from(RATE),
+            "the start's first chunk did not play from the cursor"
+        );
+        assert!(e.transport_acked(t.generation()), "the held return never landed");
+    }
+
+    /// **The seams carry no step.**
+    ///
+    /// Everywhere the tape's path or its gain changes hands: the dip before
+    /// a start, the hand-back where a start reaches speed and the dial is at
+    /// rest (the resampled path becomes the direct one), the wind-down's
+    /// start (the path engages at exactly ratio 1), a cut, and a hold's
+    /// release. A 1 kHz tone on the timeline, and a 1 kHz preview playing
+    /// throughout so the parked desk is heard too (the dip fades it, and a
+    /// preview is a player, so the hold lets go of it at once), at 44.1, 48
+    /// and 96 kHz in passes of 32 and 256 frames. Around each seam the
+    /// largest second difference is at most 1.25 times a sine's own at the
+    /// loudest level heard there, `A 4 sin^2(pi f / fs)`: a path switch that
+    /// skipped the phase's frame and a half instead would be a step of 0.2 A
+    /// at 48 kHz, ten times that.
+    #[test]
+    fn the_seams_carry_no_step() {
+        const HZ: f64 = 1_000.0;
+        for rate in [44_100u32, 48_000, 96_000] {
+            for pass in [32usize, 256] {
+                let what = format!("at {rate} Hz in {pass}-frame passes");
+                let mut e = tone_desk(rate, HZ, 30.0);
+                e.set_preview(Some(tone(HZ, 30.0, rate)));
+                e.set_tape_motor(true, 0.25, 0.35);
+                let mut t = Transport::new();
+                let mut passes = run(&mut e, &mut t, 64 * 256 / pass, pass);
+                let mut seams: Vec<(&str, usize, usize)> = Vec::new();
+                let at = |passes: &Vec<Pass>| passes.len() * pass;
+                t.toggle_play();
+                passes.extend(until(&mut e, &mut t, pass, MotorShow::Dipping, 8));
+                seams.push(("the dip", at(&passes) - pass, 0));
+                passes.extend(until(&mut e, &mut t, pass, MotorShow::Running, 100_000));
+                seams.push(("the hand-back", at(&passes) - pass, pass));
+                passes.extend(run(&mut e, &mut t, rate as usize / 5 / pass, pass));
+                t.stop();
+                passes.extend(until(&mut e, &mut t, pass, MotorShow::WindingDown, 8));
+                seams.push(("the wind-down's start", at(&passes) - pass, 0));
+                passes.extend(run(&mut e, &mut t, rate as usize / 10 / pass, pass));
+                // A ruler click during the coast, as `R::Locate` makes it.
+                t.locate(2.0);
+                e.cut_motor();
+                passes.extend(until(&mut e, &mut t, pass, MotorShow::Cutting, 8));
+                seams.push(("the cut", at(&passes) - pass, 0));
+                passes.extend(until(&mut e, &mut t, pass, MotorShow::Holding, 100_000));
+                seams.push(("the hold's release", at(&passes) - pass, 0));
+                passes.extend(run(&mut e, &mut t, rate as usize / 10 / pass, pass));
+                let left: Vec<f32> = tape(&passes).chunks_exact(2).map(|f| f[0]).collect();
+                let own = 4.0 * (std::f64::consts::PI * HZ / f64::from(rate)).sin().powi(2);
+                let period = (f64::from(rate) / HZ) as usize;
+                let glide = (0.010 * f64::from(rate)) as usize;
+                for (seam, from, extent) in seams {
+                    let reach = (4 * period).max(glide + 64);
+                    let lo = from.saturating_sub(reach);
+                    let hi = (from + extent + reach).min(left.len());
+                    let a = f64::from(peak(&left[lo..hi]));
+                    let lo = from.saturating_sub(64).max(1);
+                    let hi = (from + extent + 64).min(left.len() - 1);
+                    let worst = (lo..hi)
+                        .map(|i| f64::from(left[i + 1] - 2.0 * left[i] + left[i - 1]).abs())
+                        .fold(0.0, f64::max);
+                    assert!(a > 1e-3, "{what}: nothing was heard around {seam}");
+                    assert!(
+                        worst <= 1.25 * a * own,
+                        "{what}: {seam} stepped: a second difference of {worst:.5} against {:.5}",
+                        1.25 * a * own
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A pass that needs no program still counts, drains and taps.**
+    ///
+    /// Near the floor a 32-frame pass reads entirely inside the resampler's
+    /// history, and the render used to return silent there before it began:
+    /// no callback counted (the stall watch's heartbeat), nothing drained, a
+    /// hole in the take, the scope and the sends. A 2 s stop in 32-frame
+    /// passes: every pass counts exactly one callback and hands the scope
+    /// its 32 frames, passes that rendered no program among them, and every
+    /// sample is a number.
+    #[test]
+    fn a_zero_program_pass_still_counts_and_taps() {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        e.set_tape_motor(true, 0.5, 2.0);
+        let mut scope = Vec::new();
+        e.drain_scope(&mut scope);
+        t.stop();
+        let mut empty = 0usize;
+        let mut last = e.transport_position();
+        for _ in 0..(2.5 * f64::from(RATE)) as usize / 32 {
+            let callbacks = e.callbacks();
+            let p = one(&mut e, &mut t, 32);
+            assert_eq!(e.callbacks(), callbacks + 1, "a pass did not count one callback");
+            scope.clear();
+            e.drain_scope(&mut scope);
+            assert_eq!(scope.len(), 32 * TAP_CHANNELS, "a pass did not hand the scope its frames");
+            assert!(p.out.iter().all(|s| s.is_finite()), "a pass at the floor rendered a NaN");
+            if p.show == MotorShow::WindingDown && p.pos == last {
+                empty += 1;
+            }
+            last = p.pos;
+        }
+        assert!(empty > 0, "no pass near the floor rendered no program, so nothing was proved");
+    }
+
+    /// **The stall watch never fires near ratio zero.**
+    ///
+    /// The watch declares the output dead when the callback count sits still
+    /// for two seconds of device time. Three seconds of 32-frame passes
+    /// through a 2 s stop and its hold, each reading fed to the watch at the
+    /// device time it was rendered at: never a stall, because every pass
+    /// counts.
+    #[test]
+    fn the_stall_watch_never_fires_near_ratio_zero() {
+        let mut e = tone_desk(RATE, 500.0, 8.0);
+        let mut t = Transport::new();
+        rolling_from_one_second(&mut e, &mut t);
+        e.set_tape_motor(true, 0.5, 2.0);
+        t.stop();
+        let mut watch = StallWatch::new();
+        let t0 = Instant::now();
+        let passes = 3 * RATE as usize / 32;
+        for k in 0..passes {
+            one(&mut e, &mut t, 32);
+            let at = t0 + Duration::from_secs_f64((k * 32) as f64 / f64::from(RATE));
+            assert!(!watch.note(true, e.callbacks(), at), "the watch declared a stall {k} passes into the stop");
+        }
+    }
+
+    /// **A count during a coast snaps the tape and counts from its own
+    /// pass** (the review's C5).
+    ///
+    /// A count-in is the press's, to the frame: the host places the take
+    /// and the record on it (`count_from`). So a count started while the
+    /// tape coasts after Stop snaps the motor in the very pass whose render
+    /// restarts the count: from that pass on the motor shows Parked, and the
+    /// count's beats and its downbeat land where an unarmed desk's, stopped
+    /// at once and counted in the same pass, land: the same beat in every
+    /// pass, the downbeat in the same pass at the same frame.
+    #[test]
+    fn a_count_during_a_coast_snaps_the_tape_and_counts_from_its_own_pass() {
+        let counted = |armed: bool| {
+            let mut e = tone_desk(RATE, 500.0, 8.0);
+            let mut t = Transport::new();
+            rolling_from_one_second(&mut e, &mut t);
+            if !armed {
+                e.set_tape_motor(false, 0.5, 0.7);
+            }
+            t.stop();
+            let coast = run(&mut e, &mut t, 6, PASS);
+            assert_eq!(
+                coast.last().map(|p| p.show == MotorShow::WindingDown),
+                Some(armed),
+                "the armed desk did not coast, or the unarmed one did"
+            );
+            e.start_count_in(4, 120.0);
+            let mut beats = Vec::new();
+            let mut downbeat = None;
+            for k in 0..(2.5 * f64::from(RATE)) as usize / PASS {
+                let p = one(&mut e, &mut t, PASS);
+                assert!(
+                    matches!(p.show, MotorShow::Parked),
+                    "armed {armed}: pass {k} of the count showed {:?}",
+                    p.show
+                );
+                beats.push(e.metronome_beat());
+                if downbeat.is_none() && e.count_in_done() {
+                    downbeat = Some((k, e.count_in_downbeat_ns()));
+                }
+            }
+            (beats, downbeat.expect("the count never reached its downbeat"))
+        };
+        let (armed, armed_go) = counted(true);
+        let (plain, plain_go) = counted(false);
+        assert_eq!(armed, plain, "the count's beats moved under a coasting tape");
+        assert_eq!(armed_go, plain_go, "the count's downbeat moved under a coasting tape");
+    }
+
+    /// An offline desk with nothing on it but the click, at 120 BPM.
+    fn click_desk() -> Engine {
+        let e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_tempo(120.0);
+        e.set_metronome_gain(1.0);
+        e.set_metronome_enabled(true);
+        e
+    }
+
+    /// **The song's click waits for the tape** (the review's C3).
+    ///
+    /// The click is not on the tape: a beat crossed while it spins up or
+    /// winds down is dropped, and the clock still ticks so it is in step
+    /// when the tape is at speed. Play from the beat line at 0:00 with the
+    /// 0.5 s start: that beat is not heard, and the first click is the first
+    /// beat line the tape crosses at speed, 34663 device frames after the
+    /// press at 120 BPM in 256-frame passes (the press pass and the dip,
+    /// 768 frames, the start's 94 passes, then the rest of the way to 0:00.5
+    /// at speed), within a pass. And Stop's coast crossing a beat line clicks
+    /// nothing after the pass that met the press.
+    #[test]
+    fn the_song_click_waits_for_the_tape() {
+        let mut e = click_desk();
+        e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        run(&mut e, &mut t, 8, PASS);
+        t.toggle_play();
+        let heard = tape(&run(&mut e, &mut t, 40_000 / PASS + 8, PASS));
+        let first = heard.chunks_exact(2).position(|f| f[0].abs() > 1e-3).expect("the click never sounded");
+        assert!(
+            (first as f64 - 34663.0).abs() <= 256.0,
+            "the first click came {first} frames after the press, not 34663"
+        );
+        // Rolling at speed from 0:00, Stop a beat line short of 0:01.
+        let mut e = click_desk();
+        e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        t.toggle_play();
+        run(&mut e, &mut t, 183, PASS);
+        let press = e.transport_position();
+        assert!(press + PASS as u64 + 12958 > 2 * 24_000 && press + (PASS as u64) < 2 * 24_000, "the stop is not placed to cross a beat");
+        t.stop();
+        let coast = until(&mut e, &mut t, PASS, MotorShow::Holding, 400);
+        let after = tape(&coast[1..]);
+        assert!(peak(&after) < 1e-4, "the coast clicked: {}", peak(&after));
+    }
+
+    /// **A hard edge rolls at once, and bit for bit.**
+    ///
+    /// Under a record's start, a count's go or an export the host says the
+    /// motor may not move, and the edge that comes with it is a hard one,
+    /// applied in the chunk that sees it: an armed desk told so plays from
+    /// its very first chunk (a 256-frame pass moves the playhead 256) and is
+    /// the unarmed desk's render, sample for sample, for a second.
+    #[test]
+    fn a_hard_edge_rolls_at_once_and_bit_for_bit() {
+        let take = |armed: bool| {
+            let mut e = tone_desk(RATE, 500.0, 4.0);
+            if armed {
+                e.set_tape_motor(true, 0.5, 0.7);
+            }
+            let mut t = Transport::new();
+            t.locate(1.0);
+            run(&mut e, &mut t, 4, PASS);
+            if armed {
+                e.park_tape_motor();
+            }
+            t.toggle_play();
+            let passes = run(&mut e, &mut t, RATE as usize / PASS, PASS);
+            assert_eq!(passes[0].pos, u64::from(RATE) + PASS as u64, "armed {armed}: the first chunk did not roll");
+            // The press pass was planned before its chunk saw the level, at
+            // rest; every pass after it is at speed.
+            assert!(passes[1..].iter().all(|p| p.show == MotorShow::Running), "armed {armed}: the motor moved");
+            tape(&passes)
+        };
+        let armed = take(true);
+        let plain = take(false);
+        assert!(peak(&plain) > 0.1, "the desk was silent, so nothing was proved");
+        assert!(
+            armed.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a hard edge is not the unarmed desk's render"
+        );
+    }
+
+    /// The audio track an input is bound to, beside the tone's lane.
+    const TRACK: usize = 5;
+
+    /// A desk somebody records on: [`tone`] on [`LANE`] (through a plate
+    /// when `plate`), and an audio track on [`TRACK`], armed when `armed`,
+    /// bound to the first input of a `width`-wide device whose monitor ring
+    /// is in place, with monitoring `monitor`. Its own lanes by plan, as the
+    /// live desk's are.
+    struct Tracking {
+        e: Engine,
+        tx: Producer<f32>,
+        pick: PickId,
+        rows: Vec<crate::engine_bridge::InputRow>,
+        table: crate::engine_bridge::PickTable,
+        width: usize,
+        fed: usize,
+    }
+
+    impl Tracking {
+        fn new(width: usize, monitor: bool, armed: bool, plate: bool) -> Self {
+            use crate::desk_plan::{InLane, LaneFlags};
+            use crate::engine_bridge::{InputRow, InputStream, LaneAt, PickTable};
+            use tangent_record::audio::{ChannelPick, Picks};
+            use tangent_ui::desk_id::TrackId;
+            let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+            e.settle_offline();
+            let lanes: Vec<InLane> = (0..LEGACY_LANES)
+                .map(|s| InLane {
+                    slot: Slot(s as u32),
+                    gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                    flags: if s == TRACK && armed { LaneFlags::ARMED | LaneFlags::MIDI_OFF } else { LaneFlags::MIDI_OFF },
+                    parent: None,
+                    punch: None,
+                    midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                    pick: None,
+                })
+                .collect();
+            e.publish_plan(&PlanInputs { lanes, ..PlanInputs::default() }).expect("the plan goes");
+            e.settle_offline();
+            let clip = tone(500.0, 12.0, RATE);
+            let len = clip.frames() as u64;
+            e.set_clips(vec![Placed { clip, strip: LANE, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 1.0 }]);
+            if plate {
+                e.load_insert(LANE, 0, Some(Path::new(crate::builtin_fx::PLATE_PATH)), None)
+                    .expect("the plate loads")
+                    .expect("and is seated");
+            }
+            let rows: Vec<InputRow> = (0..LEGACY_LANES)
+                .map(|i| InputRow {
+                    id: TrackId(i as u32),
+                    audio: i == TRACK,
+                    spec: (i == TRACK).then_some(ChannelPick::Mono(0)),
+                    armed: armed && i == TRACK,
+                })
+                .collect();
+            let stream = InputStream { device_channels: Some(width), picks: Picks::EVERYTHING };
+            let mut table = PickTable::default();
+            table.bind(&rows, &stream);
+            let pick = table.pick_of(TrackId(TRACK as u32)).expect("the track has a pick");
+            e.set_monitor_on(monitor);
+            let (tx, rx) = RingBuffer::<f32>::new(width * RATE as usize);
+            e.set_monitor(Some((rx, width as u16, vec![width as u8].into_boxed_slice(), PASS as u32, Picks::EVERYTHING)));
+            let lane_of = |id: TrackId| {
+                let slot = Slot(id.0);
+                e.lane_gen(slot).map(|gen| LaneAt { slot, gen })
+            };
+            let monitor = table.monitor(lane_of);
+            e.set_monitor_inputs(&monitor, &Picks::EVERYTHING);
+            let mut me = Self { e, tx, pick, rows, table, width, fed: 0 };
+            // The block the device is filling while the output runs.
+            me.feed(PASS);
+            me
+        }
+
+        /// `frames` frames of the device's input, at device rate: a sine at
+        /// -60 dBFS on the first input, every other column silent.
+        fn feed(&mut self, frames: usize) {
+            let width = self.width;
+            let at = self.fed;
+            let block: Vec<f32> = (0..frames)
+                .flat_map(|f| {
+                    let v = ((std::f64::consts::TAU * 330.0 * (at + f) as f64 / f64::from(RATE)).sin() * 1e-3) as f32;
+                    (0..width).map(move |c| if c == 0 { v } else { 0.0 })
+                })
+                .collect();
+            let _ = self.tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+            self.fed += frames;
+        }
+
+        /// One pass of `frames`, its input fed as a device delivers it.
+        fn one(&mut self, t: &mut Transport, frames: usize) -> Pass {
+            self.feed(frames);
+            one(&mut self.e, t, frames)
+        }
+
+        fn run(&mut self, t: &mut Transport, n: usize, frames: usize) -> Vec<Pass> {
+            (0..n).map(|_| self.one(t, frames)).collect()
+        }
+
+        fn until(&mut self, t: &mut Transport, frames: usize, show: MotorShow, limit: usize) -> Vec<Pass> {
+            let mut passes = Vec::new();
+            for _ in 0..limit {
+                let p = self.one(t, frames);
+                let done = p.show == show;
+                passes.push(p);
+                if done {
+                    return passes;
+                }
+            }
+            panic!("the motor never showed {show:?} in {limit} passes");
+        }
+
+        /// Whether the renderer read its last chunk as a tracking desk.
+        fn tracking(&self) -> bool {
+            self.e.offline.as_ref().is_some_and(|r| r.room_tracking)
+        }
+    }
+
+    /// Whether any of `passes` ramped: a dip, a start, a stop, a cut.
+    fn ramped(passes: &[Pass]) -> bool {
+        passes
+            .iter()
+            .any(|p| matches!(p.show, MotorShow::Dipping | MotorShow::SpinningUp | MotorShow::WindingDown | MotorShow::Cutting))
+    }
+
+    /// **The motor stands aside on a tracking desk** (the owner's ruling).
+    ///
+    /// With monitoring on and an armed track's bound input heard by the
+    /// room, somebody is playing through the desk and hears themselves
+    /// straight: Play rolls from its first chunk and Stop is back at the
+    /// cursor in the pass that meets it, as with the setting off. The same
+    /// desk with monitoring off is nobody's monitor, and Play spins it up.
+    /// And a monitoring switch landing mid-start is a hard edge like every
+    /// other the motor is not allowed: the next pass is at speed.
+    #[test]
+    fn a_tracking_desk_plays_and_stops_at_once() {
+        let mut d = Tracking::new(1, true, true, false);
+        d.e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        assert!(d.tracking(), "a monitored, armed, bound input is not a tracking desk");
+        t.toggle_play();
+        let passes = d.run(&mut t, 40, PASS);
+        assert_eq!(passes[0].pos, PASS as u64, "Play on a tracking desk did not roll from its first chunk");
+        assert!(!ramped(&passes), "the tape spun up under a player");
+        t.stop();
+        let passes = d.run(&mut t, 8, PASS);
+        assert_eq!(passes[0].pos, 0, "Stop on a tracking desk did not return at once");
+        assert!(!ramped(&passes), "the tape wound down under a player");
+        // Monitoring off: nobody's monitor, and the tape spins.
+        let mut d = Tracking::new(1, false, true, false);
+        d.e.set_tape_motor(true, 0.5, 0.7);
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        assert!(!d.tracking(), "an unmonitored input is a tracking desk");
+        t.toggle_play();
+        let passes = d.until(&mut t, PASS, MotorShow::SpinningUp, 8);
+        assert!(ramped(&passes), "an unmonitored desk did not spin up");
+        // Monitoring switched on mid-start: at speed by the next pass.
+        d.run(&mut t, 20, PASS);
+        d.e.set_monitor_on(true);
+        let passes = d.run(&mut t, 20, PASS);
+        assert!(passes[2..].iter().all(|p| p.show == MotorShow::Running), "a monitoring switch mid-start did not snap the tape");
+    }
+
+    /// **An unmonitored desk holds its slowed tails; a tracking desk is
+    /// never held** (the review's C2, under the owner's ruling).
+    ///
+    /// A plate on the tone's lane and an armed input bound at -60 dBFS, the
+    /// stop at 0.2 s. Monitoring off: the tape winds down and the plate's
+    /// tail, slowed with it, would come back at full pitch the moment the
+    /// parked desk played on, so it is held: the output stays below
+    /// -90 dBFS while the plate's own strip meter, which reads before the
+    /// motor, says it still rings above the park floor. Monitoring on: the
+    /// motor stands aside, the stop is instant, and the tail is heard ring
+    /// out, never held.
+    #[test]
+    fn an_unmonitored_desk_holds_its_tails_and_a_tracking_desk_is_never_held() {
+        let ring = |e: &Engine| {
+            let cells = e.lane_shared(Slot(LANE as u32)).expect("the lane's numbers");
+            (0..2).map(|c| f32::from_bits(cells.peak[c].swap(0, Ordering::Relaxed))).fold(0.0f32, f32::max)
+        };
+        let mut d = Tracking::new(1, false, true, true);
+        d.e.set_tape_motor(true, 0.5, 0.2);
+        let mut t = Transport::new();
+        t.toggle_play();
+        d.run(&mut t, RATE as usize / PASS, PASS);
+        t.stop();
+        d.until(&mut t, PASS, MotorShow::Holding, 400);
+        let mut held = 0usize;
+        loop {
+            let p = d.one(&mut t, PASS);
+            if p.show != MotorShow::Holding {
+                break;
+            }
+            let plate = ring(&d.e);
+            assert!(db(f64::from(peak(&p.out)).max(1e-12)) < -90.0, "a held tail was heard: {}", peak(&p.out));
+            if plate > PARK_FLOOR {
+                held += 1;
+            }
+        }
+        assert!(held > 4, "the plate never rang while the tape held it, so nothing was proved");
+        // Monitored: nothing held, the tail heard.
+        let mut d = Tracking::new(1, true, true, true);
+        d.e.set_tape_motor(true, 0.5, 0.2);
+        let mut t = Transport::new();
+        t.toggle_play();
+        d.run(&mut t, RATE as usize / PASS, PASS);
+        t.stop();
+        let after = d.run(&mut t, 16, PASS);
+        assert!(!ramped(&after) && after.iter().all(|p| p.show != MotorShow::Holding), "a tracking desk was wound down or held");
+        assert!(after.iter().all(|p| db(f64::from(peak(&p.out))) > -90.0), "a tracking desk's tail was not heard");
+    }
+
+    /// **The input keeps its place through a ramp.**
+    ///
+    /// Under the motor the input is stretched by a step that moves, up to
+    /// 127 real frames a program frame near the floor, and its phase keeps
+    /// the lead such a step leaves, so what is consumed is what the device
+    /// delivered. Rings of one, two and six inputs fed at the device's rate,
+    /// the dial at rest, passes of 64, 256 and 512, through a start, a stop
+    /// to its hold and a re-spin: no frame is ever dropped as stale
+    /// (`monitor_slip` stays 0), the ring's backlog stays within what one
+    /// pass reads and the device's block, plus a pass, and nothing is NaN.
+    #[test]
+    fn the_input_keeps_its_place_through_a_ramp() {
+        for width in [1usize, 2, 6] {
+            for pass in [64usize, 256, 512] {
+                let what = format!("a {width}-wide input in {pass}-frame passes");
+                let mut d = Tracking::new(width, false, true, false);
+                d.e.set_tape_motor(true, 0.3, 0.4);
+                let mut t = Transport::new();
+                let mut passes = d.run(&mut t, 8, pass);
+                t.toggle_play();
+                passes.extend(d.until(&mut t, pass, MotorShow::Running, 4000));
+                t.stop();
+                passes.extend(d.until(&mut t, pass, MotorShow::Holding, 4000));
+                t.toggle_play();
+                passes.extend(d.until(&mut t, pass, MotorShow::Running, 4000));
+                assert!(ramped(&passes), "{what}: the tape never ramped");
+                assert_eq!(d.e.shared.monitor_slip.load(Ordering::Relaxed), 0, "{what}: input frames were dropped as stale");
+                let backlog = d.e.shared.monitor_backlog.load(Ordering::Relaxed) as usize;
+                assert!(backlog <= 3 * pass + PASS, "{what}: the ring backed up to {backlog} frames");
+                assert!(passes.iter().all(|p| p.out.iter().all(|s| s.is_finite())), "{what}: a NaN");
+            }
+        }
+    }
+
+    /// **A hardware loop, an IR job or a capture keeps the motor down.**
+    ///
+    /// A hardware insert's clock is measured against the device's frames,
+    /// an IR job plays and records at the jacks, and an arrangement capture
+    /// tapes the program at its rate: none of them may ride a ramp. With a
+    /// port claimed by an insert in circuit, an IR tone running, or a pick's
+    /// capture flag up, Play rolls from its first chunk and nothing ramps.
+    #[test]
+    fn a_hardware_loop_an_ir_job_or_a_capture_keeps_the_motor_down() {
+        let plays_at_once = |e: &mut Engine, what: &str| {
+            let mut t = Transport::new();
+            run(e, &mut t, 4, PASS);
+            t.toggle_play();
+            let passes = run(e, &mut t, 40, PASS);
+            assert_eq!(passes[0].pos, PASS as u64, "{what}: Play did not roll from its first chunk");
+            assert!(!ramped(&passes), "{what}: the tape spun up");
+        };
+        // A hardware loop: an insert on the tone's lane, its jacks on a
+        // six-channel device both ways.
+        let mut e = OFFLINE_WIDTH.with(|w| {
+            w.set(6);
+            let e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+            w.set(2);
+            e
+        });
+        e.shared.hw.set_live(true);
+        let (mut tx, rx) = RingBuffer::<f32>::new(RATE as usize * 6);
+        e.set_monitor(Some((rx, 6, vec![6].into_boxed_slice(), PASS as u32, tangent_record::audio::Picks::EVERYTHING)));
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::HWINSERT_PATH).expect("registered");
+        let lines = crate::units::hwinsert::state_lines(
+            Some(crate::units::hwinsert::Jacks::pair(2)),
+            Some(crate::units::hwinsert::Jacks::pair(4)),
+            None,
+        );
+        let state = crate::builtin_fx::state_text(spec, &spec.defaults(), &lines).into_bytes();
+        e.load_insert(lane_seat(LANE, CHAIN_OWN), 0, Some(Path::new(crate::builtin_fx::HWINSERT_PATH)), Some(&state))
+            .expect("the insert loads")
+            .expect("the bay reports it");
+        e.set_tape_motor(true, 0.5, 0.7);
+        let mut out = vec![0.0f32; PASS * 6];
+        for _ in 0..8 {
+            for _ in 0..PASS * 6 {
+                let _ = tx.push(0.0);
+            }
+            e.render_offline(&mut out);
+        }
+        assert!(e.offline.as_ref().is_some_and(|r| r.hw_lane_n > 0), "the insert claimed no port, so nothing was proved");
+        let mut t = Transport::new();
+        let mut out = vec![0.0f32; PASS * 6];
+        t.push(Some(&e));
+        e.render_offline(&mut out);
+        t.toggle_play();
+        let mut shows = Vec::new();
+        for k in 0..40 {
+            for _ in 0..PASS * 6 {
+                let _ = tx.push(0.0);
+            }
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+            if k == 0 {
+                assert_eq!(e.transport_position(), PASS as u64, "a hardware loop: Play did not roll from its first chunk");
+            }
+            shows.push(e.motor_show());
+        }
+        assert!(!shows.iter().any(|s| *s != MotorShow::Running && *s != MotorShow::Parked), "a hardware loop: the tape moved");
+        // An IR job: the level tone running on the jacks.
+        let mut e = tone_desk(RATE, 500.0, 4.0);
+        e.set_tape_motor(true, 0.5, 0.7);
+        e.start_ir_tone((0, 1), (0, 1), -20.0);
+        let mut out = vec![0.0f32; PASS * 2];
+        e.render_offline(&mut out);
+        assert!(e.offline.as_ref().is_some_and(|r| r.ir.is_some()), "the IR job never arrived");
+        plays_at_once(&mut e, "an IR job");
+        // A capture: the armed pick's flag up, unmonitored.
+        let mut d = Tracking::new(1, false, true, false);
+        d.e.set_tape_motor(true, 0.5, 0.7);
+        let armed = d.table.armed(&d.rows);
+        d.e.sync_capture_rings(&armed).expect("the armed pick's ring");
+        d.e.set_capturing(&[d.pick]);
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        t.toggle_play();
+        let passes = d.run(&mut t, 40, PASS);
+        assert_eq!(passes[0].pos, PASS as u64, "a capture: Play did not roll from its first chunk");
+        assert!(!ramped(&passes), "a capture: the tape spun up");
     }
 }

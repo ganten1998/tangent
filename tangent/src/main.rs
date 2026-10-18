@@ -82,6 +82,11 @@ mod loudness;
 /// Minimal build for it to sit between.
 #[cfg(feature = "recorder")]
 mod varispeed;
+/// The tape's start and stop: the motor that spins the whole desk up at Play
+/// and winds it down at Stop, through the varispeed path. Inside `recorder`
+/// with the path it drives.
+#[cfg(feature = "recorder")]
+mod motor;
 /// Time-stretching a clip. Inside `recorder` because it takes an
 /// `tangent_record::decode::Clip`, and a Minimal build does not link that crate
 /// at all.
