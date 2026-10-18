@@ -265,14 +265,14 @@ the legacy eight-sound arrays are still read at their own stride
 
 ### What changed in the engine
 
-- **The grands are mode banks.** The Intimate and the Concert Grand play `grand::GrandVoice`
-  on `modal::Bank` (768 modes), each partial a two-pole resonator placed on
-  the stiff-string series with a per-key B and a stretched tuning, its loss
-  read off a bridge admittance with board bumps, and three strings per course
-  coupled at the bridge, which is where the two-stage decay comes from. The
-  waveguide piano (`string.rs`) no longer plays any sound and has left the
-  voice pool; its code stays for its tests and the bench, and `Body` is still
-  both grands' board.
+- **The grands are mode banks.** The Intimate and the Concert Grand play
+  `grand::GrandVoice` on `modal::Bank` (768 modes), each partial a two-pole
+  resonator placed on the stiff-string series with a per-key B and a stretched
+  tuning, its loss read off a bridge admittance with board bumps, and three
+  strings per course coupled at the bridge, which is where the two-stage decay
+  comes from. The waveguide piano (`string.rs`) no longer plays any sound and
+  has left the voice pool; its code stays for its tests and the bench, and
+  `Body` is still both grands' board.
 - **Their strings are solved before anyone strikes them**
   (`grand::GrandDesigns`): every key of both grands at the knobs' centres in
   `new`, then brought to the knobs as they move, a key for every 64 frames
@@ -286,8 +286,8 @@ the legacy eight-sound arrays are still read at their own stride
   restrike, the una corda moving the hammer), each voice's ledger (each
   string's place and each mode's root, per partial) projects the strings'
   motion onto the new modes. It used to hand each mode's motion to the new
-  mode of the same index, which under the una corda is another mode: the Intimate Grand's
-  E5 at a tiny UNISON rang 13 times its first strike.
+  mode of the same index, which under the una corda is another mode: the
+  Intimate Grand's E5 at a tiny UNISON rang 13 times its first strike.
 - **The hammer is graded by key and velocity** (`hammer.rs`, a midpoint
   contact with a felt core that hardens with rate), with level and
   brightness set apart, so the level law follows the reference (v20/41/70/98
@@ -444,11 +444,12 @@ the lane reports in the study folder have the tables.
    comping, but the grands and the guitar fall away faster with velocity
    than the electric pianos: on the pedalled voicings they span 8.7 dB, the
    Concert Grand the quietest (the reference's own ten span 11.8).
-2. **The Intimate Grand's tone across velocity.** Its pianissimo is still 3 to 11 dB too
-   bright at C5, and its bass and tenor fortissimo 8 to 16 dB too dark at 4
-   to 8 kHz. Its C7 fortissimo tail stands 15 to 20 dB over the reference's
-   at 1.2 to 1.4 s, and its C8 holds its tone where the reference's drops 19
-   dB in its first 60 ms (the top row fails at -26.2 against -32.5).
+2. **The Intimate Grand's tone across velocity.** Its pianissimo is still 3 to
+   11 dB too bright at C5, and its bass and tenor fortissimo 8 to 16 dB too
+   dark at 4 to 8 kHz. Its C7 fortissimo tail stands 15 to 20 dB over the
+   reference's at 1.2 to 1.4 s, and its C8 holds its tone where the
+   reference's drops 19 dB in its first 60 ms (the top row fails at -26.2
+   against -32.5).
 3. **The grands' half pedal and una corda.** CC 64 at 64 misses its row at
    +1 s, and the una corda's C4 hold and partial changes still fail; the
    concert's C4 unison and aftersound, its treble image (median IPD 34
@@ -497,17 +498,16 @@ the lane reports in the study folder have the tables.
     -68 dB at 4096-frame calls, and its velocity and knob extremes -60 at
     1024. Each is a step landing up to a call later in an otherwise whole
     take, not a sound of its own.
-12. **What the reworked frame costs.** A STRETCH drag under a pedalled
-    chord costs more than it did (the Intimate Grand at 128 frames 73-78 us a block
-    to 111-114; the electric grand 23 to 43-46), as does the first landing
-    of a copied voice after the string table has moved off its knobs (1.7
-    to 2.3 times the old one). A lane that has never rendered pays 424 us
-    a block (4 %) at 512-frame buffers for about 11 blocks, where it paid
-    82 us for 44 or more; on a project load with many unarmed pianos that
-    adds up across lanes. The clavs cost 2 to 6 % more than before the
-    frame's grids.
-13. **The harp keeps the Intimate Grand awake after a pedal lift.** Its damped tail
-    runs down to the -146 dBFS floor, 2.7 s after the lift, and the lane
+12. **What the reworked frame costs.** A STRETCH drag under a pedalled chord
+    costs more than it did (the Intimate Grand at 128 frames 73-78 us a block
+    to 111-114; the electric grand 23 to 43-46), as does the first landing of
+    a copied voice after the string table has moved off its knobs (1.7 to 2.3
+    times the old one). A lane that has never rendered pays 424 us a block
+    (4 %) at 512-frame buffers for about 11 blocks, where it paid 82 us for 44
+    or more; on a project load with many unarmed pianos that adds up across
+    lanes. The clavs cost 2 to 6 % more than before the frame's grids.
+13. **The harp keeps the Intimate Grand awake after a pedal lift.** Its damped
+    tail runs down to the -146 dBFS floor, 2.7 s after the lift, and the lane
     is not idle until it does (CPU only; nothing over the floor is heard).
 14. **STRETCH's top.** At the knob's 1 C8 sits 128 cents over equal
     temperament, and the bass's 8th partial on the harp 10.5 to 12.7 cents
@@ -612,6 +612,7 @@ about the model and belongs in prose like this.
 The same holds for every sound since: "Intimate Grand", "Concert Grand",
 "Clav", "Reed 200", "Reed Amp", "Electric Grand" and "Nylon Guitar" are
 Tangent's names (the first two were "Piano 1" and "Piano 2" until 5.1.0; a
-saved strip keeps its sound, since the slot is stored by number), and the instruments
-they were voiced against are named in no patch, description or comment. The
-code and its comments call the measured instrument "the reference".
+saved strip keeps its sound, since the slot is stored by number), and the
+instruments they were voiced against are named in no patch, description or
+comment. The code and its comments call the measured instrument "the
+reference".
