@@ -116,7 +116,8 @@ pub struct TapeParams {
     pub wobble: f32,
     /// Tape hiss, and the modulation noise that rides the music. 0 is silent
     /// tape, which no real reel ever was; see [`HISS_GAIN`] and
-    /// [`JITTER_UM`].
+    /// [`JITTER_UM`]. The hiss is the tape's, under the record level, so it
+    /// falls as Drive rises and rises as Drive falls ([`HISS_DRIVE`]).
     pub hiss: f32,
     /// Output trim. 0.5 is unity; see [`TRIM_DB`].
     pub trim: f32,
@@ -395,6 +396,12 @@ const DESIGN_RATE: f32 = 44_100.0;
 /// Drive and Roll keep their saved values, too, because a state blob writes
 /// every symbol; only a fresh tape opens at the new defaults.
 const DRIVE_TANH: (f32, f32) = (0.1, 20.0);
+
+/// The record level a Drive dial position asks for, as `log2 d`: the
+/// geometric sweep of [`DRIVE_TANH`], the one place it is spelled.
+fn dial_log2_d(drive: f32) -> f64 {
+    f64::from(DRIVE_TANH.0).log2() + f64::from(drive) * f64::from(DRIVE_TANH.1 / DRIVE_TANH.0).log2()
+}
 
 /// How much of the flux the tape refused comes back one SESSION sample later.
 ///
@@ -863,13 +870,33 @@ const SUB_BLOCK: u64 = 32;
 /// is -69.0 dB(A) re 0 VU, -87.0 dBFS(A), 0.7 dB over 5.0's hiss at rest.
 /// The other speeds take the same flux's noise: 30 ips 3 dB quieter,
 /// 7.5 ips 1.5 dB quieter and 3.75 ips 2.5 dB louder, so -72.0, -70.5 and
-/// -66.5 dB(A) re 0 VU. The level does not follow Drive: at a fresh tape's
-/// datasheet alignment (Drive 0.5, the 3 % point 10.2 dB over 0 VU) the
-/// datasheet's noise would sit 4.3 dB higher, at Hiss 0.32. The knob's
-/// taper is squared, because ears meet noise in decibels, and `process`
-/// scales the gain so every rate puts the same hiss in every hertz.
+/// -66.5 dB(A) re 0 VU. Those are the levels at [`HISS_DRIVE`], and the
+/// hiss follows Drive from there, as it does on tape: see that constant.
+/// The knob's taper is squared, because ears meet noise in decibels, and
+/// `process` scales the gain so every rate puts the same hiss in every
+/// hertz.
 const HISS_GAIN: [f64; 4] = [8.619e-5, 8.613e-5, 1.023_7e-4, 1.133_2e-4];
 const HISS_EQ_US: [f64; 4] = [90.0, 50.0, 50.0, 17.5];
+
+/// **The Drive the hiss's level is quoted at, and why the hiss follows
+/// Drive from it.**
+///
+/// The bias noise is on the tape, and the tape does not know the record
+/// level. Recording hotter puts the music further above that noise, and
+/// the line-up then brings the music back down to 0 VU and the noise down
+/// with it; recording cooler does the opposite. So the hiss a person hears
+/// is the tape's noise over the record level: it falls as `1 / d` for the
+/// dial's `d` ([`DRIVE_TANH`]), the same `d` the record curve and the
+/// line-up read, so at small signal the coupling is exact. [`HISS_GAIN`]
+/// is quoted at 0.6, the hot alignment 5.0 shipped, so a fresh tape's 0.5,
+/// the datasheet alignment, sits 4.6 dB over it: -82.4 dBFS(A) at 15 ips,
+/// 64.4 dB(A) under 0 VU, where studio two-tracks at 15 ips measure 63 to
+/// 64. The bottom of the dial sits 27.6 dB over, a record level that low
+/// being as noisy as it is on any machine, and the top 18.4 dB under. The
+/// tape's modulation noise rides the music and is not rescaled
+/// ([`JITTER_UM`]). `the_hiss_falls_as_the_record_level_rises_as_it_does_on_tape`
+/// holds the law.
+const HISS_DRIVE: f32 = 0.6;
 
 /// Modulation noise, as the head's spacing jittering: its depth at Hiss 0.25
 /// in micrometres RMS, the most it can reach, and its bandwidth at 15 ips in
@@ -1695,7 +1722,10 @@ struct Voicing {
     low: f64,
     /// The hiss: its playback shelf ([`Section::playback_shelf`]) and its
     /// gain as `log2` ([`HISS_GAIN`]), blended in octaves so a glide moves
-    /// it in decibels.
+    /// it in decibels. The gain carries [`HISS_DRIVE`]'s record level and
+    /// this speed's `dmol`, so `process` follows Drive by multiplying it by
+    /// the `1 / d` the record curve already has: `dmol` cancels there, and
+    /// at [`HISS_DRIVE`] the hiss is [`HISS_GAIN`] at every speed.
     hiss_eq: [f64; 3],
     hiss_gain: f64,
     /// The modulation noise's one-pole at its bandwidth for this speed, and
@@ -1713,8 +1743,9 @@ impl Voicing {
         let floor = v_m / (ERASE_FLOOR_UM * 1.0e-6);
         let f_b = v_m / (BUMP_WAVELENGTH_MM * 1.0e-3);
         let jitter_a = f64::from(lp_a(sample_rate, JITTER_HZ_15 * speed.ips() / 15.0));
+        let dmol = -DMOL_DB[i] / 20.0 * std::f64::consts::LOG2_10;
         Self {
-            dmol: -DMOL_DB[i] / 20.0 * std::f64::consts::LOG2_10,
+            dmol,
             nab: Section::nab_shelf(NAB_SHELF_DB[i], sample_rate),
             erase: std::array::from_fn(|k| {
                 let e = ERASE_CLAMP * k as f64 / (ERASE_POINTS - 1) as f64;
@@ -1733,7 +1764,7 @@ impl Voicing {
             dip_g: bell_g(2.0 * f_b, sample_rate),
             low: tpt_g((HEAD_LF_SHARE * f_b).max(HEAD_LF_FLOOR_HZ), sample_rate),
             hiss_eq: Section::playback_shelf(HISS_EQ_US[i], 50.0, sample_rate),
-            hiss_gain: HISS_GAIN[i].log2(),
+            hiss_gain: HISS_GAIN[i].log2() + dial_log2_d(HISS_DRIVE) + dmol,
             jitter_a,
             // A one-pole `y += a (x - y)` driven by unit white noise has a
             // variance of `a / (2 - a)`; this hands it back.
@@ -2653,8 +2684,7 @@ impl Tape {
         );
         let speed = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial()));
         self.speed.target = speed as usize as f64;
-        self.drive.target = f64::from(DRIVE_TANH.0).log2()
-            + f64::from(drive) * f64::from(DRIVE_TANH.1 / DRIVE_TANH.0).log2();
+        self.drive.target = dial_log2_d(drive);
         self.bump_db.target = f64::from(BUMP_DB.0 + (BUMP_DB.1 - BUMP_DB.0) * bump);
         // Out of circuit, Roll's corner heads for the top of its sweep, and
         // the stage leaves the circuit only once it is there.
@@ -2877,7 +2907,10 @@ impl Tape {
 
             // ── the heads: the transport's sway and each track's noise ───
             let (delays, [studio, deep]) = self.heads();
-            let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain;
+            // The tape's noise over the record level ([`HISS_DRIVE`]): the
+            // voicing's gain carries the speed's `dmol`, which `1 / d`
+            // takes back out.
+            let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain * inv_d;
 
             for ch in 0..2 {
                 // The input transformer: keep DC and rumble out of the
@@ -3132,10 +3165,13 @@ pub fn bump_hz(p: &TapeParams) -> f32 {
 /// engine runs at. The shelf, Roll's one-pole when it is in circuit and the
 /// A-weighting are summed over the band's third octaves in octaves of
 /// frequency, which agrees with the integral to a hundredth of a decibel,
-/// and Trim adds its own decibels. The contour leaves it alone: its bell and
-/// its low end sit where the A-weighting has already taken thirty decibels.
-/// A fresh tape reads -87.0 dBFS(A), 0 VU less 69.0 dB(A), the datasheet
-/// figure [`HISS_GAIN`] is set to.
+/// and Drive and Trim add their own decibels: the record level's, 4.6 dB
+/// for every tenth of the dial under [`HISS_DRIVE`] and as much off for
+/// every tenth over, and the trim's. The contour leaves it alone: its bell
+/// and its low end sit where the A-weighting has already taken thirty
+/// decibels. A fresh tape reads -82.4 dBFS(A): the datasheet's -87.0, 0 VU
+/// less 69.0 dB(A) at [`HISS_DRIVE`], with the datasheet alignment's 4.6 dB
+/// on it.
 pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
     let hiss = norm(p.hiss);
     if hiss <= 0.0 {
@@ -3177,7 +3213,10 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
     // 2 dB low.
     let a_norm = 10.0_f64.powf(0.2);
     let trim = f64::from((norm(p.trim) - 0.5) * (TRIM_DB.1 - TRIM_DB.0));
-    (10.0 * (density * sum * step * a_norm).log10() + trim) as f32
+    // The tape's noise over the record level, `d` at [`HISS_DRIVE`] over `d`
+    // at the dial.
+    let drive = 20.0 * std::f64::consts::LOG10_2 * (dial_log2_d(HISS_DRIVE) - dial_log2_d(norm(p.drive)));
+    (10.0 * (density * sum * step * a_norm).log10() + trim + drive) as f32
 }
 
 /// The weighted peaks a fresh transport is calibrated to read at each
@@ -3592,8 +3631,8 @@ mod tests {
     /// the 50 µs its level is quoted behind: per hertz, 10 kHz against 1 kHz
     /// reads +4.0 dB at 3.75 ips (NAB 90 µs), level at 7.5 and 15 ips, and
     /// -6.6 dB at 30 (AES 17.5 µs), each within a decibel. (c) And the noise
-    /// a tone carries: a 1 kHz tone at 0 VU at 15 ips, Drive 0.6 and the
-    /// default Hiss, the transport still, carries a skirt at 800 Hz 72.5 dB
+    /// a tone carries: a 1 kHz tone at 0 VU at 15 ips, at a fresh tape's
+    /// Drive and Hiss, the transport still, carries a skirt at 800 Hz 72.5 dB
     /// under it in 10 Hz, within 3 dB, the figure studio machines measure.
     /// It is eleven 1 Hz bins of a one-second Hann window summed and scaled
     /// by `10 / (11 x 1.5)`: a Hann bin gathers 1.5 bins' worth of noise, so
@@ -3602,8 +3641,8 @@ mod tests {
     /// is left there is only the hiss, which is still there, above 1e-7 RMS:
     /// the noise that follows the music is around each note, not a swell.
     /// Measured: a slope of -0.20 dB an octave; +4.07, -0.11, -0.11 and
-    /// -6.71 dB; a skirt of -71.1 dB that falls to -101.3 once the tone
-    /// stops, over a floor of 6.2e-5 RMS.
+    /// -6.71 dB; a skirt of -70.9 dB that falls to -96.7 once the tone
+    /// stops, over a floor of 1.0e-4 RMS.
     #[test]
     fn the_hiss_is_white_behind_the_playback_eq_and_the_modulation_noise_rides_the_signal() {
         let sr = 48_000.0_f32;
@@ -3666,7 +3705,7 @@ mod tests {
 
         // (c) The skirt a tone carries, and what is left when it stops.
         let p = TapeParams {
-            drive: 0.6,
+            drive: TapeParams::default().drive,
             hiss: 0.25,
             ..TapeParams::NEUTRAL
         };
@@ -3706,29 +3745,36 @@ mod tests {
 
     /// **The hiss floor and colour follow each speed's datasheet.**
     ///
-    /// On silence, every colour off and the default Hiss, at 44.1 kHz, the
-    /// rate the levels are designed at: the hiss's density at 1 kHz is each
-    /// speed's datasheet noise behind its playback EQ, -128.7, -129.5,
-    /// -128.0 and -127.5 dB re full scale squared per hertz at 3.75, 7.5, 15
-    /// and 30 ips, within a decibel; and at 15 ips its A-weighted level is
-    /// -87.0 dBFS(A), -69.0 dB(A) re 0 VU, within 0.7 dB, measured as the
-    /// A-weighted sum of the third-octave bands the output actually carries.
-    /// Measured: -128.7, -129.3, -127.8 and -127.2 dB/Hz, and -86.9 dBFS(A).
+    /// On silence, every colour off, the default Hiss and a fresh tape's
+    /// Drive, at 44.1 kHz, the rate the levels are designed at. The
+    /// datasheet figures are quoted at [`HISS_DRIVE`], and a fresh tape's
+    /// record level is a tenth of the dial cooler, which puts its hiss
+    /// 4.6 dB over them: so the hiss's density at 1 kHz is each speed's
+    /// datasheet noise behind its playback EQ (-128.7, -129.5, -128.0 and
+    /// -127.5 dB re full scale squared per hertz at 3.75, 7.5, 15 and
+    /// 30 ips) with those 4.6 dB on it, -124.1, -124.9, -123.4 and -122.9,
+    /// within a decibel; and at 15 ips its A-weighted level is -82.4
+    /// dBFS(A), the datasheet's -87.0 (0 VU less 69.0 dB(A)) with the same
+    /// 4.6 dB, within 0.7 dB, measured as the A-weighted sum of the
+    /// third-octave bands the output actually carries. Measured: -124.1,
+    /// -124.7, -123.2 and -122.6 dB/Hz, and -82.3 dBFS(A).
     ///
     /// **And the figure a face prints is the one a meter reads.**
     /// [`hiss_dbfs_a`] works the same level out from the dials alone, and it
     /// must agree with the measured A-weighted level within half a decibel
     /// at every speed, at Hiss 0.1, 0.5 and 1 as well as 0.25, with Roll at
-    /// half travel and with Trim at +6 dB; it reads minus infinity at Hiss
-    /// 0, and a fresh tape reads the datasheet's -87.0 within a fifth of a
-    /// decibel. The meter's bands are each scaled to the noise bandwidth they
-    /// really pass, or their overlapping skirts would read a tenth of a
-    /// decibel hot. Measured: the meter 0.00 to 0.12 dB over the helper at
-    /// 3.75, 7.5 and 15 ips, at every Hiss and with the Trim (its sum reaches
-    /// past 20 kHz, where the helper's band stops), 0.37 over at 30 ips and
-    /// 0.32 with Roll at half travel, where the shelf's bilinear warp and
-    /// Roll's one-pole pass a little more treble at 44.1 kHz than the
-    /// analogue figures the helper sums; and -87.05 dBFS(A) for a fresh tape.
+    /// half travel, with Trim at +6 dB, and at the bottom and the top of
+    /// Drive, where the hiss sits 23.0 dB over a fresh tape's and 18.4 dB
+    /// under the datasheet's; it reads minus infinity at Hiss 0, and a fresh
+    /// tape reads -82.4 within a fifth of a decibel. The meter's bands are
+    /// each scaled to the noise bandwidth they really pass, or their
+    /// overlapping skirts would read a tenth of a decibel hot. Measured: the
+    /// meter 0.00 to 0.12 dB over the helper at 3.75, 7.5 and 15 ips, at
+    /// every Hiss and Drive and with the Trim (its sum reaches past 20 kHz,
+    /// where the helper's band stops), 0.37 over at 30 ips and 0.32 with
+    /// Roll at half travel, where the shelf's bilinear warp and Roll's
+    /// one-pole pass a little more treble at 44.1 kHz than the analogue
+    /// figures the helper sums; and -82.45 dBFS(A) for a fresh tape.
     #[test]
     fn the_hiss_floor_and_colour_follow_each_speeds_datasheet() {
         let sr = 44_100.0_f32;
@@ -3776,6 +3822,7 @@ mod tests {
             10.0 * weighted.log10()
         };
         let silence = vec![0.0; frames * 2];
+        let fresh = TapeParams::default().drive;
         let face_agrees = |p: &TapeParams, measured: f64, what: &str| {
             let told = f64::from(hiss_dbfs_a(p));
             assert!(
@@ -3784,8 +3831,9 @@ mod tests {
                  reads {measured:+.2}"
             );
         };
-        for (speed, want) in TapeSpeed::ALL.into_iter().zip([-128.7, -129.5, -128.0, -127.5]) {
+        for (speed, want) in TapeSpeed::ALL.into_iter().zip([-124.1, -124.9, -123.4, -122.9]) {
             let p = TapeParams {
+                drive: fresh,
                 hiss: 0.25,
                 speed: speed.dial(),
                 ..TapeParams::NEUTRAL
@@ -3802,17 +3850,20 @@ mod tests {
             face_agrees(&p, level, speed.label());
             if speed == TapeSpeed::Ips15 {
                 assert!(
-                    (level + 87.0).abs() < 0.7,
-                    "at 15 ips the hiss reads {level:+.2} dBFS(A), where the datasheet puts -87.0"
+                    (level + 82.4).abs() < 0.7,
+                    "at 15 ips the hiss reads {level:+.2} dBFS(A) at a fresh tape's Drive, where \
+                     the datasheet's -87.0 at Drive {HISS_DRIVE} puts -82.4"
                 );
             }
         }
         for (what, p) in [
-            ("Hiss 0.1", TapeParams { hiss: 0.1, ..TapeParams::NEUTRAL }),
-            ("Hiss 0.5", TapeParams { hiss: 0.5, ..TapeParams::NEUTRAL }),
-            ("Hiss 1", TapeParams { hiss: 1.0, ..TapeParams::NEUTRAL }),
-            ("Roll at half travel", TapeParams { hiss: 0.25, roll: 0.5, ..TapeParams::NEUTRAL }),
-            ("Trim at +6 dB", TapeParams { hiss: 0.25, trim: 0.75, ..TapeParams::NEUTRAL }),
+            ("Hiss 0.1", TapeParams { drive: fresh, hiss: 0.1, ..TapeParams::NEUTRAL }),
+            ("Hiss 0.5", TapeParams { drive: fresh, hiss: 0.5, ..TapeParams::NEUTRAL }),
+            ("Hiss 1", TapeParams { drive: fresh, hiss: 1.0, ..TapeParams::NEUTRAL }),
+            ("Roll at half travel", TapeParams { drive: fresh, hiss: 0.25, roll: 0.5, ..TapeParams::NEUTRAL }),
+            ("Trim at +6 dB", TapeParams { drive: fresh, hiss: 0.25, trim: 0.75, ..TapeParams::NEUTRAL }),
+            ("Drive 0", TapeParams { drive: 0.0, hiss: 0.25, ..TapeParams::NEUTRAL }),
+            ("Drive 1", TapeParams { drive: 1.0, hiss: 0.25, ..TapeParams::NEUTRAL }),
         ] {
             let out = left(&feed(&mut Tape::new(sr), &silence, &p));
             face_agrees(&p, dba(&out), what);
@@ -3822,11 +3873,68 @@ mod tests {
             f32::NEG_INFINITY,
             "silent tape is not silent to the face"
         );
-        let fresh = hiss_dbfs_a(&TapeParams::default());
+        let told = hiss_dbfs_a(&TapeParams::default());
         assert!(
-            (fresh + 87.0).abs() < 0.2,
-            "a fresh tape tells the face its hiss reads {fresh:+.2} dBFS(A), not the datasheet's -87.0"
+            (told + 82.4).abs() < 0.2,
+            "a fresh tape tells the face its hiss reads {told:+.2} dBFS(A), not the -82.4 its \
+             datasheet alignment puts it at"
         );
+    }
+
+    /// **The hiss falls as the record level rises, as it does on tape.**
+    ///
+    /// The bias noise is on the tape, under whatever record level put the
+    /// music there, and the line-up brings the music back to 0 VU and the
+    /// noise with it: the hiss a person hears is the tape's noise over the
+    /// record level `d` ([`HISS_DRIVE`]), so between two Drives it moves by
+    /// twenty times the log of their `d`s, the other way. On silence, every
+    /// colour off and the default Hiss, Drive 0.2 against 0.8, three fifths
+    /// of the dial's 46 dB sweep apart: the hiss reads 27.6 dB louder at 0.2,
+    /// within a tenth of a decibel, at 15 ips and at 3.75, where the speed
+    /// scales what the curve is asked for and the law must not care, and the
+    /// figure a face prints moves by the same. And the tape's modulation
+    /// noise, which rides the music rather than sitting under it, moves each
+    /// track's head by exactly as much at either Drive. Measured: 27.61 dB
+    /// at both speeds, and the head's furthest jitter bit for bit the same.
+    #[test]
+    fn the_hiss_falls_as_the_record_level_rises_as_it_does_on_tape() {
+        let sr = 48_000.0_f32;
+        let silence = vec![0.0_f32; (sr * 1.0) as usize * 2];
+        let skip = (sr * 0.1) as usize * 2;
+        let law = 20.0 * (dial_log2_d(0.8) - dial_log2_d(0.2)) * std::f64::consts::LOG10_2;
+        for speed in [TapeSpeed::Ips15, TapeSpeed::Ips3_75] {
+            let at = |drive: f32| {
+                let p = TapeParams {
+                    drive,
+                    hiss: 0.25,
+                    speed: speed.dial(),
+                    ..TapeParams::NEUTRAL
+                };
+                let mut unit = Tape::new(sr);
+                let out = feed(&mut unit, &silence, &p);
+                (rms(&out[skip..]), unit.deepest()[0], f64::from(hiss_dbfs_a(&p)))
+            };
+            let ((cool, cool_jitter, cool_told), (hot, hot_jitter, hot_told)) = (at(0.2), at(0.8));
+            let moved = db(cool / hot);
+            assert!(
+                (moved - law).abs() < 0.1,
+                "at {} the hiss reads {moved:+.2} dB louder at Drive 0.2 than at 0.8, where the \
+                 record levels are {law:.2} dB apart",
+                speed.label()
+            );
+            assert!(
+                (cool_told - hot_told - law).abs() < 0.01,
+                "at {} the face is told the hiss moves {:+.2} dB between Drive 0.2 and 0.8, not {law:.2}",
+                speed.label(),
+                cool_told - hot_told
+            );
+            assert!(
+                cool_jitter > 0.0 && cool_jitter == hot_jitter,
+                "at {} the modulation noise moved the head {cool_jitter} samples at Drive 0.2 and \
+                 {hot_jitter} at 0.8: it rides the music, and the record level does not scale it",
+                speed.label()
+            );
+        }
     }
 
     /// **Nothing the six knobs can reach may blow up.** Every combination of
