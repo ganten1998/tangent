@@ -83,6 +83,11 @@ const CALIBRATION_STEPS: usize = 256;
 /// two flux values differ by far more than an `f32` can lose subtracting them.
 const SLOPE_STEP: f32 = 0.01;
 
+/// Points per period in [`Transducer::coil_spectrum`]. A power of two is not
+/// needed (it is a plain sum, not an FFT); sixty-four keeps a strike's two
+/// spectra at 256 flux evaluations, under a microsecond.
+const SPECTRUM_POINTS: usize = 64;
+
 /// The shallowest slope the normalisation will divide by. A characteristic
 /// flatter than this across the whole swing is a plate parked so far from the
 /// metal that it hears nothing, and the right output of a plate that hears
@@ -153,6 +158,15 @@ impl Curve {
             }
             Curve::Exponential { scale } => (-x / scale).exp(),
         }
+    }
+
+    /// `f(x)` at the absolute position `x`, for an instrument that reads the
+    /// characteristic in a closed form of its own and takes its reference
+    /// values from the curve itself: the reed's plate is read rest-referred,
+    /// `C(x₀ ± x) − C(x₀)` without cancellation, and its rest value `C(x₀)`
+    /// comes from here (`reed::Plate`).
+    pub fn at(self, x: f32) -> f32 {
+        self.flux(x)
     }
 }
 
@@ -252,13 +266,11 @@ impl Transducer {
     }
 
     /// The static characteristic `f` at absolute position `x`, offset not
-    /// applied — for tests, and for a consumer whose wave variable is already
-    /// a velocity and wants the curve without the derivative (the clavinet
-    /// reading Gabrielli's way, which is how `pickup.py` measures that row).
-    ///
-    /// Both of those consumers are outside the shipped path, so nothing in
-    /// the binary calls it — the doc above is the reason it stays.
-    #[allow(dead_code)]
+    /// applied — for tests, for a consumer whose wave variable is already a
+    /// velocity and wants the curve without the derivative (the clav
+    /// reading Gabrielli's way, which is how `pickup.py` measures that row),
+    /// and for the clav's coils, which advance their flux a sample at a
+    /// time and re-take it exactly from here once a block (`clav::Coil`).
     pub fn flux(&self, x: f32) -> f32 {
         self.curve.flux(x)
     }
@@ -283,6 +295,7 @@ impl Transducer {
     /// we lose is a real instrument's tendency to get brighter and louder up
     /// the keyboard; that is a per-patch decision the level curves already
     /// make, and this file declines to make it a second time.
+    #[allow(dead_code)] // The normalised read: this file's tests pin it; the tine reads `tick_unnormalised` and the reed's plate the closed form (`Curve::at`).
     pub fn tick(&mut self, x: f32, omega0_per_sample: f32) -> f32 {
         let now = self.curve.flux(self.x0 + x);
         if !self.primed {
@@ -292,6 +305,77 @@ impl Transducer {
         let out = (now - self.prev) * self.norm / omega0_per_sample.max(OMEGA_FLOOR);
         self.prev = now;
         out
+    }
+
+    /// `tick` without the normalisation: `(f(now) − f(previous)) / omega0`,
+    /// the coil referred to the note's fundamental and nothing else.
+    ///
+    /// **For a consumer that owns its level.** `norm` is re-measured at
+    /// every `calibrate`, and a consumer that recalibrates under a ringing
+    /// note (a strike landing on one) steps its output by the ratio of the
+    /// two norms in one sample. One that sets its own output gain at the
+    /// strike — and can glide it — reads the coil raw and multiplies by its
+    /// own number; [`Self::coil_spectrum`] is measured in the same raw units,
+    /// so the two agree by construction. Same memory and the same `primed`
+    /// rule as `tick`; the two may not be mixed on one note.
+    pub fn tick_unnormalised(&mut self, x: f32, omega0_per_sample: f32) -> f32 {
+        let now = self.curve.flux(self.x0 + x);
+        if !self.primed {
+            self.prev = self.curve.flux(self.x0);
+            self.primed = true;
+        }
+        let out = (now - self.prev) / omega0_per_sample.max(OMEGA_FLOOR);
+        self.prev = now;
+        out
+    }
+
+    /// The fundamental's amplitude and the RMS of the whole output that
+    /// [`Self::tick_unnormalised`] would produce for a sinusoid of `swing`
+    /// about the current rest position: one period sampled at
+    /// [`SPECTRUM_POINTS`] points, the coil read as `f′(x₀ + s·sin θ)·s·cos θ`
+    /// (the derivative referred to ω₀, which is what the backward difference
+    /// converges to at a note's own frequency), `f′` by the same central
+    /// difference `calibrate` uses.
+    ///
+    /// **Strike-time, and the reason it exists.** A consumer that wants a
+    /// level law separate from what the swing does to the timbre needs to
+    /// know, before the note sounds, how loud this regulation makes this
+    /// swing: the RMS is that number, Parseval over every harmonic the curve
+    /// makes. Sixty-four points resolve harmonics to the thirty-first,
+    /// beyond anything the tables this module carries ask for (the deepest
+    /// bark measured is still 10 dB down by the sixteenth). Raw units — the
+    /// normalisation is not applied — so it pairs with `tick_unnormalised`.
+    pub fn coil_spectrum(&self, swing: f32) -> (f32, f32) {
+        self.spectrum_about(self.x0, swing)
+    }
+
+    /// [`Self::coil_spectrum`] about a rest position of the caller's choosing,
+    /// clamped as [`Self::set_offset`] clamps it, leaving this transducer as it
+    /// is: what the coil WOULD put out at another regulation. For a consumer
+    /// that is moving its rest position and has to know, at a strike, how the
+    /// coil hears a swing both where the tip is and where it is going.
+    pub fn coil_spectrum_at(&self, x0: f32, swing: f32) -> (f32, f32) {
+        let floor = OFFSET_FLOOR * self.curve.scale();
+        let x0 = if x0.abs() < floor { floor.copysign(x0) } else { x0 };
+        self.spectrum_about(x0, swing)
+    }
+
+    fn spectrum_about(&self, x0: f32, swing: f32) -> (f32, f32) {
+        let h = SLOPE_STEP * self.curve.scale();
+        let s = swing.abs();
+        let (mut re, mut im, mut sq) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for i in 0..SPECTRUM_POINTS {
+            let th = std::f32::consts::TAU * i as f32 / SPECTRUM_POINTS as f32;
+            let (sn, cs) = (super::sine_apart(th), th.cos());
+            let x = x0 + s * sn;
+            let slope = (self.curve.flux(x + h) - self.curve.flux(x - h)) / (2.0 * h);
+            let out = slope * s * cs;
+            sq += out * out;
+            re += out * cs;
+            im += out * sn;
+        }
+        let n = SPECTRUM_POINTS as f32;
+        ((re * re + im * im).sqrt() * 2.0 / n, (sq / n).sqrt())
     }
 
     /// Forget the previous sample.
@@ -813,6 +897,39 @@ mod tests {
         t.set_offset(0.3);
         let first = t.tick(0.0, omega());
         assert_eq!(first, 0.0, "the first tick differentiated from the OLD rest value");
+    }
+
+    /// `coil_spectrum` is what `tick_unnormalised` puts out: the same
+    /// sinusoid rendered through the coil and measured by a Hann DFT over
+    /// whole periods, at the inflection, on the flank and in saturation,
+    /// fundamental and RMS both within 1 %. (The tine's level law divides by
+    /// this number; if the two disagreed, every level in that file would be
+    /// off by the disagreement.)
+    #[test]
+    fn coil_spectrum_is_what_the_raw_coil_puts_out() {
+        for (x0, swing) in [(0.4675_f32, 0.2_f32), (0.25, 0.3), (0.25, 0.9), (0.55, 1.6)] {
+            let mut t = rhodes();
+            t.set_offset(x0);
+            t.calibrate(swing);
+            let (h1, rms) = t.coil_spectrum(swing);
+            t.clear();
+            let w = std::f32::consts::TAU * F0 / RATE;
+            let w64 = TAU * F0 as f64 / RATE as f64;
+            let sig: Vec<f32> = (0..HONEST_N).map(|i| t.tick_unnormalised(swing * (w64 * i as f64).sin() as f32, w)).collect();
+            let tail = &sig[2400..];
+            let m = tail.iter().map(|&v| f64::from(v)).sum::<f64>() / tail.len() as f64;
+            let got_rms = (tail.iter().map(|&v| (f64::from(v) - m).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+            let n = tail.len();
+            let (mut re, mut im) = (0.0_f64, 0.0_f64);
+            for (i, &v) in tail.iter().enumerate() {
+                let win = 0.5 - 0.5 * (TAU * i as f64 / n as f64).cos();
+                re += f64::from(v) * win * (w64 * i as f64).cos();
+                im += f64::from(v) * win * (w64 * i as f64).sin();
+            }
+            let got_h1 = re.hypot(im) * 4.0 / n as f64;
+            println!("x0 {x0} swing {swing}: h1 {h1:.5} against {got_h1:.5}, rms {rms:.5} against {got_rms:.5}");
+            assert!((f64::from(h1) / got_h1 - 1.0).abs() < 0.01 && (f64::from(rms) / got_rms - 1.0).abs() < 0.01);
+        }
     }
 
     /// Two arithmetic guards, each with the line that removes it. A note

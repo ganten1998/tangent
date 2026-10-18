@@ -2638,7 +2638,13 @@ impl DeskSnap {
                 im.insert("keys_patch".into(), counts(rows.iter().map(|r| r.keys.patch).collect()));
                 im.insert(
                     "keys_params".into(),
-                    Value::Array(rows.iter().flat_map(|r| r.keys.params.iter().map(|v| serde_json::json!(v))).collect()),
+                    // At the legacy rack's stride, which is what every reader
+                    // of this dense key expects (`desk_model::V32_KEYS_SPAN`).
+                    Value::Array(
+                        rows.iter()
+                            .flat_map(|r| r.keys.params.iter().take(crate::desk_model::V32_KEYS_SPAN).map(|v| serde_json::json!(v)))
+                            .collect(),
+                    ),
                 );
                 m.insert("instruments".into(), Value::Object(im));
             }

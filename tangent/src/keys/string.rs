@@ -28,6 +28,14 @@
 //! **What the body is.** A plate with modes (`board.rs`), driven through the
 //! bridge, with the old feedback delay network kept behind it for the
 //! diffuse tail. See `Body`.
+//!
+//! **What still plays here.** No patch plays the waveguide voice: Piano 1
+//! and Piano 2 are the modal grand (`grand.rs`) since 2026-10-17. The voice
+//! stays as the real struck string that the harp's tests (`symp.rs`) and the
+//! grand's tests strike and that keysrig's `solo_string` measures, so its
+//! items carry `allow(dead_code)` in the app build. `Body` is still both
+//! grands' soundboard, and the loop's filters (`Lp`, `Ap`, `design_loss`)
+//! serve the clav and the harp.
 
 use super::{board, hammer, Patch, PianoKnobs};
 
@@ -100,6 +108,10 @@ struct Knock {
     b2: [f32; 2],
 }
 
+#[allow(dead_code)]
+// The waveguide piano's knock: no patch plays it since the modal grand
+// took Piano 1 and Piano 2 (see the module doc); its tests, the harp's
+// and the grand's tests and keysrig's `solo_string` still strike it.
 impl Knock {
     /// Throw the action. Lands on whatever the last throw left ringing —
     /// the same superposition as `tine::Mode::kick_add`, for the same
@@ -116,7 +128,7 @@ impl Knock {
             let r = 10.0_f32.powf(-3.0 / (T60[i] * rate)).clamp(0.0, 0.999_9);
             self.b1[i] = 2.0 * r * w.cos();
             self.b2[i] = -(r * r);
-            let seed = amp * MIX[i] * r * w.sin();
+            let seed = amp * MIX[i] * r * super::sine_apart(w);
             if self.y1[i] == 0.0 && self.y2[i] == 0.0 {
                 self.y1[i] = seed;
             } else {
@@ -280,10 +292,10 @@ impl Ap {
     }
 }
 
-/// One string of a unison — and, `pub(super)`, one string of anything
-/// else strung on a bridge: the clav borrows this whole loop rather than
-/// growing its own, because a struck-and-held string is a struck-and-held
-/// string whichever cabinet it lives in.
+/// One string of the waveguide's unison. The clav once borrowed this whole
+/// loop; it has its own now and borrows only the loop's filters (`Lp`, `Ap`).
+#[allow(dead_code)]
+// The waveguide's string: see `PianoVoice`'s allow.
 pub(super) struct Str {
     buf: [f32; MAX_DELAY],
     write: usize,
@@ -295,6 +307,8 @@ pub(super) struct Str {
     pub(super) gain: f32,
 }
 
+#[allow(dead_code)]
+// The waveguide's string: see `PianoVoice`'s allow.
 impl Str {
     pub(super) fn new() -> Self {
         Str {
@@ -390,7 +404,7 @@ impl Str {
 /// frequency keeps "0 cents at the fundamental" true by construction rather
 /// than by luck.
 pub(super) fn loop_phase_delay(w: f32, p: f32, ap: f32) -> f32 {
-    let (sw, cw) = w.sin_cos();
+    let (sw, cw) = (super::sine_apart(w), w.cos());
     // One-pole H = g(1-p)/(1 - p e^{-jw}): real numerator, so the phase is
     // minus the denominator's argument.
     let lp = (p * sw).atan2(1.0 - p * cw);
@@ -475,6 +489,10 @@ pub struct PianoVoice {
     knock: Knock,
 }
 
+#[allow(dead_code)]
+// The waveguide piano: no patch plays it since the modal grand
+// took Piano 1 and Piano 2 (see the module doc); its tests, the harp's
+// and the grand's tests and keysrig's `solo_string` still strike it.
 impl PianoVoice {
     pub fn new(sample_rate: f32) -> Self {
         PianoVoice {
@@ -1024,9 +1042,26 @@ impl Body {
         self.pedal = down;
     }
 
+    /// Silence the body outright: every line, every one-pole of the
+    /// network's loss, the follower and the plate's ring. The coefficients,
+    /// the pedal and the plate stay: they are the patch's and the foot's.
+    ///
+    /// **The one-poles too.** Each line is written through its own loss
+    /// (`damp`), and a one-pole's state is the last thing it was fed: left
+    /// set, it poured back into the cleared line on the next tick and came
+    /// out a line's length later at full gain. The grands clicked 20 to 42
+    /// ms after all notes off cleared them, and a patch changed a block
+    /// after it heard the old soundboard (verifier: a second difference of
+    /// -56.6 and -52.2 dBFS on Piano 1 and Piano 2 there, where key-ups and
+    /// a pedal lift leave -61.0 and -58.6). The write heads may stay where
+    /// they are: a line of zeros reads the same from anywhere in it
+    /// (`a_reset_body_is_a_new_one`).
     pub fn reset(&mut self) {
         for l in &mut self.lines {
             l.fill(0.0);
+        }
+        for d in &mut self.damp {
+            d.z = 0.0;
         }
         self.energy = 0.0;
         self.board.clear();
@@ -1369,74 +1404,6 @@ mod tests {
         assert!(!me.contains(word), "a width curve is back in string.rs");
     }
 
-    /// **Acceptance A2, the partial table.** `keysrig piano report`'s
-    /// levels at C4 mezzo, partials 1..=8, against the table the
-    /// instrument was signed off with (`BASE_PARTIALS`, base 898cbfb):
-    /// each within 2 dB, the notched eighth still under the report's find
-    /// threshold. This is a re-derivation, not a re-voicing: the level
-    /// scale (`LOOP_UNITS_PER_MPS`) is the one number tuned, and it was
-    /// tuned on the VELOCITY table's mean, not here.
-    #[test]
-    fn the_partials_at_mezzo_stay_where_they_were_signed_off() {
-        for (patch, base, stiff) in [
-            (Patch::Piano1, BASE_PARTIALS, 1.0_f32),
-            (Patch::Piano2, BASE2_PARTIALS, 0.85),
-        ] {
-            let x = render(patch, &[], &[(0.0, Ev::On(60, 90)), (6.0, Ev::Off(60))], 2.2, false);
-            let got = partial_levels_of(&x, 8, stiff);
-            let mut worst = 0.0_f32;
-            for n in 0..7 {
-                let d = got[n] - base[n];
-                println!("{patch:?} n{}: {:+7.1} dB (signed off {:+7.1}, moved {d:+.1})", n + 1, got[n], base[n]);
-                worst = worst.max(d.abs());
-            }
-            println!("{patch:?} n8: {:+7.1} dB (was under the -107 dB find threshold)", got[7]);
-            assert!(worst <= 2.0, "{patch:?}: a mezzo partial moved {worst:.1} dB");
-            assert!(got[7] < -100.0, "{patch:?}: n8 came out of the strike notch at {:.1} dB", got[7]);
-        }
-    }
-
-    /// **Acceptance A2, the velocity table.** The twelve rows of `keysrig
-    /// piano report`'s velocity response on E4 keep their shape: after one
-    /// overall gain (the mean offset, printed and stated in the doc of
-    /// `LOOP_UNITS_PER_MPS`) every row's peak sits within 2 dB of the
-    /// signed-off table. The bright-partials column is printed beside it:
-    /// a felt pulse is not a Gaussian, and where it differs is stated in
-    /// `HammerBase::JAZZ`'s doc rather than tuned away here.
-    #[test]
-    fn the_velocity_table_keeps_its_shape() {
-        for (patch, base_pk, base_bell) in [
-            (Patch::Piano1, BASE_PEAK, BASE_BELL),
-            (Patch::Piano2, BASE2_PEAK, BASE2_BELL),
-        ] {
-            let x = render(patch, &[], &velramp_events(), 20.5, false);
-            let t = velocity_table(&x);
-            let gain = (0..12).map(|i| t[i].0 - base_pk[i]).sum::<f32>() / 12.0;
-            let mut worst = 0.0_f32;
-            let mut worst_bell = 0.0_f32;
-            println!("{patch:?}: overall gain {gain:+.2} dB");
-            for i in 0..12 {
-                let v = (8 + i * 11).min(127);
-                let d = t[i].0 - gain - base_pk[i];
-                let db_ = t[i].1 - base_bell[i];
-                println!(
-                    "  {v:3}  peak {:+6.1} (drift {d:+.1})  bell/f0 {:+6.1} (drift {db_:+.1})  asym {:.3}",
-                    t[i].0, t[i].1, t[i].2
-                );
-                worst = worst.max(d.abs());
-                worst_bell = worst_bell.max(db_.abs());
-            }
-            println!("  worst peak drift {worst:.2} dB, worst bell drift {worst_bell:.1} dB");
-            assert!(worst <= 2.0, "{patch:?}: a velocity row drifted {worst:.1} dB after one gain");
-            assert!(gain.abs() < 3.0, "{patch:?}: the overall gain is {gain:.1} dB, not a calibration");
-            // The sweep itself: the bright partials rise with velocity,
-            // and by about what they used to.
-            let sweep = t[11].1 - t[0].1;
-            let base_sweep = base_bell[11] - base_bell[0];
-            assert!((sweep - base_sweep).abs() < 8.0, "{patch:?}: bell sweep {sweep:.1} dB vs {base_sweep:.1}");
-        }
-    }
-
     /// The rail velocity under the hammer, as `tick` reads it.
     fn rail_velocity(v: &PianoVoice) -> f32 {
         let at = v.strike as f32;
@@ -1682,9 +1649,14 @@ mod tests {
     }
 
     /// The body's level under `comp` with the plate in, against the
-    /// network alone at the level it had before the plate — within 1 dB,
-    /// with the two halves at equal power. Prints both halves, which is
-    /// how `BOARD_SEND` was set.
+    /// network alone at the level it had before the plate. Prints both
+    /// halves, which is how `BOARD_SEND` was set: on the waveguide piano's
+    /// drive, where the two halves sat at equal power and the total within
+    /// 1 dB of the network before the plate. Piano 1 is the modal grand
+    /// now, whose bridge puts less into the plate's band: the total reads
+    /// -1.33 dB with the plate 2.1 dB under the network (2026-10-17), and
+    /// both grands were voiced on that body. Pinned there, so a change to
+    /// the body or to the grand's drive shows here.
     #[test]
     fn the_body_keeps_its_level_with_the_plate_in() {
         let ev = comp_events();
@@ -1701,8 +1673,58 @@ mod tests {
             "body under comp: before {:.1} dBFS; now network {:.1} + plate {:.1} = {:.1} dBFS ({:+.2} dB); plate/network {:+.1} dB",
             db(before), db(fdn_rms), db(plate_rms), db(after), db(after / before), db(plate_rms / fdn_rms)
         );
-        assert!((db(after / before)).abs() <= 1.0, "the body moved {:+.2} dB", db(after / before));
+        let moved = db(after / before);
+        assert!((moved + 1.33).abs() <= 0.5, "the body moved {moved:+.2} dB (the grands were voiced at -1.33)");
         assert!((db(plate_rms / fdn_rms)).abs() <= 3.0, "the split is not near equal power");
+    }
+
+    /// **A reset body is a new one.** Sixteen histories (bridge noise of a
+    /// random length and level, the pedal thrown at random, on either
+    /// grand's plate), then `reset`: driven by the same signal from there,
+    /// silence first and then a burst, the body renders exactly what one
+    /// built fresh renders, to the bit, both channels. The pedal and the
+    /// plate are kept on purpose (the foot's and the patch's), so the fresh
+    /// body is given them. The network's one-pole states were left set and
+    /// came back out of the cleared lines a line's length later.
+    #[test]
+    fn a_reset_body_is_a_new_one() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        for trial in 0..16 {
+            let patch = if trial % 2 == 0 { Patch::Piano1 } else { Patch::Piano2 };
+            let mut used = Body::new(RATE);
+            used.set_patch(patch);
+            let level = 10.0_f32.powf(-3.0 * rnd());
+            let len = 1_000 + (rnd() * 30_000.0) as usize;
+            for i in 0..len {
+                if i % 997 == 0 {
+                    used.set_pedal(rnd() > 0.5);
+                }
+                used.tick(level * (2.0 * rnd() - 1.0));
+            }
+            used.reset();
+            let mut fresh = Body::new(RATE);
+            fresh.set_patch(patch);
+            fresh.set_pedal(used.pedal);
+            // Longer than the longest line (41.9 ms) of silence, so a
+            // leftover has its whole way round, then a burst to ring.
+            for i in 0..4_800 {
+                let x = if i >= 2_400 && i < 2_600 { 0.3 * (2.0 * rnd() - 1.0) } else { 0.0 };
+                let (a, b) = (used.tick(x), fresh.tick(x));
+                assert!(
+                    a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits(),
+                    "trial {trial} ({patch:?}): the reset body differs from a new one {i} samples on ({:e} against {:e})",
+                    a.0,
+                    b.0
+                );
+                assert_eq!(used.ringing(), fresh.ringing(), "trial {trial} ({patch:?}): the reset body rings where a new one does not, {i} samples on");
+            }
+        }
     }
 
     /// Diagnostic: the restrike across one period of a ringing ff C4 —

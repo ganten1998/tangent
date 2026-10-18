@@ -608,4 +608,38 @@ mod tests {
             assert!(mono > 0.5, "{plate:?} cancels in mono ({mono:.3})");
         }
     }
+
+    /// **Test 6.** A cleared board is a new one, and so is a board moved
+    /// to another plate: after a history of noise at a random level and
+    /// length, `clear` (and `set_plate` to the other plate) leaves only the
+    /// design, which is the plate's, and the same signal from there renders
+    /// what a board built for that plate renders, to the bit.
+    #[test]
+    fn a_cleared_board_is_a_new_one() {
+        let mut seed = 0xB0A2_D5EE;
+        for trial in 0..12 {
+            let plate = if trial % 2 == 0 { Plate::Jazz } else { Plate::Concert };
+            let other = if trial % 2 == 0 { Plate::Concert } else { Plate::Jazz };
+            let level = 10.0_f32.powf(-3.0 * uniform(&mut seed) as f32);
+            let len = 500 + (uniform(&mut seed) * 40_000.0) as usize;
+            let mut cleared = Board::new(RATE, plate);
+            let mut moved = Board::new(RATE, plate);
+            for _ in 0..len {
+                let x = level * noise(&mut seed);
+                cleared.tick(x);
+                moved.tick(x);
+            }
+            cleared.clear();
+            moved.set_plate(other);
+            let (mut fresh, mut fresh_other) = (Board::new(RATE, plate), Board::new(RATE, other));
+            for i in 0..4_800 {
+                let x = if (1_000..1_200).contains(&i) { noise(&mut seed) } else { 0.0 };
+                let (a, b) = (cleared.tick(x), fresh.tick(x));
+                let (c, d) = (moved.tick(x), fresh_other.tick(x));
+                assert!(a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits(), "trial {trial}: a cleared {plate:?} board differs from a new one {i} samples on");
+                assert!(c.0.to_bits() == d.0.to_bits() && c.1.to_bits() == d.1.to_bits(), "trial {trial}: a board moved to {other:?} differs from a new one {i} samples on");
+                assert!(cleared.ringing() == fresh.ringing() && moved.ringing() == fresh_other.ringing(), "trial {trial}: a cleared or moved board rings where a new one does not, {i} samples on");
+            }
+        }
+    }
 }

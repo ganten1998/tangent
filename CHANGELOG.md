@@ -10,6 +10,57 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **Tangent Keys has ten sounds: an Electric Grand and a Nylon Guitar join
+  the eight.** They take two new places after Reed Amp, so a saved track
+  keeps the sound it had. The Electric Grand is short, stiff strings read
+  by pickups, with no soundboard, and strings of its own that ring in
+  sympathy under the pedal. The Nylon Guitar plays six strings: each note
+  goes to the string a hand would choose, the open strings and the body's
+  air ring with what is played, and a key below the low E or past the
+  fingerboard is silent.
+- **The two pianos half-pedal, hold a sostenuto and shift for the una
+  corda.** The sustain, sostenuto and soft pedals (CC 64, 66 and 67) reach
+  them as levels: the dampers follow the sustain part way down, the
+  sostenuto holds the keys that are down when it is pressed (sounding or
+  not), and the soft pedal moves the hammers. Every other sound hears the
+  sustain as a switch, as before.
+
+### Changed
+
+- **Every Tangent Keys sound was re-voiced against measurements.** Each was
+  compared with a reference instrument one measured quantity at a time (a
+  partial's decay, a velocity law, the level of the ring around a note, a
+  release) on the same key at the same velocity, against tolerances set
+  before anything was fitted; `docs/KEYS.md` has the tables. Piano 1 is now
+  an intimate, close-miked grand and Piano 2 a concert grand. Both are new
+  instruments: banks of string modes in place of the old waveguides, three
+  strings to a note coupled at the bridge (which is where a piano's
+  two-stage decay comes from), a hammer graded by key and velocity, the
+  action's knock and the dampers' thump, and sympathetic strings that ring
+  around every note and after it. The tine pianos, the clavs and the reed
+  piano kept their mechanisms and were refitted.
+- **Reed 140 is now Reed Amp**, the reed piano through its amplifier: the
+  cabinet's slap, its throb and a room. A track saved on Reed 140 opens on
+  Reed Amp with the knobs it had; its Tremolo now sets the depth of the
+  amplifier's throb.
+- **The two pianos and the Electric Grand play A0 to C8.** A key outside a
+  piano's 88 is silent on them, as it is on the instrument.
+- **A Keys track sounds the same at any buffer size.** Each voice's control
+  (a damper's fall, a hammer's contact, a tremolo, the wah's follower) used
+  to run once per audio buffer, so the same performance at 64 frames and
+  at 512 came out slightly different. Every voice now keeps its own clock:
+  five of the ten render the same to the bit at any buffer size, and the
+  rest within -74 dB of it.
+- **Levels moved with the re-voicing.** At the same velocities Piano 1 now
+  plays 3 to 5 dB quieter than before through the middle of its range and
+  Piano 2 5 to 8 dB (at fortissimo both are where they were), EP Suitcase 2
+  to 4 dB quieter, and the two clavs 3 to 9 dB louder. A mix balanced on
+  the old sounds may want its faders looked at.
+- **A Keys track holds 22.5 MB** (5.7 MB before), all of it taken when the
+  track is made, never while it plays.
+
 ## [5.0.0] - 2026-10-12
 
 The version the arrangement became real in: buses and returns, folders that

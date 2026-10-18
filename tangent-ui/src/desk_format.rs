@@ -1125,6 +1125,31 @@ mod tests {
         }
     }
 
+    /// **A row written before the keyboard grew keeps its knobs, and the new
+    /// sounds start at their own.** Format 2 stores a row's knobs as one flat
+    /// list, sound after sound; a desk saved with the eight-sound rack has a
+    /// list `V32_KEYS_SPAN` long. Its knobs are the head of the live row
+    /// (`Patch::ALL` is append-only), and every sound appended since reads
+    /// its shipped defaults rather than zeros or the neighbour's values.
+    #[test]
+    fn a_row_from_the_eight_sound_rack_reads_the_new_sounds_at_their_defaults() {
+        use crate::desk_model::V32_KEYS_SPAN;
+        let old: Vec<f64> = (0..V32_KEYS_SPAN).map(|i| (i % 7) as f64 / 8.0).collect();
+        let mut d = desk(vec![row(0)]);
+        d["rows"][0]["keys"] = serde_json::json!({ "patch": 7, "params": old });
+        let m = read(&d).expect("readable").model;
+        let keys = &m.rows[0].keys;
+        assert_eq!(keys.patch, 7);
+        assert_eq!(keys.params.len(), KEYS_SPAN);
+        assert_eq!(&keys.params[..V32_KEYS_SPAN], &old[..], "the saved sounds' knobs moved");
+        assert_eq!(
+            &keys.params[V32_KEYS_SPAN..],
+            &crate::dialogs::keys_params_default(1)[V32_KEYS_SPAN..],
+            "an appended sound did not start at its shipped knobs"
+        );
+        assert_eq!(read(&write(&m)).expect("rewritten").model, m);
+    }
+
     /// **Huge numbers allocate nothing**: ids, chains, jacks and the
     /// counter at the top of their types read as numbers, never as sizes.
     #[test]

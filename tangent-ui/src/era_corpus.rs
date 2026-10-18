@@ -1117,7 +1117,7 @@ fn fnv(text: &str) -> u64 {
 /// **What production writes for the default settings**, pinned at the
 /// flip (W4-integrate (B)): the format-2 file a fresh install's first save
 /// writes, stamp included. The fixtures' are `FORMAT2_BYTES` below.
-const DEFAULT_V2_BYTES: (u64, usize) = (0xa396_60c0_9bc5_d8bc, 29342);
+const DEFAULT_V2_BYTES: (u64, usize) = (0xe028_4149_425a_c38c, 30430);
 
 /// **Production writes the format-2 bytes**, stamps included, for every
 /// fixture and for the default settings: `WRITE_V8` is on, so what a user's
@@ -1382,34 +1382,42 @@ fn a_refused_desk_refuses_the_open_and_touches_nothing() {
 /// than committed files: each is some seventy kilobytes, nearly all of it
 /// the Keys rack's knobs, and `write_format_2_fixtures` writes them out for
 /// reading. Re-pin only with a deliberate change to the format.
+///
+/// Re-pinned with `DEFAULT_V2_BYTES` on 2026-10-17 for the keyboard's
+/// ninth and tenth sounds and its re-voiced defaults (the clav's Pickup
+/// 0.35 to 0.6, the reeds' Width, Tremolo and Growl): every file differs
+/// from its earlier pin in its rows' `keys.params` alone, at those knobs
+/// and in the appended sounds' shipped defaults, checked structurally
+/// against the earlier writer's output (`default-settings.json` is dumped
+/// beside them for the same check).
 const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
-    ("settings-v12.json", 0xcf90_7463_db04_c1cc, 69416),
-    ("settings-v17-pads16.json", 0x36b9_6067_72e0_c1b4, 69632),
-    ("settings-v18.json", 0x9591_043b_1e5a_7765, 69633),
-    ("settings-v19.json", 0xdfd3_71f3_c4ca_0f37, 70933),
+    ("settings-v12.json", 0xf80e_d0d9_6db1_cc82, 77160),
+    ("settings-v17-pads16.json", 0x4d20_e813_09b9_5c46, 77376),
+    ("settings-v18.json", 0xc90d_44e1_3b60_6ee5, 77377),
+    ("settings-v19.json", 0x4fc2_14c5_5b32_5053, 78677),
     // Lifted (`desk_lift::V24_LIFT`, on with the switch since W4-integrate
     // (B)): the window's buses and master on the specials, its pads on
     // their rows. Unlifted it wrote 0xbee3_aa56_2a6b_446b, 72152.
-    ("settings-v20-27.json", 0x3309_53c6_5839_c883, 72161),
-    ("settings-v20.json", 0xd266_9919_ec06_d8a5, 73278),
-    ("settings-v21.json", 0x5a2d_3407_fbbd_b9b2, 72085),
-    ("settings-v22.json", 0xa193_416c_708e_f3be, 72120),
-    ("daw-3x.json", 0x034e_5ee6_cbc7_03a9, 68925),
-    ("daw-4x.json", 0x120d_564a_9e54_1e19, 69321),
-    ("daw-5x.json", 0x1e6a_62dc_dca0_7b27, 70258),
+    ("settings-v20-27.json", 0xc33d_7c4f_ad06_84ef, 79905),
+    ("settings-v20.json", 0x9e7e_be7f_44bb_7a4d, 81022),
+    ("settings-v21.json", 0x2096_b471_2d6c_7348, 79829),
+    ("settings-v22.json", 0x55be_1dc5_3ee3_ede8, 79864),
+    ("daw-3x.json", 0x0d97_ad93_d952_23bb, 76669),
+    ("daw-4x.json", 0xaf17_1b77_e6ed_e0ff, 77065),
+    ("daw-5x.json", 0xc049_f263_aa3a_3d59, 78002),
     // **The documents read their drum row's badge** (W6): a document from
     // before the badges derives them as it is read, the drum where the
     // drumpad stands, where the derivation ran at the apply while the desk
     // had arrays to leave empty. Each of the six below differs from its
     // earlier pin by that one `"icon": 1` and nothing else (checked by
     // reverting it, which gives the earlier pin back byte for byte).
-    ("doc-v4-11.json", 0x5ca1_e730_c50a_a7cd, 66404),
-    ("doc-v5-18.json", 0x8671_a662_6ca4_04b8, 67366),
-    ("doc-v5-19.json", 0xf207_0839_7671_ddb1, 67363),
+    ("doc-v4-11.json", 0x0659_5de6_fedb_123d, 74148),
+    ("doc-v5-18.json", 0x7344_d5a8_dd20_bfda, 75110),
+    ("doc-v5-19.json", 0x5935_245b_4a23_9807, 75107),
     // Lifted, as `settings-v20-27.json`. Unlifted: 0xba6f_3803_9396_0a03, 68492.
-    ("doc-v6-27.json", 0x243f_e05a_2567_c399, 68512),
-    ("doc-v6-35.json", 0xd16d_ec65_b25c_1213, 69099),
-    ("doc-v7.json", 0x31ec_7056_1847_6121, 69323),
+    ("doc-v6-27.json", 0xc97f_dce6_7d2f_80cd, 76256),
+    ("doc-v6-35.json", 0xb2c0_241b_88d7_aa45, 76843),
+    ("doc-v7.json", 0xe7ba_8593_1aad_eaef, 77067),
 ];
 
 /// The format-2 bytes this build writes for every legacy fixture, by name.
@@ -1443,4 +1451,7 @@ fn write_format_2_fixtures() {
     for (name, text) in written_v2() {
         std::fs::write(dir.join(name), text).expect("write");
     }
+    // And what a fresh install writes (`DEFAULT_V2_BYTES`), compact as
+    // production writes it.
+    std::fs::write(dir.join("default-settings.json"), Settings::default().to_json()).expect("write");
 }

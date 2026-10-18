@@ -6,7 +6,8 @@
 //! has ever tuned an instrument model.
 //!
 //!   cargo run --release -- <patch> <performance> <out.wav>
-//!   patches: piano piano2 ep suitcase clav clavwah wurli wurli140
+//!   patches: piano piano2 ep suitcase clav clavwah reed reedamp egrand guitar
+//!   (wurli and wurli140 still name the two reed patches)
 //!
 //!   cargo run --release -- restrike     the consecutive-strike report, every
 //!                                       patch and the DX7 (see `report_restrike`)
@@ -230,8 +231,10 @@ fn patch_label(patch: Patch) -> &'static str {
         Patch::EpSuitcase => "EP Suitcase",
         Patch::Clav => "Clav",
         Patch::ClavWah => "Clav Wah",
-        Patch::Wurli200 => "Wurli 200",
-        Patch::Wurli140 => "Wurli 140",
+        Patch::Wurli200 => "Reed 200",
+        Patch::Wurli140 => "Reed Amp",
+        Patch::ElectricGrand => "Electric Grand",
+        Patch::Guitar => "Nylon Guitar",
     }
 }
 
@@ -293,6 +296,18 @@ fn report_velocity(patch: Patch) {
         // second and third harmonics, absent feathered, arriving with
         // force. The bar's own overtones are colour, not the story.
         Patch::Wurli200 | Patch::Wurli140 => vec![f0 * 2.0, f0 * 3.0],
+        // The electric grand's B at E4, near 4.1e-4 (`egrand::EGrandBase`).
+        Patch::ElectricGrand => (5..=10)
+            .map(|n| n as f32 * f0 * (1.0 + 4.1e-4 * (n * n) as f32).sqrt())
+            .collect(),
+        // The plucked string's upper half, on its own measured stiffness
+        // (E4 is the top string open).
+        Patch::Guitar => {
+            let bb = keys::guitar::Place::home(64).map_or(0.0, keys::guitar::inharmonicity) as f32;
+            (5..=10)
+                .map(|n| n as f32 * f0 * (1.0 + bb * (n * n) as f32).sqrt() / (1.0 + bb).sqrt())
+                .collect()
+        }
     };
     let mut first_hf = 0.0_f32;
     for i in 0..12 {
@@ -375,6 +390,17 @@ fn report_partials(patch: Patch) {
                 let r = [1.0, 2.0, 3.0, 4.4 * drop, 14.6 * drop];
                 f0 * r.get(n - 1).copied().unwrap_or(n as f32)
             }
+            // The electric grand's B at C4 (`egrand::EGrandBase`).
+            Patch::ElectricGrand => {
+                let n = n as f32;
+                n * f0 * (1.0 + 3.5e-4 * n * n).sqrt()
+            }
+            // C4 is the B string at the first fret, partial 1 on f0 exactly.
+            Patch::Guitar => {
+                let b = keys::guitar::Place::home(60).map_or(0.0, keys::guitar::inharmonicity) as f32;
+                let n = n as f32;
+                n * f0 * (1.0 + b * n * n).sqrt() / (1.0 + b).sqrt()
+            }
         }
     };
     let count = match patch {
@@ -382,6 +408,8 @@ fn report_partials(patch: Patch) {
         Patch::EpMk1 | Patch::EpSuitcase => 6,
         Patch::Clav | Patch::ClavWah => 10,
         Patch::Wurli200 | Patch::Wurli140 => 5,
+        Patch::ElectricGrand => 10,
+        Patch::Guitar => 10,
     };
     // t60 source: one string, one strike, no unison, no body — the decay
     // DESIGN, cleanly. Everything else in the table is the full instrument.
@@ -1389,8 +1417,10 @@ fn main() {
         Some("piano2") => Patch::Piano2,
         Some("clav") => Patch::Clav,
         Some("clavwah") => Patch::ClavWah,
-        Some("wurli") => Patch::Wurli200,
-        Some("wurli140") => Patch::Wurli140,
+        Some("reed" | "wurli") => Patch::Wurli200,
+        Some("reedamp" | "wurli140") => Patch::Wurli140,
+        Some("egrand") => Patch::ElectricGrand,
+        Some("guitar") => Patch::Guitar,
         _ => Patch::Piano1,
     };
     let perf = args.get(2).cloned().unwrap_or_else(|| "single".into());

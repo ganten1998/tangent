@@ -3792,24 +3792,34 @@ pub const SAMPLER_NAME: &str = "Tangent Sampler";
 /// see the audio crate. The engine's `keys::Patch::ALL` is the same list in the
 /// same order; the index is the contract between them, which is why the
 /// settings key stores a number.
-pub const KEYS_PATCHES: usize = 8;
+pub const KEYS_PATCHES: usize = 10;
 /// APPENDED, never reordered: the first two indices were in settings files
-/// for months before the other six existed, and the index IS the contract.
+/// for months before the rest existed, and the index IS the contract. Slot 7
+/// kept its index when it became the reed piano through its amp: a saved
+/// strip there keeps its knobs.
 pub const KEYS_PATCH_NAMES: [(&str, &str); KEYS_PATCHES] = [
-    ("Piano 1", "jazz grand, voiced for solo playing"),
+    ("Piano 1", "intimate grand, heard close: soft felt, wood and the action"),
     (
         "EP Mk.1",
         "tine electric piano, dry - light is bell, hard is bark",
     ),
-    ("Piano 2", "concert grand: longer ring, sweeter top, wider swing"),
+    ("Piano 2", "concert grand: longer ring, deeper bass, wider swing"),
     (
         "EP Suitcase",
         "the same tines through their own amp - the stereo throb",
     ),
     ("Clav", "struck-and-held strings, a sliding pickup, taken dry"),
     ("Clav Wah", "the same strings through a filter that chases your touch"),
-    ("Reed 200", "reed piano, transistor amp: hollow soft, growling hard"),
-    ("Reed 140", "the tube reed piano: darker, and never entirely clean"),
+    ("Reed 200", "reed piano, dry: hollow soft, growling hard"),
+    ("Reed Amp", "the reed piano through its amp: slap, cabinet, throb, room"),
+    (
+        "Electric Grand",
+        "stage grand: short stiff strings heard through pickups",
+    ),
+    (
+        "Nylon Guitar",
+        "six nylon strings under a fingertip, the open ones ringing along",
+    ),
 ];
 
 /// How many knobs a keyboard sound exposes, and what they are.
@@ -3884,7 +3894,7 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
         ("Voicing", "tangent tip: worn soft to fresh hard", 0.5),
         ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
         ("Decay", "how long a held string rings", 0.5),
-        ("Pickup", "where the coil sits under the string", 0.35),
+        ("Pickup", "where the coil sits under the string", 0.6),
         ("Tone", "the filter rockers, folded to one sweep", 0.75),
         ("Snap", "how much of the muted length rejoins the string at release", 0.5),
         ("Release", "how fast the yarn chokes the string", 0.5),
@@ -3894,7 +3904,7 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
         ("Voicing", "tangent tip: worn soft to fresh hard", 0.5),
         ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
         ("Decay", "how long a held string rings", 0.5),
-        ("Pickup", "where the coil sits under the string", 0.35),
+        ("Pickup", "where the coil sits under the string", 0.6),
         ("Wah", "how hard the filter chases your touch", 0.55),
         ("Snap", "how much of the muted length rejoins the string at release", 0.5),
         ("Release", "how fast the yarn chokes the string", 0.5),
@@ -3902,23 +3912,55 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
     ],
     [
         ("Voicing", "hammer felt: worn soft to packed hard", 0.5),
-        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Width", "how far bass and treble sit apart", 0.0),
         ("Decay", "how long the reed rings", 0.5),
         ("Reed", "how much of the bar's own metal speaks", 0.5),
         ("Growl", "the reed's regulation: where it rests in the plate's field", 0.5),
-        ("Tremolo", "the amp's throb", 0.4),
+        ("Tremolo", "the amp's throb", 0.0),
         ("Release", "how fast the damper stops the reed", 0.5),
         ("Thump", "the hammer's knock against the reed", 0.5),
     ],
     [
         ("Voicing", "hammer felt: worn soft to packed hard", 0.5),
-        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Width", "how far bass and treble sit apart", 0.0),
         ("Decay", "how long the reed rings", 0.5),
         ("Reed", "how much of the bar's own metal speaks", 0.5),
-        ("Growl", "the reed's regulation: where it rests in the plate's field", 0.62),
-        ("Tremolo", "the amp's throb", 0.0),
+        ("Growl", "the reed's regulation: where it rests in the plate's field", 0.5),
+        ("Tremolo", "the amp's throb", 0.5),
         ("Release", "how fast the damper stops the reed", 0.5),
         ("Thump", "the hammer's knock against the reed", 0.5),
+    ],
+    [
+        ("Voicing", "hammer felt: needled soft to lacquered hard", 0.5),
+        ("Width", "how differently the two pickup rails hear a string", 1.0 / 1.5),
+        ("Decay", "how long a struck string rings", 0.5),
+        (
+            "Brilliance",
+            "how long the upper partials ring: the wire's friction",
+            0.5,
+        ),
+        (
+            "Unison",
+            "detune between the strings of a course: the beating",
+            0.5,
+        ),
+        ("Stretch", "string stiffness, which pulls the partials sharp", 0.5),
+        ("Release", "how fast the damper stops a string", 0.5),
+        ("Pickup", "where the pickups read the strings: round to thin", 0.5),
+    ],
+    [
+        ("Voicing", "the plucking finger: flesh to nail", 0.5),
+        ("Width", "how far apart the two close microphones hear it", 1.0 / 1.5),
+        ("Decay", "how long a plucked string rings", 0.5),
+        (
+            "Position",
+            "where the finger plucks: near the bridge or over the soundhole",
+            0.5,
+        ),
+        ("Body", "how much the hollow body's air speaks", 0.5),
+        ("Pick", "how long the finger holds the string before letting go", 0.5),
+        ("Release", "how fast a lifted finger stops the string", 0.5),
+        ("Strings", "the open strings that ring in sympathy", 0.5),
     ],
 ];
 
@@ -3927,6 +3969,37 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
 /// chances to write one sound's knob into another's slot.
 pub fn keys_param_index(ch: usize, patch: usize, knob: usize) -> usize {
     (ch * KEYS_PATCHES + patch) * KEYS_PARAMS + knob
+}
+
+/// **The rack every legacy file was written in**: eight sounds of eight
+/// knobs. Settings carried it from 2026-09-01 (`strip_keys_params8`) and
+/// documents from 2026-09-12 (`instruments.keys_params`), both after the
+/// keyboard reached eight sounds, and format 2 replaced both before it grew
+/// past them; so a legacy array is laid out at THIS stride whatever
+/// [`KEYS_PATCHES`] becomes, and the legacy readers and writers index it
+/// with [`keys_param_index_v32`] alone. The live rack's first eight sounds
+/// are the same sounds in the same order (`Patch::ALL` is append-only), so
+/// a legacy row's knobs are the head of a live row's.
+pub const V32_KEYS_PATCHES: usize = 8;
+const _: () = assert!(KEYS_PATCHES >= V32_KEYS_PATCHES);
+
+/// [`keys_param_index`] at the legacy stride ([`V32_KEYS_PATCHES`]).
+pub fn keys_param_index_v32(ch: usize, patch: usize, knob: usize) -> usize {
+    (ch * V32_KEYS_PATCHES + patch) * KEYS_PARAMS + knob
+}
+
+/// [`keys_params_default`] at the legacy stride: the shipped knobs of the
+/// first [`V32_KEYS_PATCHES`] sounds, per channel.
+pub fn keys_params_default_v32(channels: usize) -> Vec<f64> {
+    let mut out = vec![0.0; channels * V32_KEYS_PATCHES * KEYS_PARAMS];
+    for ch in 0..channels {
+        for (patch, specs) in KEYS_PARAM_SPECS.iter().take(V32_KEYS_PATCHES).enumerate() {
+            for (knob, spec) in specs.iter().enumerate() {
+                out[keys_param_index_v32(ch, patch, knob)] = f64::from(spec.2);
+            }
+        }
+    }
+    out
 }
 
 /// A whole desk's worth of knobs at their initialised values.

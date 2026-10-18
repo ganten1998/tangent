@@ -64,6 +64,11 @@ use crate::routing::{LaneKey, LaneRoute, LaneTarget};
 /// laid out as one channel's slice of `Settings::strip_keys_params`.
 pub const KEYS_SPAN: usize = KEYS_PATCHES * KEYS_PARAMS;
 
+/// One LEGACY row's Keys knobs: [`KEYS_SPAN`] at the legacy rack of
+/// [`crate::dialogs::V32_KEYS_PATCHES`] sounds, the span every dense legacy
+/// array was written in. A legacy row is the head of a live row.
+pub const V32_KEYS_SPAN: usize = crate::dialogs::V32_KEYS_PATCHES * KEYS_PARAMS;
+
 /// **What a row is for.** No kind (`None` on [`TrackRow::kind`]) is a row
 /// that holds nothing of its own yet: a bare added track, a folder header,
 /// the indented plus, or a vacant legacy row.
@@ -1166,8 +1171,11 @@ impl DeskModel {
                     patch: v.dx7_patch.get(r).copied().unwrap_or(0),
                 };
                 row.keys.patch = v.keys_patch.get(r).copied().unwrap_or(0);
-                if let Some(p) = v.keys_params.get(r * KEYS_SPAN..(r + 1) * KEYS_SPAN) {
-                    row.keys.params = p.to_vec();
+                // The legacy rack's sounds are the live rack's first ones, in
+                // order, so a legacy row fills the head of the row's knobs
+                // and every sound added since keeps its shipped values.
+                if let Some(p) = v.keys_params.get(r * V32_KEYS_SPAN..(r + 1) * V32_KEYS_SPAN) {
+                    row.keys.params[..V32_KEYS_SPAN].copy_from_slice(p);
                 }
                 row.frozen = v.frozen.get(r).cloned().flatten();
                 // Strip space: the frozen map puts row r at strip r.
@@ -1410,7 +1418,7 @@ pub(crate) fn route_text(e: &RouteEdge) -> String {
 /// identity rule); nothing live keeps one.
 ///
 /// Channel arrays are [`V32_CHANNELS`] long (`keys_params` that times
-/// [`KEYS_SPAN`]), strip arrays 36 (names, colours) or 35 (sends; the
+/// [`V32_KEYS_SPAN`]), strip arrays 36 (names, colours) or 35 (sends; the
 /// master has none), masks are bits of strip space. Seats are the V32 flat
 /// map, sparse: `inserts[flat] = path`, `bypass` as `(seat, bay)`. Routes
 /// and keys keep their legacy lane and strip numbers.
@@ -1468,7 +1476,7 @@ impl V22Desk {
             dx7_cartridge: vec![String::new(); c],
             dx7_patch: vec![0; c],
             keys_patch: vec![0; c],
-            keys_params: crate::dialogs::keys_params_default(c),
+            keys_params: crate::dialogs::keys_params_default_v32(c),
             frozen: vec![None; c],
             names: vec![String::new(); V32_STRIPS + 1],
             colors: vec![0; V32_STRIPS + 1],
@@ -2032,7 +2040,7 @@ mod tests {
             v.dx7_cartridge[r] = format!("c{r}.syx");
             v.dx7_patch[r] = r;
             v.keys_patch[r] = r % 8;
-            v.keys_params[r * KEYS_SPAN + r] = 0.123;
+            v.keys_params[r * V32_KEYS_SPAN + r] = 0.123;
             v.frozen[r] = (r % 7 == 0).then(|| Frozen { path: format!("f{r}.wav"), len_s: r as f64 });
         }
         for s in 0..36 {
@@ -2080,6 +2088,9 @@ mod tests {
             assert_eq!((row.dx7.cart.as_str(), row.dx7.patch), (format!("c{r}.syx").as_str(), r));
             assert_eq!(row.keys.patch, r % 8);
             assert_eq!(row.keys.params[r], 0.123);
+            // The sounds past the legacy rack keep their shipped knobs.
+            assert_eq!(row.keys.params.len(), KEYS_SPAN);
+            assert_eq!(&row.keys.params[V32_KEYS_SPAN..], &crate::dialogs::keys_params_default(1)[V32_KEYS_SPAN..]);
             assert_eq!(row.frozen, v.frozen[r]);
             assert_eq!((row.name.as_str(), row.color), (format!("s{r}").as_str(), 100 + r as i64));
             assert_eq!(row.added, bit(0xdead_beef, r), "row {r} added");

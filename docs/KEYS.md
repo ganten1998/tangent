@@ -1,30 +1,46 @@
-# Tangent Keys — a piano and an electric piano, computed
+# Tangent Keys: ten instruments, computed
 
 Built 2026-09-01 against `main` at "Pertinent entries, taken slowly"
 (`ea77eeb`, 5.0.0-dev). Written for whoever changes the physics next.
 
-Since then the instrument grew to eight sounds — two of each mechanism —
-and on 2026-09-04/05 its physics was reworked against a brief of its own
-(`tangent-keys-handoff/KEYS-REWORK-BRIEF.md`). Everything below still
-describes how the thing is built and why; **"The physics rework" near the
-end says what changed and what it was measured against**, and where the two
-disagree the later section is the current instrument.
+Since then the instrument has moved three times. It grew to eight sounds,
+two of each mechanism; on 2026-09-04/05 its physics was reworked against a
+brief of its own (`tangent-keys-handoff/KEYS-REWORK-BRIEF.md`); and on
+2026-10-16/17 every sound was re-voiced against measured renders of a
+reference instrument and two sounds were added. Everything below
+still describes how the thing is built and why, but **"The physics rework"
+says what changed in September and "The reference study (2026-10)" what
+changed in October**, and where two sections disagree the later one is the
+current instrument.
 
 ## What it is
 
 A third built-in instrument beside Tangent DX7 and Tangent Drums, on the
 sentinel `@tangent-keys`. It contains **no samples**. Every note is computed
-from a model of the mechanism, which is why it ships two convincing
-instruments in a few hundred lines and no data at all:
+from a model of the mechanism, which is why it ships ten instruments and no
+data at all:
 
-- **Piano 1** — a jazz grand, voiced for solo playing.
-- **EP Mk.1** — a tine electric piano, taken dry. Bell-like when it is played
+- **Piano 1**: an intimate grand heard close, soft felt, wood and the action.
+- **EP Mk.1**: a tine electric piano, taken dry. Bell-like when it is played
   lightly and it barks when it is not.
+- **Piano 2**: a concert grand, a longer ring, a deeper bass and a wider
+  swing.
+- **EP Suitcase**: the same tines through their own amp, with its stereo
+  throb.
+- **Clav**: struck-and-held strings read by two coils, taken dry.
+- **Clav Wah**: the same strings through a filter that chases the touch.
+- **Reed 200**: a reed piano, dry: hollow when soft, growling when hard.
+- **Reed Amp**: the reed piano through its amp, its slap, cabinet, throb and
+  room.
+- **Electric Grand**: a stage grand, short stiff strings heard through
+  pickups and no soundboard.
+- **Nylon Guitar**: six nylon strings under a fingertip, the open ones
+  ringing along.
 
-Load it in any MIDI channel's first bay, exactly as the DX7 loads — in as
+Load it in any MIDI channel's first bay, exactly as the DX7 loads, in as
 many bays as you like, because every lane owns a full instance of the
 instrument: a piano track and an EP track in one session, or eight of either,
-each with its own settings. Clicking the bay opens a window with the two
+each with its own settings. Clicking the bay opens a window with the ten
 sounds and, under whichever is chosen, that sound's own rack of eight.
 
 The first cut had no knobs at all, on the argument that every control on a
@@ -45,8 +61,16 @@ which pulls the partials sharp), **Release** (the damper's speed) and
 **Soundboard**. The electric piano has Voicing, Width, Decay, **Bell** (the
 chime on the attack), **Bark** (how hard the tine leans on the pickup),
 **Chime** (where the bell partial sits above the note), Release and
-**Tonebar**. Showing one fixed rack with half of it inert would be a lie
-about both instruments.
+**Tonebar**; the suitcase trades Chime for its amp's **Tremolo**. The clavs
+have **Pickup** (where the coil sits under the string), **Tone** or **Wah**,
+**Snap** and **Mute** (the sliding damper pad); the reed pianos **Reed**,
+**Growl** (where the reed rests in the plate's field), **Tremolo** and
+**Thump**; the electric grand the piano's string knobs with a **Pickup**
+(where the pickups read the strings) in place of the soundboard; the guitar
+**Position** (where the finger plucks), **Body** (the hollow body's air),
+**Pick** (how long the finger holds the string before letting go) and
+**Strings** (the open strings that ring in sympathy). Showing one fixed rack
+with half of it inert would be a lie about every one of these instruments.
 
 **Every knob's default is the bench's own number.** The mappings are written
 so that the centre lands exactly on the constant this instrument was tuned
@@ -194,6 +218,294 @@ to 33x, the clavinet 108x to 61x, the Wurlitzer 69x to 62x. The floor is 25x
 and the machine was under load in every one of those readings; the brief's own
 idle baseline for the piano was 78x.
 
+## The reference study (2026-10)
+
+On 2026-10-16 to 18 every sound was re-voiced against measured renders of a
+reference instrument, and two sounds were
+added. The method was measurement, not copying: the reference was only ever
+driven offline (MIDI in, WAV out, no audio device), and everything taken
+from it is a number read off its output: a partial's decay, a velocity law,
+a halo's level, a release slope. No code, data or preset of the reference is
+in this module, and the mechanisms are this module's own. Where a fit and a
+physical argument disagreed, the argument won and the difference is written
+down where the number lives. The study itself, with every table it
+measured, is in the owner's handoff folder (`tangent-keys-handoff/`).
+
+Each sound was built by its own lane against a written brief, checked by an
+adversarial verifier that re-measured it, and fixed. The integrated frame
+then had two reviews and eight more lanes of the same kind, which fixed its
+pedals and edges, solved the grands' strings ahead and paid for them by the
+frames that go by, carried a landing's motion onto its new modes, and made
+the host's buffer size no part of the sound. The acceptance tables compare
+each sound with its reference row by row (a row is one measured quantity on
+one key at one velocity, with a tolerance the brief set before anything was
+fitted; the counts are as each sound's own lane last measured them):
+
+| slot | sound | mechanism | voiced against | rows passing |
+|---|---|---|---|---|
+| 0 | Piano 1 | `grand` (modal) + `symp` | an intimate, close-miked grand | 107 of 138 (55 before) |
+| 1 | EP Mk.1 | `tine` | a dry tine piano | 15 of 16 |
+| 2 | Piano 2 | `grand` (modal) + `symp` | a concert grand | 80 of 110 (37 before) |
+| 3 | EP Suitcase | `tine` | a tine piano through its amp | 10 of 11 |
+| 4 | Clav | `clav` | a clavinet, dry | 25 of 30, with the wah's rows |
+| 5 | Clav Wah | `clav` + `clav_wah` | the same through an envelope wah | (above) |
+| 6 | Reed 200 | `reed` | a reed piano, dry | 63 of 65 |
+| 7 | Reed Amp | `reed` + `reed_amp` | a reed piano through its amp | 65 of 68; the amp chain all |
+| 8 | Electric Grand | `egrand` + `symp` | a stage electric grand | 32 of 35 |
+| 9 | Nylon Guitar | `guitar` | a classical guitar | 22 of 27 |
+
+Slot 7 kept its index when it became Reed Amp, so a saved strip there keeps
+its knobs (its Tremolo now means the amp's throb in dB, 0.5 the reference's
+3 dB). Slots 8 and 9 are appended; `Patch::ALL` is still append-only. A rack
+saved before the two new sounds existed gives them their shipped knobs, and
+the legacy eight-sound arrays are still read at their own stride
+(`dialogs::V32_KEYS_PATCHES`), whatever the live rack's count becomes.
+
+### What changed in the engine
+
+- **The grands are mode banks.** Piano 1 and Piano 2 play `grand::GrandVoice`
+  on `modal::Bank` (768 modes), each partial a two-pole resonator placed on
+  the stiff-string series with a per-key B and a stretched tuning, its loss
+  read off a bridge admittance with board bumps, and three strings per course
+  coupled at the bridge, which is where the two-stage decay comes from. The
+  waveguide piano (`string.rs`) no longer plays any sound and has left the
+  voice pool; its code stays for its tests and the bench, and `Body` is still
+  both grands' board.
+- **Their strings are solved before anyone strikes them**
+  (`grand::GrandDesigns`): every key of both grands at the knobs' centres in
+  `new`, then brought to the knobs as they move, a key for every 64 frames
+  that go by. The host says what went by: a render pays its own frames, and
+  a lane with nothing to play is told `Keys::idle`, so no call pays more than
+  its own length (after a 512-frame grain a 16-frame visit had paid 322 to
+  348 us). A knob put back where it was leaves no key stale. A fresh strike
+  copies its key's strings instead of solving them; under the una corda it
+  takes what the soft pedal does not move and solves the rest.
+- **A landing never gains.** When new modes land under a ringing voice (a
+  restrike, the una corda moving the hammer), each voice's ledger (each
+  string's place and each mode's root, per partial) projects the strings'
+  motion onto the new modes. It used to hand each mode's motion to the new
+  mode of the same index, which under the una corda is another mode: Piano 1's
+  E5 at a tiny UNISON rang 13 times its first strike.
+- **The hammer is graded by key and velocity** (`hammer.rs`, a midpoint
+  contact with a felt core that hardens with rate), with level and
+  brightness set apart, so the level law follows the reference (v20/41/70/98
+  against v127: about -23/-17/-11/-5 dB) while fortissimo stays where the
+  old piano had it.
+- **The action speaks** (`grand_noise.rs`): the knock, the key's release,
+  and the trapwork's thump when the dampers are thrown and land.
+- **The pedals are levels.** `Keys::set_pedals` takes CC 64, 66 and 67 as
+  0..127 every block: the grand's dampers and the harp follow the sustain
+  part way (half pedalling), the sostenuto catches the keys that are down
+  (sounding or not) and forgets them at a patch change, the soft pedal
+  shifts the action. Every other sound, the electric grand included, hears
+  the sustain as a switch at 64.
+- **The sympathetic harp was rebuilt** (`symp.rs`): fed flat above each
+  string's fundamental (shaped for the strings nobody struck), the struck
+  string's halo only while its key is held, a released key's string ringing
+  free under the pedal, the felt's bite when a damper lands, aliquots over
+  the intimate's top courses, and a set designed per instrument in
+  `Keys::new` and loaded at `set_patch` (both grands and the electric grand).
+  The harp is strung where STRETCH tunes the voices it shadows (at the
+  knob's top C8's string had sat 84 cents from its voice), and it is
+  re-strung on a 128-frame grid of the timeline as the knob moves; a ringing
+  string glides to its new tuning rather than jumping.
+- **Every family is block-rendered and owns its stereo image.** The frame
+  no longer pans voices and has no per-sample path; each voice renders up to
+  `modal::BLOCK` frames into the accumulators with its own microphones or
+  image.
+- **New mechanisms:** `egrand` (short, stiff strings read by pickups, no
+  board), `reed_amp` (the reed piano's slap, cabinet, throb and room), and
+  `guitar` (six strings on a modal bank, a fingertip's pluck, and a shared
+  `guitar::Fretboard` that picks each note's string and holds the open
+  strings and the body's air).
+- **A host's call size is not part of the sound.** The control a voice runs
+  once a block (a damper's fall, a contact solve, a cull, a tremolo's phase,
+  the wah's follower) ran once a host CALL, so the same performance at
+  64-frame buffers and at 512 were two performances: the reed's strikes
+  were -4.2 dB re peak apart at 1-frame calls, the grands -30 to -45. Every
+  voice now keeps its own 128-frame control block counted from its last
+  event (each family's `Ctl`, the fretboard's `BoardCtl`), a grand's
+  contact is solved for its whole block across calls, and the harp is paid
+  on its own grid. At calls of 1 to 1024 frames against 128, EP Mk.1, EP
+  Suitcase, Clav, Reed 200 and Nylon Guitar render the same to the bit;
+  Clav Wah is within -100.8 dB re peak, Reed Amp -87.1 and the electric
+  grand -91.1. The grand's voice is the same to the bit; through the frame
+  the grands read -74 dB, which is the harp's glide and the frame's work at
+  the end of a call (below).
+- **The frame's edges**, from the reviews of the integrated frame:
+  `all_notes_off` fades the shared side (harp, board, open strings, body
+  air) over 10 ms instead of cutting it, fades it back in after its clear,
+  chokes the guitar's strings, and stays off when the pedal moves after it.
+  The host repeats it every block of a quiet lane, and a repeat with nothing
+  struck since costs nothing more than the first. After it the harp's and
+  the guitar's open strings hear nothing until a key goes down, and each
+  sleeps once its output stays under -146 dBFS RMS, so under the pedal the
+  guitar is asleep half a second after a stop where it rang on for 7 to
+  10 s. Every reset the frame makes renders as a new component would, after
+  any history; a knob moved in silence is heard at its new value from the
+  next note; the three harp patches drop keys outside A0..C8, as the guitar
+  drops keys off its fingerboard; a NaN velocity is a silent touch; and
+  eight corpses fade a chord that steals eight voices in one block.
+
+### Cost
+
+keysrig's `stress` score: 64 keys struck 20 ms apart under the pedal, 7.4 s of
+audio. Render time, the median of seven rounds interleaved with main's build
+in the same minute, on the owner's machine (load 1.8):
+
+| slot | sound | main | now |
+|---|---|---|---|
+| 0 | Piano 1 | 308 ms, 24x real time | 413 ms, 18x |
+| 1 | EP Mk.1 | 214 ms, 35x | 187 ms, 40x |
+| 2 | Piano 2 | 370 ms, 20x | 373 ms, 20x |
+| 3 | EP Suitcase | 214 ms, 35x | 222 ms, 33x |
+| 4 | Clav | 122 ms, 61x | 205 ms, 36x |
+| 5 | Clav Wah | 129 ms, 57x | 209 ms, 35x |
+| 6 | Reed 200 | 119 ms, 62x | 169 ms, 44x |
+| 7 | Reed Amp (Reed 140 on main) | 118 ms, 63x | 178 ms, 42x |
+| 8 | Electric Grand | new | 292 ms, 25x |
+| 9 | Nylon Guitar | new | 35 ms, 213x |
+
+Piano 1 is the one under the 25x floor above, and under the 20x the modal
+brief accepted: its harp carries the intimate's nineteen aliquots over the
+88 strings, and each voice is a 768-mode bank. At 18x a full pedalled
+texture of 64 voices takes 5.5 % of one core. The guitar takes the score's
+keys on six strings, a new note on a string stopping the one there, and
+drops the keys off its fingerboard, which is most of its figure.
+
+`Keys::new` takes 22.5 MB of heap (22,481,524 bytes; main's took 5.7 MB), in
+11 to 13 ms on the UI thread (main's 1 ms), and nothing after it: no patch
+allocates on the audio thread (`no_keys_patch_allocates_after_new`). Most
+of it is mode banks: every voice slot carries a full 768-mode bank for each
+of the three modal families though only one plays at a time (gap 10), and
+both grands' strings are solved ahead of any strike.
+
+### Levels
+
+Every sound comes out quieter than its reference at the same velocities: by
+1.3 to 11.4 dB on the pedalled voicings (`evans`) and 0.3 to 12.8 dB on the
+comping (`comp`). Loudness here is the power mean over the 300 ms windows
+within 40 dB of a take's loudest, both channels, so the gaps between phrases
+do not count:
+
+| slot | sound | against the reference, evans / comp (dB) |
+|---|---|---|
+| 0 | Piano 1 | -11.0 / -10.6 |
+| 1 | EP Mk.1 | -1.8 / -0.3 |
+| 2 | Piano 2 | -8.2 / -8.5 |
+| 3 | EP Suitcase | -5.5 / -4.0 |
+| 4 | Clav | -1.8 / -3.2 |
+| 5 | Clav Wah | -1.7 / -2.9 |
+| 6 | Reed 200 | -1.3 / -1.4 |
+| 7 | Reed Amp | -5.7 / -3.2 |
+| 8 | Electric Grand | -11.4 / -12.8 |
+| 9 | Nylon Guitar | -7.3 / -6.9 |
+
+The ten also sit further apart than the reference's do: 15.7 dB from the
+loudest to the quietest on `evans` (EP Mk.1 to Piano 2), where the
+reference's spread is 11.8, and 9.2 on `comp` against 5.7. The two grands
+keep the waveguide piano's fortissimo, where users' mixes were set (a
+fortissimo C4 puts -24.6 dBFS into its first 300 ms), and take the
+reference's velocity law under it, so at these scores' middle velocities
+they sit under main's piano too: Piano 1 by 5.3 and 3.3 dB (evans / comp),
+Piano 2 by 7.7 and 4.8. Against main the suitcase is 4.3 and 2.3 dB
+quieter, the clavs 3.4 to 8.7 louder, and EP Mk.1 and the reed pianos
+within 2.5 dB either way.
+
+A trim per sound would level them, at a cost in headroom. Trimmed to the
+reference's loudness, the comping take would peak at +1.1 dBFS on Piano 1,
++1.7 on Reed Amp, +3.8 on the electric grand and +4.1 on the suitcase, where
+the reference's own comping renders stop at 0 dBFS; the grands' crest
+factor is 19 to 20 dB. As shipped, a pedalled fortissimo chord already
+passes full scale on the electric instruments: ten keys at MIDI 127 from C3
+to C6 peak at +4.2 dBFS on EP Mk.1, +3.5 on the suitcase, +2.1 on the clav,
++1.7 on the wah, +4.8 on Reed 200 and +5.6 on Reed Amp (main's peaked at
++5.5 to +9.2 on the same chord), while the grands, the electric grand and
+the guitar stay under -4 dBFS. The trim is the owner's call. The study's
+listening pairs are loudness-matched, so what they compare is tone.
+
+### Known gaps, most audible first
+
+Each is measured against the reference on the same score, by the same code;
+the lane reports in the study folder have the tables.
+
+1. **The ten sounds do not sit at one level** (above). A per-sound trim
+   would level them; it is the owner's call.
+2. **Piano 1's tone across velocity.** Its pianissimo is still 3 to 11 dB too
+   bright at C5, and its bass and tenor fortissimo 8 to 16 dB too dark at 4
+   to 8 kHz. Its C7 fortissimo tail stands 15 to 20 dB over the reference's
+   at 1.2 to 1.4 s, and its C8 holds its tone where the reference's drops 19
+   dB in its first 60 ms (the top row fails at -26.2 against -32.5).
+3. **The grands' half pedal and una corda.** CC 64 at 64 misses its row at
+   +1 s, and the una corda's C4 hold and partial changes still fail; the
+   concert's C4 unison and aftersound, its treble image (median IPD 34
+   degrees) and its bass n2-n1 at E1 and E2 do too.
+4. **The harp.** Under a dense pedalled bass its 31 to 250 Hz octaves sit 23
+   to 30 dB under the voices, where the reference's sit 4 to 18 dB under; a
+   bass string damped by a pedal-up key-off has almost no tail (C2's needs a
+   shelf in the damped loop, about one multiply-add per loop sample); the
+   concert's silent E4, G4 and G5 answer 11 to 15 dB over; the intimate's
+   aliquots in the middle are 5 to 14 dB under. On the electric grand the
+   mid and treble rings are 12 to 19 dB under from C4 to C5, because the
+   reference's ring grows through the hold and this one holds steady.
+5. **The guitar's first half second.** With the open strings ringing, 13 of
+   19 fundamentals decay within 30 % of the reference's (E3 9.3 s against
+   23.0, B3 5.0 against 9.7): a one-way drive cannot slow a played partial.
+   The 222 to 249 Hz band rings 5.0 s against 10.4; three of five phantoms
+   on E2 at MIDI 127 sit in their band; there is no damper-noise burst.
+6. **The reed's E4 to G4 tail** is 8.7 to 10.4 dB louder than the
+   reference's at 2 to 3 s, where the reference's decay speeds up and then
+   beats; a sum of two decays cannot make that. The amp's room is 22 to 53
+   % short above 1 kHz, and the reed piano has no sympathetic resonance.
+7. **The clav's attack.** The upper register lacks early top end (C4 v127
+   in its first 12 ms: -28.5 against -19.3 dB), C2's above 2.8 kHz is
+   under, and above 9 kHz it is over; C4 H3 at v70 is 5.5 dB hot and the
+   anti-phase pickup's n7 19.9 dB over. G1 still blooms 2 dB at 1 s. The
+   wah's late centres match on 20 to 22 of 27 notes.
+8. **The tine pianos.** Mk.1's upper harmonics are a structural limit of the
+   pickup curve (a new pickup model and a refit of both patches); the
+   suitcase's C4 H6 falls into a null near v110 to v115 (-52 against -36
+   dB); the knock runs up to 3.4 dB hot from v40 to v90; the deep bass (F1
+   and below) is about 9 dB short on H3.
+9. **The electric grand's spectrum.** C4 at MIDI 70 (n3) and its odd
+   partials n7 to n11 are about 10 dB short; C2's n16 to n36 are 10 to 20
+   dB short and its fortissimo above 3 kHz 14 dB; the reference's onset
+   glide is not built.
+10. **Memory.** Every voice slot carries a full 768-mode bank for each of
+    the three modal families though only one plays at a time (above).
+11. **What a host's call size still moves.** Through the frame the two
+    grands are -74 dB re peak off the 128-frame take at small calls, three
+    places where a step lands at the end of a call rather than on a grid:
+    the harp's glide steps once a run, the frame falls silent at the end of
+    a call, and a finished voice's harp string is handed back there. With
+    STRETCH moving under a pedalled chord the grands read -61 dB, and
+    silent presses under a pedalled C2 -44 at 1024-frame calls (no app path
+    sends a velocity-0 note-on). The electric grand's velocity ladder reads
+    -68 dB at 4096-frame calls, and its velocity and knob extremes -60 at
+    1024. Each is a step landing up to a call later in an otherwise whole
+    take, not a sound of its own.
+12. **What the reworked frame costs.** A STRETCH drag under a pedalled
+    chord costs more than it did (Piano 1 at 128 frames 73-78 us a block
+    to 111-114; the electric grand 23 to 43-46), as does the first landing
+    of a copied voice after the string table has moved off its knobs (1.7
+    to 2.3 times the old one). A lane that has never rendered pays 424 us
+    a block (4 %) at 512-frame buffers for about 11 blocks, where it paid
+    82 us for 44 or more; on a project load with many unarmed pianos that
+    adds up across lanes. The clavs cost 2 to 6 % more than before the
+    frame's grids.
+13. **The harp keeps Piano 1 awake after a pedal lift.** Its damped tail
+    runs down to the -146 dBFS floor, 2.7 s after the lift, and the lane
+    is not idle until it does (CPU only; nothing over the floor is heard).
+14. **STRETCH's top.** At the knob's 1 C8 sits 128 cents over equal
+    temperament, and the bass's 8th partial on the harp 10.5 to 12.7 cents
+    off its voice's (one all-pass per string is the limit).
+15. **By decision:** a key struck in the 10 ms of the stop's fade keeps
+    some but not all of its shared side (its step is held at 1.2 times a
+    fresh strike's); after a second stop in a row the board and the harp
+    stay muted until the choked voices finish (up to 1.7 s on the electric
+    grand), until a key is struck; and keys outside A0..C8 are silent on
+    the two pianos and the electric grand.
+
 ## The bench
 
 `tangent/src/keys/` is pure `std` and depends on nothing, exactly as
@@ -210,9 +522,12 @@ minutes the app takes:
     cargo run --release -- piano evans out.wav    # pedalled voicings
     cargo run --release -- ep    velramp v.wav    # 12 strikes, vel 8..127
     cargo run --release -- ep    report           # the measurement tables
+    cargo run --release -- guitar stress /dev/null # the CPU check
 
-It renders in 128-frame blocks, the same size the audio callback uses, so a
-bug that only happens at a block boundary happens on the bench too.
+The ten sounds are `piano ep piano2 suitcase clav clavwah reed reedamp egrand
+guitar`, in slot order. It renders in 128-frame blocks, the same size the
+audio callback uses, so a bug that only happens at a block boundary happens
+on the bench too.
 
 ### Measure, do not opine
 
@@ -251,7 +566,8 @@ can hold a DX7 track *and* a piano track" — it now holds a piano track and an
 EP track, or several of each, because the amount-limit on the in-house
 instruments died. Instances are built and freed on the UI thread and travel
 by the kit's swap-ring protocol, since the callback may neither allocate a
-synth nor drop 3 MB of delay lines. A lane with no instrument costs a `None`.
+synth nor drop 22 MB of mode banks. A lane with no instrument costs a
+`None`.
 
 Two things that must stay true:
 
@@ -266,9 +582,10 @@ Two things that must stay true:
   sounds right while it is being played and the rendered file is missing a
   track.
 
-CC 64 reaches the model. A modelled piano without a damper pedal loses its
-pedalled sustain and its sympathetic wash, which is half of what makes a jazz
-voicing hang together.
+CC 64, 66 and 67 reach the model, as levels, every block. A modelled piano
+without a damper pedal loses its pedalled sustain and its sympathetic wash,
+which is half of what makes a jazz voicing hang together; the grands also
+half-pedal, hold the sostenuto's keys and shift for the una corda.
 
 ## Naming
 
@@ -278,3 +595,8 @@ says why. "Rhodes", "Fender Rhodes" and "Mark I" are live trademarks and
 appear nowhere in the product, the patch names, or the UI. "EP Mk.1" is
 Tangent's name for a Tangent instrument; what it is modelled on is a fact
 about the model and belongs in prose like this.
+
+The same holds for every sound since: "Clav", "Reed 200", "Reed Amp",
+"Electric Grand" and "Nylon Guitar" are Tangent's names, and the instruments
+they were voiced against are named in no patch, description or comment. The
+code and its comments call the measured instrument "the reference".

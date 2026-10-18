@@ -250,9 +250,11 @@ impl DenseRows {
         while names.last().is_some_and(String::is_empty) {
             names.pop();
         }
-        let mut keys_params = crate::dialogs::keys_params_default(W);
+        // The legacy rack's stride (`desk_model::V32_KEYS_SPAN`): a dense
+        // legacy array is read and written at it whatever the live rack is.
+        let mut keys_params = crate::dialogs::keys_params_default_v32(W);
         for (r, row) in rows.iter().enumerate() {
-            let span = crate::desk_model::KEYS_SPAN;
+            let span = crate::desk_model::V32_KEYS_SPAN;
             for (i, p) in row.keys.params.iter().take(span).enumerate() {
                 keys_params[r * span + i] = *p;
             }
@@ -289,7 +291,7 @@ impl DenseRows {
     /// freeze is the document's). The arm word, when said, is applied; the
     /// caller keeps whether it was.
     fn into_rows(self, ids: &[crate::desk_id::TrackId]) -> Vec<crate::desk_model::TrackRow> {
-        use crate::desk_model::{Dx7, KeysSel, RowKind, TrackRow, KEYS_SPAN};
+        use crate::desk_model::{Dx7, KeysSel, RowKind, TrackRow, V32_KEYS_SPAN};
         let bit = |mask: u64, r: usize| r < 64 && mask >> r & 1 == 1;
         ids.iter()
             .enumerate()
@@ -322,8 +324,9 @@ impl DenseRows {
                     patch: self.strip_keys_patch.get(r).copied().unwrap_or(0),
                     ..KeysSel::default()
                 };
-                if let Some(p) = self.strip_keys_params.get(r * KEYS_SPAN..(r + 1) * KEYS_SPAN) {
-                    keys.params = p.to_vec();
+                // A legacy row is the head of a live one (V32_KEYS_SPAN).
+                if let Some(p) = self.strip_keys_params.get(r * V32_KEYS_SPAN..(r + 1) * V32_KEYS_SPAN) {
+                    keys.params[..V32_KEYS_SPAN].copy_from_slice(p);
                 }
                 row.keys = keys;
                 row
@@ -3709,7 +3712,7 @@ impl Settings {
         desk.rows.strip_dx7_cartridge = vec![s.dx7_cartridge.clone(); n];
         desk.rows.strip_dx7_patch = vec![s.dx7_patch; n];
         desk.rows.strip_keys_patch = vec![s.keys_patch; n];
-        desk.rows.strip_keys_params = crate::dialogs::keys_params_default(n);
+        desk.rows.strip_keys_params = crate::dialogs::keys_params_default_v32(n);
         if let Some(Value::Array(v)) = map.shift_remove("strip_dx7_cartridge") {
             for (dst, x) in desk.rows.strip_dx7_cartridge.iter_mut().zip(v) {
                 *dst = x.as_str().unwrap_or_default().to_owned();
@@ -3733,8 +3736,8 @@ impl Settings {
         if let Some(Value::Array(v)) = map.shift_remove("strip_keys_voicing") {
             for (ch, x) in v.iter().enumerate().take(n) {
                 let val = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
-                for patch in 0..crate::dialogs::KEYS_PATCHES {
-                    let at = crate::dialogs::keys_param_index(ch, patch, 0);
+                for patch in 0..crate::dialogs::V32_KEYS_PATCHES {
+                    let at = crate::dialogs::keys_param_index_v32(ch, patch, 0);
                     if let Some(slot) = desk.rows.strip_keys_params.get_mut(at) {
                         *slot = val;
                     }
@@ -3744,8 +3747,8 @@ impl Settings {
         if let Some(Value::Array(v)) = map.shift_remove("strip_keys_width") {
             for (ch, x) in v.iter().enumerate().take(n) {
                 let val = (x.as_f64().unwrap_or(1.0).clamp(0.0, 1.5)) / 1.5;
-                for patch in 0..crate::dialogs::KEYS_PATCHES {
-                    let at = crate::dialogs::keys_param_index(ch, patch, 1);
+                for patch in 0..crate::dialogs::V32_KEYS_PATCHES {
+                    let at = crate::dialogs::keys_param_index_v32(ch, patch, 1);
                     if let Some(slot) = desk.rows.strip_keys_params.get_mut(at) {
                         *slot = val;
                     }
@@ -3770,7 +3773,7 @@ impl Settings {
                 let knob = i % OLD_KNOBS;
                 let patch = (i / OLD_KNOBS) % OLD_PATCHES;
                 let ch = i / (OLD_KNOBS * OLD_PATCHES);
-                let at = crate::dialogs::keys_param_index(ch, patch, knob);
+                let at = crate::dialogs::keys_param_index_v32(ch, patch, knob);
                 if let Some(slot) = desk.rows.strip_keys_params.get_mut(at) {
                     *slot = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
                 }
@@ -5611,7 +5614,7 @@ impl Settings {
                     for patch in 0..2 {
                         for knob in 0..crate::dialogs::KEYS_PARAMS {
                             let at =
-                                crate::dialogs::keys_param_index(ch, patch, knob);
+                                crate::dialogs::keys_param_index_v32(ch, patch, knob);
                             old.push(Value::from(
                                 d.strip_keys_params
                                     .get(at)
@@ -8811,11 +8814,11 @@ mod tests {
             "the mark sheared away from its strip and sound"
         );
         // A new sound's untouched knob sits at its own default, not at a
-        // sheared neighbour's value: the clav's Pickup ships at 0.35.
+        // sheared neighbour's value: the clav's Pickup ships at 0.6.
         // f32 spec defaults widen inexactly; the tolerance is the same 1e-6
         // the cross-crate pinning test uses.
         assert!(
-            (knob(&s, 1, 4, 3) - 0.35).abs() < 1e-6,
+            (knob(&s, 1, 4, 3) - 0.6).abs() < 1e-6,
             "a new sound inherited an old strip's knob"
         );
         // Round trip: the full rack comes back exactly through the file this
@@ -8832,8 +8835,10 @@ mod tests {
             (legacy[(2 + 1) * 8 + 3].as_f64().unwrap() - 0.91).abs() < 1e-9,
             "an old build would not find the knob where it left it"
         );
+        // The rack key is the legacy stride too, however many sounds the
+        // live rack has grown since (`dialogs::V32_KEYS_PATCHES`).
         let full = m["strip_keys_params8"].as_array().expect("full rack key");
-        assert_eq!(full.len(), n * crate::dialogs::KEYS_PATCHES * 8);
+        assert_eq!(full.len(), n * crate::dialogs::V32_KEYS_PATCHES * 8);
     }
 
     #[test]

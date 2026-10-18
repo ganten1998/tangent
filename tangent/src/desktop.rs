@@ -26807,6 +26807,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// **No sound allocates once the instrument is built.** Every voice of
+    /// every patch is sized in `Keys::new` (the guitar's banks and plans,
+    /// its fretboard's open strings and air, the harp's designed sets, the
+    /// reed amp's room, the grand's solved table), so a patch change,
+    /// strikes, chords of more keys than a guitar has strings, the pedal and
+    /// the blocks after them ask the allocator for nothing. Driven as the
+    /// host drives a Keys (`set_params` with the block's frames every block,
+    /// `render` while it sounds and `idle` while it does not), at odd call
+    /// sizes: every knob moved in silence and under a ringing chord, which
+    /// re-solves the grand's table and re-strings the harp asleep and
+    /// ringing; the three pedals at levels, the sostenuto catching keys and
+    /// letting them go, strikes under the una corda (the table's take); all
+    /// notes off while sounding; a patch change mid-phrase and back. It
+    /// reached none of the table's solving or the una corda's take when it
+    /// only rendered and switched the sustain (review). Counted where a
+    /// counting allocator exists.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn no_keys_patch_allocates_after_new() {
+        use crate::keys::{Keys, Patch, MAX_PARAMS};
+        // The host's calls for one block of `frames`: the walk's three, then
+        // the lane render, which tells a silent instrument it went by.
+        fn block(k: &mut Keys, out: &mut [f32], patch: Patch, knobs: &[f32; MAX_PARAMS], cc: [u8; 3], frames: usize) {
+            k.set_patch(patch);
+            k.set_params(knobs, frames);
+            k.set_pedals(cc);
+            if k.active() {
+                out[..2 * frames].fill(0.0);
+                k.render(&mut out[..2 * frames], frames, 2);
+            } else {
+                k.idle(frames);
+            }
+        }
+        const SIZES: [usize; 9] = [128, 1, 37, 16, 1024, 3, 129, 64, 511];
+        let mut k = Keys::new(48_000.0);
+        let mut out = vec![0.0f32; 2 * 1024];
+        for (n, &patch) in Patch::ALL.iter().enumerate() {
+            let next = Patch::ALL[(n + 1) % Patch::ALL.len()];
+            let ((), c) = crate::rt_alloc::count_allocs(|| {
+                let mut knobs = patch.defaults();
+                let mut cc = [0u8; 3];
+                let mut call = 0usize;
+                let mut run = |k: &mut Keys, out: &mut [f32], p: Patch, knobs: &[f32; MAX_PARAMS], cc: [u8; 3], blocks: usize| {
+                    for _ in 0..blocks {
+                        block(k, out, p, knobs, cc, SIZES[call % SIZES.len()]);
+                        call += 1;
+                    }
+                };
+                // Every knob moved in silence: the table re-solves, the harp
+                // re-strings asleep.
+                for (i, v) in [(0, 0.2), (1, 0.9), (2, 0.8), (3, 0.3), (4, 0.75), (5, 1.0), (6, 0.4), (7, 0.7)] {
+                    knobs[i] = v;
+                    run(&mut k, &mut out, patch, &knobs, cc, 12);
+                }
+                // Strikes under the una corda at three depths, from the
+                // table, and a restrike of a ringing key.
+                for (soft, keys) in [(64u8, &[48u8, 52, 55, 60][..]), (127, &[48, 60][..]), (1, &[64, 67][..])] {
+                    cc[2] = soft;
+                    for &p in keys {
+                        k.note_on(p, 0.8);
+                    }
+                    run(&mut k, &mut out, patch, &knobs, cc, 6);
+                }
+                cc[2] = 0;
+                // The sustain at levels, and the sostenuto catching held keys
+                // and letting them go.
+                for p in [40u8, 47, 52, 56, 59, 64, 53, 72, 76, 30, 100] {
+                    k.note_on(p, 1.0);
+                    run(&mut k, &mut out, patch, &knobs, cc, 2);
+                }
+                for level in [30u8, 64, 100, 127] {
+                    cc[0] = level;
+                    run(&mut k, &mut out, patch, &knobs, cc, 3);
+                }
+                cc[1] = 127;
+                run(&mut k, &mut out, patch, &knobs, cc, 2);
+                for p in [40u8, 47, 52] {
+                    k.note_off(p);
+                }
+                cc[0] = 0;
+                run(&mut k, &mut out, patch, &knobs, cc, 4);
+                cc[1] = 0;
+                run(&mut k, &mut out, patch, &knobs, cc, 4);
+                // Every knob moved under a ringing pedalled chord: STRETCH
+                // jumped and dragged re-strings the harp as it rings.
+                cc[0] = 127;
+                for p in [36u8, 48, 55, 60, 64, 67, 72, 84, 96] {
+                    k.note_on(p, 0.7);
+                }
+                for (i, v) in [(5, 0.0), (5, 0.5), (2, 0.3), (4, 0.2), (3, 0.9), (1, 0.4), (0, 0.6), (6, 0.8), (7, 0.2)] {
+                    knobs[i] = v;
+                    run(&mut k, &mut out, patch, &knobs, cc, 6);
+                }
+                for step in 0..20 {
+                    knobs[5] = step as f32 / 19.0;
+                    run(&mut k, &mut out, patch, &knobs, cc, 1);
+                }
+                // All notes off while it sounds, and the blocks after.
+                k.all_notes_off();
+                run(&mut k, &mut out, patch, &knobs, cc, 8);
+                cc[0] = 0;
+                // A patch change mid-phrase, and back.
+                k.note_on(60, 0.9);
+                run(&mut k, &mut out, patch, &knobs, cc, 3);
+                let theirs = next.defaults();
+                k.note_on(62, 0.9);
+                run(&mut k, &mut out, next, &theirs, cc, 3);
+                run(&mut k, &mut out, patch, &knobs, cc, 40);
+                k.all_notes_off();
+            });
+            assert_eq!(c.total(), 0, "{patch:?} allocated {} times", c.total());
+        }
+    }
+
     /// **The engine's knob table and the panel's are the same table.**
     ///
     /// The panel cannot see the audio crate, so `dialogs::KEYS_PARAM_SPECS`
@@ -27875,11 +27989,11 @@ mod tests {
         assert!((ep.body - 1.0).abs() < 1.0e-5, "body {}", ep.body);
 
         // The clav: pickup and tone are raw positions the voice reads as
-        // shipped (0.35 under the string, rockers at 0.75); everything
+        // shipped (0.6, both coils in phase; rockers at 0.75); everything
         // multiplicative lands on 1.0 and the mute pad ships lifted.
         let clav = crate::keys::ClavKnobs::from_params(&crate::keys::Patch::Clav.defaults());
         assert!((clav.decay - 1.0).abs() < 1.0e-5, "decay {}", clav.decay);
-        assert!((clav.pickup - 0.35).abs() < 1.0e-5, "pickup {}", clav.pickup);
+        assert!((clav.pickup - 0.6).abs() < 1.0e-5, "pickup {}", clav.pickup);
         assert!((clav.tone - 0.75).abs() < 1.0e-5, "tone {}", clav.tone);
         assert!((clav.snap - 1.0).abs() < 1.0e-5, "snap {}", clav.snap);
         assert!((clav.release - 1.0).abs() < 1.0e-5, "release {}", clav.release);
@@ -27891,10 +28005,11 @@ mod tests {
         );
         assert!((wah.tone - 0.75).abs() < 1.0e-5, "wah tone {}", wah.tone);
 
-        // The reed pianos: multiplicative knobs through 1.0 on the 200; the
-        // 140 ships with its growl leaning (0.62 of a 0..2 map) and its
-        // tremolo off — those two defaults ARE the difference between the
-        // transistor and the tube instrument, so they are pinned.
+        // The reed pianos: multiplicative knobs through 1.0 on both, growl
+        // at each base's own per-key regulation (the tables are the fit).
+        // What tells them apart is the amp: the dry 200 ships the old amp
+        // throb off (its reference has no tremolo), and the Amp patch ships
+        // its throb at the reference's 3 dB (0.5 of `reed_amp`'s 6 dB knob).
         let wur =
             crate::keys::WurliKnobs::from_params(&crate::keys::Patch::Wurli200.defaults());
         assert!((wur.decay - 1.0).abs() < 1.0e-5, "decay {}", wur.decay);
@@ -27902,20 +28017,29 @@ mod tests {
         assert!((wur.growl - 1.0).abs() < 1.0e-5, "growl {}", wur.growl);
         assert!((wur.release - 1.0).abs() < 1.0e-5, "release {}", wur.release);
         assert!((wur.thump - 1.0).abs() < 1.0e-5, "thump {}", wur.thump);
-        let tube =
-            crate::keys::WurliKnobs::from_params(&crate::keys::Patch::Wurli140.defaults());
-        assert!((tube.growl - 1.24).abs() < 1.0e-5, "tube growl {}", tube.growl);
         assert!(
-            (crate::keys::Patch::Wurli140.defaults()[5]).abs() < 1.0e-5,
-            "the tube instrument's tremolo ships off"
+            (crate::keys::Patch::Wurli200.defaults()[5]).abs() < 1.0e-5,
+            "the dry reed piano's throb ships off"
+        );
+        let amp =
+            crate::keys::WurliKnobs::from_params(&crate::keys::Patch::Wurli140.defaults());
+        assert!((amp.growl - 1.0).abs() < 1.0e-5, "amp growl {}", amp.growl);
+        assert!(
+            (crate::keys::Patch::Wurli140.defaults()[5] - 0.5).abs() < 1.0e-5,
+            "the amp's throb ships at the reference's depth"
         );
 
         // And WIDTH's default is the stock seating, which is 1.0 of a knob
-        // that runs to 1.5 — the one default that is not the middle. True
-        // of every patch, because WIDTH means the same thing on all eight.
+        // that runs to 1.5 — the one default that is not the middle — on
+        // every patch but the two reeds, which ship mono like the reference
+        // they were voiced against (the Amp patch's room is its stereo).
         for &patch in &crate::keys::Patch::ALL {
             let w = patch.defaults()[crate::keys::P_WIDTH];
-            assert!((w * 1.5 - 1.0).abs() < 1.0e-5, "{patch:?} width {w}");
+            if matches!(patch, crate::keys::Patch::Wurli200 | crate::keys::Patch::Wurli140) {
+                assert!(w.abs() < 1.0e-5, "{patch:?} width {w}");
+            } else {
+                assert!((w * 1.5 - 1.0).abs() < 1.0e-5, "{patch:?} width {w}");
+            }
         }
         let mut keys = crate::keys::Keys::new(48_000.0);
         keys.reset_params();

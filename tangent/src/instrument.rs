@@ -9966,6 +9966,16 @@ fn render_lane(
         // is separable and therefore none at which a fader can reach
         // it. The DX7's slot fader was silent for exactly that reason.
         let active = seats.keys.as_ref().is_some_and(|k| k.active());
+        // **Silent, it is told the span went by** (`Keys::idle`), which is
+        // all a render of it would have done: the grand's table and the
+        // harp's strings follow the knobs by the audio, and here on the lane's
+        // own worker rather than in the walk's next visit, which is serial
+        // over every lane.
+        if !active {
+            if let Some(k) = seats.keys.as_mut() {
+                k.idle(frames);
+            }
+        }
         if active || !keys_head {
             let Some(scratch) = io.keys_scratch.get_mut(..want) else {
                 return false;
@@ -18297,14 +18307,26 @@ impl Renderer {
                             self.shared.lanes.get(ch).keys_params[i].load(Ordering::Relaxed),
                         );
                     }
-                    k.set_params(&knobs);
-                    // **Every block, not only on an event.** `set_pedal`
-                    // early-returns on a level it already holds, so this is
-                    // a compare — and stating it unconditionally is what
-                    // lets a stop, a locate off the end of a clip and the
-                    // clip simply ending all release the damper through one
-                    // path instead of three.
-                    k.set_pedal(pedal_now[0] >= 64);
+                    // **And the CHUNK's frames, not the lane's span.** They
+                    // pay what follows the knobs (the grand's table, the
+                    // harp's strings) for a visit nothing rendered and
+                    // nothing told `idle`: a lane the render passes by
+                    // (parked, fed by nothing) keeps no grain, so it is
+                    // visited every chunk, its span widened to a grain it
+                    // never renders, and a chunk is what went by. A lane
+                    // that renders or idles is paid there instead.
+                    k.set_params(&knobs, frames);
+                    // **Every block, not only on an event.** `set_pedals`
+                    // early-returns on levels it already holds, so this is
+                    // three compares — and stating it unconditionally is
+                    // what lets a stop, a locate off the end of a clip and
+                    // the clip simply ending all release the damper through
+                    // one path instead of three. All three pedals as levels
+                    // (CC 64, 66, 67 in `PEDAL_CCS` order): the modal grand
+                    // half-pedals, holds the sostenuto's keys and shifts for
+                    // the una corda; every other family hears the sustain's
+                    // switch at 64.
+                    k.set_pedals(pedal_now);
                 }
             }
             if self.spine.ext.desk.builtins.contains(ch) {
@@ -44331,8 +44353,13 @@ mod slot_engine {
         /// **Every instrument lets go**: a note held through the sustain
         /// pedal on a DX7, a keyboard and an analog, and the pedal lifted.
         /// While the pedal is down after the note's end both built-ins are
-        /// still sounding; a second after it lifts the track is silent and
-        /// neither holds a voice. Without the pedal the same note ends.
+        /// still sounding; four seconds after it lifts the track is silent
+        /// and neither holds a voice. The keyboard's voice ends within a
+        /// second of the lift; its sympathetic strings then ring their damped
+        /// tail out to the harp's floor (-146 dBFS a string,
+        /// `keys::symp::FLOOR_RMS`, which the bench measures tails down to),
+        /// and on Piano 1 that takes until 2.7 s after the lift. Without the
+        /// pedal the same note ends.
         #[test]
         fn a_note_off_and_the_pedal_reach_every_instrument_on_the_track() {
             let parts = [Part::Dx7(0), Part::Analog(1), Part::Keys(4)];
@@ -44341,9 +44368,9 @@ mod slot_engine {
                 ClipPedal { at: 24_000, cc: 64, value: 0 },
             ];
             // Blocks of 512: the note ends at 0.1 s, the pedal lifts at 0.5,
-            // and the roll runs to 2.7 s.
-            let (held, e) = stem(&parts, 4_800, &pedal, 250);
-            let (bare, bare_e) = stem(&parts, 4_800, &[], 250);
+            // and the roll runs to 4.5 s.
+            let (held, e) = stem(&parts, 4_800, &pedal, 420);
+            let (bare, bare_e) = stem(&parts, 4_800, &[], 420);
             let window = |xs: &[f32], from: usize, to: usize| -> f32 {
                 let s = &xs[from * 2..to * 2];
                 (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
