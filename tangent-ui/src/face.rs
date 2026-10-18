@@ -2603,14 +2603,20 @@ mod tests {
     /// that reached home could never leave it, which is the varispeed dial's
     /// lesson on a kit row. The double-click still goes home, and the home
     /// is marked: one hairline where `default` sits on the track, and none
-    /// on a plain row.
+    /// on a plain row. And the catch is the width its doc promises, a
+    /// sixtieth of the travel: probed half a point inside its edge and half
+    /// a point outside, either side of home, with the sixtieth spelled here
+    /// rather than read off [`DETENT`], so a catch three times as wide or
+    /// two fifths as wide fails where the presses a point and a half and ten
+    /// points out cannot tell.
     ///
     /// The geometry is the row's own at 400 wide: the label takes 136 and
     /// the item gap 8, so the slider runs from 144 to 316 and its track,
     /// inset by the handle's radius, from 151.2 to 308.8, which puts a home
-    /// of 0.5 at x 230. A press at 231.5 is 0.5095 of the track and one at
-    /// 240 is 0.5635. The gestures stand whole seconds apart, because egui
-    /// dates its double-clicks and two of these must never pair.
+    /// of 0.5 at x 230 and the catch's edges 2.63 points either side. A
+    /// press at 231.5 is 0.5095 of the track and one at 240 is 0.5635. The
+    /// gestures stand whole seconds apart, because egui dates its
+    /// double-clicks and two of these must never pair.
     ///
     /// Revert-checks performed: with the catch added to the parted branch the
     /// fine drag is caught at home and stalls there, and this goes red on the
@@ -2752,6 +2758,37 @@ mod tests {
         );
         let (_, plain) = frame(11.0, Vec::new(), none, 0.8, false);
         assert!(plain.is_empty(), "a plain slider row painted a home mark at {plain:?}");
+
+        // ── and the catch is a sixtieth of the travel, either side ──────
+        // The width the doc promises, spelled here rather than read off
+        // DETENT, so a catch of any other size fails: half a point inside
+        // its edge on either side of home lands on home, and half a point
+        // outside it is a value of its own. A second between the presses,
+        // so no two of them pair into a double.
+        let catch = (308.8 - 151.2) / 60.0;
+        for (k, (off, caught)) in [(catch - 0.5, true), (-(catch - 0.5), true), (catch + 0.5, false), (-(catch + 0.5), false)]
+            .into_iter()
+            .enumerate()
+        {
+            let t = 12.0 + k as f64;
+            let at = egui::pos2(230.0 + off, 9.0);
+            let _ = frame(t, vec![egui::Event::PointerMoved(at)], none, 0.8, true);
+            let asked = frame(t + step, vec![press_at(at, true)], none, 0.8, true).0;
+            let _ = frame(t + 2.0 * step, vec![press_at(at, false)], none, 0.8, true);
+            let want = (at.x - 151.2) / (308.8 - 151.2);
+            match asked {
+                Some(SliderAsk::Value(v)) if caught => assert_eq!(
+                    v, HOME,
+                    "a press {off:+.2} points from home, inside a catch a sixtieth of the travel wide, asked {v}"
+                ),
+                Some(SliderAsk::Value(v)) => assert!(
+                    v != HOME && (v - want).abs() < 1.0e-3,
+                    "a press {off:+.2} points from home, outside a catch a sixtieth of the travel wide, asked {v}, \
+                     wanted {want}"
+                ),
+                other => panic!("a press {off:+.2} points from home asked {other:?}"),
+            }
+        }
     }
 
     /// **And the drag still owns the hand once it has left the track.**
@@ -3407,6 +3444,108 @@ mod tests {
                 "a {button:?} click on the pointer made the slider's next click a reset: {last:?}"
             );
         }
+    }
+
+    /// **A pointer row paints both its lines inside the row it takes, and
+    /// cuts them to the room left of its chevron**, on every font the app
+    /// ships.
+    ///
+    /// The row is one exact allocation of [`pointer_row_height`] and its
+    /// words are painted into it, not laid out, so nothing in egui stops a
+    /// line from running past the allocation: a height that forgot the
+    /// second line, or a second line set lower than the height counts it,
+    /// paints over whatever is under the row, and no layout test sees it.
+    /// So the allocation is held to the height asked of it, and every word
+    /// the row paints (its two lines and its chevron, each at the rect its
+    /// galley really covers) is held inside that allocation, on all three
+    /// fonts. And the lines are cut, never wrapped: at a width that holds
+    /// the longest line the tape can say they are painted whole, and at one
+    /// far too narrow for it both are cut and end left of the chevron.
+    #[test]
+    fn a_pointer_row_paints_both_its_lines_inside_itself_on_every_font() {
+        let st = a_test_style();
+        let (line, sub) = ("Start and stop: 9.99 s up, 9.99 s down", "set on the PITCH CONT dial");
+        let mut bad: Vec<String> = Vec::new();
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            for width in [400.0_f32, 120.0] {
+                let (mut took, mut tall) = (Rect::NOTHING, f32::NAN);
+                let out = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(width, 100.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                tall = pointer_row_height(ui);
+                                took = ui
+                                    .scope(|ui| {
+                                        let _ = pointer_row(ui, &st, line, sub, "go there");
+                                    })
+                                    .response
+                                    .rect;
+                            });
+                    },
+                );
+                let at = format!("{} at {width} wide", font.key());
+                if (took.height() - tall).abs() > 1.0e-3 {
+                    bad.push(format!("{at}: the row took {:.2} points, not the {tall:.2} it asked for", took.height()));
+                }
+                fn walk(shape: &egui::Shape, into: &mut Vec<(String, Rect)>) {
+                    match shape {
+                        egui::Shape::Vec(v) => {
+                            for s in v {
+                                walk(s, into);
+                            }
+                        }
+                        egui::Shape::Text(t) => {
+                            into.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2())));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut words = Vec::new();
+                for cs in &out.shapes {
+                    walk(&cs.shape, &mut words);
+                }
+                for (w, r) in &words {
+                    if r.top() < took.top() - 1.0e-3
+                        || r.bottom() > took.bottom() + 1.0e-3
+                        || r.left() < took.left() - 1.0e-3
+                        || r.right() > took.right() + 1.0e-3
+                    {
+                        bad.push(format!("{at}: {w:?} is painted at {r:?}, outside the row's {took:?}"));
+                    }
+                }
+                let Some(chevron) = words.iter().find(|(w, _)| w == "\u{203A}").map(|(_, r)| *r) else {
+                    bad.push(format!("{at}: no chevron is painted"));
+                    continue;
+                };
+                let mut lines: Vec<&(String, Rect)> = words.iter().filter(|(w, _)| w != "\u{203A}").collect();
+                lines.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+                let [(first, first_at), (second, second_at)] = lines.as_slice() else {
+                    bad.push(format!("{at}: the row paints {} lines, not two", lines.len()));
+                    continue;
+                };
+                if width >= 400.0 {
+                    if (first.as_str(), second.as_str()) != (line, sub) {
+                        bad.push(format!("{at}: room for both lines, and it painted {first:?} and {second:?}"));
+                    }
+                } else {
+                    if first == line || second == sub {
+                        bad.push(format!("{at}: no room for the lines, and it painted {first:?} over {second:?}, not both cut"));
+                    }
+                    for (w, r) in [(first, first_at), (second, second_at)] {
+                        if r.right() > chevron.left() + 1.0e-3 {
+                            bad.push(format!("{at}: {w:?} ends at {:.1}, under the chevron at {:.1}", r.right(), chevron.left()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the pointer row does not hold its words:\n  {}", bad.join("\n  "));
     }
 
 
