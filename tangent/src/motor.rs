@@ -1164,9 +1164,9 @@ impl Motor {
     /// destination is put through.
     ///
     /// - `frames`: the pass's device frames, the plan's own.
-    /// - `live`: a player was heard this pass (a live note or pad, an input
-    ///   the room heard above the park floor, a preview). A hold lets go at
-    ///   once, gliding up from the pass's first frame.
+    /// - `live`: a player was heard this pass (a live note or pad, a
+    ///   tracking desk, a preview). A hold lets go at once, gliding up from
+    ///   the pass's first frame.
     /// - `landed`: the pass put every level on its target (a realtime
     ///   export's head). The envelope is exactly 1 for the pass and the
     ///   reproducer is cleared, so an export never starts under a glide.

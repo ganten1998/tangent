@@ -14585,9 +14585,17 @@ impl Renderer {
     /// instant. A steady pass returns at once: no arithmetic touches a
     /// sample.
     ///
-    /// A player is live when a note or a pad was struck this pass or a
-    /// preview is playing; while the tails are held, the hold hears the
-    /// pass's loudest pre-gain sample of the device output.
+    /// A player is live when a note or a pad was struck this pass, a
+    /// preview is playing, or the room is tracking (monitoring on and an
+    /// armed track's bound input heard, as this pass's chunks found it);
+    /// while the tails are held, the hold hears the pass's loudest pre-gain
+    /// sample of the device output.
+    ///
+    /// **A tracking desk lets go of a hold in the pass that finds it.** It
+    /// makes the motor not allowed, but the pass's plan read the LAST pass's
+    /// answer, so leaving the release to the snap that follows held a player
+    /// who had just switched monitoring on, or armed, silent for one more
+    /// pass. Spec 4.10's monitored input lets go at once, in this pass.
     fn motor_stage(&mut self, out: &mut [f32], dev_frames: usize) {
         if self.motor.last().steady {
             return;
@@ -14598,7 +14606,7 @@ impl Renderer {
             .preview
             .as_deref()
             .is_some_and(|c| self.preview_pos < c.frames());
-        let live = self.live_struck || preview;
+        let live = self.live_struck || preview || self.room_tracking;
         let peak = if self.motor.holding() {
             out[..n].iter().fold(0.0f32, |m, s| m.max(s.abs()))
         } else {
@@ -52707,6 +52715,37 @@ mod tape_motor {
         let after = d.run(&mut t, 16, PASS);
         assert!(!ramped(&after) && after.iter().all(|p| p.show != MotorShow::Holding), "a tracking desk was wound down or held");
         assert!(after.iter().all(|p| db(f64::from(peak(&p.out))) > -90.0), "a tracking desk's tail was not heard");
+    }
+
+    /// **A hold lets go in the very pass that finds a tracking desk.**
+    ///
+    /// A tracking desk is a player: spec 4.10 lets a monitored input go
+    /// through a hold at once, in its own pass. Monitoring switched on while
+    /// an unmonitored desk holds its plate's tail: the pass whose chunks
+    /// first mix the room with the armed input heard lets go, gliding up from
+    /// its first frame, so it is heard. Left to the snap the next pass's plan
+    /// makes (a tracking desk does not allow the motor, but a plan reads the
+    /// last pass's answer) the player was held silent one pass longer.
+    #[test]
+    fn a_hold_lets_go_in_the_pass_that_finds_a_tracking_desk() {
+        let mut d = Tracking::new(1, false, true, true);
+        d.e.set_tape_motor(true, 0.5, 0.2);
+        let mut t = Transport::new();
+        t.toggle_play();
+        d.run(&mut t, RATE as usize / PASS, PASS);
+        t.stop();
+        d.until(&mut t, PASS, MotorShow::Holding, 400);
+        for p in d.run(&mut t, 4, PASS) {
+            assert_eq!(p.show, MotorShow::Holding, "the tail was not held");
+            assert!(db(f64::from(peak(&p.out)).max(1e-12)) < -90.0, "a held tail was heard: {}", peak(&p.out));
+        }
+        d.e.set_monitor_on(true);
+        let p = d.one(&mut t, PASS);
+        assert!(d.tracking(), "the switch did not make a tracking desk, so nothing was proved");
+        assert!(peak(&p.out) > PARK_FLOOR, "the pass that found a tracking desk was held silent ({})", peak(&p.out));
+        let head = p.out.chunks_exact(2).take(8).fold(0.0f32, |m, f| m.max(f[0].abs()).max(f[1].abs()));
+        assert!(head < peak(&p.out) * 0.05, "the release did not glide up from the pass's first frame");
+        assert_ne!(d.one(&mut t, PASS).show, MotorShow::Holding, "the hold outlived a tracking desk");
     }
 
     /// **The master meter reads what the speakers play, through a hold and
