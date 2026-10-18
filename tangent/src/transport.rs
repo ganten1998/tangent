@@ -16,7 +16,9 @@
 //! "seek to N" store could not be told from the same value re-asserted. The
 //! locate is now a GENERATION-stamped command (`Engine::set_transport`), the
 //! callback acks the generation it has applied, and the level (`set_rolling`)
-//! is derived and safe to re-assert because nothing keys off its edges.
+//! is derived and safe to re-assert every frame. The one thing that keys off
+//! its edges is the tape motor (`crate::motor`), on the audio thread, and only
+//! while `Shared::motor_ok` lets it.
 //!
 //! The generation is this struct's monotonic counter, starting at 1 and never
 //! reset — deliberately, so a freshly built engine (whose applied generation
@@ -65,6 +67,11 @@ pub struct Transport {
     /// (`Engine::motor_coasting`), so the push after it carries where the
     /// tape came to rest back once more. See `push`.
     coasting: bool,
+    /// **The pending locate is Stop's own return to the cursor**: set by
+    /// `stop`, cleared by every other locate. While the engine has not
+    /// applied it, the tape may still be on its way to the coast that holds
+    /// it, and is drawn where it is (`shown_s`).
+    returning: bool,
 }
 
 impl Transport {
@@ -75,6 +82,7 @@ impl Transport {
             playing: false,
             cursor_s: 0.0,
             coasting: false,
+            returning: false,
         }
     }
 
@@ -85,6 +93,7 @@ impl Transport {
         self.pos_s = seconds.max(0.0);
         self.cursor_s = self.pos_s;
         self.generation += 1;
+        self.returning = false;
     }
 
     /// Move the playhead WITHOUT moving the edit cursor — the return-to-
@@ -97,6 +106,7 @@ impl Transport {
     pub fn locate_playhead(&mut self, seconds: f64) {
         self.pos_s = seconds.max(0.0);
         self.generation += 1;
+        self.returning = false;
     }
 
     /// The green button. Starts the audition from the playhead; pressed while
@@ -115,6 +125,7 @@ impl Transport {
     pub fn stop(&mut self) {
         self.playing = false;
         self.locate_playhead(self.cursor_s);
+        self.returning = true;
     }
 
     /// **The generation of the latest locate**, the one the next `push`
@@ -152,19 +163,48 @@ impl Transport {
     }
 
     /// **The playhead as it is drawn, and as the hand edits it**: the
-    /// engine's own clock while its tape coasts to a stop, otherwise
-    /// [`Transport::position_s`].
+    /// engine's own clock while Stop's return waits on a moving tape,
+    /// otherwise [`Transport::position_s`].
     ///
     /// One authority at a time, extended by one case: through a coast the
     /// line follows the tape as it slows, and every action at the playhead
     /// (a split, a paste, an automation point, the readouts, a nudge) acts
     /// at the line the user sees; when a Stop's coast ends, the line jumps
-    /// to the cursor and they act there.
+    /// to the cursor and they act there. A Pause's coast needs no case of
+    /// its own: it holds no locate, so `position_s` is the engine's clock.
+    ///
+    /// **From the frame after the press, not from the first pass that
+    /// coasts.** The band draws before the frame's push (`fill_recorder_state`
+    /// runs before `after_frame`, and Stop lands in `after_frame`'s request
+    /// loop, after the push), so the frame after a Stop draws before the
+    /// engine has been told anything: the tape still shows Running and the
+    /// return is unacked. Asked only while the tape coasted, that frame drew
+    /// the requested position, the cursor, and the next ones the coasting
+    /// tape again, a blink at every Stop, longer with a callback longer than
+    /// a pass. So while the pending locate is Stop's own return and the
+    /// engine has not applied it, a tape that coasts, or that the host lets
+    /// move and is not at rest, is drawn where it is. With the motor off a
+    /// Stop draws the cursor at once, as it always has; on a desk where the
+    /// engine keeps the motor down itself (a tracking desk, a hardware loop)
+    /// the line waits at the stopped tape for the frame before the ack. Any
+    /// other locate, a ruler click during a coast among them, is drawn where
+    /// it was asked at once, which is the lag `position_s` was built to
+    /// remove.
     pub fn shown_s(&self, engine: Option<&Engine>, rate: f64) -> f64 {
         match engine {
-            Some(e) if e.motor_coasting() && rate > 0.0 => e.transport_position() as f64 / rate,
+            Some(e) if rate > 0.0 && self.returning && !e.transport_acked(self.generation) && Self::moving(e) => {
+                e.transport_position() as f64 / rate
+            }
             _ => self.position_s(engine, rate),
         }
+    }
+
+    /// **The engine's tape is moving, or may still be**: coasting, or not at
+    /// rest with the host letting the motor move (`Engine::motor_armed`), so
+    /// a Stop it has not yet read may yet coast.
+    fn moving(e: &Engine) -> bool {
+        use crate::motor::MotorShow;
+        e.motor_coasting() || (e.motor_armed() && !matches!(e.motor_show(), MotorShow::Parked | MotorShow::Holding))
     }
 
     /// Reconcile once a frame.
@@ -605,8 +645,82 @@ mod tests {
     /// position it asked for, the cursor (`position_s`), so a record started
     /// or a take placed then is placed at the cursor. When the tape stops,
     /// both are the cursor.
+    ///
+    /// Driven in `DesktopApp::update`'s own order from the frame after the
+    /// press: the band draws (`fill_recorder_state`), then the frame's push,
+    /// then the callbacks until the next frame, one 256-frame pass a frame
+    /// or six (a 33 ms frame at 48 kHz holds about six). The press lands in
+    /// a frame's request loop, after its push, so the first frame after it
+    /// is drawn before the engine has heard of it: the line must not blink
+    /// to the cursor there and back onto the tape, as it did whenever only
+    /// a coasting tape was drawn where it is.
     #[test]
     fn the_shown_playhead_follows_a_coasting_tape_and_the_cursor_holds_the_logic() {
+        for per_frame in [1usize, 6] {
+            let what = format!("{per_frame} passes a frame");
+            let (mut e, mut t) = armed();
+            let rate = 48_000.0;
+            t.locate(1.0);
+            t.toggle_play();
+            let mut out = vec![0.0f32; 2 * 256];
+            let frame = |e: &mut Engine, t: &mut Transport, out: &mut [f32]| {
+                t.push(Some(&*e));
+                for _ in 0..per_frame {
+                    e.render_offline(out);
+                }
+            };
+            for _ in 0..40 {
+                frame(&mut e, &mut t, &mut out);
+            }
+            let pressed = e.transport_position() as f64 / rate;
+            // The press, in this frame's request loop, after its push.
+            t.stop();
+            let mut drawn = Vec::new();
+            let mut coasted = false;
+            for _ in 0..400 {
+                drawn.push(t.shown_s(Some(&e), rate));
+                assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9, "{what}: the host's logic left the cursor mid-coast");
+                frame(&mut e, &mut t, &mut out);
+                coasted |= e.motor_coasting();
+                if coasted && !e.motor_coasting() {
+                    drawn.push(t.shown_s(Some(&e), rate));
+                    break;
+                }
+            }
+            assert!(coasted, "{what}: the stop did not coast");
+            let home = drawn
+                .iter()
+                .position(|s| (s - 1.0).abs() < 1e-9)
+                .unwrap_or_else(|| panic!("{what}: the drawn playhead never came home to the cursor"));
+            assert!(home > 10, "{what}: the line came home {home} frames after the press, before the tape could have stopped");
+            assert!(
+                drawn[..home].iter().all(|s| *s >= pressed - 1e-9),
+                "{what}: the line was drawn behind the tape before it came home: {:?}",
+                &drawn[..home.min(6)]
+            );
+            assert!(drawn[..home].windows(2).all(|w| w[1] >= w[0]), "{what}: the drawn playhead went backwards through the coast");
+            assert!(
+                drawn[home..].iter().all(|s| (s - 1.0).abs() < 1e-9),
+                "{what}: the drawn playhead left the cursor after it came home: {:?}",
+                &drawn[..drawn.len().min(6)]
+            );
+            assert!((t.shown_s(Some(&e), rate) - 1.0).abs() < 1e-9, "{what}: the drawn playhead is not at the cursor after the stop");
+            assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9);
+        }
+    }
+
+    /// **A click during a coast is drawn where it lands, at once.**
+    ///
+    /// A ruler click while the tape coasts to a stop is a locate
+    /// (`R::Locate`), which also cuts the coast (`Engine::cut_motor`) so the
+    /// engine applies it after the house's 10 ms declick rather than when the
+    /// coast would have ended. It is not Stop's return, so from the very
+    /// frame after the click the line is drawn where it was asked, as every
+    /// click is (`position_s`), and not at the coasting tape until the cut
+    /// lands. Frame by frame in `update`'s order, the click landing in a
+    /// frame's request loop.
+    #[test]
+    fn a_click_during_a_coast_is_drawn_where_it_lands_at_once() {
         let (mut e, mut t) = armed();
         let rate = 48_000.0;
         t.locate(1.0);
@@ -617,22 +731,20 @@ mod tests {
             e.render_offline(&mut out);
         }
         t.stop();
-        let mut shown = Vec::new();
-        for _ in 0..400 {
+        for _ in 0..20 {
             t.push(Some(&e));
             e.render_offline(&mut out);
-            if e.motor_coasting() {
-                assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9, "the host's logic left the cursor mid-coast");
-                shown.push(t.shown_s(Some(&e), rate));
-            } else if !shown.is_empty() {
-                break;
-            }
         }
-        assert!(shown.len() > 10, "the stop did not coast");
-        assert!(shown.windows(2).all(|w| w[1] >= w[0]), "the drawn playhead went backwards through the coast");
-        assert!(shown[0] > 1.0 + 40.0 * 256.0 / rate - 1e-9, "the drawn playhead jumped to the cursor mid-coast");
-        assert!((t.shown_s(Some(&e), rate) - 1.0).abs() < 1e-9, "the drawn playhead is not at the cursor after the stop");
-        assert!((t.position_s(Some(&e), rate) - 1.0).abs() < 1e-9);
+        assert!(e.motor_coasting(), "the stop did not coast, so nothing was proved");
+        t.locate(3.0);
+        e.cut_motor();
+        for k in 0..30 {
+            let drawn = t.shown_s(Some(&e), rate);
+            assert!((drawn - 3.0).abs() < 1e-9, "{k} frames after the click the line was drawn at {drawn}");
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        assert!(e.transport_acked(t.generation()) && !e.motor_coasting(), "the click never landed");
     }
 
     /// **A Pause's coast is remembered where the tape stopped** (the

@@ -27380,6 +27380,15 @@ impl Engine {
         self.motor_show().settled(playing)
     }
 
+    /// **The host lets the tape's motor move**: its own word, as
+    /// `set_tape_motor` and `park_tape_motor` last stored it. Whether the
+    /// motor does is still the engine's to say (a hardware loop, an IR job,
+    /// a capture or a tracking desk keep it down). What the drawn playhead
+    /// asks of a Stop the engine has not read yet (`Transport::shown_s`).
+    pub(crate) fn motor_armed(&self) -> bool {
+        self.shared.motor_ok.load(Ordering::Relaxed)
+    }
+
 
 
     // ── health ──────────────────────────────────────────────────────────────
