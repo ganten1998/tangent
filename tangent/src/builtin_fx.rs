@@ -1495,14 +1495,20 @@ impl BuiltinUnit {
             BuiltinUnit::Eq(_) => 0,
             // Width, floor and velvet all read the sample they write.
             BuiltinUnit::Imager(_) => 0,
-            // The play head sits a couple of milliseconds behind the record
-            // head (`units::tape::BASE_MS`), but the figure is deliberately
-            // unreported this pass: the head also WANDERS around that point,
-            // so the number is nominal, and the suite ships every unit at
-            // zero. The road for the honest figure already exists —
-            // `Backend::reported_latency` reads this every block — so
-            // reporting it later is one arm here and no new plumbing.
-            BuiltinUnit::Tape(_) => 0,
+            // **The play head's delay, reported.** The head sits
+            // `units::tape::BASE_MS` behind the record head with the record
+            // stage's oversampler inside that figure, and an impulse leaves
+            // on exactly the frame the kernel names, so the number is the
+            // real delay rather than a nominal one: the wobble sways the head
+            // around it, never off it on average. The kernel answers from
+            // the params alone, so the figure is right straight after
+            // `UnitSpec::create` and for a bay restored bypassed, whose
+            // kernel never runs (the denoiser's lesson, in
+            // `DenoiseUnit::set_param`). `Backend::reported_latency`
+            // re-reads it every block in circuit, and the rack's bypass arm
+            // every block out of it, because a bypassed Tape keeps this
+            // delay ([`TapeUnit::bypassed`]).
+            BuiltinUnit::Tape(u) => u.kernel.latency_frames(&u.params) as u32,
             // Feed-forward with no lookahead window.
             BuiltinUnit::Comp(_) => 0,
             // The one honest mover: 3 ms with the lookahead up, nothing with
@@ -1785,6 +1791,36 @@ impl BuiltinUnit {
         }
     }
 
+    /// **Whether a bypassed bay of this unit keeps the delay it reports.**
+    ///
+    /// A bypassed bay's figure stays in the compensation graph, so a unit
+    /// with a delay that let its input past untouched would play its lane
+    /// that much early against the rest of the mix. The rack sends a bay of
+    /// a unit that answers yes through [`BuiltinUnit::bypassed`] instead of
+    /// past it: the hardware insert (its loop's round trip, the owner's
+    /// ruling) and the tape (its play head). Every other built-in reports
+    /// nothing, or, like the denoise's lookahead, has yet to opt in here.
+    pub fn keeps_its_delay_when_bypassed(&self) -> bool {
+        matches!(self, BuiltinUnit::HwInsert(_) | BuiltinUnit::Tape(_))
+    }
+
+    /// The bay bypassed, for a unit that
+    /// [keeps its delay](BuiltinUnit::keeps_its_delay_when_bypassed): its
+    /// input, as late as its latency says. Any other unit answers the
+    /// untouched signal, which is what its bypass is.
+    pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        match self {
+            BuiltinUnit::HwInsert(u) => u.bypassed(input, frames, out),
+            BuiltinUnit::Tape(u) => u.bypassed(input, frames, out),
+            _ => {
+                for (src, dst) in input.iter().zip(out.iter_mut()) {
+                    let n = frames.min(src.len()).min(dst.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                }
+            }
+        }
+    }
+
     /// Drop whatever the unit remembers of the signal, the way every unit in
     /// `effects.rs` can. The trim remembers only where its slew is, and
     /// clearing that snaps the gain to its target.
@@ -1793,7 +1829,8 @@ impl BuiltinUnit {
             BuiltinUnit::Trim(t) => t.clear(),
             BuiltinUnit::Eq(u) => u.kernel.clear(),
             BuiltinUnit::Imager(u) => u.kernel.clear(),
-            BuiltinUnit::Tape(u) => u.kernel.clear(),
+            // The tape, and the dry line its bypass keeps.
+            BuiltinUnit::Tape(u) => u.clear(),
             BuiltinUnit::Comp(u) => u.kernel.clear(),
             // The denoise's clear keeps what was LEARNED — its kernel
             // documents "forget what was playing, keep the thresholds",
@@ -2003,18 +2040,80 @@ impl ImagerUnit {
 
 // ── Tangent Tape, seated ────────────────────────────────────────────────────
 
+/// How long the seat's fade between the tape and its own dry takes, either
+/// way, in milliseconds.
+///
+/// **An equal-gain fade, because the two are one signal at one time.** The
+/// dry line holds the input exactly as late as the tape reports, and the
+/// tape's play head sways around that figure and never off it on average,
+/// so a linear fade between them is a fade between two takes of the same
+/// sound with nothing in it to cancel. Ten milliseconds is too short to
+/// hear as a fade and long enough that neither end can click.
+const TAPE_BYPASS_FADE_MS: f32 = 10.0;
+
+/// How long a kernel started again after a bypass plays dry beyond the
+/// tape's own delay, before the fade back to it, in milliseconds.
+///
+/// A stopped kernel is cleared before it runs again, so it never replays what
+/// was on its tape before the bay went out. Its head then reads the silence
+/// of a clean tape for exactly the tape's delay while the new signal is
+/// recorded, and its filters settle from rest; the dry covers both, the
+/// delay and this much more, and only then fades back to the tape.
+const TAPE_REFILL_MS: f32 = 5.0;
+
 pub struct TapeUnit {
     kernel: crate::units::tape::Tape,
     params: crate::units::tape::TapeParams,
     scratch: Vec<f32>,
+    /// **The input, as late as the tape.** A line per channel, written every
+    /// block whether the bay is in circuit or not and read at the latency
+    /// the kernel reports, so a bypassed bay is heard where the tape would
+    /// have been. Sized at build for the most a tape can ever report.
+    dry: [Vec<f32>; 2],
+    dry_at: usize,
+    /// How much of the output is the dry: 0 in circuit, 1 bypassed, and
+    /// between while one fades into the other.
+    mix: f32,
+    /// Whether the kernel has stopped. A bypassed bay runs it only for the
+    /// fade out; after that it costs nothing until the bay is back in
+    /// circuit, and then it starts again from a clean tape.
+    stale: bool,
+    /// Whether the kernel has run since the last clear. A bay opened
+    /// bypassed has nothing on its tape to fade away from, so it goes to the
+    /// dry at once.
+    live: bool,
+    /// Frames of dry still owed while a kernel started again refills its
+    /// tape, before the fade back to it begins.
+    warm: usize,
+    /// How far `mix` moves per frame: a whole fade in
+    /// [`TAPE_BYPASS_FADE_MS`].
+    fade: f32,
+    /// [`TAPE_REFILL_MS`] in frames at this unit's rate.
+    refill: usize,
+    /// How many blocks the kernel has been run, so a test can hold a
+    /// bypassed bay to costing nothing.
+    #[cfg(test)]
+    kernel_blocks: usize,
 }
 
 impl TapeUnit {
     fn new(sample_rate: f32) -> Self {
+        let sr = sample_rate.max(8_000.0);
+        let line = crate::units::tape::Tape::max_latency_frames(sample_rate) + 8;
         Self {
             kernel: crate::units::tape::Tape::new(sample_rate),
             params: crate::units::tape::TapeParams::default(),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
+            dry: [vec![0.0; line], vec![0.0; line]],
+            dry_at: 0,
+            mix: 0.0,
+            stale: false,
+            live: false,
+            warm: 0,
+            fade: 1.0 / (TAPE_BYPASS_FADE_MS * 1.0e-3 * sr).max(1.0),
+            refill: (TAPE_REFILL_MS * 1.0e-3 * sr).round() as usize,
+            #[cfg(test)]
+            kernel_blocks: 0,
         }
     }
 
@@ -2023,21 +2122,116 @@ impl TapeUnit {
             return;
         };
         let v = washed(spec, value);
+        // **Every id names its field, and an id with no arm writes
+        // nothing.** The last arm used to be a catch-all into the trim, which
+        // was harmless while the table stopped at the trim and would not stay
+        // so: a row appended to `TAPE_FACE_PARAMS` without an arm here would
+        // have driven the output level, and the seat's sweep would still have
+        // passed, because the trim moves the output.
         match id {
             0 => self.params.drive = v,
             1 => self.params.bump = v,
             2 => self.params.roll = v,
             3 => self.params.wobble = v,
             4 => self.params.hiss = v,
-            _ => self.params.trim = v,
+            5 => self.params.trim = v,
+            _ => {}
         }
     }
 
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
-        let (kernel, params) = (&mut self.kernel, &self.params);
-        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
-            kernel.process(buf, n, 2, params);
-        });
+        self.run(input, frames, out, false);
+    }
+
+    /// **The bay bypassed: its input, exactly as late as the tape it
+    /// stands in for.** The latency the tape reports stays in the
+    /// compensation graph while the bay is out, as every bypass in the rack
+    /// keeps it, so a bypass that passed the input untouched would play the
+    /// lane that many frames early against the rest of the mix: two
+    /// milliseconds, a flam on every A/B. So the dry leaves through a line
+    /// as long as the report. Going out, the kernel keeps running for
+    /// [`TAPE_BYPASS_FADE_MS`] while the output fades to the dry, then
+    /// stops and costs nothing; a bay opened bypassed has no tape to fade
+    /// from and goes to the dry at once. Coming back, see
+    /// [`TAPE_REFILL_MS`].
+    pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        self.run(input, frames, out, true);
+    }
+
+    /// One block, in circuit or bypassed: the one road both take, so the dry
+    /// line is written either way and the fade between the two is one
+    /// state whichever way it is going, a fade reversed halfway included.
+    fn run(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>], bypassed: bool) {
+        // Fewer than two channels is the planar adapter's copy-through, in
+        // circuit and out: a mono bay never runs the tape, so it has no
+        // delay of the tape's to keep.
+        if input.len() < 2 || out.len() < 2 {
+            run_planar(&mut self.scratch, input, frames, out, |_, _| {});
+            return;
+        }
+        let late = self.kernel.latency_frames(&self.params);
+        if bypassed && !self.live {
+            self.mix = 1.0;
+            self.stale = true;
+        }
+        if !bypassed && self.stale {
+            self.kernel.clear();
+            self.stale = false;
+            self.warm = late + self.refill;
+        }
+        let wet = !self.stale;
+        if wet {
+            let (kernel, params) = (&mut self.kernel, &self.params);
+            run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+                kernel.process(buf, n, 2, params);
+            });
+            self.live = true;
+            #[cfg(test)]
+            {
+                self.kernel_blocks += 1;
+            }
+        }
+        let line = self.dry[0].len();
+        for f in 0..frames {
+            let back = (self.dry_at + line - late) % line;
+            for (ch, d) in self.dry.iter_mut().enumerate() {
+                d[self.dry_at] = input[ch].get(f).copied().unwrap_or(0.0);
+            }
+            let dry = [self.dry[0][back], self.dry[1][back]];
+            self.dry_at = (self.dry_at + 1) % line;
+            if bypassed {
+                self.mix = (self.mix + self.fade).min(1.0);
+            } else if self.warm > 0 {
+                self.warm -= 1;
+            } else {
+                self.mix = (self.mix - self.fade).max(0.0);
+            }
+            let m = self.mix;
+            if m > 0.0 {
+                for (o, d) in out.iter_mut().zip(dry) {
+                    if let Some(o) = o.get_mut(f) {
+                        *o = if m >= 1.0 { d } else { *o + (d - *o) * m };
+                    }
+                }
+            }
+        }
+        if bypassed && self.mix >= 1.0 {
+            self.stale = true;
+        }
+    }
+
+    /// Forget the tape and the dry with it, and stand in circuit: a bay
+    /// that loads bypassed is told so by its first block.
+    fn clear(&mut self) {
+        self.kernel.clear();
+        for d in &mut self.dry {
+            d.fill(0.0);
+        }
+        self.dry_at = 0;
+        self.mix = 0.0;
+        self.stale = false;
+        self.live = false;
+        self.warm = 0;
     }
 }
 
@@ -3544,6 +3738,353 @@ mod tests {
             "the shipped tape moved the broadband level by {shipped:.3} dB \
              through the adapter"
         );
+    }
+
+    /// **The tape reports its head to delay compensation before its first
+    /// block.**
+    ///
+    /// The play head holds the tape `units::tape::BASE_MS` behind the
+    /// record head, and the seat used to tell the compensation graph zero,
+    /// so every Tape lane played two milliseconds late against the rest of
+    /// the mix. Now it reports the kernel's own figure, and the figure has to
+    /// be there the moment the bay is seated: `UnitSpec::create` sets the
+    /// parameters and `instrument`'s `prepare_builtin` reads `latency()` on
+    /// the next line, and a bay restored bypassed never runs the block that
+    /// could correct it: the denoiser's fault, pinned by
+    /// `a_denoise_seated_from_a_blob_reports_its_latency_before_the_first_block`.
+    ///
+    /// So it is read through the real load path, `state_text`,
+    /// `values_from_state`, `create`, with no block processed: two
+    /// milliseconds at 44.1, 48 and 96 kHz, which is 88, 96 and 192 frames.
+    /// And no dial moves it: every id driven to both ends of its travel on
+    /// the live unit leaves the figure where it was, because a report that
+    /// moved with a character dial would re-time the lane every time
+    /// somebody turned it.
+    #[test]
+    fn the_tape_reports_its_head_to_delay_compensation_before_its_first_block() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        for (sr, want) in [(44_100.0_f32, 88_u32), (48_000.0, 96), (96_000.0, 192)] {
+            let text = state_text(spec, &spec.defaults(), &[]);
+            let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+            let mut unit = spec.create(sr, &back);
+            assert_eq!(
+                unit.latency(),
+                want,
+                "a tape seated at {sr} Hz reported {} frames before its first block",
+                unit.latency()
+            );
+            for p in spec.params {
+                for end in [0.0_f32, 1.0] {
+                    unit.set_param(p.id, end);
+                    assert_eq!(
+                        unit.latency(),
+                        want,
+                        "{} at {end} moved the tape's report at {sr} Hz",
+                        p.symbol
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Every tape id reaches its own field, and an id the table does not
+    /// name reaches none.**
+    ///
+    /// The seat's sweep (`every_imager_and_tape_control_moves_the_audio_through_the_seat`)
+    /// asks whether each id moves the sound, and an id wired to the wrong
+    /// field passes it whenever that field moves the sound too, which the
+    /// trim always does. `TapeUnit::set_param` used to end in a catch-all
+    /// into the trim, so the first row appended to the table without an arm
+    /// of its own would have driven the output level and nothing would have
+    /// said so. So each id is set to a value of its own and the kernel's
+    /// params are read back field by field: its field takes the value and no
+    /// other field moves. The field list must be exactly as long as the
+    /// table or this fails first, so a row appended to one is a row added to
+    /// the other. Ids past the table move nothing, and a NaN lands on the
+    /// row's default rather than on what was there.
+    #[test]
+    fn every_tape_id_reaches_its_own_field() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let BuiltinUnit::Tape(mut u) = spec.create(48_000.0, &spec.defaults()) else {
+            panic!("the tape path built something that is not a tape");
+        };
+        let fields = |p: &crate::units::tape::TapeParams| {
+            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim]
+        };
+        assert_eq!(
+            fields(&u.params).len(),
+            TAPE_FACE_PARAMS.len(),
+            "a tape row has no field in this list, or a field has no row"
+        );
+        for (k, row) in TAPE_FACE_PARAMS.iter().enumerate() {
+            assert_eq!(row.id as usize, k, "the tape's ids are not its rows");
+            let before = fields(&u.params);
+            let v = (k as f32 + 1.0) / 16.0;
+            u.set_param(row.id, v);
+            for (j, (was, now)) in before.iter().zip(fields(&u.params)).enumerate() {
+                if j == k {
+                    assert_eq!(now, v, "id {k} ({}) did not reach its own field", row.symbol);
+                } else {
+                    assert_eq!(
+                        now, *was,
+                        "id {k} ({}) moved {}",
+                        row.symbol, TAPE_FACE_PARAMS[j].symbol
+                    );
+                }
+            }
+        }
+        let before = u.params;
+        for id in [TAPE_FACE_PARAMS.len() as u32, 13, 99, u32::MAX] {
+            u.set_param(id, 0.875);
+        }
+        assert_eq!(u.params, before, "an id past the tape's table moved a knob");
+        for row in TAPE_FACE_PARAMS {
+            u.set_param(row.id, f32::NAN);
+            assert_eq!(
+                fields(&u.params)[row.id as usize],
+                row.default,
+                "NaN on {} did not read as its default",
+                row.symbol
+            );
+        }
+    }
+
+    /// Rising zero crossings of `v`, each placed between its two samples by
+    /// linear interpolation, past the first `skip` frames.
+    fn rising_crossings(v: &[f32], skip: usize) -> Vec<f64> {
+        (skip.max(1)..v.len())
+            .filter(|&i| v[i - 1] < 0.0 && v[i] >= 0.0)
+            .map(|i| (i - 1) as f64 + f64::from(v[i - 1]) / f64::from(v[i - 1] - v[i]))
+            .collect()
+    }
+
+    /// **A bypassed tape keeps its delay, and switching it out and back in
+    /// does not click.**
+    ///
+    /// The tape's report stays in the compensation graph while its bay is
+    /// bypassed, as every bypass in the rack keeps its bay's figure, so a
+    /// bypass that let the input past untouched played the lane two
+    /// milliseconds early: every A/B against the tape was a comparison of
+    /// two timings as well as two sounds. The seat now holds the dry signal
+    /// exactly as late as the tape reports and fades between the two.
+    ///
+    /// A 440 Hz sine at -12 dBFS through every colour off at 48 kHz, in
+    /// 512-frame blocks through `BuiltinUnit::process` and
+    /// `BuiltinUnit::bypassed`. Bypassed from creation it is the input
+    /// delayed by the 96 frames reported, to a millionth, and the kernel
+    /// never runs. Switched out at block 10 and back at block 40, against
+    /// the same sine left in circuit: no sample-to-sample step is more than
+    /// half as big again as the sine's own largest, so neither fade clicks;
+    /// every zero crossing stays within a sample and a half of the
+    /// in-circuit run's, so the bypass never moved the lane; the kernel does
+    /// not run once its fade out is done; and 40 ms after the switch back
+    /// the output is the in-circuit run's within a thousandth, so the tape
+    /// it went back to plays as if it had never left. Measured: the worst
+    /// step 1.02 times the sine's own, the crossings 1.31 samples, the
+    /// kernel idle from block 11 to 39, and 2.8e-7 at 40 ms.
+    ///
+    /// The crossings' bar is the tape's own phase and not its timing: its
+    /// 35 Hz sub roll leads a pure delay by 1.31 samples at 440 Hz, while a
+    /// bypass that dropped the tape's 96 frames would move a crossing by 13.
+    /// 440 Hz and not 1 kHz, because a 1 kHz period at 48 kHz is 48 frames,
+    /// which 96 is two of, and a lane that slipped by exactly the report
+    /// would cross zero where it always had.
+    #[test]
+    fn a_bypassed_tape_keeps_its_delay_and_switches_without_a_click() {
+        const BLOCK: usize = 512;
+        const BLOCKS: usize = 64;
+        let sr = 48_000.0_f32;
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let neutral = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        let amp = 10.0_f64.powf(-12.0 / 20.0);
+        let sine: Vec<f32> = (0..BLOCK * BLOCKS)
+            .map(|i| (amp * (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(sr)).sin()) as f32)
+            .collect();
+        let largest = sine.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
+        // The sine through a fresh unit, bypassed on the blocks `out_of`
+        // names: the left channel, how many blocks the kernel had run by the
+        // end of each block, and the latency reported.
+        let run = |out_of: &dyn Fn(usize) -> bool| {
+            let mut unit = spec.create(sr, &neutral);
+            let mut heard = Vec::with_capacity(sine.len());
+            let mut ran = Vec::with_capacity(BLOCKS);
+            let mut out = vec![vec![0.0_f32; BLOCK]; 2];
+            for k in 0..BLOCKS {
+                let block = sine[k * BLOCK..(k + 1) * BLOCK].to_vec();
+                let input = vec![block.clone(), block];
+                if out_of(k) {
+                    unit.bypassed(&input, BLOCK, &mut out);
+                } else {
+                    unit.process(&input, BLOCK, &mut out);
+                }
+                heard.extend_from_slice(&out[0]);
+                let BuiltinUnit::Tape(t) = &unit else {
+                    panic!("the tape path built something that is not a tape");
+                };
+                ran.push(t.kernel_blocks);
+            }
+            (heard, ran, unit.latency() as usize)
+        };
+
+        let (dry, ran, late) = run(&|_| true);
+        assert_eq!(late, 96, "the tape reports {late} frames at 48 kHz");
+        for (i, v) in dry.iter().enumerate() {
+            let want = if i < late { 0.0 } else { sine[i - late] };
+            assert!(
+                (v - want).abs() < 1.0e-6,
+                "frame {i} of a bay bypassed since creation read {v}, and the input \
+                 {late} frames back is {want}"
+            );
+        }
+        assert_eq!(ran[BLOCKS - 1], 0, "a bay bypassed since creation ran its kernel");
+
+        let (live, _, _) = run(&|_| false);
+        let (flip, ran, _) = run(&|k| (10..40).contains(&k));
+        for (i, w) in flip.windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= 1.5 * largest,
+                "frame {i}: a step of {step:.4} against the sine's own {largest:.4}, so \
+                 the switch clicked"
+            );
+        }
+        let (was, now) = (rising_crossings(&live, 200), rising_crossings(&flip, 200));
+        assert_eq!(was.len(), now.len(), "the switched run crossed zero a different number of times");
+        let moved = was.iter().zip(&now).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
+        assert!(
+            moved < 1.5,
+            "a zero crossing moved {moved:.3} of a sample, so the bypass moved the lane"
+        );
+        assert_eq!(
+            ran[10], ran[39],
+            "the kernel ran while the bay was fully bypassed ({} blocks, then {})",
+            ran[10], ran[39]
+        );
+        assert!(ran[40] > ran[39], "the kernel did not start again when the bay came back");
+        let back = 40 * BLOCK + (0.040 * sr) as usize;
+        let off = live[back..]
+            .iter()
+            .zip(&flip[back..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            off < 1.0e-3,
+            "40 ms after the switch back the tape is {off:.2e} from the one that never left"
+        );
+    }
+
+    /// **A bypassed tape keeps its lane in time, through the real rack.**
+    ///
+    /// The seat's dry line is half of the fix; the other half is the rack's
+    /// bypass arm, which used to send only the hardware insert through its
+    /// bypass and let every other bay's input past untouched while the bay's
+    /// figure stayed in the compensation graph. So a pad note on lane 5,
+    /// through a tape with every colour off in that lane's own first bay, is
+    /// played three ways in the offline engine: in circuit; bypassed from
+    /// before the note; and bypassed, then put back in circuit at the
+    /// twentieth block, mid-note. Bypassed it sounds on the very frame the
+    /// tape in circuit does, at the same level, and flipped mid-note it
+    /// never steps by more than the tone's own largest step and a
+    /// thousandth, which a lane jumping by the tape's 96 frames would, by
+    /// about the tone's whole height.
+    #[test]
+    fn a_bypassed_tape_keeps_its_lane_in_time() {
+        use crate::instrument::{ClipNote, Engine, PadKit, PlacedMidi};
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+        const BLOCK: usize = 256;
+        const LANE: usize = 5;
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let neutral = state_text(spec, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5], &[]).into_bytes();
+        let amp = 0.05_f64;
+        let tone: Vec<f32> = (0..24_000)
+            .flat_map(|i| {
+                let v = (amp * (std::f64::consts::TAU * 440.0 * f64::from(i) / 48_000.0).sin()) as f32;
+                [v, v]
+            })
+            .collect();
+        let largest = tone
+            .chunks_exact(2)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+        let note = |bypassed: bool, flip_at: Option<usize>| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, tangent_record::audio::Timebase::new()).expect("offline");
+            e.load_insert(LANE, 0, Some(Path::new(TAPE_PATH)), Some(&neutral))
+                .expect("the tape loads")
+                .expect("the bay reports it");
+            if bypassed {
+                e.set_insert_bypass(&[(LANE, 0)]);
+            }
+            e.set_pad_kit(LANE, {
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+                    samples: tone.clone(),
+                    rate: 48_000,
+                    source: PathBuf::new(),
+                }));
+                kit
+            });
+            e.set_channel_gain(LANE, 1.0);
+            e.set_drum_strips(1 << LANE);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: LANE,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: 20_000,
+                    key: tangent_ui::recorder::DRUM_PAD_BASE,
+                    vel: 100,
+                }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut heard = Vec::new();
+            for k in 0..80 {
+                if Some(k) == flip_at {
+                    e.set_insert_bypass(&[]);
+                }
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard.extend(out.iter().step_by(2));
+            }
+            heard
+        };
+        let onset = |t: &[f32]| t.iter().position(|v| v.abs() > 1.0e-3).expect("a sound");
+        let level = |t: &[f32], at: usize| {
+            let w = &t[at + 1_000..at + 5_800];
+            (w.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / w.len() as f64).sqrt()
+        };
+        let through = note(false, None);
+        let at = onset(&through);
+        let bypassed = note(true, None);
+        assert_eq!(
+            onset(&bypassed),
+            at,
+            "the bypassed tape moved its lane by {} frames",
+            onset(&bypassed) as i64 - at as i64
+        );
+        let gain = 20.0 * (level(&bypassed, at) / level(&through, at)).log10();
+        assert!(gain.abs() < 0.1, "bypassed, the lane is {gain:+.3} dB from the tape in circuit");
+        let flipped = note(true, Some(20));
+        assert_eq!(onset(&flipped), at, "the lane bypassed until mid-note moved");
+        for (k, w) in flipped[at..at + 13_000].windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= largest + 1.0e-3,
+                "frame {k} after the onset stepped by {step:.4}, against the tone's own \
+                 {largest:.4}: the lane jumped when the tape came back"
+            );
+        }
     }
 
     /// **A block bigger than the scratch is chunked, not truncated or

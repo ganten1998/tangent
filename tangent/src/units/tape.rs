@@ -860,6 +860,22 @@ fn makeup_at(table: &[f32; MAKEUP_POINTS], log2_d: f64) -> f32 {
     table[i] + (table[i + 1] - table[i]) * t
 }
 
+/// Where a play head `ms` behind the record head rests, in whole samples at
+/// `sample_rate`: the delay less the [`OS_LATENCY`] the record stage's
+/// oversampler already holds, so the head and the pair together are `ms`.
+///
+/// `saturating_sub` and the floor are for a rate so low that the delay is
+/// shorter than the filter pair. 8 kHz is the lowest a tape can be built at
+/// and no engine runs there, but a kernel does not get to assume that, and a
+/// head at least four samples deep is what [`tap`] needs to interpolate at
+/// all. The rate is floored as [`Tape::new`] floors it, so a seat that asks
+/// this of the session rate gets the head the kernel built.
+fn head_rest(sample_rate: f32, ms: f32) -> usize {
+    ((ms * 1.0e-3 * sample_rate.max(8_000.0)).round() as usize)
+        .saturating_sub(OS_LATENCY)
+        .max(4)
+}
+
 /// Four-point third-order Hermite, the polynomial from `varispeed.rs`.
 ///
 /// The echo reads its tape with linear interpolation and gets away with it
@@ -1058,15 +1074,7 @@ impl Tape {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(8_000.0);
         let cap = (LINE_MS * 1.0e-3 * sr) as usize + 8;
-        // The head gives up what the oversampler already holds, so the two
-        // together are still BASE_MS. `saturating_sub` and the floor are for
-        // a rate so low that 2 ms is shorter than the filter pair — 8 kHz is
-        // the lowest this can be built at and no engine runs there, but a
-        // kernel does not get to assume that, and a head at least four
-        // samples deep is what `tap` needs to interpolate at all.
-        let base = ((BASE_MS * 1.0e-3 * sr).round() as usize)
-            .saturating_sub(OS_LATENCY)
-            .max(4);
+        let base = head_rest(sr, BASE_MS);
         Self {
             sample_rate: sr,
             line: [vec![0.0; cap], vec![0.0; cap]],
@@ -1122,6 +1130,16 @@ impl Tape {
     pub fn latency_frames(&self, p: &TapeParams) -> usize {
         let _ = p;
         self.base + OS_LATENCY
+    }
+
+    /// The most a tape built at `sample_rate` can ever report, at any
+    /// setting: what a seat sizes a line by when it has to hold the tape's
+    /// delay itself, which a bypassed bay does (`builtin_fx::TapeUnit`
+    /// keeps the dry signal as late as the tape, so switching it out
+    /// compares two sounds and not two timings). One head today, so it is
+    /// the figure [`Tape::latency_frames`] gives at every setting.
+    pub fn max_latency_frames(sample_rate: f32) -> usize {
+        head_rest(sample_rate, BASE_MS) + OS_LATENCY
     }
 
     /// In place on an interleaved buffer; `channels` is the stride. Stereo
