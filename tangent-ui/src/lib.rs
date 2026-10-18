@@ -93,6 +93,9 @@ mod ban_scan;
 /// everything else in the app used to do with a multiply.
 pub mod tempo;
 pub mod varispeed;
+/// Tape start and stop: whether Play spins the desk up and Stop winds it
+/// down, and how long each takes. The setting only; the engine is the motor.
+pub mod motor;
 pub mod confetti;
 pub mod splash;
 pub mod staff;

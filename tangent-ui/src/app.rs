@@ -9676,6 +9676,15 @@ impl TangentApp {
                 // so it rode into whatever was done next.
                 self.undo_commit();
             }
+            Some(VariHit::Motor) => {
+                // **The tape's start and stop, the other way round**, and a
+                // press, so a moment: the switch is hashed with the desk
+                // (`DeskSnap::start_stop`).
+                let on = self.settings.start_stop.on();
+                self.settings.start_stop.set_on(!on);
+                self.save_settings();
+                self.undo_commit();
+            }
             Some(VariHit::Close) => {
                 self.vari_open = false;
                 self.menu_ate_press = true;
@@ -10985,6 +10994,9 @@ impl TangentApp {
             master_mono: Some(s.master_mono),
             lufs_window: Some(s.lufs_window),
             varispeed: Some(s.varispeed),
+            // The tape's start and stop: the live desk says it, as every
+            // late field, so a save always writes it.
+            start_stop: Some(s.start_stop),
             click: Some(crate::arrangement::ClickRef {
                 div: s.metronome_div,
                 in_take: s.metronome_in_take,
@@ -11260,6 +11272,11 @@ impl TangentApp {
             // hold a range that has lost its invariant, which is the whole
             // reason it travels as the model and not as three numbers.
             self.settings.varispeed = v;
+        }
+        if let Some(v) = d.start_stop {
+            // The same: its times cannot be held outside the reach, so every
+            // value a moment or a document carries lands as it is.
+            self.settings.start_stop = v;
         }
         if let Some(c) = d.click.as_ref() {
             // 0 is "once a bar"; anything past 8 is a buzz, not a click —
@@ -32545,6 +32562,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.varispeed.ratio() as f32
     }
 
+    /// **The tape's start and stop, for the host to push**: the switch and
+    /// its two times, handed to the engine every frame.
+    ///
+    /// The model and not three loose numbers, for the reason the dial is
+    /// handed over as a ratio: the clamp to the reach and the rounding to the
+    /// centisecond live in `crate::motor`, once, and the engine is never told
+    /// a time this app could not have shown.
+    pub fn start_stop(&self) -> crate::motor::StartStop {
+        self.settings.start_stop
+    }
+
     /// What each effect is set to, as the flat map the settings file holds.
     ///
     /// **Untyped on purpose.** `tangent-ui` cannot name an `effects::Params` —
@@ -37844,6 +37872,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 None
             }
+            // **The tape's two times, in seconds, and one moment each**, on
+            // the roads the range's ends take: the times are hashed with the
+            // desk (`DeskSnap::start_stop`). A time out of the reach is
+            // clamped by the model; what is not a time closes the field on
+            // the time it opened with.
+            F::MotorStart | F::MotorStop => {
+                if let Some(t) = crate::motor::StartStop::parse(&edit.text) {
+                    if edit.field == F::MotorStart {
+                        self.settings.start_stop.set_start_s(t);
+                    } else {
+                        self.settings.start_stop.set_stop_s(t);
+                    }
+                    self.save_settings();
+                    self.undo_commit();
+                }
+                None
+            }
             F::Varispeed => recorder::parse_trim_percent(&edit.text).map(|d| {
                 let mut v = self.settings.varispeed;
                 v.set_percent(crate::varispeed::OFF + d);
@@ -37894,6 +37939,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             F::VariMin => format!("{}", self.settings.varispeed.min()),
             F::VariMax => format!("{}", self.settings.varispeed.max()),
+            // The reading without its unit: "0.5 s" opens as "0.5".
+            F::MotorStart => crate::motor::StartStop::reading(self.settings.start_stop.start_cs())
+                .trim_end_matches(" s")
+                .to_owned(),
+            F::MotorStop => crate::motor::StartStop::reading(self.settings.start_stop.stop_cs())
+                .trim_end_matches(" s")
+                .to_owned(),
             F::Varispeed => {
                 // The readout carries the sign and the field opens on what
                 // the readout says; `parse_trim_percent` takes it back.
@@ -44064,6 +44116,7 @@ impl TangentApp {
                     ui.max_rect(),
                     anchor,
                     self.settings.varispeed,
+                    self.settings.start_stop,
                     self.num_edit.as_ref(),
                     &self.settings,
                 );
@@ -59819,6 +59872,10 @@ mod tests {
     /// was added. (That is the opposite of the folder fields' rule, and
     /// deliberately: a stale folder flag HIDES lanes, so there the harm ran
     /// the other way.)
+    ///
+    /// Revert-check, performed for the tape's start and stop: read its
+    /// absence as the shipped setting in `apply_desk_snapshot` and the
+    /// session's own, on at 2 s and 4 s, is switched off by the open.
     #[test]
     fn a_document_from_before_these_keys_leaves_the_live_desk_alone() {
         let root = project_scratch("deskold");
@@ -59851,6 +59908,10 @@ mod tests {
             // window of every old session, and put the header width and the
             // lane count back on AUTO (zero is AUTO for those two).
             "view",
+            // The tape's start and stop, later again. Read as the shipped
+            // setting it would switch off a session that had it on, and its
+            // Play and Stop would go back to instant on first open.
+            "start_stop",
         ] {
             assert!(desk.remove(k).is_some(), "{k} was never written");
         }
@@ -59870,6 +59931,7 @@ mod tests {
         app.settings.arr_visible = 7;
         app.settings.quantize_window_ms = 40.0;
         app.settings.quantize_fit = "stretch".to_owned();
+        app.settings.start_stop = crate::motor::StartStop::new(true, 2.0, 4.0);
         // The routing by ROW: what "stands" means for a document that does
         // not say, on whatever ids the rows wear after the open.
         let patches = |s: &Settings| s.rows.iter().map(|r| r.dx7.patch).collect::<Vec<_>>();
@@ -59903,6 +59965,11 @@ mod tests {
             "the quantize window was reset"
         );
         assert_eq!(app.settings.quantize_fit, view_keep.4, "the warp fit was reset");
+        assert_eq!(
+            app.settings.start_stop,
+            crate::motor::StartStop::new(true, 2.0, 4.0),
+            "the tape's start and stop was reset"
+        );
         // And it does not read as unsaved work merely for being old.
         assert!(
             !app.project_dirty(),
@@ -78273,6 +78340,146 @@ mod tests {").expect("the tests module")];
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── the tape's start and stop, under the range ─────────────────────────
+
+    /// **The tape's switch is one undo moment a press**, and undo and redo
+    /// put it back each way.
+    ///
+    /// The switch is hashed with the desk (`DeskSnap::start_stop`), so a
+    /// press that committed nothing would ride into whatever was done next,
+    /// and one Ctrl+Z would take back the switch and that thing together.
+    /// The press is the panel's: the switch flips, the panel stays up, and
+    /// the host is handed what the switch says.
+    ///
+    /// Revert-checks, both performed: take the commit out of the `Motor` arm
+    /// of `press_in_vari_panel` and the press is no moment; take the switch
+    /// out of `apply_desk_snapshot` and one step back leaves it off.
+    #[test]
+    fn the_tape_switch_is_one_undo_moment() {
+        use recorder_panel::VariHit;
+        let (ctx, mut app, root, screen, anchor) = vari_panel_up("tapeswitch", false);
+        let switch = vari_point(screen, anchor, Some(VariHit::Motor));
+        assert!(!app.settings.start_stop.on(), "fixture: tape start and stop ships on");
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, switch, egui::Modifiers::NONE);
+        assert!(app.settings.start_stop.on(), "the switch did not go on");
+        assert!(app.vari_open && app.num_edit.is_none(), "the switch closed its panel or opened a field");
+        assert_eq!(app.hist_at, before + 1, "the press is not one moment");
+        assert_eq!(app.start_stop(), app.settings.start_stop, "the host is handed another setting");
+        click_with(&ctx, &mut app, switch, egui::Modifiers::NONE);
+        assert!(!app.settings.start_stop.on(), "a second press did not turn it off");
+        assert_eq!(app.hist_at, before + 2, "the second press is not one moment");
+        app.undo();
+        assert!(app.settings.start_stop.on(), "one step back is not the switch on");
+        app.undo();
+        assert!(!app.settings.start_stop.on(), "two steps back is not where it started");
+        assert_eq!(app.hist_at, before);
+        app.redo();
+        assert!(app.settings.start_stop.on(), "redo did not put it back on");
+        // The switch, and nothing but the switch.
+        assert_eq!((app.settings.start_stop.start_cs(), app.settings.start_stop.stop_cs()), (50, 70));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A typed Start or Stop is one moment on every road that lands it**:
+    /// Enter, Tab, a press on the other time, the X, a press away from the
+    /// panel, and the panel going under another knob's right-click.
+    ///
+    /// The two times are hashed with the desk, so each road owes the
+    /// timeline exactly one commit, the rule the range's typed ends keep.
+    /// Each field opens on its reading without the unit ("0.5 s" as "0.5"),
+    /// a number lands in seconds, one past the reach is clamped to it, and
+    /// an emptied field is refused and is no moment.
+    ///
+    /// Revert-checks, performed: take the moment out of the times' arm of
+    /// `commit_number` and the first road is no moment; drop the two from
+    /// `lives_in_vari_range` and the reverb's right-click leaves Stop open,
+    /// drawn nowhere.
+    #[test]
+    fn a_typed_start_or_stop_is_one_moment_on_every_road() {
+        use recorder::NumField as F;
+        use recorder_panel::VariHit;
+        let none = egui::Modifiers::NONE;
+        let (ctx, mut app, root, screen, anchor) = vari_panel_up("tapetimes", false);
+        let start = vari_point(screen, anchor, Some(VariHit::Type(F::MotorStart)));
+        let stop = vari_point(screen, anchor, Some(VariHit::Type(F::MotorStop)));
+        let close = vari_point(screen, anchor, Some(VariHit::Close));
+        let times = |app: &TangentApp| (app.settings.start_stop.start_cs(), app.settings.start_stop.stop_cs());
+        let typing = |app: &TangentApp| app.num_edit.as_ref().map(|e| (e.field, e.text.clone()));
+        let reopen = |ctx: &egui::Context, app: &mut TangentApp| {
+            let dial = knob_cell(app, recorder_panel::Hit::SetVarispeed(0.5)).center();
+            right_click_at(ctx, app, dial);
+            assert!(app.vari_open, "fixture: the range did not open again");
+            pointer_frame(ctx, app, Vec::new());
+        };
+        let before = app.hist_at;
+
+        // Enter.
+        click_with(&ctx, &mut app, start, none);
+        assert_eq!(typing(&app), Some((F::MotorStart, "0.5".to_owned())), "Start did not open on its reading");
+        type_keys(&ctx, &mut app, "1.25");
+        key_with(&ctx, &mut app, egui::Key::Enter, none);
+        assert!(app.num_edit.is_none() && app.vari_open, "Enter left Start open or closed the panel");
+        assert_eq!((times(&app), app.hist_at), ((125, 70), before + 1), "Enter");
+
+        // Tab.
+        click_with(&ctx, &mut app, stop, none);
+        assert_eq!(typing(&app), Some((F::MotorStop, "0.7".to_owned())), "Stop did not open on its reading");
+        type_keys(&ctx, &mut app, "2");
+        key_with(&ctx, &mut app, egui::Key::Tab, none);
+        assert_eq!((times(&app), app.hist_at), ((125, 200), before + 2), "Tab");
+
+        // A press on the other time: Start lands, then Stop opens on its own.
+        click_with(&ctx, &mut app, start, none);
+        type_keys(&ctx, &mut app, "3");
+        click_with(&ctx, &mut app, stop, none);
+        assert_eq!(typing(&app), Some((F::MotorStop, "2".to_owned())), "Stop did not open on its own reading");
+        assert_eq!((times(&app), app.hist_at), ((300, 200), before + 3), "a press on Stop");
+
+        // The X.
+        type_keys(&ctx, &mut app, "4.5");
+        click_with(&ctx, &mut app, close, none);
+        assert!(!app.vari_open && app.num_edit.is_none(), "the X left the panel or Stop");
+        assert_eq!((times(&app), app.hist_at), ((300, 450), before + 4), "the X");
+
+        // A press away from the panel, which is spent closing it.
+        reopen(&ctx, &mut app);
+        let outside = Pos2::new(6.0, 894.0);
+        assert!(!recorder_panel::vari_popup_rect(screen, app.vari_anchor()).contains(outside));
+        click_with(&ctx, &mut app, start, none);
+        type_keys(&ctx, &mut app, "0.1");
+        click_with(&ctx, &mut app, outside, none);
+        assert!(!app.vari_open && app.num_edit.is_none(), "the press away left the panel or Start");
+        assert_eq!((times(&app), app.hist_at), ((10, 450), before + 5), "a press away");
+
+        // The panel going under another knob's right-click, and a time past
+        // the reach, clamped to it.
+        reopen(&ctx, &mut app);
+        click_with(&ctx, &mut app, stop, none);
+        type_keys(&ctx, &mut app, "30");
+        let reverb = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.5)).center();
+        right_click_at(&ctx, &mut app, reverb);
+        assert_eq!(app.fx_open, Some(recorder_panel::Fx::Reverb), "fixture: the reverb's panel did not open");
+        assert!(!app.vari_open && app.num_edit.is_none(), "Stop outlived its panel, drawn nowhere");
+        assert_eq!((times(&app), app.hist_at), ((10, 1000), before + 6), "the panel going");
+
+        // Emptied, then Enter: refused, and no moment.
+        click_with(&ctx, &mut app, Pos2::new(6.0, 894.0), none);
+        reopen(&ctx, &mut app);
+        click_with(&ctx, &mut app, start, none);
+        for _ in 0..3 {
+            key_with(&ctx, &mut app, egui::Key::Backspace, none);
+        }
+        assert_eq!(typing(&app), Some((F::MotorStart, String::new())), "fixture: Start was not emptied");
+        key_with(&ctx, &mut app, egui::Key::Enter, none);
+        assert_eq!((times(&app), app.hist_at), ((10, 1000), before + 6), "an emptied Start was not refused");
+
+        // And one step back is the time typed before the last.
+        app.undo();
+        assert_eq!(times(&app), (10, 450), "one step back is not the Stop typed before");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A point on the band this app last drew that answers nothing, clear
     /// of `avoid`: where a right-click opens the band's own menu.
     fn bare_band_point(app: &TangentApp, avoid: Rect) -> Pos2 {
@@ -78296,7 +78503,8 @@ mod tests {").expect("the tests module")];
 
     /// **Hiding the band lands what was typed into it**, as a press away
     /// from it does, over the timeline and over the desk: an end of the
-    /// varispeed's range, and the band's own tempo.
+    /// varispeed's range, the band's own tempo, and a time of the tape's
+    /// start and stop, typed in the range's panel under its ends.
     ///
     /// The road is the band's right-click menu. The right-click leaves a
     /// field as it was, and its "Hide Recorder Band" took the band and every
@@ -78306,7 +78514,11 @@ mod tests {").expect("the tests module")];
     ///
     /// Revert-check, performed: put back the band-gone block's
     /// `num_edit = None` and MIN stays 85 on both surfaces, and with MIN's
-    /// half taken out the tempo stays where it was.
+    /// half taken out the tempo stays where it was. And with the tape's two
+    /// times out of both `lives_in_band` and `lives_in_vari_range`, Start
+    /// outlives the band; out of `lives_in_band` alone it still lands, one
+    /// moment, because the band takes the range panel with it and the
+    /// panel's own guard lands the time later in the same paint.
     #[test]
     fn hiding_the_band_lands_what_was_typed_into_it_on_either_surface() {
         use recorder::NumField as F;
@@ -78353,6 +78565,31 @@ mod tests {").expect("the tests module")];
                 "on {on} hiding the band threw the typed tempo away: {}",
                 app.tempo_bpm()
             );
+
+            // **And a time of the tape's start and stop**, typed under the
+            // range in the same panel: the band takes the panel, and the
+            // time lands as MIN does, one moment.
+            app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
+            pointer_frame(&ctx, &mut app, Vec::new());
+            assert!(app.settings.show_recorder, "fixture: the band did not come back over {on}");
+            let dial = knob_cell(&app, recorder_panel::Hit::SetVarispeed(0.5)).center();
+            right_click_at(&ctx, &mut app, dial);
+            assert!(app.vari_open, "fixture: the range did not open again over {on}");
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let start = vari_point(screen, app.vari_anchor(), Some(recorder_panel::VariHit::Type(F::MotorStart)));
+            click_with(&ctx, &mut app, start, egui::Modifiers::NONE);
+            assert_eq!(
+                app.num_edit.as_ref().map(|e| e.field),
+                Some(F::MotorStart),
+                "fixture: Start did not open over {on}"
+            );
+            type_keys(&ctx, &mut app, "2");
+            let before = app.hist_at;
+            hide(&ctx, &mut app);
+            assert!(!app.vari_open, "on {on} the range panel outlived the band");
+            assert!(app.num_edit.is_none(), "on {on} Start outlived the band");
+            assert_eq!(app.settings.start_stop.start_cs(), 200, "on {on} hiding the band threw the typed start away");
+            assert_eq!(app.hist_at, before + 1, "on {on} the typed start is not one moment");
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -80812,6 +81049,11 @@ mod folder_tests {
     /// signature, its editor feel. The test sets a session up, writes it,
     /// moves every field somewhere else — which is what another session
     /// does — and opens the first one back.
+    ///
+    /// The tape's start and stop is on the list from its first day: this is
+    /// the one test that carries it from a live desk through a document and
+    /// back through `apply_desk_snapshot` (revert-check, performed: take it
+    /// out of the apply and it comes back off).
     #[test]
     fn a_session_carries_its_rack_its_levels_and_its_feel() {
         let root = std::env::temp_dir().join(format!(
@@ -80840,6 +81082,7 @@ mod folder_tests {
         s.master_mono = true;
         s.lufs_window = recorder::LoudnessWindow::Integrated;
         s.varispeed = crate::varispeed::Varispeed::with_range(70, 140);
+        s.start_stop = crate::motor::StartStop::new(true, 1.5, 3.0);
         s.metronome_div = 2;
         s.metronome_in_take = true;
         s.click_sample = "clave.wav".into();
@@ -80900,6 +81143,7 @@ mod folder_tests {
         s.master_mono = false;
         s.lufs_window = recorder::LoudnessWindow::Momentary;
         s.varispeed = crate::varispeed::Varispeed::default();
+        s.start_stop = crate::motor::StartStop::default();
         s.metronome_div = 1;
         s.metronome_in_take = false;
         s.click_sample = String::new();
@@ -80958,6 +81202,11 @@ mod folder_tests {
             s.varispeed,
             crate::varispeed::Varispeed::with_range(70, 140),
             "the varispeed"
+        );
+        assert_eq!(
+            s.start_stop,
+            crate::motor::StartStop::new(true, 1.5, 3.0),
+            "the tape's start and stop"
         );
         assert_eq!(s.metronome_div, 2, "the click's division");
         assert!(s.metronome_in_take, "the click going into the take");
@@ -85220,6 +85469,12 @@ mod folder_tests {
             })),
             ("the signature", Box::new(|a: &mut TangentApp| {
                 a.settings.record_time_signature = "7/8".into();
+            })),
+            ("tape start and stop switched on", Box::new(|a: &mut TangentApp| {
+                a.settings.start_stop.set_on(true);
+            })),
+            ("the tape's stop time", Box::new(|a: &mut TangentApp| {
+                a.settings.start_stop.set_stop_s(2.5);
             })),
             ("which rows exist", Box::new(|a: &mut TangentApp| {
                 a.settings.set_word(|r| &mut r.added, a.settings.word(|r| r.added) ^ (1 << 9));

@@ -3689,6 +3689,14 @@ pub enum NumField {
     /// own. 1, 2, 4, 8, 16 or 32 and nothing else - see
     /// [`TimeSignature::with_typed_unit`].
     MetUnit,
+    /// **The tape's START time, in the varispeed's range panel**: how long
+    /// Play takes to bring the desk to speed, typed in seconds, the unit it
+    /// reads in ("0.5 s" opens as "0.5"). Appended at the END, this enum's
+    /// law. See `crate::motor::StartStop::parse` for what it takes.
+    MotorStart,
+    /// **The tape's STOP time**: how long Stop or Pause takes to bring the
+    /// desk to a halt. As [`NumField::MotorStart`].
+    MotorStop,
 }
 
 impl NumField {
@@ -3701,6 +3709,10 @@ impl NumField {
     /// **The metronome's two are not the band's.** Its panel hangs on the
     /// timeline or the desk, never on the band, so hiding the band must not
     /// close a field somebody is typing into over the lanes.
+    ///
+    /// **The tape's two times are**: they live in the varispeed's range
+    /// panel, which hangs off the band's dial, so hiding the band takes the
+    /// panel and must land what was typed into either, as it lands MIN.
     pub fn lives_in_band(self) -> bool {
         match self {
             NumField::Master
@@ -3709,7 +3721,9 @@ impl NumField {
             | NumField::Meter
             | NumField::VariMin
             | NumField::VariMax
-            | NumField::Varispeed => true,
+            | NumField::Varispeed
+            | NumField::MotorStart
+            | NumField::MotorStop => true,
             NumField::MeterAt(_)
             | NumField::MarkerName(_)
             | NumField::MetBeats
@@ -3725,9 +3739,13 @@ impl NumField {
 
     /// **Whether the field is typed into the varispeed's RANGE panel**, and
     /// so lives exactly as long as that panel does - the rule
-    /// [`NumField::lives_in_metronome`] keeps for the metronome's two.
+    /// [`NumField::lives_in_metronome`] keeps for the metronome's two. The
+    /// range's two ends, and the tape start and stop's two times below them.
     pub fn lives_in_vari_range(self) -> bool {
-        matches!(self, NumField::VariMin | NumField::VariMax)
+        matches!(
+            self,
+            NumField::VariMin | NumField::VariMax | NumField::MotorStart | NumField::MotorStop
+        )
     }
 }
 
