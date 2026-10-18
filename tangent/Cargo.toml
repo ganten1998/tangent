@@ -1,11 +1,4 @@
 [package]
-# What still wears the codename, and why. "Ivory" survives only where
-# changing it would cost a user something real: the macOS bundle id
-# (Gatekeeper trust and every external binding are keyed to it), the settings
-# and override file FORMATS, and the IVORY_* developer switches scripts and
-# muscle memory depend on. The crates, the config dir and the app struct are
-# all tangent-named now; none of what remains is visible to anyone using the
-# app.
 name = "tangent"
 version.workspace = true
 edition.workspace = true

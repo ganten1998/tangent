@@ -1865,10 +1865,10 @@ def redo_report():
 
 # ── the retired abstract palettes ──────────────────────────────────────────
 #
-# **`--legacy` only.** These eight (IVORY, EMBER, TIDE...) are what the desk
+# **`--legacy` only.** These eight (SPECTRUM, EMBER, TIDE...) are what the desk
 # wore before the theme-named runs replaced them wholesale -- sixteen themes
 # sharing eight abstract sets, until the owner's "pick and choose" made it a
-# named palette per theme. The generators stay because the IVORY spectrum is
+# named palette per theme. The generators stay because the SPECTRUM palette is
 # byte-identical to indices 28..44 (Default's run grew out of it) and because
 # the family/ash machinery is the starting point for designing anything new.
 
@@ -1924,7 +1924,7 @@ def ash():
 
 LEGACY_PALETTES = {
     # name: (slots, click, master, adjacency floor)
-    "IVORY": (spectrum(WHEEL), make(48, 0.30, 1), MASTER, 10.0),
+    "SPECTRUM": (spectrum(WHEEL), make(48, 0.30, 1), MASTER, 10.0),
     "EMBER": (family([20, 34, 50, 74]), make(44, 0.25, 1), MASTER, 10.0),
     "TIDE": (family([168, 196, 220, 258]), make(196, 0.22, 1), MASTER, 10.0),
     "MOSS": (family([78, 104, 136, 166]), make(84, 0.24, 1), MASTER, 10.0),

@@ -112,9 +112,10 @@ fi
 # A cargo workspace will not load with a member missing, so the Dockerfile has
 # to COPY all of them — even the GUI crates it never builds, purely so the root
 # manifest parses. That rule was written in a comment at the top of the
-# Dockerfile and comments do not fail builds: the rename left `COPY ivory` in
-# place, and two members added since were never added at all. The failure lands
-# on a Fly builder minutes into a deploy, which is the worst place to find it.
+# Dockerfile and comments do not fail builds: the rename left the old crate's
+# COPY line in place, and two members added since were never added at all. The
+# failure lands on a Fly builder minutes into a deploy, which is the worst
+# place to find it.
 missing=""
 for m in $(sed -n 's/^members *= *\[\(.*\)\]/\1/p' Cargo.toml | tr -d '" ' | tr ',' ' '); do
   grep -q "^COPY $m \./$m\$" tools/tangent-fulfil/Dockerfile || missing="$missing $m"

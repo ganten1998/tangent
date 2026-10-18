@@ -56,7 +56,7 @@ emoji-icon-font  ->  emoji-icon-font-MIT.txt
 
 
 None of these fonts has been modified, subset, or renamed, and none is sold
-standalone. Ivory's own MIT grant (see LICENSE) covers Ivory's source and
+standalone. Tangent's own MIT grant (see LICENSE) covers Tangent's source and
 compiled code only; it does not relicense the fonts above, which remain
 entirely under their own terms.
 

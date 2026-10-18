@@ -4,13 +4,19 @@
 For every generated MIDI note set, records detect_chord() output under both
 flat and sharp naming preferences. The Rust rewrite differential-tests
 against this file (minus a documented known-bug exception list).
+
+Usage: gen_corpus.py <corpus.json> <python-engine-folder>. The second
+argument is the folder that holds the reference chord_detector.py, which is
+archived outside this repo.
 """
 import json
 import random
 import sys
 
-IVORY_DIR = "/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory"
-sys.path.insert(0, IVORY_DIR)
+if len(sys.argv) != 3:
+    sys.exit("usage: gen_corpus.py <corpus.json> <folder holding the Python chord_detector.py>")
+PYTHON_ENGINE_DIR = sys.argv[2]
+sys.path.insert(0, PYTHON_ENGINE_DIR)
 
 import chord_detector as cd  # noqa: E402
 from chord_detector import ChordDetector  # noqa: E402
@@ -110,7 +116,7 @@ for key in sorted(cases):
         errors += 1
     out.append(rec)
 
-path = sys.argv[1] if len(sys.argv) > 1 else "corpus.json"
+path = sys.argv[1]
 with open(path, "w") as f:
     json.dump(out, f, indent=0)
 

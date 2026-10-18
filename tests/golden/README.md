@@ -74,8 +74,9 @@ mislabel a clean, complete, common chord Python got right.
 ## Regenerate
 
 ```sh
-# 1. Python corpus (needs the reference chord_detector.py on disk)
-python3 tests/golden/gen_corpus.py tests/golden/corpus.json
+# 1. Python corpus. The second argument is the folder that holds the
+#    reference chord_detector.py, which is archived outside this repo.
+python3 tests/golden/gen_corpus.py tests/golden/corpus.json <python-engine-folder>
 
 # 2. Rust baseline + live mismatch counts
 cargo run -p tangent-core --example diffcorpus --release -- \

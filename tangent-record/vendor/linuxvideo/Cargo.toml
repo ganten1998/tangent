@@ -9,12 +9,12 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
-# VENDORED FOR IVORY. See vendor/README.md for the diff against 0.3.5.
+# VENDORED FOR TANGENT. See vendor/README.md for the diff against 0.3.5.
 # The workspace root excludes this directory, so it builds standalone.
 #
 # Upstream's `examples/` and `[dev-dependencies]` are removed: cargo resolves a
 # PATH dependency's dev-dependencies into the workspace lockfile even though it
-# never builds them, and pulling regex, env_logger and png into ivory's
+# never builds them, and pulling regex, env_logger and png into Tangent's
 # dependency surface to support examples we do not compile is not a trade worth
 # making. `src/` is untouched.
 

@@ -2,7 +2,7 @@ Copyright (C) 2020 Dimitar Toshkov Zhekov
 Copyright (C) 2023 Tilman Blumenbach
 
 Terminess Nerd Font Mono, a Nerd Fonts patched build of Terminus TTF.
-Bundled with Ivory as an optional UI typeface.
+Bundled with Tangent as its default UI typeface.
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:
