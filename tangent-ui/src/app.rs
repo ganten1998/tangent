@@ -9637,7 +9637,18 @@ impl TangentApp {
 
     /// **Open the varispeed dial's range panel**, the one way it opens: the
     /// dial's own right-click and the Tape face's pointer both come here.
+    ///
+    /// **The setup panel goes first**, as it goes for any press outside it.
+    /// It is painted over the range, and the range is asked about a press
+    /// before it is, so a range opened under it would be a panel nobody can
+    /// see, spending the next press aimed at setup on closing itself. The
+    /// dial's right-click never meets it, because the band refuses that
+    /// press while setup is up; the Tape face's pointer is pressed in a
+    /// window of its own, where setup's rule cannot see the press.
     fn open_vari_range(&mut self) {
+        if self.setup_open {
+            self.close_setup();
+        }
         self.vari_open = true;
         self.fx_open = None;
         self.fx_drag = None;
@@ -69868,7 +69879,9 @@ mod tests {
     /// over the desk: left up, it would cover the very panel it opened. So
     /// the press opens the range by the one road the dial's own right-click
     /// takes (an effect panel that was open goes, as it does there), closes
-    /// the face, and the range is still up a frame later.
+    /// the face, and the range is still up a frame later. With the setup
+    /// panel up, setup goes first: it is painted over the range, so a range
+    /// opened under it would be a door into a wall of its own.
     ///
     /// With the band hidden there is no dial to hang the range from, and the
     /// draw path closes a range whose dial is gone on the next frame. So
@@ -69879,7 +69892,10 @@ mod tests {
     /// the band, by the menu's name for it, and a right-click on its dial, by
     /// the word the band prints on the dial, which is read off the band's
     /// own source, so a renamed dial fails here by name rather than leaving
-    /// the notice sending a hand to a word it cannot find.
+    /// the notice sending a hand to a word it cannot find. A band that is
+    /// showing but too short for its dials draws no dial either, and is
+    /// answered the same way: the question is the dial, never the band's
+    /// switch.
     #[test]
     fn the_tape_faces_pointer_opens_the_range_its_setting_lives_in() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -69906,6 +69922,25 @@ mod tests {
         pointer_frame(&ctx, &mut app, Vec::new());
         assert!(app.vari_open, "the range the pointer opened closed on the next frame");
 
+        // The setup panel up over the band: it goes, and the range opens.
+        app.vari_open = false;
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Machine;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.setup_open && !app.vari_open, "fixture: the setup panel is not up on its own");
+        open(&mut app);
+        app.apply_dialog_action(DialogAction::OpenStartStop { bay: sb });
+        assert!(
+            !app.setup_open && app.vari_open && app.dialog.is_none(),
+            "with the setup panel up the pointer left it painted over the range it opened \
+             (setup {}, range {}, face {})",
+            app.setup_open,
+            app.vari_open,
+            app.dialog.is_some()
+        );
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.vari_open && !app.setup_open, "the range or the setup panel changed on the next frame");
+
         // The band hidden: no dial, so no range.
         app.settings.show_recorder = false;
         pointer_frame(&ctx, &mut app, Vec::new());
@@ -69928,6 +69963,28 @@ mod tests {
             "the notice does not send the hand to the Recorder band and a right-click on its {dial} dial: \
              {START_STOP_ON_THE_BAND:?}"
         );
+
+        // The band showing but too short for its dials: the band draws no
+        // PITCH CONT dial, so there is no range to open, band or no band.
+        app.settings.show_recorder = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.vari_anchor().is_positive(), "fixture: the band did not come back with its dial");
+        app.messages.clear();
+        open(&mut app);
+        let band = app.last_band;
+        app.last_band = Rect::from_min_size(band.min, Vec2::new(band.width(), 24.0));
+        assert!(
+            app.settings.show_recorder && !app.vari_anchor().is_positive(),
+            "fixture: a band 24 points tall still draws its PITCH CONT dial"
+        );
+        app.apply_dialog_action(DialogAction::OpenStartStop { bay: sb });
+        assert!(!app.vari_open, "a range was opened off a band too short to draw its dial");
+        assert!(
+            matches!(app.dialog, Some(Dialog::InsertFace { bay, .. }) if bay == sb),
+            "the face went down on a press that opened nothing, under a band too short for its dials"
+        );
+        let said = app.said().notes().iter().filter(|n| n.text == START_STOP_ON_THE_BAND).count();
+        assert_eq!(said, 1, "a band too short for its dials said where the setting is {said} times");
     }
 
     /// **A Tape in a pedal seat closes only its own window on the way
@@ -69940,7 +69997,10 @@ mod tests {
     /// next frame would take the pedal's with it. So the ask carries its
     /// bay, and the answer empties the stacked window when the stack is over
     /// that bay and leaves the slot alone; the frame tail drops the emptied
-    /// stack, the amp stays up, and the range is open.
+    /// stack, the amp stays up, and the range is open. And the slot is
+    /// written only for the face that is in it: with no stack up, an ask
+    /// from a bay the slot does not hold opens the range and leaves the
+    /// slot's face where it is.
     #[test]
     fn a_tape_in_a_pedal_seat_closes_only_its_own_window_on_the_way_there() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -69973,6 +70033,15 @@ mod tests {
             "the amp's face went down a frame after its pedal's ask"
         );
         assert!(app.vari_open, "the range closed under the amp's face");
+
+        // No stack up, and the ask names a bay the slot does not hold.
+        app.vari_open = false;
+        app.apply_dialog_action(DialogAction::OpenStartStop { bay: pedal });
+        assert!(app.vari_open, "an ask from a bay outside the slot did not open the range");
+        assert!(
+            matches!(app.dialog, Some(Dialog::InsertFace { bay, .. }) if bay == amp),
+            "an ask from a window the slot does not hold took down the face that is in it"
+        );
     }
 
     /// **Only the Tape face is told about tape start and stop**, and it is
@@ -69984,7 +70053,9 @@ mod tests {
     /// the switch thrown in the range panel is on the pointer by the next
     /// frame. Every other face is told nothing, and the push says so every
     /// frame rather than only filling the field for the tape: an EQ face
-    /// whose live state was holding a value comes back holding none.
+    /// whose live state was holding a value comes back holding none. And a
+    /// Tape in an amp's pedal seat, whose face stands in the stacked window
+    /// over the amp's, is told by the same push, while the amp is not.
     #[test]
     fn only_the_tape_face_is_told_about_tape_start_and_stop() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
@@ -70014,6 +70085,29 @@ mod tests {
         });
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(told(&app), None, "an EQ face was told about tape start and stop");
+
+        // The stacked window over an amp, a Tape in its pedal seat.
+        let amp = app.row_bay(2, 0).expect("a bay");
+        let pedal = crate::desk_id::SeatBay::new(app.row_node(2), crate::desk_id::Rack::Pedal(0), 0);
+        app.set_bay_face(amp, face(crate::faces_amp::AMP_PATH));
+        app.set_bay_face(pedal, face(crate::faces_tape::TAPE_PATH));
+        app.dialog = Some(Dialog::InsertFace { bay: amp, live: Box::default() });
+        app.pedal_stack = Some(PedalStack {
+            over: amp,
+            pedal,
+            dialog: Some(Dialog::InsertFace { bay: pedal, live: Box::default() }),
+        });
+        let _ = run_frame(&ctx, &mut app);
+        let stacked = match app.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref()) {
+            Some(Dialog::InsertFace { live, .. }) => live.start_stop,
+            _ => panic!("the pedal's stacked window did not stay open"),
+        };
+        assert_eq!(
+            stacked,
+            Some(app.start_stop()),
+            "the Tape in the amp's pedal seat was not told how start and stop stands"
+        );
+        assert_eq!(told(&app), None, "the amp under its pedal's window was told about tape start and stop");
     }
 
     /// **The Setup panel marks the system that is RUNNING.** The setting is

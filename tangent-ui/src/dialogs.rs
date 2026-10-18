@@ -21850,6 +21850,11 @@ at: None,
         /// a modifier decorating the pointer EVENT alone would be invisible
         /// to `ui.input(|i| i.modifiers)` and would test nothing.
         mods: egui::Modifiers,
+        /// **Shown as the pedal's stacked window** (`show_stacked`), the
+        /// window an amp's pedal opens over the amp's, rather than as the
+        /// desk's own slot. The two are one drawing on two surfaces, and a
+        /// test that says what the stacked window asks shows it there.
+        stacked: bool,
     }
 
     impl Slot {
@@ -21863,6 +21868,7 @@ at: None,
                 face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
                 clock: 0.0,
                 mods: egui::Modifiers::NONE,
+                stacked: false,
             }
         }
 
@@ -21898,7 +21904,12 @@ at: None,
                     ..Default::default()
                 },
                 |ctx| {
-                    if let Some(a) = show(ctx, &mut self.dialog, self.face, Self::placement()) {
+                    let asked = if self.stacked {
+                        show_stacked(ctx, &mut self.dialog, self.face, Self::placement())
+                    } else {
+                        show(ctx, &mut self.dialog, self.face, Self::placement())
+                    };
+                    if let Some(a) = asked {
                         action = Some(a);
                     }
                 },
@@ -22802,27 +22813,41 @@ at: None,
     /// window steps aside for the range panel is the app's decision, and a
     /// Tape in an amp's pedal seat must close its own stacked window and not
     /// the amp's, which only the bay can tell apart. So the face does not
-    /// close itself on the way out, and the next frame still shows it.
+    /// close itself on the way out, and the next frame still shows it. Both
+    /// roads are walked, the desk's slot and the pedal's stacked window,
+    /// each naming the bay its own window was opened over.
     #[test]
     fn the_tapes_pointer_asks_to_be_taken_to_start_and_stop() {
-        let mut live = crate::faces::FaceLive {
-            start_stop: Some(crate::motor::StartStop::default()),
-            ..Default::default()
-        };
-        live.face.path = crate::faces_tape::TAPE_PATH.to_owned();
-        let mut slot = Slot::new(Dialog::InsertFace { bay: tb(0, 0), live: Box::new(live) });
-        assert!(slot.says("Start and stop: off"), "the tape's transport does not say how start and stop stands");
-        assert!(
-            matches!(
-                slot.click("Start and stop: off"),
-                Some(DialogAction::OpenStartStop { bay }) if bay == tb(0, 0)
-            ),
-            "the pointer did not ask to be taken to start and stop for its own bay"
+        let pedal = crate::desk_id::SeatBay::new(
+            crate::desk_id::Node::Track(crate::desk_id::TrackId(0)),
+            crate::desk_id::Rack::Pedal(0),
+            0,
         );
-        assert!(
-            slot.says("TRANSPORT"),
-            "the face closed itself; which window steps aside is the app's to decide"
-        );
+        for (stacked, at) in [(false, tb(0, 0)), (true, pedal)] {
+            let road = if stacked { "the pedal's stacked window" } else { "the desk's slot" };
+            let mut live = crate::faces::FaceLive {
+                start_stop: Some(crate::motor::StartStop::default()),
+                ..Default::default()
+            };
+            live.face.path = crate::faces_tape::TAPE_PATH.to_owned();
+            let mut slot = Slot::new(Dialog::InsertFace { bay: at, live: Box::new(live) });
+            slot.stacked = stacked;
+            assert!(
+                slot.says("Start and stop: off"),
+                "the tape's transport does not say how start and stop stands, in {road}"
+            );
+            assert!(
+                matches!(
+                    slot.click("Start and stop: off"),
+                    Some(DialogAction::OpenStartStop { bay }) if bay == at
+                ),
+                "the pointer did not ask to be taken to start and stop for its own bay, in {road}"
+            );
+            assert!(
+                slot.says("TRANSPORT"),
+                "the face closed itself in {road}; which window steps aside is the app's to decide"
+            );
+        }
     }
 
     /// **The amp keeps its footer for the preset strip.** The other half of
