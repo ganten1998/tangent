@@ -2591,11 +2591,12 @@ ivory/
 ├── tests/golden/           corpus.json (13,133 rows), gen_corpus.py, + classifier outputs
 ├── scripts/                build-macos.sh, build-cross.sh, build-linux-native.sh, gen-third-party-licenses.sh
 └── docs/                   DESIGN.md, DIVERGENCES.md, HANDOFF.md(this), RELEASE.md,
-                            spec/ (extracted Python spec), reference/ (old ivory-rust GUI)
+                            spec/ (extracted Python spec)
 ```
 
-`docs/reference/` holds the old ivory-rust GUI files (egui 0.29 API, stale but
-logic/geometry sound) — reference only, not compiled.
+The first Rust attempt's GUI files (egui 0.29 API, stale but logic/geometry
+sound) were kept in `docs/reference/`, never compiled, until that folder was
+deleted; `git log -- docs/reference` finds them.
 
 ---
 
@@ -2784,8 +2785,8 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
       Settings → Branches for tidiness (then `master` can be deleted). A stray
       `cursor/ai-stream-connection-error-b1a2` branch predates this and is
       harmless.
-- [x] `ivory-rust` retired to Trash (recoverable); its guide PDF preserved at
-      `docs/reference/Ivory-Rust-Guide.pdf`.
+- [x] The first Rust attempt retired to Trash (recoverable); its guide PDF was
+      kept in `docs/reference/` and is in git history now.
 - [ ] Business decisions in `docs/RELEASE.md`: keep MIT? Developer-ID signing +
       notarization ($99/yr — macOS 15+ has no right-click-Open bypass, a real
       blocker for selling to strangers); Windows SmartScreen; the "Ivory" name

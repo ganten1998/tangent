@@ -21,9 +21,9 @@ priority order:
 Reference specs live in `docs/spec/` (extracted and machine-verified from the
 Python source at `~/Dropbox/Archive/Ivory`). The prior Rust attempt
 (`ivory-rust`) was audited; its `tangent-core` is the engine base (42 green
-tests), its GUI is reference-only (`docs/reference/`). This design was
-adversarially reviewed by a three-lens critic panel; decisions below are
-post-review.
+tests), and its GUI was kept for reference in `docs/reference/` until that
+folder was deleted (git history keeps it). This design was adversarially
+reviewed by a three-lens critic panel; decisions below are post-review.
 
 ## Workspace
 
@@ -54,7 +54,7 @@ ivory/
 ├── assets/               ivory.png (128×128), ivory.ico, ivory.desktop, fonts/{CourierPrime-*.ttf, OFL.txt}
 ├── tests/                golden corpus + differential harness
 ├── scripts/              build-macos.sh, build-cross.sh, build-linux-native.sh (navi pattern)
-└── docs/                 DESIGN.md, DIVERGENCES.md, RELEASE.md, spec/, reference/
+└── docs/                 DESIGN.md, DIVERGENCES.md, RELEASE.md, spec/
 ```
 
 ## Engine (`tangent-core`)
