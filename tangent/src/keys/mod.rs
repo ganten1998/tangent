@@ -191,7 +191,37 @@ impl Patch {
         }
         out
     }
+
+    /// **What the frame lifts this sound by on its way out**, a factor: one,
+    /// exactly, for six of the ten, which are the instrument they were to
+    /// the bit.
+    ///
+    /// The two grands, the electric grand and the guitar were each set by
+    /// their loudest playing to peak a few dB under full scale (the grands'
+    /// pedalled fortissimo chords at -2.9 dBFS, the guitar's six-string
+    /// strum at full velocity at -3.6), where the tine and reed pianos and
+    /// the clavs had been voiced up to it. So at forte they sat 7 to 8 dB
+    /// under the other six: comping, -27.1 to -28.0 dB against -18.8 to
+    /// -23.4 (the reference study's listening scores, 300 ms windows within
+    /// 40 dB of the loudest, both channels), and a six-note fortissimo
+    /// chord's RMS -25.3 to -26.2 dBFS against -16.6 to -20.7. `LIFT` puts
+    /// them in the middle of the other six on both; their six-note
+    /// fortissimo chords then peak at -1.0 to +1.3 dBFS, the other six's at
+    /// -0.9 to +3.7.
+    ///
+    /// **At the output, after everything the instrument does**, so nothing
+    /// it measures of itself moves: its culls, its sleep and the harp's are
+    /// where they were, and only what the host hears is louder.
+    pub fn lift(self) -> f32 {
+        match self {
+            Patch::Piano1 | Patch::Piano2 | Patch::ElectricGrand | Patch::Guitar => LIFT,
+            _ => 1.0,
+        }
+    }
 }
+
+/// 7 dB, `10^(7/20)`: see `Patch::lift`.
+const LIFT: f32 = 2.238_721;
 
 /// The most knobs any one sound exposes. The store is a fixed array so that
 /// nothing on the audio thread has a length to get wrong.
@@ -1101,12 +1131,9 @@ impl Mechanism {
                 &egrand::EGrandBase::ELECTRIC,
             ),
             // Struck through `strike_guitar`, with the string the selector
-            // chose; a strike without one is the first-position string.
-            Patch::Guitar => {
-                if let Some(place) = guitar::Place::home(pitch) {
-                    self.strike_guitar(place, pitch, velocity, params);
-                }
-            }
+            // chose; a strike without one is the first-position string (or,
+            // off the fingerboard, the key's own).
+            Patch::Guitar => self.strike_guitar(guitar::Place::home(pitch), pitch, velocity, params),
         }
     }
 
@@ -1840,13 +1867,13 @@ impl Keys {
             return;
         }
         // **The patches with a harp have its eighty-eight keys** and no
-        // others, and a key they do not have plays nothing, as a key off the
-        // guitar's fingerboard plays nothing (below). Each voice clamped one
-        // onto its edge key while the frame and the harp took it as it came:
-        // MIDI 15 rang A0 with A0's string asleep, and beside a struck A0 it
-        // was a second voice on that one string (review). Dropped rather than
-        // clamped: a clamped key would share A0's voice and string, and the
-        // two keys' note-offs would have to agree on which of them lets it go.
+        // others, and a key they do not have plays nothing. Each voice
+        // clamped one onto its edge key while the frame and the harp took it
+        // as it came: MIDI 15 rang A0 with A0's string asleep, and beside a
+        // struck A0 it was a second voice on that one string (review).
+        // Dropped rather than clamped: a clamped key would share A0's voice
+        // and string, and the two keys' note-offs would have to agree on
+        // which of them lets it go.
         if self.has_harp() && !HARP_KEYS.contains(&pitch) {
             return;
         }
@@ -1857,15 +1884,8 @@ impl Keys {
         let velocity = if velocity.is_nan() { 0.0 } else { velocity.clamp(0.0, 1.0) };
         // **The guitar decides the string before the voice.** One note per
         // string: the selector picks the string (`guitar::Fretboard::place`),
-        // and a key outside the fingerboard is silent.
-        let place = if self.patch.family() == Family::Guitar {
-            match self.fretboard.place(pitch) {
-                Some(p) => Some(p),
-                None => return,
-            }
-        } else {
-            None
-        };
+        // and a key off the fingerboard is a string of its own.
+        let place = (self.patch.family() == Family::Guitar).then(|| self.fretboard.place(pitch));
         // A re-struck key takes its own voice back, sounding or merely held
         // by the pedal. The DX7 learned this the hard way: matching only the
         // held flag let a repeated note under the pedal allocate a fresh
@@ -2436,7 +2456,7 @@ impl Keys {
             if guitar {
                 // A voice that ends in this block hands its string back from
                 // the frame it ended on, on the fretboard's own grid.
-                let s = note.mech.guitar.string();
+                let s = note.mech.guitar.bus();
                 let sounded = note.mech.guitar.render(&mut self.acc_l[..m], &mut self.acc_r[..m], self.fretboard.bus(s, m));
                 if let (true, Some(p)) = (note.mech.guitar.finished(), note.pitch) {
                     self.fretboard.voice_ended(p, sounded);
@@ -2453,7 +2473,7 @@ impl Keys {
             self.tmp_r[..m].fill(0.0);
             self.tmp_d[..m].fill(0.0);
             c.mech.render_block(&mut self.tmp_l[..m], &mut self.tmp_r[..m], &mut self.tmp_d[..m]);
-            let bus = if guitar { Some(c.mech.guitar.string()) } else { None };
+            let bus = if guitar { Some(c.mech.guitar.bus()) } else { None };
             for i in 0..m {
                 if c.left == 0 {
                     break;
@@ -2505,7 +2525,7 @@ impl Keys {
                         continue;
                     }
                     if guitar {
-                        let s = note.mech.guitar.string();
+                        let s = note.mech.guitar.bus();
                         let sounded = note.mech.guitar.render(&mut self.acc_l[..m], &mut self.acc_r[..m], self.fretboard.bus(s, m));
                         if let (true, Some(p)) = (note.mech.guitar.finished(), note.pitch) {
                             self.fretboard.voice_ended(p, sounded);
@@ -2588,6 +2608,7 @@ impl Keys {
         let reed_knob = self.params[5].clamp(0.0, 1.0);
         let trem_inc = std::f32::consts::TAU * trem_hz / self.rate;
         let wah_sens = self.params[4].clamp(0.0, 1.0);
+        let lift = patch.lift();
         // Whether this block is under the hush (`render_blocks`).
         let mut hushed = false;
         let (mut at, mut m) = (0, 0);
@@ -2707,6 +2728,9 @@ impl Keys {
                 }
                 _ => {}
             }
+            // The sound's level (`Patch::lift`): one, exactly, for six.
+            left *= lift;
+            right *= lift;
             let base = f * channels;
             if channels == 1 {
                 out[base] += (left + right) * 0.5;
@@ -3657,8 +3681,12 @@ mod tests {
         // 9_528_229_155_151_203_875 where a debug one hashed this. Both now
         // make the two plain calls and hash the same, as every patch here
         // does.
+        //
+        // Piano1 re-pinned for 5.1.0 by its level alone: the frame lifts it
+        // 7 dB at its output (`Patch::lift`), every sample the old one times
+        // `LIFT` to the bit (4_764_576_450_495_230_413 before).
         for (patch, want) in [
-            (Patch::Piano1, 4_764_576_450_495_230_413),
+            (Patch::Piano1, 17_994_698_811_216_702_661),
             (Patch::EpMk1, 3_987_617_924_517_340_302),
             (Patch::Clav, 5_576_748_566_300_753_751),
             (Patch::Wurli200, 18_381_627_961_271_600_470),
@@ -4636,9 +4664,8 @@ mod tests {
                 // A key goes down, as on the harp: the open strings listen
                 // from a key on (`guitar::Fretboard::hush`).
                 if blk == 2 {
-                    if let Some(pl) = f.place(52) {
-                        f.take(pl, 52);
-                    }
+                    let pl = f.place(52);
+                    f.take(pl, 52);
                 }
                 f.set_knobs(&gk);
                 f.begin(BLOCK);
@@ -4890,13 +4917,12 @@ mod tests {
 
     /// **The grands have eighty-eight keys.** On the three harp patches, the
     /// pedal down, a key below A0 or above C8 (MIDI 15, 20, 109, 120) plays
-    /// nothing, as a key off the guitar's fingerboard plays nothing: the take
-    /// is the pedal's alone, to the bit. And MIDI 15 struck with A0 is A0
-    /// alone. Each voice clamped such a key onto its edge key while the
-    /// frame and the harp took it as it came: MIDI 15 rang A0 with A0's
-    /// string asleep (-240 against -63.6 dB of harp), and struck with MIDI 21
-    /// it was a second voice on that one string, 6 dB over A0 (review,
-    /// alloc 6).
+    /// nothing: the take is the pedal's alone, to the bit. And MIDI 15
+    /// struck with A0 is A0 alone. Each voice clamped such a key onto its
+    /// edge key while the frame and the harp took it as it came: MIDI 15
+    /// rang A0 with A0's string asleep (-240 against -63.6 dB of harp), and
+    /// struck with MIDI 21 it was a second voice on that one string, 6 dB
+    /// over A0 (review, alloc 6).
     #[test]
     fn the_harp_patches_have_eighty_eight_keys() {
         for patch in [Patch::Piano1, Patch::Piano2, Patch::ElectricGrand] {
@@ -5205,20 +5231,54 @@ mod tests {
         assert!(out.iter().all(|s| s.is_finite()) && out.iter().any(|s| *s != 0.0), "the instrument went non-finite or silent");
     }
 
-    /// **A fortissimo C4 sits where the waveguide piano's did.** Users'
-    /// mixes were set against the waveguide grand, whose C4 at MIDI 127 put
-    /// -24.6 dBFS into its first 300 ms through the frame (both channels'
-    /// power; the base cc701c73 and the concert measure the same); Piano 1's
-    /// refit had it at -21.6, 3 dB over, and its pedalled fortissimo chords
-    /// went over full scale (+2.9 dBFS, 199 samples; verifier). Both pianos
-    /// within half a decibel of it. Measured: printed.
+    /// **A fortissimo C4 sits 7 dB over where the waveguide piano's did.**
+    /// The grand's own level (`GrandBase::gain`) is still the waveguide
+    /// grand's, whose C4 at MIDI 127 put -24.6 dBFS into its first 300 ms
+    /// through the frame (both channels' power; the base cc701c73 and the
+    /// concert measure the same); Piano 1's refit had it at -21.6, 3 dB
+    /// over, and its pedalled fortissimo chords went over full scale (+2.9
+    /// dBFS, 199 samples; verifier). The frame then lifts both pianos 7 dB,
+    /// level with the other sounds at forte (`Patch::lift`): -17.6. Both
+    /// pianos within half a decibel of it, and of -24.6 with the lift taken
+    /// out. Measured: printed.
     #[test]
-    fn a_fortissimo_c4_sits_where_the_waveguide_piano_did() {
+    fn a_fortissimo_c4_sits_seven_db_over_the_waveguide_piano() {
         for patch in [Patch::Piano1, Patch::Piano2] {
             let (l, r) = pedal_script(patch, &[(0.0, PedalEv::On(60, 127))], 0.4);
             let rms = span_db(&l, &r, 0.0, 0.3);
-            println!("{patch:?}: C4 MIDI 127, the first 300 ms {rms:+.2} dBFS");
-            assert!((rms + 24.6).abs() <= 0.5, "{patch:?}: a fortissimo C4 at {rms:+.2} dBFS");
+            let own = rms - 20.0 * patch.lift().log10();
+            println!("{patch:?}: C4 MIDI 127, the first 300 ms {rms:+.2} dBFS ({own:+.2} before the lift)");
+            assert!((rms + 17.6).abs() <= 0.5, "{patch:?}: a fortissimo C4 at {rms:+.2} dBFS");
+            assert!((own + 24.6).abs() <= 0.5, "{patch:?}: the grand's own fortissimo C4 at {own:+.2} dBFS");
+        }
+    }
+
+    /// **The ten sounds sit together at forte.** The same six-note chord (C3
+    /// G3 C4 E4 G4 C5 at MIDI 100, 9 ms between fingers, the pedal up) on
+    /// each sound through the frame: the first 500 ms RMS, both channels,
+    /// within 6 dB from the loudest sound to the quietest (measured 2.7:
+    /// -14.1 dBFS, EP Mk.1, to -16.8, the guitar). Before the lift
+    /// (`Patch::lift`) the two grands, the electric grand and the guitar sat
+    /// 5.6 to 7.6 dB under the middle of the other six on this chord and the
+    /// ten spanned 9.7, so a sound voiced away from the others, or a lift
+    /// lost, shows here. And it is one, exactly, for the other six.
+    /// Measured: printed.
+    #[test]
+    fn the_ten_sounds_sit_together_at_forte() {
+        let chord = [48u8, 55, 60, 64, 67, 72];
+        let mut got = Vec::new();
+        for patch in Patch::ALL {
+            let ev: Vec<(f32, PedalEv)> = chord.iter().enumerate().map(|(i, &p)| (0.009 * i as f32, PedalEv::On(p, 100))).collect();
+            let (l, r) = pedal_script(patch, &ev, 0.6);
+            let rms = span_db(&l, &r, 0.0, 0.5);
+            println!("{patch:?}: the chord's first 500 ms {rms:+.2} dBFS (lift {:+.1} dB)", 20.0 * patch.lift().log10());
+            got.push(rms);
+        }
+        let (lo, hi) = got.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(hi - lo <= 6.0, "the ten sounds span {:.1} dB at forte ({lo:+.1} to {hi:+.1} dBFS)", hi - lo);
+        for patch in Patch::ALL {
+            let lifted = matches!(patch, Patch::Piano1 | Patch::Piano2 | Patch::ElectricGrand | Patch::Guitar);
+            assert_eq!(patch.lift() == 1.0, !lifted, "{patch:?}: lifted {}", patch.lift());
         }
     }
 }

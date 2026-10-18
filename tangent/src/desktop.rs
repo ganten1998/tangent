@@ -27923,8 +27923,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{path} has a face and no unit"));
             // **The class, plus the standing where a unit has one.** A
             // unit that is not finished says so in its display name — the
-            // Keys have said "(Experimental)" for releases, and the denoiser
-            // says it now — while `class` stays the plain word because
+            // Keys said "(Experimental)" until 5.1.0, and the denoiser says
+            // it now — while `class` stays the plain word because
             // `preset_subfolder` spells a directory out of it and a rename
             // would hide every preset already saved in it. So the two agree
             // up to that suffix and must agree exactly below it.

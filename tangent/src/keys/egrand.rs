@@ -3991,9 +3991,11 @@ mod tests {
     #[test]
     fn chords_at_fortissimo_keep_three_decibels_of_headroom() {
         // Through the frame, MIDI 127, 9 ms between fingers: the brief's
-        // ceiling is -3 dBFS. Measured -9.7 (C major, four notes), -5.7 (ten
-        // keys from C2), -5.3 (ten adjacent keys from C4), -9.3 dBFS (the
-        // treble).
+        // ceiling is -3 dBFS, for the instrument's own level. Measured -9.7
+        // (C major, four notes), -5.7 (ten keys from C2), -5.3 (ten adjacent
+        // keys from C4), -9.3 dBFS (the treble). The frame then lifts the
+        // electric grand 7 dB with the grands and the guitar (`Patch::lift`),
+        // to -2.6, +1.5, +1.8 and -2.3 dBFS.
         use super::super::{Keys, Patch};
         for chord in [&[60u8, 64, 67, 72][..], &[36, 43, 48, 52, 55, 60, 64, 67, 72, 76], &[60, 61, 62, 63, 64, 65, 66, 67, 68, 69], &[72, 76, 79, 84, 88, 91, 96]] {
             let mut k = Keys::new(RATE);
@@ -4012,8 +4014,9 @@ mod tests {
                 k.render(&mut out, BLOCK, 2);
                 peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
             }
-            println!("{chord:?} at MIDI 127: peak {:.1} dBFS", 20.0 * peak.log10());
-            assert!(peak <= 0.708, "{chord:?} at MIDI 127 peaked at {:.1} dBFS", 20.0 * peak.log10());
+            let own = peak / Patch::ElectricGrand.lift();
+            println!("{chord:?} at MIDI 127: peak {:.1} dBFS ({:.1} before the lift)", 20.0 * peak.log10(), 20.0 * own.log10());
+            assert!(own <= 0.708, "{chord:?} at MIDI 127 peaked at {:.1} dBFS before the lift", 20.0 * own.log10());
         }
     }
 

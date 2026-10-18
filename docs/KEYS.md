@@ -20,11 +20,12 @@ sentinel `@tangent-keys`. It contains **no samples**. Every note is computed
 from a model of the mechanism, which is why it ships ten instruments and no
 data at all:
 
-- **Piano 1**: an intimate grand heard close, soft felt, wood and the action.
+- **Intimate Grand**: a small room's grand heard close, soft felt, wood and
+  the action.
 - **EP Mk.1**: a tine electric piano, taken dry. Bell-like when it is played
   lightly and it barks when it is not.
-- **Piano 2**: a concert grand, a longer ring, a deeper bass and a wider
-  swing.
+- **Concert Grand**: the hall instrument, a longer ring, a deeper bass and a
+  wider swing.
 - **EP Suitcase**: the same tines through their own amp, with its stereo
   throb.
 - **Clav**: struck-and-held strings read by two coils, taken dry.
@@ -35,7 +36,8 @@ data at all:
 - **Electric Grand**: a stage grand, short stiff strings heard through
   pickups and no soundboard.
 - **Nylon Guitar**: six nylon strings under a fingertip, the open ones
-  ringing along.
+  ringing along. Every key plays: one under the low E or past the
+  fingerboard is a string of its own, as a harp guitar's extra strings are.
 
 Load it in any MIDI channel's first bay, exactly as the DX7 loads, in as
 many bays as you like, because every lane owns a full instance of the
@@ -243,9 +245,9 @@ fitted; the counts are as each sound's own lane last measured them):
 
 | slot | sound | mechanism | voiced against | rows passing |
 |---|---|---|---|---|
-| 0 | Piano 1 | `grand` (modal) + `symp` | an intimate, close-miked grand | 107 of 138 (55 before) |
+| 0 | Intimate Grand | `grand` (modal) + `symp` | an intimate, close-miked grand | 107 of 138 (55 before) |
 | 1 | EP Mk.1 | `tine` | a dry tine piano | 15 of 16 |
-| 2 | Piano 2 | `grand` (modal) + `symp` | a concert grand | 80 of 110 (37 before) |
+| 2 | Concert Grand | `grand` (modal) + `symp` | a concert grand | 80 of 110 (37 before) |
 | 3 | EP Suitcase | `tine` | a tine piano through its amp | 10 of 11 |
 | 4 | Clav | `clav` | a clavinet, dry | 25 of 30, with the wah's rows |
 | 5 | Clav Wah | `clav` + `clav_wah` | the same through an envelope wah | (above) |
@@ -263,7 +265,7 @@ the legacy eight-sound arrays are still read at their own stride
 
 ### What changed in the engine
 
-- **The grands are mode banks.** Piano 1 and Piano 2 play `grand::GrandVoice`
+- **The grands are mode banks.** The Intimate and the Concert Grand play `grand::GrandVoice`
   on `modal::Bank` (768 modes), each partial a two-pole resonator placed on
   the stiff-string series with a per-key B and a stretched tuning, its loss
   read off a bridge admittance with board bumps, and three strings per course
@@ -284,7 +286,7 @@ the legacy eight-sound arrays are still read at their own stride
   restrike, the una corda moving the hammer), each voice's ledger (each
   string's place and each mode's root, per partial) projects the strings'
   motion onto the new modes. It used to hand each mode's motion to the new
-  mode of the same index, which under the una corda is another mode: Piano 1's
+  mode of the same index, which under the una corda is another mode: the Intimate Grand's
   E5 at a tiny UNISON rang 13 times its first strike.
 - **The hammer is graded by key and velocity** (`hammer.rs`, a midpoint
   contact with a felt core that hardens with rate), with level and
@@ -343,8 +345,8 @@ the legacy eight-sound arrays are still read at their own stride
   guitar is asleep half a second after a stop where it rang on for 7 to
   10 s. Every reset the frame makes renders as a new component would, after
   any history; a knob moved in silence is heard at its new value from the
-  next note; the three harp patches drop keys outside A0..C8, as the guitar
-  drops keys off its fingerboard; a NaN velocity is a silent touch; and
+  next note; the three harp patches drop keys outside A0..C8; a NaN
+  velocity is a silent touch; and
   eight corpses fade a chord that steals eight voices in one block.
 
 ### Cost
@@ -355,23 +357,25 @@ in the same minute, on the owner's machine (load 1.8):
 
 | slot | sound | main | now |
 |---|---|---|---|
-| 0 | Piano 1 | 308 ms, 24x real time | 413 ms, 18x |
+| 0 | Intimate Grand | 308 ms, 24x real time | 413 ms, 18x |
 | 1 | EP Mk.1 | 214 ms, 35x | 187 ms, 40x |
-| 2 | Piano 2 | 370 ms, 20x | 373 ms, 20x |
+| 2 | Concert Grand | 370 ms, 20x | 373 ms, 20x |
 | 3 | EP Suitcase | 214 ms, 35x | 222 ms, 33x |
 | 4 | Clav | 122 ms, 61x | 205 ms, 36x |
 | 5 | Clav Wah | 129 ms, 57x | 209 ms, 35x |
 | 6 | Reed 200 | 119 ms, 62x | 169 ms, 44x |
 | 7 | Reed Amp (Reed 140 on main) | 118 ms, 63x | 178 ms, 42x |
 | 8 | Electric Grand | new | 292 ms, 25x |
-| 9 | Nylon Guitar | new | 35 ms, 213x |
+| 9 | Nylon Guitar | new | 111 ms, 67x |
 
-Piano 1 is the one under the 25x floor above, and under the 20x the modal
-brief accepted: its harp carries the intimate's nineteen aliquots over the
-88 strings, and each voice is a 768-mode bank. At 18x a full pedalled
-texture of 64 voices takes 5.5 % of one core. The guitar takes the score's
-keys on six strings, a new note on a string stopping the one there, and
-drops the keys off its fingerboard, which is most of its figure.
+The Intimate Grand is the one under the 25x floor above, and under the 20x
+the modal brief accepted: its harp carries the intimate's nineteen aliquots
+over the 88 strings, and each voice is a 768-mode bank. At 18x a full
+pedalled texture of 64 voices takes 5.5 % of one core. The guitar takes the
+score's keys on the fingerboard on six strings, a new note on a string
+stopping the one there, and every key off it on a string of its own: 35 ms
+(213x) when it dropped those, 111 ms (67x) since it plays every key
+(5.1.0, three rounds at load 6 to 7, so if anything high).
 
 `Keys::new` takes 22.5 MB of heap (22,481,524 bytes; main's took 5.7 MB), in
 11 to 13 ms on the UI thread (main's 1 ms), and nothing after it: no patch
@@ -382,56 +386,65 @@ both grands' strings are solved ahead of any strike.
 
 ### Levels
 
-Every sound comes out quieter than its reference at the same velocities: by
-1.3 to 11.4 dB on the pedalled voicings (`evans`) and 0.3 to 12.8 dB on the
-comping (`comp`). Loudness here is the power mean over the 300 ms windows
-within 40 dB of a take's loudest, both channels, so the gaps between phrases
-do not count:
+The two grands, the electric grand and the guitar were each set by their
+loudest playing to peak a few dB under full scale, where the tine and reed
+pianos and the clavs had been voiced up to it, so at forte the four sat 7 to
+8 dB under the other six and the ten spanned 15.7 dB on the pedalled
+voicings. For 5.1.0 the frame lifts those four by 7 dB at its output
+(`Patch::lift`), after everything the instrument does, so that nothing it
+measures of itself (its culls, its sleep, the harp's) moves; the other six
+are untouched, to the bit. Against the reference, at the same velocities,
+on its two listening scores (loudness the power mean over the 300 ms
+windows within 40 dB of a take's loudest, both channels, so the gaps
+between phrases do not count):
 
 | slot | sound | against the reference, evans / comp (dB) |
 |---|---|---|
-| 0 | Piano 1 | -11.0 / -10.6 |
+| 0 | Intimate Grand | -4.0 / -3.6 |
 | 1 | EP Mk.1 | -1.8 / -0.3 |
-| 2 | Piano 2 | -8.2 / -8.5 |
+| 2 | Concert Grand | -1.2 / -1.5 |
 | 3 | EP Suitcase | -5.5 / -4.0 |
 | 4 | Clav | -1.8 / -3.2 |
 | 5 | Clav Wah | -1.7 / -2.9 |
 | 6 | Reed 200 | -1.3 / -1.4 |
 | 7 | Reed Amp | -5.7 / -3.2 |
-| 8 | Electric Grand | -11.4 / -12.8 |
-| 9 | Nylon Guitar | -7.3 / -6.9 |
+| 8 | Electric Grand | -4.4 / -5.8 |
+| 9 | Nylon Guitar | -0.3 / +0.1 |
 
-The ten also sit further apart than the reference's do: 15.7 dB from the
-loudest to the quietest on `evans` (EP Mk.1 to Piano 2), where the
-reference's spread is 11.8, and 9.2 on `comp` against 5.7. The two grands
-keep the waveguide piano's fortissimo, where users' mixes were set (a
-fortissimo C4 puts -24.6 dBFS into its first 300 ms), and take the
-reference's velocity law under it, so at these scores' middle velocities
-they sit under main's piano too: Piano 1 by 5.3 and 3.3 dB (evans / comp),
-Piano 2 by 7.7 and 4.8. Against main the suitcase is 4.3 and 2.3 dB
-quieter, the clavs 3.4 to 8.7 louder, and EP Mk.1 and the reed pianos
-within 2.5 dB either way.
+From the loudest of the ten to the quietest is now 4.6 dB on the comping
+(`comp`; EP Mk.1 to Clav Wah) where the reference spreads 5.7, and 8.7 on
+the pedalled voicings (`evans`; EP Mk.1 to the Concert Grand) against its
+11.8. A six-note chord at MIDI 100 lands all ten within 2.7 dB
+(`the_ten_sounds_sit_together_at_forte`). Under forte the grands and the
+guitar still fall away faster than the electric pianos, as the reference's
+do (gap 1).
 
-A trim per sound would level them, at a cost in headroom. Trimmed to the
-reference's loudness, the comping take would peak at +1.1 dBFS on Piano 1,
-+1.7 on Reed Amp, +3.8 on the electric grand and +4.1 on the suitcase, where
-the reference's own comping renders stop at 0 dBFS; the grands' crest
-factor is 19 to 20 dB. As shipped, a pedalled fortissimo chord already
-passes full scale on the electric instruments: ten keys at MIDI 127 from C3
-to C6 peak at +4.2 dBFS on EP Mk.1, +3.5 on the suitcase, +2.1 on the clav,
-+1.7 on the wah, +4.8 on Reed 200 and +5.6 on Reed Amp (main's peaked at
-+5.5 to +9.2 on the same chord), while the grands, the electric grand and
-the guitar stay under -4 dBFS. The trim is the owner's call. The study's
-listening pairs are loudness-matched, so what they compare is tone.
+What it costs in headroom: the comping take peaks at -2.6 dBFS on the
+Intimate Grand, -1.9 on the Concert and the electric grand, -2.5 on the
+guitar, where EP Mk.1's peaks at -1.1 and the suitcase's at +0.2. Ten keys
+at MIDI 127 from C3 to C6 under the pedal pass full scale on all ten: +1.9
+dBFS on the Intimate Grand, +2.9 on
+the Concert, +1.6 on the electric grand and the guitar, against +4.2 on EP
+Mk.1, +3.5 on the suitcase, +2.1 on the clav, +1.7 on the wah, +4.8 on Reed
+200 and +5.6 on Reed Amp (main's peaked at +5.5 to +9.2 on that chord). The
+reference's own comping renders stop at 0 dBFS. Against main, the Intimate
+Grand plays 1.7 and 3.7 dB louder (evans / comp) and 7 at fortissimo (a
+fortissimo C4's first 300 ms -17.6 dBFS, where the waveguide piano's was
+-24.6); the Concert Grand 0.7 quieter on `evans`, 2.2 louder on `comp` and
+7 at fortissimo; the suitcase is 4.3 and 2.3 dB quieter, the clavs 3.4 to
+8.7 louder, and EP Mk.1 and the reed pianos within 2.5 dB either way. The
+study's listening pairs are loudness-matched, so what they compare is tone.
 
 ### Known gaps, most audible first
 
 Each is measured against the reference on the same score, by the same code;
 the lane reports in the study folder have the tables.
 
-1. **The ten sounds do not sit at one level** (above). A per-sound trim
-   would level them; it is the owner's call.
-2. **Piano 1's tone across velocity.** Its pianissimo is still 3 to 11 dB too
+1. **Levels under forte.** The lift puts the ten within 4.6 dB on the
+   comping, but the grands and the guitar fall away faster with velocity
+   than the electric pianos: on the pedalled voicings they span 8.7 dB, the
+   Concert Grand the quietest (the reference's own ten span 11.8).
+2. **The Intimate Grand's tone across velocity.** Its pianissimo is still 3 to 11 dB too
    bright at C5, and its bass and tenor fortissimo 8 to 16 dB too dark at 4
    to 8 kHz. Its C7 fortissimo tail stands 15 to 20 dB over the reference's
    at 1.2 to 1.4 s, and its C8 holds its tone where the reference's drops 19
@@ -485,7 +498,7 @@ the lane reports in the study folder have the tables.
     1024. Each is a step landing up to a call later in an otherwise whole
     take, not a sound of its own.
 12. **What the reworked frame costs.** A STRETCH drag under a pedalled
-    chord costs more than it did (Piano 1 at 128 frames 73-78 us a block
+    chord costs more than it did (the Intimate Grand at 128 frames 73-78 us a block
     to 111-114; the electric grand 23 to 43-46), as does the first landing
     of a copied voice after the string table has moved off its knobs (1.7
     to 2.3 times the old one). A lane that has never rendered pays 424 us
@@ -493,7 +506,7 @@ the lane reports in the study folder have the tables.
     82 us for 44 or more; on a project load with many unarmed pianos that
     adds up across lanes. The clavs cost 2 to 6 % more than before the
     frame's grids.
-13. **The harp keeps Piano 1 awake after a pedal lift.** Its damped tail
+13. **The harp keeps the Intimate Grand awake after a pedal lift.** Its damped tail
     runs down to the -146 dBFS floor, 2.7 s after the lift, and the lane
     is not idle until it does (CPU only; nothing over the floor is heard).
 14. **STRETCH's top.** At the knob's 1 C8 sits 128 cents over equal
@@ -596,7 +609,9 @@ appear nowhere in the product, the patch names, or the UI. "EP Mk.1" is
 Tangent's name for a Tangent instrument; what it is modelled on is a fact
 about the model and belongs in prose like this.
 
-The same holds for every sound since: "Clav", "Reed 200", "Reed Amp",
-"Electric Grand" and "Nylon Guitar" are Tangent's names, and the instruments
+The same holds for every sound since: "Intimate Grand", "Concert Grand",
+"Clav", "Reed 200", "Reed Amp", "Electric Grand" and "Nylon Guitar" are
+Tangent's names (the first two were "Piano 1" and "Piano 2" until 5.1.0; a
+saved strip keeps its sound, since the slot is stored by number), and the instruments
 they were voiced against are named in no patch, description or comment. The
 code and its comments call the measured instrument "the reference".

@@ -430,7 +430,9 @@ pub struct GrandBase {
     /// against the waveguide piano, so a fortissimo C4's first 300 ms has
     /// its RMS, -24.6 dBFS through the frame (both channels' power; the
     /// base cc701c73 measures the same), held by
-    /// `keys::tests::a_fortissimo_c4_sits_where_the_waveguide_piano_did`.
+    /// `keys::tests::a_fortissimo_c4_sits_seven_db_over_the_waveguide_piano`;
+    /// the frame lifts it from there, 7 dB, level with the other sounds at
+    /// forte (`Patch::lift`).
     /// The first voicing was 7 dB louder there and in the bass, and this
     /// lane's refit of the intimate's hammer 3 dB louder (-21.6), with
     /// pedalled fortissimo chords over full scale (+2.9 dBFS; verifier); at

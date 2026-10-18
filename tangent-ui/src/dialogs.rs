@@ -3750,11 +3750,12 @@ pub const DRUMPAD_NAME: &str = "Tangent Drums";
 /// carries it as a path and none of them has to learn what it is.
 pub const KEYS_PATH: &str = "@tangent-keys";
 /// **The DISPLAY name only.** The preset folder is spelled separately, in
-/// `desktop::preset_subfolder`, and deliberately still reads "Tangent Keys":
-/// a saved preset lives at a path, and renaming the drawer would hide every
-/// preset anybody has already written. The parenthetical is a label on the
-/// instrument, not a change of identity.
-pub const KEYS_NAME: &str = "Tangent Keys (Experimental)";
+/// `desktop::preset_subfolder`, and deliberately so: a saved preset lives at
+/// a path, and renaming the drawer would hide every preset anybody has
+/// already written. Until 5.1.0 this read "Tangent Keys (Experimental)",
+/// a label on the instrument and never a change of identity, which is why
+/// taking it off moved nothing on disk.
+pub const KEYS_NAME: &str = "Tangent Keys";
 
 /// **The fourth built-in instrument's sentinel, and the first that is a
 /// VOICE in a bay.** It rides the picker exactly as the three above do,
@@ -3798,12 +3799,12 @@ pub const KEYS_PATCHES: usize = 10;
 /// kept its index when it became the reed piano through its amp: a saved
 /// strip there keeps its knobs.
 pub const KEYS_PATCH_NAMES: [(&str, &str); KEYS_PATCHES] = [
-    ("Piano 1", "intimate grand, heard close: soft felt, wood and the action"),
+    ("Intimate Grand", "a small room's grand, heard close: soft felt, wood and the action"),
     (
         "EP Mk.1",
         "tine electric piano, dry - light is bell, hard is bark",
     ),
-    ("Piano 2", "concert grand: longer ring, deeper bass, wider swing"),
+    ("Concert Grand", "the hall instrument: longer ring, deeper bass, wider swing"),
     (
         "EP Suitcase",
         "the same tines through their own amp - the stereo throb",
@@ -15657,7 +15658,7 @@ mod tests {
     #[test]
     fn keys_patches_are_named_in_engine_order() {
         assert_eq!(KEYS_PATCH_NAMES.len(), KEYS_PATCHES);
-        assert_eq!(KEYS_PATCH_NAMES[0].0, "Piano 1");
+        assert_eq!(KEYS_PATCH_NAMES[0].0, "Intimate Grand");
         assert_eq!(KEYS_PATCH_NAMES[1].0, "EP Mk.1");
         for (name, about) in KEYS_PATCH_NAMES {
             assert!(!name.is_empty() && !about.is_empty());

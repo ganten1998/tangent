@@ -17,9 +17,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   keeps the sound it had. The Electric Grand is short, stiff strings read
   by pickups, with no soundboard, and strings of its own that ring in
   sympathy under the pedal. The Nylon Guitar plays six strings: each note
-  goes to the string a hand would choose, the open strings and the body's
-  air ring with what is played, and a key below the low E or past the
-  fingerboard is silent.
+  goes to the string a hand would choose, and the open strings and the
+  body's air ring with what is played. It plays every key: one below the
+  low E or past the fingerboard is a string of its own, as a harp guitar's
+  extra strings are, so it never takes a string from a fretted note.
 - **The two pianos half-pedal, hold a sostenuto and shift for the una
   corda.** The sustain, sostenuto and soft pedals (CC 64, 66 and 67) reach
   them as levels: the dampers follow the sustain part way down, the
@@ -33,14 +34,20 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   compared with a reference instrument one measured quantity at a time (a
   partial's decay, a velocity law, the level of the ring around a note, a
   release) on the same key at the same velocity, against tolerances set
-  before anything was fitted; `docs/KEYS.md` has the tables. Piano 1 is now
-  an intimate, close-miked grand and Piano 2 a concert grand. Both are new
+  before anything was fitted; `docs/KEYS.md` has the tables. The two pianos
+  are an intimate, close-miked grand and a concert grand, and both are new
   instruments: banks of string modes in place of the old waveguides, three
   strings to a note coupled at the bridge (which is where a piano's
   two-stage decay comes from), a hammer graded by key and velocity, the
   action's knock and the dampers' thump, and sympathetic strings that ring
   around every note and after it. The tine pianos, the clavs and the reed
   piano kept their mechanisms and were refitted.
+- **Piano 1 and Piano 2 are now called Intimate Grand and Concert Grand.**
+  A track saved on either opens on the same sound with the knobs it had:
+  the sound is stored by its place in the list, not by its name.
+- **Tangent Keys is no longer marked experimental.** The instrument picker
+  and its window say Tangent Keys; projects, presets and the tracks already
+  named after it are untouched.
 - **Reed 140 is now Reed Amp**, the reed piano through its amplifier: the
   cabinet's slap, its throb and a room. A track saved on Reed 140 opens on
   Reed Amp with the knobs it had; its Tremolo now sets the depth of the
@@ -53,11 +60,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   at 512 came out slightly different. Every voice now keeps its own clock:
   five of the ten render the same to the bit at any buffer size, and the
   rest within -74 dB of it.
-- **Levels moved with the re-voicing.** At the same velocities Piano 1 now
-  plays 3 to 5 dB quieter than before through the middle of its range and
-  Piano 2 5 to 8 dB (at fortissimo both are where they were), EP Suitcase 2
-  to 4 dB quieter, and the two clavs 3 to 9 dB louder. A mix balanced on
-  the old sounds may want its faders looked at.
+- **The ten Keys sounds sit together.** Played hard they are within about
+  5 dB of one another, where in 5.0.0 the two pianos sat 7 to 11 dB under
+  EP Mk.1. Against 5.0.0 at the same velocities, the Intimate Grand
+  plays 2 to 4 dB louder through the middle of its range and 7 dB louder at
+  fortissimo, the Concert Grand within 2 dB of where it was through the
+  middle and 7 dB louder at fortissimo, EP Suitcase 2 to 4 dB quieter, and
+  the two clavs 3 to 9 dB louder. A mix balanced on the old sounds may want
+  its faders looked at.
 - **A Keys track holds 22.5 MB** (5.7 MB before), all of it taken when the
   track is made, never while it plays.
 

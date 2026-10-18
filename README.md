@@ -115,8 +115,9 @@ FreeBSD 15 on amd64.
   folders you add, and rescans without a restart. Plugins are told the
   tempo (ramps included), meter, position and transport.
 - Several instruments on one track all play from the same MIDI.
-- **Instruments:** Tangent Keys (eight modelled sounds: grand pianos, tine
-  and reed electric pianos, clavs), an FM synth that reads DX7 patch banks,
+- **Instruments:** Tangent Keys (ten modelled sounds: an intimate and a
+  concert grand, an electric grand, tine and reed electric pianos, clavs and
+  a nylon guitar), an FM synth that reads DX7 patch banks,
   Tangent Analog (an analog-style synth with an arpeggiator), Tangent Sampler,
   and Tangent Drums.
 - **Effects:** EQ, Comp, Tape, Imager, Plate, Echo, Chorus, Trem, Wah,

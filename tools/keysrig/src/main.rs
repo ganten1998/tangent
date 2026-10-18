@@ -225,8 +225,8 @@ fn solo_string(pitch: u8, vel: f32, secs: f32, base: &keys::string::PianoBase) -
 /// applies) for every patch the bench knows.
 fn patch_label(patch: Patch) -> &'static str {
     match patch {
-        Patch::Piano1 => "Piano 1",
-        Patch::Piano2 => "Piano 2",
+        Patch::Piano1 => "Intimate Grand",
+        Patch::Piano2 => "Concert Grand",
         Patch::EpMk1 => "EP Mk.1",
         Patch::EpSuitcase => "EP Suitcase",
         Patch::Clav => "Clav",
@@ -303,7 +303,7 @@ fn report_velocity(patch: Patch) {
         // The plucked string's upper half, on its own measured stiffness
         // (E4 is the top string open).
         Patch::Guitar => {
-            let bb = keys::guitar::Place::home(64).map_or(0.0, keys::guitar::inharmonicity) as f32;
+            let bb = keys::guitar::inharmonicity(keys::guitar::Place::home(64)) as f32;
             (5..=10)
                 .map(|n| n as f32 * f0 * (1.0 + bb * (n * n) as f32).sqrt() / (1.0 + bb).sqrt())
                 .collect()
@@ -397,7 +397,7 @@ fn report_partials(patch: Patch) {
             }
             // C4 is the B string at the first fret, partial 1 on f0 exactly.
             Patch::Guitar => {
-                let b = keys::guitar::Place::home(60).map_or(0.0, keys::guitar::inharmonicity) as f32;
+                let b = keys::guitar::inharmonicity(keys::guitar::Place::home(60)) as f32;
                 let n = n as f32;
                 n * f0 * (1.0 + b * n * n).sqrt() / (1.0 + b).sqrt()
             }

@@ -23,7 +23,9 @@
 //! 1. *The fingerboard.* Six strings at E2 A2 D3 G3 B3 E4, first position
 //!    (frets 0-4, then the top string to its 19th fret), and a string selector
 //!    the frame owns (`Fretboard`): one note per string, so a second that
-//!    would share a string moves to the next string down that reaches it.
+//!    would share a string moves to the next string down that reaches it. A
+//!    key off the fingerboard, under the bass E or past the 19th fret, is a
+//!    string of its own, as a harp guitar's extra strings are (`Place::home`).
 //! 2. *The pluck.* A triangle with its apex at a fixed DISTANCE from the bridge
 //!    (0.197 of the open string, so the comb's notches move with the fret),
 //!    released from rest; its spectrum shaped by how the string leaves the
@@ -60,11 +62,17 @@ pub const STRINGS: usize = 6;
 /// Each string's open pitch, MIDI, string 1 to string 6: the standard tuning.
 pub const OPEN: [u8; STRINGS] = [64, 59, 55, 50, 45, 40];
 
-/// The compass: the bass E open to the 19th fret of the top E — a classical
-/// guitar's whole fingerboard, which is also everything the reference plays
-/// (its scores reach B5 and stop). Keys outside it are silent.
+/// The fingerboard's compass: the bass E open to the 19th fret of the top
+/// E — a classical guitar's whole fingerboard, which is also everything the
+/// reference plays (its scores reach B5 and stop). Every other key has a
+/// string of its own (`Place::home`).
 pub const LOWEST: u8 = 40;
 pub const HIGHEST: u8 = 83;
+
+/// Whether `pitch` is on the fingerboard, where the six strings play it.
+pub fn on_board(pitch: u8) -> bool {
+    (LOWEST..=HIGHEST).contains(&pitch)
+}
 
 /// The last fret.
 const FRETS: u8 = 19;
@@ -100,15 +108,31 @@ impl Place {
     /// the note, which in standard tuning is always within frets 0-4, and the
     /// top string up to its 19th fret above E4. This is where the reference's
     /// measured pluck combs and stiffnesses put 17 of its 19 notes (the
-    /// analysis's beta and B tables). `None` outside the compass.
-    pub fn home(pitch: u8) -> Option<Place> {
-        if !(LOWEST..=HIGHEST).contains(&pitch) {
-            return None;
+    /// analysis's beta and B tables).
+    ///
+    /// **Off the fingerboard, a string of its own, as a harp guitar has.** A
+    /// key under the bass E is an open string tuned to it on the bass E's
+    /// laws: the scale, tension, pluck point, stiffness and losses of the
+    /// open bass E, only its pitch lower (a harp guitar's sub-basses, heavier
+    /// strings at the same scale rather than longer ones). A key past the
+    /// 19th fret is the top string's 19th fret held the same way, its
+    /// super-trebles. Every law here that reads a place is so held at the
+    /// fingerboard's end, as the tables that read a pitch are past their last
+    /// knots (`voicing_db`, `by_key`), and such a string is none of the six:
+    /// the selector neither gives it a fretted note's string nor takes one
+    /// from it (`Fretboard::place`).
+    pub fn home(pitch: u8) -> Place {
+        if pitch < LOWEST {
+            return Place { string: STRINGS - 1, fret: 0 };
         }
-        OPEN.iter().position(|&open| pitch >= open).map(|s| Place {
+        if pitch > HIGHEST {
+            return Place { string: 0, fret: FRETS };
+        }
+        let s = OPEN.iter().position(|&open| pitch >= open).unwrap_or(STRINGS - 1);
+        Place {
             string: s,
             fret: pitch - OPEN[s],
-        })
+        }
     }
 
     /// The note on string `s`, if that string reaches it.
@@ -420,6 +444,19 @@ fn bumps(coef: &[f64], cen0: f64, step: f64, width: f64, f: f64) -> f64 {
     sum
 }
 
+/// **The fitted curves answer from the bass E's fundamental up**, the lowest
+/// partial the reference was measured on: under `FIT_FLOOR_HZ` the bridge's
+/// curve (`G_SHARED`, `G_STRING`) and the radiation (`RADIATION`) are held
+/// where they stand there. Away from their knots the Gaussian sums fall back
+/// to 0 dB, so a sub-bass string (`Place::home`) would have radiated its
+/// fundamental louder than the bass E radiates its own and lost almost
+/// nothing to the bridge: at A0's 27.5 Hz the radiation read -0.0 dB
+/// against -6.9 here, and the bridge 1.0 dB/s against 6.9, a minute's ring
+/// for eight seconds'. Just under 82.41 Hz, so no partial of the
+/// fingerboard's own (the bass E's is the lowest, and no glide or remnant
+/// flattens it) is moved.
+const FIT_FLOOR_HZ: f64 = 82.0;
+
 /// The string material's own loss at `f`, dB per second.
 fn internal_loss(f: f64) -> f64 {
     INTERNAL_DB_1K * (f / 1000.0).powf(INTERNAL_EXP)
@@ -428,6 +465,7 @@ fn internal_loss(f: f64) -> f64 {
 /// What the bridge takes from a mode of string `s` at `f` Hz, dB per
 /// second, for an open string.
 fn bridge_loss(s: usize, f: f64) -> f64 {
+    let f = f.max(FIT_FLOOR_HZ);
     let shared = bumps(&G_SHARED, G_CEN0, G_STEP, G_WIDTH, f);
     let own = bumps(&G_STRING[s], G_CEN0, G_STEP, G_WIDTH, f);
     (shared + own).exp()
@@ -540,8 +578,10 @@ const SUB_HZ: f64 = 80.0;
 const SUB_DB: f64 = -3.5;
 const SUB_OCT: f64 = 0.12;
 
-/// The radiation at `f`, linear, before the overall gain.
+/// The radiation at `f`, linear, before the overall gain; held under
+/// `FIT_FLOOR_HZ`.
 fn radiation(f: f64) -> f64 {
+    let f = f.max(FIT_FLOOR_HZ);
     let db = bumps(&RADIATION, RAD_CEN0, 1.0 / 3.0, 1.0 / 3.0, f);
     let x = (f / DIP_HZ).log2() / DIP_OCT;
     let h = (f / HELM_HZ).log2() / HELM_OCT;
@@ -1538,9 +1578,21 @@ impl GuitarVoice {
         self.done
     }
 
-    /// The string this voice is on.
+    /// The string this voice is on, or whose laws it is built on off the
+    /// fingerboard (the frame asks for the bus instead: `bus`).
+    #[cfg(test)]
     pub fn string(&self) -> usize {
         self.place.string
+    }
+
+    /// The fretboard bus this voice drives (`Fretboard::bus`): its string's,
+    /// or for a key off the fingerboard the one every open string hears.
+    pub fn bus(&self) -> usize {
+        if on_board(self.pitch) {
+            self.place.string
+        } else {
+            STRINGS
+        }
     }
 
     /// Loudness for the stealing policy: the bank's own level (measured every
@@ -2750,8 +2802,9 @@ pub struct Fretboard {
     air_awake: bool,
     body: f32,
     /// One block of each string's bridge drive, as the voices on it render
-    /// into it, and scratch.
-    bus: Box<[[f32; BLOCK]; STRINGS]>,
+    /// into it, then one for the strings off the fingerboard (`Place::home`),
+    /// which every open string hears; and scratch.
+    bus: Box<[[f32; BLOCK]; STRINGS + 1]>,
     total: Box<[f32; BLOCK]>,
     x: Box<[f32; BLOCK]>,
     sym_d: Box<[f32; BLOCK]>,
@@ -2787,7 +2840,7 @@ impl Fretboard {
             air: Box::new(Resonators::new()),
             air_awake: false,
             body: 1.0,
-            bus: Box::new([[0.0; BLOCK]; STRINGS]),
+            bus: Box::new([[0.0; BLOCK]; STRINGS + 1]),
             total: Box::new([0.0; BLOCK]),
             x: Box::new([0.0; BLOCK]),
             sym_d: Box::new([0.0; BLOCK]),
@@ -2854,30 +2907,40 @@ impl Fretboard {
     /// the reference's manual says the same of its own (seconds and minor
     /// thirds cannot share a string; an automatic selector moves them). A
     /// string a released note is still ringing on is free: the new note takes
-    /// it and that note stops. `None` outside the compass.
-    pub fn place(&self, pitch: u8) -> Option<Place> {
-        let home = Place::home(pitch)?;
+    /// it and that note stops. A key off the fingerboard is a string of its
+    /// own (`Place::home`), which no other key takes.
+    pub fn place(&self, pitch: u8) -> Place {
+        let home = Place::home(pitch);
+        if !on_board(pitch) {
+            return home;
+        }
         if let Some(s) = self.owner.iter().position(|&o| o == Some(pitch)) {
-            return Place::on(s, pitch);
+            return Place::on(s, pitch).unwrap_or(home);
         }
         if !self.busy(home.string) {
-            return Some(home);
+            return home;
         }
         for s in home.string + 1..STRINGS {
             if let Some(p) = Place::on(s, pitch) {
                 if p.fret <= REACH && !self.busy(s) {
-                    return Some(p);
+                    return p;
                 }
             }
         }
-        Some(home)
+        home
     }
 
     /// Give `place`'s string to `pitch`, key down. Returns the other pitch
-    /// that was on it, which the frame chokes.
+    /// that was on it, which the frame chokes. A key off the fingerboard is
+    /// down and takes none of the six: nothing is choked, and every open
+    /// string goes on hearing the bridge.
     pub fn take(&mut self, place: Place, pitch: u8) -> Option<u8> {
         self.close_block();
         self.deaf = false;
+        if !on_board(pitch) {
+            self.keys |= 1u128 << (pitch & 127);
+            return None;
+        }
         let s = place.string;
         let old = self.owner[s].filter(|&p| p != pitch);
         self.owner[s] = Some(pitch);
@@ -3037,9 +3100,10 @@ impl Fretboard {
         }
     }
 
-    /// String `s`'s drive bus, for a voice on it to render into.
+    /// String `s`'s drive bus, for a voice on it to render into; `STRINGS`
+    /// is the bus of the strings off the fingerboard (`GuitarVoice::bus`).
     pub fn bus(&mut self, s: usize, m: usize) -> &mut [f32] {
-        &mut self.bus[s.min(STRINGS - 1)][..m.min(BLOCK)]
+        &mut self.bus[s.min(STRINGS)][..m.min(BLOCK)]
     }
 
     /// Run the open strings and the air on this block's buses and ADD them
@@ -3259,7 +3323,7 @@ mod tests {
     /// No fretboard: the string alone, as the open strings switched off hear it.
     fn play(pitch: u8, vel: f32, secs: f32, k: &GuitarKnobs, release_at: Option<f32>) -> (Vec<f32>, Vec<f32>, Vec<f32>, GuitarVoice) {
         let mut v = GuitarVoice::new(RATE);
-        v.strike(Place::home(pitch).unwrap(), pitch, vel, k);
+        v.strike(Place::home(pitch), pitch, vel, k);
         let n = (secs * RATE) as usize / BLOCK * BLOCK;
         let (mut l, mut r, mut d) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let mut at = 0;
@@ -3369,11 +3433,117 @@ mod tests {
             (76, 1, 12),
             (83, 1, 19),
         ] {
-            let place = Place::home(p).unwrap();
+            let place = Place::home(p);
             assert_eq!((place.string + 1, place.fret), (s, f), "pitch {p}");
         }
-        assert_eq!(Place::home(LOWEST - 1), None);
-        assert_eq!(Place::home(HIGHEST + 1), None);
+        // Off the fingerboard, a string of its own on the laws of the
+        // fingerboard's end: the open bass E under it, the top string's 19th
+        // fret past it.
+        for p in [0u8, 21, LOWEST - 1] {
+            assert_eq!(Place::home(p), Place { string: STRINGS - 1, fret: 0 }, "pitch {p}");
+        }
+        for p in [HIGHEST + 1, 108, 127] {
+            assert_eq!(Place::home(p), Place { string: 0, fret: FRETS }, "pitch {p}");
+        }
+    }
+
+    /// **Every key plays, and none runs away.** Each of MIDI 0 to 127 alone
+    /// through the frame, at MIDI 80 and 127: every sample finite, every key
+    /// heard (its first 300 ms over -60 dBFS RMS) and none over -3 dBFS
+    /// peak, no key more than 3 dB from its neighbour, and across each end
+    /// of the fingerboard no more than 2. Measured: D#2 to E2 0.6 dB at MIDI
+    /// 80, B5 to C6 0.8; the largest step anywhere G1 to G#1, 2.2 dB (G#1's
+    /// second partial on the air mode); the loudest key -6.3 dBFS; A0 4.5 dB
+    /// and C8 13.5 dB under the fingerboard's end, as a piano's top octave
+    /// falls away under its middle. The fingerboard alone kept every other
+    /// key silent.
+    #[test]
+    fn every_key_plays_and_none_runs_away() {
+        for vel in [80.0 / 127.0, 1.0] {
+            let mut rms = [0.0_f64; 128];
+            for p in 0..=127u8 {
+                let (l, r, _) = perform(&[(0.0, Ev::On(p, vel)), (1.0, Ev::Off(p))], 1.2, &[]);
+                assert!(l.iter().chain(&r).all(|v| v.is_finite()), "MIDI {p} at {vel}: a sample is not a number");
+                let n = (0.3 * RATE) as usize;
+                let e: f64 = l[..n].iter().chain(&r[..n]).map(|v| f64::from(*v).powi(2)).sum::<f64>() / (2 * n) as f64;
+                rms[usize::from(p)] = 10.0 * e.max(1e-30).log10();
+                let peak = l.iter().chain(&r).fold(0.0_f32, |m, v| m.max(v.abs()));
+                let peak = 20.0 * f64::from(peak).max(1e-30).log10();
+                assert!(rms[usize::from(p)] > -60.0, "MIDI {p} at {vel}: silent ({:+.1} dBFS)", rms[usize::from(p)]);
+                assert!(peak < -3.0, "MIDI {p} at {vel}: peaks at {peak:+.1} dBFS");
+            }
+            for p in 1..128 {
+                let step = (rms[p] - rms[p - 1]).abs();
+                let edge = p == usize::from(LOWEST) || p == usize::from(HIGHEST) + 1;
+                let bar = if edge { 2.0 } else { 3.0 };
+                assert!(step <= bar, "MIDI {} to {p} at {vel}: {step:.1} dB apart", p - 1);
+            }
+        }
+    }
+
+    /// **A key off the fingerboard is a string of its own.** Under a held E2
+    /// (the bass E open) D2, C2 and A1 all sound and E2 keeps its string;
+    /// over a held B5 (the top string's 19th fret) C6 and D6 do and B5 keeps
+    /// its own. None of them owns one of the six, every one drives the bus
+    /// the open strings all hear, and one struck twice lands on itself, as a
+    /// re-pluck does: no voice is buried. The selector used to have nowhere
+    /// to put such a key, and it was silent.
+    #[test]
+    fn a_key_off_the_fingerboard_is_a_string_of_its_own() {
+        let held = |k: &Keys, p: u8| k.notes.iter().find(|n| n.pitch == Some(p) && !n.mech.finished()).map(|n| (n.mech.guitar.string(), n.mech.guitar.bus()));
+        let (_, _, k) = perform(&[(0.0, Ev::On(40, 0.8)), (0.1, Ev::On(38, 0.8)), (0.2, Ev::On(36, 0.8)), (0.3, Ev::On(33, 0.8))], 0.6, &[]);
+        assert_eq!(k.fretboard.owner[STRINGS - 1], Some(40), "E2 lost the bass E");
+        assert_eq!(held(&k, 40), Some((STRINGS - 1, STRINGS - 1)));
+        for p in [38u8, 36, 33] {
+            assert_eq!(held(&k, p), Some((STRINGS - 1, STRINGS)), "MIDI {p} is not its own string");
+            assert!(!k.fretboard.owner.contains(&Some(p)), "MIDI {p} owns one of the six");
+        }
+        let (_, _, k) = perform(&[(0.0, Ev::On(83, 0.8)), (0.1, Ev::On(84, 0.8)), (0.2, Ev::On(86, 0.8))], 0.6, &[]);
+        assert_eq!(k.fretboard.owner[0], Some(83), "B5 lost the top string");
+        for p in [84u8, 86] {
+            assert_eq!(held(&k, p), Some((0, STRINGS)), "MIDI {p} is not its own string");
+        }
+        // Struck twice: the second lands on the first, so nothing fades out
+        // as a corpse.
+        let (_, _, k) = perform(&[(0.0, Ev::On(30, 0.8)), (0.4, Ev::On(30, 0.6))], 0.5, &[]);
+        assert_eq!(k.notes.iter().filter(|n| n.pitch == Some(30)).count(), 1, "a re-pluck took a second voice");
+        assert!(k.corpses.iter().all(|c| c.left == 0), "a re-pluck off the fingerboard buried its string");
+        // And the board: such a key is down, owns nothing and chokes nothing.
+        let mut fb = Fretboard::new(RATE);
+        let e2 = fb.place(40);
+        assert_eq!(fb.take(e2, 40), None);
+        let d2 = fb.place(38);
+        assert_eq!(d2, Place { string: STRINGS - 1, fret: 0 });
+        assert_eq!(fb.take(d2, 38), None, "D2 choked E2");
+        assert_eq!(fb.owner[STRINGS - 1], Some(40));
+        assert_ne!(fb.keys & (1u128 << 38), 0, "D2's key is not down");
+    }
+
+    /// **The open strings hear a string off the fingerboard.** Its drive has
+    /// a bus of its own (`GuitarVoice::bus`), heard by all six; on one of
+    /// the six's buses that string would not hear it, and every key under
+    /// the bass E would have been deaf to the open bass E. A 110 Hz drive on
+    /// it wakes the open A string, A2, and is heard.
+    #[test]
+    fn the_open_strings_hear_a_string_off_the_fingerboard() {
+        let mut fb = Fretboard::new(RATE);
+        let a1 = fb.place(33);
+        fb.take(a1, 33);
+        let (mut l, mut r) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK]);
+        let mut heard = 0.0_f64;
+        for blk in 0..40 {
+            fb.set_knobs(&knobs());
+            fb.begin(BLOCK);
+            for (i, v) in fb.bus(STRINGS, BLOCK).iter_mut().enumerate() {
+                *v = if blk < 20 { 0.05 * (TAU * 110.0 * (i + blk * BLOCK) as f64 / f64::from(RATE)).sin() as f32 } else { 0.0 };
+            }
+            l.fill(0.0);
+            r.fill(0.0);
+            fb.render(&mut l, &mut r, BLOCK);
+            heard += l.iter().chain(&r).map(|v| f64::from(*v).powi(2)).sum::<f64>();
+        }
+        assert!(fb.awake[4], "the open A string did not wake");
+        assert!(heard > 1e-9, "the open strings gave nothing back ({heard:e})");
     }
 
     /// **One note per string, and a second moves rather than chokes.** E3
@@ -3386,39 +3556,39 @@ mod tests {
     #[test]
     fn the_selector_keeps_one_note_per_string() {
         let mut fb = Fretboard::new(RATE);
-        let e3 = fb.place(52).unwrap();
+        let e3 = fb.place(52);
         assert_eq!((e3.string, e3.fret), (3, 2));
         assert_eq!(fb.take(e3, 52), None);
-        let f3 = fb.place(53).unwrap();
+        let f3 = fb.place(53);
         assert_eq!((f3.string, f3.fret), (4, 8), "F3 beside a held E3");
         assert_eq!(fb.take(f3, 53), None);
-        assert_eq!(fb.place(52), Some(e3), "a re-pluck finds its own string");
-        assert_eq!(fb.place(53), Some(f3), "wherever that string is");
+        assert_eq!(fb.place(52), e3, "a re-pluck finds its own string");
+        assert_eq!(fb.place(53), f3, "wherever that string is");
         // A third note that wants the A string and finds it busy: G#2's own
         // place is the low E string (fret 4), which is free.
-        assert_eq!(fb.place(44).map(|p| (p.string, p.fret)), Some((5, 4)));
+        assert_eq!((fb.place(44).string, fb.place(44).fret), (5, 4));
         // Nowhere to move: the older note is choked.
-        let c5 = fb.place(72).unwrap();
+        let c5 = fb.place(72);
         fb.take(c5, 72);
-        let e5 = fb.place(76).unwrap();
+        let e5 = fb.place(76);
         assert_eq!((e5.string, e5.fret), (0, 12));
         assert_eq!(fb.take(e5, 76), Some(72), "E5 takes the top string from C5");
         // Released, E3's string is free again: F3 (its old voice gone) goes
         // home, and the still-ringing E3 is the note to stop.
         fb.key_up(52);
         fb.voice_done(53);
-        let home = fb.place(53).unwrap();
+        let home = fb.place(53);
         assert_eq!((home.string, home.fret), (3, 3), "F3 home once E3 is released");
         assert_eq!(fb.take(home, 53), Some(52));
         // Under the pedal a released note keeps its string.
         let mut fb = Fretboard::new(RATE);
         fb.set_pedal(true);
-        let e3 = fb.place(52).unwrap();
+        let e3 = fb.place(52);
         fb.take(e3, 52);
         fb.key_up(52);
-        assert_eq!(fb.place(53).map(|p| p.string), Some(4), "the pedal holds E3's string");
+        assert_eq!(fb.place(53).string, 4, "the pedal holds E3's string");
         fb.set_pedal(false);
-        assert_eq!(fb.place(53).map(|p| p.string), Some(3), "lifting the pedal frees it");
+        assert_eq!(fb.place(53).string, 3, "lifting the pedal frees it");
     }
 
     /// **E3 and F3 held together through the frame**: two voices, on the D
@@ -3693,7 +3863,8 @@ mod tests {
     /// of it (E3 G#3 B3), all notes off at 1.2 s with the pedal held: the
     /// guitar is asleep within a second, as the grands are (measured 0.507
     /// and 0.485 s; Piano 1 0.54, Piano 2 0.90), and the last `QUIET_SECS`
-    /// before it sleeps are under `FLOOR_RMS` (-150.2 and -152.9 dBFS RMS).
+    /// before it sleeps are under `FLOOR_RMS` (-150.2 and -152.9 dBFS RMS,
+    /// the frame's 7 dB lift taken out: `Patch::lift`).
     /// At 0d20e3d1 the open strings, answering again after the hush's clear,
     /// took up what the choked voices played into them for their last tenth
     /// of a second and rang it out under the pedal (-104 and -102 dBFS RMS
@@ -3735,7 +3906,10 @@ mod tests {
             let secs = (a - stop) as f32 / RATE;
             println!("{keys:?} under the pedal, all notes off: asleep {secs:.3} s on{}, the last {:.0} ms before it {last:+.1} dBFS RMS", if asleep.is_none() { " (still awake)" } else { "" }, QUIET_SECS * 1e3);
             assert!(asleep.is_some() && secs <= 1.0, "{keys:?}: still awake {secs:.3} s after all notes off");
-            assert!(last <= 20.0 * f64::from(FLOOR_RMS).log10(), "{keys:?}: put to sleep from {last:+.1} dBFS RMS");
+            // The floor is the board's own, in what it measures of itself:
+            // the frame's lift comes after it (`Patch::lift`).
+            let own = last - 20.0 * f64::from(Patch::Guitar.lift()).log10();
+            assert!(own <= 20.0 * f64::from(FLOOR_RMS).log10(), "{keys:?}: put to sleep from {own:+.1} dBFS RMS before the lift");
         }
     }
 
@@ -3766,7 +3940,7 @@ mod tests {
     #[test]
     fn a_note_choked_before_it_lets_go_never_plucks() {
         let mut v = GuitarVoice::new(RATE);
-        v.strike(Place::home(64).unwrap(), 64, 1.0, &knobs());
+        v.strike(Place::home(64), 64, 1.0, &knobs());
         let (mut l, mut r, mut d) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK], [0.0_f32; BLOCK]);
         v.render(&mut l, &mut r, &mut d);
         assert!(v.contact.is_some(), "the finger let go inside the first block");
@@ -3946,7 +4120,7 @@ mod tests {
             assert_eq!(GuitarKnobs::from_params(&p), knobs(), "a NaN knob {i} is not its default");
         }
         let mut v = GuitarVoice::new(RATE);
-        v.strike(Place::home(52).unwrap(), 52, f32::NAN, &knobs());
+        v.strike(Place::home(52), 52, f32::NAN, &knobs());
         let (mut l, mut r, mut d) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK], [0.0_f32; BLOCK]);
         for _ in 0..40 {
             v.render(&mut l, &mut r, &mut d);
@@ -3968,7 +4142,7 @@ mod tests {
     fn the_pluck_point_is_a_fixed_distance_from_the_bridge() {
         for &(pitch, pos) in &[(40u8, 0.5_f32), (43, 0.5), (57, 0.5), (69, 0.5), (71, 0.5), (76, 0.5), (83, 0.5), (45, 0.0), (64, 1.0), (79, 1.0)] {
             let k = knobs_with(3, pos);
-            let place = Place::home(pitch).unwrap();
+            let place = Place::home(pitch);
             // The 19th fret's default lands exactly on the cap; G5 at the top
             // of POSITION (0.94 asked) is held there (`beta_max`).
             let beta = (BETA_OPEN * 2.0_f64.powf(f64::from(place.fret) / 12.0) * f64::from(k.position)).min(beta_max());
@@ -4028,7 +4202,7 @@ mod tests {
             (83, 2.1e-4),
         ];
         for &(p, b) in &measured {
-            let got = inharmonicity(Place::home(p).unwrap());
+            let got = inharmonicity(Place::home(p));
             assert!((got / b - 1.0).abs() < 1e-12, "pitch {p}: {got:e} against {b:e}");
         }
         // The stopped-string law between the top string's 3rd and 5th frets.
@@ -4084,7 +4258,7 @@ mod tests {
         ];
         let mut line = Vec::new();
         for &(p, t) in &targets {
-            let place = Place::home(p).unwrap();
+            let place = Place::home(p);
             let f1 = f_equal(p);
             let t60 = 1000.0_f64.ln() / mode_sigma(place, f1);
             line.push(format!("{p}:{t60:.2}/{t}"));
@@ -4189,7 +4363,7 @@ mod tests {
     #[test]
     fn velocity_sets_the_level_and_the_finger_the_brightness() {
         for p in [45u8, 57, 69] {
-            let place = Place::home(p).unwrap();
+            let place = Place::home(p);
             let start = |vel: f32, k: &GuitarKnobs| -> Vec<f64> {
                 let mut v = GuitarVoice::new(RATE);
                 v.strike(place, p, vel, k);
@@ -4203,7 +4377,7 @@ mod tests {
             println!("pitch {p}: n1 +{n1:.1} dB, n5..n10 re n1 +{bright:.1} dB from MIDI 10 to 127");
             assert!((8.0..=15.0).contains(&bright), "pitch {p}: brightness span {bright:.1} dB");
         }
-        let place = Place::home(57).unwrap();
+        let place = Place::home(57);
         let start = |k: &GuitarKnobs| -> Vec<f64> {
             let mut v = GuitarVoice::new(RATE);
             v.strike(place, 57, 80.0 / 127.0, k);
@@ -4257,7 +4431,7 @@ mod tests {
         let mut once = 0;
         let mut most = 0;
         for i in 0..40 {
-            v.strike(Place::home(40).unwrap(), 40, 100.0 / 127.0, &knobs());
+            v.strike(Place::home(40), 40, 100.0 / 127.0, &knobs());
             for b in 0..per {
                 if b == per / 2 {
                     v.release(false);
@@ -4283,7 +4457,7 @@ mod tests {
     #[test]
     fn a_pluck_is_heard_by_the_stealing_policy_from_its_first_block() {
         let mut v = GuitarVoice::new(RATE);
-        v.strike(Place::home(45).unwrap(), 45, 80.0 / 127.0, &knobs());
+        v.strike(Place::home(45), 45, 80.0 / 127.0, &knobs());
         let (mut l, mut r, mut d) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK], [0.0_f32; BLOCK]);
         let mut levels = Vec::new();
         for _ in 0..(0.2 * RATE) as usize / BLOCK {
@@ -4409,15 +4583,19 @@ mod tests {
 
     /// **The loudest thing a keyboard can ask of it does not clip**: all six
     /// strings at MIDI 127 in one instant, under the brief's -3 dBFS ceiling
-    /// (`GAIN` was set by these: G major -3.5 dBFS in the lane's tbench).
+    /// (`GAIN` was set by these: G major -3.5 dBFS in the lane's tbench), as
+    /// the instrument plays it. The frame then lifts the guitar 7 dB with the
+    /// grands (`Patch::lift`), and these strums peak at +2.8 to +3.7 dBFS,
+    /// where the tine pianos' six-note fortissimo chords already did.
     #[test]
     fn the_loudest_strum_stays_under_minus_3_dbfs() {
         for (name, shape) in [("E major", [40u8, 47, 52, 56, 59, 64]), ("G major", [43, 47, 50, 55, 59, 67]), ("E major, B5 on top", [40, 47, 52, 56, 59, 83])] {
             let evs: Vec<(f32, Ev)> = shape.iter().map(|&p| (0.0, Ev::On(p, 1.0))).collect();
             let (l, r, _) = perform(&evs, 1.0, &[]);
             let pk = l.iter().chain(&r).fold(0.0_f32, |m, s| m.max(s.abs()));
-            println!("{name} at MIDI 127, all at once: {:.1} dBFS", 20.0 * pk.log10());
-            assert!(pk < 0.708, "{name} peaked at {pk}");
+            let own = pk / Patch::Guitar.lift();
+            println!("{name} at MIDI 127, all at once: {:.1} dBFS ({:.1} before the lift)", 20.0 * pk.log10(), 20.0 * own.log10());
+            assert!(own < 0.708, "{name} peaked at {own} before the lift");
         }
     }
 
@@ -4456,7 +4634,7 @@ mod tests {
             line.push_str(&format!(" {p}:{d:+.1}"));
             assert!(d.abs() < 3.0, "pitch {p}: {d:+.1} dB off the reference's balance");
             // The last fret before a crossing: G#2, C#3, F#3, A#3, D#4.
-            if i > 0 && Place::home(p).unwrap().string != Place::home(p - 1).unwrap().string {
+            if i > 0 && Place::home(p).string != Place::home(p - 1).string {
                 let (step, want) = (g - got[i - 1], r - reference[i - 1]);
                 println!("crossing into {p}: {step:+.1} dB against the reference's {want:+.1}");
                 assert!((step - want).abs() < 1.5, "crossing into {p}: {step:+.1} dB against {want:+.1}");
@@ -4543,13 +4721,13 @@ mod tests {
     #[test]
     #[ignore]
     fn timing_of_a_pluck_and_a_voice() {
-        for p in [40u8, 52, 64, 83] {
+        for p in [21u8, 40, 52, 64, 83, 108] {
             let mut best = f64::MAX;
             let mut v = GuitarVoice::new(RATE);
             for _ in 0..20 {
                 v.silence();
                 let t0 = std::time::Instant::now();
-                v.strike(Place::home(p).unwrap(), p, 0.8, &knobs());
+                v.strike(Place::home(p), p, 0.8, &knobs());
                 let (mut l, mut r, mut d) = ([0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK]);
                 // The release happens inside one of the first blocks.
                 for _ in 0..4 {
@@ -4560,7 +4738,7 @@ mod tests {
             let mut best_r = f64::MAX;
             for _ in 0..5 {
                 let mut v = GuitarVoice::new(RATE);
-                v.strike(Place::home(p).unwrap(), p, 0.8, &knobs());
+                v.strike(Place::home(p), p, 0.8, &knobs());
                 let (mut l, mut r, mut d) = ([0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK]);
                 let t0 = std::time::Instant::now();
                 for _ in 0..(2.0 * RATE) as usize / BLOCK {
@@ -4580,7 +4758,7 @@ mod tests {
     fn print_the_glide() {
         for (p, vel) in [(40u8, 1.0_f32), (40, 80.0 / 127.0), (45, 1.0), (64, 1.0), (76, 1.0)] {
             let mut v = GuitarVoice::new(RATE);
-            v.strike(Place::home(p).unwrap(), p, vel, &knobs());
+            v.strike(Place::home(p), p, vel, &knobs());
             let (mut l, mut r, mut d) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK], [0.0_f32; BLOCK]);
             let (mut line, mut steps, mut last) = (String::new(), 0, 0.0);
             for b in 0..(1.6 * RATE) as usize / BLOCK {
@@ -4691,9 +4869,8 @@ mod tests {
                 let pitch = LOWEST + (rnd() * f32::from(HIGHEST - LOWEST)) as u8;
                 match (rnd() * 6.0) as u32 {
                     0 | 1 => {
-                        if let Some(pl) = used.place(pitch) {
-                            used.take(pl, pitch);
-                        }
+                        let pl = used.place(pitch);
+                        used.take(pl, pitch);
                     }
                     2 => used.key_up(pitch),
                     3 => used.voice_done(pitch),
@@ -4708,9 +4885,8 @@ mod tests {
             let hushing = trial % 2 == 1;
             if hushing {
                 used.release_all();
-                if let Some(pl) = used.place(64) {
-                    used.take(pl, 64);
-                }
+                let pl = used.place(64);
+                used.take(pl, 64);
                 render(&mut used, &k, &|_, _| 0.0, &mut out);
                 used.hush();
                 fresh.owner = used.owner;
@@ -4731,9 +4907,8 @@ mod tests {
                 for f in [&mut used, &mut fresh] {
                     match b {
                         2 => {
-                            if let Some(pl) = f.place(52) {
-                                f.take(pl, 52);
-                            }
+                            let pl = f.place(52);
+                            f.take(pl, 52);
                         }
                         60 => f.key_up(52),
                         90 => f.set_pedal(false),
@@ -4819,9 +4994,8 @@ mod tests {
                     while next < events.len() && events[next].0 <= at {
                         match events[next].1 {
                             Ev::Take(p) => {
-                                if let Some(pl) = board.place(p) {
-                                    board.take(pl, p);
-                                }
+                                let pl = board.place(p);
+                                board.take(pl, p);
                             }
                             Ev::Up(p) => board.key_up(p),
                             Ev::Pedal(d) => board.set_pedal(d),
@@ -4891,7 +5065,7 @@ mod tests {
         let mut board = Fretboard::new(RATE);
         board.set_knobs(&knobs());
         let (mut l, mut r) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK]);
-        let held = board.place(52).expect("E3 is on the fingerboard");
+        let held = board.place(52);
         board.take(held, 52);
         board.begin(BLOCK);
         board.bus(held.string, BLOCK).fill(f32::NAN);
@@ -4911,7 +5085,7 @@ mod tests {
         println!("a NaN on the strings: the board asleep {secs:.4} s after its drive stopped");
         assert!(!board.active(), "a NaN kept the board awake {secs:.3} s with nothing driving it");
         assert!(secs <= 2.0 * QUIET_SECS + 0.01, "the board slept {secs:.3} s after its drive stopped");
-        let next = board.place(57).expect("A3 is on the fingerboard");
+        let next = board.place(57);
         board.take(next, 57);
         for b in 0..20 {
             l.fill(0.0);
