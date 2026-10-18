@@ -21,6 +21,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   patchbay that saved a connection to the names they had before (qpwgraph,
   qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
   save. Choosing a MIDI input in Tangent works as before.
+- **Tangent no longer deletes a 4.x settings folder at launch.** The folder
+  4.x kept its settings in is left where it is. It is still not read, so a
+  supporter key from 4.x is pasted again, as before.
 
 ## [5.1.0] - 2026-10-18
 
