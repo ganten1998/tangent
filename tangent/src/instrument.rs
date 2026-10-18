@@ -14931,6 +14931,15 @@ impl Renderer {
         // This does not close the whole gap and cannot: two AudioUnits means
         // an output callback can only ever see input that arrived before it
         // started, which is one buffer a DUPLEX device does not pay.
+        //
+        // **Under the tape's motor with the dial off-centre** a ramp's reads
+        // are lumpy near the floor (the first reads at the floor are short,
+        // and later a whole program frame's step is read at once every few
+        // passes), so the ring can stand up to a step above what the next
+        // read wants, and a few frames go here, at the ramp's floor end and
+        // under the final fade. A wider allowance only carries them to the
+        // ramp's end, to be dropped at full level.
+        // `tape_motor::the_input_keeps_its_place_through_a_ramp` bounds them.
         let in_flight = want + self.monitor_block * ch_in;
         let backlog = ring.slots();
         self.shared
@@ -52828,30 +52837,79 @@ mod tape_motor {
     /// 127 real frames a program frame near the floor, and its phase keeps
     /// the lead such a step leaves, so what is consumed is what the device
     /// delivered. Rings of one, two and six inputs fed at the device's rate,
-    /// the dial at rest, passes of 64, 256 and 512, through a start, a stop
-    /// to its hold and a re-spin: no frame is ever dropped as stale
+    /// passes of 64, 256 and 512, through a start, a stop to its hold and a
+    /// re-spin: with the dial at rest no frame is ever dropped as stale
     /// (`monitor_slip` stays 0), the ring's backlog stays within what one
     /// pass reads and the device's block, plus a pass, and nothing is NaN.
+    ///
+    /// **With the dial off-centre a ramp can drop a few frames at its floor
+    /// end, and only there.** The dial keeps the path engaged, so a start
+    /// does not open it fresh: the step jumps from the dial's to the floor's
+    /// (75 real frames a program frame at 0.85, 127 at 0.5) with the input's
+    /// phase where the dial left it, and the first chunks at the floor read
+    /// a few frames each for program frames the output then plays for a
+    /// hundred device frames; a stop's last passes meet the same lumpiness,
+    /// a whole program frame's step read at once every few passes. The ring
+    /// then stands up to a step higher than the next read wants, and the
+    /// stale drop trims it. The trim is where it does least harm, in a pass
+    /// that begins below the knee (the last two octaves above the floor,
+    /// where the final fade closes), and never more than one floor step in
+    /// a ramp. Measured here: at most 59 frames in a start at the dial's 0.5
+    /// and 4 at 0.85, in the start's first passes at the floor itself, where
+    /// the fade is 0, and a frame or none in a stop; the engine review's
+    /// two-second ramps dropped up to 96 and 34. Widening the allowance
+    /// instead only carries the excess to the ramp's end, where the trim
+    /// lands at full level (47 frames at speed, tried). And under the
+    /// owner's third ruling a monitored input never rides a ramp (a
+    /// tracking desk stops the motor): this is an unmonitored input, in a
+    /// take and not in the room.
     #[test]
     fn the_input_keeps_its_place_through_a_ramp() {
-        for width in [1usize, 2, 6] {
-            for pass in [64usize, 256, 512] {
-                let what = format!("a {width}-wide input in {pass}-frame passes");
-                let mut d = Tracking::new(width, false, true, false);
-                d.e.set_tape_motor(true, 0.3, 0.4);
-                let mut t = Transport::new();
-                let mut passes = d.run(&mut t, 8, pass);
-                t.toggle_play();
-                passes.extend(d.until(&mut t, pass, MotorShow::Running, 4000));
-                t.stop();
-                passes.extend(d.until(&mut t, pass, MotorShow::Holding, 4000));
-                t.toggle_play();
-                passes.extend(d.until(&mut t, pass, MotorShow::Running, 4000));
-                assert!(ramped(&passes), "{what}: the tape never ramped");
-                assert_eq!(d.e.shared.monitor_slip.load(Ordering::Relaxed), 0, "{what}: input frames were dropped as stale");
-                let backlog = d.e.shared.monitor_backlog.load(Ordering::Relaxed) as usize;
-                assert!(backlog <= 3 * pass + PASS, "{what}: the ring backed up to {backlog} frames");
-                assert!(passes.iter().all(|p| p.out.iter().all(|s| s.is_finite())), "{what}: a NaN");
+        for dial in [1.0f32, 0.85, 0.5] {
+            let step = (1.0 / (f64::from(dial) * crate::motor::FLOOR)).ceil() as u64;
+            for width in [1usize, 2, 6] {
+                for pass in [64usize, 256, 512] {
+                    let what = format!("a {width}-wide input in {pass}-frame passes, the dial at {dial}");
+                    let mut d = Tracking::new(width, false, true, false);
+                    d.e.set_varispeed(dial);
+                    d.e.set_tape_motor(true, 0.3, 0.4);
+                    let slip = |d: &Tracking| d.e.shared.monitor_slip.load(Ordering::Relaxed);
+                    let mut t = Transport::new();
+                    let mut passes = d.run(&mut t, 8, pass);
+                    for (ramp, play, until) in
+                        [("the start", true, MotorShow::Running), ("the stop", false, MotorShow::Holding), ("the re-spin", true, MotorShow::Running)]
+                    {
+                        if play {
+                            t.toggle_play();
+                        } else {
+                            t.stop();
+                        }
+                        let from = slip(&d);
+                        let mut reached = false;
+                        for _ in 0..4000 {
+                            let before = slip(&d);
+                            let p = d.one(&mut t, pass);
+                            let s0 = d.e.offline.as_ref().expect("an offline renderer").motor.last().s0;
+                            let dropped = slip(&d) - before;
+                            assert!(
+                                dropped == 0 || (dial != 1.0 && s0 < 4.0 * crate::motor::FLOOR),
+                                "{what}: {dropped} input frames were dropped as stale in {ramp}, in a pass that began at speed {s0:.4}"
+                            );
+                            reached = p.show == until;
+                            passes.push(p);
+                            if reached {
+                                break;
+                            }
+                        }
+                        assert!(reached, "{what}: {ramp} never ended");
+                        let dropped = slip(&d) - from;
+                        assert!(dropped <= step, "{what}: {dropped} input frames were dropped as stale in {ramp}, more than a floor step ({step})");
+                    }
+                    assert!(ramped(&passes), "{what}: the tape never ramped");
+                    let backlog = d.e.shared.monitor_backlog.load(Ordering::Relaxed) as usize;
+                    assert!(backlog <= 3 * pass + PASS, "{what}: the ring backed up to {backlog} frames");
+                    assert!(passes.iter().all(|p| p.out.iter().all(|s| s.is_finite())), "{what}: a NaN");
+                }
             }
         }
     }
