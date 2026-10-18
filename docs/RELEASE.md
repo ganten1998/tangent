@@ -371,9 +371,6 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    `latest/download` resolves against the latest stable, so a correctly
    marked beta leaves the permanent links alone. Release notes must include
    the SmartScreen note.
-   For 5.0.0 specifically they must also say that the pre-5.0
-   `~/.config/ivory/` directory is removed at first launch rather than
-   migrated (a clean break; supporter keys are re-sent by email).
 10. **Verify as a stranger**: download each artifact on a clean machine or VM
     (quarantine attribute present) and confirm the documented first-launch
     paths work. Then put `main` back on the next `X.Y.Z-dev`.

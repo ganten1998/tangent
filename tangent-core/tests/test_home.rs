@@ -1,7 +1,7 @@
 //! **This crate's integration tests are a test build too** (design
-//! W8-safe-tests): a test here that loads the licence, relocks the Konami
-//! marker or runs the pre-5.0 purge does it in a scratch home, not in the
-//! home of whoever ran `cargo test -p tangent-core`.
+//! W8-safe-tests): a test here that loads the licence or relocks the Konami
+//! marker does it in a scratch home, not in the home of whoever ran
+//! `cargo test -p tangent-core`.
 //!
 //! A file under `tests/` is a crate of its own, and it links the ORDINARY
 //! library: `#[cfg(test)]` is true only while the library's own unit tests

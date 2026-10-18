@@ -4617,13 +4617,13 @@ impl Settings {
     /// alternative is what this app did until now, which is that a default,
     /// once shipped, could never be corrected for anybody who already had it.
     ///
-    /// **Since 5.0 no file in `~/.config/tangent` can be older than v19** —
-    /// `purge_pre_5_0` deletes the old directory unread — so versions below
-    /// 19 are reachable only through a hand-copied pre-5.0 file or
-    /// `IVORY_SETTINGS_PATH`. They are kept anyway, decided on audit: a
-    /// settings file copied between machines is a supported flow (see the
-    /// `config` module doc), and these migrations are the only code that
-    /// makes an old one land right.
+    /// **Since 5.0 no file in `~/.config/tangent` can be older than v19**:
+    /// 5.0 started that directory fresh, and no build since reads the 4.x
+    /// one, so versions below 19 are reachable only through a hand-copied
+    /// pre-5.0 file or `IVORY_SETTINGS_PATH`. They are kept anyway, decided
+    /// on audit: a settings file copied between machines is a supported flow
+    /// (see the `config` module doc), and these migrations are the only code
+    /// that makes an old one land right.
     fn migrate_from(
         &mut self,
         was: u64,

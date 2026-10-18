@@ -363,11 +363,11 @@ fn parse_cli() -> CliArgs {
 struct StderrLogger(log::LevelFilter);
 
 /// The file the logger drains to, once [`attach_log_file`] has opened it.
-/// `None` until then, so nothing touches the config directory before the
-/// pre-5.0 purge has had its turn. A mutex because `log::Log` is `&self` from
-/// any thread; acceptable in the log path because nothing on the audio
-/// callback logs, warnings are exceptional, and each record is one
-/// pre-formatted `write_all` — no formatting and no flush loop inside the lock.
+/// `None` until then, so a record emitted earlier goes to stderr only. A
+/// mutex because `log::Log` is `&self` from any thread; acceptable in the log
+/// path because nothing on the audio callback logs, warnings are exceptional,
+/// and each record is one pre-formatted `write_all` — no formatting and no
+/// flush loop inside the lock.
 static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
 /// What the file keeps no matter what `IVORY_LOG` says.
@@ -506,12 +506,9 @@ fn rotate_log(path: &std::path::Path, max_len: u64) {
 
 /// Open `~/.config/tangent/tangent.log` and hand it to the logger.
 ///
-/// Called from `main` AFTER `purge_pre_5_0` — the ordering comment there is
-/// load-bearing, and this is exactly the kind of config-file creation it
-/// exists to forbid, which is why this is not simply part of
-/// [`install_logger`]. Until it runs the logger has only stderr; the handful
-/// of records startup emits before this point go to the terminal as they
-/// always did.
+/// Called from `main` once [`install_logger`] has run. Until it runs the
+/// logger has only stderr; the handful of records startup emits before this
+/// point go to the terminal as they always did.
 ///
 /// Every failure in here is shrugged off: a read-only home costs the log
 /// file, never the launch.
@@ -897,14 +894,6 @@ fn main() {
     install_logger();
     install_panic_hook();
 
-    // **Before anything reads or creates a config file.** `acquire_single_instance`
-    // below does a `create_dir_all` on the new directory, and Settings::load
-    // follows it — either would have to run after this, not before, or the
-    // pre-5.0 directory would still be sitting there next to a new one.
-    if tangent_core::config::purge_pre_5_0() {
-        log::info!("removed the 4.x settings folder ~/.config/ivory");
-    }
-
     // **The graph-clock claim's crash road.** The claim (see
     // `tangent_record::audio::claim_graph_clock`) releases on every clean
     // exit; a crash cannot, so each launch checks whether the force still
@@ -918,8 +907,7 @@ fn main() {
         tangent_record::audio::recover_graph_claim();
     }
 
-    // The earliest legal moment — see the ordering comment above and the one
-    // on the function. Everything the logger says from here on is on disk.
+    // Everything the logger says from here on is on disk.
     attach_log_file();
 
     // **After the log is on disk**, so the line it writes is kept, and before
