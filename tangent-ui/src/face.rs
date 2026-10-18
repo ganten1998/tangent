@@ -879,12 +879,22 @@ pub fn pointer_row_height(ui: &egui::Ui) -> f32 {
 /// setting that changes under it moves nothing below. Each line is cut to
 /// the room left of the chevron and never wraps. There is no hover fill,
 /// because ink on the hover ground is a pair no sweep measures; the pointing
-/// hand and the chevron say it is a door. To the keyboard and to a screen
-/// reader it is the button it is, named by its two lines.
+/// hand and the chevron say it is a door.
+///
+/// **It never takes the keyboard's focus**: `Sense::CLICK`, not
+/// `Sense::click()`, which adds `FOCUSABLE` (the notices' rule, in
+/// `notify`). A reading above it commits on Tab, Tab hands the focus to the
+/// next widget that takes one, and egui presses a focused widget on Enter or
+/// Space, the transport's key. The row paints no focus, so a hand that typed
+/// a value, tabbed on and pressed Space would have walked through a door it
+/// could not see and lost the window it was typing in. So Tab passes it by.
+/// A screen reader still finds it and presses it, as the button it is,
+/// named by its two lines. Nothing is taken from the keyboard: the row holds
+/// nothing, and the setting it leads to is set where it lives.
 pub fn pointer_row(ui: &mut egui::Ui, st: &FaceStyle, line: &str, sub: &str, hover: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), pointer_row_height(ui)),
-        egui::Sense::click(),
+        egui::Sense::CLICK,
     );
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();

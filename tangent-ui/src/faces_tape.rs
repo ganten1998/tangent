@@ -429,13 +429,20 @@ mod tests {
     }
 
     /// Every word a frame painted: what it says, where, and in what ink.
+    ///
+    /// Where is the galley's own rect moved to the shape's origin, which is
+    /// where the word is drawn. A galley laid out against its right edge (a
+    /// reading in its right-to-left column) or its middle (a name centred in
+    /// its cell) starts left of that origin, so a rect built from the origin
+    /// and the galley's size would sit a whole width, or half of one, to the
+    /// right of the word, and a press aimed at its middle would miss.
     fn words(shapes: &[egui::Shape]) -> Vec<(String, Rect, Color32)> {
         shapes
             .iter()
             .filter_map(|s| match s {
                 egui::Shape::Text(t) => Some((
                     t.galley.text().to_owned(),
-                    Rect::from_min_size(t.pos, t.galley.rect.size()),
+                    t.galley.rect.translate(t.pos.to_vec2()),
                     t.override_text_color
                         .or_else(|| t.galley.job.sections.first().map(|sec| sec.format.color))
                         .unwrap_or(t.fallback_color),
@@ -1152,5 +1159,83 @@ mod tests {
             asked.iter().any(|a| matches!(a, Some(FaceAction::Set { id: P_RATE, .. }))),
             "the press on Rate's slider never landed on it, so it proves nothing"
         );
+    }
+
+    /// **A reading committed with Tab never lands Enter or Space on the
+    /// pointer.**
+    ///
+    /// Rate's reading is the last field above the pointer, and a typed
+    /// reading commits on Tab, which hands egui's keyboard focus to the next
+    /// widget that takes one; egui then presses a focused widget on Enter or
+    /// Space. The pointer is a door that closes the window it stands in, it
+    /// paints no focus, and Space is the transport's key: in the Tab order,
+    /// it is a hand that typed a value, tabbed on, pressed Space to play and
+    /// lost the window instead. So the walk is the hand's: click Rate's
+    /// reading, type, press Tab, and the typed value must arrive (the field
+    /// held the focus, and Tab is what moved it on) with the focus left on
+    /// some widget; then Enter, then Space, and neither may ask to be taken
+    /// to start and stop.
+    #[test]
+    fn a_reading_committed_with_tab_never_lands_enter_or_space_on_the_pointer() {
+        let st = style();
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
+        let none = egui::Modifiers::NONE;
+        let mut live = a_tape_of(0..ID_CEILING as u32);
+        live.start_stop = Some(crate::motor::StartStop::new(true, 0.5, 0.7));
+        for p in live.face.params.iter_mut().filter(|p| p.id == P_RATE) {
+            p.reading = "77%".to_owned();
+        }
+        let named = |a: &Option<FaceAction>| match a {
+            None => "nothing".to_owned(),
+            Some(FaceAction::Set { id, value }) => format!("Set {id} to {value}"),
+            Some(FaceAction::Type { id, text }) => format!("Type {text:?} into {id}"),
+            Some(FaceAction::OpenStartStop) => "OpenStartStop".to_owned(),
+            Some(_) => "another ask".to_owned(),
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: none,
+        };
+        let mut clock = 1.0_f64;
+        let mut frame = |live: &mut FaceLive, events: Vec<egui::Event>| -> Option<FaceAction> {
+            clock += 1.0 / 60.0;
+            show(&ctx, floor, &st, live, clock, none, events).asked
+        };
+        let reading = word(&show(&ctx, floor, &st, &mut live, 0.5, none, Vec::new()).shapes, "77%").center();
+        let mut typed = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(reading)],
+            vec![press(reading, egui::PointerButton::Primary, true, none)],
+            vec![press(reading, egui::PointerButton::Primary, false, none)],
+            Vec::new(),
+            vec![egui::Event::Text("60%".to_owned())],
+            vec![key(egui::Key::Tab)],
+        ] {
+            typed.push(frame(&mut live, events));
+        }
+        assert!(
+            typed.iter().any(|a| matches!(a, Some(FaceAction::Type { id: P_RATE, text }) if text == "60%")),
+            "Rate's reading never committed what was typed, so Tab moved nothing and this proves nothing: {:?}",
+            typed.iter().map(named).collect::<Vec<_>>()
+        );
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "Tab left the focus nowhere, so Enter and Space had no widget to press and this proves nothing"
+        );
+        for (what, events) in [
+            ("Enter", vec![key(egui::Key::Enter)]),
+            ("Space", vec![key(egui::Key::Space), egui::Event::Text(" ".to_owned())]),
+        ] {
+            let asked = frame(&mut live, events);
+            assert!(
+                !matches!(asked, Some(FaceAction::OpenStartStop)),
+                "{what} after Rate's reading was committed with Tab pressed the pointer, a door that paints no \
+                 focus and closes the window it stands in"
+            );
+        }
     }
 }
