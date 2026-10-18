@@ -8,7 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
-## [Unreleased]
+## [5.1.0] - 2026-10-18
+
+The version Tangent Keys was rebuilt in: ten sounds re-voiced against
+measurements, two of them new, sitting together in level, with presets
+for each.
 
 ### Added
 
@@ -93,6 +97,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   in a file name, such as one with a question mark or one that is a
   device name like Con, is saved under a file name it will, keeping the
   name as typed.
+- **A named chord spells its notes from its root** on the staff, the Tonnetz
+  and the circle of fifths. D7(b9,#11) (D F# C Eb Ab B) drew its third as G
+  flat on all three and its sharp eleventh as A flat whenever flats were
+  preferred; every note is now named for what it is in the chord the
+  readout names.
+- **The staff's alternate reading names every sounding note.** A reading
+  that explains only part of the chord (the B major triad inside D F# C Eb
+  Ab B) no longer trails the real alternate as a second way of hearing it.
 
 ## [5.0.0] - 2026-10-12
 

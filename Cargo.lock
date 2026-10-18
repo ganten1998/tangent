@@ -3513,7 +3513,7 @@ dependencies = [
 
 [[package]]
 name = "tangent"
-version = "5.0.1-dev"
+version = "5.1.0"
 dependencies = [
  "block2 0.6.2",
  "core-graphics",
@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-core"
-version = "5.0.1-dev"
+version = "5.1.0"
 dependencies = [
  "dirs",
  "ed25519-compact",
@@ -3558,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-host"
-version = "5.0.1-dev"
+version = "5.1.0"
 dependencies = [
  "libc",
  "lilv",
@@ -3575,7 +3575,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-record"
-version = "5.0.1-dev"
+version = "5.1.0"
 dependencies = [
  "asio-sys",
  "cpal",
@@ -3597,7 +3597,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-ui"
-version = "5.0.1-dev"
+version = "5.1.0"
 dependencies = [
  "egui",
  "log",
