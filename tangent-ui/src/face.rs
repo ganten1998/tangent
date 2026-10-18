@@ -869,7 +869,8 @@ pub fn pointer_row_height(ui: &egui::Ui) -> f32 {
 /// **A row that takes the hand to a setting that lives somewhere else.**
 /// What the setting is now on the first line, where it lives on the second,
 /// a chevron at the end, and the whole row one target. It owns nothing: the
-/// panel says what the lines read and what a click means. Its click goes
+/// panel says what the lines read and what a click means, which is the
+/// primary button's. Every click it takes, whichever button made it, goes
 /// through [`note_click`] like every click a face row takes, so the slider
 /// clicked next cannot pair it with a click of its own and read a reset.
 ///
@@ -932,11 +933,22 @@ pub fn pointer_row(ui: &mut egui::Ui, st: &FaceStyle, line: &str, sub: &str, hov
     let resp = resp
         .on_hover_text(hover)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if resp.clicked() {
+    // **Every button's click is reported**, not only the one that opens the
+    // door: egui keeps one click clock for all of them, so a right-click
+    // here is the first half of a double for the primary click after it,
+    // and a click left unreported would hand the slider clicked next the
+    // pair from before it. The tape's pointer tells the hand to right-click
+    // the band's dial, which makes a stray right-click here the likely slip.
+    let went = resp.clicked();
+    if went
+        || resp.secondary_clicked()
+        || [egui::PointerButton::Middle, egui::PointerButton::Extra1, egui::PointerButton::Extra2]
+            .into_iter()
+            .any(|b| resp.clicked_by(b))
+    {
         note_click(&resp);
-        return true;
     }
-    false
+    went
 }
 
 // ── meters ──────────────────────────────────────────────────────────────────
@@ -3299,7 +3311,7 @@ mod tests {
     }
 
     /// **A click on a pointer row cannot turn the next slider click into a
-    /// reset.**
+    /// reset**, whichever button made it.
     ///
     /// The pointer is a door, not a control, so its click means nothing to
     /// the row itself; it is reported to [`note_click`] anyway, because the
@@ -3309,71 +3321,92 @@ mod tests {
     /// the slider again, a frame apart, so the last release lands inside
     /// egui's double-click window of the pointer's and its triple-click
     /// window of the slider's first. egui's clock reads it as a double or a
-    /// triple either way; only the kit's memory of the pointer keeps it from
-    /// being the slider's, and the slider from going home.
+    /// triple, and the test asks egui so, or it would prove nothing; only the
+    /// kit's memory of the pointer keeps it from being the slider's, and the
+    /// slider from going home. Twice, from a fresh start each time: with the
+    /// pointer clicked by the primary button, which opens the door, and by
+    /// the secondary, which opens nothing and still runs egui's one clock for
+    /// every button.
     #[test]
     fn a_click_on_a_pointer_row_cannot_turn_the_next_slider_click_into_a_reset() {
-        let ctx = a_test_ctx();
         let st = a_test_style();
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
-        let mut clock = 0.0_f64;
-        // One frame of the panel: the pointer, then the slider under it, at
-        // 0.8 with its home at 0.25. What each asked, and how tall the
-        // pointer was drawn, so the presses can find the slider under it.
-        let mut frame = |events: Vec<egui::Event>| -> (bool, Option<SliderAsk>, f32) {
-            clock += 1.0 / 60.0;
-            let mut out = (false, None, 0.0);
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    time: Some(clock),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE)
-                        .show(ctx, |ui| {
-                            let tall = pointer_row_height(ui);
-                            let went = pointer_row(ui, &st, "Start and stop: off", "set somewhere else", "go there");
-                            let asked = slider_row(ui, &st, "KNOB", "80%", 0.80, 0.25);
-                            out = (went, asked, tall);
-                        });
-                },
-            );
-            out
-        };
+        let primary = egui::PointerButton::Primary;
+        for button in [primary, egui::PointerButton::Secondary] {
+            let ctx = a_test_ctx();
+            let mut clock = 0.0_f64;
+            // One frame of the panel: the pointer, then the slider under it,
+            // at 0.8 with its home at 0.25. What each asked, how tall the
+            // pointer was drawn, so the presses can find the slider under it,
+            // and whether egui read a primary release this frame as a double
+            // or a triple.
+            let mut frame = |events: Vec<egui::Event>| -> (bool, Option<SliderAsk>, f32, bool) {
+                clock += 1.0 / 60.0;
+                let mut out = (false, None, 0.0, false);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(clock),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let tall = pointer_row_height(ui);
+                                let went = pointer_row(ui, &st, "Start and stop: off", "set somewhere else", "go there");
+                                let asked = slider_row(ui, &st, "KNOB", "80%", 0.80, 0.25);
+                                let paired = ui.input(|i| {
+                                    i.pointer.button_double_clicked(primary) || i.pointer.button_triple_clicked(primary)
+                                });
+                                out = (went, asked, tall, paired);
+                            });
+                    },
+                );
+                out
+            };
 
-        let (_, _, tall) = frame(Vec::new());
-        let pointer = egui::pos2(60.0, tall / 2.0);
-        // Rows sit one item spacing apart, and the middle of the slider is
-        // the middle of its track, well off the 0.8 it holds, so a press
-        // there is a change the row reports.
-        let slider = egui::pos2(230.0, tall + 3.0 + ROW_H / 2.0);
-        let mut went = false;
-        let mut last: Vec<Option<SliderAsk>> = Vec::new();
-        for (k, at) in [slider, pointer, slider].into_iter().enumerate() {
-            let mut asks = Vec::new();
-            for events in [
-                vec![egui::Event::PointerMoved(at)],
-                vec![press_at(at, true)],
-                vec![press_at(at, false)],
-            ] {
-                let (pressed, asked, _) = frame(events);
-                went |= pressed && k == 1;
-                asks.push(asked);
+            let (_, _, tall, _) = frame(Vec::new());
+            let pointer = egui::pos2(60.0, tall / 2.0);
+            // Rows sit one item spacing apart, and the middle of the slider
+            // is the middle of its track, well off the 0.8 it holds, so a
+            // press there is a change the row reports.
+            let slider = egui::pos2(230.0, tall + 3.0 + ROW_H / 2.0);
+            let mut went = false;
+            let mut paired = false;
+            let mut last: Vec<Option<SliderAsk>> = Vec::new();
+            for (k, (at, by)) in [(slider, primary), (pointer, button), (slider, primary)].into_iter().enumerate() {
+                let mut asks = Vec::new();
+                for events in [
+                    vec![egui::Event::PointerMoved(at)],
+                    vec![egui::Event::PointerButton { pos: at, button: by, pressed: true, modifiers: egui::Modifiers::NONE }],
+                    vec![egui::Event::PointerButton { pos: at, button: by, pressed: false, modifiers: egui::Modifiers::NONE }],
+                ] {
+                    let (pressed, asked, _, pair) = frame(events);
+                    went |= pressed && k == 1;
+                    paired |= pair && k == 2;
+                    asks.push(asked);
+                }
+                last = asks;
             }
-            last = asks;
+            if button == primary {
+                assert!(went, "the pointer was never clicked, so this proves nothing");
+            }
+            assert!(
+                paired,
+                "egui did not read the last click as a double or a triple after a {button:?} click on the pointer, \
+                 so nothing could have reset and this proves nothing"
+            );
+            assert!(
+                last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.5).abs() < 0.05)),
+                "the last click never landed on the slider, so this proves nothing: {last:?}"
+            );
+            assert!(
+                !last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.25).abs() < 1.0e-6)),
+                "a {button:?} click on the pointer made the slider's next click a reset: {last:?}"
+            );
         }
-        assert!(went, "the pointer was never clicked, so this proves nothing");
-        assert!(
-            last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.5).abs() < 0.05)),
-            "the last click never landed on the slider, so this proves nothing: {last:?}"
-        );
-        assert!(
-            !last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.25).abs() < 1.0e-6)),
-            "a click on the pointer made the slider's next click a reset: {last:?}"
-        );
     }
 
 
