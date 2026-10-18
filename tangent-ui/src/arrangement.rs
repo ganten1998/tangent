@@ -6304,6 +6304,29 @@ mod tests {
         }
     }
 
+    /// **A start and stop that is not an object says nothing.**
+    ///
+    /// The desk's `start_stop` is an object of the switch and its two times
+    /// (`StartStop::to_json`), read member by member through the model's
+    /// setters, so a member that is missing or of the wrong type reads as
+    /// its default. A value that is not an object at all (a hand-edited 5,
+    /// a `true`, a list, a null, a word) would read the same way if it
+    /// reached the model: the shipped setting, off, and opening the file
+    /// would switch a live desk's tape start and stop off. So it never
+    /// reaches it: the desk reads as one that does not say (`None`), and
+    /// the live switch stands (`apply_desk_snapshot`).
+    #[test]
+    fn a_start_and_stop_that_is_not_an_object_says_nothing() {
+        let snap = a_document_with_everything_in_it().desk.take().unwrap();
+        assert!(snap.start_stop.is_some_and(|m| m.on()), "the fixture's desk does not say, so nothing is proved");
+        for odd in [serde_json::json!(5), serde_json::json!(true), serde_json::json!([1, 2]), Value::Null, serde_json::json!("on")] {
+            let mut value = snap.to_value();
+            value.as_object_mut().expect("a desk object").insert("start_stop".into(), odd.clone());
+            let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
+            assert_eq!(back.start_stop, None, "a start_stop of {odd} was read as {:?}", back.start_stop);
+        }
+    }
+
     /// **A trimmed loop fills its whole length**, tail included.
     ///
     /// The unroll places each note at `at_s - offset_s + shift`, so a clip
