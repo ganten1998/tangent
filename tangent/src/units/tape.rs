@@ -394,6 +394,10 @@ const WANDER_SLEW_S: f32 = 0.1;
 /// fractions of a microsecond. Tape dragging on a fixed head sticks and
 /// slips at kilohertz rates; the sidebands it sprays are 50 dB down, felt as
 /// a faint graininess rather than heard as anything.
+///
+/// The depth scales the band noise as [`DESIGN_RATE`] draws it, and
+/// `process` scales the noise so every other rate draws the same sway per
+/// hertz: at the shipped wobble, about 0.026 µs RMS of head movement.
 const SCRAPE_MS: f32 = 0.000_5;
 const SCRAPE_BAND_HZ: (f32, f32) = (800.0, 3_000.0);
 
@@ -437,6 +441,9 @@ const PINK_WHITE: f64 = 0.184_8;
 /// modulation noise ride the level — and lets it fall back when the music
 /// stops, but never to nothing: a stopped mix on a 388 still has tape
 /// against the head. Squared knob taper, because ears meet noise in dB.
+///
+/// The level is the white source's scale at [`DESIGN_RATE`]; `process`
+/// rescales it so every other rate puts the same hiss in every hertz.
 const HISS_MAX: f32 = 2.0e-3;
 const HISS_FLOOR: f32 = 0.3;
 const HISS_ATTACK_MS: f32 = 10.0;
@@ -486,6 +493,56 @@ fn lp_a(sample_rate: f64, hz: f64) -> f32 {
 #[inline]
 fn env_a(sample_rate: f64, ms: f64) -> f32 {
     (1.0 - (-1.0 / (sample_rate * ms * 1.0e-3)).exp()) as f32
+}
+
+/// How long a moving control takes to arrive, as the time constant of the
+/// one-pole every [`Glide`] runs, in milliseconds: the house smoothing.
+const GLIDE_MS: f64 = 20.0;
+
+/// A one-pole glide that lands: within `snap` of its target it IS the
+/// target, so a settled control is an exact number and never a denormal
+/// tail. `units::bitcrush`'s, restated for the reason [`OS`] gives.
+///
+/// **A level glides as a linear gain, never in decibels.** The bottom of a
+/// level's travel is silence, which is minus infinity in decibels, and a
+/// glide leaving it computes `-inf + a (x + inf)`: not a number, which then
+/// never lands, because nothing compares equal to it. A level glided as a
+/// gain arrives at an exact zero instead, and the stage it feeds can be
+/// skipped there.
+#[derive(Clone, Copy, Debug)]
+struct Glide {
+    cur: f64,
+    target: f64,
+    snap: f64,
+}
+
+impl Glide {
+    const fn new(snap: f64) -> Self {
+        Self {
+            cur: 0.0,
+            target: 0.0,
+            snap,
+        }
+    }
+
+    /// One frame of the glide; `a` is the one-pole's per-frame step.
+    #[inline]
+    fn tick(&mut self, a: f64) -> f64 {
+        if self.cur != self.target {
+            let next = self.cur + a * (self.target - self.cur);
+            self.cur = if (self.target - next).abs() <= self.snap {
+                self.target
+            } else {
+                next
+            };
+        }
+        self.cur
+    }
+
+    /// Arrive at once.
+    fn settle(&mut self) {
+        self.cur = self.target;
+    }
 }
 
 /// Xorshift white noise in −1..1. Tape noise, not a number anybody is
@@ -1043,6 +1100,8 @@ pub struct Tape {
     /// shared program tracker that rides them up and down.
     pink: [Pink; 2],
     hiss_env: f32,
+    /// The hiss's level as a linear gain, gliding to the dial. See [`Glide`].
+    hiss_level: Glide,
     /// Where the modulators are, in turns. One set for both channels: one
     /// capstan.
     wow: f32,
@@ -1068,6 +1127,11 @@ pub struct Tape {
     a_scrape_lo: f32,
     a_scrape_hi: f32,
     a_wander: f32,
+    /// Every [`Glide`]'s per-frame step, [`GLIDE_MS`] at this rate.
+    a_glide: f64,
+    /// Whether the next block is the first since `new` or `clear`, which
+    /// snaps every glide to that block's controls.
+    fresh: bool,
 }
 
 impl Tape {
@@ -1091,6 +1155,7 @@ impl Tape {
             roll_lp: [0.0; 2],
             pink: [Pink::new(sr, 0xA5A5_0001), Pink::new(sr, 0x5EED_C0DE)],
             hiss_env: 0.0,
+            hiss_level: Glide::new(1.0e-9),
             wow: 0.0,
             // Apart, so the two flutter rates never start in step.
             flutter: [0.0, 0.37],
@@ -1111,6 +1176,8 @@ impl Tape {
             a_scrape_lo: lp_a(f64::from(sr), f64::from(SCRAPE_BAND_HZ.0)),
             a_scrape_hi: lp_a(f64::from(sr), f64::from(SCRAPE_BAND_HZ.1)),
             a_wander: env_a(f64::from(sr), f64::from(WANDER_SLEW_S * 1_000.0)),
+            a_glide: 1.0 - (-1.0 / (f64::from(sr) * GLIDE_MS * 1.0e-3)).exp(),
+            fresh: true,
         }
     }
 
@@ -1181,16 +1248,35 @@ impl Tape {
         };
         let trim_gain =
             10.0_f64.powf(f64::from((trim - 0.5) * (TRIM_DB.1 - TRIM_DB.0)) / 20.0) as f32;
-        // White noise carries its power in bandwidth, so the same sample
-        // variance is quieter per hertz at 96k; the square root keeps the
-        // audible hiss level the same on every machine.
-        let hiss_level = hiss * hiss * HISS_MAX * (DESIGN_RATE / sr).sqrt();
+        // **White noise carries its power in bandwidth.** The same sample
+        // variance spread over twice the band is half the power per hertz,
+        // so at 96 kHz every hertz of the audible band gets 44.1/96 of what
+        // it gets at 44.1, and the gain has to rise by the square root of
+        // the rates to hand it back. The root used to be the other way up,
+        // which doubled the fault where it meant to cancel it: the hiss was
+        // 0.74 dB quiet at 48 kHz and 6.8 dB quiet at 96.
+        // `the_same_machine_runs_at_every_sample_rate` holds it.
+        let noise_rate = (sr / DESIGN_RATE).sqrt();
+        // The hiss's level glides, and as a linear gain: see [`Glide`] for
+        // why it may not glide in decibels.
+        self.hiss_level.target = f64::from(hiss * hiss * HISS_MAX * noise_rate);
+        if self.fresh {
+            // The first block after `new` or `clear` starts AT its controls,
+            // not gliding to them from wherever the glides were left.
+            self.hiss_level.settle();
+            self.fresh = false;
+        }
         let wow_amp = WOW_DEPTH_MS * 1.0e-3 * sr * wobble;
         let flutter_amp = (
             FLUTTER_DEPTH_MS.0 * 1.0e-3 * sr * wobble,
             FLUTTER_DEPTH_MS.1 * 1.0e-3 * sr * wobble,
         );
-        let scrape_amp = SCRAPE_MS * 1.0e-3 * sr * wobble;
+        // The scrape is white noise through a band too, so its sway per
+        // hertz needs the same root; without it the head scraped 3.4 dB
+        // less at 96 kHz than at 44.1, and
+        // `the_scrape_sprays_the_same_sidebands_at_every_sample_rate`
+        // holds that.
+        let scrape_amp = SCRAPE_MS * 1.0e-3 * sr * wobble * noise_rate;
         let n = self.line[0].len();
         let tau = std::f32::consts::TAU;
 
@@ -1241,6 +1327,7 @@ impl Tape {
                 self.a_hrel
             };
             self.hiss_env = flush(self.hiss_env + (program - self.hiss_env) * ah);
+            let hiss_level = self.hiss_level.tick(self.a_glide) as f32;
             let hiss_gain =
                 hiss_level * (HISS_FLOOR + (1.0 - HISS_FLOOR) * self.hiss_env.min(1.0));
 
@@ -1286,8 +1373,11 @@ impl Tape {
                 }
 
                 // The hiss, after the EQ: it is the repro chain's noise, and
-                // the tone knobs of the machine do not touch it much.
-                v += self.pink[ch].step() * hiss_gain;
+                // the tone knobs of the machine do not touch it much. A level
+                // glided to exactly nothing skips the stage.
+                if hiss_level > 0.0 {
+                    v += self.pink[ch].step() * hiss_gain;
+                }
 
                 buf[f + ch] = v * trim_gain;
             }
@@ -1322,6 +1412,7 @@ impl Tape {
             p.clear();
         }
         self.hiss_env = 0.0;
+        self.fresh = true;
         self.wow = 0.0;
         self.flutter = [0.0, 0.37];
         self.wander_rng = 0x1B0F_5EED;
@@ -1723,6 +1814,66 @@ mod tests {
         assert!(
             buf.iter().all(|v| v.is_finite()),
             "NaN params reached the audio"
+        );
+
+        // **Every control end to end on alternate blocks, and the hiss back
+        // from silence.** A glide leaving the bottom of a level's travel is
+        // where a level gliding in decibels computes its way to NaN (see
+        // [`Glide`]), and a NaN level that skipped its stage would not reach
+        // the audio, it would only leave the hiss dead for good. So the hiss
+        // jumps 0, 1, 0, 1 on silence, every control then jumps with it on
+        // the stepped signal, and after that the hiss held up must be there.
+        // And a fresh unit starts at its controls rather than gliding to
+        // them: its first block of hiss is already most of the way up.
+        let silence = vec![0.0_f32; 128 * 2];
+        let mut jumps = Tape::new(sr);
+        for k in 0..128 {
+            let end = (k % 2) as f32;
+            let p = if k < 64 {
+                TapeParams {
+                    hiss: end,
+                    ..TapeParams::NEUTRAL
+                }
+            } else {
+                TapeParams {
+                    drive: end,
+                    bump: end,
+                    roll: end,
+                    wobble: end,
+                    hiss: end,
+                    trim: end,
+                }
+            };
+            let mut buf = if k < 64 { silence.clone() } else { block.clone() };
+            jumps.process(&mut buf, 128, 2, &p);
+            assert!(
+                buf.iter().all(|v| v.is_finite() && v.abs() < 16.0),
+                "block {k} of the end-to-end jumps left the audio at {:?}",
+                buf.iter().find(|v| !v.is_finite() || v.abs() >= 16.0)
+            );
+        }
+        let hissing = TapeParams {
+            hiss: 1.0,
+            ..TapeParams::NEUTRAL
+        };
+        let mut held = vec![0.0_f32; 4_800 * 2];
+        jumps.process(&mut held, 4_800, 2, &hissing);
+        let steady = rms(&held[2_400 * 2..]);
+        assert!(steady > 1.0e-5, "the hiss never came back after its jumps: {steady:e}");
+        let mut fresh = Tape::new(sr);
+        let blocks: Vec<f64> = (0..12)
+            .map(|_| {
+                let mut buf = silence.clone();
+                fresh.process(&mut buf, 128, 2, &hissing);
+                rms(&buf)
+            })
+            .collect();
+        assert!(
+            blocks[0] > 0.5 * blocks[11],
+            "a fresh unit's first block of hiss read {:e} against {:e} eleven blocks on: \
+             it glided in",
+            blocks[0],
+            blocks[11]
         );
 
         // And the tail dies when told to.
@@ -2389,6 +2540,168 @@ mod tests {
             worst < 0.01,
             "the line-up table is {worst:.4} dB from the direct solve"
         );
+    }
+
+    /// A Butterworth low- or high-pass of even order to measure with: a
+    /// cascade of biquads from the analog prototype by the bilinear
+    /// transform with the corner prewarped (the cookbook designs), in f64,
+    /// so it is the same analog filter at every rate except for the warp of
+    /// frequencies far from its corner.
+    struct Butter {
+        /// Per section: `b0, b1, b2`, `a1, a2` (normalised), and the
+        /// transposed direct form's two states.
+        sections: Vec<([f64; 3], [f64; 2], [f64; 2])>,
+    }
+
+    impl Butter {
+        fn new(order: usize, sr: f64, hz: f64, high: bool) -> Self {
+            let (sn, cs) = (std::f64::consts::TAU * hz / sr).sin_cos();
+            let sections = (0..order / 2)
+                .map(|k| {
+                    let angle = std::f64::consts::PI * (2 * k + 1) as f64 / (2 * order) as f64;
+                    let alpha = sn * angle.sin();
+                    let a0 = 1.0 + alpha;
+                    let b = if high {
+                        [(1.0 + cs) / 2.0, -(1.0 + cs), (1.0 + cs) / 2.0]
+                    } else {
+                        [(1.0 - cs) / 2.0, 1.0 - cs, (1.0 - cs) / 2.0]
+                    };
+                    (
+                        [b[0] / a0, b[1] / a0, b[2] / a0],
+                        [-2.0 * cs / a0, (1.0 - alpha) / a0],
+                        [0.0; 2],
+                    )
+                })
+                .collect();
+            Self { sections }
+        }
+
+        fn run(&mut self, x: f64) -> f64 {
+            let mut v = x;
+            for (b, a, z) in &mut self.sections {
+                let y = b[0] * v + z[0];
+                z[0] = b[1] * v - a[0] * y + z[1];
+                z[1] = b[2] * v - a[1] * y;
+                v = y;
+            }
+            v
+        }
+    }
+
+    /// The mean power of `buf` between `lo` and `hi` hertz, eighth-order
+    /// skirts each side, past `skip` samples of the filters settling.
+    fn band_power(buf: &[f32], sr: f64, lo: f64, hi: f64, skip: usize) -> f64 {
+        let mut hp = Butter::new(8, sr, lo, true);
+        let mut lp = Butter::new(8, sr, hi, false);
+        let mut sum = 0.0;
+        for (i, x) in buf.iter().enumerate() {
+            let y = lp.run(hp.run(f64::from(*x)));
+            if i >= skip {
+                sum += y * y;
+            }
+        }
+        sum / (buf.len() - skip) as f64
+    }
+
+    /// **The same machine runs at every sample rate.**
+    ///
+    /// Every voicing number here is in hertz or seconds so that a 96 kHz
+    /// session hears the machine a 44.1 kHz one does. Noise is where that is
+    /// easiest to get wrong, because white noise of a fixed sample variance
+    /// spreads the same power over more hertz at a higher rate, and the
+    /// hiss's correction for it was the wrong way up: the tape was 0.74 dB
+    /// quieter at 48 kHz and 6.8 dB quieter at 96 than at 44.1.
+    ///
+    /// So the hiss alone on silence, at the top of its dial with every colour
+    /// off, is measured in the octave around 1 kHz, where the ear meets it,
+    /// and must read within half a decibel at 48 and at 96 kHz of what it
+    /// reads at 44.1. Four seconds of it at each rate pin the band power to a
+    /// few hundredths of a decibel. Measured: +0.02 and +0.05 dB; with the
+    /// root the wrong way up, -0.72 and -6.71.
+    #[test]
+    fn the_same_machine_runs_at_every_sample_rate() {
+        let p = TapeParams {
+            hiss: 1.0,
+            ..TapeParams::NEUTRAL
+        };
+        let octave = |sr: f32| {
+            let frames = (sr * 4.0) as usize;
+            let out = left(&feed(&mut Tape::new(sr), &vec![0.0; frames * 2], &p));
+            10.0 * band_power(&out, sr.into(), 700.0, 1_400.0, (sr * 0.1) as usize).log10()
+        };
+        let at_44k = octave(44_100.0);
+        let offs = [48_000.0_f32, 96_000.0].map(|sr| (sr, octave(sr) - at_44k));
+        for (sr, off) in offs {
+            assert!(
+                off.abs() < 0.5,
+                "the hiss around 1 kHz reads {off:+.2} dB at {sr} Hz against 44.1 kHz \
+                 (every rate, in dB: {offs:?})"
+            );
+        }
+    }
+
+    /// **The scrape sprays the same sidebands at every sample rate.**
+    ///
+    /// The twin of the hiss's fault: the scrape is white noise through a
+    /// band, swaying the head, and its depth carried no correction at all for
+    /// the rate it was drawn at, so the head scraped 0.37 dB less at 48 kHz
+    /// and 3.4 dB less at 96 than at 44.1. Scrape is heard, as far as it is
+    /// heard, as the grain it sprays around a tone: the sidebands a moving
+    /// head writes onto anything playing through it, hundreds of hertz to a
+    /// few kilohertz either side.
+    ///
+    /// So a 5 kHz tone through full wobble, everything else off, is shifted
+    /// down to 0 Hz and the band 600 Hz to 4 kHz either side of it measured
+    /// against the tone. The wow and flutter sit within 30 Hz of the tone
+    /// and the shift's image twice the tone away, far outside the band, so
+    /// what is measured is the scrape's own spray, 54 dB under the tone, and
+    /// it must read the same within a quarter of a decibel at 48 and at
+    /// 96 kHz as at 44.1. Measured: +0.01 and -0.04 dB; without the root,
+    /// -0.35 and -3.41.
+    #[test]
+    fn the_scrape_sprays_the_same_sidebands_at_every_sample_rate() {
+        const TONE: f64 = 5_000.0;
+        let p = TapeParams {
+            wobble: 1.0,
+            ..TapeParams::NEUTRAL
+        };
+        let spray = |sr: f32| {
+            let frames = (sr * 3.0) as usize;
+            let mono: Vec<f32> = (0..frames)
+                .map(|i| 0.25 * (std::f64::consts::TAU * TONE * i as f64 / f64::from(sr)).sin() as f32)
+                .collect();
+            let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
+            let sr = f64::from(sr);
+            let w = std::f64::consts::TAU * TONE / sr;
+            let mut filters = [0, 1].map(|_| (Butter::new(8, sr, 600.0, true), Butter::new(16, sr, 4_000.0, false)));
+            let skip = (sr * 0.5) as usize;
+            let (mut sides, mut tone) = (0.0_f64, 0.0_f64);
+            for (n, y) in out.iter().enumerate() {
+                let y = f64::from(*y);
+                let (s, c) = (w * n as f64).sin_cos();
+                let mut power = 0.0;
+                for ((hp, lp), x) in filters.iter_mut().zip([y * c, -y * s]) {
+                    let v = lp.run(hp.run(x));
+                    power += v * v;
+                }
+                if n >= skip {
+                    sides += power;
+                    tone += y * y;
+                }
+            }
+            // The shift halves both the tone's power and the sidebands', so
+            // twice what passed the band, over the tone, is their ratio.
+            10.0 * (2.0 * sides / tone).log10()
+        };
+        let at_44k = spray(44_100.0);
+        let offs = [48_000.0_f32, 96_000.0].map(|sr| (sr, spray(sr) - at_44k));
+        for (sr, off) in offs {
+            assert!(
+                off.abs() < 0.25,
+                "the scrape's sidebands read {off:+.2} dB at {sr} Hz against 44.1 kHz \
+                 (every rate, in dB: {offs:?})"
+            );
+        }
     }
 
     /// **No knob on this unit may be a decoration.**
