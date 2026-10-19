@@ -28,6 +28,95 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   started; from this release it is left where it is. It is still not read,
   so paste a 4.x supporter key again, as with 5.0.
 
+## [Unreleased]
+
+Tangent Tape became a tape machine with four speeds and the controls of
+one, and the desk learned to start and stop the way a tape does.
+
+### Added
+
+- **Tangent Tape runs at four speeds, 3.75, 7.5, 15 and 30 inches per
+  second, and each is its own machine.** The speed sets the playback EQ, where
+  the head bump sits (it moves with the tape's wavelength, near 35 Hz at 15
+  ips and 70 Hz at 30), how much loud treble the tape can take, and the colour
+  of its hiss. Changing it re-voices the machine smoothly while playing; the
+  pitch never moves.
+- **Wow, Flutter and Rate.** Wow is the slow sway of the reels and the pinch
+  roller, Flutter the fast shake of the capstan and the guides, and Rate how
+  fast every turning part turns, half to double. Out of the box they sit at a
+  healthy studio transport's published figure, 0.04 % weighted at 15 ips.
+- **Bias** sets the record bias either side of the aligned point: under-biased
+  tape is brighter and saturates sooner in the low end, over-biased tape is
+  darker and cleaner. The machine is lined up again after every change, so the
+  level stays put.
+- **Age and Damage.** Age wears the tape and the heads: the treble goes first
+  and most on slow tape, the two tracks drift apart in time, and the hiss and
+  grain rise. Damage lays dropouts, creases and worn edges along the tape,
+  counted per metre, so slow tape plays each one for longer. Both open at 0.
+- **A deep wow range.** Wow Range switches to a second play head 25 ms back
+  that plays a worn cassette's warble, about 1 % at the default Wow and up to
+  2.6 % at full. It is the only Tape control that changes the delay Tape
+  reports: 25 ms while selected, compensated across the desk.
+- **Tangent Tape has a panel of its own.** Its controls stand in four groups,
+  the way a tape machine lays them out: Transport, Record, Tape and Playback.
+  Speed and Wow Range are stepped selectors, Bias has a centre mark that reads
+  "aligned", and three of the captions show what the dials come to: the
+  weighted wow and flutter with the delay, the hiss floor, and the head bump's
+  frequency. The window opens at 400 by 520 points at the least.
+- **Tape start and stop.** Right-click the PITCH CONT dial: under its range a
+  new switch makes Play spin the whole desk up from a standstill, and Stop or
+  Pause wind it down to a halt before the transport stops, the pitch following
+  the speed as a tape's does. Out of the box the start takes half a second and
+  the stop 0.7 s, the slow end of what professional machines publish; either
+  can be set from 0.1 to 10 s. As the tape slows the treble dulls and the low
+  end sinks the way a playback head loses them, and whatever was still ringing
+  when it stopped stays quiet until it has died away (at most eight seconds) or
+  something is played. The click waits for the tape: it joins on the first
+  beat the tape reaches at full speed. A take films it as the room hears it.
+  Arrangement recording, count-ins, exports and freezes never use it, and
+  while an armed input is monitored it stands aside, so Play and Stop are
+  instant on a tracking desk. It is saved with the project and off until
+  switched on, and a project exports the same file with it on or off. The
+  Tape panel's Transport section has a line that opens it.
+
+### Changed
+
+- **A fresh Tape is a 15 ips machine lined up the way its tape's datasheet
+  says.** Drive opens at 0.5 (it was 0.6): about 10 dB of headroom over 0 VU
+  and 0.25 % third harmonic on a 0 VU tone, so normal levels stay clean and
+  loud peaks round off; push Drive for colour. Roll opens off, because the
+  speed now sets the top.
+- **Tape tracks line up with the rest of the mix.** Tape now tells delay
+  compensation about its 2 ms play head, so a Tape track saved in 5.0 or 5.1
+  plays 2 ms earlier than it did, in time with everything else. A track nudged
+  by hand to make up for the old offset will now be 2 ms out. A bypassed Tape
+  keeps its delay, so bypassing it changes what you hear and never when.
+- **A Tape saved in 5.0 or 5.1 hears the new machine.** Its six saved knobs
+  are kept and the new controls read their defaults, so it plays at 15 ips (it
+  was voiced like 7.5): about 2 dB more headroom at the same Drive, the head
+  bump an octave lower, loud treble kept much better, and a little flutter.
+  Wobble is now Wow alone: at Wobble 0 the tape is not quite still any more
+  (turn Flutter and Hiss down for that), and at Wobble 1 there is more wow and
+  less flutter than before. Switching to 7.5 ips brings back the old curve.
+- **Tape's hiss sounds like tape.** It is white behind each speed's playback
+  EQ instead of pink, and it no longer swells with the music; the tape's
+  modulation noise rides each note instead. It follows Drive, as recording
+  hotter does on tape: at a saved Drive of 0.6 it sits where 5.0 put it, and
+  each tenth of the dial moves it about 4.6 dB, quieter as Drive rises.
+- **Tape costs less processor time.** Its oversampled record stage does under
+  half the arithmetic it did, and its real delay is now exactly the one it
+  reports (it ran three quarters of a sample early).
+
+### Fixed
+
+- **Tape's hiss and scrape are the same at every sample rate.** At 96 kHz the
+  hiss was 6.8 dB too quiet and the scrape 3.4 dB too shallow (0.7 and 0.4 dB
+  at 48 kHz).
+- **An input monitored under the PITCH CONT dial plays at its own pitch
+  whatever its width.** A wide interface's input (64 channels, say) was played
+  unstretched, a 1 kHz tone at 874.5 Hz, and a mono or six-channel input
+  re-sized its buffers on the audio thread on the first stretched block.
+
 ## [5.1.0] - 2026-10-18
 
 The version Tangent Keys was rebuilt in: ten sounds re-voiced against
