@@ -5507,7 +5507,7 @@ mod tests {
         // spacing at all.
         let v_m = 0.0254 * TapeSpeed::Ips15.ips();
         for d in [f64::NAN, f64::INFINITY] {
-            assert_eq!(Tape::new(sr).spacing_bs(d, v_m), [0.0; 2], "a spacing of {d} m is not a wire");
+            assert_eq!(Tape::new(sr).spacing_bs(d, v_m), [0.0; 2], "a spacing of {d} m filtered the track instead of being a wire");
         }
 
         // **Every control end to end on alternate blocks, and the hiss back
