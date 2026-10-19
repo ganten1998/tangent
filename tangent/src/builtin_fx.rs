@@ -5669,6 +5669,71 @@ mod tests {
         }
     }
 
+    /// **The tape's panel has a place for every control this table
+    /// declares, and the ids it restates are this table's.** `faces_tape`
+    /// spells the ids because the UI crate cannot see this one, and its own
+    /// tests draw synthetic names, so a swapped pair (Age and Damage,
+    /// Flutter and Rate, Speed and Wow Range) passes every one of them and
+    /// lays a section out in the wrong order. So each restated id is held
+    /// to its symbol here, whenever its row is declared, which makes the pin
+    /// hold at every prefix of the table as the kernel appends to it. Every
+    /// declared row has exactly one place in the four sections, under the
+    /// ceiling the shared sweeps number up to, and is stepped exactly when
+    /// the panel draws it as a selector. A fourteenth control fails here by
+    /// name, so its place on the panel is decided rather than left to the
+    /// tail the panel draws for whatever it has no place for.
+    #[test]
+    fn the_tape_face_has_a_place_for_every_control_the_engine_declares() {
+        use tangent_ui::faces_tape as f;
+        assert_eq!(f::TAPE_PATH, TAPE_PATH);
+        for p in TAPE_FACE_PARAMS {
+            let places = f::SECTIONS.iter().filter(|(_, ids)| ids.contains(&p.id)).count();
+            assert_eq!(places, 1, "{} (id {}) has {places} places on the panel", p.symbol, p.id);
+            assert!(
+                (p.id as usize) < f::ID_CEILING,
+                "{} (id {}) is past the panel's id ceiling of {}",
+                p.symbol,
+                p.id,
+                f::ID_CEILING
+            );
+            assert_eq!(
+                p.steps >= 2,
+                f::STEPPED.contains(&p.id),
+                "{} (id {}) has {} steps and the panel {} it as a selector",
+                p.symbol,
+                p.id,
+                p.steps,
+                if f::STEPPED.contains(&p.id) { "draws" } else { "does not draw" }
+            );
+        }
+        let restated = [
+            (f::P_DRIVE, "drive"),
+            (f::P_BUMP, "bump"),
+            (f::P_ROLL, "roll"),
+            (f::P_WOBBLE, "wobble"),
+            (f::P_HISS, "hiss"),
+            (f::P_TRIM, "trim"),
+            (f::P_SPEED, "speed"),
+            (f::P_FLUTTER, "flutter"),
+            (f::P_RATE, "rate"),
+            (f::P_WOW_RANGE, "wow_range"),
+            (f::P_BIAS, "bias"),
+            (f::P_AGE, "age"),
+            (f::P_DAMAGE, "damage"),
+        ];
+        assert_eq!(restated.len(), f::ID_CEILING, "the ceiling is not one past the panel's last id");
+        for (id, symbol) in restated {
+            if let Some(p) = TAPE_FACE_PARAMS.get(id as usize) {
+                assert_eq!(p.id, id, "row {id} of the table carries id {}", p.id);
+                assert_eq!(
+                    p.symbol, symbol,
+                    "the panel places id {id} as {symbol}, and the engine's id {id} is {}",
+                    p.symbol
+                );
+            }
+        }
+    }
+
     /// **Seated, the bitcrusher's wire is still a wire and a mono lane is
     /// still crushed.** Through the planar road at 24 bits, full rate and
     /// unity, the awkward values come back to the bit; at its shipped rest

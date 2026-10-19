@@ -16,8 +16,8 @@
 //! does. The glass is the timecode cluster's own idiom — `lcd` digits on
 //! `lcd_face`, `FontId::monospace`, brightness tiers 1.0 / 0.55 / 0.45,
 //! sized against the widest reading a field can show so nothing ever
-//! resizes. A sweep test at the bottom dresses the kit in all sixteen
-//! factory themes, both modes, and fails the build on the first layer that
+//! resizes. A sweep test at the bottom dresses the kit in every factory
+//! theme, both modes, and fails the build on the first layer that
 //! cannot be read.
 //!
 //! **Two laws the first shipping build broke, written down here so the next
@@ -424,7 +424,21 @@ struct SliderDrag {
 /// An alt-press moves nothing, because an alt-click is the reset gesture
 /// and a reset that first knocked the knob to the press point would show
 /// as a flinch. The double-click reset is [`home_gesture`]'s, unchanged.
-fn fine_slider(ui: &mut egui::Ui, value: f32, default: f32) -> (egui::Response, Option<f32>) {
+///
+/// **`centre` is a home the plain drag is caught at**, and marked on the
+/// rail: a [`centred_row`]'s, `None` on every other row, which is then
+/// exactly the slider it always was. Only the unparted rule catches. A fine
+/// step is about a five-hundredth of the travel per point, far inside
+/// [`DETENT`], so a catch on the relative rule would put the knob back on
+/// its home every frame and a fine drag started there could never leave it:
+/// the varispeed dial learned that first, and its catch is a plain drag's
+/// alone for the same reason.
+fn fine_slider(
+    ui: &mut egui::Ui,
+    value: f32,
+    default: f32,
+    centre: Option<f32>,
+) -> (egui::Response, Option<f32>) {
     let thickness = ui
         .text_style_height(&egui::TextStyle::Body)
         .max(ui.spacing().interact_size.y);
@@ -454,7 +468,8 @@ fn fine_slider(ui: &mut egui::Ui, value: f32, default: f32) -> (egui::Response, 
                 let rate = if shift { FINE_RATIO } else { 1.0 };
                 value + dx / track.span().max(1.0) * rate
             } else {
-                egui::remap_clamp(p.x, track, 0.0..=1.0)
+                let at = egui::remap_clamp(p.x, track, 0.0..=1.0);
+                centre.filter(|c| (at - c).abs() <= DETENT).unwrap_or(at)
             };
             ui.data_mut(|d| d.insert_temp(key, drag));
             let next = next.clamp(0.0, 1.0);
@@ -484,6 +499,18 @@ fn fine_slider(ui: &mut egui::Ui, value: f32, default: f32) -> (egui::Response, 
             trailing.max.x = center.x + corner.nw as f32;
             ui.painter()
                 .rect_filled(trailing, corner, ui.visuals().selection.bg_fill);
+        }
+        // **The home, marked where the hand can find it**: a hairline across
+        // the rail, two points proud of it either side, in the rail's own
+        // foreground, so it reads wherever the rail does and asks no colour
+        // of its own. The handle covers it at home, which is the look at
+        // rest; anywhere else it says where home is.
+        if let Some(c) = centre {
+            let x = egui::lerp(track, c.clamp(0.0, 1.0));
+            ui.painter().line_segment(
+                [egui::pos2(x, rail.top() - 2.0), egui::pos2(x, rail.bottom() + 2.0)],
+                Stroke::new(1.0_f32, widgets.inactive.fg_stroke.color),
+            );
         }
         match ui.style().visuals.handle_shape {
             egui::style::HandleShape::Circle => {
@@ -599,6 +626,72 @@ pub fn slider_row(
     value: f32,
     default: f32,
 ) -> Option<SliderAsk> {
+    slider_row_body(
+        ui,
+        st,
+        name,
+        reading,
+        value,
+        default,
+        None,
+        "drag to set; shift for fine; double-click or alt-click to reset; click the reading to type",
+    )
+}
+
+/// How far either side of a centred row's home a plain drag is caught: a
+/// sixtieth of the travel, the share the varispeed dial's own catch takes
+/// of its default range (half a percent of thirty, `varispeed::DETENT`).
+/// About two and a half points either side on the tape's floor: wide enough
+/// to hit, narrow enough that nobody aiming at a real value is snapped off.
+pub const DETENT: f32 = 1.0 / 60.0;
+
+/// **One continuous parameter that is a trim about its own home**, as a
+/// row: the kit's slider row with a mark at `default` and a catch there.
+/// Everything else is [`slider_row`]'s contract, unchanged.
+///
+/// A trim about the point the DSP calls home wants the varispeed dial's
+/// laws on a kit row: a home a hand can see, a plain drag that lands on it
+/// when it comes within [`DETENT`], and a reading signed about it, which is
+/// the host's to print. The home is the pushed default and never a number
+/// spelled here, so a unit that moves its home moves the mark and the catch
+/// with it. Shift's fine drag is never caught (see [`fine_slider`]); the
+/// double-click and the alt-click go home as on every row, and so does a
+/// typed reading that names it.
+pub fn centred_row(
+    ui: &mut egui::Ui,
+    st: &FaceStyle,
+    name: &str,
+    reading: &str,
+    value: f32,
+    default: f32,
+) -> Option<SliderAsk> {
+    slider_row_body(
+        ui,
+        st,
+        name,
+        reading,
+        value,
+        default,
+        Some(default),
+        "drag to set, it catches at home; shift for fine, which does not catch; double-click or alt-click to reset; click the reading to type",
+    )
+}
+
+/// The one body [`slider_row`] and [`centred_row`] are drawn by: the name,
+/// the slider, the reading. `centre` is the home a centred row catches and
+/// marks, `None` on a plain row; `hover` is what the handle says it does,
+/// which differs between the two by exactly the catch.
+#[allow(clippy::too_many_arguments)]
+fn slider_row_body(
+    ui: &mut egui::Ui,
+    st: &FaceStyle,
+    name: &str,
+    reading: &str,
+    value: f32,
+    default: f32,
+    centre: Option<f32>,
+    hover: &str,
+) -> Option<SliderAsk> {
     let mut out = None;
     ui.horizontal(|ui| {
         let w = ui.available_width();
@@ -610,13 +703,11 @@ pub fn slider_row(
             ),
         );
         ui.spacing_mut().slider_width = w * (1.0 - LABEL_W - READING_W) - 16.0;
-        let (hand, moved) = fine_slider(ui, value, default);
+        let (hand, moved) = fine_slider(ui, value, default, centre);
         if let Some(v) = moved {
             out = Some(SliderAsk::Value(v));
         }
-        hand.on_hover_text(
-            "drag to set; shift for fine; double-click or alt-click to reset; click the reading to type",
-        );
+        hand.on_hover_text(hover);
         let at_rest = (value - default).abs() < 0.5 / 100.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(text) = reading_field(ui, st, name, reading, at_rest, w * READING_W) {
@@ -751,6 +842,113 @@ pub fn stepped_row(
         }
     });
     out
+}
+
+/// The hair between [`pointer_row`]'s two lines, so the second reads as the
+/// first one's footnote and not as a line of its own.
+const POINTER_GAP: f32 = 1.0;
+
+/// How tall [`pointer_row`] is drawn: its two lines and the hair between
+/// them, never less than a kit row. One function for drawing and for
+/// reserving, so a panel that budgets its height asks this rather than
+/// guessing (the `preset_foot_height` bargain).
+pub fn pointer_row_height(ui: &egui::Ui) -> f32 {
+    let line = |f: FontId| {
+        ui.painter()
+            .layout_no_wrap("Xg".to_owned(), f, Color32::WHITE)
+            .rect
+            .height()
+    };
+    ROW_H.max(
+        line(FontId::new(10.0, fonts::courier_bold()))
+            + POINTER_GAP
+            + line(FontId::new(9.0, fonts::courier())),
+    )
+}
+
+/// **A row that takes the hand to a setting that lives somewhere else.**
+/// What the setting is now on the first line, where it lives on the second,
+/// a chevron at the end, and the whole row one target. It owns nothing: the
+/// panel says what the lines read and what a click means, which is the
+/// primary button's. Every click it takes, whichever button made it, goes
+/// through [`note_click`] like every click a face row takes, so the slider
+/// clicked next cannot pair it with a click of its own and read a reset.
+///
+/// One exact allocation, [`pointer_row_height`] tall and as wide as the
+/// panel, with both lines and the chevron painted into it, so the row is the
+/// same size and takes the same one auto id whatever its lines say: a
+/// setting that changes under it moves nothing below. Each line is cut to
+/// the room left of the chevron and never wraps. There is no hover fill,
+/// because ink on the hover ground is a pair no sweep measures; the pointing
+/// hand and the chevron say it is a door.
+///
+/// **It never takes the keyboard's focus**: `Sense::CLICK`, not
+/// `Sense::click()`, which adds `FOCUSABLE` (the notices' rule, in
+/// `notify`). A reading above it commits on Tab, Tab hands the focus to the
+/// next widget that takes one, and egui presses a focused widget on Enter or
+/// Space, the transport's key. The row paints no focus, so a hand that typed
+/// a value, tabbed on and pressed Space would have walked through a door it
+/// could not see and lost the window it was typing in. So Tab passes it by.
+/// A screen reader still finds it and presses it, as the button it is,
+/// named by its two lines. Nothing is taken from the keyboard: the row holds
+/// nothing, and the setting it leads to is set where it lives.
+pub fn pointer_row(ui: &mut egui::Ui, st: &FaceStyle, line: &str, sub: &str, hover: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), pointer_row_height(ui)),
+        egui::Sense::CLICK,
+    );
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let first = FontId::new(10.0, fonts::courier_bold());
+        let second = FontId::new(9.0, fonts::courier());
+        // The stepped row's chevron family, the other way: this one leads
+        // out of the panel rather than back through a list.
+        let chevron = painter.text(
+            rect.right_center(),
+            Align2::RIGHT_CENTER,
+            "\u{203A}",
+            FontId::new(11.0, fonts::courier_bold()),
+            st.s.faint,
+        );
+        let room = (chevron.left() - rect.left() - ui.spacing().item_spacing.x).max(0.0);
+        let top = painter.text(
+            rect.left_top(),
+            Align2::LEFT_TOP,
+            crate::drumpad_panel::cut_text(painter, room, line, &first),
+            first,
+            st.s.ink,
+        );
+        painter.text(
+            egui::pos2(rect.left(), top.bottom() + POINTER_GAP),
+            Align2::LEFT_TOP,
+            crate::drumpad_panel::cut_text(painter, room, sub, &second),
+            second,
+            st.s.faint,
+        );
+    }
+    let enabled = resp.enabled();
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, format!("{line}, {sub}"))
+    });
+    let resp = resp
+        .on_hover_text(hover)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // **Every button's click is reported**, not only the one that opens the
+    // door: egui keeps one click clock for all of them, so a right-click
+    // here is the first half of a double for the primary click after it,
+    // and a click left unreported would hand the slider clicked next the
+    // pair from before it. The tape's pointer tells the hand to right-click
+    // the band's dial, which makes a stray right-click here the likely slip.
+    let went = resp.clicked();
+    if went
+        || resp.secondary_clicked()
+        || [egui::PointerButton::Middle, egui::PointerButton::Extra1, egui::PointerButton::Extra2]
+            .into_iter()
+            .any(|b| resp.clicked_by(b))
+    {
+        note_click(&resp);
+    }
+    went
 }
 
 // ── meters ──────────────────────────────────────────────────────────────────
@@ -1634,9 +1832,20 @@ pub(crate) mod fit {
                     seconds: 0.5,
                 })
                 .collect(),
+            // The longest line the tape's pointer can say, both times at
+            // their longest reading. Only the tape draws it.
+            start_stop: Some(crate::motor::StartStop::new(true, 9.99, 9.99)),
             ..Default::default()
         }
     }
+
+    /// **A sentinel no unit is spelled**, so `faces::draw` takes its generic
+    /// arm by definition: every parameter a row, in id order. The kit's
+    /// generic-row tests ask this. The tape stood in for it until it grew a
+    /// panel of its own, and every real unit is a candidate for one, so a
+    /// test that borrows a real unit's path for "the generic rows" is a test
+    /// that goes on measuring them only until that unit's panel lands.
+    pub const GENERIC_ROWS: &str = "@tangent-generic-rows";
 
     /// One face's shape as this harness needs it: the sentinel, how many
     /// parameters the engine declares for it, which of those are stepped,
@@ -1657,7 +1866,20 @@ pub(crate) mod fit {
     pub const FACES: &[FaceShape] = &[
         ("@tangent-eq", 15, &[0, 1, 5, 6, 10, 11], false, Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
         ("@tangent-imager", 3, &[], false, Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
-        ("@tangent-tape", 13, &[6, 9], false, Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
+        // The tape's count is its panel's id ceiling, the analog's bargain
+        // below: every id the four sections place, whether or not the
+        // engine has appended it yet, so the shelf is swept at the panel's
+        // fullest. `builtin_fx` pins the ceiling and the stepped ids against
+        // the engine's table, and `faces_tape` pins the two windows against
+        // `dialogs::FACE_SIZES`.
+        (
+            crate::faces_tape::TAPE_PATH,
+            crate::faces_tape::ID_CEILING,
+            crate::faces_tape::STEPPED,
+            false,
+            Vec2::new(400.0, 520.0),
+            Vec2::new(640.0, 832.0),
+        ),
         ("@tangent-comp", 7, &[], false, Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
         ("@tangent-denoise", 6, &[0, 5], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-amp", 9, &[0, 5], true, Vec2::new(540.0, 360.0), Vec2::new(864.0, 576.0)),
@@ -1991,7 +2213,7 @@ mod tests {
     use super::*;
 
     /// **The suite is dressed by every theme or the build fails.** The same
-    /// sweep the loudness meter runs: all sixteen factory themes, both
+    /// sweep the loudness meter runs: every factory theme, both
     /// modes, every layer of the kit asserted against the surface it is
     /// actually drawn on. A face built from the kit inherits this proof.
     #[test]
@@ -2093,11 +2315,13 @@ mod tests {
     // ── the hand on a row ───────────────────────────────────────────────
 
     /// A face of `n` plain continuous rows: the shape `faces::draw` gives
-    /// any unit without a hand-built panel, which is most of the suite.
+    /// any unit without a hand-built panel, which is most of the suite. On
+    /// [`fit::GENERIC_ROWS`], which no unit is, so the rows stay generic
+    /// whichever unit grows a panel next.
     fn a_face_of(n: usize) -> crate::faces::FaceLive {
         crate::faces::FaceLive {
             face: crate::ports::BuiltinFace {
-                path: "@tangent-tape".to_owned(),
+                path: fit::GENERIC_ROWS.to_owned(),
                 params: (0..n)
                     .map(|i| crate::ports::BuiltinFaceParam {
                         id: i as u32,
@@ -2367,6 +2591,204 @@ mod tests {
             Some(SliderAsk::Value(HOME)),
             "an alt-click on a slider row did not ask for the DSP's default"
         );
+    }
+
+    /// **A centred row catches a plain drag at its home and lets a fine one
+    /// through.** A trim about the point the machine is aligned at is one a
+    /// hand drags back to that point, so a plain press within [`DETENT`] of
+    /// home lands ON it, exactly, and one ten points away is left where it
+    /// was put. Shift's fine drag is never caught: it moves about a
+    /// five-hundredth of the travel per point, far inside the catch, so a
+    /// catch on it would snap the knob home on every frame and a fine drag
+    /// that reached home could never leave it, which is the varispeed dial's
+    /// lesson on a kit row. The double-click still goes home, and the home
+    /// is marked: one hairline where `default` sits on the track, and none
+    /// on a plain row. And the catch is the width its doc promises, a
+    /// sixtieth of the travel: probed half a point inside its edge and half
+    /// a point outside, either side of home, with the sixtieth spelled here
+    /// rather than read off [`DETENT`], so a catch three times as wide or
+    /// two fifths as wide fails where the presses a point and a half and ten
+    /// points out cannot tell.
+    ///
+    /// The geometry is the row's own at 400 wide: the label takes 136 and
+    /// the item gap 8, so the slider runs from 144 to 316 and its track,
+    /// inset by the handle's radius, from 151.2 to 308.8, which puts a home
+    /// of 0.5 at x 230 and the catch's edges 2.63 points either side. A
+    /// press at 231.5 is 0.5095 of the track and one at 240 is 0.5635. The
+    /// gestures stand whole seconds apart, because egui dates its
+    /// double-clicks and two of these must never pair.
+    ///
+    /// Revert-checks performed: with the catch added to the parted branch the
+    /// fine drag is caught at home and stalls there, and this goes red on the
+    /// fine drag; with the catch taken off the plain branch, red on the first
+    /// press.
+    #[test]
+    fn a_centred_row_catches_at_home_and_lets_a_fine_drag_through() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
+        const HOME: f32 = 0.5;
+        // One frame of one row at `t` seconds: what it asked for, and the x
+        // of every vertical hairline it painted.
+        let frame = |t: f64,
+                     events: Vec<egui::Event>,
+                     modifiers: egui::Modifiers,
+                     value: f32,
+                     centred: bool|
+         -> (Option<SliderAsk>, Vec<f32>) {
+            let mut out = None;
+            let painted = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(t),
+                    modifiers,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            out = if centred {
+                                centred_row(ui, &st, "BIAS", "aligned", value, HOME)
+                            } else {
+                                slider_row(ui, &st, "BIAS", "aligned", value, HOME)
+                            };
+                        });
+                },
+            );
+            fn walk(shape: &egui::Shape, marks: &mut Vec<f32>) {
+                match shape {
+                    egui::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, marks);
+                        }
+                    }
+                    egui::Shape::LineSegment { points, .. }
+                        if (points[0].x - points[1].x).abs() < 1.0e-3 =>
+                    {
+                        marks.push(points[0].x);
+                    }
+                    _ => {}
+                }
+            }
+            let mut marks = Vec::new();
+            for cs in &painted.shapes {
+                walk(&cs.shape, &mut marks);
+            }
+            (out, marks)
+        };
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let step = 1.0 / 60.0;
+
+        // ── a plain press a point and a half from home lands on it ──────
+        let near = egui::pos2(231.5, 9.0);
+        let _ = frame(1.0, vec![egui::Event::PointerMoved(near)], none, 0.8, true);
+        let (asked, _) = frame(1.0 + step, vec![press_at(near, true)], none, 0.8, true);
+        assert_eq!(
+            asked,
+            Some(SliderAsk::Value(HOME)),
+            "a plain press inside the catch did not land exactly on home"
+        );
+        let _ = frame(1.0 + 2.0 * step, vec![press_at(near, false)], none, HOME, true);
+
+        // ── and one ten points away is a real value, left where it is put
+        let far = egui::pos2(240.0, 9.0);
+        let _ = frame(3.0, vec![egui::Event::PointerMoved(far)], none, 0.8, true);
+        match frame(3.0 + step, vec![press_at(far, true)], none, 0.8, true).0 {
+            Some(SliderAsk::Value(v)) => assert!(
+                (v - 0.5635).abs() < 1.0e-3 && v != HOME,
+                "a press outside the catch asked {v}, wanted 0.5635 and not home"
+            ),
+            other => panic!("a press outside the catch asked {other:?}"),
+        }
+        let _ = frame(3.0 + 2.0 * step, vec![press_at(far, false)], none, 0.5635, true);
+
+        // ── a fine drag walks straight through home ─────────────────────
+        // From 0.6, leftward in eight-point steps, the value fed back each
+        // frame as a face's is. Each step is a quarter of 8 / 157.6 of the
+        // travel, so the seventh lands at 0.511 and the eighth at 0.498:
+        // inside the catch on both sides of home, and never on it.
+        let mut value = 0.6_f32;
+        let mut at = egui::pos2(260.0, 9.0);
+        let _ = frame(5.0, vec![egui::Event::PointerMoved(at)], shift, value, true);
+        let (pressed, _) = frame(5.0 + step, vec![press_with(at, true, shift)], shift, value, true);
+        assert_eq!(pressed, None, "a press with Shift held moved the knob");
+        let mut caught = Vec::new();
+        let mut t = 5.0 + step;
+        for _ in 0..10 {
+            t += step;
+            at.x -= 8.0;
+            if let (Some(SliderAsk::Value(v)), _) =
+                frame(t, vec![egui::Event::PointerMoved(at)], shift, value, true)
+            {
+                if v == HOME {
+                    caught.push(v);
+                }
+                value = v;
+            }
+        }
+        let _ = frame(t + step, vec![press_with(at, false, shift)], shift, value, true);
+        assert!(caught.is_empty(), "a fine drag was caught at home {} times", caught.len());
+        assert!(
+            value < HOME,
+            "ten fine steps from 0.6 did not take the knob past home: it stands at {value}"
+        );
+
+        // ── a double-click still goes home ──────────────────────────────
+        let away = egui::pos2(290.0, 9.0);
+        let _ = frame(8.0, vec![egui::Event::PointerMoved(away)], none, 0.8, true);
+        let _ = frame(8.0 + step, vec![press_at(away, true)], none, 0.8, true);
+        let _ = frame(8.0 + 2.0 * step, vec![press_at(away, false)], none, 0.8, true);
+        let _ = frame(8.0 + 3.0 * step, vec![press_at(away, true)], none, 0.8, true);
+        assert_eq!(
+            frame(8.0 + 4.0 * step, vec![press_at(away, false)], none, 0.8, true).0,
+            Some(SliderAsk::Value(HOME)),
+            "a double-click on a centred row did not ask for its home"
+        );
+
+        // ── and home is marked, on the centred row alone ────────────────
+        let (_, marks) = frame(10.0, Vec::new(), none, 0.8, true);
+        assert_eq!(marks.len(), 1, "a centred row painted {} home marks", marks.len());
+        assert!(
+            (marks[0] - 230.0).abs() <= 0.5,
+            "the home mark stands at x {}, wanted 230",
+            marks[0]
+        );
+        let (_, plain) = frame(11.0, Vec::new(), none, 0.8, false);
+        assert!(plain.is_empty(), "a plain slider row painted a home mark at {plain:?}");
+
+        // ── and the catch is a sixtieth of the travel, either side ──────
+        // The width the doc promises, spelled here rather than read off
+        // DETENT, so a catch of any other size fails: half a point inside
+        // its edge on either side of home lands on home, and half a point
+        // outside it is a value of its own. A second between the presses,
+        // so no two of them pair into a double.
+        let catch = (308.8 - 151.2) / 60.0;
+        for (k, (off, caught)) in [(catch - 0.5, true), (-(catch - 0.5), true), (catch + 0.5, false), (-(catch + 0.5), false)]
+            .into_iter()
+            .enumerate()
+        {
+            let t = 12.0 + k as f64;
+            let at = egui::pos2(230.0 + off, 9.0);
+            let _ = frame(t, vec![egui::Event::PointerMoved(at)], none, 0.8, true);
+            let asked = frame(t + step, vec![press_at(at, true)], none, 0.8, true).0;
+            let _ = frame(t + 2.0 * step, vec![press_at(at, false)], none, 0.8, true);
+            let want = (at.x - 151.2) / (308.8 - 151.2);
+            match asked {
+                Some(SliderAsk::Value(v)) if caught => assert_eq!(
+                    v, HOME,
+                    "a press {off:+.2} points from home, inside a catch a sixtieth of the travel wide, asked {v}"
+                ),
+                Some(SliderAsk::Value(v)) => assert!(
+                    v != HOME && (v - want).abs() < 1.0e-3,
+                    "a press {off:+.2} points from home, outside a catch a sixtieth of the travel wide, asked {v}, \
+                     wanted {want}"
+                ),
+                other => panic!("a press {off:+.2} points from home asked {other:?}"),
+            }
+        }
     }
 
     /// **And the drag still owns the hand once it has left the track.**
@@ -2923,6 +3345,207 @@ mod tests {
             !matches!(landed, Some((1, v)) if (v - 0.25).abs() < 1.0e-6),
             "clicking one row reset the NEXT one: {landed:?}"
         );
+    }
+
+    /// **A click on a pointer row cannot turn the next slider click into a
+    /// reset**, whichever button made it.
+    ///
+    /// The pointer is a door, not a control, so its click means nothing to
+    /// the row itself; it is reported to [`note_click`] anyway, because the
+    /// answer that function keeps is "what did the hand touch last", and a
+    /// click nobody reported leaves the next row believing the pair before
+    /// it was its own. So: click a slider, click the pointer over it, click
+    /// the slider again, a frame apart, so the last release lands inside
+    /// egui's double-click window of the pointer's and its triple-click
+    /// window of the slider's first. egui's clock reads it as a double or a
+    /// triple, and the test asks egui so, or it would prove nothing; only the
+    /// kit's memory of the pointer keeps it from being the slider's, and the
+    /// slider from going home. Twice, from a fresh start each time: with the
+    /// pointer clicked by the primary button, which opens the door, and by
+    /// the secondary, which opens nothing and still runs egui's one clock for
+    /// every button.
+    #[test]
+    fn a_click_on_a_pointer_row_cannot_turn_the_next_slider_click_into_a_reset() {
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let primary = egui::PointerButton::Primary;
+        for button in [primary, egui::PointerButton::Secondary] {
+            let ctx = a_test_ctx();
+            let mut clock = 0.0_f64;
+            // One frame of the panel: the pointer, then the slider under it,
+            // at 0.8 with its home at 0.25. What each asked, how tall the
+            // pointer was drawn, so the presses can find the slider under it,
+            // and whether egui read a primary release this frame as a double
+            // or a triple.
+            let mut frame = |events: Vec<egui::Event>| -> (bool, Option<SliderAsk>, f32, bool) {
+                clock += 1.0 / 60.0;
+                let mut out = (false, None, 0.0, false);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(clock),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let tall = pointer_row_height(ui);
+                                let went = pointer_row(ui, &st, "Start and stop: off", "set somewhere else", "go there");
+                                let asked = slider_row(ui, &st, "KNOB", "80%", 0.80, 0.25);
+                                let paired = ui.input(|i| {
+                                    i.pointer.button_double_clicked(primary) || i.pointer.button_triple_clicked(primary)
+                                });
+                                out = (went, asked, tall, paired);
+                            });
+                    },
+                );
+                out
+            };
+
+            let (_, _, tall, _) = frame(Vec::new());
+            let pointer = egui::pos2(60.0, tall / 2.0);
+            // Rows sit one item spacing apart, and the middle of the slider
+            // is the middle of its track, well off the 0.8 it holds, so a
+            // press there is a change the row reports.
+            let slider = egui::pos2(230.0, tall + 3.0 + ROW_H / 2.0);
+            let mut went = false;
+            let mut paired = false;
+            let mut last: Vec<Option<SliderAsk>> = Vec::new();
+            for (k, (at, by)) in [(slider, primary), (pointer, button), (slider, primary)].into_iter().enumerate() {
+                let mut asks = Vec::new();
+                for events in [
+                    vec![egui::Event::PointerMoved(at)],
+                    vec![egui::Event::PointerButton { pos: at, button: by, pressed: true, modifiers: egui::Modifiers::NONE }],
+                    vec![egui::Event::PointerButton { pos: at, button: by, pressed: false, modifiers: egui::Modifiers::NONE }],
+                ] {
+                    let (pressed, asked, _, pair) = frame(events);
+                    went |= pressed && k == 1;
+                    paired |= pair && k == 2;
+                    asks.push(asked);
+                }
+                last = asks;
+            }
+            if button == primary {
+                assert!(went, "the pointer was never clicked, so this proves nothing");
+            }
+            assert!(
+                paired,
+                "egui did not read the last click as a double or a triple after a {button:?} click on the pointer, \
+                 so nothing could have reset and this proves nothing"
+            );
+            assert!(
+                last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.5).abs() < 0.05)),
+                "the last click never landed on the slider, so this proves nothing: {last:?}"
+            );
+            assert!(
+                !last.iter().flatten().any(|a| matches!(a, SliderAsk::Value(v) if (v - 0.25).abs() < 1.0e-6)),
+                "a {button:?} click on the pointer made the slider's next click a reset: {last:?}"
+            );
+        }
+    }
+
+    /// **A pointer row paints both its lines inside the row it takes, and
+    /// cuts them to the room left of its chevron**, on every font the app
+    /// ships.
+    ///
+    /// The row is one exact allocation of [`pointer_row_height`] and its
+    /// words are painted into it, not laid out, so nothing in egui stops a
+    /// line from running past the allocation: a height that forgot the
+    /// second line, or a second line set lower than the height counts it,
+    /// paints over whatever is under the row, and no layout test sees it.
+    /// So the allocation is held to the height asked of it, and every word
+    /// the row paints (its two lines and its chevron, each at the rect its
+    /// galley really covers) is held inside that allocation, on all three
+    /// fonts. And the lines are cut, never wrapped: at a width that holds
+    /// the longest line the tape can say they are painted whole, and at one
+    /// far too narrow for it both are cut and end left of the chevron.
+    #[test]
+    fn a_pointer_row_paints_both_its_lines_inside_itself_on_every_font() {
+        let st = a_test_style();
+        let (line, sub) = ("Start and stop: 9.99 s up, 9.99 s down", "set on the PITCH CONT dial");
+        let mut bad: Vec<String> = Vec::new();
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            for width in [400.0_f32, 120.0] {
+                let (mut took, mut tall) = (Rect::NOTHING, f32::NAN);
+                let out = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(width, 100.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                tall = pointer_row_height(ui);
+                                took = ui
+                                    .scope(|ui| {
+                                        let _ = pointer_row(ui, &st, line, sub, "go there");
+                                    })
+                                    .response
+                                    .rect;
+                            });
+                    },
+                );
+                let at = format!("{} at {width} wide", font.key());
+                if (took.height() - tall).abs() > 1.0e-3 {
+                    bad.push(format!("{at}: the row took {:.2} points, not the {tall:.2} it asked for", took.height()));
+                }
+                fn walk(shape: &egui::Shape, into: &mut Vec<(String, Rect)>) {
+                    match shape {
+                        egui::Shape::Vec(v) => {
+                            for s in v {
+                                walk(s, into);
+                            }
+                        }
+                        egui::Shape::Text(t) => {
+                            into.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2())));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut words = Vec::new();
+                for cs in &out.shapes {
+                    walk(&cs.shape, &mut words);
+                }
+                for (w, r) in &words {
+                    if r.top() < took.top() - 1.0e-3
+                        || r.bottom() > took.bottom() + 1.0e-3
+                        || r.left() < took.left() - 1.0e-3
+                        || r.right() > took.right() + 1.0e-3
+                    {
+                        bad.push(format!("{at}: {w:?} is painted at {r:?}, outside the row's {took:?}"));
+                    }
+                }
+                let Some(chevron) = words.iter().find(|(w, _)| w == "\u{203A}").map(|(_, r)| *r) else {
+                    bad.push(format!("{at}: no chevron is painted"));
+                    continue;
+                };
+                let mut lines: Vec<&(String, Rect)> = words.iter().filter(|(w, _)| w != "\u{203A}").collect();
+                lines.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+                let [(first, first_at), (second, second_at)] = lines.as_slice() else {
+                    bad.push(format!("{at}: the row paints {} lines, not two", lines.len()));
+                    continue;
+                };
+                if width >= 400.0 {
+                    if (first.as_str(), second.as_str()) != (line, sub) {
+                        bad.push(format!("{at}: room for both lines, and it painted {first:?} and {second:?}"));
+                    }
+                } else {
+                    if first == line || second == sub {
+                        bad.push(format!("{at}: no room for the lines, and it painted {first:?} over {second:?}, not both cut"));
+                    }
+                    for (w, r) in [(first, first_at), (second, second_at)] {
+                        if r.right() > chevron.left() + 1.0e-3 {
+                            bad.push(format!("{at}: {w:?} ends at {:.1}, under the chevron at {:.1}", r.right(), chevron.left()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the pointer row does not hold its words:\n  {}", bad.join("\n  "));
     }
 
 
@@ -3525,7 +4148,7 @@ mod tests {
     // ── the ink lands on a surface that can carry it ────────────────────────
 
     /// **Every word a face prints is measured against the surface it actually
-    /// landed on** — all thirteen panels, all sixteen factory themes, both
+    /// landed on**: every panel the shelf sweeps, every factory theme, both
     /// modes.
     ///
     /// This replaces a sweep that read as coverage and was not. That one

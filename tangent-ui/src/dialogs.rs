@@ -2336,6 +2336,11 @@ pub enum DialogAction {
     /// host deletes only inside the preset folder, and the app lists the
     /// strip's sound again after it, so the row goes whatever the host found.
     DeleteKeysPreset { slot: usize, path: String },
+    /// **The Tape face's pointer was pressed: take the hand to tape start
+    /// and stop.** Appended at the END, this enum's law. The bay is the
+    /// window that asked, so the app closes that window and no other; the
+    /// setting itself is the project's.
+    OpenStartStop { bay: crate::desk_id::SeatBay },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -6121,8 +6126,13 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // knob rows, here the stair over six rows where the comp has a needle
     // over seven.
     ("@tangent-bitcrush", Vec2::new(0.344, 0.582), Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
-    // MERGE-ME(face): faces_tape's row replaces this one
-    ("@tangent-tape", Vec2::new(0.344, 0.688), Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
+    // **The tape is a machine in four sections** (`faces_tape`): up to
+    // thirteen controls under four captions, room under the transport for
+    // the pointer to the desk's tape start and stop, and the footer,
+    // measured on all three fonts with the section air whole at the floor.
+    // The knob panels' width share and the rule's 1.6 ceiling; the height
+    // share puts a 14-inch laptop about a third over the floor.
+    (crate::faces_tape::TAPE_PATH, Vec2::new(0.344, 0.688), Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
     // The insert: the glass, two routing rows, four knobs and the ping row
     // stacked over the footer. Taller than the knob panels by those rows.
     (
@@ -8955,6 +8965,11 @@ fn show_on(
                                     }
                                     crate::faces::FaceAction::HwInsert(ask) => {
                                         Some(DialogAction::HwInsert { bay, ask })
+                                    }
+                                    // The window stays up: which one steps
+                                    // aside for the range is the app's call.
+                                    crate::faces::FaceAction::OpenStartStop => {
+                                        Some(DialogAction::OpenStartStop { bay })
                                     }
                                     // No bay: one default folder
                                     // for the app, shared with the drumpad's
@@ -21035,6 +21050,10 @@ at: None,
     /// nothing ever gets smaller; the ceiling is that floor scaled by 1.6 in
     /// both directions, so a face keeps its proportions when the cap bites;
     /// and a laptop lands comfortably between the two. See [`FACE_SIZES`].
+    ///
+    /// The tape's floor grew from 400 by 360 to 400 by 520 when it took a
+    /// panel of its own; the promise it keeps is that it never opens smaller
+    /// than its panel needs.
     #[test]
     fn a_face_is_sized_from_the_screen_between_its_floor_and_its_ceiling() {
         // Every face that has a size of its own, with the size it used to
@@ -21132,11 +21151,41 @@ at: None,
             );
         }
         // It is meaningfully bigger than the generic face it used to share a
-        // size with, which is the whole reason it is called out.
+        // size with, which is the whole reason it is called out. Asked of a
+        // sentinel no unit is, so it is the generic face by definition: the
+        // tape stood in for it until the tape grew a panel and a size of
+        // its own.
         let laptop = Some(Vec2::new(1512.0, 982.0));
         assert!(
             face_window_size("@tangent-ir", laptop).x
-                > face_window_size("@tangent-tape", laptop).x * 2.0
+                > face_window_size(crate::face::fit::GENERIC_ROWS, laptop).x * 2.0
+        );
+    }
+
+    /// **No face is sized by two rows.** [`face_window_size`] takes the
+    /// FIRST row of [`FACE_SIZES`] that names a unit, so a second row for
+    /// the same unit is silently dead: whichever of the two a merge put
+    /// lower never sizes anything, and nothing says so. That is exactly what
+    /// a stopgap row and a panel's own row would leave if a merge kept them
+    /// both, so every unit appears once. And the IR appears not at all,
+    /// because [`FACE_IR`] sizes it ahead of the table, and a row there
+    /// would be one somebody tuned for nothing. The tape's own row is
+    /// there, too: a merge that resolved the two rows by dropping both
+    /// would open its panel at the generic size, under its own floor.
+    #[test]
+    fn no_face_is_sized_by_two_rows() {
+        let mut seen: Vec<&str> = Vec::new();
+        for &(unit, ..) in FACE_SIZES {
+            assert!(!seen.contains(&unit), "{unit} has two rows in FACE_SIZES; only the first sizes it");
+            seen.push(unit);
+        }
+        assert!(
+            !seen.contains(&"@tangent-ir"),
+            "the IR has a FACE_SIZES row, which FACE_IR answers ahead of"
+        );
+        assert!(
+            seen.contains(&crate::faces_tape::TAPE_PATH),
+            "the tape has no row of its own, so it opens at the generic size"
         );
     }
 
@@ -21801,6 +21850,11 @@ at: None,
         /// a modifier decorating the pointer EVENT alone would be invisible
         /// to `ui.input(|i| i.modifiers)` and would test nothing.
         mods: egui::Modifiers,
+        /// **Shown as the pedal's stacked window** (`show_stacked`), the
+        /// window an amp's pedal opens over the amp's, rather than as the
+        /// desk's own slot. The two are one drawing on two surfaces, and a
+        /// test that says what the stacked window asks shows it there.
+        stacked: bool,
     }
 
     impl Slot {
@@ -21814,6 +21868,7 @@ at: None,
                 face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
                 clock: 0.0,
                 mods: egui::Modifiers::NONE,
+                stacked: false,
             }
         }
 
@@ -21849,7 +21904,12 @@ at: None,
                     ..Default::default()
                 },
                 |ctx| {
-                    if let Some(a) = show(ctx, &mut self.dialog, self.face, Self::placement()) {
+                    let asked = if self.stacked {
+                        show_stacked(ctx, &mut self.dialog, self.face, Self::placement())
+                    } else {
+                        show(ctx, &mut self.dialog, self.face, Self::placement())
+                    };
+                    if let Some(a) = asked {
                         action = Some(a);
                     }
                 },
@@ -22741,6 +22801,52 @@ at: None,
                     ),
                 }
             }
+        }
+    }
+
+    /// **The Tape face's pointer asks to be taken to tape start and stop**,
+    /// for the bay its window was opened over, and the window stays up.
+    ///
+    /// The setting is the desk's, so the face carries a row that says how it
+    /// stands and where it is set, and a press there leaves this file as an
+    /// ask naming the window's own bay. The bay is the whole point: which
+    /// window steps aside for the range panel is the app's decision, and a
+    /// Tape in an amp's pedal seat must close its own stacked window and not
+    /// the amp's, which only the bay can tell apart. So the face does not
+    /// close itself on the way out, and the next frame still shows it. Both
+    /// roads are walked, the desk's slot and the pedal's stacked window,
+    /// each naming the bay its own window was opened over.
+    #[test]
+    fn the_tapes_pointer_asks_to_be_taken_to_start_and_stop() {
+        let pedal = crate::desk_id::SeatBay::new(
+            crate::desk_id::Node::Track(crate::desk_id::TrackId(0)),
+            crate::desk_id::Rack::Pedal(0),
+            0,
+        );
+        for (stacked, at) in [(false, tb(0, 0)), (true, pedal)] {
+            let road = if stacked { "the pedal's stacked window" } else { "the desk's slot" };
+            let mut live = crate::faces::FaceLive {
+                start_stop: Some(crate::motor::StartStop::default()),
+                ..Default::default()
+            };
+            live.face.path = crate::faces_tape::TAPE_PATH.to_owned();
+            let mut slot = Slot::new(Dialog::InsertFace { bay: at, live: Box::new(live) });
+            slot.stacked = stacked;
+            assert!(
+                slot.says("Start and stop: off"),
+                "the tape's transport does not say how start and stop stands, in {road}"
+            );
+            assert!(
+                matches!(
+                    slot.click("Start and stop: off"),
+                    Some(DialogAction::OpenStartStop { bay }) if bay == at
+                ),
+                "the pointer did not ask to be taken to start and stop for its own bay, in {road}"
+            );
+            assert!(
+                slot.says("TRANSPORT"),
+                "the face closed itself in {road}; which window steps aside is the app's to decide"
+            );
         }
     }
 
