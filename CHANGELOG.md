@@ -7,43 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
-## [Unreleased]
+## [5.2.0] - 2026-10-19
 
-### Changed
-
-- **A new session plays a grand piano.** The default project's second
-  track, the one that opens armed with the theory switch on, now holds
-  Tangent Keys on its Intimate Grand instead of Tangent DX7, and the drums
-  stay on the first track. A default template that is still as Tangent
-  wrote it (no clips, markers, automation or track names, no other plugins,
-  the tempo and meter it came with, and its instrument on the sound it came
-  with) is replaced at the next launch, so an install that has launched
-  before gets the new desk too. Levels or knob settings changed on their own
-  do not keep a template: name one of its tracks to keep it. A template you
-  have built on keeps what it has, and Settings > Reset > The Default
-  Template brings in the new desk. Saved projects are not touched, and
-  Tangent DX7 is still in the instrument picker.
-- **The developer switches are spelled with Tangent's name.** The
-  environment variables that turn on diagnostics and test hooks now start
-  with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
-  `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
-  a shell or a launcher that still sets it needs the new name. Every
-  release up to 5.1.0 reads only the old prefix, so the `TANGENT_` names in
-  the older entries below work from this release on.
-- **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
-  see its MIDI client as `tangent` and its input port as `tangent-in`. A
-  patchbay that saved a connection to the names they had before (qpwgraph,
-  qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
-  save. Choosing a MIDI input in Tangent works as before.
-- **Tangent no longer deletes a 4.x settings folder at launch.** 5.0.0 and
-  5.1.0 deleted the folder 4.x kept its settings in, unread, when they
-  started; from this release it is left where it is. It is still not read,
-  so paste a 4.x supporter key again, as with 5.0.
-
-## [Unreleased]
-
-Tangent Tape became a tape machine with four speeds and the controls of
-one, and the desk learned to start and stop the way a tape does.
+The version Tangent Tape became a tape machine with four speeds and the
+controls of one, the desk learned to start and stop the way a tape does,
+and a new session plays a grand piano.
 
 ### Added
 
@@ -93,6 +61,18 @@ one, and the desk learned to start and stop the way a tape does.
 
 ### Changed
 
+- **A new session plays a grand piano.** The default project's second
+  track, the one that opens armed with the theory switch on, now holds
+  Tangent Keys on its Intimate Grand instead of Tangent DX7, and the drums
+  stay on the first track. A default template that is still as Tangent
+  wrote it (no clips, markers, automation or track names, no other plugins,
+  the tempo and meter it came with, and its instrument on the sound it came
+  with) is replaced at the next launch, so an install that has launched
+  before gets the new desk too. Levels or knob settings changed on their own
+  do not keep a template: name one of its tracks to keep it. A template you
+  have built on keeps what it has, and Settings > Reset > The Default
+  Template brings in the new desk. Saved projects are not touched, and
+  Tangent DX7 is still in the instrument picker.
 - **A fresh Tape is a 15 ips machine lined up the way its tape's datasheet
   says.** Drive opens at 0.5 (it was 0.6): about 10 dB of headroom over 0 VU
   and 0.25 % third harmonic on a 0 VU tone, so normal levels stay clean and
@@ -122,6 +102,22 @@ one, and the desk learned to start and stop the way a tape does.
   now exactly the one it reports (it ran three quarters of a sample early).
   While Tape start and stop ramps, the desk costs a little more than with the
   varispeed dial engaged, well inside the real-time deadline.
+- **The developer switches are spelled with Tangent's name.** The
+  environment variables that turn on diagnostics and test hooks now start
+  with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
+  `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
+  a shell or a launcher that still sets it needs the new name. Every
+  release up to 5.1.0 reads only the old prefix, so the `TANGENT_` names in
+  the older entries below work from this release on.
+- **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
+  see its MIDI client as `tangent` and its input port as `tangent-in`. A
+  patchbay that saved a connection to the names they had before (qpwgraph,
+  qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
+  save. Choosing a MIDI input in Tangent works as before.
+- **Tangent no longer deletes a 4.x settings folder at launch.** 5.0.0 and
+  5.1.0 deleted the folder 4.x kept its settings in, unread, when they
+  started; from this release it is left where it is. It is still not read,
+  so paste a 4.x supporter key again, as with 5.0.
 
 ### Fixed
 
