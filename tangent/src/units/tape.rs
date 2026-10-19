@@ -9464,4 +9464,153 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
+
+    /// **Every move arrives where a fresh tape starts.**
+    ///
+    /// A tape whose controls are still must run exactly the arithmetic a
+    /// fresh tape at the same settings runs, and once a moving control's
+    /// filters move to each design a frame at a time ([`Ramp`]), that holds
+    /// only if every move arrives. A filter that stops short plays on
+    /// between two designs for good, and no test of a tape at rest can hear
+    /// it, because the tape it renders never moved: with the dip's bell left
+    /// where its first design put it, every other test passed, while a tape
+    /// thrown from Bump 0.5 to 1 settled 1.09 dB off a fresh one at 80 Hz,
+    /// one thrown from 15 to 30 ips 1.01 dB off at 150 Hz, and from 15 to
+    /// 3.75 ips 1.06 dB off at 80 Hz.
+    ///
+    /// So Bias, Bump, Speed, Roll and Age are thrown across their ranges,
+    /// alone and all five together, at 44.1, 48 and 96 kHz, 50 ms apart so
+    /// that each lands before the last one's glide has arrived, and the last
+    /// setting is held until every glide has arrived (the speed's and Age's,
+    /// the slowest, take two seconds) and a block more, past the last
+    /// design's move and its inverse's. Then nothing is on its way, no
+    /// inverse waits, every stage is in or out of circuit as a fresh tape's
+    /// is after one block, and every coefficient a design sets, moved or
+    /// stepped, is bit for bit the fresh tape's.
+    #[test]
+    fn every_move_arrives_where_a_fresh_tape_starts() {
+        use TapeSpeed::{Ips15, Ips30, Ips3_75, Ips7_5};
+        // Every coefficient a design sets, moved or stepped, whether each
+        // stage is in circuit, and whether anything is still on its way, as
+        // bits, named.
+        fn designs(u: &Tape) -> Vec<(&'static str, Vec<u64>)> {
+            let f32s = |v: &[f32]| v.iter().map(|x| u64::from(x.to_bits())).collect::<Vec<u64>>();
+            let section = |s: &Section| f32s(&[s.b0, s.b1, s.a1]);
+            let bell = |b: &Bell| f32s(&[b.a1, b.a2, b.a3, b.m1]);
+            let shelf = |s: &Shelf| f32s(&[s.a1, s.a2, s.a3, s.m1, s.m2]);
+            vec![
+                ("what is on its way", vec![u64::from(u.moving), u.inverse_waiting as u64]),
+                (
+                    "which stages are in circuit",
+                    [u.under_on, u.under_inv_on, u.shelf_on, u.roll_on, u.h2_on].map(u64::from).to_vec(),
+                ),
+                ("the under-bias shelf", shelf(&u.under.now)),
+                ("its inverse", shelf(&u.under_inv.now)),
+                ("the bias shelf", section(&u.shelf.now)),
+                ("the bump's bell", bell(&u.bump_bell.now)),
+                ("the dip's bell", bell(&u.dip_bell.now)),
+                ("Roll", f32s(&[u.roll_a.now])),
+                (
+                    "the speed's record level and the line-up",
+                    [u.dmol.now, u.lineup_from, u.lineup_to].map(f64::to_bits).to_vec(),
+                ),
+                ("the NAB pair", [section(&u.nab), section(&u.nab_inv)].concat()),
+                ("the erasure", f32s(&u.erase)),
+                ("the head's top and its low end", f32s(&[u.top_b, u.low_g])),
+                (
+                    "the hiss and the modulation noise",
+                    [
+                        section(&u.hiss_shelf),
+                        f32s(&[u.hiss_gain, u.hiss_age, u.jitter_a, u.jitter_norm, u.per_um]),
+                    ]
+                    .concat(),
+                ),
+            ]
+        }
+        let dials = |bias: f32, bump: f32, speed: TapeSpeed, roll: f32, age: f32| TapeParams {
+            bias,
+            bump,
+            speed: speed.dial(),
+            roll,
+            age,
+            ..TapeParams::default()
+        };
+        let rest = dials(0.5, 0.5, Ips15, 0.0, 0.0);
+        let throws: [(&str, Vec<TapeParams>); 7] = [
+            (
+                "Bias",
+                vec![rest, dials(0.0, 0.5, Ips15, 0.0, 0.0), dials(1.0, 0.5, Ips15, 0.0, 0.0), dials(0.3, 0.5, Ips15, 0.0, 0.0)],
+            ),
+            (
+                "Bias home to aligned",
+                vec![dials(0.0, 0.5, Ips15, 0.0, 0.0), dials(1.0, 0.5, Ips15, 0.0, 0.0), rest],
+            ),
+            (
+                "Bump",
+                vec![rest, dials(0.5, 1.0, Ips15, 0.0, 0.0), dials(0.5, 0.0, Ips15, 0.0, 0.0), dials(0.5, 0.7, Ips15, 0.0, 0.0)],
+            ),
+            (
+                "Speed",
+                vec![rest, dials(0.5, 0.5, Ips30, 0.0, 0.0), dials(0.5, 0.5, Ips3_75, 0.0, 0.0), dials(0.5, 0.5, Ips7_5, 0.0, 0.0)],
+            ),
+            (
+                "Roll",
+                vec![rest, dials(0.5, 0.5, Ips15, 1.0, 0.0), dials(0.5, 0.5, Ips15, 0.4, 0.0), rest],
+            ),
+            (
+                "Age",
+                vec![rest, dials(0.5, 0.5, Ips15, 0.0, 1.0), dials(0.5, 0.5, Ips15, 0.0, 0.0), dials(0.5, 0.5, Ips15, 0.0, 0.3)],
+            ),
+            (
+                "all five together",
+                vec![
+                    rest,
+                    dials(0.1, 1.0, Ips30, 0.8, 1.0),
+                    dials(0.9, 0.2, Ips3_75, 0.0, 0.0),
+                    dials(0.25, 0.6, Ips7_5, 0.5, 0.5),
+                ],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            for (what, plan) in &throws {
+                let mut unit = Tape::new(sr);
+                unit.transport_trace(&plan[0], 512);
+                for p in &plan[1..plan.len() - 1] {
+                    unit.transport_trace(p, (sr * 0.05) as usize);
+                }
+                let last = plan[plan.len() - 1];
+                let mut held = 0;
+                loop {
+                    unit.transport_trace(&last, 512);
+                    held += 512;
+                    let glides = [
+                        &unit.speed,
+                        &unit.drive,
+                        &unit.bump_db,
+                        &unit.roll,
+                        &unit.trim,
+                        &unit.bias,
+                        &unit.age,
+                        &unit.damage,
+                        &unit.hiss_level,
+                        &unit.jitter,
+                    ];
+                    if glides.iter().all(|g| g.cur == g.target) {
+                        break;
+                    }
+                    assert!(held < (sr * 10.0) as usize, "at {sr} Hz, {what}: a glide never arrived");
+                }
+                unit.transport_trace(&last, 512);
+                let mut fresh = Tape::new(sr);
+                fresh.transport_trace(&last, 512);
+                for ((name, moved), (_, new)) in designs(&unit).iter().zip(designs(&fresh)) {
+                    if *moved != new {
+                        wrong.push(format!("at {sr} Hz, {what} thrown and settled: {name} is not a fresh tape's"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} designs never arrived:\n{}", wrong.len(), wrong.join("\n"));
+    }
 }
