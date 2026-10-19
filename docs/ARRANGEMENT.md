@@ -273,30 +273,82 @@ channels play back their clips and nothing else. "Ready to play" and
   whenever the transport stands on them, because playback never asks the
   arm — and note-offs ride an active ledger that survives a jump landing
   exactly on a note.
-- Known slack in phase 4, written down on purpose: capture start is
-  block-quantised (no input-latency compensation yet); and a recorded WAV's
-  tail can be one device buffer short, because the tee drains what has
-  arrived when the record ends rather than waiting.
-  - **Still known: a recording is not placed against delay compensation,
-    and the click is not held by it.** A desk whose plugins report a delay
-    holds every track back by the longest of them, so the whole mix plays
-    that much behind the song's own clock: a Tape in its deep wow range
-    holds it 25 ms (1,200 frames at 48 kHz), a Tape in the studio range
-    2 ms (96 frames), an IR with an impulse loaded about 11 ms (512 frames).
-    The click is a cue and is never held (the rule
-    `the_click_pays_a_lookahead_bus_uncompensated` pins), so on such a desk
-    the player hears the click that much ahead of the drums. A part is
-    recorded on the song's clock and placed where the record was pressed,
-    with nothing taken off for the hold: played in time with the backing, it
-    lands late by the hold, 25 ms behind the beat it was played to with a
-    deep-range Tape on the desk; played in time with the click, it lands on
-    the beat. The interface's own round trip comes on top, uncompensated
-    too. MIDI is placed the same way, against the press. Measured offline at
-    48 kHz, one deep-range Tape on a silent lane: the click's attack falls
-    where it does on a bare desk, the backing's beat comes out of the master
-    1,200 frames later than on a bare desk, and an impulse played into an
-    armed input on the frame that beat came out was recorded 1,200 frames
-    after it (96 with the studio range, 512 with an IR).
+- Known slack in phase 4, written down on purpose: a recorded WAV's tail
+  can be one device buffer short, because the tee drains what has arrived
+  when the record ends rather than waiting. (Capture start being
+  block-quantised was on this list too; a take is placed from the mark its
+  ring carries now, below.)
+  - **Delay compensation is done properly, as the player hears it (the
+    owner's ruling of 2026-10-19).** A desk whose plugins report a delay
+    holds every track back by the longest of them (the alignment target),
+    and the master's racks and its limiter's lookahead hold the mix back
+    further on its way out: a Tape in its deep wow range holds it 1,200
+    frames (25 ms at 48 kHz), a Tape in the studio range 96 frames (2 ms),
+    an IR with an impulse loaded 512 frames (about 11 ms); an IR across the
+    master holds the take, and the speakers while they share the take's
+    mix, 512 more, and the limiter in circuit 58. Three things follow it now.
+    - **The click is heard on the mix's beat.** It is still a cue: made on
+      the song's clock (a count-in on the keypress's), summed after the
+      master and its ceiling, never ducked, never in an export, a freeze or
+      a bounce, and it never holds the desk back. But it is held to each
+      destination's mix (`ClickHold` in `instrument.rs`): the speakers', the
+      take's when it is in the take, its Return 0 send at the lanes' own
+      hold, and its send into a bus at what that bus's way out does not pay.
+      Measured offline at 48 kHz with the backing's impulse on beat two
+      (frame 24,000): the click's attack crosses where it does on a bare
+      desk, 30 frames past the beat, on every desk, in the speakers and in
+      the take; it used to cross at 24,030 whatever the desk, 1,170 frames
+      ahead of the beat with a deep-range Tape (it led by the hold). A
+      count-in's go and the mix's first beat are heard together when the
+      transport rolls on the go, and the go the engine publishes for a
+      take's T0 and the count's end is the instant it is heard. The song's
+      click still waits for the tape: with tape start and stop on, the
+      first click is the first beat at full speed, the hold after it.
+      A change of hold (a plugin added, the deep range thrown) loses the
+      beats inside the old hold, as the lanes lose the music there, and
+      doubles none. The click's own rack's latency counts against its hold;
+      past what the rings can hold (32,256 frames) the click is early by the
+      excess.
+    - **A part lands where it was played against what was heard.** The
+      tee marks a take's first rolling frame in its capture ring with the
+      song frame it was captured on and the hold the speakers played at,
+      and the host places the take from it (`take_placement`): frame `k`
+      lands on the song frame its sample arrived on, less that hold. An
+      impulse played into an armed input on the frame the backing's beat
+      two is heard now lands on frame 24,000 on every desk; it landed on
+      25,200 with a deep-range Tape, 24,096 with the studio range and
+      24,512 with an IR. The frames the tee takes between the press and
+      the transport rolling stand before the roll in the file, as they did
+      in time, where they used to push the whole take late by as much.
+      Nothing lands before the song's start: a record from 0:00 on a held
+      desk starts at 0:00 with those frames and the hold cut off its head.
+      MIDI is placed by the engine's anchor (the song frame and the instant
+      of the first chunk that rolled after the press), less the same hold,
+      so a note played on the beat heard lands on it; a note that would end
+      before 0:00 goes, one that would begin before it begins on it. A hold
+      that moves during a take moves nothing already placed: the hold at the
+      take's first rolling frame places all of it. A punch carves from where
+      the take lands. The varispeed dial changes nothing here: the tee,
+      the hold and the mark are all in the program's frames.
+    - **An armed track played live is heard at once.** A lane armed and
+      listening to MIDI stands outside the wait while it is armed, the way
+      a monitored input does: a key into a DX7 on it with a deep-range Tape
+      on another lane is heard 110 frames after it is pressed, as on a bare
+      desk, where it was 1,310; a pad struck on an armed drum lane at once,
+      where it was 1,200 frames late. Its own clips play with it while it
+      is armed, as an armed monitored audio lane's do. Arming and disarming
+      mid-roll glide the lane's wait over 10 ms, the old read fading under
+      the new one, so nothing steps, repeats a block or opens a hole; under
+      a realtime export every lane waits with the mix, as in the full-speed
+      one. A lane that only listens (the one open in the MIDI editor) waits
+      as before.
+  - **Still known: the interface's own round trip is not compensated.**
+    Its input and output buffers and its converters are the device's, not
+    the desk's, so a part played in time with what was heard lands late by
+    them, on a bare desk as on a held one. And when a count-in ends, the
+    host rolls the transport a UI frame or two after the go (it watches the
+    count end rather than being told), so the backing's first beat comes
+    that long after the go on every desk, held or not.
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip
