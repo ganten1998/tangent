@@ -2165,8 +2165,20 @@ impl Shelf {
 /// under one, at every rate, speed and pair of designs: a running stage
 /// never meets the wire itself, because a move to the wire leaves the
 /// circuit on the frame it arrives ([`Tape::move_designs`]).
-/// `every_blend_of_two_designs_stays_stable` checks every design the dials
-/// can reach, in pairs, at 44.1, 48 and 96 kHz.
+/// `every_blend_of_two_designs_stays_stable` checks it on a grid of the
+/// designs the dials reach (every speed and halfway between, Bias and Bump
+/// every decibel), in pairs, at 44.1, 48 and 96 kHz.
+///
+/// **That is exact arithmetic.** On the coefficients as f32 rounds them a
+/// frame can grow a state by a hair (6.5e-8 at the most, in the shelves'
+/// blends) and two frames still shrink every one; but the states' own
+/// arithmetic rounds too, by up to 6e-8 of a state at each operation, more
+/// than the slowest stage shrinks over two frames (the bump's bell at
+/// 96 kHz, by 6e-11). What holds that stage in f32 is that its poles sit
+/// inside the unit circle on every frame, 2e-4 of the way in at the
+/// slowest, a margin no rounding reaches and a move a frame at a time does
+/// not wear away: the test's two seconds of the widest moves leave 2e-19
+/// of a state.
 trait Blend: Copy + PartialEq {
     fn blend(&self, to: &Self, t: f32) -> Self;
 }
@@ -8997,8 +9009,8 @@ mod tests {
     /// state-variable section's states move by a matrix that grows none of
     /// them, at any design or any blend, and shrinks every one over two
     /// frames. This holds the argument to the coefficients the kernel
-    /// actually makes. Its own design path is asked for every design the
-    /// moving stages can take at 44.1, 48 and 96 kHz: at every speed and
+    /// actually makes. Its own design path is asked for a grid of the
+    /// moving stages' designs at 44.1, 48 and 96 kHz: at every speed and
     /// halfway between each pair, Bias every decibel across its travel on a
     /// new head and a worn one, Bump every decibel across its own. Every pair
     /// of each stage's designs, its wire among them where it has one, is
