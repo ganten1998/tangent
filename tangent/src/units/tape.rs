@@ -1003,7 +1003,9 @@ const SPEED_GLIDE_MS: f64 = 100.0;
 
 /// How often the voicing is designed again while something glides, in
 /// frames. Counted from `new` or `clear` across every block, so a render
-/// redesigns on the same frames at any block size.
+/// redesigns on the same frames at any block size. Between two designs the
+/// filters a step would click on move from one to the next a frame at a
+/// time ([`Ramp`]).
 const SUB_BLOCK: u64 = 32;
 
 /// The tape's bias noise at each speed, slowest first: the gain on uniform
@@ -2142,6 +2144,167 @@ impl Shelf {
     }
 }
 
+/// **A filter's coefficients, `t` of the way from one design to another**:
+/// each coefficient blended on its own, `from + (to - from) t`.
+///
+/// **Why no blend can go unstable, whatever the dials do.** A first-order
+/// section's one pole is `-a1`, and a blend of two `a1` inside the unit
+/// circle is inside it. A state-variable section's two states, as
+/// [`Bell::run`] and [`Shelf::run`] hold them, move from frame to frame by
+/// `[[2 a1 - 1, -2 a2], [2 a2, 1 - 2 a3]]`, which is linear in the
+/// coefficients, so a blend of two sections moves by the blend of their
+/// matrices. For any design (`g > 0`, damping `k > 0`) that matrix's
+/// singular values are exactly 1 and `|1 + g^2 - g k| / (1 + g^2 + g k)`:
+/// it never grows a state, and keeps a state's size only along `(g, 1)`,
+/// which it turns to `(-g, 1)`; the wire is the identity. A norm is
+/// convex, so a blend of two designs, or of a design and the wire, never
+/// grows a state either, and keeps one's size only where both ends keep it
+/// alike, which is again `(g, 1)` to `(-g, 1)` (two designs at one `g`) or
+/// nowhere. No design and no blend keeps `(-g, 1)`, so two frames running
+/// shrink every state, by a factor that the dials' closed ranges hold
+/// under one, at every rate, speed and pair of designs: a running stage
+/// never meets the wire itself, because a move to the wire leaves the
+/// circuit on the frame it arrives ([`Tape::move_designs`]).
+/// `every_blend_of_two_designs_stays_stable` checks every design the dials
+/// can reach, in pairs, at 44.1, 48 and 96 kHz.
+trait Blend: Copy + PartialEq {
+    fn blend(&self, to: &Self, t: f32) -> Self;
+}
+
+/// A one-pole's coefficient: `y += a (x - y)` is stable for any `a` in
+/// `(0, 2)`, and a blend of two in `(0, 1]` stays there.
+impl Blend for f32 {
+    #[inline]
+    fn blend(&self, to: &Self, t: f32) -> Self {
+        self + (to - self) * t
+    }
+}
+
+/// A level in octaves, which no blend can make unstable.
+impl Blend for f64 {
+    #[inline]
+    fn blend(&self, to: &Self, t: f32) -> Self {
+        self + (to - self) * f64::from(t)
+    }
+}
+
+impl Blend for Section {
+    #[inline]
+    fn blend(&self, to: &Self, t: f32) -> Self {
+        Section {
+            b0: self.b0 + (to.b0 - self.b0) * t,
+            b1: self.b1 + (to.b1 - self.b1) * t,
+            a1: self.a1 + (to.a1 - self.a1) * t,
+        }
+    }
+}
+
+impl Blend for Bell {
+    #[inline]
+    fn blend(&self, to: &Self, t: f32) -> Self {
+        Bell {
+            a1: self.a1 + (to.a1 - self.a1) * t,
+            a2: self.a2 + (to.a2 - self.a2) * t,
+            a3: self.a3 + (to.a3 - self.a3) * t,
+            m1: self.m1 + (to.m1 - self.m1) * t,
+        }
+    }
+}
+
+impl Blend for Shelf {
+    #[inline]
+    fn blend(&self, to: &Self, t: f32) -> Self {
+        Shelf {
+            a1: self.a1 + (to.a1 - self.a1) * t,
+            a2: self.a2 + (to.a2 - self.a2) * t,
+            a3: self.a3 + (to.a3 - self.a3) * t,
+            m1: self.m1 + (to.m1 - self.m1) * t,
+            m2: self.m2 + (to.m2 - self.m2) * t,
+        }
+    }
+}
+
+/// **A design on its way to the next, a frame at a time.**
+///
+/// The voicing is designed once a sub-block ([`SUB_BLOCK`]), and a design
+/// switched in whole is a step in every coefficient: in a section's `b0`,
+/// which multiplies the signal, and in a state-variable section's mix
+/// gains, which multiply its states, and on a bass note those states are
+/// the note. A step there is a click: Bias thrown across its travel on a
+/// 100 Hz tone put a burst +10.7 dB over the steady treble above 12 kHz,
+/// and Bump at 30 ips with the tone on its bell +9.4 dB. Smaller steps,
+/// under the hiss, were Roll's one-pole and the record level a speed sets,
+/// each a step in the signal's gain. So a design that moves runs `now`,
+/// which leaves the last design (`from`) on the frame after a design and
+/// arrives at the new one (`to`) exactly on the sub-block's last frame, in
+/// a straight line between: the click becomes a move. A design that has
+/// not changed stands still, and runs exactly the coefficients it was
+/// designed with. Blending cannot go unstable; see [`Blend`].
+#[derive(Debug, Clone, Copy)]
+struct Ramp<T> {
+    now: T,
+    from: T,
+    to: T,
+}
+
+impl<T: Blend> Ramp<T> {
+    /// Standing still at `c`.
+    fn at(c: T) -> Self {
+        Self {
+            now: c,
+            from: c,
+            to: c,
+        }
+    }
+
+    /// Set off from where it stands toward `to`: whether that is a move.
+    fn toward(&mut self, to: T) -> bool {
+        self.from = self.now;
+        self.to = to;
+        self.from != to
+    }
+
+    /// One frame of the move, `t` of the way; at 1 it is exactly there.
+    #[inline]
+    fn step(&mut self, t: f32) {
+        self.now = if t < 1.0 { self.from.blend(&self.to, t) } else { self.to };
+    }
+}
+
+/// **A stage that is in circuit only off its wire, at a design**: in
+/// circuit toward `to`, or on its way out of it toward `wire` for `None`.
+/// The first design after `new` or `clear` stands there at once, as there
+/// is nothing playing to move from; a stage coming back in sets off from
+/// its wire, its states at rest. Whether it is moving.
+fn stage_toward<T: Blend>(ramp: &mut Ramp<T>, on: &mut bool, to: Option<T>, wire: T, first: bool) -> bool {
+    match to {
+        Some(c) if first => {
+            (*ramp, *on) = (Ramp::at(c), true);
+            false
+        }
+        Some(c) if !*on => {
+            *ramp = Ramp::at(wire);
+            *on = true;
+            ramp.toward(c)
+        }
+        Some(c) => ramp.toward(c),
+        None if *on => ramp.toward(wire),
+        None => false,
+    }
+}
+
+/// Which designs are on their way this frame, as the bits of
+/// [`Tape::moving`]: the under-bias shelf, the bias shelf, the contour's
+/// bells, the speed's record level and Roll move across the sub-block their
+/// design opened, the under-bias shelf's inverse across the one its queue
+/// opened.
+const MOVING_UNDER: u8 = 1;
+const MOVING_SHELF: u8 = 2;
+const MOVING_BELLS: u8 = 4;
+const MOVING_INVERSE: u8 = 8;
+const MOVING_DMOL: u8 = 16;
+const MOVING_ROLL: u8 = 32;
+
 /// The hiss's seeds, one per channel (two tracks, two noises), and the
 /// modulation noise's. Restored by `clear`, so a cleared tape hisses the same
 /// hiss again.
@@ -3279,7 +3442,10 @@ pub struct Tape {
     /// designed for (`voiced_at`, the speed's position on [`TapeSpeed::ALL`];
     /// NaN until the first design).
     voiced_at: f64,
-    dmol: f64,
+    /// How far the speed moves the record level, as [`Voicing::dmol`], on
+    /// its way to its last design ([`Ramp`]): it sets the curve's `d` and
+    /// the line-up with it, so a step was a step in the signal's gain.
+    dmol: Ramp<f64>,
     nab: Section,
     nab_inv: Section,
     erase: [f32; ERASE_POINTS],
@@ -3294,14 +3460,15 @@ pub struct Tape {
     /// Samples of play-head delay per micrometre of spacing jitter, at the
     /// speed the voicing is at: the tape's speed, inverted, at this rate.
     per_um: f32,
-    /// The contour's two bells, and the `(bump g, dip g, bump dB)` they were
-    /// designed at.
-    bump_bell: Bell,
-    dip_bell: Bell,
+    /// The contour's two bells, each on its way to its last design
+    /// ([`Ramp`]), and the `(bump g, dip g, bump dB)` that was designed at.
+    bump_bell: Ramp<Bell>,
+    dip_bell: Ramp<Bell>,
     bells_for: (f64, f64, f64),
-    /// Roll's coefficient, the corner it was designed at (`log2` Hz), and
-    /// whether the stage is in circuit.
-    roll_a: f32,
+    /// Roll's coefficient on its way to its last design ([`Ramp`]), the
+    /// corner that was designed at (`log2` Hz), and whether the stage is in
+    /// circuit.
+    roll_a: Ramp<f32>,
     roll_for: f64,
     roll_on: bool,
     /// The bias's stages: the under-bias low shelf and its inverse, the
@@ -3315,17 +3482,25 @@ pub struct Tape {
     /// shapes at one frame leaves the curve that many frames later, and the
     /// inverse must meet it with the same design, or every design while the
     /// bias glides is a 44-frame step in the bass, a click. So each design's
-    /// inverse waits in `inverse_due` with the frame it takes over at (at
-    /// most two wait, designs being 32 frames apart).
-    under: Shelf,
+    /// inverse waits in `inverse_due` with the frame it sets off at (at
+    /// most two wait, designs being 32 frames apart), and moves from there
+    /// as the shelf moved, frame for frame ([`Ramp`]): `inverse_from` is
+    /// the frame its move counts from. A stage moving to its wire leaves
+    /// the circuit as it arrives.
+    under: Ramp<Shelf>,
     under_on: bool,
-    under_inv: Shelf,
+    under_inv: Ramp<Shelf>,
     under_inv_on: bool,
     inverse_due: [(u64, Shelf, bool); 2],
     inverse_waiting: usize,
-    shelf: Section,
+    inverse_from: u64,
+    shelf: Ramp<Section>,
     shelf_on: bool,
     bias_for: (f64, f64, f64),
+    /// Which designs are on their way this frame ([`MOVING_UNDER`] and the
+    /// rest): nothing when every design has arrived, which is one test a
+    /// frame and no arithmetic.
+    moving: u8,
     /// The line-up's reading of the bias, as how many octaves hotter the
     /// 1 kHz alignment tone meets the curve through the under-bias shelf:
     /// where it was at the last design and where it is going, ramped across
@@ -3444,7 +3619,7 @@ impl Tape {
             a_speed: step(SPEED_GLIDE_MS),
             voicings: TapeSpeed::ALL.map(|v| Voicing::at(v, rate)),
             voiced_at: f64::NAN,
-            dmol: 0.0,
+            dmol: Ramp::at(0.0),
             nab: Section::WIRE,
             nab_inv: Section::WIRE,
             erase: [0.0; ERASE_POINTS],
@@ -3457,21 +3632,23 @@ impl Tape {
             jitter_a: 0.0,
             jitter_norm: 0.0,
             per_um: 0.0,
-            bump_bell: Bell::WIRE,
-            dip_bell: Bell::WIRE,
+            bump_bell: Ramp::at(Bell::WIRE),
+            dip_bell: Ramp::at(Bell::WIRE),
             bells_for: (f64::NAN, f64::NAN, f64::NAN),
-            roll_a: 0.0,
+            roll_a: Ramp::at(0.0),
             roll_for: f64::NAN,
             roll_on: false,
-            under: Shelf::WIRE,
+            under: Ramp::at(Shelf::WIRE),
             under_on: false,
-            under_inv: Shelf::WIRE,
+            under_inv: Ramp::at(Shelf::WIRE),
             under_inv_on: false,
             inverse_due: [(0, Shelf::WIRE, false); 2],
             inverse_waiting: 0,
-            shelf: Section::WIRE,
+            inverse_from: 0,
+            shelf: Ramp::at(Section::WIRE),
             shelf_on: false,
             bias_for: (f64::NAN, f64::NAN, f64::NAN),
+            moving: 0,
             lineup_from: 0.0,
             lineup_to: 0.0,
             tan_1k: (std::f64::consts::PI * 1_000.0 / rate).tan(),
@@ -3620,7 +3797,9 @@ impl Tape {
     /// `log2` of the speed: piecewise-linear in `log2 v` between the four
     /// speeds the tables are exact at. A blend of two one-poles' `b` is a
     /// one-pole, and of two state-variable bells' `g` a bell, so no blend
-    /// can go unstable.
+    /// can go unstable. The bells, the bias's stages, the speed's record
+    /// level and Roll then move to what this designs a frame at a time
+    /// across the sub-block ([`Ramp`]).
     fn design(&mut self, roll_wanted: bool) {
         let pos = self.speed.cur;
         if pos != self.voiced_at {
@@ -3628,7 +3807,12 @@ impl Tape {
             let t = (pos - lo as f64).clamp(0.0, 1.0);
             let (a, b) = (&self.voicings[lo], &self.voicings[lo + 1]);
             let mix = |x: f64, y: f64| x * (1.0 - t) + y * t;
-            self.dmol = mix(a.dmol, b.dmol);
+            let dmol = mix(a.dmol, b.dmol);
+            if self.voiced_at.is_nan() {
+                self.dmol = Ramp::at(dmol);
+            } else if self.dmol.toward(dmol) {
+                self.moving |= MOVING_DMOL;
+            }
             (self.nab, self.nab_inv) = Section::and_inverse([
                 mix(a.nab[0], b.nab[0]),
                 mix(a.nab[1], b.nab[1]),
@@ -3653,15 +3837,28 @@ impl Tape {
             self.per_um = (1.0e-6 * f64::from(self.sample_rate) / v_m) as f32;
             self.voiced_at = pos;
         }
+        // The bells move to their new design across the sub-block ([`Ramp`]),
+        // so a speed or Bump glide never steps them; the first design after
+        // `new` or `clear` stands there at once.
         let bells = (self.bump_g, self.dip_g, self.bump_db.cur);
         if bells != self.bells_for {
-            self.bump_bell = Bell::design(bells.0, BUMP_Q, bells.2);
-            self.dip_bell = Bell::design(bells.1, DIP_Q, DIP_SHARE * bells.2);
+            let bump = Bell::design(bells.0, BUMP_Q, bells.2);
+            let dip = Bell::design(bells.1, DIP_Q, DIP_SHARE * bells.2);
+            if self.bells_for.0.is_nan() {
+                (self.bump_bell, self.dip_bell) = (Ramp::at(bump), Ramp::at(dip));
+            } else if self.bump_bell.toward(bump) | self.dip_bell.toward(dip) {
+                self.moving |= MOVING_BELLS;
+            }
             self.bells_for = bells;
         }
         let corner = self.roll.cur;
         if corner != self.roll_for {
-            self.roll_a = lp_a(f64::from(self.sample_rate), corner.exp2());
+            let a = lp_a(f64::from(self.sample_rate), corner.exp2());
+            if self.roll_for.is_nan() {
+                self.roll_a = Ramp::at(a);
+            } else if self.roll_a.toward(a) {
+                self.moving |= MOVING_ROLL;
+            }
             self.roll_for = corner;
         }
         self.roll_on = roll_wanted || self.roll.cur != self.roll.target;
@@ -3784,10 +3981,11 @@ impl Tape {
     /// [`UNDER_BIAS_UM`] on this speed, the bias shelf at [`BIAS_SHELF_UM`],
     /// and the record level the line-up reads for the 1 kHz tone. Each stage
     /// is in circuit only off the aligned point, where it is a wire, and
-    /// starts again from rest when it comes back in: a glide through aligned
-    /// takes it out at the last sub-block's small gain, and the inverse goes
-    /// with that design, its frames later, so nothing steps. Nothing here
-    /// runs while neither the bias nor the speed moves.
+    /// starts again from rest when it comes back in, from its wire: a glide
+    /// through aligned moves it to its wire across a sub-block and takes it
+    /// out as it arrives, and the inverse does the same its frames later,
+    /// so nothing steps ([`Ramp`]). Nothing here runs while neither the
+    /// bias nor the speed moves.
     fn design_bias(&mut self, pos: f64) {
         let (b, age) = (self.bias.cur, self.age.cur);
         if b == self.bias_for.0 && pos == self.bias_for.1 && age == self.bias_for.2 {
@@ -3802,36 +4000,39 @@ impl Tape {
         if under > 0.0 {
             let db = UNDER_BIAS_DB_PER_DB * under;
             let t = bell_g(v_m / (UNDER_BIAS_UM * 1.0e-6), sr);
-            self.under = Shelf::low(t, db);
-            self.under_on = true;
+            if stage_toward(&mut self.under, &mut self.under_on, Some(Shelf::low(t, db)), Shelf::WIRE, first) {
+                self.moving |= MOVING_UNDER;
+            }
             self.inverse_after(Shelf::low(t, -db), true, first);
             lineup = Shelf::low_gain(t, self.tan_1k, db).log2();
         } else if self.under_on {
-            self.under_on = false;
-            self.under_in = [[0.0; 2]; 2];
+            if stage_toward(&mut self.under, &mut self.under_on, None, Shelf::WIRE, first) {
+                self.moving |= MOVING_UNDER;
+            }
             self.inverse_after(Shelf::WIRE, false, first);
         }
         // A worn head records as if biased hotter, on the treble shelf only.
         let height = bias_shelf_db(b + AGE_OVERBIAS_DB * age);
-        if height != 0.0 {
-            self.shelf = Section::of(Section::bias_shelf(v_m / (BIAS_SHELF_UM * 1.0e-6), height, self.shelf_points));
-            self.shelf_on = true;
-        } else if self.shelf_on {
-            self.shelf_on = false;
-            self.bias_hf = [0.0; 2];
+        let shelf = (height != 0.0)
+            .then(|| Section::of(Section::bias_shelf(v_m / (BIAS_SHELF_UM * 1.0e-6), height, self.shelf_points)));
+        if stage_toward(&mut self.shelf, &mut self.shelf_on, shelf, Section::WIRE, first) {
+            self.moving |= MOVING_SHELF;
         }
         self.lineup_from = if first { lineup } else { self.lineup_to };
         self.lineup_to = lineup;
         self.bias_for = (b, pos, age);
     }
 
-    /// Queue the under-bias shelf's inverse to take over [`OS_LATENCY`]
+    /// Queue the under-bias shelf's inverse to set off [`OS_LATENCY`]
     /// frames from now, when what the shelf just started shaping leaves the
     /// curve; on the first design after `new` or `clear` there is nothing in
-    /// the curve yet, and it takes over at once.
+    /// the curve yet, and it stands there at once.
     fn inverse_after(&mut self, inverse: Shelf, on: bool, now: bool) {
         if now {
-            (self.under_inv, self.under_inv_on, self.inverse_waiting) = (inverse, on, 0);
+            if on {
+                self.under_inv = Ramp::at(inverse);
+            }
+            (self.under_inv_on, self.inverse_waiting) = (on, 0);
             return;
         }
         if self.inverse_waiting == self.inverse_due.len() {
@@ -3841,24 +4042,93 @@ impl Tape {
         self.inverse_waiting += 1;
     }
 
-    /// The oldest waiting inverse takes over: in circuit with its design, or
-    /// out of it, starting again from rest.
+    /// The oldest waiting inverse sets off: toward its design, or toward
+    /// its wire and out of the circuit ([`Tape::move_designs`]), the way the
+    /// shelf it undoes went.
     fn inverse_take(&mut self) {
-        let (_, inverse, on) = self.inverse_due[0];
+        let (due, inverse, on) = self.inverse_due[0];
         self.inverse_due[0] = self.inverse_due[1];
         self.inverse_waiting -= 1;
-        if !on {
-            self.under_out = [[0.0; 2]; 2];
+        let to = on.then_some(inverse);
+        if stage_toward(&mut self.under_inv, &mut self.under_inv_on, to, Shelf::WIRE, false) {
+            self.moving |= MOVING_INVERSE;
+            // Counted from its due frame, so it moves exactly as late as it
+            // was queued; never from a frame still to come.
+            self.inverse_from = due.min(self.frame);
         }
-        (self.under_inv, self.under_inv_on) = (inverse, on);
     }
 
-    /// One frame's turn of the waiting inverses: the one due at the frame
-    /// now being made (`frame` already counts it) takes over.
+    /// **One frame's turn of the moving designs**, the frame now being made
+    /// (`frame` already counts it): the waiting inverse due now sets off,
+    /// and whatever is on its way moves a frame ([`Tape::move_designs`]).
+    /// With nothing moving it is two tests and nothing else.
     #[inline]
-    fn inverse_turn(&mut self) {
+    fn turn(&mut self) {
         if self.inverse_waiting > 0 && self.frame > self.inverse_due[0].0 {
             self.inverse_take();
+        }
+        if self.moving != 0 {
+            self.move_designs();
+        }
+    }
+
+    /// **A frame of every design on its way** ([`Ramp`]): the stages the
+    /// last design moved, across its sub-block, `t` of the way, arriving on
+    /// its last frame; and the inverse across the sub-block its queue
+    /// opened. A stage that arrives at its wire leaves the circuit before
+    /// the frame runs, its states at rest, so a running stage never meets
+    /// the wire itself (see [`Blend`] for why that matters).
+    ///
+    /// **What a move costs**, once a frame for both channels and only
+    /// while something moves: a subtraction, a multiply and an add for each
+    /// coefficient on its way, 8 for the two bells (a Bump or speed glide),
+    /// 5 for the under-bias shelf and 5 for its inverse, 3 for the bias
+    /// shelf (a Bias, Age or speed glide), one for the speed's record level
+    /// and one for Roll, so 23 at the most, 69 operations; and where each
+    /// move stands, a few integer operations, a conversion and a multiply,
+    /// and a comparison for each stage moving.
+    fn move_designs(&mut self) {
+        let t = ((self.frame - 1) % SUB_BLOCK + 1) as f32 / SUB_BLOCK as f32;
+        let forward = MOVING_UNDER | MOVING_SHELF | MOVING_BELLS | MOVING_DMOL | MOVING_ROLL;
+        if self.moving & forward != 0 {
+            if self.moving & MOVING_UNDER != 0 {
+                self.under.step(t);
+            }
+            if self.moving & MOVING_SHELF != 0 {
+                self.shelf.step(t);
+            }
+            if self.moving & MOVING_BELLS != 0 {
+                self.bump_bell.step(t);
+                self.dip_bell.step(t);
+            }
+            if self.moving & MOVING_DMOL != 0 {
+                self.dmol.step(t);
+            }
+            if self.moving & MOVING_ROLL != 0 {
+                self.roll_a.step(t);
+            }
+            if t >= 1.0 {
+                if self.under_on && self.under.now == Shelf::WIRE {
+                    self.under_on = false;
+                    self.under_in = [[0.0; 2]; 2];
+                }
+                if self.shelf_on && self.shelf.now == Section::WIRE {
+                    self.shelf_on = false;
+                    self.bias_hf = [0.0; 2];
+                }
+                self.moving &= !forward;
+            }
+        }
+        if self.moving & MOVING_INVERSE != 0 {
+            let t = (self.frame - self.inverse_from) as f32 / SUB_BLOCK as f32;
+            self.under_inv.step(t);
+            if t >= 1.0 {
+                if self.under_inv.now == Shelf::WIRE {
+                    self.under_inv_on = false;
+                    self.under_out = [[0.0; 2]; 2];
+                }
+                self.moving &= !MOVING_INVERSE;
+            }
         }
     }
 
@@ -3952,7 +4222,7 @@ impl Tape {
                 self.design(roll_wanted);
             }
             self.frame += 1;
-            self.inverse_turn();
+            self.turn();
 
             // ── the glides, and the record level they make ─────────────────
             self.speed.tick(self.a_speed);
@@ -3968,7 +4238,7 @@ impl Tape {
             // the level the 1 kHz alignment tone meets the curve, which the
             // under-bias shelf raises ([`BIAS_RANGE_DB`]), ramped across the
             // sub-block.
-            let log2_d = self.drive.tick(self.a_glide) + self.dmol;
+            let log2_d = self.drive.tick(self.a_glide) + self.dmol.now;
             let along = ((self.frame - 1) % SUB_BLOCK + 1) as f64 / SUB_BLOCK as f64;
             let lineup = self.lineup_from + (self.lineup_to - self.lineup_from) * along;
             let makeup = makeup_at(&self.makeup, log2_d + lineup);
@@ -4007,7 +4277,7 @@ impl Tape {
                 // treble shelf.
                 let mut r = self.nab.run(&mut self.nab_in[ch], u);
                 if self.under_on {
-                    r = self.under.run(&mut self.under_in[ch], r);
+                    r = self.under.now.run(&mut self.under_in[ch], r);
                 }
                 let mut y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r) * makeup;
                 // A magnetised head's second harmonic, on the flux the tape
@@ -4017,11 +4287,11 @@ impl Tape {
                     y = self.dc[ch].high(y, self.g_dc);
                 }
                 if self.under_inv_on {
-                    y = self.under_inv.run(&mut self.under_out[ch], y);
+                    y = self.under_inv.now.run(&mut self.under_out[ch], y);
                 }
                 let mut y = self.nab_inv.run(&mut self.nab_out[ch], y);
                 if self.shelf_on {
-                    y = self.shelf.run(&mut self.bias_hf[ch], y);
+                    y = self.shelf.now.run(&mut self.bias_hf[ch], y);
                 }
 
                 // HF self-erasure: the corner falls as the level rises, read
@@ -4074,11 +4344,11 @@ impl Tape {
 
                 // The head contour, then Roll. Out of circuit, Roll's state
                 // follows the signal, so it comes back in without a step.
-                v = self.bump_bell.run(&mut self.bump[ch], v);
-                v = self.dip_bell.run(&mut self.dip[ch], v);
+                v = self.bump_bell.now.run(&mut self.bump[ch], v);
+                v = self.dip_bell.now.run(&mut self.dip[ch], v);
                 v = self.low[ch].high(v, self.low_g);
                 if self.roll_on {
-                    self.roll_lp[ch] = flush(self.roll_lp[ch] + self.roll_a * (v - self.roll_lp[ch]));
+                    self.roll_lp[ch] = flush(self.roll_lp[ch] + self.roll_a.now * (v - self.roll_lp[ch]));
                     v = self.roll_lp[ch];
                 } else {
                     self.roll_lp[ch] = v;
@@ -4112,6 +4382,7 @@ impl Tape {
         self.bias_hf = [0.0; 2];
         (self.under_on, self.under_inv_on, self.shelf_on) = (false, false, false);
         self.inverse_waiting = 0;
+        self.moving = 0;
         self.wear.clear();
         (self.skew_from, self.skew_to) = (0.0, 0.0);
         (self.spacing_from, self.spacing_to) = ([[0.0; 2]; 2], [[0.0; 2]; 2]);
@@ -4184,7 +4455,7 @@ impl Tape {
                 self.design(roll_wanted);
             }
             self.frame += 1;
-            self.inverse_turn();
+            self.turn();
             self.speed.tick(self.a_speed);
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
@@ -8715,115 +8986,348 @@ mod tests {
         }
     }
 
-    /// **A moving control never clicks.**
+    /// **Every blend of two designs stays stable.**
     ///
-    /// A 1 kHz tone at -18 dBFS through a fresh tape, and each control
-    /// thrown from one end of its travel to the other at a block boundary
-    /// and back: Speed from 15 to 3.75 ips and back, the wow range from the
-    /// studio head to the deep one and back, every other control 0 to 1 and
-    /// 1 to 0. A click is energy the band above 12 kHz did not carry before
-    /// or after, so the 20 ms after each throw may carry no more there than
-    /// the louder of the two settings' own steady state, plus 6 dB. And the
-    /// range switch fades the heads with equal power, two copies of the tone
-    /// 23 ms apart, so its level never rises past the steady tone's by more
-    /// than 3.2 dB. Bias's
-    /// under-bias shelf and its inverse straddle the record stage's
-    /// oversampler, so the inverse takes each design over 44 frames after
-    /// the shelf does; designed together, each design while the bias glided
-    /// was a 44-frame step in the bass, +9.3 dB above 12 kHz.
-    /// Measured: at most +3.9 dB above 12 kHz, Bias thrown from its bottom
-    /// to its top, its shelves redesigned a sub-block at a time through the
-    /// glide, and +0.6 or under for every other throw; the heads' fade
-    /// swells the tone +2.48 dB into the deep head, whose cassette starts
-    /// from nothing so the two copies nearly agree, and not at all on the
-    /// way back.
+    /// A filter on its way to its next design runs a blend of two designs
+    /// ([`Ramp`]), and [`Blend`] argues why no blend can go unstable: a
+    /// first-order section's pole stays inside the unit circle, and a
+    /// state-variable section's states move by a matrix that grows none of
+    /// them, at any design or any blend, and shrinks every one over two
+    /// frames. This holds the argument to the coefficients the kernel
+    /// actually makes. Its own design path is asked for every design the
+    /// moving stages can take at 44.1, 48 and 96 kHz: at every speed and
+    /// halfway between each pair, Bias every decibel across its travel on a
+    /// new head and a worn one, Bump every decibel across its own. Every pair
+    /// of each stage's designs, its wire among them where it has one, is
+    /// then blended at every frame of a move: no pole of the bias shelf
+    /// leaves the unit circle, and no matrix of the under-bias shelf, its
+    /// inverse or the bells has a singular value over one, past the f32
+    /// rounding of its coefficients (a millionth). And the states do die: each
+    /// state-variable stage, holding the one state its first design keeps
+    /// whole for a frame, `(g, 1)`, and moved every sub-block between its
+    /// two designs furthest apart for two seconds with nothing playing,
+    /// never grows by more than that rounding in a frame, and ends under a
+    /// millionth of where it started. Measured: the largest singular value
+    /// over every blend is 1 + 7e-8, the bias shelf's largest pole 0.949,
+    /// and the slowest stage keeps 2e-19 of its state.
     #[test]
-    fn a_moving_control_never_clicks() {
-        let sr = 48_000.0_f32;
-        let srf = f64::from(sr);
-        let block = 480;
-        let amp = 10.0_f64.powf(-18.0 / 20.0);
-        let tone = |i: usize| (amp * (std::f64::consts::TAU * 1_000.0 * i as f64 / srf).sin()) as f32;
-        let settle = (sr * 1.0) as usize;
-        let after = (sr * 1.5) as usize;
-        let window = (sr * 0.02) as usize;
-        // The tone through a fresh tape at `from`, thrown to `to` on the
-        // block at one second: the left channel.
-        let thrown = |from: &TapeParams, to: &TapeParams| {
-            let mut unit = Tape::new(sr);
-            let total = settle + after;
-            let mut heard = Vec::with_capacity(total);
-            for b in 0..total / block {
-                let mut buf: Vec<f32> = (b * block..(b + 1) * block).flat_map(|i| [tone(i), tone(i)]).collect();
-                let p = if b * block < settle { from } else { to };
-                unit.process(&mut buf, block, 2, p);
-                heard.extend(buf.chunks_exact(2).map(|f| f[0]));
-            }
-            heard
-        };
-        // The power above 12 kHz, frame by frame, through an eighth-order
-        // high-pass run over the whole render so it has settled by the
-        // throw.
-        let treble = |heard: &[f32]| {
-            let mut hp = Butter::new(8, srf, 12_000.0, true);
-            heard.iter().map(|v| hp.run(f64::from(*v)).powi(2)).collect::<Vec<f64>>()
-        };
-        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        let set = |k: usize, v: f32| {
-            let mut p = TapeParams::default();
-            match k {
-                0 => p.drive = v,
-                1 => p.bump = v,
-                2 => p.roll = v,
-                3 => p.wobble = v,
-                4 => p.hiss = v,
-                5 => p.trim = v,
-                6 => p.speed = v,
-                7 => p.flutter = v,
-                8 => p.rate = v,
-                9 => p.wow_range = v,
-                10 => p.bias = v,
-                11 => p.age = v,
-                _ => p.damage = v,
-            }
-            p
-        };
-        let ends = |k: usize| match k {
-            6 => (TapeSpeed::Ips15.dial(), TapeSpeed::Ips3_75.dial()),
-            _ => (0.0, 1.0),
-        };
-        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias", "age", "damage"];
-        for k in 0..names.len() {
-            let (a, b) = ends(k);
-            for (x, y) in [(a, b), (b, a)] {
-                let heard = thrown(&set(k, x), &set(k, y));
-                let hf = treble(&heard);
-                let before = mean(&hf[settle - window..settle]);
-                let steady = mean(&hf[heard.len() - window..]);
-                let at = mean(&hf[settle..settle + window]);
-                let rise = 10.0 * (at / before.max(steady).max(1.0e-30)).log10();
+    fn every_blend_of_two_designs_stays_stable() {
+        // A stage's two designs furthest apart: its lowest corner and its
+        // highest (`g` is `a2 / a1`), the wire left out.
+        fn extremes<T: Blend>(set: &[T], g: impl Fn(&T) -> f32) -> (T, T) {
+            let mut s: Vec<T> = set.iter().copied().filter(|c| g(c) > 0.0).collect();
+            s.sort_by(|a, b| g(a).total_cmp(&g(b)));
+            (s[0], s[s.len() - 1])
+        }
+        // `frames` of a stage moved between `lo` and `hi` every sub-block with
+        // nothing playing, from the state `lo` keeps whole, `(g, 1)`: what is
+        // left of it, failing if a frame ever grew it.
+        fn decay<T: Blend>(lo: T, hi: T, g: f32, run: impl Fn(&T, &mut [f32; 2]) -> f32, frames: usize, sr: f32) -> f64 {
+            let size = |st: &[f32; 2]| (f64::from(st[0]).powi(2) + f64::from(st[1]).powi(2)).sqrt();
+            let norm = (f64::from(g).powi(2) + 1.0).sqrt();
+            let mut st = [(f64::from(g) / norm) as f32, (1.0 / norm) as f32];
+            let mut was = size(&st);
+            let mut ramp = Ramp::at(lo);
+            let block = SUB_BLOCK as usize;
+            for f in 0..frames {
+                if f % block == 0 {
+                    ramp.toward(if (f / block) % 2 == 1 { lo } else { hi });
+                }
+                ramp.step((f % block + 1) as f32 / block as f32);
+                run(&ramp.now, &mut st);
+                let now = size(&st);
                 assert!(
-                    rise <= 6.0,
-                    "{} thrown from {x} to {y}: the 20 ms after carried {rise:+.1} dB above 12 kHz \
-                     over the louder steady state",
-                    names[k]
+                    now <= was * (1.0 + 1.0e-6),
+                    "at {sr} Hz a moving stage grew its state from {was:e} to {now:e} on frame {f}"
                 );
-                if k == 9 {
-                    let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
-                    let steady = rms(&heard[settle - 4 * window..settle]).max(rms(&heard[heard.len() - 4 * window..]));
-                    let ms = (sr / 1_000.0) as usize;
-                    let worst = heard[settle..settle + 2 * window]
-                        .chunks_exact(ms)
-                        .map(|c| rms(c))
-                        .fold(0.0_f64, f64::max);
-                    let swell = 20.0 * (worst / steady).log10();
-                    assert!(
-                        swell <= 3.2,
-                        "the wow range thrown from {x} to {y} swelled the tone {swell:+.2} dB through \
-                         the heads' fade"
-                    );
+                was = now;
+            }
+            was
+        }
+        // The largest singular value of a state-variable section's
+        // transition matrix, `[[2 a1 - 1, -2 a2], [2 a2, 1 - 2 a3]]`.
+        let sigma = |a1: f32, a2: f32, a3: f32| {
+            let (p, q, r, s) = (2.0 * f64::from(a1) - 1.0, -2.0 * f64::from(a2), 2.0 * f64::from(a2), 1.0 - 2.0 * f64::from(a3));
+            let t = p * p + q * q + r * r + s * s;
+            let d = p * s - q * r;
+            (0.5 * (t + (t * t - 4.0 * d * d).max(0.0).sqrt())).sqrt()
+        };
+        let (mut widest, mut pole, mut kept) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            let mut unit = Tape::new(sr);
+            let (mut under, mut inverse, mut shelf, mut bump, mut dip) =
+                (vec![Shelf::WIRE], vec![Shelf::WIRE], vec![Section::WIRE], Vec::new(), Vec::new());
+            // The kernel's own design, standing at the glides' positions as
+            // the first design after `clear` does.
+            let design = |unit: &mut Tape, pos: f64, bias: f64, age: f64, bump_db: f64| {
+                unit.clear();
+                for (g, v) in [(&mut unit.speed, pos), (&mut unit.bias, bias), (&mut unit.age, age), (&mut unit.bump_db, bump_db)] {
+                    (g.cur, g.target) = (v, v);
+                }
+                unit.design(false);
+            };
+            for pos in (0..=6).map(|i| f64::from(i) * 0.5) {
+                for bias in (-6..=6).map(f64::from) {
+                    for age in [0.0, 1.0] {
+                        design(&mut unit, pos, bias, age, 0.0);
+                        if unit.under_on {
+                            under.push(unit.under.now);
+                            inverse.push(unit.under_inv.now);
+                        }
+                        if unit.shelf_on {
+                            shelf.push(unit.shelf.now);
+                        }
+                    }
+                }
+                for db in (0..=5).map(f64::from) {
+                    design(&mut unit, pos, 0.0, 0.0, db);
+                    bump.push(unit.bump_bell.now);
+                    dip.push(unit.dip_bell.now);
                 }
             }
+            let steps = (1..=SUB_BLOCK).map(|k| k as f32 / SUB_BLOCK as f32);
+            for a in &shelf {
+                for b in &shelf {
+                    for t in steps.clone() {
+                        let c = a.blend(b, t);
+                        pole = pole.max(f64::from(c.a1.abs()));
+                    }
+                }
+            }
+            for set in [&under, &inverse] {
+                for a in set {
+                    for b in set {
+                        for t in steps.clone() {
+                            let c = a.blend(b, t);
+                            widest = widest.max(sigma(c.a1, c.a2, c.a3));
+                        }
+                    }
+                }
+            }
+            for set in [&bump, &dip] {
+                for a in set {
+                    for b in set {
+                        for t in steps.clone() {
+                            let c = a.blend(b, t);
+                            widest = widest.max(sigma(c.a1, c.a2, c.a3));
+                        }
+                    }
+                }
+            }
+            assert!(widest <= 1.0 + 1.0e-6, "at {sr} Hz a blend's matrix grows a state by {widest}");
+            assert!(pole < 1.0, "at {sr} Hz a blend of the bias shelf has its pole at {pole}");
+            // The states dying: each stage moved every sub-block between its
+            // two designs furthest apart, the lowest corner and the highest,
+            // from the state the first keeps whole.
+            let frames = (sr * 2.0) as usize;
+            for set in [&under, &inverse] {
+                let (lo, hi) = extremes(set, |c: &Shelf| c.a2 / c.a1);
+                kept = kept.max(decay(lo, hi, lo.a2 / lo.a1, |c: &Shelf, st| c.run(st, 0.0), frames, sr));
+            }
+            for set in [&bump, &dip] {
+                let (lo, hi) = extremes(set, |c: &Bell| c.a2 / c.a1);
+                kept = kept.max(decay(lo, hi, lo.a2 / lo.a1, |c: &Bell, st| c.run(st, 0.0), frames, sr));
+            }
+        }
+        assert!(kept < 1.0e-6, "two seconds of moves left {kept:e} of a stage's state");
+        println!("largest singular value {widest:.9}, largest pole {pole:.4}, kept {kept:e}");
+    }
+
+    /// **A moving control never clicks.**
+    ///
+    /// A click is energy the band above 12 kHz carries in neither setting, so
+    /// each control is thrown at block boundaries through a fresh tape
+    /// playing a tone at -18 dBFS: from 0 to 1, back to 0, and from that end
+    /// to the middle (a double-click home), 0.4 s apart, and the 20 ms after
+    /// each throw may carry no more there than the louder of the two
+    /// settings' own steady states, past which each control has its own
+    /// ceiling. Speed's ends are 3.75 and 30 ips and its middle 15; the wow
+    /// range's are the two heads.
+    ///
+    /// **Bass, because bass is what a stepped design clicks on.** A design
+    /// switched in whole steps a section's `b0`, which multiplies the signal,
+    /// and a state-variable section's mix gains, which multiply its states,
+    /// and on a bass note those states are the note; the treble a step
+    /// sprays lands where a low tone has none of its own. So the tones are
+    /// 60, 100 and 220 Hz, and 997.5 Hz for what the midrange does. And the
+    /// bump's own leg: at 30 ips its bell sits at 70 Hz, so Bump and Bias are
+    /// thrown there with a 70 Hz tone on the bell, at 44.1 and 48 kHz.
+    ///
+    /// **And on silent tape, where nothing masks a step.** The hiss is the
+    /// floor every throw above is held to, and two steps sat under it: Roll's
+    /// one-pole and the record level a speed sets, each a step in the
+    /// signal's gain once a sub-block. With the hiss off they read +12.3 and
+    /// +7.2 dB on the bass tones, peaking at -98 and -110 dBFS; so Roll and
+    /// Speed are thrown again at Hiss 0 on the 60 and 100 Hz tones, under
+    /// their own ceilings there.
+    ///
+    /// **Every throw meets the tone's crest at the head.** A stage that
+    /// steps in proportion to the signal is silent at a zero crossing, and a
+    /// throw a whole second into a 1 kHz tone, two of its periods behind the
+    /// head, lands on one: the test this replaces passed a Roll that came
+    /// into circuit from a stale state (+3.3 dB, under its +6 bar), and
+    /// passes it no longer. Each segment is a whole number of every tone's
+    /// periods, and the tone is phased so its crest leaves the head on the
+    /// first throw, so it does on all three.
+    ///
+    /// **Each control's ceiling is its own**, 3 dB over the worst its throws
+    /// measured once every design moved to the next a frame at a time
+    /// ([`Ramp`]), rounded up to the whole decibel, as
+    /// `every_knob_changes_the_sound_and_by_how_much_is_pinned` pins its
+    /// floors: one shared bar sat ten decibels over most clean throws, and a
+    /// click that small was invisible under it. Every ceiling is under the
+    /// +6 dB that bar allowed.
+    ///
+    /// And the range switch fades the heads with equal power, two copies of
+    /// the tone 23 ms apart, so on the 997.5 Hz tone its level never rises
+    /// past the steady tone's by more than 3.2 dB, the 3.01 dB two copies in
+    /// step would make and a little.
+    ///
+    /// Measured, the worst throw of each control over the louder steady
+    /// state above 12 kHz: Drive -6.1 dB, Bump +0.1, Roll -2.1, Wow +0.1,
+    /// Hiss -4.0, Trim -3.1, Speed -0.4, Flutter +0.1, Rate +0.1, the wow
+    /// range +0.1, Bias +0.1, Age +0.2, Damage +0.3, and on silent tape Roll
+    /// +0.4 and Speed +0.6; the heads' fade swells the tone +2.81 dB into the
+    /// deep head and +1.82 the second time, and not at all on the way back.
+    /// With each design switched in once a sub-block, as 5.2.0 did, Bias read
+    /// +8.7 dB on the 100 Hz tone at 15 ips and +15.5 at 30 ips, Bump +10.8
+    /// at 30 ips, and on silent tape Roll +12.3 and Speed +7.2; and the stale
+    /// Roll reads +11.4.
+    #[test]
+    fn a_moving_control_never_clicks() {
+        // Each control's ceiling over the louder steady state, in dB; the
+        // worst it measured is beside it.
+        let ceilings: [(&str, f64); 13] = [
+            // -6.1 dB: a hot record level's own treble is the louder
+            // steady state.
+            ("drive", -3.0),
+            // +0.1 dB.
+            ("bump", 4.0),
+            // -2.1 dB.
+            ("roll", 1.0),
+            // +0.1 dB.
+            ("wow", 4.0),
+            // -4.0 dB: the hiss glides in under its own steady state.
+            ("hiss", 0.0),
+            // -3.1 dB.
+            ("trim", 0.0),
+            // -0.4 dB.
+            ("speed", 3.0),
+            // +0.1 dB.
+            ("flutter", 4.0),
+            // +0.1 dB.
+            ("rate", 4.0),
+            // +0.1 dB.
+            ("wow range", 4.0),
+            // +0.1 dB, at 30 ips.
+            ("bias", 4.0),
+            // +0.2 dB.
+            ("age", 4.0),
+            // +0.3 dB.
+            ("damage", 4.0),
+        ];
+        let set = |p: &mut TapeParams, k: usize, v: f32| match k {
+            0 => p.drive = v,
+            1 => p.bump = v,
+            2 => p.roll = v,
+            3 => p.wobble = v,
+            4 => p.hiss = v,
+            5 => p.trim = v,
+            6 => p.speed = v,
+            7 => p.flutter = v,
+            8 => p.rate = v,
+            9 => p.wow_range = v,
+            10 => p.bias = v,
+            11 => p.age = v,
+            _ => p.damage = v,
+        };
+        // The control at each segment's setting: the three throws.
+        let settings = [0.0_f32, 1.0, 0.0, 0.5];
+        let throws = ["0 to 1", "1 to 0", "0 to 0.5"];
+        let amp = 10.0_f64.powf(-18.0 / 20.0);
+        let mut over = Vec::new();
+        let mut swells = Vec::new();
+        // One leg: control `k` through a fresh tape at `p`, a segment at each
+        // setting in 10 ms blocks, the tone at `hz`; each throw's rise.
+        let mut leg = |sr: f32, p: &TapeParams, k: usize, hz: f64, what: &str, ceiling: f64| {
+            let srf = f64::from(sr);
+            let block = (sr / 100.0) as usize;
+            let seg = (srf * 0.4) as usize;
+            let mut unit = Tape::new(sr);
+            let crest = (seg - unit.latency_frames(p)) as f64;
+            let tone = |i: usize| (amp * (std::f64::consts::TAU * hz * (i as f64 - crest) / srf).cos()) as f32;
+            let mut heard = Vec::with_capacity(4 * seg);
+            for (s, v) in settings.iter().enumerate() {
+                let mut q = *p;
+                set(&mut q, k, *v);
+                for b in 0..seg / block {
+                    let start = s * seg + b * block;
+                    let mut buf: Vec<f32> = (start..start + block).flat_map(|i| [tone(i), tone(i)]).collect();
+                    unit.process(&mut buf, block, 2, &q);
+                    heard.extend(buf.chunks_exact(2).map(|f| f[0]));
+                }
+            }
+            // The power above 12 kHz, frame by frame, through an
+            // eighth-order high-pass run over the whole leg, so it has
+            // settled long before the first throw.
+            let mut hp = Butter::new(8, srf, 12_000.0, true);
+            let hf: Vec<f64> = heard.iter().map(|v| hp.run(f64::from(*v)).powi(2)).collect();
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            let rms = |v: &[f32]| (v.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+            let w = (sr * 0.02) as usize;
+            for (j, throw) in throws.iter().enumerate() {
+                let at = (j + 1) * seg;
+                let steady = mean(&hf[at - w..at]).max(mean(&hf[at + seg - w..at + seg]));
+                let rise = 10.0 * (mean(&hf[at..at + w]) / steady.max(1.0e-30)).log10();
+                let name = ceilings[k].0;
+                if rise > ceiling {
+                    over.push(format!(
+                        "{name} thrown {throw} on a {hz} Hz tone {what}: the 20 ms after carried {rise:+.1} dB \
+                         above 12 kHz over the louder steady state, past its {ceiling:+.0}"
+                    ));
+                }
+                if k == 9 && hz > 500.0 {
+                    let steady = rms(&heard[at - 4 * w..at]).max(rms(&heard[at + seg - 4 * w..at + seg]));
+                    let ms = (sr / 1_000.0) as usize;
+                    let worst = heard[at..at + 2 * w].chunks_exact(ms).map(|c| rms(c)).fold(0.0_f64, f64::max);
+                    swells.push((throw, 20.0 * (worst / steady).log10()));
+                }
+            }
+        };
+        let fresh = TapeParams::default();
+        for (k, (_, ceiling)) in ceilings.iter().enumerate() {
+            for hz in [60.0, 100.0, 220.0, 997.5] {
+                leg(48_000.0, &fresh, k, hz, "at 48 kHz, 15 ips", *ceiling);
+            }
+        }
+        let fast = TapeParams {
+            speed: TapeSpeed::Ips30.dial(),
+            ..TapeParams::default()
+        };
+        for sr in [44_100.0_f32, 48_000.0] {
+            for k in [1, 10] {
+                leg(sr, &fast, k, 70.0, &format!("on the bell at {sr} Hz, 30 ips"), ceilings[k].1);
+            }
+        }
+        // Silent tape, where nothing masks a step: Roll and Speed, whose
+        // steps sat under the hiss, each with its ceiling there, 3 dB over
+        // the worst it measured once it moved a frame at a time (Roll +0.4,
+        // Speed +0.6), rounded up.
+        let silent = TapeParams {
+            hiss: 0.0,
+            ..TapeParams::default()
+        };
+        for (k, ceiling) in [(2, 4.0), (6, 4.0)] {
+            for hz in [60.0, 100.0] {
+                leg(48_000.0, &silent, k, hz, "on silent tape at 48 kHz, 15 ips", ceiling);
+            }
+        }
+        assert!(over.is_empty(), "{} throws clicked:\n{}", over.len(), over.join("\n"));
+        for (throw, swell) in swells {
+            assert!(
+                swell <= 3.2,
+                "the wow range thrown {throw} swelled the tone {swell:+.2} dB through the heads' fade"
+            );
         }
     }
 }
