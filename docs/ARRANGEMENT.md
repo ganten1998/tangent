@@ -277,6 +277,26 @@ channels play back their clips and nothing else. "Ready to play" and
   block-quantised (no input-latency compensation yet); and a recorded WAV's
   tail can be one device buffer short, because the tee drains what has
   arrived when the record ends rather than waiting.
+- **Still known: a recording is not placed against delay compensation,
+  and the click is not held by it.** A desk whose plugins report a delay
+  holds every track back by the longest of them, so the whole mix plays
+  that much behind the song's own clock: a Tape in its deep wow range
+  holds it 25 ms (1,200 frames at 48 kHz), a Tape in the studio range
+  2 ms (96 frames), an IR with an impulse loaded about 11 ms (512 frames).
+  The click is a cue and is never held (the rule
+  `the_click_pays_a_lookahead_bus_uncompensated` pins), so on such a desk
+  the player hears the click that much ahead of the drums. A part is
+  recorded on the song's clock and placed where the record was pressed,
+  with nothing taken off for the hold: played in time with the backing, it
+  lands late by the hold, 25 ms behind the beat it was played to with a
+  deep-range Tape on the desk; played in time with the click, it lands on
+  the beat. The interface's own round trip comes on top, uncompensated
+  too. MIDI is placed the same way, against the press. Measured offline at
+  48 kHz, one deep-range Tape on a silent lane: the click's attack falls
+  where it does on a bare desk, the backing's beat comes out of the master
+  1,200 frames later than on a bare desk, and an impulse played into an
+  armed input on the frame that beat came out was recorded 1,200 frames
+  after it (96 with the studio range, 512 with an IR).
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip
