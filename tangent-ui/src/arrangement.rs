@@ -1370,9 +1370,13 @@ pub struct DeskSnap {
     /// `start_stop`: the tape's start and stop, the switch and its two times
     /// (`Settings::start_stop`), **as the model**, whose times are whole
     /// centiseconds so the file, the fingerprint and the field read one
-    /// number. `None` is a document from before it, and the live switch
-    /// stands: an old project must not start spinning up, or stop doing so,
-    /// because a key was added.
+    /// number. `None` is a document from before it (or one whose value is
+    /// not an object), and it opens with the switch off at the shipped
+    /// times, `StartStop::default()`, rather than with whatever stands: start
+    /// and stop is the project's and off until switched on (the owner's
+    /// ruling), no document from before it can have asked for it, and an
+    /// old project must not start spinning up because another one had it
+    /// on (`TangentApp::apply_desk_snapshot`).
     pub start_stop: Option<crate::motor::StartStop>,
     /// **The drum bus, the click, the effects return and the master**: each
     /// one's name, colour, sends, mute, solo and polarity (W5). Always said:
@@ -3267,8 +3271,9 @@ impl DeskSnap {
             }),
             // **The tape's start and stop**, through the model's setters
             // member by member (`StartStop::from_json`). Absent, or not an
-            // object, is a document that does not say, which leaves the live
-            // switch standing, as the varispeed's block above is read.
+            // object, is a document that does not say, which opens with the
+            // switch off: it is the project's, and off until switched on
+            // (`DeskSnap::start_stop`).
             start_stop: m
                 .get("start_stop")
                 .filter(|v| v.is_object())
@@ -6318,11 +6323,15 @@ mod tests {
     /// (`StartStop::to_json`), read member by member through the model's
     /// setters, so a member that is missing or of the wrong type reads as
     /// its default. A value that is not an object at all (a hand-edited 5,
-    /// a `true`, a list, a null, a word) would read the same way if it
-    /// reached the model: the shipped setting, off, and opening the file
-    /// would switch a live desk's tape start and stop off. So it never
-    /// reaches it: the desk reads as one that does not say (`None`), and
-    /// the live switch stands (`apply_desk_snapshot`).
+    /// a `true`, a list, a null, a word) is no build's writing, so it is no
+    /// opinion either: the desk reads as one that does not say (`None`).
+    /// What a desk that does not say opens with is the per-project reading,
+    /// off at the shipped times (`apply_desk_snapshot`), because start and
+    /// stop is the project's and off until switched on (the owner's ruling).
+    /// It used to leave the live switch standing instead, and a `true` would
+    /// have been read the same way as nothing; neither a stray `true` nor
+    /// another session's `on` can switch a project's motor on now. The
+    /// open's half is `a_document_that_says_nothing_of_start_and_stop_opens_with_it_off`.
     #[test]
     fn a_start_and_stop_that_is_not_an_object_says_nothing() {
         let snap = a_document_with_everything_in_it().desk.take().unwrap();

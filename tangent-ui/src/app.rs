@@ -11317,11 +11317,19 @@ impl TangentApp {
             // reason it travels as the model and not as three numbers.
             self.settings.varispeed = v;
         }
-        if let Some(v) = d.start_stop {
-            // The same: its times cannot be held outside the reach, so every
-            // value a moment or a document carries lands as it is.
-            self.settings.start_stop = v;
-        }
+        // **Tape start and stop is the PROJECT's, and off until switched
+        // on** (the owner's ruling), so a desk that does not say reads as
+        // off, not as whatever stands. Every document and template written
+        // before 5.2 says nothing of it, and none of them can have asked for
+        // it: keeping the live switch carried the motor from whichever
+        // session had it on into an old project, into a New made from an
+        // old template (the owner's own is one) and into a launch on one,
+        // and the next save wrote "on" into a document that never said it.
+        // A value that is not the model's says nothing too
+        // (`DeskSnap::from_value`). A moment always says, since the live desk
+        // always does, so undo puts back exactly what it took. Its times
+        // cannot be held outside the reach, so what is said lands as it is.
+        self.settings.start_stop = d.start_stop.unwrap_or_default();
         if let Some(c) = d.click.as_ref() {
             // 0 is "once a bar"; anything past 8 is a buzz, not a click —
             // the settings reader's own bound, in its own words.
@@ -60078,9 +60086,14 @@ mod tests {
     /// deliberately: a stale folder flag HIDES lanes, so there the harm ran
     /// the other way.)
     ///
-    /// Revert-check, performed for the tape's start and stop: read its
-    /// absence as the shipped setting in `apply_desk_snapshot` and the
-    /// session's own, on at 2 s and 4 s, is switched off by the open.
+    /// **One key is the exception, by the owner's ruling: tape start and
+    /// stop.** It is the project's and off until switched on, and no
+    /// document from before it can have asked for it, so a document that
+    /// does not say opens with it OFF, whatever the session had: the
+    /// session's own, on at 2 s and 4 s, is switched off by the open. It
+    /// used to stand like the rest, and carried the motor into every old
+    /// project opened after one that had it on (see
+    /// `a_document_that_says_nothing_of_start_and_stop_opens_with_it_off`).
     #[test]
     fn a_document_from_before_these_keys_leaves_the_live_desk_alone() {
         let root = project_scratch("deskold");
@@ -60113,9 +60126,8 @@ mod tests {
             // window of every old session, and put the header width and the
             // lane count back on AUTO (zero is AUTO for those two).
             "view",
-            // The tape's start and stop, later again. Read as the shipped
-            // setting it would switch off a session that had it on, and its
-            // Play and Stop would go back to instant on first open.
+            // The tape's start and stop, later again, and the exception: a
+            // document that does not say opens with it off (see the doc).
             "start_stop",
         ] {
             assert!(desk.remove(k).is_some(), "{k} was never written");
@@ -60172,8 +60184,8 @@ mod tests {
         assert_eq!(app.settings.quantize_fit, view_keep.4, "the warp fit was reset");
         assert_eq!(
             app.settings.start_stop,
-            crate::motor::StartStop::new(true, 2.0, 4.0),
-            "the tape's start and stop was reset"
+            crate::motor::StartStop::default(),
+            "the session's tape start and stop stood over a document that never asked for it"
         );
         // And it does not read as unsaved work merely for being old.
         assert!(
@@ -78881,6 +78893,88 @@ mod tests {").expect("the tests module")];
         assert!(app.settings.start_stop.on(), "redo did not put it back on");
         // The switch, and nothing but the switch.
         assert_eq!((app.settings.start_stop.start_cs(), app.settings.start_stop.stop_cs()), (50, 70));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A document that says nothing of start and stop opens with it off,
+    /// whatever the session before it had.**
+    ///
+    /// Start and stop is the project's and off until switched on (the
+    /// owner's ruling), and every document and template written before 5.2
+    /// says nothing of it. The live switch used to stand over one that did
+    /// not say, so once it was on anywhere, opening a 5.0 or 5.1 project,
+    /// pressing New on a 5.1 template (the owner's own is one) or launching
+    /// on one spun the desk up on Play, and the next save wrote "on" into a
+    /// document that never asked. Each road, from a session with it on at
+    /// 2 s and 4 s: a 5.1-style document opens off at the shipped times and
+    /// its next save says off; one whose value is not an object (a
+    /// hand-edited `true`) opens off as well; and a New on a 5.1-style
+    /// template is off, and the launch stands on its template by the same
+    /// road (`adopt_template`). The other way, a 5.2 document that says on,
+    /// at its own times, opens on from a session that is off, so only the
+    /// unsaid reads as off. A document with NO desk at all (a missing or
+    /// empty one, one from before the desk was written) is another thing:
+    /// it opens on the live desk whole, by `inhabit_document`'s rule, and
+    /// start and stop stands with the rest of that desk, as the export
+    /// corpus's documents rely on.
+    #[test]
+    fn a_document_that_says_nothing_of_start_and_stop_opens_with_it_off() {
+        use crate::motor::StartStop;
+        let root = project_scratch("startstop-unsaid");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // The shipped desk, saying start and stop as given: `None` writes no
+        // key at all, which is how a 5.1 document or template reads.
+        let write = |dir: &std::path::Path, start_stop: Option<StartStop>| {
+            std::fs::create_dir_all(dir.join("media")).expect("a project folder");
+            let mut desk = TangentApp::template_desk();
+            desk.start_stop = start_stop;
+            let mut arr = crate::arrangement::Arrangement::default();
+            arr.desk = Some(desk);
+            let doc = crate::arrangement::doc_in(dir);
+            arr.save_to(&doc);
+            doc
+        };
+        let on = StartStop::new(true, 2.0, 4.0);
+        let old = write(&root.join("Old"), None);
+        let text = std::fs::read_to_string(&old).expect("the old document");
+        assert!(!text.contains("start_stop"), "fixture: the 5.1-style document says start and stop");
+        app.settings.start_stop = on;
+        app.open_project(&old);
+        assert_eq!(app.settings.start_stop, StartStop::default(), "a 5.1 document opened with the last session's start and stop");
+        assert_eq!(
+            TangentApp::desk_snapshot_of(&app.settings).start_stop,
+            Some(StartStop::default()),
+            "the next save would not write off into the 5.1 document"
+        );
+        let odd = write(&root.join("Odd"), None);
+        let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&odd).expect("read")).expect("json");
+        value
+            .get_mut("desk")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("a desk")
+            .insert("start_stop".into(), serde_json::json!(true));
+        std::fs::write(&odd, serde_json::to_string(&value).expect("json")).expect("write");
+        app.settings.start_stop = on;
+        app.open_project(&odd);
+        assert_eq!(app.settings.start_stop, StartStop::default(), "a start_stop of true switched the project's motor on");
+        let template = root.join("Templates").join("old");
+        write(&template, None);
+        app.settings.start_stop = on;
+        app.adopt_template(&template, &root.join("Projects").join("Untitled 2"));
+        assert_eq!(app.settings.start_stop, StartStop::default(), "a New on a 5.1 template kept the last session's start and stop");
+        let bare = root.join("Bare");
+        std::fs::create_dir_all(bare.join("media")).expect("a bare project");
+        let bare = crate::arrangement::doc_in(&bare);
+        crate::arrangement::Arrangement::default().save_to(&bare);
+        assert!(crate::arrangement::Arrangement::load_from(&bare).desk.is_none(), "fixture: the bare document has a desk");
+        app.settings.start_stop = on;
+        app.open_project(&bare);
+        assert_eq!(app.settings.start_stop, on, "a document with no desk did not open on the live desk whole");
+        let said = write(&root.join("New"), Some(StartStop::new(true, 1.5, 3.0)));
+        app.settings.start_stop = StartStop::default();
+        app.open_project(&said);
+        assert_eq!(app.settings.start_stop, StartStop::new(true, 1.5, 3.0), "a document that says on did not open on");
         let _ = std::fs::remove_dir_all(&root);
     }
 
