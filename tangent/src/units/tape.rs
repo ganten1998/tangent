@@ -44,7 +44,8 @@
 //! record, at four times the session rate: a bias-linearised tanh with the
 //! refused flux fed back → the repro line-up → both shelves' exact inverses →
 //! the bias's own treble shelf ([`BIAS_RANGE_DB`]) → HF self-erasure (the
-//! envelope-driven corner above) → the tape: a short Hermite-interpolated play head swayed by
+//! envelope-driven corner above) → the tape: a short play head, read between
+//! samples through sixteen taps ([`READ_TAPS`]), swayed by
 //! the transport's parts ([`Transport`]: Wow's reel, pinch roller and drift,
 //! Flutter's guides, capstan, the tape's own resonance and a whisper of
 //! scrape, their depths noise-modulated and the head's travel shared out
@@ -732,7 +733,8 @@ const ERASE_RELEASE_MS: f32 = 80.0;
 /// come to [`BASE_MS`] (or [`DEEP_MS`]) and that is what the host is told.
 /// The studio head may sway [`STUDIO_TRAVEL_MS`] either way of its rest,
 /// which is more than a fresh machine asks for at any speed, and the deep
-/// head [`DEEP_TRAVEL_MS`]; the line holds both at any rate the tape can be
+/// head [`DEEP_TRAVEL_MS`], each short of the read's reach from the record
+/// head ([`READ_REACH`]); the line holds both at any rate the tape can be
 /// built at.
 const LINE_MS: f32 = 50.0;
 const BASE_MS: f32 = 2.0;
@@ -892,11 +894,17 @@ const DRIFT_POLE_S: f64 = 1.0;
 ///
 /// The head may move [`STUDIO_TRAVEL_MS`] either way of its rest, and the
 /// governor shares that between the parts once the per-channel noise has
-/// its reserve. And the parts' excursions may grow or shrink, all together,
-/// by at most [`STUDIO_SLEW`] of a sample per sample, 0.3 % of the speed,
-/// shared equally by the head's [`STUDIO_PARTS`]: so an automated depth, Rate
-/// or Speed bends the pitch at most 0.3 % past what either setting does on
-/// its own. A Wow thrown from 0 to 1 at 15 ips develops over about a second.
+/// its reserve. At 44.1 kHz the head rests only 44 samples back, and the
+/// play head's read must stay [`READ_REACH`] samples behind the record
+/// head, so there it may move 36 samples, 0.82 ms ([`studio_travel`]): a
+/// fresh machine still asks for less at every speed, and where Wow and
+/// Flutter at their tops ask for more, the governor sheds about a tenth
+/// more of it at 44.1 kHz than at 48 and up. And the parts' excursions may
+/// grow or shrink, all together, by at most [`STUDIO_SLEW`] of a sample per
+/// sample, 0.3 % of the speed, shared equally by the head's
+/// [`STUDIO_PARTS`]: so an automated depth, Rate or Speed bends the pitch at
+/// most 0.3 % past what either setting does on its own. A Wow thrown from 0
+/// to 1 at 15 ips develops over about a second.
 const STUDIO_TRAVEL_MS: f64 = 0.90;
 const STUDIO_SLEW: f64 = 0.003;
 const STUDIO_PARTS: usize = 7;
@@ -1804,47 +1812,216 @@ fn makeup_at(table: &[f32; MAKEUP_POINTS], log2_d: f64) -> f32 {
 ///
 /// `saturating_sub` and the floor are for a rate so low that the delay is
 /// shorter than the filter pair. 8 kHz is the lowest a tape can be built at
-/// and no engine runs there, but a kernel does not get to assume that, and a
-/// head at least four samples deep is what [`tap`] needs to interpolate at
-/// all. The rate is floored as [`Tape::new`] floors it, so a seat that asks
-/// this of the session rate gets the head the kernel built.
+/// and no engine runs there, but a kernel does not get to assume that: the
+/// floor is the play head's reach ([`READ_REACH`]) and two samples of
+/// travel, so a head always has the samples its read takes, and sways two
+/// samples either way, as far as the four-sample floor Hermite needed let
+/// it. Only 22.05 kHz and under ever meet it. The rate is floored as
+/// [`Tape::new`] floors it, so a seat that asks this of the session rate
+/// gets the head the kernel built.
 fn head_rest(sample_rate: f32, ms: f32) -> usize {
     ((ms * 1.0e-3 * sample_rate.max(8_000.0)).round() as usize)
         .saturating_sub(OS_LATENCY)
-        .max(4)
+        .max(READ_REACH + 2)
 }
 
-/// Four-point third-order Hermite, the polynomial from `varispeed.rs`.
+/// **The play head reads between samples through sixteen taps**: one row of
+/// them for every 256th of a sample ([`READ_PHASES`]), and the two rows either
+/// side of where the head stands blended in a straight line.
 ///
-/// The echo reads its tape with linear interpolation and gets away with it
-/// because every repeat is also low-passed; this path is heard ONCE and
-/// wide open, and linear interpolation's error is a lowpass whose corner
-/// moves with the sway — a dullness that breathes. Hermite is two more
-/// multiplies and flat enough that what you hear is the wow, not the
-/// arithmetic.
-#[inline]
-fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
-    let c0 = y1;
-    let c1 = 0.5 * (y2 - y0);
-    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-    ((c3 * t + c2) * t + c1) * t + c0
+/// The head sways, so where it reads between two samples moves all the
+/// time, and whatever the read does to the top of the band it does in time
+/// with the sway. 5.0 to 5.2 read it with four-point Hermite, and Hermite
+/// half way between two samples is the filter `[-1, 9, 9, -1] / 16`: 4.6 dB
+/// down at 16 kHz at 44.1 kHz, and 8.4 dB down at 20 kHz at 48. The default
+/// sway crosses a whole sample forty to fifty times a second, so a 16 kHz
+/// tone's level swung 4.6 dB at 44.1 kHz, 3.3 at 48 and 0.2 at 96, white
+/// noise came out 1.8 dB dull at 16 kHz at 44.1 and 2.6 at 20 kHz at 48, and
+/// the machine was not the same machine at every rate. That is the dullness
+/// that breathes which Hermite was brought in to cure in linear
+/// interpolation, an octave higher. Sixteen taps put it above the band: see
+/// [`READ_FIT`] for the rows and what they measure.
+///
+/// **A head parked on a whole sample hands it through untouched.** Row 0 is
+/// a unit impulse, exactly (one tap of one and fifteen of zero, not a fit
+/// that comes close), and the last row the same impulse one sample on, so a
+/// still tape reads its samples bit for bit as Hermite read them at no
+/// fraction, and a head crossing a whole sample meets the same read from
+/// either side. The kernel is centred: its sixteen taps reach seven samples
+/// newer than the whole sample the head stands behind and eight older, so
+/// its delay is the head's and nothing more, and the latency the host is told
+/// is the one it was told before.
+///
+/// **What a read costs**: the multiply that finds the row, two dot products
+/// of sixteen and the blend, 34 multiply-adds in all and no division or
+/// modulo, the window one contiguous slice ([`Line`]) and each row sixteen
+/// contiguous floats, the second straight after the first, for the vector
+/// path. Hermite was about ten, and four modulos.
+const READ_TAPS: usize = 16;
+const READ_PHASES: usize = 256;
+
+/// **How close to the record head a play head may read**, in samples: the
+/// seven samples newer than its whole sample that [`READ_TAPS`] reach, and
+/// one more, as the four-point read kept one sample past its own reach. The
+/// clamp in [`Tape::heads`] holds every head at least this deep and at least
+/// this far from the far end of the line, and the budget each head sways
+/// within ([`studio_travel`], [`deep_travel`]) is its rest less this, so the
+/// governor never plans a sway the read cannot take.
+const READ_REACH: usize = READ_TAPS / 2;
+
+/// **The read's rows, as the least-squares fit to an exact delay**: for each
+/// fraction, the sixteen taps whose response is nearest, in the mean, to a
+/// delay of exactly that fraction, weighted by where in the band an error is
+/// heard (`(from, to, weight)` in fractions of Nyquist), and held to read any
+/// quadratic exactly, as Hermite did: the taps sum to one, and their first
+/// and second moments are the head's fraction and its square. So the bass
+/// never breathes with the sway, and a slow signal reads as truly as it did.
+///
+/// **Where the weights are.** Ten thousand under 0.3 of Nyquist, where a
+/// fractional delay is easy and the ear is sharpest, ten to 0.75, and one to
+/// 0.92, with nothing asked above it: every row of sixteen taps half a
+/// sample along must fall to nothing at Nyquist, and the space above 0.92
+/// (20.3 kHz at 44.1, 22.1 kHz at 48) is where it does. A windowed sinc of
+/// the same length was the expected shape and was measured first: at the
+/// window that held 20 kHz at 48 kHz, its ripple put 0.13 dB on a 5 kHz tone
+/// at 96 kHz where Hermite put 0.01, and 0.08 dB on 3 kHz noise at 44.1.
+/// These rows read a tone closer to its exact delay than Hermite did at
+/// every frequency measured from 1 to 20 kHz at 44.1, 48 and 96 kHz, by
+/// 9 dB at the least: the error is 105 dB under a 1 kHz tone at 44.1 kHz
+/// where Hermite's was 87, and 51 under a 10 kHz tone where Hermite's was
+/// 22.
+///
+/// Measured through the machine, white noise at the default sway against
+/// the parked head, in third octaves: -0.02, -0.00, +0.02 and +0.08 dB at
+/// 8, 10, 12.5 and 16 kHz at 44.1 kHz (Hermite -0.18, -0.39, -0.83 and
+/// -1.76), +0.03, -0.01 and +0.13 at 12.5, 16 and 20 kHz at 48 (Hermite
+/// -0.68, -1.50 and -2.56), and within 0.02 at 96 (Hermite to -0.31); and
+/// a 16 kHz tone's level swings 0.07, 0.13 and 0.03 dB at 44.1, 48 and
+/// 96 kHz (Hermite 4.62, 3.25 and 0.23), a 12.5 kHz tone's 0.12, 0.08 and
+/// 0.01 (Hermite 1.76, 1.25 and 0.09). Design time only: [`read_kernel`]
+/// solves it once in [`Tape::new`].
+const READ_FIT: [(f64, f64, f64); 3] = [(0.0, 0.3, 10_000.0), (0.3, 0.75, 10.0), (0.75, 0.92, 1.0)];
+
+/// The read's rows: [`READ_PHASES`] of them and one more, row `k` the taps
+/// for a head `k / READ_PHASES` of a sample past its whole sample, taps
+/// newest first.
+type ReadKernel = [[f32; READ_TAPS]; READ_PHASES + 1];
+
+/// **Design the read's rows** ([`READ_FIT`]), once, in [`Tape::new`].
+///
+/// The fit's normal equations are a Gram matrix that depends only on how far
+/// apart two taps are, the same for every row, so it is factored once
+/// (Cholesky: it is symmetric and positive definite, every weight being
+/// positive) and each row costs a right-hand side and two triangular solves.
+/// The three moments are Lagrange multipliers on top, and their matrix is
+/// the same for every row too: with `A v = b` the plain fit, `C` the moments'
+/// rows (each tap's offset to the powers 0, 1 and 2) and `A U = C^T`, the
+/// held fit is `v - U M^-1 (C v - c)` for `M = C U` and `c = (1, mu, mu^2)`.
+/// Rows 0 and [`READ_PHASES`] are not solved but written: the unit impulses
+/// the read promises.
+fn read_kernel() -> Box<ReadKernel> {
+    const N: usize = READ_TAPS;
+    /// Factor a symmetric positive definite matrix, `A = L L^T`.
+    fn cholesky<const K: usize>(a: impl Fn(usize, usize) -> f64) -> [[f64; K]; K] {
+        let mut l = [[0.0_f64; K]; K];
+        for i in 0..K {
+            for j in 0..=i {
+                let s = a(i, j) - (0..j).map(|k| l[i][k] * l[j][k]).sum::<f64>();
+                l[i][j] = if i == j { s.max(f64::MIN_POSITIVE).sqrt() } else { s / l[j][j] };
+            }
+        }
+        l
+    }
+    /// Solve `L L^T x = b`.
+    fn solve<const K: usize>(l: &[[f64; K]; K], b: [f64; K]) -> [f64; K] {
+        let mut y = [0.0_f64; K];
+        for i in 0..K {
+            y[i] = (b[i] - (0..i).map(|k| l[i][k] * y[k]).sum::<f64>()) / l[i][i];
+        }
+        let mut x = [0.0_f64; K];
+        for i in (0..K).rev() {
+            x[i] = (y[i] - (i + 1..K).map(|k| l[k][i] * x[k]).sum::<f64>()) / l[i][i];
+        }
+        x
+    }
+    // Each tap's delay past the whole sample: seven newer, eight older.
+    let offset = |k: usize| k as f64 - (N / 2 - 1) as f64;
+    // The weighted integral of `cos(w d)` over the fit's bands.
+    let gram = |d: f64| -> f64 {
+        READ_FIT
+            .iter()
+            .map(|&(from, to, weight)| {
+                let (a, b) = (from * std::f64::consts::PI, to * std::f64::consts::PI);
+                weight * if d == 0.0 { b - a } else { ((b * d).sin() - (a * d).sin()) / d }
+            })
+            .sum()
+    };
+    let l: [[f64; N]; N] = cholesky(|i, j| gram(offset(i) - offset(j)));
+    let u: [[f64; N]; 3] = std::array::from_fn(|j| solve(&l, std::array::from_fn(|k| offset(k).powi(j as i32))));
+    let moment = |j: usize, h: &[f64; N]| (0..N).map(|k| offset(k).powi(j as i32) * h[k]).sum::<f64>();
+    let m: [[f64; 3]; 3] = cholesky(|i, j| moment(i, &u[j]));
+    let mut rows = Box::new([[0.0_f32; N]; READ_PHASES + 1]);
+    rows[0][N / 2 - 1] = 1.0;
+    rows[READ_PHASES][N / 2] = 1.0;
+    for (p, row) in rows.iter_mut().enumerate().take(READ_PHASES).skip(1) {
+        let mu = p as f64 / READ_PHASES as f64;
+        let v = solve(&l, std::array::from_fn(|k| gram(offset(k) - mu)));
+        let lambda = solve(&m, std::array::from_fn(|j| moment(j, &v) - mu.powi(j as i32)));
+        for (k, t) in row.iter_mut().enumerate() {
+            *t = (v[k] - (0..3).map(|j| u[j][k] * lambda[j]).sum::<f64>()) as f32;
+        }
+    }
+    rows
 }
 
-/// Read `delay` samples behind `at`, Hermite-interpolated. `delay` must be
-/// clamped by the caller to `2.0..=(len - 4)`, which `process` does.
-#[inline]
-fn tap(buf: &[f32], at: usize, delay: f32) -> f32 {
-    let n = buf.len();
-    let whole = delay as usize;
-    let frac = delay - whole as f32;
-    // `+ n` before the subtraction: `at` is smaller than `whole` for the
-    // first pass through the buffer, and this is unsigned.
-    let i1 = (at + n - whole) % n;
-    let i0 = (i1 + 1) % n;
-    let i2 = (i1 + n - 1) % n;
-    let i3 = (i1 + n - 2) % n;
-    hermite(buf[i0], buf[i1], buf[i2], buf[i3], frac)
+/// **One track of tape**: a ring of samples, newest first, every sample
+/// written twice, `len` apart, as [`History`] writes its own, so the sixteen
+/// samples a read takes are always one slice and no read divides. Made in
+/// [`Tape::new`] at the line's length; writing, reading and clearing it
+/// allocate nothing.
+struct Line {
+    z: Vec<f32>,
+    pos: usize,
+    len: usize,
+}
+
+impl Line {
+    fn new(len: usize) -> Self {
+        Self {
+            z: vec![0.0; 2 * len],
+            pos: 0,
+            len,
+        }
+    }
+
+    /// The record head writes the frame's sample.
+    #[inline]
+    fn push(&mut self, x: f32) {
+        self.pos = if self.pos == 0 { self.len - 1 } else { self.pos - 1 };
+        self.z[self.pos] = x;
+        self.z[self.pos + self.len] = x;
+    }
+
+    /// Read `delay` samples behind the newest, through the read's rows
+    /// ([`READ_TAPS`]). `delay` must be held by the caller to
+    /// `READ_REACH..=(len - READ_REACH - 2)`, which [`Tape::heads`] does.
+    #[inline]
+    fn read(&self, rows: &ReadKernel, delay: f32) -> f32 {
+        let whole = delay as usize;
+        let x = (delay - whole as f32) * READ_PHASES as f32;
+        let k = (x as usize).min(READ_PHASES - 1);
+        let t = x - k as f32;
+        let from = self.pos + whole - (READ_TAPS / 2 - 1);
+        let w = &self.z[from..from + READ_TAPS];
+        let a = dot(&rows[k], w);
+        let b = dot(&rows[k + 1], w);
+        fma(t, b - a, a)
+    }
+
+    fn clear(&mut self) {
+        self.z.fill(0.0);
+        self.pos = 0;
+    }
 }
 
 /// The matched one-pole low-pass for a corner of `fc` hertz: the `b` of
@@ -2480,9 +2657,19 @@ fn govern(asked: &[f64; STUDIO_PARTS], room: f64) -> [f64; STUDIO_PARTS] {
 }
 
 /// The studio head's travel either way of its rest, in samples, for a tape
-/// built at `sr` whose head rests `base` samples back.
+/// built at `sr` whose head rests `base` samples back: [`STUDIO_TRAVEL_MS`],
+/// or the rest less the play head's reach ([`READ_REACH`]) where that is
+/// shorter, which it is at 44.1 kHz (36 samples, 0.82 ms) and under.
 fn studio_travel(sr: f64, base: usize) -> f64 {
-    (STUDIO_TRAVEL_MS * 1.0e-3 * sr).min(base as f64 - 2.0).max(0.0)
+    (STUDIO_TRAVEL_MS * 1.0e-3 * sr).min(base as f64 - READ_REACH as f64).max(0.0)
+}
+
+/// The deep head's travel either way of its rest, in samples, for a tape
+/// built at `sr` whose deep head rests `base_deep` samples back:
+/// [`DEEP_TRAVEL_MS`], or the rest less the play head's reach where that is
+/// shorter, which only the 8 kHz floor ever meets.
+fn deep_travel(sr: f64, base_deep: usize) -> f64 {
+    (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(base_deep as f64 - READ_REACH as f64).max(0.0)
 }
 
 /// The resonance's two-pole at `sr`, `[c1, c2]`, and how much its output,
@@ -2725,7 +2912,7 @@ impl Transport {
             cas_given: [0.0; 3],
             cas_slew: (DEEP_SLEW - 4.0 * STUDIO_SLEW / STUDIO_PARTS as f64) / 3.0,
             cas_breath: 1.0,
-            deep_travel: (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(base_deep as f64 - 2.0).max(0.0),
+            deep_travel: deep_travel(sr, base_deep),
             deep_room: 0.0,
             belt_rng: BELT_SEED,
             belt_hold: 0,
@@ -2885,10 +3072,13 @@ impl Transport {
     /// what Flutter's shared parts were given on the studio head, which ride
     /// this one too; were the cassette ever to ask for more, the slowest of
     /// its parts would give way first, the belt, then the pack, then the
-    /// roller. It never does: at full Wow and the bottom of Rate it asks for
-    /// 19.3 ms, and the least room the head is ever left, at 3.75 ips with
-    /// Flutter, Hiss, Age and Damage at their tops and Bias at its bottom,
-    /// is 21.4 ms.
+    /// roller. At any rate an engine runs at it never does: at full Wow and
+    /// the bottom of Rate it asks for 19.3 ms, and the least room the head
+    /// is ever left, at 3.75 ips with Flutter, Hiss, Age and Damage at their
+    /// tops and Bias at its bottom, is 21.4 ms. Only at the 8 kHz floor,
+    /// where the deep head rests 19.5 ms back and its travel stops the
+    /// read's reach short of the record head, is it 18.2 ms, and there the
+    /// belt gives way first.
     fn design_cassette(&mut self, r: f64, reserve: f64) {
         let sr = self.sample_rate;
         for k in 0..2 {
@@ -3363,13 +3553,15 @@ pub struct Tape {
     /// switch fades between the heads), which is why the transport's sway
     /// below is shared; only the modulation noise, which is each track's own
     /// grain, differs between them.
-    line: [Vec<f32>; 2],
-    at: usize,
+    line: [Line; 2],
+    /// The play head's read, its rows designed here ([`read_kernel`]) and
+    /// shared by both tracks and both heads.
+    read: Box<ReadKernel>,
     /// The studio head's rest position in whole samples, and the deep
-    /// head's. Whole on purpose: with Wow, Flutter and Hiss at zero the tap
-    /// interpolates at exactly zero fraction and hands samples through
-    /// untouched. Shortened by [`OS_LATENCY`], for the reason [`BASE_MS`]
-    /// gives.
+    /// head's. Whole on purpose: with Wow, Flutter and Hiss at zero the head
+    /// reads at exactly zero fraction, whose row is a unit impulse, and hands
+    /// samples through untouched. Shortened by [`OS_LATENCY`], for the reason
+    /// [`BASE_MS`] gives.
     base: usize,
     base_deep: usize,
     /// The two heads' share of what is heard, as the cosine and sine of an
@@ -3435,11 +3627,6 @@ pub struct Tape {
     /// way, while it carried weight, in samples: what the travel test reads.
     #[cfg(test)]
     deepest: [f32; 2],
-    /// Holds an aged head's gap square to the tracks in time, so neither
-    /// track is read between samples for the skew: what lets a test hear
-    /// Age's spacing without the play head's interpolation on top.
-    #[cfg(test)]
-    square_head: bool,
     // Per-rate coefficients, fixed at construction: the sample rate is, too,
     // per the house law.
     a_att: f32,
@@ -3590,8 +3777,8 @@ impl Tape {
         let step = |ms: f64| 1.0 - (-1.0 / (rate * ms * 1.0e-3)).exp();
         Self {
             sample_rate: sr,
-            line: [vec![0.0; cap], vec![0.0; cap]],
-            at: 0,
+            line: [Line::new(cap), Line::new(cap)],
+            read: read_kernel(),
             base,
             base_deep,
             fade: 0.0,
@@ -3626,8 +3813,6 @@ impl Tape {
             clamp_hits: 0,
             #[cfg(test)]
             deepest: [0.0; 2],
-            #[cfg(test)]
-            square_head: false,
             a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
             a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
             a_glide: step(GLIDE_MS),
@@ -3983,10 +4168,6 @@ impl Tape {
             self.wear_step();
         }
         self.wear.tick();
-        #[cfg(test)]
-        if self.square_head {
-            return 0.0;
-        }
         let along = ((self.frame - 1) % WEAR_STEP + 1) as f64 / WEAR_STEP as f64;
         (self.skew_from + (self.skew_to - self.skew_from) * along) as f32
     }
@@ -4151,10 +4332,11 @@ impl Tape {
     /// and on the deep head, in samples (the transport's sway for that head,
     /// shared, plus the track's own modulation noise and its share of the
     /// azimuth's `skew`, the left late and the right early, held inside the
-    /// line and counted when it had to be), and the two heads' shares of what is
-    /// heard. The range's crossfade turns a step here every frame; a head
-    /// that carries no weight is neither placed nor counted, and once the
-    /// deep head has faded out its cassette stops, reset silent.
+    /// line, [`READ_REACH`] from either end, and counted when it had to be),
+    /// and the two heads' shares of what is heard. The range's crossfade
+    /// turns a step here every frame; a head that carries no weight is
+    /// neither placed nor counted, and once the deep head has faded out its
+    /// cassette stops, reset silent.
     #[inline]
     fn heads(&mut self, skew: f32) -> ([[f32; 2]; 2], [f32; 2]) {
         self.transport.tick();
@@ -4196,7 +4378,7 @@ impl Tape {
         let sways = [self.transport.sway as f32, self.transport.deep_sway as f32];
         let rests = [self.base as f32, self.base_deep as f32];
         let weights = self.fade_w.map(|w| w as f32);
-        let last = (self.line[0].len() - 4) as f32;
+        let last = (self.line[0].len - READ_REACH - 2) as f32;
         let mut delays = [[0.0_f32; 2]; 2];
         for h in 0..2 {
             if weights[h] == 0.0 {
@@ -4204,7 +4386,7 @@ impl Tape {
             }
             for ((d, j), s) in delays[h].iter_mut().zip(jitter).zip([skew, -skew]) {
                 let want = rests[h] + sways[h] + j + s;
-                let held = want.clamp(2.0, last);
+                let held = want.clamp(READ_REACH as f32, last);
                 if held != want {
                     self.clamp_hits += 1;
                 }
@@ -4229,7 +4411,6 @@ impl Tape {
         debug_assert!(buf.len() >= frames * channels);
         self.aim(p);
         let roll_wanted = norm(p.roll) > 1.0e-3;
-        let n = self.line[0].len();
         let e_scale = (ERASE_POINTS - 1) as f32 / ERASE_CLAMP as f32;
         for i in 0..frames {
             let f = i * channels;
@@ -4315,17 +4496,17 @@ impl Tape {
                 let k = (e as usize).min(ERASE_POINTS - 2);
                 let b = self.erase[k] + (self.erase[k + 1] - self.erase[k]) * (e - k as f32);
                 self.erase_lp[ch] = flush(y + b * (self.erase_lp[ch] - y));
-                self.line[ch][self.at] = self.erase_lp[ch];
+                self.line[ch].push(self.erase_lp[ch]);
 
                 // The play head, swaying, and the head's own top. Both heads
                 // are read only while a range switch fades between them.
+                let line = &self.line[ch];
                 let v = if deep == 0.0 {
-                    tap(&self.line[ch], self.at, delays[0][ch])
+                    line.read(&self.read, delays[0][ch])
                 } else if studio == 0.0 {
-                    tap(&self.line[ch], self.at, delays[1][ch])
+                    line.read(&self.read, delays[1][ch])
                 } else {
-                    studio * tap(&self.line[ch], self.at, delays[0][ch])
-                        + deep * tap(&self.line[ch], self.at, delays[1][ch])
+                    studio * line.read(&self.read, delays[0][ch]) + deep * line.read(&self.read, delays[1][ch])
                 };
                 self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
                 let mut v = self.top[ch];
@@ -4372,11 +4553,6 @@ impl Tape {
                 buf[f + ch] = v * trim_gain;
             }
             self.spacing_fresh = false;
-
-            self.at += 1;
-            if self.at >= n {
-                self.at = 0;
-            }
         }
     }
 
@@ -4386,9 +4562,8 @@ impl Tape {
     /// controls.
     pub fn clear(&mut self) {
         for l in &mut self.line {
-            l.fill(0.0);
+            l.clear();
         }
-        self.at = 0;
         self.transformer = [OnePole::default(); 2];
         self.nab_in = [0.0; 2];
         self.nab_out = [0.0; 2];
@@ -4831,7 +5006,7 @@ fn turning_parts(p: &TapeParams) -> ([Turning; 7], usize, f64) {
             CASSETTE_DEPTH * CASSETTE_SHARE[1] * dial / (tau * cassette_hz[1] / sr),
         ];
         let shared: f64 = [GUIDES, CAPSTAN, RESONANCE, SCRAPE].iter().map(|&j| asked[j] * keep[j]).sum();
-        let travel = (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(head_rest(sr as f32, DEEP_MS) as f64 - 2.0);
+        let travel = deep_travel(sr, head_rest(sr as f32, DEEP_MS));
         let mut over = want.iter().sum::<f64>() - (travel - reserve - shared).max(0.0);
         let limit = CASSETTE_BREATH * tau * cassette_hz[0] * DEPTH_WANDER.1 / span;
         for (j, w) in want.iter().enumerate() {
@@ -6950,6 +7125,185 @@ mod tests {
         }
     }
 
+    /// **The swaying head keeps the top octave, the same at every rate.**
+    ///
+    /// At the defaults the head sways about nine samples either way, so
+    /// where it reads between two samples sweeps through every fraction forty
+    /// to fifty times a second, and whatever the read does to the top of the
+    /// band it does in time with the sway. 5.2's Hermite read made that a
+    /// dullness: white noise through the default sway, against the same tape
+    /// with its head parked, came out nearly 2 dB down at 16 kHz at 44.1 kHz
+    /// and over 2.5 at 20 kHz at 48, and a third of a decibel at 96, so the
+    /// machine was not the same machine at every rate.
+    ///
+    /// So the same noise at -20 dBFS, Drive, Hiss and Bump off so that only
+    /// the moving head differs, three seconds of it, is read in third
+    /// octaves from 1 kHz to the top of the band, 16 kHz at 44.1 kHz and
+    /// 20 kHz at 48 and 96: every third octave the swaying head plays is
+    /// within a quarter of a decibel of the parked head's, and what the sway
+    /// costs it at 44.1 and 48 kHz is within a quarter of a decibel of what
+    /// it costs the same third octave at 96. Measured: -0.02, -0.00, +0.02
+    /// and +0.08 dB at 8 to 16 kHz at 44.1 kHz, -0.02, -0.02, +0.03, -0.01
+    /// and +0.13 at 8 to 20 kHz at 48, -0.02 at worst at 96, and every third
+    /// octave under 8 kHz within a hundredth; the sway moves 16 kHz 0.09 dB
+    /// further from the parked head at 44.1 than at 96, and 20 kHz 0.15
+    /// further at 48. With Hermite put back: -0.39, -0.83 and -1.76 dB at
+    /// 10, 12.5 and 16 kHz at 44.1, -2.56 at 20 kHz at 48, and -0.31 at 96.
+    #[test]
+    fn the_swaying_head_keeps_the_top_octave_at_every_rate() {
+        let costs = |sr: f32| -> Vec<(f64, f64)> {
+            let frames = (sr * 3.0) as usize;
+            let mut seed = 0x7071_0001_u32;
+            let mono: Vec<f32> = (0..frames).map(|_| 0.1 * 3.0_f32.sqrt() * white(&mut seed)).collect();
+            let swaying = TapeParams {
+                drive: 0.0,
+                hiss: 0.0,
+                bump: 0.0,
+                ..TapeParams::default()
+            };
+            let parked = TapeParams {
+                wobble: 0.0,
+                flutter: 0.0,
+                ..swaying
+            };
+            let [still, moving] = [parked, swaying].map(|p| left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p)));
+            let top = if sr < 48_000.0 { 16_000.0 } else { 20_000.0 };
+            [1_000.0, 2_000.0, 4_000.0, 8_000.0, 10_000.0, 12_500.0, 16_000.0, 20_000.0]
+                .into_iter()
+                .filter(|f| *f <= top)
+                .map(|f| {
+                    let power = |x: &[f32]| band_power(x, sr.into(), f / 1.12, f * 1.12, (sr * 0.25) as usize);
+                    (f, 10.0 * (power(&moving) / power(&still)).log10())
+                })
+                .collect()
+        };
+        let at_96k = costs(96_000.0);
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            let here = costs(sr);
+            for (f, cost) in &here {
+                assert!(
+                    cost.abs() <= 0.25,
+                    "at {sr} Hz the swaying head plays the {f} Hz third octave {cost:+.3} dB off the \
+                     parked head's (every third octave: {here:.3?})"
+                );
+                let (_, there) = at_96k.iter().find(|(g, _)| g == f).expect("96 kHz reads every third octave");
+                assert!(
+                    (cost - there).abs() <= 0.25,
+                    "the sway costs the {f} Hz third octave {cost:+.3} dB at {sr} Hz and {there:+.3} \
+                     at 96 kHz"
+                );
+            }
+        }
+    }
+
+    /// **A high tone holds its level while the head sways.**
+    ///
+    /// The same fault, heard on a tone: Hermite half way between two samples
+    /// is 4.6 dB down at 16 kHz at 44.1 kHz, so as the default sway took the
+    /// head's fraction from nothing to a half and back, forty times a
+    /// second, a 16 kHz tone's level swung 4.62 dB at 44.1 kHz, 3.25 at 48
+    /// and 0.23 at 96, and a 12.5 kHz tone's 1.76, 1.25 and 0.09: a treble
+    /// that flickers with the wow. So a tone at -30 dBFS through the default
+    /// sway, Drive, Hiss and Bump off, is read in 5 ms windows across two
+    /// seconds: at 44.1 and 48 kHz a 16 kHz tone's level swings half a
+    /// decibel at most and a 12.5 kHz tone's 0.3, and at 96 kHz, where both
+    /// sit far inside the band the read holds flat, a twentieth of a decibel
+    /// at most. Measured: 0.07 and 0.12 dB at 16 and 12.5 kHz at 44.1 kHz,
+    /// 0.13 and 0.08 at 48, 0.03 and 0.01 at 96 (a parked head's window
+    /// alone swings a 16 kHz tone 0.05 dB at 44.1 kHz, its 5 ms not being a
+    /// whole number of periods); with Hermite put back, 4.62 and 1.76, 3.25
+    /// and 1.25, 0.23 and 0.09.
+    #[test]
+    fn a_high_tone_holds_its_level_while_the_head_sways() {
+        let p = TapeParams {
+            drive: 0.0,
+            hiss: 0.0,
+            bump: 0.0,
+            ..TapeParams::default()
+        };
+        let amp = 10.0_f32.powf(-30.0 / 20.0) * std::f32::consts::SQRT_2;
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            for (hz, most) in [(12_500.0, 0.3), (16_000.0, 0.5)] {
+                let frames = (sr * 3.0) as usize;
+                let mono: Vec<f32> = (0..frames)
+                    .map(|i| amp * (std::f64::consts::TAU * hz * i as f64 / f64::from(sr)).sin() as f32)
+                    .collect();
+                let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
+                let window = (sr * 0.005) as usize;
+                let levels: Vec<f64> = out[sr as usize..].chunks_exact(window).map(rms).collect();
+                let (lo, hi) = levels.iter().fold((f64::MAX, 0.0_f64), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                let swing = db(hi / lo);
+                let most = if sr > 48_000.0 { 0.05 } else { most };
+                assert!(
+                    swing <= most,
+                    "at {sr} Hz a {hz} Hz tone's level swings {swing:.3} dB as the head sways, past {most}"
+                );
+            }
+        }
+    }
+
+    /// **A head parked on a whole sample hands it through untouched.**
+    ///
+    /// A still tape sits on whole samples ([`Tape::base`]), and every pin of
+    /// a still machine, the latency's above all, leans on the play head
+    /// handing those samples through as they are. The read keeps that by
+    /// construction, not by a fit that comes close: its first row is a unit
+    /// impulse, one tap of exactly one and fifteen of exactly zero, and its
+    /// last row the same impulse a sample on, so a read at any whole delay
+    /// returns the sample bit for bit, which is what Hermite returned at no
+    /// fraction, and a head crossing a whole sample meets the same read from
+    /// either side. And every row between reads a quadratic exactly, as
+    /// Hermite did: its taps sum to one and its first and second moments are
+    /// its fraction and the fraction's square, to a millionth, so neither
+    /// the bass nor the time a slow signal is read at breathes with the sway.
+    /// Measured: the rows' moments 1.8e-7 off at worst, the rounding of their
+    /// taps to floats. With the first row solved instead of written, its
+    /// outer taps read 2e-16, not zero; and with the moments not held, the
+    /// second row's taps already sum to 0.999997.
+    #[test]
+    fn a_head_parked_on_a_whole_sample_hands_it_through_untouched() {
+        let rows = read_kernel();
+        for (row, one) in [(0, READ_TAPS / 2 - 1), (READ_PHASES, READ_TAPS / 2)] {
+            for (k, tap) in rows[row].iter().enumerate() {
+                let want = if k == one { 1.0_f32 } else { 0.0 };
+                assert_eq!(tap.to_bits(), want.to_bits(), "row {row}'s tap {k} is {tap:e}, not exactly {want}");
+            }
+        }
+        for (k, row) in rows.iter().enumerate() {
+            let mu = k as f64 / READ_PHASES as f64;
+            for power in 0..3 {
+                let moment: f64 = row
+                    .iter()
+                    .enumerate()
+                    .map(|(t, h)| f64::from(*h) * (t as f64 - (READ_TAPS / 2 - 1) as f64).powi(power))
+                    .sum();
+                assert!(
+                    (moment - mu.powi(power)).abs() < 1.0e-6,
+                    "row {k}'s moment {power} is {moment:.9}, not {:.9}",
+                    mu.powi(power)
+                );
+            }
+        }
+        let len = 1_000;
+        let mut line = Line::new(len);
+        let mut seed = 0x0B17_1DE5_u32;
+        let mut written = Vec::with_capacity(3 * len);
+        for _ in 0..3 * len {
+            let v = 1.7 * white(&mut seed);
+            line.push(v);
+            written.push(v);
+            for delay in [READ_REACH, READ_REACH + 1, 77, len - READ_REACH - 2] {
+                let want = written.len().checked_sub(delay + 1).map_or(0.0, |at| written[at]);
+                let got = line.read(&rows, delay as f32);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "a read {delay} samples back gave {got:e}, not the {want:e} written there"
+                );
+            }
+        }
+    }
+
     /// **The scrape sprays the same sidebands at every sample rate.**
     ///
     /// The twin of the hiss's fault: the scrape is white noise through a
@@ -6967,7 +7321,7 @@ mod tests {
     /// image twice the tone away, far outside the band, so what is measured
     /// is the scrape's own spray, 43 dB under the tone, and it must read the
     /// same within a quarter of a decibel at 48 and at 96 kHz as at 44.1.
-    /// Measured: -0.02 and -0.09 dB; without the root, -0.39 and -3.45.
+    /// Measured: -0.01 and -0.07 dB; without the root, -0.38 and -3.44.
     #[test]
     fn the_scrape_sprays_the_same_sidebands_at_every_sample_rate() {
         const TONE: f64 = 5_000.0;
@@ -7037,25 +7391,26 @@ mod tests {
         let input = to_stereo(&mono);
 
         // symbol, what it does, and the floor in dB relative to the program.
-        // Each floor is 3 dB under what the knob measured from a fresh
-        // tape, rounded down to the whole decibel; the measured figure is
-        // beside it.
+        // Each floor was set 3 dB under what the knob measured from a fresh
+        // tape, rounded down to the whole decibel, and the measured figure
+        // is beside it: the sixteen-tap play head moved those by up to four
+        // tenths, which leaves every floor 2.8 to 4.2 dB under.
         let knobs: [(&str, fn(&mut TapeParams, f32), f64); 13] = [
-            // -3.7 dB.
+            // -3.4 dB.
             ("drive", |p, v| p.drive = v, -7.0),
-            // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
+            // -37.2 dB: at 15 ips the contour's bell sits near 35 Hz, a
             // thin slice of broadband noise; the bump's own size is pinned
             // in hertz by its octave test and by the sample-rate test.
             ("bump", |p, v| p.bump = v, -40.0),
-            // -2.5 dB.
+            // -2.4 dB.
             ("roll", |p, v| p.roll = v, -6.0),
-            // +3.1 dB: Wow alone now, its reel and pinch roller swaying the
+            // +2.9 dB: Wow alone now, its reel and pinch roller swaying the
             // head by up to twenty samples at full travel, and broadband
             // noise a few samples apart is another noise, so the difference
             // is the programme's own level twice over, which is as loud as
             // this measure can read.
             ("wobble", |p, v| p.wobble = v, 0.0),
-            // -9.5 dB, most of it the modulation noise: at Hiss 1 each
+            // -9.1 dB, most of it the modulation noise: at Hiss 1 each
             // channel's head jitters by up to 2 µm of spacing, which moves
             // broadband programme far more than the hiss under it does. Its
             // skirt and the hiss's colour are pinned by their own tests.
@@ -7065,22 +7420,22 @@ mod tests {
             // +2.9 dB: 15 ips to either end of the selector, which moves
             // the transport's parts with it as well as the voicing.
             ("speed", |p, v| p.speed = v, -1.0),
-            // +0.9 dB: Flutter's parts sway the head by a few samples at
+            // +1.2 dB: Flutter's parts sway the head by a few samples at
             // full travel.
             ("flutter", |p, v| p.flutter = v, -3.0),
-            // +3.1 dB: the parts turning at half or twice their speed sway
+            // +3.0 dB: the parts turning at half or twice their speed sway
             // the head through other samples.
             ("rate", |p, v| p.rate = v, 0.0),
             // +3.0 dB: the deep head plays the tape 23 ms later, with a
             // cassette's sway on it.
             ("wow_range", |p, v| p.wow_range = v, 0.0),
-            // -4.6 dB: the top of the dial dulls 10 kHz by seven decibels at
+            // -4.4 dB: the top of the dial dulls 10 kHz by seven decibels at
             // 15 ips, and the bottom lifts it and saturates the bass sooner.
             ("bias", |p, v| p.bias = v, -8.0),
-            // -5.2 dB: at 15 ips full Age takes 5 dB off 10 kHz and skews
+            // -4.8 dB: at 15 ips full Age takes 5 dB off 10 kHz and skews
             // each track a quarter of a sample.
             ("age", |p, v| p.age = v, -9.0),
-            // -15.5 dB: full Damage at 15 ips, its worn edges riding the
+            // -15.2 dB: full Damage at 15 ips, its worn edges riding the
             // tape up to 2 µm off the head and 1.5 dropouts a second.
             ("damage", |p, v| p.damage = v, -19.0),
         ];
@@ -7721,17 +8076,17 @@ mod tests {
     /// 44.1, 48 and 96 kHz within 0.3 dB, every corner being matched at
     /// 10 kHz.
     ///
-    /// The head is held square in time for this ([`Tape::square_head`]): an
-    /// aged head's skew reads each track between samples, and the play
-    /// head's Hermite costs a 10 kHz tone up to half a decibel at 44.1 and
-    /// 48 kHz where it reads half way (a hundredth at 96), which the
-    /// parked head of Age 0 never pays. That loss is the play head's, not
-    /// Age's, and a moving transport pays it at any Age, so a ruler that
-    /// counted it would pin the interpolator, not the spacing; with the
-    /// skew in, 3.75 ips reads -21.80, -21.79 and -21.30 dB at the three
-    /// rates. Measured square: -21.27, -11.54, -5.22 and -2.34 dB at 48 kHz,
-    /// 1 kHz -0.53, and 3.75 ips -21.27, -21.27 and -21.28 at the three
-    /// rates.
+    /// The head reads with its real skew, each track between samples, as an
+    /// aged head does. 5.2 held it square in time for this, because its
+    /// Hermite read cost a 10 kHz tone up to half a decibel at 44.1 and
+    /// 48 kHz where it read half way, which the parked head of Age 0 never
+    /// paid: with the skew in, 3.75 ips read -21.80, -21.79 and -21.30 dB at
+    /// the three rates, half a decibel apart, a ruler of the interpolator and
+    /// not of the spacing. The sixteen-tap read ([`READ_TAPS`]) costs a
+    /// 10 kHz tone under a tenth of a decibel anywhere between samples, so
+    /// the ruler reads the spacing through the head as it is. Measured:
+    /// -21.33, -11.59, -5.27 and -2.37 dB at 48 kHz, 1 kHz -0.53, and
+    /// 3.75 ips -21.30, -21.33 and -21.29 at the three rates, 0.04 apart.
     #[test]
     fn age_takes_the_treble_by_spacing_and_slow_tape_loses_the_most() {
         let amp = 0.1_f32;
@@ -7746,9 +8101,7 @@ mod tests {
                 let mono: Vec<f32> = (0..frames)
                     .map(|i| amp * (std::f64::consts::TAU * hz * i as f64 / f64::from(sr)).sin() as f32)
                     .collect();
-                let mut unit = Tape::new(sr);
-                unit.square_head = true;
-                let out = left(&feed(&mut unit, &to_stereo(&mono), &p));
+                let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
                 let lo = (sr * 0.3) as usize;
                 db(band(&out[lo..], sr.into(), hz) / band(&mono[lo..], sr.into(), hz))
             };
@@ -7799,7 +8152,7 @@ mod tests {
     /// the skew can never carry a track off the line. Measured: a mean of
     /// 2.20 samples (4 s is 1.3 turns of the wander, so the mean leans to
     /// the turn it saw twice), swinging from 1.01 to 3.04; the room 1.512
-    /// samples less, against a widest share of 1.520 as the lag reads it.
+    /// samples less, against a widest share of 1.518 as the lag reads it.
     #[test]
     fn age_pulls_the_two_tracks_apart_in_time_like_a_skewed_head() {
         let sr = 48_000.0_f32;
@@ -8059,7 +8412,7 @@ mod tests {
     /// sample. And because any Damage can crease the tape, the head keeps
     /// each track's share of that widest twist out of the room its
     /// transport may sway once Damage is up at all. Measured: a lag of
-    /// 3.008 samples, and the room 1.512 samples less, the share exactly.
+    /// 3.006 samples, and the room 1.512 samples less, the share exactly.
     #[test]
     fn a_crease_twists_the_head_and_the_head_keeps_room_for_it() {
         let sr = 48_000.0_f32;
@@ -8340,9 +8693,9 @@ mod tests {
     /// has begun to share the head, and at 3.75 ips with them at 1 and Rate
     /// at its bottom, where it has shed most of the head's parts. Measured:
     /// 0.0967, 0.0595, 0.0415 and 0.0279 %, unweighted 1.30, 1.30, 1.65 and
-    /// 1.42 times that, the face 3.5, 0.8, 3.7 and 7.5 % off; 0.4 % off at
-    /// full Wow and Flutter at 15 ips (0.2959 % measured) and 5.3 % in the
-    /// governed corner (0.3470 %).
+    /// 1.42 times that, the face 3.5, 0.8, 3.7 and 7.5 % off; 0.5 % off at
+    /// full Wow and Flutter at 15 ips (0.2787 % measured) and 5.5 % in the
+    /// governed corner (0.3176 %).
     #[test]
     fn the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed() {
         let sr = 44_100.0_f32;
@@ -8413,7 +8766,7 @@ mod tests {
     /// weighting and detector, reads the 0.040 % the transport is
     /// calibrated to, within 35 % (the per-period reading is a sample of
     /// the speed 3150 times a second, and the scrape's kilohertz grain
-    /// folds a little into it). Measured: 0.0411 %.
+    /// folds a little into it). Measured: 0.0412 %.
     #[test]
     fn weighted_flutter_survives_the_audio_path() {
         let sr = 44_100.0_f32;
@@ -8627,10 +8980,24 @@ mod tests {
     /// the bottom of Rate at full Wow, starting at every speed, at 44.1, 48
     /// and 96 kHz, five seconds each, under the same two bars. The cassette
     /// stays on the deep head until that head has faded out, and starts
-    /// from nothing when it fades back in. Measured at worst: 32.2 of the
-    /// studio head's 39.7 samples (15 ips, Rate at its bottom) and 719 of
-    /// the deep head's 970 (7.5 ips, Rate at its bottom) at 44.1 kHz;
-    /// thrown, 35.4 of 43.2 and 422.4 of 2112 at 48 and 96 kHz.
+    /// from nothing when it fades back in. (c) And the read's own reach, at
+    /// every rate a tape can be built at, from its 8 kHz floor to 192 kHz:
+    /// each head's travel leaves it at least [`READ_REACH`] samples from the
+    /// newest sample and from the oldest the line keeps, so a head inside
+    /// its travel never needs the safety net, and the sixteen samples the
+    /// read takes are always there; and both heads at full Wow and Flutter,
+    /// at 3.75 ips mid-Rate and 15 ips at the bottom of Rate, where the
+    /// sways ask the most, four seconds each, under the same two bars. The
+    /// reach is what bounds the studio head at 44.1 kHz and under: 36
+    /// samples there (0.82 ms), 12 at 32 kHz and 2 at the floor, where the
+    /// head rests [`READ_REACH`] and two samples back. Measured at worst:
+    /// 29.3 of the studio head's 36 samples (15 ips, Rate at its bottom)
+    /// and 718 of the deep head's 970 (7.5 ips, Rate at its bottom) at
+    /// 44.1 kHz; thrown, the studio head 29.4 of 36 at 44.1, 35.4 of 43.2
+    /// at 48 and 71.7 of 86.4 at 96 kHz, and the deep head 422.4 of 2112 at
+    /// 96 kHz; and at every rate, the studio head 84 % of its travel at
+    /// most (132.8 of 158.8 at 176.4 kHz, 29.7 of 36 at 44.1, 9.2 of 12 at
+    /// 32) and the deep head 68 % (100.6 of 148 at the 8 kHz floor).
     #[test]
     fn the_play_head_never_runs_off_its_tape_at_any_setting() {
         let held = |unit: &Tape, what: &str| {
@@ -8686,6 +9053,35 @@ mod tests {
                 held(&unit, &format!("the range thrown from {} at {sr} Hz", start.label()));
             }
         }
+        let rates = [8_000.0_f32, 22_050.0, 32_000.0, 44_100.0, 48_000.0, 88_200.0, 96_000.0, 176_400.0, 192_000.0];
+        for sr in rates {
+            let mut unit = Tape::new(sr);
+            unit.transport_trace(&TapeParams::default(), 64);
+            let (g, far) = (unit.governed(), unit.line[0].len - READ_REACH - 2);
+            for (head, rest, travel) in [("studio", unit.base, g.travel), ("deep", unit.base_deep, g.deep_travel)] {
+                assert!(
+                    rest as f64 - travel >= READ_REACH as f64 && rest as f64 + travel <= far as f64,
+                    "at {sr} Hz the {head} head rests {rest} samples back and may sway {travel:.2} \
+                     either way, past the {READ_REACH} samples the read reaches from either end of \
+                     a line it may read to {far}"
+                );
+            }
+            for range in WowRange::ALL {
+                for (speed, rate) in [(TapeSpeed::Ips3_75, 0.5), (TapeSpeed::Ips15, 0.0)] {
+                    let p = TapeParams {
+                        wobble: 1.0,
+                        flutter: 1.0,
+                        rate,
+                        speed: speed.dial(),
+                        wow_range: range.dial(),
+                        ..TapeParams::default()
+                    };
+                    let mut unit = Tape::new(sr);
+                    unit.transport_trace(&p, (sr * 4.0) as usize);
+                    held(&unit, &format!("{} on the {} head at Rate {rate} at {sr} Hz", speed.label(), range.label()));
+                }
+            }
+        }
     }
 
     /// **The head is shared when the tape asks for more than it holds.**
@@ -8700,9 +9096,11 @@ mod tests {
     /// 44.1 kHz the head swings to between 70 % and all of the room it has
     /// and never past it, the safety net catches nothing, and Wow stays a
     /// live dial there: the wow the head carries at Wow 1 is at least 1.5
-    /// times what it carries at Wow 0.3, with Flutter at 1 and at 0.3 (model
-    /// 2.2 and 2.3 times). And a fresh tape asks for nothing to be shed at
-    /// any speed. Measured: 79 % of the room, and 2.18 and 2.27 times.
+    /// times what it carries at Wow 0.3, with Flutter at 1 and at 0.3. And a
+    /// fresh tape asks for nothing to be shed at any speed. Measured: 79 %
+    /// of the room, and 2.18 and 2.05 times (2.27 with Flutter at 0.3 when
+    /// the head had all 0.9 ms here: at 44.1 kHz the read's reach leaves it
+    /// 0.82, which sheds more of Wow 1's sway and none of Wow 0.3's).
     #[test]
     fn the_head_is_shared_when_the_tape_asks_for_more_than_it_holds() {
         let sr = 44_100.0_f32;
@@ -8776,10 +9174,10 @@ mod tests {
     /// never exceeds the larger of the two settings' own largest, over 20 s
     /// of each, by more than that 0.3 %: Wow 1 from 3.75 to 30 ips and back,
     /// and Wow and Flutter thrown from 0 to 1 at once at 15 ips. Measured:
-    /// 0.231 and 0.292 % through the speed changes against their settings'
-    /// 0.310, and 0.841 through the jump, which is the largest of the
+    /// 0.229 and 0.279 % through the speed changes against their settings'
+    /// 0.302, and 0.821 through the jump, which is the largest of the
     /// setting it settles into; with a part's turn free to rise at once the
-    /// first reads 0.772.
+    /// first reads 0.749.
     #[test]
     fn a_rate_or_speed_change_never_bends_the_pitch_past_the_settings_own_depth() {
         let sr = 44_100.0_f32;
