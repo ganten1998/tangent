@@ -1792,6 +1792,49 @@ struct ClickHold {
     /// **What the speakers were held back by**, the last chunk that asked:
     /// the hold a take's capture mark carries (`mix_monitor`'s tee).
     room_hold: usize,
+    /// **Where the voice was struck**, the recent beats' write frames: what
+    /// a tape's stop asks to find the beats its hold caught (`HoldRead::hush`).
+    onsets: Onsets,
+    /// The last chunk's pass was at full speed, so the first chunk off it is
+    /// seen (`aim_click`).
+    was_at_speed: bool,
+    /// **This chunk is the first off speed**: every read hushes the beats
+    /// it holds, the buses' too (`gather_node`).
+    hushed: bool,
+}
+
+/// **How many of the voice's recent strikes the click keeps**
+/// ([`Onsets`]): a beat at most every [`CLICK_HOLD_FRAMES`] / 64 frames
+/// (512 at 48 kHz, a click every 11 ms) fits a whole held window. Past that
+/// a stop hushes from a later beat than the first it caught, and the ones
+/// before it play their coast.
+const CLICK_ONSETS: usize = 64;
+
+/// **The click's recent onsets**: the write frame of each beat the voice was
+/// struck on, oldest overwritten. Frames only grow, so the ring is sorted.
+#[derive(Clone, Copy, Debug)]
+struct Onsets {
+    at: [u64; CLICK_ONSETS],
+    n: u64,
+}
+
+impl Onsets {
+    /// The voice was struck on write frame `k`.
+    fn strike(&mut self, k: u64) {
+        if let Some(slot) = self.at.get_mut((self.n % CLICK_ONSETS as u64) as usize) {
+            *slot = k;
+        }
+        self.n += 1;
+    }
+
+    /// **The first strike at or after write frame `k`** of those kept.
+    fn first_from(&self, k: u64) -> Option<u64> {
+        let kept = self.n.min(CLICK_ONSETS as u64);
+        (1..=kept)
+            .map(|back| self.at[((self.n - back) % CLICK_ONSETS as u64) as usize])
+            .take_while(|o| *o >= k)
+            .last()
+    }
 }
 
 impl ClickHold {
@@ -1810,6 +1853,9 @@ impl ClickHold {
             target: 0,
             own: 0,
             room_hold: 0,
+            onsets: Onsets { at: [0; CLICK_ONSETS], n: 0 },
+            was_at_speed: true,
+            hushed: false,
         }
     }
 
@@ -1844,10 +1890,25 @@ impl ClickHold {
 /// take's, a master plugin's delay moving), so neither does the click. A
 /// longer hold is silence for what it grew by, a shorter one skips what it
 /// shrank by, and nothing is heard twice.
+///
+/// **And a tape's stop hushes the beats it holds** ([`HoldRead::hush`]): the
+/// song's click waits for the tape (the owner's ruling), and a beat made at
+/// speed in the last hold before the stop would be heard in the coast,
+/// pitched down with it, where the mix's own beat is. From the first such
+/// beat until the voice is next struck the read plays nothing; a click
+/// already sounding when the tape leaves speed rings out, as one does on a
+/// desk that holds nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct HoldRead {
     hold: usize,
     from: u64,
+    /// **What this read will not play, `[cut, until)` in its ring's
+    /// frames**: from the first beat a stop caught in its hold to the next
+    /// strike, which is `u64::MAX` until the voice is struck again.
+    quiet: Option<(u64, u64)>,
+    /// The write frame the tape left speed on, the hush's: the strike that
+    /// ends it is the first at or after it.
+    quiet_from: u64,
 }
 
 impl HoldRead {
@@ -1860,11 +1921,42 @@ impl HoldRead {
     /// **Aim this read, keeping every frame it has not yet played when
     /// `kept`**: the frame it would have read next is `at - hold` at its old
     /// hold, and it reads on from there at the new one. Not `kept`, it starts
-    /// afresh at `at`, as [`HoldRead::aim`].
+    /// afresh at `at`, as [`HoldRead::aim`]. A hush it has read past is over.
     fn aim_kept(&mut self, hold: usize, at: u64, kept: bool) {
         if hold != self.hold {
             self.from = if kept { at.saturating_sub(self.hold as u64).max(self.from) } else { at };
             self.hold = hold;
+        }
+        if let Some((_, until)) = self.quiet {
+            if at.saturating_sub(self.hold as u64) >= until {
+                self.quiet = None;
+            }
+        }
+    }
+
+    /// **The tape left speed on the chunk written from `at`**: the beats
+    /// this read holds, struck before `at` and not yet played, are heard in
+    /// no coast. `lat` is how far its ring lags the voice (the click's own
+    /// rack, for the rings after it): a strike on voice frame `o` is ring
+    /// frame `o + lat`. A hush still under way grows to the next strike.
+    fn hush(&mut self, at: u64, lat: u64, onsets: &Onsets) {
+        let next = at.saturating_sub(self.hold as u64).saturating_sub(lat);
+        let caught = onsets.first_from(next).filter(|o| *o < at);
+        self.quiet = match (self.quiet, caught) {
+            (Some((cut, _)), _) => Some((cut, u64::MAX)),
+            (None, Some(o)) => Some((o.saturating_add(lat), u64::MAX)),
+            (None, None) => None,
+        };
+        self.quiet_from = at;
+    }
+
+    /// **A hush ends where the voice is next struck**, at speed (a beat is
+    /// only made at speed): asked once the chunk's strikes are in.
+    fn settle(&mut self, lat: u64, onsets: &Onsets) {
+        if let Some((cut, u64::MAX)) = self.quiet {
+            if let Some(o) = onsets.first_from(self.quiet_from) {
+                self.quiet = Some((cut, o.saturating_add(lat)));
+            }
         }
     }
 
@@ -1873,7 +1965,10 @@ impl HoldRead {
     #[inline]
     fn frame(&self, at: u64, i: usize) -> Option<u64> {
         let k = (at + i as u64).checked_sub(self.hold as u64)?;
-        (k >= self.from).then_some(k)
+        if k < self.from || self.quiet.is_some_and(|(cut, until)| k >= cut && k < until) {
+            return None;
+        }
+        Some(k)
     }
 }
 
@@ -14155,6 +14250,7 @@ impl Renderer {
                 };
                 if let Some(beat) = heard_beat {
                     self.voice.trigger(beat.accent);
+                    self.click_hold.onsets.strike(mark + i as u64);
                     if beat.count_in > 0 || beat.downbeat {
                         // A whole beat, so the sample has room to decay, and
                         // reset on the downbeat too — that click is the "go"
@@ -14352,6 +14448,15 @@ impl Renderer {
                     *o = self.click_out[i];
                     *t = self.click_taped[i];
                 }
+            }
+            // A stop's hush ends on the voice's next strike, which this
+            // chunk may have made (`HoldRead::settle`).
+            {
+                let hold = &mut self.click_hold;
+                let lat = hold.own as u64;
+                hold.room.settle(lat, &hold.onsets);
+                hold.take.settle(lat, &hold.onsets);
+                hold.fx.settle(0, &hold.onsets);
             }
             {
                 let fx = self.click_hold.fx;
@@ -16929,6 +17034,17 @@ impl Renderer {
         hold.room.aim_kept(room.saturating_sub(own).min(ClickHold::MOST), at, kept);
         hold.take.aim_kept(take.saturating_sub(own).min(ClickHold::MOST), at, kept);
         hold.fx.aim(target.min(ClickHold::MOST), at);
+        // **The tape leaving speed hushes what the reads hold** (the song's
+        // click waits for the tape): seen on the first chunk off speed, and
+        // the buses' reads hush on it too (`gather_node`).
+        hold.hushed = hold.was_at_speed && !self.motor_at_speed;
+        hold.was_at_speed = self.motor_at_speed;
+        if hold.hushed {
+            let lat = own as u64;
+            hold.room.hush(at, lat, &hold.onsets);
+            hold.take.hush(at, lat, &hold.onsets);
+            hold.fx.hush(at, 0, &hold.onsets);
+        }
         hold.target = target;
         hold.own = own;
         hold.room_hold = room;
@@ -22806,6 +22922,13 @@ impl Renderer {
                                 .saturating_sub(hold.own)
                                 .min(ClickHold::MOST);
                             click_read.aim(wait, hold.written);
+                            // A tape's stop hushes what it holds, as the
+                            // speakers' read does (`HoldRead::hush`).
+                            let lat = hold.own as u64;
+                            if hold.hushed {
+                                click_read.hush(hold.written, lat, &hold.onsets);
+                            }
+                            click_read.settle(lat, &hold.onsets);
                             // The click is one voice on both sides.
                             for f in 0..frames {
                                 let v = ClickHold::read(&hold.out, click_read, hold.written, f) * level;
@@ -49347,6 +49470,103 @@ mod slot_engine {
             assert_eq!(e.motor_show(), MotorShow::Holding, "the motor never came to rest");
             let loud = after.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(loud < 1e-4, "the coast clicked: {loud}");
+        }
+
+        /// The passes `stopped_on_a_coast` renders in.
+        const COAST_PASS: usize = 128;
+
+        /// **A desk held `hold` frames, rolled at speed from 0:00 and stopped
+        /// with tape start and stop on, the press pass meeting song frame
+        /// `press`**: every pass from the press until the tape holds, then
+        /// Play from where Stop returned the playhead (0:00) and the passes
+        /// that cover its first click. The motor is allowed eight passes
+        /// before the press, so the roll is at speed from its first frame.
+        fn stopped_on_a_coast(hold: u32, press: u64) -> (Vec<f32>, Vec<f32>) {
+            use crate::motor::MotorShow;
+            use crate::transport::Transport;
+            const PASS: usize = COAST_PASS;
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("an offline engine needs no device");
+            e.set_armed(0);
+            e.set_midi_off(u64::MAX);
+            e.set_tempo(120.0);
+            e.set_metronome_gain(1.0);
+            e.set_metronome_enabled(true);
+            if hold > 0 {
+                fake_hold(&mut e, hold);
+            }
+            let pass = |e: &mut Engine, t: &mut Transport| -> Vec<f32> {
+                t.push(Some(&*e));
+                let mut out = vec![0.0f32; PASS * 2];
+                e.render_offline(&mut out);
+                out
+            };
+            let mut t = Transport::new();
+            pass(&mut e, &mut t);
+            t.toggle_play();
+            while e.transport_position() < press {
+                if e.transport_position() + 8 * PASS as u64 == press {
+                    e.set_tape_motor(true, 0.5, 0.7);
+                }
+                pass(&mut e, &mut t);
+            }
+            assert_eq!(e.transport_position(), press, "fixture: the press is not on a pass's edge");
+            assert_eq!(e.motor_show(), MotorShow::Running, "fixture: the tape is not running at the press");
+            t.stop();
+            let mut coast = Vec::new();
+            for _ in 0..600 {
+                coast.extend(pass(&mut e, &mut t));
+                if e.motor_show() == MotorShow::Holding {
+                    break;
+                }
+            }
+            assert_eq!(e.motor_show(), MotorShow::Holding, "fixture: the tape never came to rest");
+            t.toggle_play();
+            let again = (0..(40_000 + hold as usize) / PASS + 8).flat_map(|_| pass(&mut e, &mut t)).collect();
+            (coast, again)
+        }
+
+        /// **A tape's stop hushes the beats its hold caught, and a click
+        /// already sounding rings out as on a desk that holds nothing** (the
+        /// owner's tape-motor ruling, spec 4.11: a Stop's coast clicks nothing
+        /// after the pass that meets the press).
+        ///
+        /// On a desk held 1,200 frames, beat four (song frame 72,000) is made
+        /// at speed and heard 1,200 frames later; with Stop pressed 64 frames
+        /// after it was made, the click would be heard in the coast, pitched
+        /// down with the tape: it was, at 0.98. Every read of the click hushes
+        /// the beats it holds on the first chunk off speed now
+        /// (`HoldRead::hush`), so nothing is heard from the press to the hold,
+        /// and the next Play's first click is the bare desk's, the hold later:
+        /// the hush ends on the voice's next strike. A click the speakers are
+        /// already playing when the tape leaves speed is not cut: held 1,024
+        /// frames and stopped 192 frames into the heard click, the coast is
+        /// the bare desk's stopped 192 frames into its own, sample for sample;
+        /// held 128 frames and stopped 64 frames after the beat (its click
+        /// heard in the press pass, at speed), the coast is the bare desk's
+        /// stopped 64 frames before its beat. Each rings on past the press
+        /// pass, which a read cut where the tape left speed would not.
+        #[test]
+        fn a_stop_hushes_the_beats_its_hold_caught_and_rings_out_the_one_sounding() {
+            let beat = 3 * BEAT_TWO as u64;
+            let loud = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let first = |v: &[f32]| onset_from(v, 0, CROSS).expect("Play never clicked");
+            let (bare_coast, bare_again) = stopped_on_a_coast(0, beat + 64);
+            let (coast, again) = stopped_on_a_coast(1_200, beat + 64);
+            assert!(loud(&coast) < 1e-4, "the coast clicked a beat the hold caught: {}", loud(&coast));
+            assert_eq!(first(&again), first(&bare_again) + 1_200, "the next Play's first click is not the bare desk's, the hold later");
+            // The tail each rings out with after the press pass, which runs
+            // at speed: 320 frames into the click, and 64.
+            for (hold, press, bare_press, tail) in [(1_024u32, beat + 1_024 + 192, beat + 192, 1e-3), (128, beat + 64, beat - 64, 0.1)] {
+                let (bare, _) = stopped_on_a_coast(0, bare_press);
+                let (held, _) = stopped_on_a_coast(hold, press);
+                let rings = loud(&bare[COAST_PASS * 2..]);
+                assert!(rings > tail, "hold {hold}: the bare desk's sounding click did not ring out in the coast ({rings})");
+                assert_eq!(held.len(), bare.len(), "hold {hold}: the coasts last differently");
+                for (k, (h, b)) in held.iter().zip(&bare).enumerate() {
+                    assert!((h - b).abs() < 1e-6, "hold {hold}: coast frame {}: {h}, the bare desk's {b}", k / 2);
+                }
+            }
+            let _ = bare_coast;
         }
 
         /// **A hold that moves mid-roll moves the click as it moves the
