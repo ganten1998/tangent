@@ -103,9 +103,13 @@ one, and the desk learned to start and stop the way a tape does.
   modulation noise rides each note instead. It follows Drive, as recording
   hotter does on tape: at a saved Drive of 0.6 it sits where 5.0 put it, and
   each tenth of the dial moves it about 4.6 dB, quieter as Drive rises.
-- **Tape costs less processor time.** Its oversampled record stage does under
-  half the arithmetic it did, and its real delay is now exactly the one it
-  reports (it ran three quarters of a sample early).
+- **Tape costs about a quarter more processor time than in 5.1**, around 29
+  microseconds an insert per 128-frame block at 48 kHz against 23, a little
+  over one percent of one core, for the speeds, the transport, Bias, Age and
+  Damage it now models. Making it cheaper again is planned. Its real delay is
+  now exactly the one it reports (it ran three quarters of a sample early).
+  While Tape start and stop ramps, the desk costs a little more than with the
+  varispeed dial engaged, well inside the real-time deadline.
 
 ### Fixed
 
