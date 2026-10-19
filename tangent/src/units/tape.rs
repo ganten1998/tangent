@@ -781,9 +781,10 @@ const DEEP_SLEW: f64 = 0.03;
 /// 44.1, 48 and 96 kHz. At the default 0.3 the bottom of Rate reads up to
 /// 5.3 % over (0.948 % at 44.1 kHz), where Flutter's shared parts, which do
 /// not scale with Wow, happen to land on the cassette's own peak (0.912 %
-/// without them). 5.2.0's belt followed Rate, so at twice the parts' speed
-/// its drift moved twice as fast and bent the pitch twice as far: full Wow
-/// peaked at 3.2 % over two minutes there and 3.4 % over ten.
+/// without them). While the belt followed Rate, as 5.2.0's did, twice the
+/// parts' speed moved its drift twice as fast and bent the pitch twice as
+/// far, and this cassette peaked at 3.2 % over two minutes there at full
+/// Wow and 3.4 % over ten.
 const CASSETTE_HZ: [f64; 2] = [0.45, 1.5];
 const CASSETTE_SHARE: [f64; 2] = [0.55, 0.30];
 const CASSETTE_DEPTH: f64 = 0.035;
@@ -2497,7 +2498,7 @@ impl Transport {
         // The belt's two poles at 0.2 Hz: `1 - e^-w` by its series, `w` being
         // under two ten-thousandths at any rate the tape can be built at, the
         // series 5.2.0 ran on every design while the belt followed Rate, so
-        // at Rate 1x the belt drifts to the same bits it did.
+        // at Rate 1x the coefficient is the same bits it was.
         let w = std::f64::consts::TAU * BELT_POLE_HZ / sr;
         let mut t = Self {
             sample_rate: sr,
@@ -4477,7 +4478,7 @@ struct Turning {
 }
 
 /// **The transport's turning parts as the governor plans them**, at
-/// [`DESIGN_RATE`]: up to seven (the studio head's reel and pinch roller
+/// [`DESIGN_RATE`]: up to five (the studio head's reel and pinch roller
 /// or the cassette's pack and roller, then the guides and the capstan with
 /// its harmonic), how many, and the tape resonance's RMS depth at a wander
 /// of one. The arithmetic is the kernel's own (the same wants, reserve and
@@ -4701,7 +4702,7 @@ fn weighted_reading(p: &TapeParams) -> f64 {
 /// hears. On the deep head the parts are Flutter's and the cassette's, and
 /// `the_deep_range_swings_the_pitch_like_a_worn_cassette` holds it within
 /// 15 % there at Wow 0.3, 0.5 and 1. The breathing is summed at 161 points
-/// of spectrum for each of up to seven parts ([`BREATH_SPAN_HZ`]), for the
+/// of spectrum for each of up to five parts ([`BREATH_SPAN_HZ`]), for the
 /// dials and again for the fresh transport, against the dozens of
 /// multiply-adds the other figures cost.
 pub fn wow_flutter_weighted_pct(p: &TapeParams) -> f32 {
@@ -8205,8 +8206,10 @@ mod tests {
     /// figure can stand within 15 % of, and over the eight 152 s windows of
     /// 21 minutes 0.020 to 0.025 %, so it reads 160 s. Measured, in that
     /// order: -0.3, +4.3, -3.7, -7.3, -9.3,
-    /// +1.5, -2.0, +11.4 and -5.7 %, where 5.2.0's figure was -73, -44,
-    /// -40, -37, -17, -24, +14, +11 and -14 %.
+    /// +1.5, -2.0, +11.4 and -5.7 %, where the turns alone, as 5.2.0's
+    /// figure summed them, read -73, -44, -40, -37, -17, -24, +14 and +11 %
+    /// on the studio head, which sounds as it did in 5.2.0, and -14 % on the
+    /// deep head as it swings now.
     #[test]
     fn the_face_reads_the_meter_where_rate_slows_the_wow() {
         let sr = 44_100.0_f32;
@@ -8264,8 +8267,10 @@ mod tests {
     /// everywhere but the one corner the short window cannot read (3.75 ips,
     /// Rate 0, Wow 0.3, Flutter 0: its first 32 s read 0.0294 %, its ten
     /// minutes 0.0236 %, and the face 0.0228 %), and the same at 48 and
-    /// 96 kHz. 5.2.0's figure was within 15 % of the 40 s meter at 233 of
-    /// the 240 and 79 % under at that corner.
+    /// 96 kHz. The turns alone, as 5.2.0's figure summed them, missed the
+    /// 40 s meter by more than 15 % at 7 of the 240, every one with Flutter
+    /// at 0 on the studio head (which sounds as it did in 5.2.0), and read
+    /// 79 % under at that corner.
     #[test]
     #[ignore = "slow: run it by hand in release with --ignored --nocapture"]
     fn the_face_reads_the_meter_across_the_whole_grid() {
