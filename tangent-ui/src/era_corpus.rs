@@ -1117,7 +1117,12 @@ fn fnv(text: &str) -> u64 {
 /// **What production writes for the default settings**, pinned at the
 /// flip (W4-integrate (B)): the format-2 file a fresh install's first save
 /// writes, stamp included. The fixtures' are `FORMAT2_BYTES` below.
-const DEFAULT_V2_BYTES: (u64, usize) = (0xe028_4149_425a_c38c, 30430);
+///
+/// Moved once since, for 5.2, by the shipped piano's path alone
+/// (`@tangent-keys` where `@tangent-dx7` was, one byte longer): the new
+/// bytes with the old path put back hash to the old pin, 0xe028_4149_425a_c38c
+/// over 30430.
+const DEFAULT_V2_BYTES: (u64, usize) = (0x6a72_ca52_e572_89f1, 30431);
 
 /// **Production writes the format-2 bytes**, stamps included, for every
 /// fixture and for the default settings: `WRITE_V8` is on, so what a user's

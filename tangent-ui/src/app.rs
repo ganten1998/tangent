@@ -3830,9 +3830,11 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 ///
 /// **All arms off, save one**, by the owner's rule: a project must be
 /// openable without headphones and without being blasted, and the one
-/// exception is the channel that makes the piano sound — the one whose
-/// first bay holds the built-in DX7. A desk without one opens silent, which
-/// is the honest reading of a desk with nothing to play.
+/// exception is the channel that makes the piano sound — the one holding a
+/// shipped piano in any of its bays (`dialogs::SHIPPED_PIANOS`: Tangent Keys,
+/// which a fresh install plays since 5.2, and the built-in DX7, which it
+/// played before). A desk without one opens silent, which is the honest
+/// reading of a desk with nothing to play.
 ///
 /// **The "or failing that, any instrument at all" fallback is gone**, and it
 /// is worth saying why rather than leaving a shorter rule behind. It armed
@@ -3854,7 +3856,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 /// and an open that disagree about what a silent desk means is two rules.
 fn default_armed(settings: &Settings) -> Option<usize> {
     let kinds: Vec<u8> = settings.rows.iter().map(|r| crate::desk_model::RowKind::byte(r.kind)).collect();
-    crate::arrangement::armed_by_default(&kinds, |n| settings.row_holds(n, dialogs::BUILTIN_PATH))
+    crate::arrangement::armed_by_default(&kinds, |n| dialogs::SHIPPED_PIANOS.iter().any(|p| settings.row_holds(n, p)))
 }
 
 #[cfg(test)]
@@ -3862,7 +3864,7 @@ mod default_arm_tests {
     use super::*;
 
     /// A desk built from NOTHING, because `Settings::default()` is the
-    /// SHIPPED desk — it already carries the drum pad and the DX7 — and a
+    /// SHIPPED desk — it already carries the drum pad and the Keys — and a
     /// test that only overrides the first channel is answered by the second
     /// one it forgot about. That cost a red run here.
     fn desk(kinds: &[u8], bay0: &[&str]) -> Settings {
@@ -3904,6 +3906,26 @@ mod default_arm_tests {
             None,
             "a drum pad and an analog are not the piano; nothing should be live"
         );
+    }
+
+    /// **The shipped piano is the Keys now, and the DX7 still counts.** A
+    /// fresh desk holds Tangent Keys where the DX7 was, so the rule has to
+    /// arm it or a new session opens with the piano loaded and dead. A desk
+    /// that never wrote its arm down from before 5.2 holds the DX7 there, and
+    /// it must open the way it always did. With both, the first one wins,
+    /// the rule's own word for which channel.
+    #[test]
+    fn the_keys_is_the_shipped_piano_and_the_dx7_still_is_one() {
+        let s = desk(&[1, 1], &[dialogs::DRUMPAD_PATH, dialogs::KEYS_PATH]);
+        assert_eq!(default_armed(&s), Some(1), "the Keys' channel, and only it");
+        let both = desk(&[1, 1, 1], &[dialogs::DRUMPAD_PATH, dialogs::KEYS_PATH, dialogs::BUILTIN_PATH]);
+        assert_eq!(default_armed(&both), Some(1), "the first piano is not the one armed");
+        let dx7_first = desk(&[1, 1, 1], &[dialogs::BUILTIN_PATH, dialogs::DRUMPAD_PATH, dialogs::KEYS_PATH]);
+        assert_eq!(default_armed(&dx7_first), Some(0), "the first piano is not the one armed");
+        // An AUDIO channel holding the Keys changes nothing, as for the DX7.
+        assert_eq!(default_armed(&desk(&[0], &[dialogs::KEYS_PATH])), None);
+        // And the shipped desk itself: the rule arms its keyboard.
+        assert_eq!(default_armed(&Settings::default()), Some(1), "a fresh desk does not arm its piano");
     }
 
     /// And the exception the rule DOES name still holds: a desk carrying the
@@ -12067,7 +12089,7 @@ impl TangentApp {
         }
         if was.is_none() && kind.is_some() {
             // **A fresh binding's send rests at ZERO** — the owner's ruling:
-            // only the shipped DX7 track arrives wired to the reverb; every
+            // only the shipped piano track arrives wired to the reverb; every
             // track anybody adds starts dry until they turn it up.
             self.settings.set_strip_send(recorder::StripRef::Row(ch), 0.0);
             // **No arm.** A fresh binding used to arm itself — first
@@ -13114,7 +13136,7 @@ impl TangentApp {
         if let Some(row) = self.row_mut(n) {
             row.added = true;
         }
-        // Dry at birth — see the bind's own comment: only the shipped DX7
+        // Dry at birth — see the bind's own comment: only the shipped piano
         // comes wired to the reverb.
         self.settings.set_strip_send(recorder::StripRef::Row(n), 0.0);
         self.save_settings();
@@ -14194,8 +14216,11 @@ const STOCK_DESKS: &[&[(usize, &str)]] = &[
     // The drumpad arrives on track two.
     &[(0, dialogs::BUILTIN_PATH), (1, dialogs::DRUMPAD_PATH)],
     // "it needs to have drums slot 1 and Tangent DX7 slot 2" — the kit first,
-    // which is what a fresh install writes today.
+    // which a fresh install wrote until 5.2.
     &[(0, dialogs::DRUMPAD_PATH), (1, dialogs::BUILTIN_PATH)],
+    // 5.2: "the keys' Intimate Grand now instead of the DX7", which is what a
+    // fresh install writes today.
+    &[(0, dialogs::DRUMPAD_PATH), (1, dialogs::KEYS_PATH)],
 ];
 
 /// Whether `d` is exactly the desk `shipped` describes and nothing more.
@@ -14207,14 +14232,33 @@ const STOCK_DESKS: &[&[(usize, &str)]] = &[
 /// kinds come from the same list rather than from a second constant: an
 /// instrument track is one the list puts a bay on, so the two cannot
 /// disagree.
+///
+/// **And each shipped piano still on the sound it shipped on.** A seed is
+/// written from `Settings::default()`, so its Keys is on sound 0 and its DX7
+/// on the bank that ships at patch 0, every time. A piano on any other sound
+/// was put there by somebody, through Save As Template, and that template is
+/// theirs. It mattered from 5.2: drums and the Keys is the shipped shape now,
+/// and before then the only templates of that shape were ones people built,
+/// say on EP Mk.1, which a reseed would have put back on the Intimate Grand;
+/// a DX7 template saved on a chosen patch would have lost its DX7. The Keys'
+/// knobs are not compared, because their defaults can move between builds
+/// and a seed whose knobs no longer read as shipped would stand for ever.
 fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) -> bool {
     let tracks = shipped.iter().map(|(row, _)| row + 1).max().unwrap_or(0);
     let named: Vec<crate::desk_id::SeatBay> = shipped.iter().filter_map(|(row, _)| d.row_bay(*row, 0)).collect();
+    let on_its_shipped_sound = |row: usize, path: &str| {
+        d.rows.get(row).is_none_or(|r| match path {
+            dialogs::KEYS_PATH => r.keys.patch == 0,
+            dialogs::BUILTIN_PATH => r.dx7 == crate::desk_model::Dx7::default(),
+            _ => true,
+        })
+    };
     d.rows
         .iter()
         .enumerate()
         .all(|(n, r)| crate::desk_model::RowKind::byte(r.kind) == u8::from(n < tracks))
         && shipped.iter().all(|(row, want)| d.row_plugin(*row, 0) == Some(*want))
+        && shipped.iter().all(|(row, want)| on_its_shipped_sound(*row, want))
         && d.plugins.iter().filter(|(_, p)| !p.is_empty()).all(|(sb, _)| named.contains(sb))
 }
 
@@ -14268,8 +14312,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             //
             // See [`STOCK_DESKS`], which is the list, and the test that
             // makes the list keep up with the default.
+            //
+            // **Nor anything else a song is made of**: no markers, no
+            // automation, and the tempo and meter a seed is written with
+            // (`Arrangement::default()`'s, 120 and 4/4 since there was a
+            // map; a seed from before the map reads its desk's one tempo
+            // and signature as constant maps, and every such seed a reseed
+            // can still meet was written at 120 and 4/4). A template
+            // somebody saved with a tempo, a meter, a marker or a curve is
+            // theirs. It mattered from 5.2, when drums and the Keys became
+            // a stock shape that, before then, only a person could have
+            // built. Levels and the Keys'
+            // knobs are not compared: their shipped values have moved
+            // between builds, and a seed that no longer read as stock would
+            // stand for ever (see `matches_stock`).
             let stock = old.clips.is_empty()
                 && old.next_id <= 1
+                && old.markers.is_empty()
+                && old.automation.is_empty()
+                && old.tempo == crate::tempo::TempoMap::default()
+                && old.meter == crate::tempo::MeterMap::default()
                 && old.desk.as_ref().is_some_and(|d| {
                     d.rows.iter().all(|r| r.name.is_empty())
                         && Self::STOCK_DESKS
@@ -14312,7 +14374,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **What a fresh Tangent is**: the shipped desk, with the DRUMS on
-    /// channel one and the built-in DX7 on channel two.
+    /// channel one and Tangent Keys, playing its Intimate Grand, on channel
+    /// two. Channel two held the built-in DX7 until 5.2; the owner: "I want
+    /// the default instrument on the freshly installed default project to be
+    /// the keys' Intimate Grand now instead of the DX7."
     ///
     /// That sentence used to say the reverse, and it was left saying it when
     /// the owner asked for the kit to come first — "it needs to have drums
@@ -54565,9 +54630,11 @@ mod tests {
         let armed: Vec<usize> = (0..shipped.rows.len()).filter(|n| shipped.rows[*n].arm).collect();
         assert_eq!(
             armed,
-            crate::arrangement::armed_by_default(&kinds, |n| shipped.row_holds(n, dialogs::BUILTIN_PATH))
-                .into_iter()
-                .collect::<Vec<_>>(),
+            crate::arrangement::armed_by_default(&kinds, |n| {
+                dialogs::SHIPPED_PIANOS.iter().any(|p| shipped.row_holds(n, p))
+            })
+            .into_iter()
+            .collect::<Vec<_>>(),
             "the template's arm is not the shipped rule"
         );
         assert!(!armed.is_empty(), "a New project opens with nothing live");
@@ -54651,6 +54718,13 @@ mod tests {
                 (0, dialogs::DRUMPAD_PATH),
                 (INSERTS, dialogs::BUILTIN_PATH),
             ],
+            // 5.2: the Keys' Intimate Grand where the DX7 was. Every install
+            // that launched on 5.1 or earlier holds the entry above, and it
+            // is the one that must now heal to this.
+            &[
+                (0, dialogs::DRUMPAD_PATH),
+                (INSERTS, dialogs::KEYS_PATH),
+            ],
         ];
         for shipped in SHIPPED_OVER_TIME {
             write_stock(shipped);
@@ -54667,9 +54741,13 @@ mod tests {
             );
             assert_eq!(
                 desk.bay(INSERTS),
-                Some(dialogs::BUILTIN_PATH),
+                Some(dialogs::KEYS_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
+            // Healed whole: the piano's track is the armed one, on sound 0.
+            let armed: Vec<usize> = (0..desk.rows.len()).filter(|n| desk.rows[*n].arm).collect();
+            assert_eq!(armed, [1], "a template healed from {shipped:?} did not arm the piano alone");
+            assert_eq!(desk.rows[1].keys.patch, 0, "a template healed from {shipped:?} is not on the Intimate Grand");
         }
 
         // And a template somebody ARRANGED stands. One extra plugin on a
@@ -54697,6 +54775,70 @@ mod tests {
             Some(dialogs::BUILTIN_PATH),
             "a template somebody had arranged was overwritten"
         );
+
+        // **And a piano somebody put on another sound stands too**, in the
+        // shipped shape itself: the Keys on EP Mk.1 (a 5.1 template built by
+        // hand, before drums and the Keys was what Tangent wrote), and the
+        // DX7 on a chosen patch (which a reseed would now swap for the Keys).
+        let on_a_chosen_sound = |shape: &[(usize, &str)], choose: &dyn Fn(&mut crate::desk_model::TrackRow)| {
+            write_stock(shape);
+            let crate::arrangement::LoadOutcome::Loaded(mut a) = crate::arrangement::Arrangement::read_from(&doc) else {
+                panic!("the fixture would not read back")
+            };
+            choose(&mut a.desk.as_mut().expect("a desk").rows[1]);
+            a.save_to(&doc);
+            app.seed_template(&dir);
+            let crate::arrangement::LoadOutcome::Loaded(kept) = crate::arrangement::Arrangement::read_from(&doc) else {
+                panic!("the chosen template would not read back")
+            };
+            kept.desk.expect("a desk")
+        };
+        let keys = on_a_chosen_sound(SHIPPED_OVER_TIME[3], &|r| r.keys.patch = 1);
+        assert_eq!(keys.rows[1].keys.patch, 1, "a template's chosen Keys sound was put back on the Intimate Grand");
+        let dx7 = on_a_chosen_sound(SHIPPED_OVER_TIME[2], &|r| r.dx7.patch = 12);
+        assert_eq!(dx7.bay(INSERTS), Some(dialogs::BUILTIN_PATH), "a template's DX7 on a chosen patch was swapped for the Keys");
+        assert_eq!(dx7.rows[1].dx7.patch, 12, "a template's chosen DX7 patch was thrown away");
+
+        // **And so does one with a song's furniture in it**, on the shipped
+        // shape and the shipped sound: a tempo, a meter, a marker or a curve
+        // is something somebody put there, and a seed never has one.
+        let furnished = |what: &str, furnish: &dyn Fn(&mut crate::arrangement::Arrangement)| {
+            write_stock(SHIPPED_OVER_TIME[3]);
+            let crate::arrangement::LoadOutcome::Loaded(mut a) = crate::arrangement::Arrangement::read_from(&doc) else {
+                panic!("the fixture would not read back")
+            };
+            furnish(&mut a);
+            let want = a.clone();
+            a.save_to(&doc);
+            app.seed_template(&dir);
+            let crate::arrangement::LoadOutcome::Loaded(kept) = crate::arrangement::Arrangement::read_from(&doc) else {
+                panic!("the furnished template would not read back")
+            };
+            assert_eq!(
+                (&kept.tempo, &kept.meter, &kept.markers, &kept.automation),
+                (&want.tempo, &want.meter, &want.markers, &want.automation),
+                "a template with {what} was reseeded"
+            );
+        };
+        // A one-tempo, one-meter song is written on the desk and read back
+        // from it (`read_maps`), so the fixture sets both, as the app does.
+        furnished("a tempo", &|a| {
+            a.tempo = crate::tempo::TempoMap::constant(90.0);
+            a.desk.as_mut().expect("a desk").tempo_bpm = 90.0;
+        });
+        furnished("a meter", &|a| {
+            a.meter = crate::tempo::MeterMap::constant(recorder::TimeSignature { beats: 3, unit: 4 });
+            let d = a.desk.as_mut().expect("a desk");
+            (d.sig_beats, d.sig_unit) = (3, 4);
+        });
+        furnished("a marker", &|a| {
+            a.markers.push(crate::arrangement::ArrMarker { at_s: 4.0, name: "VERSE".to_owned() });
+        });
+        furnished("a curve", &|a| {
+            a.automation.entry(AutoLane::Master, crate::automation::AutoParam::Gain).put(
+                crate::automation::Point { at_s: 0.0, value: 0.448, shape: crate::automation::Shape::Linear },
+            );
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -57326,9 +57468,11 @@ mod tests {
     #[test]
     fn opening_the_builtin_shows_patches_and_a_vst_shows_its_own_editor() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        // The shipped desk: the Tangent DX7 in channel 1's first bay — the
-        // kit takes channel 0. A VST beside it in the second, to prove the
-        // two bays answer differently.
+        // The Tangent DX7 in channel 1's first bay, where the shipped desk
+        // had it until 5.2 (the Keys sits there now, so it is put back) —
+        // the kit takes channel 0. A VST beside it in the second, to prove
+        // the two bays answer differently.
+        app.set_insert(1, 0, Some(dialogs::BUILTIN_PATH));
         app.set_insert(1, 1, Some("/x/Grand 8.vst3"));
 
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
@@ -59047,7 +59191,7 @@ mod tests {
         let root = project_scratch("reorder");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        // Dress channel 1 (the DX7) distinctly.
+        // Dress channel 1 (the Keys) distinctly.
         app.settings.rows[1].name = "LEAD".to_owned();
         app.settings.rows[1].icon = 2; // guitar badge
         app.settings.rows[1].color = 7;
@@ -59066,7 +59210,7 @@ mod tests {
         std::fs::write(&mid, &b).unwrap();
         app.import_midi_at(&mid, 1, 0.0).expect("midi in");
 
-        // Move the DX7 from its own row to row 3. It ships on channel 1 —
+        // Move the Keys from its own row to row 3. It ships on channel 1 —
         // the kit takes the first row — so this is the row the fixture set
         // everything else on, too.
         app.move_channel(1, 3);
@@ -59078,8 +59222,8 @@ mod tests {
         assert_eq!(app.settings.rows[3].kind_byte(), 1);
         assert_eq!(
             app.insert(3, 0),
-            Some(dialogs::BUILTIN_PATH),
-            "the DX7 did not ride to row 4"
+            Some(dialogs::KEYS_PATH),
+            "the Keys did not ride to row 4"
         );
         // Moving channel 1 to position 3 shifts channels 2..3 down one and
         // leaves row 0 — the drum's — exactly where it was.
@@ -59795,14 +59939,15 @@ mod tests {
     /// what answers for a desk that has never said, which is what this test
     /// opens with.
     #[test]
-    fn arm_opens_on_the_dx7_alone_and_follows_the_desk() {
+    fn arm_opens_on_the_piano_alone_and_follows_the_desk() {
         use crate::mixer_panel::Hit;
         use crate::recorder::{ChannelKind, Column};
         let (_, mut app) = headless(Caps::DESKTOP);
-        // The shipped desk: the DX7 opens LIVE and nothing else. It sits on
-        // channel 1 — the kit is first — and the arm FOLLOWS THE INSTRUMENT
-        // rather than the seat, which is what `default_armed` is for.
-        assert_eq!(app.armed_word(), 2, "a fresh desk should open with the DX7 armed");
+        // The shipped desk: the piano (the Keys since 5.2) opens LIVE and
+        // nothing else. It sits on channel 1 — the kit is first — and the
+        // arm FOLLOWS THE INSTRUMENT rather than the seat, which is what
+        // `default_armed` is for.
+        assert_eq!(app.armed_word(), 2, "a fresh desk should open with the piano armed");
 
         app.apply_mixer_hit(Hit::Arm(Column::Track(1)), 0.0);
         assert_eq!(app.armed_word(), 0, "R did not disarm");
@@ -59815,7 +59960,7 @@ mod tests {
         let n = (1..crate::desk_lift::V32_CHANNELS)
             .find(|n| app.channel_kind(*n).is_none())
             .expect("an unused channel");
-        assert_eq!(app.armed_word(), 2, "the DX7 should stand armed here");
+        assert_eq!(app.armed_word(), 2, "the piano should stand armed here");
         app.set_channel_input_spec(n, "midi:all");
         assert_eq!(app.channel_kind(n), Some(ChannelKind::Midi));
         assert_eq!(
@@ -60583,7 +60728,7 @@ mod tests {
         let at = Strip::Channel(n).index();
         assert!(
             app.settings.strip_send(recorder::StripRef::Row(at)).abs() < 1e-9,
-            "a fresh track's send should rest at ZERO - only the shipped DX7 is wired"
+            "a fresh track's send should rest at ZERO - only the shipped piano is wired"
         );
         assert_eq!(app.armed_word() & (1 << n), 0, "a fresh track armed itself");
 
@@ -60620,7 +60765,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
-        // Channel 0 ships used (the DX7). Dress it further, then remove it.
+        // Channel 0 ships used (the drums). Dress it further, then remove it.
         app.set_insert(0, 1, Some("/x/Grand 8.vst3"));
         app.settings.rows[0].name = "BELL KEYS".to_owned();
         app.settings.rows[0].color = 14;
@@ -60651,6 +60796,8 @@ mod tests {
     #[test]
     fn loading_a_cartridge_refills_the_open_picker() {
         let (_, mut app) = headless(Caps::DESKTOP);
+        // The DX7 on track 2, where the shipped desk had it until 5.2.
+        app.set_insert(1, 0, Some(dialogs::BUILTIN_PATH));
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
@@ -60689,6 +60836,8 @@ mod tests {
     #[test]
     fn a_cartridge_that_fails_leaves_the_good_one_alone() {
         let (_, mut app) = headless(Caps::DESKTOP);
+        // The DX7 on track 2, where the shipped desk had it until 5.2.
+        app.set_insert(1, 0, Some(dialogs::BUILTIN_PATH));
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
@@ -60778,6 +60927,8 @@ mod tests {
     fn a_held_patch_row_sounds_its_strip_and_is_put_back_when_the_hand_lifts() {
         let ctx = egui::Context::default();
         let (_, mut app) = headless(Caps::DESKTOP);
+        // The DX7 on track 2, where the shipped desk had it until 5.2.
+        app.set_insert(1, 0, Some(dialogs::BUILTIN_PATH));
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
@@ -71205,8 +71356,8 @@ mod tests {
             "a reset did not restore every theory element"
         );
         // **And an instrument on the desk.** A reset that left every bay
-        // empty would tell somebody the app had no instrument, and the patch
-        // picker is reached by clicking the bay it is in.
+        // empty would tell somebody the app had no instrument, and the
+        // Keys' sounds are reached by clicking the bay it is in.
         assert_eq!(
             bay_of(&s, 0, 0),
             Some(dialogs::DRUMPAD_PATH),
@@ -71214,7 +71365,7 @@ mod tests {
         );
         assert_eq!(
             bay_of(&s, 1, 0),
-            Some(dialogs::BUILTIN_PATH),
+            Some(dialogs::KEYS_PATH),
             "a reset left the keyboard off the desk"
         );
     }
@@ -71379,9 +71530,14 @@ mod tests {
         // **The kit first, the keyboard second** — the owner's order for the
         // out-of-the-box desk. See `Settings::default`.
         assert_eq!(bay_of(&s, 0, 0), Some(dialogs::DRUMPAD_PATH));
-        assert_eq!(bay_of(&s, 1, 0), Some(dialogs::BUILTIN_PATH));
+        // **The keyboard is Tangent Keys on its Intimate Grand** since 5.2,
+        // the owner's "the keys' Intimate Grand now instead of the DX7". The
+        // sound is the ROW's (`KeysSel`), and sound 0 is the one by that name.
+        assert_eq!(bay_of(&s, 1, 0), Some(dialogs::KEYS_PATH));
+        assert_eq!(s.rows[1].keys.patch, 0, "a fresh install's keyboard is not on sound 0");
+        assert_eq!(dialogs::KEYS_PATCH_NAMES[0].0, "Intimate Grand");
         // And nothing else: two channels with instruments, not sixteen of
-        // something. Channels 0 (drumpad) and 1 (DX7) each hold one bay-0
+        // something. Channels 0 (drumpad) and 1 (Keys) each hold one bay-0
         // instrument; every other bay everywhere is empty.
         assert!(
             (2..=crate::desk_legacy::V32_STRIPS)
@@ -83449,11 +83605,13 @@ mod folder_tests {
         use crate::desk_lift::V32_CHANNELS as CHANNELS;
         use crate::recorder::{Strip, INSERTS};
         let d = TangentApp::template_desk();
-        // Two rows, and only two: the drums on one, the built-in on two.
+        // Two rows, and only two: the drums on one, the Keys on two.
         assert_eq!(d.word(|r| r.added), 0b11, "the template is not two tracks");
         let bay = |ch: usize| d.bay(Strip::Channel(ch).index() * INSERTS).unwrap_or("");
         assert_eq!(bay(0), dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
-        assert_eq!(bay(1), dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
+        assert_eq!(bay(1), dialogs::KEYS_PATH, "channel 2 is not the Keys");
+        assert_eq!(d.rows[1].keys.patch, 0, "channel 2 is not on the Intimate Grand");
+        assert_eq!(d.word(|r| r.arm), 0b10, "the template does not arm the piano alone");
         for ch in 2..CHANNELS {
             assert!(bay(ch).is_empty(), "channel {} came with a plugin", ch + 1);
         }

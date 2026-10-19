@@ -2181,22 +2181,23 @@ fn parse_object(text: &str) -> Result<Map<String, Value>, String> {
 /// the desk SHOWS its two tracks and one place to add the next, and Add
 /// fills the vacant row it lands on rather than growing past it.
 ///
-/// **Row 0 ships as the DRUMPAD, row 1 as the DX7** (their bays are in
-/// `plugins`). The two built-in instruments sit side by side, so a fresh
+/// **Row 0 ships as the DRUMPAD, row 1 as Tangent Keys on its Intimate
+/// Grand** (their bays are in `plugins`; the sound is `KeysSel::default`'s
+/// sound 0). The two built-in instruments sit side by side, so a fresh
 /// install makes a sound, has a kit the editor can write for, and the desk
 /// shows both. The DRUMS come first by the owner's ruling: a desk is read
 /// top down, and the kit is what a song is built on top of rather than what
-/// sits under the melody. It also puts the one ARMED row (the DX7, see
+/// sits under the melody. It also puts the one ARMED row (the piano, see
 /// `app::default_armed`) second, where the record light is not the first
-/// thing the eye lands on.
+/// thing the eye lands on. Row 1 held the built-in DX7 until 5.2.
 ///
 /// The drumpad wears the drum badge; everything else follows its kind.
-/// **Only the shipped DX7 arrives wired to the reverb**, the owner's ruling,
-/// riding with the instrument rather than the row; every other row rests
-/// dry. **The one T on the desk** is the DX7's too: the theory surfaces are
-/// about what somebody is PLAYING, and on a fresh install that is the
-/// keyboard rather than the kit. Nothing is hand-painted, the click and the
-/// master included (`Palette::click`).
+/// **Only the shipped piano arrives wired to the reverb**, the owner's
+/// ruling, riding with the instrument rather than the row; every other row
+/// rests dry. **The one T on the desk** is the piano's too: the theory
+/// surfaces are about what somebody is PLAYING, and on a fresh install that
+/// is the keyboard rather than the kit. Nothing is hand-painted, the click
+/// and the master included (`Palette::click`).
 pub fn shipped_rows() -> Vec<crate::desk_model::TrackRow> {
     use crate::desk_model::{RowKind, TrackRow};
     let mut rows: Vec<TrackRow> = crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS)
@@ -2382,8 +2383,8 @@ impl Default for Settings {
             render_ahead_ms: -1.0,
             open_view: 0,
             palette_auto: true,
-            // **Row 0 ships as the DRUMPAD, row 1 as the DX7**, and the rest
-            // of the legacy width vacant: see [`shipped_rows`].
+            // **Row 0 ships as the DRUMPAD, row 1 as Tangent Keys**, and the
+            // rest of the legacy width vacant: see [`shipped_rows`].
             rows: shipped_rows(),
             // Nothing written down: the app resolves the shipped rule once.
             // See the field.
@@ -2410,15 +2411,17 @@ impl Default for Settings {
             bus_effect: None,
             guitar_intervals: true,
             fx_return_gain: 1.0,
-            // Row 0's first bay holds the DRUMPAD, and row 1's holds the
-            // built-in DX7 that is a fresh install's sound, on the shipped
-            // rows' identity ids (see [`shipped_rows`] for the order).
+            // Row 0's first bay holds the DRUMPAD, and row 1's holds Tangent
+            // Keys, whose sound 0 (Intimate Grand, `KeysSel::default`) is a
+            // fresh install's sound, on the shipped rows' identity ids (see
+            // [`shipped_rows`] for the order). It was the built-in DX7 until
+            // 5.2; see `dialogs::SHIPPED_PIANOS`.
             plugins: {
                 use crate::desk_id::{Node, Rack, SeatBay, TrackId};
                 let first = |row: u32| SeatBay::new(Node::Track(TrackId(row)), Rack::Chain(0), 0);
                 std::collections::BTreeMap::from([
                     (first(0), crate::dialogs::DRUMPAD_PATH.to_owned()),
-                    (first(1), crate::dialogs::BUILTIN_PATH.to_owned()),
+                    (first(1), crate::dialogs::KEYS_PATH.to_owned()),
                 ])
             },
             input_alias: String::new(),
@@ -4476,7 +4479,7 @@ impl Settings {
         if self.arm_unsaid {
             let kinds: Vec<u8> = model.rows.iter().map(|r| crate::desk_model::RowKind::byte(r.kind)).collect();
             let armed = crate::arrangement::armed_by_default(&kinds, |n| {
-                self.row_holds(n, crate::dialogs::BUILTIN_PATH)
+                crate::dialogs::SHIPPED_PIANOS.iter().any(|p| self.row_holds(n, p))
             });
             for (n, row) in model.rows.iter_mut().enumerate() {
                 row.arm = Some(n) == armed;
@@ -5491,7 +5494,7 @@ impl Settings {
             // **Read off the default rather than spelled again here.** This
             // was a second copy of `Settings::default`'s own vector, and the
             // day the shipped desk changed — the kit taking the first row and
-            // the DX7 the second — the copy still said channel 0 and a fresh
+            // the piano the second — the copy still said channel 0 and a fresh
             // file started writing a key it had never written before.
             let fresh = DenseRows::default().strip_to_theory;
             if d.strip_to_theory != fresh {
@@ -7973,7 +7976,7 @@ mod tests {
         assert!(why.contains("line 1"), "the note does not carry serde's position: {why}");
         // And what came up is usable rather than a half-empty window.
         assert!(s.show_recorder && s.show_fretboard);
-        // The default desk: the kit in channel 0's first bay, the DX7 in
+        // The default desk: the kit in channel 0's first bay, the Keys in
         // channel 1's. See `Settings::default`.
         assert_eq!(
             s.legacy_inserts().first().map(String::as_str),
@@ -7981,7 +7984,7 @@ mod tests {
         );
         assert_eq!(
             s.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
-            Some(crate::dialogs::BUILTIN_PATH)
+            Some(crate::dialogs::KEYS_PATH)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8317,7 +8320,7 @@ mod tests {
 
         assert!(!dir.join("settings.json.unreadable").exists());
         assert!(s.show_recorder);
-        // The default desk: the kit in channel 0's first bay, the DX7 in
+        // The default desk: the kit in channel 0's first bay, the Keys in
         // channel 1's. See `Settings::default`.
         assert_eq!(
             s.legacy_inserts().first().map(String::as_str),
@@ -8325,7 +8328,7 @@ mod tests {
         );
         assert_eq!(
             s.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
-            Some(crate::dialogs::BUILTIN_PATH)
+            Some(crate::dialogs::KEYS_PATH)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8630,9 +8633,9 @@ mod tests {
             "the recorder is invisible on a fresh install"
         );
         // **Both built-ins are loaded, and that is visibility too.** The
-        // default desk carries the kit in channel 0's first bay and the DX7
-        // in channel 1's, and a first launch keeps that: the patch picker and
-        // the patch editor are reached by clicking the bay it is in.
+        // default desk carries the kit in channel 0's first bay and the Keys
+        // in channel 1's, and a first launch keeps that: the Keys' window,
+        // with its ten sounds, is reached by clicking the bay it is in.
         assert_eq!(
             first.legacy_inserts().first().map(String::as_str),
             Some(crate::dialogs::DRUMPAD_PATH),
@@ -8640,7 +8643,7 @@ mod tests {
         );
         assert_eq!(
             first.legacy_inserts().get(crate::recorder::INSERTS).map(String::as_str),
-            Some(crate::dialogs::BUILTIN_PATH),
+            Some(crate::dialogs::KEYS_PATH),
             "a fresh install has no instrument on the desk"
         );
 
@@ -8680,7 +8683,7 @@ mod tests {
         if s.arm_unsaid {
             let kinds: Vec<u8> = s.rows.iter().map(|r| r.kind_byte()).collect();
             let armed = crate::arrangement::armed_by_default(&kinds, |n| {
-                s.row_holds(n, crate::dialogs::BUILTIN_PATH)
+                crate::dialogs::SHIPPED_PIANOS.iter().any(|p| s.row_holds(n, p))
             });
             for (n, row) in s.rows.iter_mut().enumerate() {
                 row.arm = Some(n) == armed;

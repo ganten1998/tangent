@@ -49,8 +49,8 @@ const QUIET: Caps = Caps {
 
 /// **A desk with nothing on it**: every row vacant and no bay seated, so
 /// each track below is made by a road and is exactly what that road made,
-/// rather than inheriting the fresh install's kit and DX7 (which a render
-/// could only make audible with a kit and a cartridge of their own). No
+/// rather than inheriting the fresh install's kit and Keys (which a render
+/// could only make audible with a kit and a sound of their own). No
 /// welcome card: it is a dialog, and a dialog takes the keys.
 fn bare_desk() -> Settings {
     let mut s = Settings {

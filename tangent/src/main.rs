@@ -38,15 +38,15 @@ mod outpath;
 /// measurement that makes the join mandatory rather than an optimisation.
 #[cfg(feature = "recorder")]
 mod rtwork;
-/// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app
-/// has when it has no instrument, so a fresh install makes a sound. The default
-/// patch is written in the source: no samples, no data, no licence questions.
+/// Six-operator FM, and real DX7 cartridges to feed it. The default patch is
+/// written in the source: no samples, no data, no licence questions.
 #[cfg(feature = "recorder")]
 mod dx7;
-/// A piano and an electric piano, computed rather than recorded. Zero samples
-/// for the same reason the DX7 carries none: a model has no velocity layers to
-/// cross and no loop points to hide, so it is right at every pitch and every
-/// force. Two patches, and both of them are arithmetic.
+/// Ten keyboard sounds (grands, electric and reed pianos, clavs and a
+/// guitar), computed rather than recorded. Zero samples for the same reason the DX7
+/// carries none: a model has no velocity layers to cross and no loop points to
+/// hide, so it is right at every pitch and every force. A fresh install's
+/// second track plays its Intimate Grand.
 #[cfg(feature = "recorder")]
 mod keys;
 /// Reverb and delay, on everything the app plays.

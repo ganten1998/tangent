@@ -3791,6 +3791,22 @@ pub const KEYS_PATH: &str = "@tangent-keys";
 /// taking it off moved nothing on disk.
 pub const KEYS_NAME: &str = "Tangent Keys";
 
+/// **The shipped pianos: what the one channel a desk arms by itself holds**
+/// (`arrangement::armed_by_default`, asked by the launch, by a document that
+/// never wrote its arm down and by a settings file that never did).
+///
+/// Tangent Keys, because since 5.2 a fresh install's second track plays its
+/// Intimate Grand. The owner: "I want the default instrument on the freshly
+/// installed default project to be the keys' Intimate Grand now instead of
+/// the DX7."
+///
+/// **And the DX7, which was that piano until then.** Every desk written
+/// before 5.2 that is answered by this rule rather than by its own arm key
+/// carries the DX7 where the piano goes, and it always opened with that
+/// channel live; a list without it would open those dead. One list, so the
+/// three readers cannot each name a different piano.
+pub const SHIPPED_PIANOS: [&str; 2] = [KEYS_PATH, BUILTIN_PATH];
+
 /// **The fourth built-in instrument's sentinel, and the first that is a
 /// VOICE in a bay.** It rides the picker exactly as the three above do,
 /// filed under the house's shelf right after Keys, and every layer between

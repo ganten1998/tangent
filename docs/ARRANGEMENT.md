@@ -18,7 +18,8 @@ later** — nothing may bake "8" in so deep that growing it is a rewrite.
 
 **The BACKING strip retires.** The desk becomes 8 general channels + click
 + master (the backing track's job is now "an audio clip on a lane"). The
-default desk stays: DX7 on channel 1, seven empty.
+default desk stays: DX7 on channel 1, seven empty. (Superseded: see "The
+default desk and its armed channel, since 5.2" below.)
 
 **Track headers (left column), from the owner's REAPER theme.** Medium
 density: track number, record-arm dot, name, a small volume knob, a slim
@@ -177,6 +178,14 @@ channels play back their clips and nothing else. "Ready to play" and
 - **Which channel opens armed**: the one whose bay holds the built-in DX7;
   if none does, the first MIDI channel carrying any instrument; if none,
   nothing opens armed.
+- **The default desk and its armed channel, since 5.2 (2026-10-18).** The
+  default desk is the drums on track one and Tangent Keys, on its Intimate
+  Grand, on track two (the owner: "the keys' Intimate Grand now instead of
+  the DX7"). The one channel that opens armed is the first MIDI channel
+  holding a shipped piano: Tangent Keys, or the DX7 in a desk written
+  before 5.2. The "any instrument" fallback above is gone. See
+  `TangentApp::template_desk`, `app::default_armed` and
+  `dialogs::SHIPPED_PIANOS`.
 - **Click in empty lane space = locate the playhead there** (and clear the
   selection). Clicking a clip selects it.
 - **Clip drawing**: body in the channel's colour, waveform (audio) or note

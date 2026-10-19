@@ -39,6 +39,9 @@ data at all:
   ringing along. Every key plays: one under the low E or past the
   fingerboard is a string of its own, as a harp guitar's extra strings are.
 
+Since 5.2 it is also what a fresh install plays: the default project's
+second track holds it on Intimate Grand, armed, where the DX7 was.
+
 Load it in any MIDI channel's first bay, exactly as the DX7 loads, in as
 many bays as you like, because every lane owns a full instance of the
 instrument: a piano track and an EP track in one session, or eight of either,

@@ -11391,13 +11391,6 @@ struct Renderer {
     /// [`Reach::EVERY`] for an event from the app itself — see
     /// `recorder::MIDI_SRC_APP`.
     note_lanes: Vec<Reach>,
-    /// The instrument this app ships with.
-    ///
-    /// Rendered when a slot has asked for it, and when NO slot has anything at
-    /// all — so a fresh install makes a sound, and choosing "Tangent DX7" in
-    /// the picker keeps making one after a real plugin has been tried and
-    /// removed. See `dx7/` for the synth and `builtin.rs` for what it grew out
-    /// of.
     /// The backing track, and where in it the transport is.
     ///
     /// **Held by the renderer, swapped in whole.** A clip is a hundred

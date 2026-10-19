@@ -11,6 +11,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **A new session plays a grand piano.** The default project's second
+  track, the one that opens armed with the theory switch on, now holds
+  Tangent Keys on its Intimate Grand instead of Tangent DX7, and the drums
+  stay on the first track. A default template that is still as Tangent
+  wrote it (no clips, markers, automation or track names, no other plugins,
+  the tempo and meter it came with, and its instrument on the sound it came
+  with) is replaced at the next launch, so an install that has launched
+  before gets the new desk too. Levels or knob settings changed on their own
+  do not keep a template: name one of its tracks to keep it. A template you
+  have built on keeps what it has, and Settings > Reset > The Default
+  Template brings in the new desk. Saved projects are not touched, and
+  Tangent DX7 is still in the instrument picker.
 - **The developer switches are spelled with Tangent's name.** The
   environment variables that turn on diagnostics and test hooks now start
   with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,

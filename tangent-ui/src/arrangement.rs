@@ -1708,9 +1708,11 @@ pub struct FrozenLane {
 ///
 /// All arms off, save one, by the owner's rule: a project must be openable
 /// without headphones and without being blasted, and the one exception is the
-/// row that makes the piano sound — the first MIDI row whose first bay holds
-/// the built-in DX7. `kinds` is a byte per row (`RowKind::byte`), as many as
-/// the desk has.
+/// row that makes the piano sound — the first MIDI row holding one of
+/// `dialogs::SHIPPED_PIANOS` (Tangent Keys since 5.2, the built-in DX7 before
+/// it). Which bays count is the caller's to say: the settings and the app ask
+/// all six (`Settings::row_holds`), a document asks the instrument seat.
+/// `kinds` is a byte per row (`RowKind::byte`), as many as the desk has.
 ///
 /// One rule, two callers: `app::default_armed` asks it about a `Settings` and
 /// [`DeskSnap::from_value`] asks it about a document that carries no `armed`
@@ -3035,8 +3037,9 @@ impl DeskSnap {
         // **Which rows are ARMED**: absent in older documents, and DERIVED
         // rather than assumed empty — the shipped rule, asked of this
         // document's own desk, so a project from before the arm was written
-        // down opens the way it always opened (the DX7's channel live,
-        // nothing else). Read AFTER the era lifts, like `tracks_added`.
+        // down opens the way it always opened (the piano's channel live,
+        // nothing else; in those documents the piano is the DX7). Read
+        // AFTER the era lifts, like `tracks_added`.
         let armed = m.get("armed").and_then(Value::as_u64).map_or_else(
             || {
                 armed_by_default(&kinds_v, |n| {
@@ -3050,7 +3053,7 @@ impl DeskSnap {
                         .binary_search_by_key(&seat, |(b, _)| *b)
                         .ok()
                         .and_then(|i| inserts.get(i))
-                        .is_some_and(|(_, p)| p == crate::dialogs::BUILTIN_PATH)
+                        .is_some_and(|(_, p)| crate::dialogs::SHIPPED_PIANOS.contains(&p.as_str()))
                 })
                 .map_or(0, |n| 1u32 << n)
             },
@@ -6281,20 +6284,25 @@ mod tests {
         for (n, row) in snap.rows.iter_mut().enumerate() {
             row.kind = (n == 1).then_some(crate::desk_model::RowKind::Midi);
         }
-        snap.set_bay(seat, crate::dialogs::BUILTIN_PATH);
         snap.set_word(|r| &mut r.arm, 1 << 1);
 
         // A document from before the arm was written down is a LEGACY one:
-        // a format-2 desk says every row's arm.
-        let mut value = snap.to_value_as(crate::desk_format::Format::Legacy);
-        let obj = value.as_object_mut().expect("a desk object");
-        assert!(obj.remove("armed").is_some(), "the key was never written");
-        let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
-        assert_eq!(
-            back.word(|r| r.arm),
-            1 << 1,
-            "a document with no arm key did not fall back to the shipped rule"
-        );
+        // a format-2 desk says every row's arm. **Either shipped piano** in
+        // that seat: the DX7, which every such document holds there, and the
+        // Keys, the other one the rule names (`dialogs::SHIPPED_PIANOS`).
+        for piano in crate::dialogs::SHIPPED_PIANOS {
+            snap.set_bay(seat, piano);
+            let mut value = snap.to_value_as(crate::desk_format::Format::Legacy);
+            let obj = value.as_object_mut().expect("a desk object");
+            assert!(obj.remove("armed").is_some(), "the key was never written");
+            let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
+            assert_eq!(
+                back.word(|r| r.arm),
+                1 << 1,
+                "a document with {piano} and no arm key did not fall back to the shipped rule"
+            );
+        }
+        snap.set_bay(seat, crate::dialogs::BUILTIN_PATH);
 
         // Written, and read back as itself — including the silent desk.
         for mask in [0u64, 1 << 1, 0b1010] {

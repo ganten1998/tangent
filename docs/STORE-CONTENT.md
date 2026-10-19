@@ -81,7 +81,7 @@ mixdown or stems, as WAV or MP3.
 
 It hosts VST3 plugins on every platform and LV2 plugins on Linux and
 FreeBSD, and tells them the song's tempo and transport. It also brings its
-own: a modelled keyboard with eight sounds, an FM synth, an analog-style
+own: a modelled keyboard with ten sounds, an FM synth, an analog-style
 synth, a sampler, and a shelf of effects from EQ and compression to tape,
 reverb, amp and a bitcrusher. Tangent Insert puts your outboard gear in an
 insert slot and keeps the session in time with it.

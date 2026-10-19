@@ -6319,9 +6319,9 @@ impl DesktopApp {
         // driving it by hand makes every measurement a different measurement.
         //   TANGENT_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
         //
-        // **`=<strip>,<bay>` names a different bay**, because bay 1 of channel
-        // 1 holds the built-in on a fresh desk and therefore opens the PATCH
-        // picker. The plugin picker is only ever reached through an EMPTY bay,
+        // **`=<strip>,<bay>` names a different bay**, because bay 1 of a
+        // channel holding a built-in instrument opens its PATCH picker, and
+        // a fresh desk seats one in channel 1 and channel 2. The plugin picker is only ever reached through an EMPTY bay,
         // so with the hook pinned to slot 0 there was no way to put it on
         // screen from a script at all — which is the one thing the hook exists
         // to make possible.
@@ -9584,16 +9584,15 @@ impl DesktopApp {
     /// Read the cartridge named in the settings, if it is still there.
     ///
     /// Failure is not reported: see the call site. The default bank always
-    /// sounds, so the worst case is the sound somebody would have had on a
-    /// fresh install.
+    /// sounds, so the worst case is the sound a new DX7 track has.
     fn load_cartridge_at_launch(&mut self) {
         let path = self.app.dx7_choice().0.to_owned();
         // **No cartridge chosen means the DEFAULT bank**, not silence and not
         // a single patch: `default.syx` on the SYSEX shelf if the user has
         // saved one there — the owner's ask, "so the user can have their
         // chosen load every time" — and otherwise the sixteen electric
-        // pianos and sixteen jazz guitars in the binary, which a fresh
-        // install has without opening a file dialog. "Load bank..." is for
+        // pianos and sixteen jazz guitars in the binary, which a new DX7
+        // track has without opening a file dialog. "Load bank..." is for
         // somebody who wants somebody else's. One reading of "default", and
         // it is `cartridge_at`'s; this only says which it found.
         let shelf = self.app.sysex_root();
@@ -21394,7 +21393,7 @@ impl DesktopApp {
         // when it is not**: cartridges live in sample folders that get
         // reorganised, and an error dialog at launch about a file somebody
         // loaded weeks ago is a worse outcome than quietly playing the built-in
-        // patch, which is what a fresh install plays anyway.
+        // patch, which is what a new DX7 track plays anyway.
         // The SYSEX shelf first, because the cartridge load right after it
         // looks there for `default.syx`, and so that the folder the manual
         // points people at exists before they have pressed anything.
@@ -39722,7 +39721,7 @@ mod arr_identity {
     /// armed)`, every one an AUDIO track.
     ///
     /// **No plugin on any bay, said in the file's own words**: the fresh
-    /// install's drumpad and DX7 are cleared through the format-2 `desk`
+    /// install's drumpad and Keys are cleared through the format-2 `desk`
     /// object (design Appendix D), which every settings shape reads and
     /// writes, and not through the field that holds them. That field is
     /// `strip_inserts` here and `plugins` (a map by `SeatBay`) once
