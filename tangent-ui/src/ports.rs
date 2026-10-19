@@ -1198,8 +1198,11 @@ pub struct PresetRow {
 /// The values are `(symbol, value)` pairs rather than a struct per unit:
 /// symbols are the append-only address space every built-in already persists
 /// by (see `builtin_fx`'s `ParamSpec` in the binary), so a preset from a
-/// newer build carries symbols this build skips and one from an older build
-/// simply leaves the missing knobs at their defaults.
+/// newer build carries symbols this build skips. A built-in's arrive with
+/// every knob of the unit, those its file does not name at their defaults
+/// (`builtin_fx::preset_values`), so a preset from an older build lands
+/// those at their defaults rather than leaving them where the bay had them;
+/// a Keys sound's are filled by its window (`preset::keys_knobs`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PresetLoaded {
     /// The unit the FILE says it belongs to — "@tangent-eq", "keys:2". The

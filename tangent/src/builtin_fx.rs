@@ -1535,6 +1535,42 @@ pub fn values_from_state(spec: &UnitSpec, bytes: &[u8]) -> Result<Vec<f32>, Stri
     Ok(values)
 }
 
+/// **A built-in's preset as its bay lands it**: every knob the unit has, at
+/// the file's value where the file names it and, where it does not, at what
+/// a saved bay without that line reads as ([`absent_reads_as`], then the
+/// spec's default), the reading [`values_from_state`] gives a session's
+/// blob. `None` for a unit that is not built in (a Keys sound's preset is
+/// filled by its own window, from its own specs).
+///
+/// A preset is applied as a run of knob asks, one per value it carries, and
+/// it used to carry only what its file said. A file from an older build
+/// says nothing of the knobs added since, so those stayed wherever the bay
+/// had them: a Tape preset saved by 5.0 or 5.1 names six of thirteen, and
+/// loaded onto a bay at 30 ips, the deep range and Age 0.8 it kept all
+/// three, so one preset sounded different from bay to bay. The session
+/// road reads the same file's knobs at their defaults (the owner's ruling
+/// for every appended control); a preset now lands the same way, the moved
+/// default included: a Denoise preset from before its selector plays the
+/// kernel it was saved on, as its saved bay does.
+///
+/// In the spec's order, then whatever the file names that this build does
+/// not know, carried as the file had it (a newer build's knob, which the
+/// face skips).
+pub fn preset_values(path: &str, values: &[(String, f64)]) -> Option<Vec<(String, f64)>> {
+    let spec = spec_for(path)?;
+    let named = |symbol: &str| values.iter().find(|(s, _)| s == symbol).map(|(_, v)| *v);
+    let mut out: Vec<(String, f64)> = spec
+        .params
+        .iter()
+        .map(|p| {
+            let unsaid = absent_reads_as(spec.path, p.symbol).unwrap_or(p.default);
+            (p.symbol.to_owned(), named(p.symbol).unwrap_or(f64::from(unsaid)))
+        })
+        .collect();
+    out.extend(values.iter().filter(|(s, _)| !spec.params.iter().any(|p| p.symbol == s)).cloned());
+    Some(out)
+}
+
 // ── the units themselves ────────────────────────────────────────────────────
 
 /// A built-in unit, ready to sit in a `Backend`. One variant per unit; the
@@ -4131,6 +4167,53 @@ mod tests {
             assert!(absent_reads_as(TAPE_PATH, p.symbol).is_none(), "{} is pinned to 5.0", p.symbol);
         }
         assert_eq!(spec.create(48_000.0, &values).latency(), 96, "a 5.0 tape opened off the studio head");
+    }
+
+    /// **A preset is handed over as a saved bay reads, every knob in it.**
+    ///
+    /// The same file read two ways must land the same knobs: a 5.1 Tape
+    /// preset names six symbols, and as a session's blob those six read as
+    /// written and the seven appended since at their defaults
+    /// (`a_5_0_tape_blob_reads_the_new_controls_at_their_defaults`), so the
+    /// preset hands over thirteen, in the spec's order, the same thirteen.
+    /// A moved default is the absent reading, not the fresh one: a Denoise
+    /// preset from before its selector plays Spectral Studio, the kernel it
+    /// was saved on, where a fresh bay opens on the Bank. A file that names
+    /// everything is handed over as it is; a symbol this build does not
+    /// know is carried after the spec's, for the face to skip; and a unit
+    /// that is not built in (a Keys sound's) is not this function's.
+    #[test]
+    fn a_preset_is_handed_over_as_a_saved_bay_reads_every_knob_in_it() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let six: Vec<(String, f64)> = [("drive", 0.6), ("bump", 0.5), ("roll", 0.12), ("wobble", 0.3), ("hiss", 0.25), ("trim", 0.5)]
+            .into_iter()
+            .map(|(s, v)| (s.to_owned(), v))
+            .collect();
+        let landed = preset_values(TAPE_PATH, &six).expect("the tape is built in");
+        let as_saved =
+            values_from_state(spec, b"tangentfx 1\ndrive=0.6\nbump=0.5\nroll=0.12\nwobble=0.3\nhiss=0.25\ntrim=0.5\n").unwrap();
+        assert_eq!(landed.len(), spec.params.len(), "the preset was not handed over whole: {landed:?}");
+        for ((p, (symbol, v)), saved) in spec.params.iter().zip(&landed).zip(&as_saved) {
+            assert_eq!(symbol, p.symbol, "the preset's knobs are out of the spec's order");
+            assert_eq!(*v as f32, *saved, "{symbol} lands at {v}, where the same file as a saved bay reads {saved}");
+        }
+        let denoise = spec_for(DENOISE_PATH).unwrap();
+        let old = preset_values(DENOISE_PATH, &[("reduce".to_owned(), 0.8)]).expect("the denoiser is built in");
+        let kernel = old.iter().find(|(s, _)| s == "kernel").map(|(_, v)| *v as f32);
+        assert_eq!(
+            kernel,
+            Some(crate::units::denoise::DenoiseKernel::UNWRITTEN.dial()),
+            "a Denoise preset from before the selector lands on another kernel than its saved bay plays"
+        );
+        let fresh = denoise.params.iter().find(|p| p.symbol == "kernel").map(|p| p.default);
+        assert_ne!(kernel, fresh, "the fixture cannot tell the absent kernel from a fresh one");
+        let full: Vec<(String, f64)> = spec.params.iter().map(|p| (p.symbol.to_owned(), 0.25)).collect();
+        assert_eq!(preset_values(TAPE_PATH, &full).as_ref(), Some(&full), "a preset that names every knob was changed");
+        let newer = [six.clone(), vec![("splice".to_owned(), 0.75)]].concat();
+        let carried = preset_values(TAPE_PATH, &newer).unwrap();
+        assert_eq!(carried.last(), Some(&("splice".to_owned(), 0.75)), "a newer build's knob was dropped");
+        assert_eq!(carried.len(), spec.params.len() + 1);
+        assert_eq!(preset_values("keys:2", &six), None, "a Keys sound's preset was filled from a built-in's spec");
     }
 
     /// **Every tape id reaches its own field, and an id the table does not

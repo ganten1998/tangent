@@ -16,8 +16,14 @@
 //! do (the sentinel path), and `"keys:2"` names a Keys patch. The values are
 //! `(symbol, value)` pairs — symbols are the append-only address space the
 //! built-ins persist by, so a file from a newer build carries symbols an
-//! older build skips, and a file from an older build leaves the missing
-//! knobs at their defaults.
+//! older build skips. A file from an older build lands the knobs it does not
+//! name at their defaults, on purpose and not by leaving them alone: the host
+//! hands a built-in's preset over with every knob of the unit, the unnamed
+//! ones at what a saved bay without them reads as (`builtin_fx::
+//! preset_values` in the binary, the reading a session's state gets), and a
+//! Keys sound's window fills its own from the sound's specs
+//! ([`keys_knobs`]). Left alone, they stayed wherever the bay had them, and
+//! one preset sounded different from bay to bay.
 
 use serde_json::{Map, Value};
 

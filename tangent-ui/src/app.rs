@@ -45530,6 +45530,14 @@ impl TangentApp {
                     _ => None,
                 });
             if let Some(sb) = asked {
+                // **Every knob the face has, not only those the file names.**
+                // The host hands a built-in's preset over whole, the knobs an
+                // older file does not name at their defaults
+                // (`builtin_fx::preset_values` in the binary), so a 5.1 Tape
+                // preset puts the speed, the range and the wear back where a
+                // fresh machine has them instead of leaving them where this
+                // bay stood. A value the face does not know is a newer build's
+                // knob, and is skipped.
                 let asks: Vec<(u32, f32)> = self
                     .bay_face(sb)
                     .map(|f| {

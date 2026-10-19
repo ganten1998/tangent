@@ -8447,6 +8447,12 @@ impl DesktopApp {
     /// (`preset_sample`), for the app to copy into this project and bind
     /// after the knobs, and so does a convolver preset's impulse
     /// (`preset_impulse`), which the app binds where it is.
+    ///
+    /// **A built-in's preset is handed over whole** (`preset_values`): every
+    /// knob of the unit, those the file does not name at what a saved bay
+    /// without them reads as, so a file from an older build puts the knobs
+    /// added since back at their defaults instead of leaving them where the
+    /// bay had them. The app lands what it is handed, knob by knob.
     fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
         let p = match read_unit_preset(unit, path) {
             Ok(p) => p,
@@ -8455,10 +8461,11 @@ impl DesktopApp {
                 return;
             }
         };
+        let values = crate::builtin_fx::preset_values(unit, &p.values).unwrap_or(p.values);
         self.app.set_preset_loaded(tangent_ui::ports::PresetLoaded {
             unit: unit.to_owned(),
             name: preset_shown_name(path, &p.name),
-            values: p.values,
+            values,
             sample: preset_sample(unit, &p.state),
             impulse: preset_impulse(unit, &p.state),
         });
@@ -27240,6 +27247,81 @@ mod tests {
             body("fn load_unit_preset(").contains("read_unit_preset(unit, path)"),
             "the load no longer reads through read_unit_preset"
         );
+    }
+
+    /// **A 5.1 Tape preset lands the controls added since at their
+    /// defaults, on a bay that had them elsewhere.**
+    ///
+    /// The owner's ruling that nothing is pinned to how 5.0 or 5.1 sounded
+    /// held for a session's state and not for a preset: the load handed the
+    /// app the file's six knobs alone, and a preset is applied as a run of
+    /// knob asks, so the seven appended since stayed where the bay had them
+    /// and one preset sounded different from bay to bay. Through the host's
+    /// own road, in what it touches: a preset written as 5.1 wrote one (six
+    /// symbols), read by the load's reader and handed over as the load hands
+    /// it (`builtin_fx::preset_values`, the line `load_unit_preset` is held
+    /// to below), then landed knob by knob, by symbol, as the app's run
+    /// does, on an engine's Tape bay standing at 30 ips, in the deep range
+    /// and at Age 0.8. The bay plays the file's six and a fresh machine's
+    /// seven: 15 ips, the studio head and its two milliseconds, no wear.
+    #[test]
+    fn a_5_1_tape_preset_lands_the_controls_added_since_at_their_defaults() {
+        use crate::builtin_fx::{spec_for, state_text, TAPE_PATH};
+        use crate::instrument::Engine;
+        use tangent_record::audio::Timebase;
+        let root = preset_scratch("tape-5-1");
+        let dir = root.join(preset_subfolder(TAPE_PATH));
+        let six = [("drive", 0.75), ("bump", 0.25), ("roll", 0.125), ("wobble", 0.625), ("hiss", 0.5), ("trim", 0.375)];
+        let preset = tangent_ui::preset::Preset {
+            version: 1,
+            unit: TAPE_PATH.to_owned(),
+            name: "Warm 5.1".to_owned(),
+            values: six.iter().map(|(s, v)| ((*s).to_owned(), *v)).collect(),
+            ..Default::default()
+        };
+        let path = write_unit_preset(&dir, &preset).expect("the preset was not written");
+        let read = read_unit_preset(TAPE_PATH, &path).expect("a tape preset reads");
+        assert_eq!(read.values.len(), 6, "the fixture is not a 5.1 preset");
+        let landed = crate::builtin_fx::preset_values(TAPE_PATH, &read.values).expect("the tape is built in");
+        let spec = spec_for(TAPE_PATH).expect("the tape");
+        let at = |symbol: &str| spec.params.iter().position(|p| p.symbol == symbol).expect("a tape knob");
+        let mut stood = spec.defaults();
+        stood[at("speed")] = 1.0;
+        stood[at("wow_range")] = 1.0;
+        stood[at("age")] = 0.8;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let state = state_text(spec, &stood, &[]).into_bytes();
+        e.load_insert(3, 0, Some(std::path::Path::new(TAPE_PATH)), Some(&state))
+            .expect("the tape loads")
+            .expect("and seats");
+        let latency = |e: &Engine| {
+            let (spec, now) = e.builtin_insert(3, 0).expect("a tape bay");
+            spec.create(48_000.0, now).latency()
+        };
+        assert_eq!(latency(&e), 1200, "the bay does not stand on the deep head, so the landing proves nothing");
+        for (symbol, v) in &landed {
+            if let Some(p) = spec.params.iter().find(|p| p.symbol == symbol) {
+                assert!(e.set_insert_param(3, 0, p.id, *v as f32), "the bay refused {symbol}");
+            }
+        }
+        let (_, now) = e.builtin_insert(3, 0).expect("a tape bay");
+        for (symbol, v) in six {
+            assert_eq!(now[at(symbol)], v as f32, "the preset's own {symbol} did not land");
+        }
+        for p in &spec.params[6..] {
+            assert_eq!(now[at(p.symbol)], p.default, "{} stayed where the bay had it, not at its default", p.symbol);
+        }
+        assert_eq!(latency(&e), 96, "the 5.1 preset left the bay on the deep head");
+        // And the load hands over what was landed here: the whole table.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let load = src.find("fn load_unit_preset(").expect("the load is still called that");
+        let load = &src[load..load + src[load..].find("\n    }\n").expect("its end")];
+        assert!(
+            load.contains("crate::builtin_fx::preset_values(unit, &p.values)") && load.contains("            values,\n"),
+            "the load no longer hands a built-in's preset over whole"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().expect("the scratch"));
     }
 
     /// **No sound allocates once the instrument is built.** Every voice of
