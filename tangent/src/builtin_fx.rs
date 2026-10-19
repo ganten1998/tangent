@@ -2351,6 +2351,22 @@ impl TapeUnit {
     }
 }
 
+/// **A tape bay's values as the kernel's parameters**, for the arithmetic
+/// the host does beside the audio (`desktop::tape_notes`): every id through
+/// [`tape_slot`] and `washed`, the road `TapeUnit::set_param` takes, so the
+/// two cannot disagree about which value is which. A value the slice lacks
+/// reads as its row's default.
+pub(crate) fn tape_params_of(values: &[f32]) -> crate::units::tape::TapeParams {
+    let mut p = crate::units::tape::TapeParams::default();
+    for spec in TAPE_FACE_PARAMS {
+        let v = values.get(spec.id as usize).copied().unwrap_or(spec.default);
+        if let Some(slot) = tape_slot(&mut p, spec.id) {
+            *slot = washed(spec, v);
+        }
+    }
+    p
+}
+
 // ── Tangent Comp, seated ────────────────────────────────────────────────────
 
 pub struct CompUnit {
@@ -4054,6 +4070,44 @@ mod tests {
                 row.symbol
             );
         }
+    }
+
+    /// **A tape bay's values read as the params its unit holds.** The host
+    /// works out the Tape panel's notes from a bay's values beside the
+    /// audio (`desktop::tape_notes`), and the unit on the audio thread hears
+    /// the same values through `set_param`. One road from values to fields,
+    /// `tape_slot` and `washed`, so the panel's arithmetic and the sound
+    /// cannot be told different numbers: for distinct values on every id
+    /// the two hold the same params; a slice too short for the table reads
+    /// its absent ids at their defaults on both sides, as a bay saved before
+    /// those rows existed opens; and a NaN lands on its row's default on
+    /// both.
+    #[test]
+    fn a_tape_bays_values_read_as_the_params_its_unit_holds() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let held = |values: &[f32]| match spec.create(48_000.0, values) {
+            BuiltinUnit::Tape(u) => u.params,
+            _ => panic!("the tape path built something that is not a tape"),
+        };
+        let distinct: Vec<f32> = (0..TAPE_FACE_PARAMS.len()).map(|k| (k as f32 + 1.0) / 16.0).collect();
+        let mut nan = spec.defaults();
+        nan[4] = f32::NAN;
+        for (what, values) in [
+            ("distinct values", distinct.clone()),
+            ("three values", distinct[..3].to_vec()),
+            ("a NaN on the hiss", nan),
+        ] {
+            assert_eq!(
+                tape_params_of(&values),
+                held(&values),
+                "{what}: the panel's arithmetic reads other params than the unit holds"
+            );
+        }
+        assert_ne!(
+            tape_params_of(&distinct),
+            crate::units::tape::TapeParams::default(),
+            "the distinct values read as a fresh tape, so the comparison above proves nothing"
+        );
     }
 
     /// Rising zero crossings of `v`, each placed between its two samples by

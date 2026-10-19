@@ -47,6 +47,18 @@
 //! landed, and the panel draws any prefix: a section whose ids are not
 //! pushed yet draws its caption and nothing under it.
 //!
+//! **The notes are the host's figures, printed as they come.** Three
+//! captions carry on their right what their dials come to: the weighted
+//! wow and flutter with the latency the host is told, the hiss on silence,
+//! and where the head bump sits at the chosen speed. The host works each
+//! one out with the kernel's own arithmetic (`desktop::tape_notes`) and
+//! pushes it as a line keyed by its section ([`NOTE_TRANSPORT`],
+//! [`NOTE_TAPE`], [`NOTE_PLAYBACK`]), so units, rounding and the tape's 0 VU
+//! reference stay with the kernel's constants and none is spelled here.
+//! RECORD carries none: its two readings say everything. A note rides its
+//! caption's own line and is cut to the room the title leaves, so it costs
+//! no height, and its arriving or going moves nothing.
+//!
 //! **The air between the sections is spent out of proven room**, the amp's
 //! rule. [`floor_cost`] is everything the panel and its footer must have,
 //! the air takes only what the window holds past that, and a row never
@@ -117,6 +129,26 @@ pub const START_STOP_WHERE: &str = "set on the PITCH CONT dial";
 /// where it is kept, and what a click here does.
 const START_STOP_HOVER: &str = "the whole desk spins up on Play and winds down on Stop or Pause, saved with the project. It is set under the varispeed dial's range (right-click the band's PITCH CONT dial); click here to go there";
 
+/// The key of the transport's note in `BuiltinFace::notes`: its weighted
+/// wow and flutter and the latency delay compensation is told about.
+pub const NOTE_TRANSPORT: &str = "transport";
+/// The key of the tape's note: the hiss on silence, A-weighted.
+pub const NOTE_TAPE: &str = "tape";
+/// The key of the playback's note: where the head bump sits at this speed.
+pub const NOTE_PLAYBACK: &str = "playback";
+
+/// Which note rides each section's caption, in [`SECTIONS`]' order, and
+/// what it says to a hand resting on it. RECORD has none.
+const NOTE_OF: [Option<(&str, &str)>; 4] = [
+    Some((
+        NOTE_TRANSPORT,
+        "weighted peak wow and flutter, the figure a spec sheet quotes; latency is what delay compensation is told this tape holds the sound",
+    )),
+    None,
+    Some((NOTE_TAPE, "the tape's hiss on silence, A-weighted")),
+    Some((NOTE_PLAYBACK, "where the play head's low-end bump sits at this speed")),
+];
+
 /// **The panel**: four captioned sections in signal order, the transport
 /// closing on its pointer to tape start and stop, then any control no
 /// section places, all above the footer `faces::draw` appends. Every
@@ -131,7 +163,8 @@ pub fn draw_tape(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Opti
         if k > 0 {
             ui.add_space(air);
         }
-        caption(ui, st, title);
+        let note = NOTE_OF[k].and_then(|(key, hover)| note(live, key).map(|text| (key, text, hover)));
+        caption(ui, st, title, note);
         for &id in *ids {
             face::keep(&mut out, control(ui, st, live, id));
         }
@@ -168,6 +201,11 @@ fn control(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive, id: u32) -> Optio
     }
 }
 
+/// The note the host pushed under `key`, if it pushed one.
+fn note<'a>(live: &'a FaceLive, key: &str) -> Option<&'a str> {
+    live.face.notes.iter().find(|(k, _)| k == key).map(|(_, text)| text.as_str())
+}
+
 /// Whether one of the four sections draws `id`.
 fn placed(id: u32) -> bool {
     SECTIONS.iter().any(|(_, ids)| ids.contains(&id))
@@ -198,25 +236,44 @@ pub fn start_stop_line(ss: Option<crate::motor::StartStop>) -> String {
 }
 
 /// One caption line: the section's title in the caption tier, faint on the
-/// panel's ground. ONE allocation of exactly one nine-point line, with the
-/// title painted into it. Laid out the ordinary way, a caption that shares
+/// panel's ground, and on the right the note the host pushed for it, if
+/// any, as `(key, text, hover)`, cut to the room the title leaves. ONE
+/// allocation of exactly one nine-point line, with both painted into it. Laid out the ordinary way, a caption that shares
 /// its line with anything (a figure on the right, say) goes through
 /// `ui.horizontal`, which starts every row at `interact_size.y`: six to
 /// eight points more than one line, which [`floor_cost`] cannot afford four
 /// times over. Allocated at its own height, the line costs the same whatever
 /// it carries, and it takes one auto id whatever it carries.
-fn caption(ui: &mut egui::Ui, st: &FaceStyle, title: &str) {
+///
+/// The note's hover is asked of `ui.interact` with an id of its own, never
+/// an allocation, so a note that arrives or goes takes no auto id and moves
+/// no row under it.
+fn caption(ui: &mut egui::Ui, st: &FaceStyle, title: &str, note: Option<(&str, &str, &str)>) {
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), caption_height(ui)),
         egui::Sense::hover(),
     );
-    ui.painter().text(
+    let painter = ui.painter();
+    let head = painter.text(
         rect.left_top(),
         egui::Align2::LEFT_TOP,
         title,
         FontId::new(9.0, fonts::courier_bold()),
         st.s.faint,
     );
+    let Some((key, text, hover)) = note else {
+        return;
+    };
+    let font = FontId::new(9.0, fonts::courier());
+    let room = (rect.right() - head.right() - ui.spacing().item_spacing.x).max(0.0);
+    let at = painter.text(
+        rect.right_top(),
+        egui::Align2::RIGHT_TOP,
+        crate::drumpad_panel::cut_text(painter, room, text, &font),
+        font,
+        st.s.faint,
+    );
+    let _ = ui.interact(at, ui.id().with(("tape-note", key)), egui::Sense::hover()).on_hover_text(hover);
 }
 
 /// A caption line's height: one nine-point line, bold or regular, whichever
@@ -306,6 +363,19 @@ fn section_air(ui: &egui::Ui, live: &FaceLive) -> f32 {
 /// so both name the dial a hand will find on the band, and a rename there
 /// fails their tests by name instead of leaving them pointing at a word the
 /// band no longer prints.
+/// **The widest notes the host can push**, one per key, for the shared
+/// sweeps' worst-case face: every figure at its format's widest, wider than
+/// any the kernel's arithmetic reaches, so a sweep that passes with these
+/// passes with whatever the host prints.
+#[cfg(test)]
+pub(crate) fn longest_notes() -> Vec<(String, String)> {
+    vec![
+        (NOTE_TRANSPORT.to_owned(), "wow and flutter 99.99%, latency 25 ms".to_owned()),
+        (NOTE_TAPE.to_owned(), "hiss -199.9 dBFS(A)".to_owned()),
+        (NOTE_PLAYBACK.to_owned(), "head bump at 999 Hz".to_owned()),
+    ]
+}
+
 #[cfg(test)]
 pub(crate) fn the_bands_word_for_its_pitch_dial() -> &'static str {
     const AT: &str = "const PITCH_LABEL: &str = \"";
@@ -1407,6 +1477,100 @@ mod tests {
                 !matches!(asked, Some(FaceAction::OpenStartStop)),
                 "{what} after Rate's reading was committed with Tab pressed the pointer, a door that paints no \
                  focus and closes the window it stands in"
+            );
+        }
+    }
+
+    /// **A note rides on its caption and moves nothing else.**
+    ///
+    /// The host pushes what three sections' dials come to, keyed by section,
+    /// and the panel prints each verbatim on its caption's own line, right
+    /// against the content's edge, in the caption tier's faint ink, the one
+    /// role the shared sweeps already measure on this ground. A note is
+    /// painted into the line the caption already holds, so on every font the
+    /// panel's extent and the auto ids it takes are the same with notes and
+    /// without: the figures change on every drag frame, and a figure that
+    /// moved a row would move it under the hand. A note too long for its
+    /// line is cut to the room the title leaves rather than run off the
+    /// panel, and a note under a key no section reads (RECORD has none)
+    /// paints nothing, so the host cannot put words where the panel has no
+    /// place for them.
+    #[test]
+    fn a_note_rides_on_its_caption_and_moves_nothing_else() {
+        let st = style();
+        let floor = crate::dialogs::face_window_size(TAPE_PATH, None);
+        let none = egui::Modifiers::NONE;
+        let said = [
+            ("TRANSPORT", NOTE_TRANSPORT, "wow and flutter 0.040%, latency 2.0 ms"),
+            ("TAPE", NOTE_TAPE, "hiss -82.4 dBFS(A)"),
+            ("PLAYBACK", NOTE_PLAYBACK, "head bump at 35 Hz"),
+        ];
+        let stray = "a note under a key no section reads";
+        let noted = |live: &mut FaceLive| {
+            live.face.notes = said.iter().map(|&(_, key, text)| (key.to_owned(), text.to_owned())).collect();
+            live.face.notes.push(("record".to_owned(), stray.to_owned()));
+        };
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            let on = font.key();
+            let mut bare = a_tape_of(0..ID_CEILING as u32);
+            let plain = show(&ctx, floor, &st, &mut bare, 1.0, none, Vec::new());
+            let mut live = a_tape_of(0..ID_CEILING as u32);
+            noted(&mut live);
+            let shown = show(&ctx, floor, &st, &mut live, 2.0, none, Vec::new());
+            assert_eq!(
+                (shown.consumed, shown.took),
+                (plain.consumed, plain.took),
+                "{on}: the notes moved the panel or took auto ids of their own"
+            );
+            for (title, key, text) in said {
+                let (head, at) = (word(&shown.shapes, title), word(&shown.shapes, text));
+                assert!(
+                    (head.center().y - at.center().y).abs() <= 1.0,
+                    "{on}: the {key} note is centred at y {:.1}, off its caption's line at {:.1}",
+                    at.center().y,
+                    head.center().y
+                );
+                assert!(
+                    (at.right() - shown.took.right()).abs() <= fit::SLACK && at.left() > head.right(),
+                    "{on}: the {key} note spans x {:.1} to {:.1}, not right against the content's edge at {:.1} \
+                     and clear of its caption ending at {:.1}",
+                    at.left(),
+                    at.right(),
+                    shown.took.right(),
+                    head.right()
+                );
+                assert_eq!(ink(&shown.shapes, text), st.s.faint, "{on}: the {key} note is not in the caption ink");
+            }
+            assert!(
+                !words(&shown.shapes).iter().any(|(w, ..)| w.contains("no section")),
+                "{on}: a note under a key no section reads was painted"
+            );
+
+            // Too long for its line, at a panel 200 points wide.
+            let narrow = Vec2::new(200.0 + 2.0 * fit::MARGIN, floor.y);
+            let long = "wow and flutter ".repeat(19);
+            let long = &long[..300];
+            let mut live = a_tape_of(0..ID_CEILING as u32);
+            live.face.notes = vec![(NOTE_TRANSPORT.to_owned(), long.to_owned())];
+            let shown = show(&ctx, narrow, &st, &mut live, 3.0, none, Vec::new());
+            let head = word(&shown.shapes, "TRANSPORT");
+            let cut: Vec<Rect> = words(&shown.shapes)
+                .into_iter()
+                .filter(|(w, ..)| w.starts_with("wow and"))
+                .map(|(w, r, _)| {
+                    assert!(w.ends_with('\u{2026}') && w.len() < long.len(), "{on}: a 300-character note was painted whole");
+                    r
+                })
+                .collect();
+            assert_eq!(cut.len(), 1, "{on}: the long note was painted {} times", cut.len());
+            assert!(
+                cut[0].right() <= shown.took.left() + 201.0 && cut[0].left() > head.right(),
+                "{on}: the long note spans x {:.1} to {:.1} on a panel from {:.1}, 200 wide, past its edge or over its \
+                 caption",
+                cut[0].left(),
+                cut[0].right(),
+                shown.took.left()
             );
         }
     }

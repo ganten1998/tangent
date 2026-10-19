@@ -1334,6 +1334,12 @@ pub struct BuiltinFace {
     /// click on the chip to the right face.
     pub path: String,
     pub params: Vec<BuiltinFaceParam>,
+    /// **What a face prints beside its captions**, worked out on the host
+    /// with the unit's own arithmetic (`desktop::tape_notes`): keyed lines a
+    /// face reads by name and nothing ever saves. A preset save copies
+    /// `extra` into the file (`DialogAction::FaceSavePreset`), never these.
+    /// Appended; empty for units that print none.
+    pub notes: Vec<(String, String)>,
 }
 
 // ── the IR shelf and the wizard's live picture ──────────────────────────────

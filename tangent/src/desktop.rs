@@ -2792,6 +2792,13 @@ pub(crate) fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
+                // The Tape's notes, by the kernel's own arithmetic at the
+                // rate the engine runs, as the EQ's line is.
+                notes: if spec.path == crate::builtin_fx::TAPE_PATH {
+                    tape_notes(values, engine.output().sample_rate as f32)
+                } else {
+                    Vec::new()
+                },
                 extra: {
                     let mut extra = engine.builtin_extra_at(rack, slot).to_vec();
                     // **A hardware insert's live picture rides along**, on
@@ -2861,6 +2868,42 @@ fn eq_curve_db(values: &[f32], sample_rate: f32) -> Vec<f32> {
     let live: Vec<crate::units::eq::Node> =
         eq.nodes.iter().filter(|p| p.on).map(|p| p.node()).collect();
     crate::units::eq::response_db(&live, &freqs, sample_rate)
+}
+
+/// **What Tangent Tape's panel prints beside three of its captions**, from
+/// the kernel's own arithmetic: the transport's weighted wow and flutter
+/// with the latency delay compensation is told about at this engine rate,
+/// the hiss on silence, and where the head bump sits at this speed. One
+/// function for the saved face and the automated one, so a note cannot be
+/// worked out two ways (`eq_curve_db`'s bargain). Closed-form helpers only:
+/// this runs on every push and on every automated host frame.
+#[cfg(feature = "recorder")]
+fn tape_notes(values: &[f32], sample_rate: f32) -> Vec<(String, String)> {
+    use crate::units::tape as k;
+    use tangent_ui::faces_tape as f;
+    let p = crate::builtin_fx::tape_params_of(values);
+    let w = k::wow_flutter_weighted_pct(&p);
+    let w = if w < 0.1 { format!("{w:.3}%") } else { format!("{w:.2}%") };
+    let ms = k::latency_ms(k::WowRange::from_dial(p.wow_range), sample_rate);
+    let hiss = k::hiss_dbfs_a(&p);
+    vec![
+        (
+            f::NOTE_TRANSPORT.to_owned(),
+            format!("wow and flutter {w}, latency {}", tangent_ui::face::fmt_ms(ms)),
+        ),
+        (
+            f::NOTE_TAPE.to_owned(),
+            if hiss.is_finite() { format!("hiss {hiss:.1} dBFS(A)") } else { "no hiss".to_owned() },
+        ),
+        (
+            f::NOTE_PLAYBACK.to_owned(),
+            if p.bump > 0.0 {
+                format!("head bump at {}", tangent_ui::face::fmt_hz(k::bump_hz(&p)))
+            } else {
+                "no head bump".to_owned()
+            },
+        ),
+    ]
 }
 
 /// **A built-in face as the automation has it right now**, or `None` when
@@ -2952,6 +2995,11 @@ fn live_face(
             Vec::new()
         },
         extra: Vec::new(),
+        notes: if spec.path == crate::builtin_fx::TAPE_PATH {
+            tape_notes(&values, sample_rate)
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -28814,6 +28862,122 @@ mod tests {
         assert!(live_face(spec, &saved, &m, 1.0, master(1), &tracks, 48_000.0).is_none());
     }
 
+    /// The note `tape_notes` keyed `key`, or a panic naming what it said.
+    #[cfg(feature = "recorder")]
+    fn tape_note(notes: &[(String, String)], key: &str) -> String {
+        notes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| panic!("no {key:?} note among {notes:?}"))
+    }
+
+    /// **The Tape face's notes are the kernel's own figures**, printed at
+    /// the rate the engine runs.
+    ///
+    /// The panel prints what the host pushes verbatim, so this is where the
+    /// words and the numbers are held: each note is the kernel helper's
+    /// figure through the face kit's own formatters, at the very params the
+    /// unit holds. The latency is the one the seat reports to delay
+    /// compensation, frame for frame, at the one rate where the studio head
+    /// does not come to a round 2 ms (22.05 kHz), and it follows the wow
+    /// range to the deep head's 25 ms. The head bump moves an octave per
+    /// doubling of the speed, the kernel's own claim for its contour, so a
+    /// helper that read the wrong speed, or none, fails on the walk up the
+    /// four speeds. Bump and Hiss at nothing say so in words rather than
+    /// printing a figure for a bump that is flat or a hiss of minus
+    /// infinity. The keys are the panel's own consts, so a note the host
+    /// files under a word the panel does not read fails here.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn the_tape_faces_notes_are_the_kernels_own_figures() {
+        use crate::units::tape as k;
+        use tangent_ui::face::{fmt_hz, fmt_ms};
+        use tangent_ui::faces_tape::{NOTE_PLAYBACK, NOTE_TAPE, NOTE_TRANSPORT};
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TAPE_PATH).expect("the tape");
+        let defaults = spec.defaults();
+        let with = |id: usize, v: f32| {
+            let mut values = defaults.clone();
+            values[id] = v;
+            values
+        };
+        let p = crate::builtin_fx::tape_params_of(&defaults);
+        let notes = tape_notes(&defaults, 48_000.0);
+        let keys: Vec<&str> = notes.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, vec![NOTE_TRANSPORT, NOTE_TAPE, NOTE_PLAYBACK], "the notes are not filed under the panel's keys");
+        assert!(
+            notes.iter().all(|(_, text)| !text.contains('\u{2014}')),
+            "a note carries an em dash: {notes:?}"
+        );
+        assert_eq!(
+            tape_note(&notes, NOTE_TRANSPORT),
+            format!("wow and flutter {:.3}%, latency 2.0 ms", k::wow_flutter_weighted_pct(&p))
+        );
+        assert!(
+            tape_note(&tape_notes(&with(9, 1.0), 48_000.0), NOTE_TRANSPORT).ends_with("latency 25 ms"),
+            "the deep head's latency is not on the note"
+        );
+        let slow = k::latency_ms(k::WowRange::Studio, 22_050.0);
+        assert!(
+            tape_note(&tape_notes(&defaults, 22_050.0), NOTE_TRANSPORT).ends_with(&format!("latency {}", fmt_ms(slow))),
+            "the note at 22.05 kHz does not print the studio head's latency there"
+        );
+        assert_eq!(
+            (slow * 22.05).round() as u32,
+            spec.create(22_050.0, &defaults).latency(),
+            "the note's latency at 22.05 kHz is not the one the seat reports"
+        );
+        assert_eq!(
+            tape_note(&notes, NOTE_TAPE),
+            format!("hiss {:.1} dBFS(A)", k::hiss_dbfs_a(&p))
+        );
+        assert_eq!(tape_note(&tape_notes(&with(4, 0.0), 48_000.0), NOTE_TAPE), "no hiss");
+        assert_eq!(tape_note(&tape_notes(&with(1, 0.0), 48_000.0), NOTE_PLAYBACK), "no head bump");
+        let mut below: Option<f32> = None;
+        for step in 0..4 {
+            let values = with(6, step as f32 / 3.0);
+            let hz = k::bump_hz(&crate::builtin_fx::tape_params_of(&values));
+            assert_eq!(
+                tape_note(&tape_notes(&values, 48_000.0), NOTE_PLAYBACK),
+                format!("head bump at {}", fmt_hz(hz))
+            );
+            if let Some(was) = below {
+                assert!(
+                    (hz / (2.0 * was) - 1.0).abs() < 0.01,
+                    "the head bump at speed {step} sits at {hz:.2} Hz, not an octave over {was:.2} Hz"
+                );
+            }
+            below = Some(hz);
+        }
+    }
+
+    /// **An automated Tape face says what the automation makes it**: the
+    /// notes on the overlay are worked out from the overlaid values, so a
+    /// curve that sweeps the wow range from the studio head to the deep one
+    /// carries the latency with it, and the panel never prints the saved
+    /// head's figure beside a selector the curve has moved. A bay no curve
+    /// names gets no overlay at all.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn an_automated_tape_face_says_what_the_automation_makes_it() {
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TAPE_PATH).expect("the tape");
+        let saved = spec.defaults();
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        let tracks: Vec<TrackId> = (0..4).map(|r| TrackId(1000 + r)).collect();
+        let bay = |row: usize, b: u8| SeatBay::new(Node::Track(tracks[row]), Rack::Chain(0), b);
+        let mut auto = Automation::default();
+        auto.set(Curve::sanitised(2, AutoParam::Plugin { bay: 1, id: 9 }, vec![pt(0.0, 0.0), pt(4.0, 1.0)]));
+        let said = |t: f64| {
+            let face = live_face(spec, &saved, &auto, t, bay(2, 1), &tracks, 48_000.0).expect("no overlay for an automated bay");
+            tape_note(&face.notes, tangent_ui::faces_tape::NOTE_TRANSPORT)
+        };
+        assert!(said(0.5).ends_with("latency 2.0 ms"), "early in the sweep the note says {:?}", said(0.5));
+        assert!(said(3.5).ends_with("latency 25 ms"), "late in the sweep the note says {:?}", said(3.5));
+        assert!(live_face(spec, &saved, &auto, 2.0, bay(2, 0), &tracks, 48_000.0).is_none());
+    }
+
     /// **The host evaluates the open faces every frame** — beside the
     /// needles in `fill_recorder_state`, against what the engine plays, and
     /// it withdraws an overlay whose curve or window has gone.
@@ -33218,6 +33382,7 @@ mod tests {").expect("the tests module")];
             "attack_cache: std::collections::HashMap::new(),",
             "quantize_marked: None,",
             "displaced_states: std::collections::HashMap::new(),",
+            "fn tape_notes(",
         ] {
             if !gated(desk, item, me) {
                 broken.push(format!("desktop.rs: `{item}` is compiled into Minimal"));

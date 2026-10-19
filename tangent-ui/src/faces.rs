@@ -3009,6 +3009,7 @@ mod tests {
                         value: 0.5,
                     })
                     .collect(),
+                notes: crate::faces_tape::longest_notes(),
                 ..Default::default()
             },
             // The longest label a pedal chip can carry — `pedal_label` cuts

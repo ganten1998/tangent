@@ -34184,6 +34184,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if !auto.curve_db.is_empty() {
                     live.face.curve_db.clone_from(&auto.curve_db);
                 }
+                // The notes the automation's values come to, worked out by
+                // the host from the overlaid bay, as the curve is.
+                if !auto.notes.is_empty() {
+                    live.face.notes.clone_from(&auto.notes);
+                }
             }
         }
         live.gr_db = self.bay_gr(sb);
@@ -70110,6 +70115,51 @@ mod tests {
         assert_eq!(told(&app), None, "the amp under its pedal's window was told about tape start and stop");
     }
 
+    /// **An automated note replaces the saved one on an open face**, and
+    /// only there. The notes are what a face's dials come to, worked out on
+    /// the host from the bay's values; under automation the values the face
+    /// shows are the curve's, so the notes it shows must be the ones the
+    /// host worked out from those, or the Tape's panel would print a
+    /// latency for a wow range its own selector no longer reads. The saved
+    /// face keeps the saved notes, as it keeps the saved values, and with
+    /// the overlay withdrawn the window prints them again.
+    #[test]
+    fn an_automated_note_replaces_the_saved_one_on_an_open_face() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let note = |text: &str| vec![(crate::faces_tape::NOTE_TRANSPORT.to_owned(), text.to_owned())];
+        let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
+        app.set_bay_face(sb, crate::ports::BuiltinFace {
+            path: crate::faces_tape::TAPE_PATH.into(),
+            notes: note("a"),
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { bay: sb, live: Box::default() });
+        let shown = |app: &TangentApp| match app.dialog.as_ref() {
+            Some(Dialog::InsertFace { live, .. }) => live.face.notes.clone(),
+            _ => panic!("the face did not stay open"),
+        };
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(shown(&app), note("a"), "the open face does not print the saved notes");
+        app.set_live_bay_face(
+            sb,
+            Some(crate::ports::BuiltinFace {
+                path: crate::faces_tape::TAPE_PATH.into(),
+                notes: note("b"),
+                ..Default::default()
+            }),
+        );
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(shown(&app), note("b"), "the open face prints the saved notes over the automation's");
+        assert_eq!(
+            app.bay_face(sb).map(|f| f.notes.clone()),
+            Some(note("a")),
+            "the automation's notes were written into the saved face"
+        );
+        app.set_live_bay_face(sb, None);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(shown(&app), note("a"), "the automation's notes outlived its curve");
+    }
+
     /// **The Setup panel marks the system that is RUNNING.** The setting is
     /// empty on the platform default, and the panel marked only a system the
     /// setting named — so a fresh Windows install playing through WASAPI lit
@@ -73664,6 +73714,7 @@ mod tests {").expect("the tests module")];
             params: Vec::new(),
             curve_db: Vec::new(),
             extra: Vec::new(),
+            notes: Vec::new(),
         });
         app.mixer_open = true;
         pointer_frame(&ctx, &mut app, Vec::new());
@@ -73705,6 +73756,7 @@ mod tests {").expect("the tests module")];
             params: Vec::new(),
             curve_db: Vec::new(),
             extra: Vec::new(),
+            notes: Vec::new(),
         });
         // One recognisable tenant on channel 1's board, and another on
         // channel 2's, so a face that read the WRONG channel's board would
@@ -73984,6 +74036,7 @@ mod tests {").expect("the tests module")];
             params: Vec::new(),
             curve_db: Vec::new(),
             extra: Vec::new(),
+            notes: Vec::new(),
         });
         // Pedal 2 dressed, so its chip wears a word a test can find. A suite
         // unit rather than a bundle: a bundle's editor is the host's own
@@ -88291,6 +88344,7 @@ mod sampler_road_tests {
             }],
             curve_db: Vec::new(),
             extra: vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
+            notes: Vec::new(),
         });
         app.apply_dialog_action(DialogAction::FaceSavePreset {
             bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),

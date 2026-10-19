@@ -1802,6 +1802,7 @@ pub(crate) mod fit {
                     })
                     .collect(),
                 curve_db: vec![0.0; CURVE_POINTS],
+                notes: crate::faces_tape::longest_notes(),
                 ..Default::default()
             },
             // The last seat is left EMPTY on purpose: an empty chip wears
