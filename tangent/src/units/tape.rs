@@ -1476,39 +1476,125 @@ fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
     ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
 }
 
-/// A history a dot product reads as one contiguous slice, newest first.
-/// Every sample is written twice, `H` apart, so the window `z[pos..pos + H]`
-/// never wraps; `H2` is twice `H`, spelled out because `2 * H` is not a type
-/// on stable Rust. The Analog's `History`, restated for the same privacy
-/// reason as [`fma`].
-#[derive(Clone, Copy)]
-struct History<const H: usize, const H2: usize> {
-    z: [f32; H2],
-    pos: usize,
+/// **How many frames the record stage takes at once**: a sub-block
+/// ([`SUB_BLOCK`]) at the most, because [`Tape::process`] runs a block as
+/// chunks that never cross a design, and between two designs nothing but the
+/// frames themselves moves what the stage is fed.
+const CHUNK: usize = SUB_BLOCK as usize;
+
+/// **How many outputs each of the record stage's filters works out at
+/// once**, one to a lane: two vectors of four, so a tap is two vector
+/// multiply-adds for eight outputs, and the eight partial sums each output
+/// keeps make sixteen independent chains, enough to keep every
+/// multiply-add unit busy while each chain waits on its last step.
+const LANES: usize = 8;
+
+/// The tree [`dot`] adds its eight partial sums up in, for lane `l` of a
+/// group.
+#[inline(always)]
+fn tree(acc: &[[f32; 4]; 8], l: usize) -> f32 {
+    ((acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l])) + ((acc[4][l] + acc[5][l]) + (acc[6][l] + acc[7][l]))
 }
 
-impl<const H: usize, const H2: usize> History<H, H2> {
-    const fn new() -> Self {
-        const { assert!(H2 == 2 * H, "a history is written twice") };
-        Self { z: [0.0; H2], pos: 0 }
+/// **[`dot`] for `m` outputs at once**: `out[i]` is the dot product of `taps`
+/// with the window that ends at `x[last + i]`, newest first, so tap `t`
+/// meets `x[last + i - t]`. `out` takes whole groups of [`LANES`], and `x`
+/// must reach as far as the last group reads.
+///
+/// **The same arithmetic as [`dot`], to the bit.** Each output keeps its own
+/// eight partial sums, tap `t` into sum `t % 8` by one [`fma`] in the order
+/// of the taps, and adds them up in [`dot`]'s tree; all that changes is that
+/// the outputs of a group sit in the lanes of two vectors, so one
+/// multiply-add a tap serves four of them. The sample-at-a-time pair this
+/// replaced wrote each sample into a history newest first and read the whole
+/// window back at once, before the processor could hand it the sample it had
+/// just written, and every output's chain waited on the one before; it ran
+/// at about one multiply-add a cycle. Here a chunk's samples are all in
+/// place, oldest first, before any window is read.
+///
+/// **Why it is shaped as it is**: the group's sixteen sums held as two
+/// halves of four, the taps read eight at a time inside the loop over them,
+/// and the whole thing kept out of line. So the compiler keeps the sums in
+/// registers and the loop over the taps a loop: measured on 32 outputs of
+/// an 80-tap filter it runs at 56 ns, where the same arithmetic written as
+/// one array of eight lanes and inlined ran at 348 (every tap hoisted out of
+/// every loop and spilled), and within a tenth of the processor's own vector
+/// instructions written by hand.
+#[inline(never)]
+fn fir<const N: usize>(taps: &[f32; N], x: &[f32], last: usize, out: &mut [f32], m: usize) {
+    const { assert!(N % 8 == 0, "a dot product runs whole chunks of eight") };
+    for i0 in (0..m).step_by(LANES) {
+        // Every sample a lane of this group reads: from the oldest the last
+        // tap meets to the newest the last lane does.
+        let x = &x[last + i0 + 1 - N..last + i0 + LANES];
+        let mut lo = [[0.0_f32; 4]; 8];
+        let mut hi = [[0.0_f32; 4]; 8];
+        for c in 0..N / 8 {
+            let a: [f32; 8] = taps[8 * c..8 * c + 8].try_into().expect("eight taps");
+            for k in 0..8 {
+                let at = N - 1 - (8 * c + k);
+                let (xl, xh): ([f32; 4], [f32; 4]) = (
+                    x[at..at + 4].try_into().expect("four samples"),
+                    x[at + 4..at + 8].try_into().expect("four samples"),
+                );
+                for l in 0..4 {
+                    lo[k][l] = fma(a[k], xl[l], lo[k][l]);
+                    hi[k][l] = fma(a[k], xh[l], hi[k][l]);
+                }
+            }
+        }
+        let out = &mut out[i0..i0 + LANES];
+        for l in 0..4 {
+            out[l] = tree(&lo, l);
+            out[l + 4] = tree(&hi, l);
+        }
     }
+}
 
-    #[inline]
-    fn push(&mut self, x: f32) {
-        self.pos = if self.pos == 0 { H - 1 } else { self.pos - 1 };
-        self.z[self.pos] = x;
-        self.z[self.pos + H] = x;
-    }
-
-    /// The newest `H` samples, newest first.
-    #[inline]
-    fn window(&self) -> &[f32] {
-        &self.z[self.pos..self.pos + H]
-    }
-
-    fn clear(&mut self) {
-        self.z = [0.0; H2];
-        self.pos = 0;
+/// **[`fir`] for the 2× decimator, which keeps one output in two**, its
+/// input held as two halves: `even[last + i]` is the sample output `i` ends
+/// on and `odd[last + i]` the one just before it, so tap `t` meets the half
+/// its parity names, `t / 2` back. The kept outputs' windows then step one
+/// sample of each half per output, as [`fir`]'s step one sample, and each
+/// partial sum only ever reads one half (sum `t % 8` takes taps of one
+/// parity). The arithmetic is [`dot`]'s, to the bit, and the shape
+/// [`fir`]'s.
+#[inline(never)]
+fn fir_halves<const N: usize>(taps: &[f32; N], even: &[f32], odd: &[f32], last: usize, out: &mut [f32], m: usize) {
+    const { assert!(N % 8 == 0, "a dot product runs whole chunks of eight") };
+    let reach = (N - 1) / 2;
+    for i0 in (0..m).step_by(LANES) {
+        let even = &even[last + i0 - reach..last + i0 + LANES];
+        let odd = &odd[last + i0 - reach..last + i0 + LANES];
+        let mut lo = [[0.0_f32; 4]; 8];
+        let mut hi = [[0.0_f32; 4]; 8];
+        for c in 0..N / 8 {
+            let a: [f32; 8] = taps[8 * c..8 * c + 8].try_into().expect("eight taps");
+            // Taps `8c + 2j` and `8c + 2j + 1` both reach `4c + j` back, one
+            // on each half.
+            for j in 0..4 {
+                let at = reach - (4 * c + j);
+                let (el, eh): ([f32; 4], [f32; 4]) = (
+                    even[at..at + 4].try_into().expect("four samples"),
+                    even[at + 4..at + 8].try_into().expect("four samples"),
+                );
+                let (ol, oh): ([f32; 4], [f32; 4]) = (
+                    odd[at..at + 4].try_into().expect("four samples"),
+                    odd[at + 4..at + 8].try_into().expect("four samples"),
+                );
+                for l in 0..4 {
+                    lo[2 * j][l] = fma(a[2 * j], el[l], lo[2 * j][l]);
+                    hi[2 * j][l] = fma(a[2 * j], eh[l], hi[2 * j][l]);
+                    lo[2 * j + 1][l] = fma(a[2 * j + 1], ol[l], lo[2 * j + 1][l]);
+                    hi[2 * j + 1][l] = fma(a[2 * j + 1], oh[l], hi[2 * j + 1][l]);
+                }
+            }
+        }
+        let out = &mut out[i0..i0 + LANES];
+        for l in 0..4 {
+            out[l] = tree(&lo, l);
+            out[l + 4] = tree(&hi, l);
+        }
     }
 }
 
@@ -1560,109 +1646,159 @@ impl OsTaps {
     }
 }
 
-/// One channel's record-stage pair, polyphase: a history per filter phase,
-/// and nothing for the zeros an interpolator stuffs in or the outputs a
-/// decimator throws away.
+/// How far each of the pair's inputs reaches back before a chunk's own
+/// samples, in samples of its own stream: a window less the sample it ends
+/// on, for the 2× and the 4× interpolators; the five the halfband's centre
+/// tap reads back on the kept 4× stream ([`OS_B_HALF`]); a whole window on
+/// the 4× stream between, because each kept output's window there ends one
+/// sample before the one that stream takes at the same moment; and the 2×
+/// decimator's reach on each half of its input ([`fir_halves`]), one more on
+/// the odd half.
+const UP_A: usize = OS_A_EVEN - 1;
+const UP_B: usize = OS_B_ODD - 1;
+const DN_KEPT: usize = OS_B_HALF;
+const DN_BETWEEN: usize = OS_B_ODD;
+const DN_A: usize = (OS_A_FULL - 1) / 2;
+
+/// One channel's record-stage pair, polyphase and a chunk at a time: each
+/// filter phase's input oldest first, the history its windows reach back
+/// into in front of the chunk's own samples, and nothing for the zeros an
+/// interpolator stuffs in or the outputs a decimator throws away.
 #[derive(Clone, Copy)]
 struct OsChannel {
-    /// `2u`, one push per session sample: both phases of the 2× interpolator
-    /// read it, the even taps for the 2× sample on the session sample and
-    /// the odd ones for the sample between.
-    up_a: History<OS_A_EVEN, { 2 * OS_A_EVEN }>,
-    /// `2 s2`, two pushes per session sample, read the same way at 4×: the
-    /// centre tap for the sub-phase on a 2× sample, the odd taps between.
-    up_b: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+    /// `2u`, one a session sample: both phases of the 2× interpolator read
+    /// it, the even taps for the 2× sample on the session sample and the odd
+    /// ones for the sample between.
+    up_a: [f32; UP_A + CHUNK],
+    /// `2 s2`, two a session sample, read the same way at 4×: the centre tap
+    /// for the sub-phase on a 2× sample, the odd taps between.
+    up_b: [f32; UP_B + 2 * CHUNK],
     /// The tape's 4× output on the sub-phases the 4× decimator keeps
-    /// (`q == 0`): its kept output reads the centre tap here, five entries
-    /// back.
-    dn_b_kept: History<8, 16>,
+    /// (`q == 0`): its kept output reads the centre tap here, five back.
+    dn_kept: [f32; DN_KEPT + 2 * CHUNK],
     /// The tape's 4× output on the sub-phases between (`q == 1`), which the
     /// kept output reads through the halfband's odd taps.
-    dn_b_between: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+    dn_between: [f32; DN_BETWEEN + 2 * CHUNK],
     /// The 4× decimator's kept outputs at 2×, which the 2× decimator reads
-    /// whole, once per session sample.
-    dn_a: History<OS_A_FULL, { 2 * OS_A_FULL }>,
+    /// whole, as its two halves ([`fir_halves`]): the ones its kept output
+    /// ends on, and the ones between.
+    dn_even: [f32; DN_A + CHUNK],
+    dn_odd: [f32; DN_A + 1 + CHUNK],
 }
 
 impl OsChannel {
     const fn new() -> Self {
         Self {
-            up_a: History::new(),
-            up_b: History::new(),
-            dn_b_kept: History::new(),
-            dn_b_between: History::new(),
-            dn_a: History::new(),
+            up_a: [0.0; UP_A + CHUNK],
+            up_b: [0.0; UP_B + 2 * CHUNK],
+            dn_kept: [0.0; DN_KEPT + 2 * CHUNK],
+            dn_between: [0.0; DN_BETWEEN + 2 * CHUNK],
+            dn_even: [0.0; DN_A + CHUNK],
+            dn_odd: [0.0; DN_A + 1 + CHUNK],
         }
     }
 
-    /// One session sample in, its four 4× sub-phases out, in order. The ×2
-    /// on each push restores the amplitude an interpolator's zeros dilute.
-    #[inline]
-    fn up(&mut self, t: &OsTaps, x: f32) -> [f32; OS] {
-        self.up_a.push(2.0 * x);
-        let w = self.up_a.window();
-        let s2 = [dot(&t.a_even, w), dot(&t.a_odd, w)];
-        let mut s4 = [0.0_f32; OS];
-        for (h, s) in s2.into_iter().enumerate() {
-            self.up_b.push(2.0 * s);
-            let w = self.up_b.window();
-            s4[2 * h] = t.b_centre * w[OS_B_HALF];
-            s4[2 * h + 1] = dot(&t.b_odd, w);
+    /// A chunk of session samples in, each one's four 4× sub-phases out, in
+    /// order. The ×2 on each sample restores the amplitude an
+    /// interpolator's zeros dilute.
+    #[inline(always)]
+    fn up(&mut self, t: &OsTaps, x: &[f32], s4: &mut [[f32; OS]]) {
+        let n = x.len().min(CHUNK);
+        for (z, x) in self.up_a[UP_A..UP_A + n].iter_mut().zip(x) {
+            *z = 2.0 * x;
         }
-        s4
-    }
-
-    /// The four 4× sub-phases of one session sample in, one session sample
-    /// out. Each decimator keeps the EARLIER output of its pair (sub-phase
-    /// `q == 0`, then `h == 0`), which is what puts the pair's delay on
-    /// [`OS_LATENCY`] exactly; see there.
-    #[inline]
-    fn down(&mut self, t: &OsTaps, w: [f32; OS]) -> f32 {
-        let mut y = 0.0;
-        for h in 0..2 {
-            self.dn_b_kept.push(w[2 * h]);
-            let d4 = fma(
-                t.b_centre,
-                self.dn_b_kept.window()[OS_B_HALF],
-                dot(&t.b_odd, self.dn_b_between.window()),
-            );
-            self.dn_a.push(d4);
-            if h == 0 {
-                y = dot(&t.a_full, self.dn_a.window());
+        let (mut on, mut between) = ([0.0_f32; CHUNK], [0.0_f32; CHUNK]);
+        fir(&t.a_even, &self.up_a, UP_A, &mut on, n);
+        fir(&t.a_odd, &self.up_a, UP_A, &mut between, n);
+        for (i, (a, b)) in on.iter().zip(&between).take(n).enumerate() {
+            self.up_b[UP_B + 2 * i] = 2.0 * a;
+            self.up_b[UP_B + 2 * i + 1] = 2.0 * b;
+        }
+        let mut odd = [0.0_f32; 2 * CHUNK];
+        fir(&t.b_odd, &self.up_b, UP_B, &mut odd, 2 * n);
+        for (i, s) in s4.iter_mut().take(n).enumerate() {
+            for h in 0..2 {
+                let m = 2 * i + h;
+                s[2 * h] = t.b_centre * self.up_b[UP_B + m - OS_B_HALF];
+                s[2 * h + 1] = odd[m];
             }
-            self.dn_b_between.push(w[2 * h + 1]);
         }
-        y
+        self.up_a.copy_within(n..n + UP_A, 0);
+        self.up_b.copy_within(2 * n..2 * n + UP_B, 0);
+    }
+
+    /// The four 4× sub-phases of each frame of a chunk in, one session sample
+    /// each out; `y` takes whole groups of [`LANES`]. Each decimator keeps
+    /// the EARLIER output of its pair (sub-phase `q == 0`, then `h == 0`),
+    /// which is what puts the pair's delay on [`OS_LATENCY`] exactly; see
+    /// there.
+    #[inline(always)]
+    fn down(&mut self, t: &OsTaps, w: &[[f32; OS]], y: &mut [f32]) {
+        let n = w.len().min(CHUNK);
+        for (i, w) in w.iter().take(n).enumerate() {
+            for h in 0..2 {
+                self.dn_kept[DN_KEPT + 2 * i + h] = w[2 * h];
+                self.dn_between[DN_BETWEEN + 2 * i + h] = w[2 * h + 1];
+            }
+        }
+        let mut odd = [0.0_f32; 2 * CHUNK];
+        fir(&t.b_odd, &self.dn_between, DN_BETWEEN - 1, &mut odd, 2 * n);
+        for i in 0..n {
+            self.dn_even[DN_A + i] = fma(t.b_centre, self.dn_kept[2 * i], odd[2 * i]);
+            self.dn_odd[DN_A + 1 + i] = fma(t.b_centre, self.dn_kept[2 * i + 1], odd[2 * i + 1]);
+        }
+        fir_halves(&t.a_full, &self.dn_even, &self.dn_odd, DN_A, y, n);
+        self.dn_kept.copy_within(2 * n..2 * n + DN_KEPT, 0);
+        self.dn_between.copy_within(2 * n..2 * n + DN_BETWEEN, 0);
+        self.dn_even.copy_within(n..n + DN_A, 0);
+        self.dn_odd.copy_within(n..n + DN_A + 1, 0);
     }
 
     fn clear(&mut self) {
-        self.up_a.clear();
-        self.up_b.clear();
-        self.dn_b_kept.clear();
-        self.dn_b_between.clear();
-        self.dn_a.clear();
+        *self = Self::new();
     }
 }
 
-/// One session sample through the record amplifier and the tape at 4×: up
-/// through the pair, saturated with the refused flux fed back per sub-phase,
-/// and down again. `process` runs exactly this, and so does the test that
-/// holds it to the direct form.
+/// **A chunk of both channels through the record amplifier and the tape at
+/// 4×**: up through the pair, saturated with the refused flux fed back per
+/// sub-phase, and down again; `n` frames of `x` in and of `y` out, at the
+/// record level `level[i]`, `(d, 1 / d)`, the reciprocal worked out once a
+/// frame by the caller rather than four times here. `process` runs exactly
+/// this, and so do the tests that hold it to the direct form and to the pair
+/// as it ran a sample at a time.
 ///
 /// See [`OS`] for why it runs at 4×, [`DRIVE_TANH`] for the curve and
 /// [`SAT_FB`] for the refusal: the value read at a sub-phase is the one that
 /// sub-phase left one session sample ago, read BEFORE it is written, which
-/// is the `z⁻¹` [`SAT_FB`] has always meant. `inv_d` is `1 / d`, worked out
-/// once per frame by the caller rather than four times here.
-#[inline]
-fn record(st: &mut OsChannel, t: &OsTaps, err: &mut [f32; OS], d: f32, inv_d: f32, u: f32) -> f32 {
-    let s4 = st.up(t, u);
-    let mut w = [0.0_f32; OS];
-    for ((w, s), e) in w.iter_mut().zip(s4).zip(err.iter_mut()) {
-        *w = (d * (s + SAT_FB * *e)).tanh() * inv_d;
-        *e = flush(s - *w);
+/// is the `z⁻¹` [`SAT_FB`] has always meant. So each sub-phase of each
+/// channel is a chain of its own, waiting only on its last frame, and a
+/// frame's eight curves run side by side.
+#[inline(always)]
+fn record(
+    os: &mut [OsChannel; 2],
+    t: &OsTaps,
+    err: &mut [[f32; OS]; 2],
+    level: &[[f32; 2]],
+    x: &[[f32; CHUNK]; 2],
+    y: &mut [[f32; CHUNK]; 2],
+    n: usize,
+) {
+    let mut s4 = [[[0.0_f32; OS]; CHUNK]; 2];
+    for ((os, x), s4) in os.iter_mut().zip(x).zip(&mut s4) {
+        os.up(t, &x[..n], &mut s4[..n]);
     }
-    st.down(t, w)
+    for (i, [d, inv_d]) in level.iter().take(n).enumerate() {
+        for (s4, err) in s4.iter_mut().zip(err.iter_mut()) {
+            for (s, e) in s4[i].iter_mut().zip(err.iter_mut()) {
+                let w = (d * (*s + SAT_FB * *e)).tanh() * inv_d;
+                *e = flush(*s - w);
+                *s = w;
+            }
+        }
+    }
+    for ((os, s4), y) in os.iter_mut().zip(&s4).zip(y) {
+        os.down(t, &s4[..n], y);
+    }
 }
 
 /// The repro amplifier's line-up: the gain that puts a 0 VU tone back where
@@ -2493,6 +2629,65 @@ const MOVING_BELLS: u8 = 4;
 const MOVING_INVERSE: u8 = 8;
 const MOVING_DMOL: u8 = 16;
 const MOVING_ROLL: u8 = 32;
+
+/// **What the second half of a chunk reads of each of its frames**
+/// ([`Tape::off_tape`]), as the first half left it ([`Tape::onto_tape`]):
+/// the line-up, Age's second harmonic, the trim and the hiss's gain, where
+/// each track's two heads read and how much of each head is heard, each
+/// track's erasure envelope and spacing filter, and every design of the
+/// chain after the record stage that can move from one frame to the next,
+/// with whether its stage is in circuit ([`CUE_UNDER_INV`] and the rest).
+/// The record level the record stage reads is beside these, in
+/// [`Tape::levels`].
+#[derive(Debug, Clone, Copy)]
+struct Cue {
+    makeup: f32,
+    h2: f32,
+    trim: f32,
+    hiss: f32,
+    delays: [[f32; 2]; 2],
+    weights: [f32; 2],
+    env: [f32; 2],
+    spacing: [[f32; 2]; 2],
+    flags: u8,
+    under_inv: Shelf,
+    shelf: Section,
+    bump: Bell,
+    dip: Bell,
+    roll_a: f32,
+}
+
+impl Cue {
+    const IDLE: Cue = Cue {
+        makeup: 1.0,
+        h2: 0.0,
+        trim: 1.0,
+        hiss: 0.0,
+        delays: [[0.0; 2]; 2],
+        weights: [1.0, 0.0],
+        env: [0.0; 2],
+        spacing: [[0.0; 2]; 2],
+        flags: 0,
+        under_inv: Shelf::WIRE,
+        shelf: Section::WIRE,
+        bump: Bell::WIRE,
+        dip: Bell::WIRE,
+        roll_a: 0.0,
+    };
+}
+
+/// A [`Cue`]'s flags: which of the chain's switchable stages are in circuit
+/// on the frame (the under-bias shelf's inverse, the bias shelf, the
+/// spacing filter, and whether the spacing starts from the signal it
+/// meets), and which states a design let go of on its way out of circuit
+/// on it, the inverse's and the bias shelf's, for the second half to clear
+/// there ([`Tape::resets`]).
+const CUE_UNDER_INV: u8 = 1;
+const CUE_SHELF: u8 = 2;
+const CUE_SPACING: u8 = 4;
+const CUE_SPACING_FRESH: u8 = 8;
+const CUE_RESET_UNDER_OUT: u8 = 16;
+const CUE_RESET_BIAS_HF: u8 = 32;
 
 /// The hiss's seeds, one per channel (two tracks, two noises), and the
 /// modulation noise's. Restored by `clear`, so a cleared tape hisses the same
@@ -3594,6 +3789,17 @@ pub struct Tape {
     /// The flux the tape refused one session sample ago, held per oversampled
     /// sub-phase. See [`SAT_FB`] for why it is a sub-phase and not a sample.
     sat_err: [[f32; OS]; 2],
+    /// **A chunk between its two halves** ([`Tape::process`]): the record
+    /// stage's input and output, the record level `(d, 1 / d)` at each
+    /// frame, what the chain after the record stage reads of each frame
+    /// ([`Cue`]), and the states the frame now being made has let go of
+    /// ([`CUE_RESET_UNDER_OUT`], [`CUE_RESET_BIAS_HF`]), which its cue
+    /// carries to the second half.
+    rec_in: [[f32; CHUNK]; 2],
+    rec_out: [[f32; CHUNK]; 2],
+    levels: [[f32; 2]; CHUNK],
+    cues: [Cue; CHUNK],
+    resets: u8,
     /// The record-level envelope that drives the self-erasure, and the
     /// erasure one-pole itself.
     erase_env: [f32; 2],
@@ -3796,6 +4002,11 @@ impl Tape {
             os: [OsChannel::new(), OsChannel::new()],
             makeup: makeup_table(),
             sat_err: [[0.0; OS]; 2],
+            rec_in: [[0.0; CHUNK]; 2],
+            rec_out: [[0.0; CHUNK]; 2],
+            levels: [[1.0; 2]; CHUNK],
+            cues: [Cue::IDLE; CHUNK],
+            resets: 0,
             erase_env: [0.0; 2],
             erase_lp: [0.0; 2],
             top: [0.0; 2],
@@ -4310,7 +4521,7 @@ impl Tape {
                 }
                 if self.shelf_on && self.shelf.now == Section::WIRE {
                     self.shelf_on = false;
-                    self.bias_hf = [0.0; 2];
+                    self.resets |= CUE_RESET_BIAS_HF;
                 }
                 self.moving &= !forward;
             }
@@ -4321,7 +4532,7 @@ impl Tape {
             if t >= 1.0 {
                 if self.under_inv.now == Shelf::WIRE {
                     self.under_inv_on = false;
-                    self.under_out = [[0.0; 2]; 2];
+                    self.resets |= CUE_RESET_UNDER_OUT;
                 }
                 self.moving &= !MOVING_INVERSE;
             }
@@ -4404,6 +4615,18 @@ impl Tape {
     /// only: anything past the first two channels is left alone, and a mono
     /// buffer is returned untouched rather than half-processed, the same
     /// contract as `Effects::process`.
+    ///
+    /// **A block runs as chunks, each in two halves around the record
+    /// stage.** A chunk ends at the next design ([`SUB_BLOCK`]) or at the end
+    /// of the block, whichever is first, so a design only ever opens one.
+    /// Its first half runs frame by frame as far as the record stage
+    /// ([`Tape::onto_tape`]); the record stage then takes the whole chunk at
+    /// once ([`record`]), each filter's outputs side by side; and the second
+    /// half runs frame by frame from there ([`Tape::off_tape`]). Nothing the
+    /// first half does reads what the second writes, and what the second
+    /// reads of each frame the first leaves in [`Cue`], so every frame meets
+    /// exactly the arithmetic it met a frame at a time, and the output is the
+    /// same to the bit at any block size.
     pub fn process(&mut self, buf: &mut [f32], frames: usize, channels: usize, p: &TapeParams) {
         if channels < 2 {
             return;
@@ -4411,12 +4634,30 @@ impl Tape {
         debug_assert!(buf.len() >= frames * channels);
         self.aim(p);
         let roll_wanted = norm(p.roll) > 1.0e-3;
-        let e_scale = (ERASE_POINTS - 1) as f32 / ERASE_CLAMP as f32;
-        for i in 0..frames {
-            let f = i * channels;
+        let mut done = 0;
+        while done < frames {
             if self.frame.is_multiple_of(SUB_BLOCK) {
                 self.design(roll_wanted);
             }
+            let n = (frames - done).min((SUB_BLOCK - self.frame % SUB_BLOCK) as usize);
+            let end = ((done + n) * channels).min(buf.len());
+            let chunk = &mut buf[done * channels..end];
+            self.onto_tape(chunk, n, channels);
+            record(&mut self.os, &self.os_taps, &mut self.sat_err, &self.levels, &self.rec_in, &mut self.rec_out, n);
+            self.off_tape(chunk, n, channels);
+            done += n;
+        }
+    }
+
+    /// **The first half of a chunk, a frame at a time**: each frame's turn
+    /// of the moving designs, the glides and the record level they make, the
+    /// heads, and each track's signal as far as the record stage (the input
+    /// transformer, the erasure's envelope, the NAB record shelf and, under
+    /// the aligned bias, the under-bias shelf), leaving the record level in
+    /// [`Tape::levels`] and what the second half reads of the frame in
+    /// [`Tape::cues`]. Nothing here reads anything the second half writes.
+    fn onto_tape(&mut self, buf: &[f32], n: usize, channels: usize) {
+        for i in 0..n {
             self.frame += 1;
             self.turn();
 
@@ -4443,20 +4684,23 @@ impl Tape {
 
             // ── the heads: the transport's sway and each track's noise ───
             let skew = self.wear_frame();
-            let (delays, [studio, deep]) = self.heads(skew);
+            let (delays, weights) = self.heads(skew);
             // The tape's noise over the record level ([`HISS_DRIVE`]): the
             // voicing's gain carries the speed's `dmol`, which `1 / d`
             // takes back out. Age raises it.
             let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain * inv_d * self.hiss_age;
             let wearing = ((self.frame - 1) % WEAR_STEP + 1) as f32 / WEAR_STEP as f32;
 
-            for ch in 0..2 {
+            let f = i * channels;
+            let mut env = [0.0_f32; 2];
+            for (ch, env) in env.iter_mut().enumerate() {
                 // The input transformer: keep DC and rumble out of the
                 // headroom.
                 let u = self.transformer[ch].high(buf[f + ch], self.g_transformer);
 
                 // The record level, dual-rate. This envelope, not any gain
-                // element, is what rounds the attacks, spectrally, below.
+                // element, is what rounds the attacks, spectrally, in the
+                // second half.
                 let lvl = (u * d).abs();
                 let a = if lvl > self.erase_env[ch] {
                     self.a_att
@@ -4464,35 +4708,105 @@ impl Tape {
                     self.a_rel
                 };
                 self.erase_env[ch] = flush(self.erase_env[ch] + (lvl - self.erase_env[ch]) * a);
+                *env = self.erase_env[ch];
 
                 // Onto the tape through the NAB record shelf and, under the
-                // aligned bias, the under-bias shelf, the record amplifier
-                // and the tape at 4× (see [`record`]), the repro amplifier's
-                // line-up (not a knob: see [`sat_makeup`]), and off it
-                // through both shelves' exact inverses, then the bias's own
-                // treble shelf.
+                // aligned bias, the under-bias shelf; the record amplifier
+                // and the tape at 4× take the chunk from here ([`record`]).
                 let mut r = self.nab.run(&mut self.nab_in[ch], u);
                 if self.under_on {
                     r = self.under.now.run(&mut self.under_in[ch], r);
                 }
-                let mut y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r) * makeup;
+                self.rec_in[ch][i] = r;
+            }
+
+            // Each track's spacing filter this frame, on its way across the
+            // wear's grid.
+            let mut spacing = [[0.0_f32; 2]; 2];
+            if self.spacing_on {
+                for (s, (from, to)) in spacing.iter_mut().zip(self.spacing_from.iter().zip(&self.spacing_to)) {
+                    *s = [
+                        from[0] + (to[0] - from[0]) * wearing,
+                        from[1] + (to[1] - from[1]) * wearing,
+                    ];
+                }
+            }
+            let mut flags = self.resets;
+            for (on, bit) in [
+                (self.under_inv_on, CUE_UNDER_INV),
+                (self.shelf_on, CUE_SHELF),
+                (self.spacing_on, CUE_SPACING),
+                (self.spacing_fresh, CUE_SPACING_FRESH),
+            ] {
+                if on {
+                    flags |= bit;
+                }
+            }
+            self.levels[i] = [d, inv_d];
+            self.cues[i] = Cue {
+                makeup,
+                h2,
+                trim: trim_gain,
+                hiss: hiss_gain,
+                delays,
+                weights,
+                env,
+                spacing,
+                flags,
+                under_inv: self.under_inv.now,
+                shelf: self.shelf.now,
+                bump: self.bump_bell.now,
+                dip: self.dip_bell.now,
+                roll_a: self.roll_a.now,
+            };
+            self.spacing_fresh = false;
+            self.resets = 0;
+        }
+    }
+
+    /// **The second half of a chunk, a frame at a time**, from what the
+    /// record stage made of it ([`Tape::rec_out`]) to the output, reading
+    /// each frame as the first half left it ([`Cue`]): the repro line-up,
+    /// the magnetised head, both record shelves' exact inverses and the
+    /// bias's treble shelf, self-erasure, the tape and its play heads, the
+    /// head's own top, the hiss, the spacing, the contour, Roll and the trim.
+    /// A state a design let go of on its way out of circuit is cleared here,
+    /// on the frame the first half let it go.
+    fn off_tape(&mut self, buf: &mut [f32], n: usize, channels: usize) {
+        let e_scale = (ERASE_POINTS - 1) as f32 / ERASE_CLAMP as f32;
+        for i in 0..n {
+            let cue = &self.cues[i];
+            if cue.flags & CUE_RESET_UNDER_OUT != 0 {
+                self.under_out = [[0.0; 2]; 2];
+            }
+            if cue.flags & CUE_RESET_BIAS_HF != 0 {
+                self.bias_hf = [0.0; 2];
+            }
+            let [studio, deep] = cue.weights;
+            let f = i * channels;
+            for ch in 0..2 {
+                // The repro amplifier's line-up (not a knob: see
+                // [`sat_makeup`]).
+                let mut y = self.rec_out[ch][i] * cue.makeup;
                 // A magnetised head's second harmonic, on the flux the tape
                 // holds, and its rectified DC taken off again.
                 if self.h2_on {
-                    y += h2 * ((y * y + MAGNETISED_KNEE * MAGNETISED_KNEE).sqrt() - MAGNETISED_KNEE);
+                    y += cue.h2 * ((y * y + MAGNETISED_KNEE * MAGNETISED_KNEE).sqrt() - MAGNETISED_KNEE);
                     y = self.dc[ch].high(y, self.g_dc);
                 }
-                if self.under_inv_on {
-                    y = self.under_inv.now.run(&mut self.under_out[ch], y);
+                // Off the tape through both record shelves' exact inverses,
+                // then the bias's own treble shelf.
+                if cue.flags & CUE_UNDER_INV != 0 {
+                    y = cue.under_inv.run(&mut self.under_out[ch], y);
                 }
                 let mut y = self.nab_inv.run(&mut self.nab_out[ch], y);
-                if self.shelf_on {
-                    y = self.shelf.now.run(&mut self.bias_hf[ch], y);
+                if cue.flags & CUE_SHELF != 0 {
+                    y = cue.shelf.run(&mut self.bias_hf[ch], y);
                 }
 
                 // HF self-erasure: the corner falls as the level rises, read
                 // from this speed's table. At rest `b` is zero: a wire.
-                let e = self.erase_env[ch].min(ERASE_CLAMP as f32) * e_scale;
+                let e = cue.env[ch].min(ERASE_CLAMP as f32) * e_scale;
                 let k = (e as usize).min(ERASE_POINTS - 2);
                 let b = self.erase[k] + (self.erase[k + 1] - self.erase[k]) * (e - k as f32);
                 self.erase_lp[ch] = flush(y + b * (self.erase_lp[ch] - y));
@@ -4502,11 +4816,11 @@ impl Tape {
                 // are read only while a range switch fades between them.
                 let line = &self.line[ch];
                 let v = if deep == 0.0 {
-                    line.read(&self.read, delays[0][ch])
+                    line.read(&self.read, cue.delays[0][ch])
                 } else if studio == 0.0 {
-                    line.read(&self.read, delays[1][ch])
+                    line.read(&self.read, cue.delays[1][ch])
                 } else {
-                    studio * line.read(&self.read, delays[0][ch]) + deep * line.read(&self.read, delays[1][ch])
+                    studio * line.read(&self.read, cue.delays[0][ch]) + deep * line.read(&self.read, cue.delays[1][ch])
                 };
                 self.top[ch] = flush(v + self.top_b * (self.top[ch] - v));
                 let mut v = self.top[ch];
@@ -4515,22 +4829,20 @@ impl Tape {
                 // which the head contour and Roll then shape as they shape
                 // the music. A level glided to exactly nothing skips the
                 // stage.
-                if hiss_gain > 0.0 {
+                if cue.hiss > 0.0 {
                     let w = white(&mut self.hiss_rng[ch]);
-                    v += self.hiss_shelf.run(&mut self.hiss_eq[ch], w) * hiss_gain;
+                    v += self.hiss_shelf.run(&mut self.hiss_eq[ch], w) * cue.hiss;
                 }
 
                 // The head-to-tape spacing, Wallace's loss as three
                 // one-poles ([`SPACING_FIT`]): after the hiss, so whatever
                 // lifts the tape off the head dulls the hiss as well.
-                if self.spacing_on {
+                if cue.flags & CUE_SPACING != 0 {
                     let st = &mut self.spacing[ch];
-                    if self.spacing_fresh {
+                    if cue.flags & CUE_SPACING_FRESH != 0 {
                         *st = [v; 3];
                     }
-                    let [from, to] = [self.spacing_from[ch], self.spacing_to[ch]];
-                    let hp = from[0] + (to[0] - from[0]) * wearing;
-                    let lp = from[1] + (to[1] - from[1]) * wearing;
+                    let [hp, lp] = cue.spacing[ch];
                     st[0] = flush(v + hp * (st[0] - v));
                     let shelved = v - SPACING_FIT.0 as f32 * (v - st[0]);
                     st[1] = flush(shelved + lp * (st[1] - shelved));
@@ -4540,19 +4852,18 @@ impl Tape {
 
                 // The head contour, then Roll. Out of circuit, Roll's state
                 // follows the signal, so it comes back in without a step.
-                v = self.bump_bell.now.run(&mut self.bump[ch], v);
-                v = self.dip_bell.now.run(&mut self.dip[ch], v);
+                v = cue.bump.run(&mut self.bump[ch], v);
+                v = cue.dip.run(&mut self.dip[ch], v);
                 v = self.low[ch].high(v, self.low_g);
                 if self.roll_on {
-                    self.roll_lp[ch] = flush(self.roll_lp[ch] + self.roll_a.now * (v - self.roll_lp[ch]));
+                    self.roll_lp[ch] = flush(self.roll_lp[ch] + cue.roll_a * (v - self.roll_lp[ch]));
                     v = self.roll_lp[ch];
                 } else {
                     self.roll_lp[ch] = v;
                 }
 
-                buf[f + ch] = v * trim_gain;
+                buf[f + ch] = v * cue.trim;
             }
-            self.spacing_fresh = false;
         }
     }
 
@@ -4587,6 +4898,7 @@ impl Tape {
             c.clear();
         }
         self.sat_err = [[0.0; OS]; 2];
+        self.resets = 0;
         self.erase_env = [0.0; 2];
         self.erase_lp = [0.0; 2];
         self.top = [0.0; 2];
@@ -4646,6 +4958,15 @@ impl Tape {
             }
             self.frame += 1;
             self.turn();
+            // No second half runs here, so what a design lets go of is
+            // cleared on its own frame, as the second half would clear it.
+            if self.resets & CUE_RESET_UNDER_OUT != 0 {
+                self.under_out = [[0.0; 2]; 2];
+            }
+            if self.resets & CUE_RESET_BIAS_HF != 0 {
+                self.bias_hf = [0.0; 2];
+            }
+            self.resets = 0;
             self.speed.tick(self.a_speed);
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
@@ -6749,6 +7070,174 @@ mod tests {
         }
     }
 
+    /// **The record stage's pair as it ran a sample at a time, to 5.2**,
+    /// kept as the reference the chunked pair is held to bit for bit
+    /// (`the_record_stage_a_chunk_at_a_time_is_the_pair_a_sample_at_a_time_to_the_bit`):
+    /// a history per filter phase, each sample written newest first and the
+    /// whole window read back at once, every output one [`dot`].
+    #[derive(Clone, Copy)]
+    struct History<const H: usize, const H2: usize> {
+        z: [f32; H2],
+        pos: usize,
+    }
+
+    impl<const H: usize, const H2: usize> History<H, H2> {
+        const fn new() -> Self {
+            const { assert!(H2 == 2 * H, "a history is written twice") };
+            Self { z: [0.0; H2], pos: 0 }
+        }
+
+        fn push(&mut self, x: f32) {
+            self.pos = if self.pos == 0 { H - 1 } else { self.pos - 1 };
+            self.z[self.pos] = x;
+            self.z[self.pos + H] = x;
+        }
+
+        /// The newest `H` samples, newest first.
+        fn window(&self) -> &[f32] {
+            &self.z[self.pos..self.pos + H]
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SamplePair {
+        up_a: History<OS_A_EVEN, { 2 * OS_A_EVEN }>,
+        up_b: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+        dn_b_kept: History<8, 16>,
+        dn_b_between: History<OS_B_ODD, { 2 * OS_B_ODD }>,
+        dn_a: History<OS_A_FULL, { 2 * OS_A_FULL }>,
+    }
+
+    impl SamplePair {
+        const fn new() -> Self {
+            Self {
+                up_a: History::new(),
+                up_b: History::new(),
+                dn_b_kept: History::new(),
+                dn_b_between: History::new(),
+                dn_a: History::new(),
+            }
+        }
+
+        fn up(&mut self, t: &OsTaps, x: f32) -> [f32; OS] {
+            self.up_a.push(2.0 * x);
+            let w = self.up_a.window();
+            let s2 = [dot(&t.a_even, w), dot(&t.a_odd, w)];
+            let mut s4 = [0.0_f32; OS];
+            for (h, s) in s2.into_iter().enumerate() {
+                self.up_b.push(2.0 * s);
+                let w = self.up_b.window();
+                s4[2 * h] = t.b_centre * w[OS_B_HALF];
+                s4[2 * h + 1] = dot(&t.b_odd, w);
+            }
+            s4
+        }
+
+        fn down(&mut self, t: &OsTaps, w: [f32; OS]) -> f32 {
+            let mut y = 0.0;
+            for h in 0..2 {
+                self.dn_b_kept.push(w[2 * h]);
+                let d4 = fma(
+                    t.b_centre,
+                    self.dn_b_kept.window()[OS_B_HALF],
+                    dot(&t.b_odd, self.dn_b_between.window()),
+                );
+                self.dn_a.push(d4);
+                if h == 0 {
+                    y = dot(&t.a_full, self.dn_a.window());
+                }
+                self.dn_b_between.push(w[2 * h + 1]);
+            }
+            y
+        }
+
+        /// One session sample through the record amplifier and the tape.
+        fn record(&mut self, t: &OsTaps, err: &mut [f32; OS], d: f32, inv_d: f32, u: f32) -> f32 {
+            let s4 = self.up(t, u);
+            let mut w = [0.0_f32; OS];
+            for ((w, s), e) in w.iter_mut().zip(s4).zip(err.iter_mut()) {
+                *w = (d * (s + SAT_FB * *e)).tanh() * inv_d;
+                *e = flush(s - *w);
+            }
+            self.down(t, w)
+        }
+    }
+
+    /// **The record stage a chunk at a time is the pair a sample at a time,
+    /// to the bit.** 5.3 runs the record stage's filters over a whole chunk
+    /// at once, each filter's outputs side by side in the lanes of a vector
+    /// ([`fir`], [`fir_halves`]), where 5.2 ran them a sample at a time
+    /// ([`SamplePair`]); every output kept its arithmetic, its eight partial
+    /// sums and their tree, so the sound must not move by a single bit. So on
+    /// four seconds of noise whose level steps between a whisper and well
+    /// over full scale, in chunks of every length from one frame to a whole
+    /// chunk in turn, with the record level sweeping the dial frame by frame,
+    /// the two channels on different noise, the chunked record stage plays
+    /// the reference's bits on both channels, and so does the linear pair
+    /// alone.
+    #[test]
+    fn the_record_stage_a_chunk_at_a_time_is_the_pair_a_sample_at_a_time_to_the_bit() {
+        let taps = OsTaps::new();
+        let frames = 4 * 48_000;
+        let mut seed = 0xC4A2_0B17_u32;
+        let input: Vec<[f32; 2]> = (0..frames)
+            .map(|i| std::array::from_fn(|ch| [0.01, 0.4, 2.5][(i / 4_999 + ch) % 3] * white(&mut seed)))
+            .collect();
+        let level = |i: usize| {
+            let d = dial_log2_d((0.5 + 0.5 * (i as f32 / 7_919.0).sin()).clamp(0.0, 1.0)).exp2() as f32;
+            [d, 1.0 / d]
+        };
+        let (mut chunked, mut err) = ([OsChannel::new(); 2], [[0.0_f32; OS]; 2]);
+        let (mut linear, mut reference) = ([OsChannel::new(); 2], [SamplePair::new(); 4]);
+        let mut ref_err = [[0.0_f32; OS]; 2];
+        let (mut done, mut len) = (0, 1);
+        while done < frames {
+            let n = len.min(frames - done);
+            let mut x = [[0.0_f32; CHUNK]; 2];
+            let mut levels = [[0.0_f32; 2]; CHUNK];
+            for i in 0..n {
+                for ch in 0..2 {
+                    x[ch][i] = input[done + i][ch];
+                }
+                levels[i] = level(done + i);
+            }
+            let mut y = [[0.0_f32; CHUNK]; 2];
+            record(&mut chunked, &taps, &mut err, &levels, &x, &mut y, n);
+            let mut lin = [[0.0_f32; CHUNK]; 2];
+            for ch in 0..2 {
+                let mut s4 = [[0.0_f32; OS]; CHUNK];
+                linear[ch].up(&taps, &x[ch][..n], &mut s4[..n]);
+                linear[ch].down(&taps, &s4[..n], &mut lin[ch]);
+            }
+            for i in 0..n {
+                let [d, inv_d] = levels[i];
+                for ch in 0..2 {
+                    let want = reference[ch].record(&taps, &mut ref_err[ch], d, inv_d, x[ch][i]);
+                    let s4 = reference[2 + ch].up(&taps, x[ch][i]);
+                    let want_linear = reference[2 + ch].down(&taps, s4);
+                    assert_eq!(
+                        y[ch][i].to_bits(),
+                        want.to_bits(),
+                        "frame {} of channel {ch}, in a chunk of {n}: the chunked record stage made {:e} where a sample at a time made {:e}",
+                        done + i,
+                        y[ch][i],
+                        want
+                    );
+                    assert_eq!(
+                        lin[ch][i].to_bits(),
+                        want_linear.to_bits(),
+                        "frame {} of channel {ch}, in a chunk of {n}: the chunked linear pair made {:e} where a sample at a time made {:e}",
+                        done + i,
+                        lin[ch][i],
+                        want_linear
+                    );
+                }
+            }
+            done += n;
+            len = len % CHUNK + 1;
+        }
+    }
+
     /// Where a buffer is loudest, by magnitude.
     fn loudest(v: &[f32]) -> usize {
         (0..v.len())
@@ -6792,13 +7281,14 @@ mod tests {
         let linear = |input: &[f32], keep: (usize, usize)| -> (Vec<f32>, Vec<f32>) {
             let mut poly = OsChannel::new();
             let mut direct = DirectPair::new(keep);
-            input
-                .iter()
-                .map(|&x| {
-                    let s4 = poly.up(&taps, x);
-                    (poly.down(&taps, s4), direct.run(x, None))
-                })
-                .unzip()
+            let mut out = Vec::with_capacity(input.len());
+            for chunk in input.chunks(CHUNK) {
+                let (mut s4, mut y) = ([[0.0_f32; OS]; CHUNK], [0.0_f32; CHUNK]);
+                poly.up(&taps, chunk, &mut s4[..chunk.len()]);
+                poly.down(&taps, &s4[..chunk.len()], &mut y);
+                out.extend_from_slice(&y[..chunk.len()]);
+            }
+            (out, input.iter().map(|&x| direct.run(x, None)).collect())
         };
         let mut impulse = vec![0.0_f32; 256];
         impulse[0] = 1.0;
@@ -6829,13 +7319,20 @@ mod tests {
         );
 
         let d = DRIVE_TANH.1;
-        let mut poly = OsChannel::new();
-        let mut err = [0.0_f32; OS];
+        let mut poly = [OsChannel::new(); 2];
+        let mut err = [[0.0_f32; OS]; 2];
         let mut direct = DirectPair::new((0, 0));
-        let worst = noise
-            .iter()
-            .map(|&x| (record(&mut poly, &taps, &mut err, d, 1.0 / d, x) - direct.run(x, Some(d))).abs())
-            .fold(0.0_f32, f32::max);
+        let mut worst = 0.0_f32;
+        for chunk in noise.chunks(CHUNK) {
+            let n = chunk.len();
+            let mut x = [[0.0_f32; CHUNK]; 2];
+            x[0][..n].copy_from_slice(chunk);
+            let mut y = [[0.0_f32; CHUNK]; 2];
+            record(&mut poly, &taps, &mut err, &[[d, 1.0 / d]; CHUNK], &x, &mut y, n);
+            for (y, &x) in y[0].iter().zip(chunk) {
+                worst = worst.max((y - direct.run(x, Some(d))).abs());
+            }
+        }
         assert!(
             worst < 1.0e-5,
             "the slammed record stage is {worst:e} from the direct form's"
