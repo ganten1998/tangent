@@ -3480,13 +3480,16 @@ pub struct Tape {
     /// **The inverse follows the shelf [`OS_LATENCY`] frames late**, because
     /// the two straddle the record stage's oversampler: what the shelf
     /// shapes at one frame leaves the curve that many frames later, and the
-    /// inverse must meet it with the same design, or every design while the
-    /// bias glides is a 44-frame step in the bass, a click. So each design's
-    /// inverse waits in `inverse_due` with the frame it sets off at (at
-    /// most two wait, designs being 32 frames apart), and moves from there
-    /// as the shelf moved, frame for frame ([`Ramp`]): `inverse_from` is
-    /// the frame its move counts from. A stage moving to its wire leaves
+    /// inverse must meet it with the same design, or the bass comes off the
+    /// tape undone by the wrong one: moved on the shelf's own frames, a
+    /// -18 dBFS 70 Hz tone with Bias thrown across its travel at 30 ips
+    /// comes off up to -39 dBFS wrong, 21 dB under the note. So each
+    /// design's inverse waits in `inverse_due` with the frame it sets off at
+    /// (at most two wait, designs being 32 frames apart), and moves from
+    /// there as the shelf moved, frame for frame ([`Ramp`]): `inverse_from`
+    /// is the frame its move counts from. A stage moving to its wire leaves
     /// the circuit as it arrives.
+    /// `the_under_bias_inverse_moves_its_latency_after_the_shelf` holds it.
     under: Ramp<Shelf>,
     under_on: bool,
     under_inv: Ramp<Shelf>,
@@ -9329,5 +9332,136 @@ mod tests {
                 "the wow range thrown {throw} swelled the tone {swell:+.2} dB through the heads' fade"
             );
         }
+    }
+
+    /// **The under-bias inverse moves its latency after the shelf.**
+    ///
+    /// The under-bias shelf shapes the bass on its way into the record
+    /// stage's oversampler and its inverse undoes it on the way out, so what
+    /// the shelf shapes on one frame meets the inverse [`OS_LATENCY`] frames
+    /// later, and must meet the same design there. So whatever the shelf
+    /// does, the inverse does that many frames later (`Tape::inverse_due`):
+    /// it is in circuit exactly when the shelf was, it moves between the
+    /// inverses of the two designs the shelf moved between (each the same
+    /// corner with its gain negated), and it is as far along its move, to
+    /// the frame, as the shelf was along its own ([`Ramp`]). Every frame is
+    /// held to all three, one frame at a time, at 44.1, 48 and 96 kHz: Bias
+    /// thrown 0 to 0.5 (out of circuit through aligned), back to 0, 0 to 1
+    /// and back again; Bias hovering on aligned, in and out of circuit
+    /// every few milliseconds; and the speed gliding 15 to 3.75 to 30 ips
+    /// with the bias under.
+    ///
+    /// **No click test can hold this any more.** While designs stepped, an
+    /// inverse a design early was a 44-frame step in the bass at every
+    /// design, +9.3 dB above 12 kHz, and `a_moving_control_never_clicks`
+    /// caught it. Now that both move a frame at a time, an inverse moved on
+    /// the shelf's own frames leaves the treble a click test reads under the
+    /// hiss where it was (no throw reads over -0.2 dB, early or not) and
+    /// takes the bass off the curve undone by the wrong design instead: a
+    /// -18 dBFS 70 Hz tone with Bias thrown 0 to 1 at 30 ips comes off up to
+    /// -39.4 dBFS wrong, 21 dB under the note, and a 100 Hz tone at 15 ips
+    /// up to -38.9 dBFS. That inverse fails here on most frames a move is
+    /// under way, and so does one a frame late.
+    #[test]
+    fn the_under_bias_inverse_moves_its_latency_after_the_shelf() {
+        // The shelf a design undoes: the same corner, its gain negated. A
+        // low shelf's height is `a^2 = 1 + m2`, and its `g = a2 / a1` is its
+        // corner's `t` over `sqrt(a)` ([`Shelf::low`]).
+        let undone = |s: &Shelf| {
+            let a = (1.0 + f64::from(s.m2)).sqrt();
+            let t = f64::from(s.a2) / f64::from(s.a1) * a.sqrt();
+            Shelf::low(t, -40.0 * a.log10())
+        };
+        let near = |x: &Shelf, y: &Shelf| {
+            [x.a1 - y.a1, x.a2 - y.a2, x.a3 - y.a3, x.m1 - y.m1, x.m2 - y.m2]
+                .iter()
+                .all(|d| d.abs() < 1.0e-5)
+        };
+        // The fractions of its way, in frames of a sub-block, at which a
+        // ramp stands where it is, as bits: one while it is under way, every
+        // one while it stands still.
+        let stands = |r: &Ramp<Shelf>| {
+            (1..=SUB_BLOCK).fold(0_u64, |bits, k| {
+                let mut at = *r;
+                at.step(k as f32 / SUB_BLOCK as f32);
+                if at.now == r.now { bits | 1 << k } else { bits }
+            })
+        };
+        let lag = OS_LATENCY;
+        let bias = |v: f32| TapeParams {
+            bias: v,
+            ..TapeParams::default()
+        };
+        let under = |speed: TapeSpeed| TapeParams {
+            bias: 0.2,
+            speed: speed.dial(),
+            ..TapeParams::default()
+        };
+        // Each leg: its settings from the second each starts at, and the
+        // second it ends at.
+        let legs: [(&str, Vec<(f64, TapeParams)>, f64); 3] = [
+            (
+                "Bias thrown 0 to 0.5, back, 0 to 1 and back",
+                vec![(0.0, bias(0.0)), (0.05, bias(0.5)), (0.45, bias(0.0)), (0.85, bias(1.0)), (1.25, bias(0.0))],
+                1.65,
+            ),
+            (
+                "Bias hovering on aligned",
+                (0..100).map(|i| (0.005 * f64::from(i), bias(if i % 2 == 0 { 0.45 } else { 0.55 }))).collect(),
+                0.5,
+            ),
+            (
+                "the speed gliding 15 to 3.75 to 30 ips under the bias",
+                vec![(0.0, under(TapeSpeed::Ips15)), (0.05, under(TapeSpeed::Ips3_75)), (1.05, under(TapeSpeed::Ips30))],
+                2.05,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for sr in [44_100.0_f32, 48_000.0, 96_000.0] {
+            for (what, plan, end) in &legs {
+                let mut unit = Tape::new(sr);
+                // The shelf on each of the last `lag` frames, and whether it
+                // was in circuit.
+                let mut shelf_was = std::collections::VecDeque::with_capacity(lag + 1);
+                let (mut flags, mut ends, mut fractions, mut under_way) = (0, 0, 0, 0);
+                let mut first = None;
+                for f in 0..(f64::from(sr) * end) as usize {
+                    let now = f as f64 / f64::from(sr);
+                    let p = plan.iter().rev().find(|(at, _)| *at <= now).expect("a setting").1;
+                    unit.transport_trace(&p, 1);
+                    shelf_was.push_back((unit.under_on, unit.under));
+                    if shelf_was.len() <= lag {
+                        continue;
+                    }
+                    let (on, shelf) = shelf_was.pop_front().expect("a frame");
+                    let inverse = unit.under_inv;
+                    let was = (flags, ends, fractions);
+                    if on != unit.under_inv_on {
+                        flags += 1;
+                    } else if on {
+                        if !near(&inverse.from, &undone(&shelf.from)) || !near(&inverse.to, &undone(&shelf.to)) {
+                            ends += 1;
+                        }
+                        let s = stands(&shelf);
+                        under_way += usize::from(s.count_ones() == 1);
+                        if s & stands(&inverse) == 0 {
+                            fractions += 1;
+                        }
+                    }
+                    if (flags, ends, fractions) != was && first.is_none() {
+                        first = Some(f + 1);
+                    }
+                }
+                assert!(under_way >= 2_000, "at {sr} Hz, {what}: only {under_way} frames under way");
+                if let Some(first) = first {
+                    wrong.push(format!(
+                        "at {sr} Hz, {what}: on {flags} frames the inverse was in or out of circuit unlike the \
+                         shelf {lag} frames before, on {ends} it moved between other designs, and on {fractions} \
+                         it stood another fraction of its way, the first frame {first}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
