@@ -759,8 +759,10 @@ const DEEP_SLEW: f64 = 0.03;
 /// around at 0.45 Hz and the pinch roller at 1.5 Hz, both times Rate and
 /// neither following the tape speed (a cassette has its own), sharing
 /// 0.55 and 0.30 of [`CASSETTE_DEPTH`]; and the belt drifting, a
-/// sample-and-hold every 2.5 s through two poles at 0.2 Hz, both at Rate's
-/// pace, a delay of up to [`BELT_MS`].
+/// sample-and-hold every 2.5 s through two poles at 0.2 Hz, a delay of up
+/// to [`BELT_MS`]. **The belt's drift ignores Rate**, as the studio head's
+/// drift does: Rate turns the parts that go round, and a drift is the
+/// belt's grip wandering, which no turn paces.
 ///
 /// **At full Wow the deep head swings the pitch 3 % at its peak, and the
 /// swing is linear in Wow's dial** (the owner's ruling): 0.9 % at the
@@ -772,10 +774,16 @@ const DEEP_SLEW: f64 = 0.03;
 /// minutes at 44.1 kHz the deep head peaks at 3.01 % at full Wow, 1.51 % at
 /// 0.5 and 0.91 % at 0.3, the same to within 0.6 % at 48 and 96 kHz, and
 /// at 3.02 % over ten minutes
-/// (`the_deep_range_swings_the_pitch_like_a_worn_cassette`). The belt
-/// follows Rate, so at twice the parts' speed its drift moves twice as
-/// fast and bends the pitch twice as far, and full Wow peaks at 3.2 % over
-/// two minutes there (3.4 % over ten); at half their speed, 3.0 %.
+/// (`the_deep_range_swings_the_pitch_like_a_worn_cassette`). So it holds
+/// at every Rate: over ten minutes at full Wow the deep head peaks between
+/// 3.00 and 3.07 % from half the parts' speed to twice it, and over two
+/// minutes at Wow 1 and 0.5 within 4 % of 3 % times Wow at both ends, at
+/// 44.1, 48 and 96 kHz. At the default 0.3 the bottom of Rate reads up to
+/// 5.3 % over (0.948 % at 44.1 kHz), where Flutter's shared parts, which do
+/// not scale with Wow, happen to land on the cassette's own peak (0.912 %
+/// without them). 5.2.0's belt followed Rate, so at twice the parts' speed
+/// its drift moved twice as fast and bent the pitch twice as far: full Wow
+/// peaked at 3.2 % over two minutes there and 3.4 % over ten.
 const CASSETTE_HZ: [f64; 2] = [0.45, 1.5];
 const CASSETTE_SHARE: [f64; 2] = [0.55, 0.30];
 const CASSETTE_DEPTH: f64 = 0.035;
@@ -2444,10 +2452,12 @@ struct Transport {
     /// theirs, in samples.
     deep_travel: f64,
     deep_room: f64,
-    /// The belt's drift: its noise, its hold's countdown, the value it holds,
-    /// and its two poles with their coefficient at Rate's pace.
+    /// The belt's drift: its noise, its hold's countdown and length, the
+    /// value it holds, and its two poles with their coefficient, none of
+    /// them following Rate.
     belt_rng: u32,
     belt_hold: u32,
+    belt_frames: u32,
     belt_held: f64,
     belt_lp: [f64; 2],
     a_belt: f64,
@@ -2484,6 +2494,11 @@ impl Transport {
             let (s, c) = (std::f64::consts::TAU * t).sin_cos();
             [c, s]
         });
+        // The belt's two poles at 0.2 Hz: `1 - e^-w` by its series, `w` being
+        // under two ten-thousandths at any rate the tape can be built at, the
+        // series 5.2.0 ran on every design while the belt followed Rate, so
+        // at Rate 1x the belt drifts to the same bits it did.
+        let w = std::f64::consts::TAU * BELT_POLE_HZ / sr;
         let mut t = Self {
             sample_rate: sr,
             wow: Glide::new(1.0e-9),
@@ -2538,9 +2553,10 @@ impl Transport {
             deep_room: 0.0,
             belt_rng: BELT_SEED,
             belt_hold: 0,
+            belt_frames: (BELT_HOLD_S * sr) as u32,
             belt_held: 0.0,
             belt_lp: [0.0; 2],
-            a_belt: 0.0,
+            a_belt: w * (1.0 - w * (0.5 - w / 6.0)),
             deep: false,
             cassette: false,
             sway: 0.0,
@@ -2735,10 +2751,6 @@ impl Transport {
             self.cas_asked[j] = want[j];
             self.cas_given[j] = want[j] * keep[j];
         }
-        // The belt's two poles at 0.2 Hz times Rate: `1 - e^-w` by its
-        // series, `w` being a few ten-thousandths.
-        let w = std::f64::consts::TAU * BELT_POLE_HZ * r / sr;
-        self.a_belt = w * (1.0 - w * (0.5 - w / 6.0));
     }
 
     /// The depth wander's scales now, Wow's and Flutter's.
@@ -2861,8 +2873,7 @@ impl Transport {
         }
         if self.belt_hold == 0 {
             self.belt_held = f64::from(white(&mut self.belt_rng));
-            let r = self.rate.cur.exp2();
-            self.belt_hold = (BELT_HOLD_S * self.sample_rate / r).max(1.0) as u32;
+            self.belt_hold = self.belt_frames;
         }
         self.belt_hold -= 1;
         self.belt_lp[0] += (self.belt_held - self.belt_lp[0]) * self.a_belt;
@@ -7873,9 +7884,9 @@ mod tests {
     /// and 96 kHz, five seconds each, under the same two bars. The cassette
     /// stays on the deep head until that head has faded out, and starts
     /// from nothing when it fades back in. Measured at worst: 32.2 of the
-    /// studio head's 39.7 samples (15 ips, Rate at its bottom) and 645 of
-    /// the deep head's 970 (Rate at its bottom) at 44.1 kHz; thrown, 35.4 of
-    /// 43.2 and 430.5 of 2112 at 48 and 96 kHz.
+    /// studio head's 39.7 samples (15 ips, Rate at its bottom) and 719 of
+    /// the deep head's 970 (7.5 ips, Rate at its bottom) at 44.1 kHz;
+    /// thrown, 35.4 of 43.2 and 422.4 of 2112 at 48 and 96 kHz.
     #[test]
     fn the_play_head_never_runs_off_its_tape_at_any_setting() {
         let held = |unit: &Tape, what: &str| {
@@ -8064,8 +8075,9 @@ mod tests {
         // the deep head's own 3 % of slew; and the cassette's pack alone,
         // whose excursion is the largest any part carries, never bends the
         // pitch past 1.2 times its own depth, `CASSETTE_DEPTH` of Wow's
-        // dial times its share (model 1.11). Measured: 3.25 % against the
-        // settings' 2.87, and the pack 0.96 times its depth.
+        // dial times its share (model 1.11). Measured: 2.70 % against the
+        // settings' 2.82 (3.25 against 2.87 while the belt's drift followed
+        // Rate), and the pack 0.96 times its depth.
         let deep = |rate: f32| TapeParams {
             wobble: 1.0,
             rate,
@@ -8114,14 +8126,19 @@ mod tests {
     /// within 5 % of its own depth: its breathing may bend the pitch by at
     /// most a quarter of that depth, and does so across its turn, so it
     /// adds about 3 % at most, while the breathing still carries the pack
-    /// to the top of its depth (5.2.0's took it to 1.6 times). With Wow and
+    /// to the top of its depth (5.2.0's took it to 1.6 times). The swing
+    /// holds at Rate's ends too, half the parts' speed and twice it: at
+    /// Wow 1 and 0.5 it peaks within the same 5 % of 3 % times Wow, because
+    /// the belt's drift ignores Rate ([`CASSETTE_HZ`]); while the drift
+    /// followed Rate, twice the speed peaked 7 and 9 % over. With Wow and
     /// Flutter at 0 the deep head does not move at all. The cassette
     /// ignores the tape speed: its pack turns at 0.45 Hz within 5 % at
     /// 3.75 and at 30 ips. And nothing is ever held inside the line.
     /// Measured: peaks of 3.011, 1.508 and 0.911 %, 1.002, 0.500 and
     /// 0.301 % weighted, the face 1.4 to 1.6 % over the meter; the pack
-    /// alone 1.026 times its depth; the pack's line at 0.4485 Hz at both
-    /// speeds.
+    /// alone 1.026 times its depth; at Rate's ends 3.068 and 1.555 % at
+    /// half speed, 3.015 and 1.530 % at twice (3.216 and 1.630 % while the
+    /// drift followed Rate); the pack's line at 0.4485 Hz at both speeds.
     #[test]
     fn the_deep_range_swings_the_pitch_like_a_worn_cassette() {
         let sr = 44_100.0_f32;
@@ -8165,6 +8182,32 @@ mod tests {
                  reads {weighted:.4} %"
             );
             assert_eq!(unit.clamp_hits(), 0, "the deep head at Wow {wobble} was held inside the line");
+        }
+
+        // Rate's ends, a hand each: the four traces are independent.
+        let ends: Vec<(f32, f32)> = [0.0_f32, 1.0].into_iter().flat_map(|rate| [(rate, 1.0_f32), (rate, 0.5)]).collect();
+        let peaks: Vec<(f64, u64)> = std::thread::scope(|sc| {
+            let hands: Vec<_> = ends
+                .iter()
+                .map(|&(rate, wobble)| {
+                    sc.spawn(move || {
+                        let mut unit = Tape::new(sr);
+                        let sway = unit.transport_trace(&TapeParams { rate, ..deep(wobble) }, (sr * 120.0) as usize);
+                        (flutter_peak(&sway, srf, skip), unit.clamp_hits())
+                    })
+                })
+                .collect();
+            hands.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+        });
+        for (&(rate, wobble), &(peak, clamped)) in ends.iter().zip(&peaks) {
+            let ruled = 3.0 * f64::from(wobble);
+            let x = rate_multiplier(rate);
+            assert!(
+                (peak / ruled - 1.0).abs() <= 0.05,
+                "the deep head at Wow {wobble} and Rate {x:.1}x peaks at {peak:.3} %, not within 5 % of \
+                 the ruled {ruled:.2} %"
+            );
+            assert_eq!(clamped, 0, "the deep head at Wow {wobble} and Rate {x:.1}x was held inside the line");
         }
 
         let still = TapeParams {
