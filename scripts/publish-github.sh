@@ -12,7 +12,10 @@
 # The permalink https://github.com/<repo>/releases/latest/download/<name>
 # matches by EXACT asset name against whatever release is currently latest.
 # The Gumroad post-purchase page, the supporter-key email and README.md all
-# link through it, using the version-less names:
+# link through it, using the version-less names, and so do the supporter
+# emails sent before 3.0.0, for the Windows zip (docs/STORE-CONTENT.md writes
+# that link out so the list carries it). Today's list, which is
+# `scripts/check-store-links.sh --names`:
 #
 #   Tangent-macos.pkg             Tangent-windows-setup.exe
 #   Tangent-macos-universal.dmg   Tangent-macos-universal.zip
@@ -138,8 +141,11 @@ echo "==> Checksums: $SUMS"
 # against the latest stable release (`check-store-links.sh --names` reads all
 # three), so `Tangent-5.1.0-macos-universal.dmg` also goes up as
 # `Tangent-macos-universal.dmg` because a link names that, and the Linux
-# aarch64 tarball, the Windows zip and the FreeBSD files go up once, under
-# their versioned names, because nothing links them bare. 5.1.0 first
+# aarch64 tarball and the FreeBSD files go up once, under their versioned
+# names, because nothing links them bare. The Windows zip gets its bare copy:
+# the emails sent before 3.0.0 link it, and STORE-CONTENT.md writes that link
+# out in full so the list names it (named only in a table cell, it was not
+# listed, and 5.2.0 shipped without the copy). 5.1.0 first
 # carried a bare copy of every artifact and of the checksums, the FreeBSD
 # complete bundle's 489 MB among them, that no link reached. The checksums
 # go up once, as `SHA256SUMS`: the release they sit in is the version.

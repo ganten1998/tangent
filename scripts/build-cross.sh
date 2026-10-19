@@ -573,8 +573,9 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # **The zip is a DELIVERABLE again, as well as the installer's input.** It was
 # briefly demoted to a transient — deleted the moment setup.exe existed, on
 # the ruling that one Windows download is one thing to support — but the
-# versionless permalink derived from it, `tangent-windows-x86_64.zip`, is on
-# the store page and in the supporter emails sent before 3.0.0, and
+# versionless permalink derived from it, `tangent-windows-x86_64.zip`, is in
+# the supporter emails sent before 3.0.0 (docs/STORE-CONTENT.md writes it out
+# in full, so `check-store-links.sh --names` lists it), and
 # `publish-github.sh` can only upload an alias for a file that actually exists
 # in dist/. Deleting the zip here meant the FIRST stable publish would
 # silently drop that alias and every one of those links would 404 — for

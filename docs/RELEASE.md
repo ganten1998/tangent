@@ -199,7 +199,11 @@ Notes on the set:
   `tangent-windows-x86_64.zip` is the store content's Windows archive
   (`docs/STORE-CONTENT.md`) and is in supporter emails sent before the
   installers took over at 3.0.0, and `publish-github.sh` can only upload an
-  alias for a file that exists in `dist/`. If `makensis` is missing, only
+  alias for a file that exists in `dist/`. STORE-CONTENT.md writes that
+  link out in full, so `scripts/check-store-links.sh --names` lists the
+  name and `publish-github.sh` uploads the alias and refuses a stable
+  release without it; while the name stood only in that file's table, 5.2.0
+  went out without the alias and the link answered 404. If `makensis` is missing, only
   the zip is built and the run fails, saying no setup.exe was produced. The
   `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
   function name; it is not a deliverable, `publish-github.sh` does not
@@ -357,9 +361,13 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 9. **Publish**: `scripts/publish-github.sh --notes-file <notes>` (the
    `github` remote is the release channel; `DRY_RUN=1` to rehearse). It
    uploads every artifact under its version-scoped name, a version-less
-   alias only for the names a permanent link uses (`Tangent-macos.pkg`,
-   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...; the
-   list is `scripts/check-store-links.sh --names`), and one `SHA256SUMS`.
+   alias only for the names a permanent link uses (six today:
+   `Tangent-macos.pkg`, `Tangent-macos-universal.dmg`,
+   `Tangent-macos-universal.zip`, `Tangent-windows-setup.exe`,
+   `tangent-windows-x86_64.zip` and `tangent-linux-x86_64.tar.gz`; the list
+   is `scripts/check-store-links.sh --names`, which prints `SHA256SUMS` as
+   well), and one `SHA256SUMS`. With the whole set built, ten artifacts with
+   FreeBSD's three among them, that is seventeen assets.
    The pre-rename names and the arm64 names of the Mac build before 3.0.0
    are no longer uploaded, and old supporter emails that link them 404. The
    version-less aliases are what

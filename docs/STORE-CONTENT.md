@@ -31,13 +31,28 @@ for the README, and nothing anywhere reports it. See `docs/RELEASE.md` step 9.
 | macOS installer | `Tangent-macos.pkg` |
 | macOS archives | `Tangent-macos-universal.dmg`, `Tangent-macos-universal.zip` |
 | Windows installer | `Tangent-windows-setup.exe` |
-| Windows archive | `tangent-windows-x86_64.zip` |
+| Windows archive | `tangent-windows-x86_64.zip` (in the emails sent before 3.0.0; see below) |
 | Linux | `tangent-linux-x86_64.tar.gz` |
 | checksums | `SHA256SUMS` |
 
 `Tangent-macos-arm64.{dmg,zip}`, the names in the emails sent before 3.0.0,
 are no longer uploaded: those links 404, and a new page hands out the
 universal names above.
+
+**The Windows archive keeps its link.** The supporter-key emails sent before
+the installers took over at 3.0.0 hand out the portable zip by its
+version-less name, and that link is kept alive:
+
+https://github.com/ganten1998/tangent/releases/latest/download/tangent-windows-x86_64.zip
+
+It is written out in full here, outside any code fence, because
+`scripts/check-store-links.sh --names` lists only the names of full links,
+and `publish-github.sh` uploads a version-less copy for exactly those names
+and refuses a stable release without one. While the zip was named only in
+the table above it was never listed, so 5.2.0 went out without the copy and
+this link answered 404. The post-purchase page below sends a new buyer to
+the release page for the zip, so this line is the one place the link is
+written.
 
 **Links, not uploaded copies.** Gumroad can host the binaries itself, and that
 was the alternative. Links win because the buyer always gets the current
