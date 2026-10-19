@@ -16370,8 +16370,24 @@ impl Renderer {
         // return, a locate lands. A parked tape, or one not allowed to move,
         // keeps today's rule (this chunk held on the new place, stopped).
         let torn = req != first && level && ok && self.motor.moving();
+        // **A fresh renderer adopts the host's first word, not its own
+        // first chunk.** Until the host's first push the generation is 0
+        // (the host's counter starts at 1, `Transport::generation`) and the
+        // level is this engine's own, stopped. An engine rebuilt mid-song
+        // renders from inside the frame that built it and is pushed to only
+        // at that frame's end, so a pass or more nearly always came first:
+        // adopted, that level made the push's rise a Play, and a buffer or
+        // device change dipped and spun the tape up where with the setting
+        // off the song just resumed. A torn read is no word either: its
+        // generation can be new beside the level from before the push. So
+        // the motor is handed no chunk until a generation has arrived in a
+        // whole read, and until then the chunk is the transport as it
+        // always was.
+        let unspoken = self.motor.fresh() && (req == 0 || req != first);
         let word = if torn {
             crate::motor::Chunk { hold_start: false, coast: true, hold_seek: true }
+        } else if unspoken {
+            crate::motor::Chunk::default()
         } else {
             self.motor.chunk(level, ok, req != self.seen_req)
         };
@@ -52550,6 +52566,130 @@ mod tape_motor {
             armed.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits()),
             "a hard edge is not the unarmed desk's render"
         );
+    }
+
+    /// **An engine rebuilt mid-song rolls on from the host's first word, at
+    /// once and bit for bit.**
+    ///
+    /// A buffer or device change drops the engine and builds another while
+    /// the song plays (`start_engine`). The new one renders from inside the
+    /// frame that built it, and the host's first push reaches it only at
+    /// that frame's end (`after_frame`), so a pass or more nearly always
+    /// comes first, with no generation (the host's counter starts at 1) and
+    /// the engine's own level, stopped. A motor that adopted that level took
+    /// the push's rise for Play and dipped and spun the tape up, 96 passes
+    /// off speed at the 0.5 s start, where with the setting off the song
+    /// just resumes. So it adopts the host's first word, read whole: 0 to 3
+    /// passes before the first push of a playing transport, the push landing
+    /// whole before a pass or inside its first chunk's read (after the
+    /// read's first load, or after its level's: a torn read, its generation
+    /// new beside the old level, which holds that chunk on its place as
+    /// every torn read does and leaves the word to the next), in passes of
+    /// one chunk and of two, then a push a pass. The unarmed desk rolls from
+    /// the host's place in the first chunk that reads the push whole; the
+    /// armed one is its render sample for sample, its motor at rest and then
+    /// at speed, from the pass after that chunk's at the latest, and never
+    /// anything else.
+    #[test]
+    fn an_engine_rebuilt_mid_song_rolls_on_from_the_hosts_first_word() {
+        use crate::instrument::{meet_transport_loads_for_test, TransportStores};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        #[derive(Clone, Copy, Debug)]
+        enum Meet {
+            /// Both stores before the pass.
+            Whole,
+            /// Both stores landing after the first chunk's `n`th load.
+            Inside(u32),
+        }
+        // The rebuild: the song playing from one second on the engine the
+        // change drops, then a fresh desk rendering `before` passes of
+        // `frames` before the first push, that push met at `meet`, and a push
+        // a pass after it. With where the host had the song.
+        let rebuilt = |armed: bool, before: usize, meet: Meet, frames: usize| {
+            let mut old = tone_desk(RATE, 500.0, 4.0);
+            let mut t = Transport::new();
+            t.locate(1.0);
+            t.toggle_play();
+            run(&mut old, &mut t, 40, PASS);
+            drop(old);
+            let mut e = tone_desk(RATE, 500.0, 4.0);
+            // `start_engine`'s own `push_monitor_settings`, right after the
+            // engine is seated.
+            if armed {
+                e.set_tape_motor(true, 0.5, 0.7);
+            }
+            let render = |e: &mut Engine| {
+                let mut out = vec![0.0f32; frames * 2];
+                e.render_offline(&mut out);
+                Pass { out, show: e.motor_show(), pos: e.transport_position() }
+            };
+            let mut passes: Vec<Pass> = (0..before).map(|_| render(&mut e)).collect();
+            // The first push's stores, in its own order for a playing
+            // transport on an engine that has applied nothing: the locate,
+            // then the level (`Transport::stores`).
+            let host = (t.position_s(None, 0.0) * f64::from(RATE)) as u64;
+            match meet {
+                Meet::Whole => {
+                    t.push(Some(&e));
+                    passes.push(render(&mut e));
+                }
+                Meet::Inside(n) => {
+                    let generation = t.generation();
+                    let fired = Rc::new(Cell::new(false));
+                    let landed = Rc::clone(&fired);
+                    meet_transport_loads_for_test(Some(Box::new(move |loads: u32, stores: &TransportStores<'_>| {
+                        if loads == n && !landed.get() {
+                            landed.set(true);
+                            stores.set_transport(generation, host);
+                            stores.set_rolling(true);
+                        }
+                    })));
+                    passes.push(render(&mut e));
+                    meet_transport_loads_for_test(None);
+                    assert!(fired.get(), "the push never met the first chunk's read at {meet:?}");
+                }
+            }
+            for _ in 0..40 {
+                t.push(Some(&e));
+                passes.push(render(&mut e));
+            }
+            (passes, host)
+        };
+        let mut moved = Vec::new();
+        for frames in [PASS, 4 * PASS] {
+            // What a torn first chunk holds on the host's place.
+            let chunk = frames.min(MAX_BLOCK as usize);
+            for before in 0..=3 {
+                for meet in [Meet::Whole, Meet::Inside(1), Meet::Inside(2)] {
+                    let what = format!("{before} passes before the first push, met {meet:?}, passes of {frames}");
+                    let (plain, host) = rebuilt(false, before, meet, frames);
+                    let (armed, _) = rebuilt(true, before, meet, frames);
+                    // The rebuild as the setting off has it: parked at 0:00
+                    // until the push, then rolling from the host's place in
+                    // the first chunk that reads the push whole.
+                    let held = if matches!(meet, Meet::Whole) { 0 } else { chunk };
+                    assert!(plain[..before].iter().all(|p| p.pos == 0), "{what}: the unarmed desk rolled before the push");
+                    assert_eq!(plain[before].pos, host + (frames - held) as u64, "{what}: the unarmed desk did not roll from the host's place");
+                    assert_eq!(plain[before + 1].pos, plain[before].pos + frames as u64, "{what}: the unarmed desk did not roll on");
+                    assert!(peak(&tape(&plain[before + 1..])) > 0.1, "{what}: the desk was silent, so nothing was proved");
+                    // At rest, then at speed from the pass after the one
+                    // whose chunk first reads the push whole at the latest,
+                    // and nothing else; and the unarmed desk's render.
+                    let word = before + usize::from(held == frames);
+                    let shows: Vec<MotorShow> = armed.iter().map(|p| p.show).collect();
+                    let ran = shows.iter().position(|s| *s != MotorShow::Parked).unwrap_or(shows.len());
+                    let same = armed
+                        .iter()
+                        .zip(&plain)
+                        .all(|(a, b)| a.pos == b.pos && a.out.iter().zip(&b.out).all(|(x, y)| x.to_bits() == y.to_bits()));
+                    if ran > word + 1 || shows[ran..].iter().any(|s| *s != MotorShow::Running) || !same {
+                        moved.push(format!("{what}: shows {:?}, the unarmed render {same}", &shows[..(word + 8).min(shows.len())]));
+                    }
+                }
+            }
+        }
+        assert!(moved.is_empty(), "the tape moved for a rebuild:\n{}", moved.join("\n"));
     }
 
     /// **A realtime export pressed while the tape is heard moving starts at

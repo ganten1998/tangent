@@ -726,7 +726,8 @@ pub(crate) struct Motor {
     mode: Mode,
     /// The host level the mode stands for: up in Dip, SpinUp, Running and
     /// Cut(Start); down in Parked, WindDown and Cut(Park). `None` until the
-    /// first chunk: a fresh renderer ADOPTS the first level it reads.
+    /// host's first word: a fresh renderer ADOPTS the level of the first
+    /// chunk it is handed (`Motor::fresh`).
     acted: Option<bool>,
     /// An edge `chunk` saw that the next `plan` acts on.
     pending: Option<Edge>,
@@ -1050,9 +1051,11 @@ impl Motor {
     /// this returns `Chunk::default()`: today's transport, exactly.
     pub(crate) fn chunk(&mut self, level: bool, ok: bool, seek_pending: bool) -> Chunk {
         let Some(acted) = self.acted else {
-            // A fresh renderer adopts the first level it reads, with no
-            // edge: an engine rebuilt mid-song rolls at once and never spins
-            // up because of a rebuild.
+            // A fresh renderer adopts the host's first word, with no edge:
+            // an engine rebuilt mid-song rolls at once and never spins up
+            // because of a rebuild. The transport hands it no chunk before
+            // that word has come (`Motor::fresh`), so the level adopted is
+            // the host's and never the engine's own.
             self.acted = Some(level);
             if level {
                 self.mode = Mode::Running;
@@ -1125,6 +1128,16 @@ impl Motor {
     /// to the next, which reads the two whole (`Renderer::run_transport`).
     pub(crate) fn moving(&self) -> bool {
         matches!(self.mode, Mode::Running | Mode::SpinUp)
+    }
+
+    /// **No level read yet**: a fresh renderer's motor, until the host's
+    /// first word reaches it. Until then a fresh engine's level is its own,
+    /// stopped, and no word of the host's, so `Renderer::run_transport`
+    /// hands such a motor no chunk until a generation has arrived in a read
+    /// the host's stores did not tear: the level it adopts is the one the
+    /// host sent with its first locate.
+    pub(crate) fn fresh(&self) -> bool {
+        self.acted.is_none()
     }
 
     /// **A seek was applied**: the transport calls this whenever it applies
