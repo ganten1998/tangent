@@ -10589,15 +10589,30 @@ fn host_transport(shared: &Shared, pos: u64) -> tangent_host::Transport {
 /// entering at a later bay pours in, over a sidechain key, and over every
 /// hosted plugin's block before anything reads it.
 ///
+/// **And the interface's input where it enters the desk**, because not all
+/// of it reaches a rack: `mix_monitor` runs [`scrub_samples`] over every
+/// frame it reads from the input ring, before the hardware inserts' returns,
+/// the IR tap, the tees, the mix and the sends, and the hub keeps only
+/// finite samples in its return rings (`HwHub::feed`), the frames the
+/// monitor drops as stale included.
+///
 /// Allocation-free and branch-free: a compare and a select a sample, which
 /// the compiler vectorises.
 #[inline]
 fn scrub_non_finite(bufs: &mut [Vec<f32>], frames: usize) {
     for b in bufs {
         let n = frames.min(b.len());
-        for x in &mut b[..n] {
-            *x = if x.is_finite() { *x } else { 0.0 };
-        }
+        scrub_samples(&mut b[..n]);
+    }
+}
+
+/// **Every sample of `xs` made finite**, [`scrub_non_finite`]'s select over
+/// one run of samples: one channel of a rack's block, or the interleaved
+/// frames an interface delivered (`mix_monitor`).
+#[inline]
+fn scrub_samples(xs: &mut [f32]) {
+    for x in xs {
+        *x = if x.is_finite() { *x } else { 0.0 };
     }
 }
 
@@ -10775,6 +10790,14 @@ fn run_rack(
     // effects bus's (`run_insert_chain`, which runs only a filled one). A
     // frozen rack runs no unit and has stood down above; a refused or
     // bypassed bay leaves what it was handed, which is finite by now.
+    //
+    // **Not every unit stands in a rack.** The effects bus's own reverb,
+    // echo, chorus and phaser and the master's own filters and limiter
+    // (`effects::Effects`) are behind no door of this kind. What reaches
+    // them is finite because each way a non-finite sample comes into the
+    // desk is closed where it comes in: a file as it is decoded, the
+    // interface's input as it is read (`mix_monitor`, `scrub_samples`), and
+    // a hosted plugin's block, below.
     scrub_non_finite(planar, frames);
     // What the dry row has already paid, once a voice has written it - see
     // the `dry` parameter. `None` while nothing has.
@@ -11009,7 +11032,12 @@ fn run_rack(
         // plugin that writes one NaN hands it to every IIR unit after it
         // otherwise, which keep it for good. Our own units are not scrubbed
         // here: each makes a finite block of a finite one, and the door at
-        // the head of this function saw to that.
+        // the head of this function saw to that. The one built-in that plays
+        // a signal from outside the desk, the hardware insert, plays the
+        // interface's return, which is finite before it reaches the bay: the
+        // input is made finite as `mix_monitor` reads it, and the hub keeps
+        // only finite samples in its return rings (`HwHub::feed`), the frames
+        // the monitor drops as stale included.
         if !matches!(p.backend, Backend::Builtin(_)) {
             if p.voice {
                 scrub_non_finite(&mut p.bufs, frames);
@@ -15122,6 +15150,18 @@ impl Renderer {
                 Err(_) => 0,
             }
         };
+        // **The interface's frames are made finite where they enter the
+        // desk** (`scrub_samples`), before the hardware inserts, the IR tap,
+        // the stretch, the tees and the walk below read any of them. A
+        // driver can deliver a NaN or an infinity, and not every road an
+        // input takes is behind a rack's door (`run_rack`): with the room not
+        // running the lane's chain (monitoring off on a lane with audio of
+        // its own, or an input on a folder), the raw frame went into the mix,
+        // the room's subtrahend and the sends, and one NaN that reached the
+        // effects bus's reverb stayed in its tank for good, and so in all the
+        // speakers played after it; and a hardware insert played it to the
+        // unit after it. A finite frame is left exactly as it was.
+        scrub_samples(&mut self.monitor_scratch[..got]);
         // **The hardware inserts' returns**, raw device frames like the IR
         // tap below, before any fader or pick binding touches them.
         self.shared.hw.feed(&self.monitor_scratch[..got], &[], ch_in);
@@ -47677,6 +47717,80 @@ mod slot_engine {
                 }
             }
         }
+
+        /// **A bad sample from the interface is silence on the roads that
+        /// run no chain over it too, and the effects bus's reverb plays
+        /// on.** The room runs a lane's chain over its input only while it
+        /// holds that chain, and it holds none for a lane with audio of its
+        /// own while monitoring is off (the shipped default; the timeline
+        /// takes the chain) and never a folder's (the fold runs it). On those
+        /// roads the raw frame went into the mix, the room's subtrahend and
+        /// the sends, where a NaN times a send of zero is a NaN, and the
+        /// effects bus's built-in reverb kept it in its tank for good: on
+        /// either road 38,832 of the 49,152 samples the speakers played were
+        /// non-finite, every one of the last quarter. Lane 3 armed with an
+        /// input, monitoring off, the bus's reverb at full and the clip's
+        /// lane sending into it: once with the noise clip on lane 3, once
+        /// with lane 3 a folder over lane 4, which holds the clip. One bad
+        /// sample at frame 5,000 of a 440 Hz input at half: the speakers stay
+        /// finite to the last sample, and their last quarter is within half
+        /// a decibel of the same desk with the input clean.
+        #[test]
+        fn a_bad_sample_from_the_interface_leaves_the_reverb_playing_where_no_chain_runs_over_it() {
+            const LANE: usize = 3;
+            #[derive(Clone, Copy, Debug)]
+            enum Road {
+                /// A lane with a clip of its own, unmonitored.
+                Clip,
+                /// An input on a folder.
+                Folder,
+            }
+            let render = |road: Road, bad: Option<f32>| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[]);
+                inputs.lanes[LANE].flags = F::ARMED | F::MIDI_OFF;
+                let holder = match road {
+                    Road::Clip => LANE,
+                    Road::Folder => {
+                        inputs.lanes[LANE + 1].parent = Some(Slot(LANE as u32));
+                        LANE + 1
+                    }
+                };
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_lane_levels(Slot(holder as u32), 1.0, 0.0, 0.5);
+                e.shared.reverb_mix.store(1.0f32.to_bits(), Ordering::Relaxed);
+                let mut tx = plug(&mut e, LANE);
+                e.set_monitor_on(false);
+                e.set_clips_slotted(vec![clip_at(&e, holder, 0x51)]);
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let mut room = Vec::new();
+                let mut n = 0usize;
+                for _ in 0..48 {
+                    for _ in 0..BLOCK {
+                        let x = (n as f32 * std::f32::consts::TAU * 440.0 / 48_000.0).sin() * 0.5;
+                        let _ = tx.push(match bad {
+                            Some(b) if n == 5_000 => b,
+                            _ => x,
+                        });
+                        n += 1;
+                    }
+                    e.render_offline(&mut out);
+                    room.extend_from_slice(&out);
+                }
+                room
+            };
+            for road in [Road::Clip, Road::Folder] {
+                let clean = render(road, None);
+                assert!(rms(&clean[clean.len() * 3 / 4..]) > 0.01, "{road:?}: the speakers played nothing, so nothing is proved");
+                for bad in BAD {
+                    let (at, db) = against(&render(road, Some(bad)), &clean);
+                    assert_eq!(at, None, "{road:?}: an input's {bad} left the speakers non-finite from sample {at:?}");
+                    assert!(db.abs() < 0.5, "{road:?}: an input's {bad} left the speakers {db:.2} dB off: the reverb stopped playing");
+                }
+            }
+        }
     }
 
     // ── a lane past slot 31 is every bit a lane (W7-slot-gaps) ──────────
@@ -51450,6 +51564,13 @@ mod hw_insert_road {
         out: Vec<f32>,
         /// Every rendered device frame, all six channels.
         tape: Vec<f32>,
+        /// Input frames delivered so far.
+        delivered: usize,
+        /// The input frame, counted as `delivered` counts, whose return
+        /// arrives spoiled on its left jack (input 5), and what it carries
+        /// there instead: a driver's NaN or infinity. `None` for a clean
+        /// cable.
+        spoil: Option<(usize, f32)>,
     }
 
     impl Rig {
@@ -51484,6 +51605,8 @@ mod hw_insert_road {
                 cable: std::iter::repeat_n([0.0; 2], cable).collect(),
                 out: vec![0.0; BLOCK * WIDE],
                 tape: Vec::new(),
+                delivered: 0,
+                spoil: None,
             }
         }
 
@@ -51494,6 +51617,11 @@ mod hw_insert_road {
             for f in 0..BLOCK {
                 self.cable.push_back([self.out[f * WIDE + 2], self.out[f * WIDE + 3]]);
                 let [l, r] = self.cable.pop_front().unwrap_or_default();
+                let l = match self.spoil {
+                    Some((at, bad)) if at == self.delivered => bad,
+                    _ => l,
+                };
+                self.delivered += 1;
                 for c in 0..WIDE {
                     let v = match c {
                         4 => l,
@@ -52075,6 +52203,65 @@ mod hw_insert_road {
         let again = rig.live(MASTER_SEAT);
         assert!(again.measured && again.connected);
         assert_eq!(again.latency, live.latency);
+    }
+
+    /// **A bad sample on the hardware return is silence, and the Tape
+    /// after the insert plays on.** The master's rack holds the insert in
+    /// bay 0, fully wet round a fifty-frame cable, and a Tape in bay 1; a
+    /// 1 kHz tone on lane 5 goes round the loop. One frame of the return's
+    /// left jack (input 5) arrives on the engine's own input ring as a
+    /// NaN, an infinity or a negative infinity: the main outs stay finite
+    /// to their last frame, and their last quarter is within half a decibel
+    /// of the same desk with the cable clean, so the Tape is still playing
+    /// the loop. A Tape is an IIR machine and nothing stands between the
+    /// insert and it, since a rack makes finite only what enters it and
+    /// what a hosted plugin writes: one bad frame of the return left the
+    /// left main out non-finite on every frame after it, 14,954 of 16,384.
+    /// It is made finite as the monitor reads the input (`mix_monitor`),
+    /// and the hub keeps its return rings finite whoever feeds them
+    /// (`HwHub::feed`).
+    #[test]
+    fn one_bad_sample_on_the_hardware_return_leaves_the_tape_after_the_insert_playing() {
+        let render = |bad: Option<f32>| -> Vec<f32> {
+            let mut rig = Rig::new(50, MASTER_SEAT, Jacks::pair(2), Jacks::pair(4), 1.0);
+            rig.e
+                .load_insert(MASTER_SEAT, 1, Some(Path::new(crate::builtin_fx::TAPE_PATH)), None)
+                .expect("the tape loads")
+                .expect("and seats");
+            let samples: Vec<f32> = (0..96_000)
+                .flat_map(|i| {
+                    let x = ((i as f64) * std::f64::consts::TAU * 1_000.0 / 48_000.0).sin() as f32 * 0.25;
+                    [x, x]
+                })
+                .collect();
+            let clip = Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::from("tone.wav") });
+            rig.e.set_clips(vec![Placed { clip, strip: 5, start: 0, offset: 0, len: 96_000, fade_in: 0, fade_out: 0, gain: 1.0 }]);
+            rig.e.set_channel_gain(5, 1.0);
+            for _ in 0..8 {
+                rig.block();
+            }
+            assert!(rig.live(MASTER_SEAT).connected, "the loop is not up, so nothing is proved");
+            rig.e.set_transport(1, 0);
+            rig.e.set_rolling(true);
+            // Frame 100 of the third block the return delivers once rolling.
+            rig.spoil = bad.map(|x| (rig.delivered + 2 * BLOCK + 100, x));
+            let from = rig.tape.len();
+            for _ in 0..64 {
+                rig.block();
+            }
+            rig.tape[from..].chunks_exact(WIDE).flat_map(|f| [f[0], f[1]]).collect()
+        };
+        let rms = |v: &[f32]| (v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>() / v.len().max(1) as f64).sqrt();
+        let tail = |v: &[f32]| rms(&v[v.len() * 3 / 4..]);
+        let clean = render(None);
+        assert!(tail(&clean) > 0.05, "the loop brought nothing back, so nothing is proved");
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let hurt = render(Some(bad));
+            let at = hurt.iter().position(|v| !v.is_finite());
+            assert_eq!(at, None, "a {bad} on the return left the main outs non-finite from sample {at:?}");
+            let db = 20.0 * (tail(&hurt) / tail(&clean)).log10();
+            assert!(db.abs() < 0.5, "a {bad} on the return left the main outs {db:.2} dB off: the Tape stopped playing");
+        }
     }
 }
 

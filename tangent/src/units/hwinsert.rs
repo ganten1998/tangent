@@ -1159,10 +1159,28 @@ impl HwHub {
     /// The input ring hands its frames over as two slices (the part before
     /// its end and the part after it wraps) and a frame may straddle them,
     /// so the two are read as one run.
+    ///
+    /// **Only finite samples are kept**: a NaN or an infinity is kept as
+    /// silence, and every finite sample as it came. The return is the one
+    /// signal a built-in plays from outside the desk, and the unit after the
+    /// insert is as likely as not an IIR one, which keeps a non-finite
+    /// sample in its state for good; nothing stands between the two, since a
+    /// rack makes finite what enters it and what a hosted plugin writes, not
+    /// what a built-in does (`instrument::scrub_non_finite`). The monitor
+    /// makes its own read finite before it hands it here, but the frames it
+    /// drops as stale come straight from the input ring, and the ping
+    /// listens to the same ring, so the hub keeps its rings finite itself.
     pub fn feed(&self, a: &[f32], b: &[f32], ch_in: usize) {
         let ch_in = ch_in.max(1);
         let count = (a.len() + b.len()) / ch_in;
-        let at_sample = |i: usize| if i < a.len() { a[i] } else { b.get(i - a.len()).copied().unwrap_or(0.0) };
+        let at_sample = |i: usize| {
+            let x = if i < a.len() { a[i] } else { b.get(i - a.len()).copied().unwrap_or(0.0) };
+            if x.is_finite() {
+                x
+            } else {
+                0.0
+            }
+        };
         if count == 0 {
             return;
         }
@@ -3449,5 +3467,49 @@ mod tests {
         // The ping ran its course inside the window (it heard nothing, since
         // nothing was fed back, and said so).
         assert!(!dev.hub.port_for(7).unwrap().pinging());
+    }
+
+    /// **A bad sample on the return is silence there, and never leaves the
+    /// bay.** A steady 0.25 round a wire, fully wet, and one frame of the
+    /// return's left jack delivered as a NaN, an infinity or a negative
+    /// infinity: every sample the bay plays after it is finite, the frame
+    /// that carried it plays as silence on its side alone, and every other
+    /// frame on both sides is the 0.25 it was. The unit after an insert is
+    /// as likely as not an IIR one, which keeps a non-finite sample in its
+    /// state for good, and a rack makes finite only what enters it and what
+    /// a hosted plugin writes. The monitor makes its own read finite before
+    /// it hands it over, but the frames it drops as stale reach `feed`
+    /// straight from the input ring, as this device's reads do, so the
+    /// hub's own write is what holds it.
+    #[test]
+    fn a_bad_sample_on_the_return_is_silence_and_never_leaves_the_bay() {
+        let block = 128;
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut dev = FakeDevice::new(4, 4, block, 20);
+            dev.patch = vec![(2, 2, 1.0), (3, 3, 1.0)];
+            let mut u = seated(&dev, Jacks::pair(2), Jacks::pair(2));
+            let input = vec![vec![0.25f32; block]; 2];
+            let mut out = vec![vec![0.0f32; block]; 2];
+            for _ in 0..40 {
+                dev.block(&mut u, &input, &mut out);
+            }
+            assert!(out.iter().flatten().all(|v| (v - 0.25).abs() < 1e-4), "the loop is not a steady wire, so nothing is proved");
+            // Frame 37 of what the input has delivered and the monitor has
+            // not read yet, on the return's left jack (input 3).
+            assert!(dev.pending.len() >= 38 * 4, "nothing is waiting to be read");
+            dev.pending[37 * 4 + 2] = bad;
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            for _ in 0..40 {
+                dev.block(&mut u, &input, &mut out);
+                left.extend_from_slice(&out[0]);
+                right.extend_from_slice(&out[1]);
+            }
+            let broken = left.iter().chain(&right).filter(|v| !v.is_finite()).count();
+            assert_eq!(broken, 0, "a {bad} on the return left the bay {broken} non-finite samples");
+            let off: Vec<usize> = (0..left.len()).filter(|&f| (left[f] - 0.25).abs() > 1e-4).collect();
+            assert_eq!(off.len(), 1, "a {bad} on the return moved {} frames of the left side, not one", off.len());
+            assert_eq!(left[off[0]], 0.0, "a {bad} on the return played as {}, not silence", left[off[0]]);
+            assert!(right.iter().all(|v| (v - 0.25).abs() < 1e-4), "a {bad} on the left jack reached the right side");
+        }
     }
 }
