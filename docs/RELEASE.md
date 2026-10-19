@@ -203,12 +203,12 @@ Notes on the set:
   link out in full, so `scripts/check-store-links.sh --names` lists the
   name and `publish-github.sh` uploads the alias and refuses a stable
   release without it; while the name stood only in that file's table, 5.2.0
-  went out without the alias and the link answered 404. If `makensis` is missing, only
-  the zip is built and the run fails, saying no setup.exe was produced. The
-  `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
-  function name; it is not a deliverable, `publish-github.sh` does not
-  upload it, and `release.sh` leaves it out of `SHA256SUMS` (a summed file
-  nobody can download fails every user's `shasum -c`).
+  went out without the alias and the link answered 404. If `makensis` is
+  missing, only the zip is built and the run fails, saying no setup.exe was
+  produced. The `tangent-<v>-windows-x86_64.pdb` beside it turns a crash
+  offset into a function name; it is not a deliverable, `publish-github.sh`
+  does not upload it, and `release.sh` leaves it out of `SHA256SUMS` (a
+  summed file nobody can download fails every user's `shasum -c`).
 - **The VST3 plugin is retired** (2026-08-24, the owner's ruling). No
   installer may carry a `Tangent.vst3`; `release.sh` fails any that does.
 - **FreeBSD ships.** `scripts/release.sh` on a FreeBSD host runs
