@@ -147,6 +147,14 @@ pub struct TapeParams {
     /// and raises the modulation noise; over-bias dulls the top. See
     /// [`bias_shelf_db`] and [`UNDER_BIAS_UM`].
     pub bias: f32,
+    /// **Age**: an old tape on a worn head. The head-to-tape spacing grows
+    /// ([`AGE_SPACING_UM`]), so the treble goes first and fastest on slow
+    /// tape; the head's gap skews against the tracks ([`AZIMUTH_URAD`]),
+    /// pulling the two apart in time; the worn head records as if
+    /// over-biased; a magnetised head adds a second harmonic
+    /// ([`MAGNETISED_H2`]); and the hiss and the modulation noise rise. 0 is
+    /// new tape on new heads, and a fresh tape opens there.
+    pub age: f32,
 }
 
 impl Default for TapeParams {
@@ -180,6 +188,8 @@ impl Default for TapeParams {
             // Aligned: the recommended over-bias, where the datasheets
             // quote the tape.
             bias: 0.5,
+            // New tape on new heads.
+            age: 0.0,
         }
     }
 }
@@ -188,9 +198,9 @@ impl Default for TapeParams {
 impl TapeParams {
     /// Every colour off: the record level at the bottom of its travel, no
     /// bump, no roll, a parked head (no wow, no flutter), silent tape, unity
-    /// trim, at the studio speed and the parts' own rate, the bias aligned.
-    /// The recipe the neutrality tests here and at the seat spell out, in
-    /// one place.
+    /// trim, at the studio speed and the parts' own rate, the bias aligned,
+    /// new tape. The recipe the neutrality tests here and at the seat spell
+    /// out, in one place.
     pub(crate) const NEUTRAL: TapeParams = TapeParams {
         drive: 0.0,
         bump: 0.0,
@@ -203,6 +213,7 @@ impl TapeParams {
         rate: 0.5,
         wow_range: WowRange::Studio.dial(),
         bias: 0.5,
+        age: 0.0,
     };
 }
 
@@ -1018,25 +1029,126 @@ const JITTER_HZ_15: f64 = 500.0;
 
 /// **The modulation noise's depth the dials ask for**, in micrometres RMS:
 /// [`JITTER_UM`] on the hiss's squared taper, raised
-/// [`UNDER_BIAS_JITTER_DB`] for every dB of under-bias, and never past
-/// [`JITTER_CAP_UM`]. The kernel's glide aims here, and so does the figure a
-/// face prints, so the two plan the head's reserve alike.
+/// [`UNDER_BIAS_JITTER_DB`] for every dB of under-bias and by an old tape's
+/// coarser grain ([`AGE_JITTER`]), and never past [`JITTER_CAP_UM`]. The
+/// kernel's glide aims here, and so does the figure a face prints, so the
+/// two plan the head's reserve alike.
 fn jitter_um(p: &TapeParams) -> f64 {
     let taper = f64::from(norm(p.hiss) / 0.25).powi(2);
     let under = (-bias_db(p)).max(0.0);
-    (JITTER_UM * taper * 10.0_f64.powf(UNDER_BIAS_JITTER_DB * under / 20.0)).min(JITTER_CAP_UM)
+    let age = 1.0 + AGE_JITTER * f64::from(norm_or(p.age, 0.0));
+    (JITTER_UM * taper * 10.0_f64.powf(UNDER_BIAS_JITTER_DB * under / 20.0) * age).min(JITTER_CAP_UM)
 }
 
 /// **What the head keeps in reserve for each track's own movement**, in
-/// samples at `sr`, for modulation noise of `noise_um` µm RMS on tape
-/// running at `v` ips: four of its sigma, which it never reaches, and a
-/// sample. The governor shares the head's travel only after this, so a
-/// track's noise can never carry its head off the line. The one place the
-/// reserve is worked out: the kernel's governor and the figure a face
-/// prints both read it.
-fn reserve(noise_um: f64, v: f64, sr: f64) -> f64 {
-    4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0
+/// samples at `sr`, on tape running at `v` ips: the skew an aged head's
+/// azimuth puts between the tracks at its widest, half of it each way
+/// ([`skew_samples`] at the Age `age`), four sigma of modulation noise of
+/// `noise_um` µm RMS, which it never reaches, and a sample. The governor
+/// shares the head's travel only after this, so a track's own movement can
+/// never carry its head off the line. The one place the reserve is worked
+/// out: the kernel's governor and the figure a face prints both read it.
+fn reserve(noise_um: f64, age: f64, v: f64, sr: f64) -> f64 {
+    skew_samples(AZIMUTH_URAD.0 + AZIMUTH_URAD.1, age, v, sr) + 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0
 }
+
+// ── what the years do ───────────────────────────────────────────────────────
+
+/// **How far an old tape rides off a worn head, in micrometres, at full
+/// Age.** Wallace's spacing law: a gap of `d` between the head and the
+/// oxide costs `54.575 d / wavelength` dB, so it is a treble loss that falls
+/// hardest on the short wavelengths of slow tape: at full Age 10 kHz loses
+/// about 21 dB at 3.75 ips, 11 at 7.5, 5 at 15 and 2.5 at 30, against new
+/// tape. 3 µm is ten times the most a studio will tolerate and inside the
+/// 1 to 20 µm the published wear and debris events reach. The filter is
+/// [`SPACING_FIT`]'s.
+const AGE_SPACING_UM: f64 = 3.0;
+
+/// **Wallace's loss as three one-poles**: `(1 - k HP1(a f0)) LP1(b f0)^2`,
+/// `(k, a, b)` here, for `f0 = v / (54.575 d)` (the frequency whose
+/// wavelength is 54.575 times the spacing, where the law has lost 1 dB).
+/// Within 0.8 dB of the law down to 10 dB of loss and 1.1 dB down to 20,
+/// each one-pole matched at 10 kHz ([`matched_b`]).
+const SPACING_FIT: (f64, f64, f64) = (0.1328, 0.5046, 7.057);
+const WALLACE_DB: f64 = 54.575;
+
+/// The spacing filter's table: matched one-pole coefficients for corners
+/// from this many hertz up, [`SPACING_PER_OCTAVE`] to the octave, over
+/// [`SPACING_POINTS`] entries, the last 16.8 MHz, past which a one-pole is
+/// a wire to a ten-millionth. Every spacing reads its corners here, so no
+/// filter is designed on the audio thread.
+const SPACING_LOW_HZ: f64 = 16.0;
+const SPACING_PER_OCTAVE: f64 = 16.0;
+const SPACING_POINTS: usize = 321;
+
+/// How often the head's spacing and the tracks' skew are worked out again,
+/// in frames, between which both move in a straight line: often enough to
+/// follow a dropout's few milliseconds, seldom enough to cost nothing.
+const WEAR_STEP: u64 = 4;
+
+/// **An aged head's azimuth, in microradians at full Age**: the gap's
+/// standing error and how far it wanders either way of that, once every
+/// [`AZIMUTH_WANDER_M`] of tape.
+///
+/// A head's gap is never quite square to the tape, and an old tape is
+/// never slit quite straight: standing errors are arcminutes, and a
+/// slitting's wander is up to 1000 µrad peak to peak every 300 mm. Across
+/// [`AZIMUTH_SPAN_MM`] of tape, an angle `theta` puts the two tracks
+/// `span tan(theta) / v` apart in time: at full Age on 3.75 ips tape, 42 µs
+/// at the standing 1000 µrad, swinging from 21 to 63 µs with the wander,
+/// half of it each way of the head. The same angle costs each track its
+/// own treble, as `|sin x / x|` across its width ([`TRACK_MM`]), which is
+/// folded into the spacing as the gap that costs the same at 10 kHz. At
+/// Age 0 the angle is exactly zero, and the two tracks bit for bit alike.
+const AZIMUTH_URAD: (f64, f64) = (1_000.0, 500.0);
+const AZIMUTH_WANDER_M: f64 = 0.300;
+const AZIMUTH_SPAN_MM: f64 = 4.0;
+const TRACK_MM: f64 = 2.0;
+
+/// The spacing that costs what an azimuth angle `theta` costs at 10 kHz, in
+/// metres, on tape at `v_m` metres a second: `1.448 pi^2 w^2 theta^2 10 kHz
+/// / (54.575 v_m)` for the track's width `w`, the `|sin x / x|` loss's
+/// small-angle form matched at 10 kHz. 0.110 µm at 1000 µrad on 3.75 ips
+/// tape, where the true loss at 10 kHz is 0.64 dB; at the wander's
+/// 1500 µrad 1.47 dB. Linear in frequency where the true loss is
+/// quadratic, which only the top octave hears.
+fn azimuth_gap(theta: f64, v_m: f64) -> f64 {
+    let w = TRACK_MM * 1.0e-3;
+    1.448 * std::f64::consts::PI.powi(2) * w * w * theta * theta * 1.0e4 / (WALLACE_DB * v_m)
+}
+
+/// **What a skewed head puts between the tracks**, as each track's share of
+/// it in samples at `sr`, at an angle of `urad` microradians at full Age,
+/// at the Age `age`, on tape at `v` ips: half the gap across
+/// [`AZIMUTH_SPAN_MM`] in time.
+fn skew_samples(urad: f64, age: f64, v: f64, sr: f64) -> f64 {
+    0.5 * AZIMUTH_SPAN_MM * 1.0e-3 * (urad * 1.0e-6 * age).tan() / (0.0254 * v) * sr
+}
+
+/// The worn record head's over-bias at full Age, in dB, on the bias's
+/// treble shelf alone: a worn head writes as if biased hotter.
+const AGE_OVERBIAS_DB: f64 = 1.5;
+
+/// **A magnetised head's second harmonic**, as the rectifier's share at full
+/// Age: `y + c (sqrt(y^2 + e^2) - e)` with `c` this times Age, a smoothed
+/// full-wave rectifier, which is 0.5 % of second harmonic at full Age at
+/// every level above a hundredth of a millivolt (`4 c / 3 pi`), the
+/// level-independent signature a magnetised head has. Its rectified DC is
+/// taken off by a one-pole high-pass at [`MAGNETISED_DC_HZ`]. After the
+/// line-up and inside the playback equalisation, where the tape's flux is.
+const MAGNETISED_H2: f32 = 0.011_78;
+const MAGNETISED_KNEE: f32 = 1.0e-4;
+const MAGNETISED_DC_HZ: f64 = 5.0;
+
+/// How far Age raises the hiss at its top, in dB, and how much coarser it
+/// makes the tape's modulation noise, as a share of it: an old tape is
+/// noisier, by up to 3 dB, and its grain modulates twice as hard.
+const AGE_HISS_DB: f64 = 3.0;
+const AGE_JITTER: f64 = 1.0;
+
+/// How long Age takes to arrive, as the time constant of its glide, in
+/// milliseconds: years are not a step.
+const AGE_GLIDE_MS: f64 = 100.0;
 
 /// Output trim, in dB across the knob. Midpoint is exactly unity.
 pub const TRIM_DB: (f32, f32) = (-12.0, 12.0);
@@ -2662,6 +2774,40 @@ impl Transport {
     }
 }
 
+/// **Where the tape is under the head**: the metres that have passed it
+/// since `new` or `clear`, and how many pass it a frame at the speed the
+/// voicing is at. What wears the tape lies along it, so it is laid out in
+/// metres and not in seconds: the azimuth's wander here, which a faster tape
+/// sweeps through faster, and the damage along it.
+struct Wear {
+    metres: f64,
+    x: f64,
+}
+
+impl Wear {
+    const fn new() -> Self {
+        Self { metres: 0.0, x: 0.0 }
+    }
+
+    fn clear(&mut self) {
+        self.x = 0.0;
+    }
+
+    /// One frame of tape past the head.
+    #[inline]
+    fn tick(&mut self) {
+        self.x += self.metres;
+    }
+
+    /// The head's azimuth error here, in radians, at Age `age`: its
+    /// standing error and the slitting's wander along the tape
+    /// ([`AZIMUTH_URAD`]). Exactly zero at Age 0.
+    fn azimuth(&self, age: f64) -> f64 {
+        let wander = (std::f64::consts::TAU * self.x / AZIMUTH_WANDER_M).sin();
+        age * (AZIMUTH_URAD.0 + AZIMUTH_URAD.1 * wander) * 1.0e-6
+    }
+}
+
 /// One stereo pair of tracks through the record and repro chain. See the
 /// module header for the signal flow.
 pub struct Tape {
@@ -2743,6 +2889,11 @@ pub struct Tape {
     /// way, while it carried weight, in samples: what the travel test reads.
     #[cfg(test)]
     deepest: [f32; 2],
+    /// Holds an aged head's gap square to the tracks in time, so neither
+    /// track is read between samples for the skew: what lets a test hear
+    /// Age's spacing without the play head's interpolation on top.
+    #[cfg(test)]
+    square_head: bool,
     // Per-rate coefficients, fixed at construction: the sample rate is, too,
     // per the house law.
     a_att: f32,
@@ -2784,8 +2935,9 @@ pub struct Tape {
     roll_on: bool,
     /// The bias's stages: the under-bias low shelf and its inverse, the
     /// bias shelf after the curve, whether each is in circuit (each is a
-    /// wire at aligned, and skipped), and the `(bias dB, speed)` they were
-    /// designed at (NaN until the first design).
+    /// wire at aligned, and skipped), and the `(bias dB, speed, Age)` they
+    /// were designed at (NaN until the first design; Age's worn head is the
+    /// treble shelf's too).
     ///
     /// **The inverse follows the shelf [`OS_LATENCY`] frames late**, because
     /// the two straddle the record stage's oversampler: what the shelf
@@ -2802,7 +2954,7 @@ pub struct Tape {
     inverse_waiting: usize,
     shelf: Section,
     shelf_on: bool,
-    bias_for: (f64, f64),
+    bias_for: (f64, f64, f64),
     /// The line-up's reading of the bias, as how many octaves hotter the
     /// 1 kHz alignment tone meets the curve through the under-bias shelf:
     /// where it was at the last design and where it is going, ramped across
@@ -2825,6 +2977,35 @@ pub struct Tape {
     trim: Glide,
     /// The bias in dB re aligned ([`BIAS_RANGE_DB`]).
     bias: Glide,
+    /// Age, and its per-frame step ([`AGE_GLIDE_MS`]).
+    age: Glide,
+    a_age: f64,
+    /// Where the tape is under the head ([`Wear`]).
+    wear: Wear,
+    /// **The wear's grid**, [`WEAR_STEP`] frames: the share of the tracks'
+    /// azimuth skew each track takes, in samples (the left's; the right
+    /// takes it the other way), and each track's spacing filter, its two
+    /// matched one-poles' `b` (the shelf's corner and the double low-pass's),
+    /// where the last step put them and where this one is taking them.
+    skew_from: f64,
+    skew_to: f64,
+    spacing_from: [[f32; 2]; 2],
+    spacing_to: [[f32; 2]; 2],
+    /// The spacing filter: each track's three one-poles, whether it is in
+    /// circuit (only while some track has a spacing at all), whether it
+    /// has to start from the signal it meets, and the table its
+    /// coefficients come from ([`SPACING_POINTS`]).
+    spacing: [[f32; 3]; 2],
+    spacing_on: bool,
+    spacing_fresh: bool,
+    spacing_table: [f32; SPACING_POINTS],
+    /// The magnetised head: each track's DC blocker, its coefficient, and
+    /// whether the stage is in circuit ([`MAGNETISED_H2`]).
+    dc: [OnePole; 2],
+    g_dc: f32,
+    h2_on: bool,
+    /// Age's lift on the hiss, as a gain ([`AGE_HISS_DB`]).
+    hiss_age: f32,
     /// Frames since `new` or `clear`: the grid [`SUB_BLOCK`] counts on.
     frame: u64,
     /// Whether the next block is the first since `new` or `clear`, which
@@ -2879,6 +3060,8 @@ impl Tape {
             clamp_hits: 0,
             #[cfg(test)]
             deepest: [0.0; 2],
+            #[cfg(test)]
+            square_head: false,
             a_att: env_a(rate, f64::from(ERASE_ATTACK_MS)),
             a_rel: env_a(rate, f64::from(ERASE_RELEASE_MS)),
             a_glide: step(GLIDE_MS),
@@ -2912,7 +3095,7 @@ impl Tape {
             inverse_waiting: 0,
             shelf: Section::WIRE,
             shelf_on: false,
-            bias_for: (f64::NAN, f64::NAN),
+            bias_for: (f64::NAN, f64::NAN, f64::NAN),
             lineup_from: 0.0,
             lineup_to: 0.0,
             tan_1k: (std::f64::consts::PI * 1_000.0 / rate).tan(),
@@ -2924,6 +3107,24 @@ impl Tape {
             roll: Glide::new(1.0e-6),
             trim: Glide::new(1.0e-9),
             bias: Glide::new(1.0e-6),
+            age: Glide::new(1.0e-9),
+            a_age: step(AGE_GLIDE_MS),
+            wear: Wear::new(),
+            skew_from: 0.0,
+            skew_to: 0.0,
+            spacing_from: [[0.0; 2]; 2],
+            spacing_to: [[0.0; 2]; 2],
+            spacing: [[0.0; 3]; 2],
+            spacing_on: false,
+            spacing_fresh: false,
+            spacing_table: std::array::from_fn(|i| {
+                let hz = (SPACING_LOW_HZ.log2() + i as f64 / SPACING_PER_OCTAVE).exp2();
+                matched_b(hz, rate) as f32
+            }),
+            dc: [OnePole::default(); 2],
+            g_dc: tpt_g(MAGNETISED_DC_HZ, rate) as f32,
+            h2_on: false,
+            hiss_age: 1.0,
             frame: 0,
             fresh: true,
         }
@@ -3001,6 +3202,7 @@ impl Tape {
         self.hiss_level.target = taper * f64::from(noise_rate);
         self.jitter.target = jitter_um(p);
         self.bias.target = bias_db(p);
+        self.age.target = f64::from(norm_or(p.age, 0.0));
         self.transport.aim(p, self.fresh);
         if self.fresh {
             // And the heads stand where the range is, not fading to it.
@@ -3020,6 +3222,7 @@ impl Tape {
                 &mut self.hiss_level,
                 &mut self.jitter,
                 &mut self.bias,
+                &mut self.age,
             ] {
                 g.settle();
             }
@@ -3083,6 +3286,17 @@ impl Tape {
         self.roll_on = roll_wanted || self.roll.cur != self.roll.target;
         self.design_bias(pos);
 
+        // Age's own parts: the hiss's lift, and the magnetised head, which
+        // leaves the circuit only once its DC blocker has nothing left in it.
+        let age = self.age.cur;
+        self.hiss_age = 10.0_f64.powf(AGE_HISS_DB * age / 20.0) as f32;
+        if age > 0.0 {
+            self.h2_on = true;
+        } else if self.h2_on && self.dc.iter().all(|f| f.s.abs() < 1.0e-9) {
+            self.h2_on = false;
+            self.dc = [OnePole::default(); 2];
+        }
+
         // The transport, at the speed the glide is at. Its reserve is what
         // the per-channel noise can take beyond the sway, four of its sigma
         // and a sample, at the deeper of where the noise and the speed are
@@ -3091,7 +3305,82 @@ impl Tape {
         let v = ips * pos.exp2();
         let slowest = v.min(ips * self.speed.target.exp2());
         let noise_um = self.jitter.cur.max(self.jitter.target);
-        self.transport.design(v, reserve(noise_um, slowest, f64::from(self.sample_rate)));
+        let sr = f64::from(self.sample_rate);
+        let aged = self.age.cur.max(self.age.target);
+        self.transport.design(v, reserve(noise_um, aged, slowest, sr));
+        self.wear.metres = 0.0254 * v / sr;
+    }
+
+    /// **One step of the wear's grid**, every [`WEAR_STEP`] frames: the
+    /// head's azimuth where the tape is now, the skew it puts between the
+    /// tracks, and each track's spacing (Age's, and the gap that costs what
+    /// the azimuth costs), as the coefficients the next frames move to. The
+    /// spacing filter is in circuit only while some track has a spacing at
+    /// all, and starts from the signal it meets when it comes back in: at no
+    /// spacing its one-poles are wires that carry nothing.
+    fn wear_step(&mut self) {
+        let sr = f64::from(self.sample_rate);
+        let v_m = self.wear.metres * sr;
+        let age = self.age.cur;
+        let theta = self.wear.azimuth(age);
+        let skew = if v_m > 0.0 {
+            0.5 * AZIMUTH_SPAN_MM * 1.0e-3 * theta.tan() / v_m * sr
+        } else {
+            0.0
+        };
+        let gap = AGE_SPACING_UM * 1.0e-6 * age + if v_m > 0.0 { azimuth_gap(theta, v_m) } else { 0.0 };
+        // The first frame since `new` or `clear` (`frame` already counts
+        // it) starts where it is, not ramping in from nothing.
+        let first = self.frame == 1;
+        let to = [gap, gap].map(|d| self.spacing_bs(d, v_m));
+        let on = gap > 0.0 || self.spacing_to.iter().flatten().any(|b| *b != 0.0);
+        if on && !self.spacing_on {
+            self.spacing_fresh = true;
+        }
+        self.spacing_on = on;
+        self.skew_from = if first { skew } else { self.skew_to };
+        self.skew_to = skew;
+        self.spacing_from = if first { to } else { self.spacing_to };
+        self.spacing_to = to;
+    }
+
+    /// A track's spacing filter for a spacing of `d` metres on tape at `v_m`
+    /// metres a second: the `b` of its shelf's one-pole and of its double
+    /// low-pass ([`SPACING_FIT`]), read from the table. No spacing is a wire.
+    fn spacing_bs(&self, d: f64, v_m: f64) -> [f32; 2] {
+        if d <= 0.0 || v_m <= 0.0 {
+            return [0.0; 2];
+        }
+        let f0 = (v_m / (WALLACE_DB * d)).log2();
+        let (_, hp, lp) = SPACING_FIT;
+        [hp, lp].map(|k| {
+            let x = (f0 + k.log2() - SPACING_LOW_HZ.log2()) * SPACING_PER_OCTAVE;
+            let last = (SPACING_POINTS - 1) as f64;
+            if x >= last {
+                return 0.0;
+            }
+            let x = x.max(0.0);
+            let i = x as usize;
+            let t = (x - i as f64) as f32;
+            self.spacing_table[i] + (self.spacing_table[i + 1] - self.spacing_table[i]) * t
+        })
+    }
+
+    /// One frame of the wear: the tape moves on, the grid steps when it is
+    /// due, and the tracks' skew for this frame, the left's share in
+    /// samples, comes back.
+    #[inline]
+    fn wear_frame(&mut self) -> f32 {
+        if (self.frame - 1).is_multiple_of(WEAR_STEP) {
+            self.wear_step();
+        }
+        self.wear.tick();
+        #[cfg(test)]
+        if self.square_head {
+            return 0.0;
+        }
+        let along = ((self.frame - 1) % WEAR_STEP + 1) as f64 / WEAR_STEP as f64;
+        (self.skew_from + (self.skew_to - self.skew_from) * along) as f32
     }
 
     /// **The bias's stages for where its glide and the speed's are now**,
@@ -3104,8 +3393,8 @@ impl Tape {
     /// with that design, its frames later, so nothing steps. Nothing here
     /// runs while neither the bias nor the speed moves.
     fn design_bias(&mut self, pos: f64) {
-        let b = self.bias.cur;
-        if b == self.bias_for.0 && pos == self.bias_for.1 {
+        let (b, age) = (self.bias.cur, self.age.cur);
+        if b == self.bias_for.0 && pos == self.bias_for.1 && age == self.bias_for.2 {
             self.lineup_from = self.lineup_to;
             return;
         }
@@ -3126,7 +3415,8 @@ impl Tape {
             self.under_in = [[0.0; 2]; 2];
             self.inverse_after(Shelf::WIRE, false, first);
         }
-        let height = bias_shelf_db(b);
+        // A worn head records as if biased hotter, on the treble shelf only.
+        let height = bias_shelf_db(b + AGE_OVERBIAS_DB * age);
         if height != 0.0 {
             self.shelf = Section::of(Section::bias_shelf(v_m / (BIAS_SHELF_UM * 1.0e-6), height, self.shelf_points));
             self.shelf_on = true;
@@ -3136,7 +3426,7 @@ impl Tape {
         }
         self.lineup_from = if first { lineup } else { self.lineup_to };
         self.lineup_to = lineup;
-        self.bias_for = (b, pos);
+        self.bias_for = (b, pos, age);
     }
 
     /// Queue the under-bias shelf's inverse to take over [`OS_LATENCY`]
@@ -3178,13 +3468,14 @@ impl Tape {
 
     /// **The two heads this frame**: each track's delay on the studio head
     /// and on the deep head, in samples (the transport's sway for that head,
-    /// shared, plus the track's own modulation noise, held inside the line
-    /// and counted when it had to be), and the two heads' shares of what is
+    /// shared, plus the track's own modulation noise and its share of the
+    /// azimuth's `skew`, the left late and the right early, held inside the
+    /// line and counted when it had to be), and the two heads' shares of what is
     /// heard. The range's crossfade turns a step here every frame; a head
     /// that carries no weight is neither placed nor counted, and once the
     /// deep head has faded out its cassette stops, reset silent.
     #[inline]
-    fn heads(&mut self) -> ([[f32; 2]; 2], [f32; 2]) {
+    fn heads(&mut self, skew: f32) -> ([[f32; 2]; 2], [f32; 2]) {
         self.transport.tick();
         let deep = self.transport.deep;
         let half = std::f64::consts::FRAC_PI_2;
@@ -3230,8 +3521,8 @@ impl Tape {
             if weights[h] == 0.0 {
                 continue;
             }
-            for (d, j) in delays[h].iter_mut().zip(jitter) {
-                let want = rests[h] + sways[h] + j;
+            for ((d, j), s) in delays[h].iter_mut().zip(jitter).zip([skew, -skew]) {
+                let want = rests[h] + sways[h] + j + s;
                 let held = want.clamp(2.0, last);
                 if held != want {
                     self.clamp_hits += 1;
@@ -3272,6 +3563,7 @@ impl Tape {
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
             self.bias.tick(self.a_glide);
+            let h2 = MAGNETISED_H2 * self.age.tick(self.a_age) as f32;
             let trim_gain = self.trim.tick(self.a_glide) as f32;
             // The dial's record level, scaled by this speed's headroom: the
             // `d` the curve is asked for, and the line-up for it, read from
@@ -3287,11 +3579,13 @@ impl Tape {
             let inv_d = 1.0 / d;
 
             // ── the heads: the transport's sway and each track's noise ───
-            let (delays, [studio, deep]) = self.heads();
+            let skew = self.wear_frame();
+            let (delays, [studio, deep]) = self.heads(skew);
             // The tape's noise over the record level ([`HISS_DRIVE`]): the
             // voicing's gain carries the speed's `dmol`, which `1 / d`
-            // takes back out.
-            let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain * inv_d;
+            // takes back out. Age raises it.
+            let hiss_gain = self.hiss_level.tick(self.a_glide) as f32 * self.hiss_gain * inv_d * self.hiss_age;
+            let wearing = ((self.frame - 1) % WEAR_STEP + 1) as f32 / WEAR_STEP as f32;
 
             for ch in 0..2 {
                 // The input transformer: keep DC and rumble out of the
@@ -3319,6 +3613,12 @@ impl Tape {
                     r = self.under.run(&mut self.under_in[ch], r);
                 }
                 let mut y = record(&mut self.os[ch], &self.os_taps, &mut self.sat_err[ch], d, inv_d, r) * makeup;
+                // A magnetised head's second harmonic, on the flux the tape
+                // holds, and its rectified DC taken off again.
+                if self.h2_on {
+                    y += h2 * ((y * y + MAGNETISED_KNEE * MAGNETISED_KNEE).sqrt() - MAGNETISED_KNEE);
+                    y = self.dc[ch].high(y, self.g_dc);
+                }
                 if self.under_inv_on {
                     y = self.under_inv.run(&mut self.under_out[ch], y);
                 }
@@ -3357,6 +3657,24 @@ impl Tape {
                     v += self.hiss_shelf.run(&mut self.hiss_eq[ch], w) * hiss_gain;
                 }
 
+                // The head-to-tape spacing, Wallace's loss as three
+                // one-poles ([`SPACING_FIT`]): after the hiss, so whatever
+                // lifts the tape off the head dulls the hiss as well.
+                if self.spacing_on {
+                    let st = &mut self.spacing[ch];
+                    if self.spacing_fresh {
+                        *st = [v; 3];
+                    }
+                    let [from, to] = [self.spacing_from[ch], self.spacing_to[ch]];
+                    let hp = from[0] + (to[0] - from[0]) * wearing;
+                    let lp = from[1] + (to[1] - from[1]) * wearing;
+                    st[0] = flush(v + hp * (st[0] - v));
+                    let shelved = v - SPACING_FIT.0 as f32 * (v - st[0]);
+                    st[1] = flush(shelved + lp * (st[1] - shelved));
+                    st[2] = flush(st[1] + lp * (st[2] - st[1]));
+                    v = st[2];
+                }
+
                 // The head contour, then Roll. Out of circuit, Roll's state
                 // follows the signal, so it comes back in without a step.
                 v = self.bump_bell.run(&mut self.bump[ch], v);
@@ -3371,6 +3689,7 @@ impl Tape {
 
                 buf[f + ch] = v * trim_gain;
             }
+            self.spacing_fresh = false;
 
             self.at += 1;
             if self.at >= n {
@@ -3396,7 +3715,15 @@ impl Tape {
         self.bias_hf = [0.0; 2];
         (self.under_on, self.under_inv_on, self.shelf_on) = (false, false, false);
         self.inverse_waiting = 0;
-        self.bias_for = (f64::NAN, f64::NAN);
+        self.wear.clear();
+        (self.skew_from, self.skew_to) = (0.0, 0.0);
+        (self.spacing_from, self.spacing_to) = ([[0.0; 2]; 2], [[0.0; 2]; 2]);
+        self.spacing = [[0.0; 3]; 2];
+        (self.spacing_on, self.spacing_fresh) = (false, false);
+        self.dc = [OnePole::default(); 2];
+        self.h2_on = false;
+        self.hiss_age = 1.0;
+        self.bias_for = (f64::NAN, f64::NAN, f64::NAN);
         (self.lineup_from, self.lineup_to) = (0.0, 0.0);
         for c in &mut self.os {
             c.clear();
@@ -3466,8 +3793,10 @@ impl Tape {
             self.roll.tick(self.a_glide);
             self.trim.tick(self.a_glide);
             self.bias.tick(self.a_glide);
+            self.age.tick(self.a_age);
             self.drive.tick(self.a_glide);
-            self.heads();
+            let skew = self.wear_frame();
+            self.heads(skew);
             self.hiss_level.tick(self.a_glide);
             sway.push(read(&self.transport));
         }
@@ -3566,9 +3895,14 @@ pub fn bump_hz(p: &TapeParams) -> f32 {
 /// engine runs at. The shelf, Roll's one-pole when it is in circuit and the
 /// A-weighting are summed over the band's third octaves in octaves of
 /// frequency, which agrees with the integral to a hundredth of a decibel,
-/// and Drive and Trim add their own decibels: the record level's, 4.6 dB
-/// for every tenth of the dial under [`HISS_DRIVE`] and as much off for
-/// every tenth over, and the trim's. The contour leaves it alone: its bell
+/// and so is an old tape's spacing, which sits after the hiss and dulls it
+/// ([`SPACING_FIT`]'s three matched one-poles at [`DESIGN_RATE`], at Age's
+/// gap and the azimuth's standing angle: the digital poles, because at
+/// 3.75 ips and full Age the spacing's top octave is a third of a decibel
+/// under its analogue form, and the meter hears the poles). Drive, Age and Trim add their own decibels: the record
+/// level's, 4.6 dB for every tenth of the dial under [`HISS_DRIVE`] and as
+/// much off for every tenth over, an old tape's up to [`AGE_HISS_DB`], and
+/// the trim's. The contour leaves it alone: its bell
 /// and its low end sit where the A-weighting has already taken thirty
 /// decibels. A fresh tape reads -82.4 dBFS(A): the datasheet's -87.0, 0 VU
 /// less 69.0 dB(A) at [`HISS_DRIVE`], with the datasheet alignment's 4.6 dB
@@ -3590,6 +3924,17 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
         f64::INFINITY
     };
     let (t2, t1) = (HISS_EQ_US[i] * 1.0e-6, 50.0e-6);
+    // An old tape's spacing: the shelf's corner and the double low-pass's,
+    // as multiples of the frequency the gap costs a decibel at.
+    let age = f64::from(norm_or(p.age, 0.0));
+    let v_m = 0.0254 * TapeSpeed::ALL[i].ips();
+    let gap = AGE_SPACING_UM * 1.0e-6 * age + azimuth_gap(AZIMUTH_URAD.0 * 1.0e-6 * age, v_m);
+    let f0 = if gap > 0.0 { v_m / (WALLACE_DB * gap) } else { f64::INFINITY };
+    let (k_shelf, at_shelf, at_lp) = SPACING_FIT;
+    let rate = f64::from(DESIGN_RATE);
+    let (b_shelf, b_lp) = (matched_b(at_shelf * f0, rate), matched_b(at_lp * f0, rate));
+    // `(1 - k) + k LP` over the shelf's pole, as a numerator `c0 - c1 z^-1`.
+    let (c0, c1) = (1.0 - k_shelf + k_shelf * (1.0 - b_shelf), (1.0 - k_shelf) * b_shelf);
     // Thirty third-octave steps from 20 Hz to 20 kHz, trapezoidal in octaves:
     // the integral of the density over `df` is of `density x f` over `ln f`.
     const STEPS: i32 = 30;
@@ -3606,8 +3951,12 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
                 * (f2 + 12_194.0_f64.powi(2)).powi(2));
         let shelf = (1.0 + w2 * t2 * t2) / (1.0 + w2 * t1 * t1);
         let roll = 1.0 / (1.0 + f2 / (corner * corner));
+        let cos = (std::f64::consts::TAU * f / rate).cos();
+        let pole = |b: f64| 1.0 - 2.0 * b * cos + b * b;
+        let lp = (1.0 - b_lp).powi(2) / pole(b_lp);
+        let spacing = (c0 * c0 + c1 * c1 - 2.0 * c0 * c1 * cos) / pole(b_shelf) * lp * lp;
         let end = if k == 0 || k == STEPS { 0.5 } else { 1.0 };
-        sum += end * a_weight * shelf * roll * f;
+        sum += end * a_weight * shelf * roll * spacing * f;
         f *= rise;
     }
     // The A curve is normalised to unity at 1 kHz, where its raw form reads
@@ -3617,7 +3966,7 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
     // The tape's noise over the record level, `d` at [`HISS_DRIVE`] over `d`
     // at the dial.
     let drive = 20.0 * std::f64::consts::LOG10_2 * (dial_log2_d(HISS_DRIVE) - dial_log2_d(norm(p.drive)));
-    (10.0 * (density * sum * step * a_norm).log10() + trim + drive) as f32
+    (10.0 * (density * sum * step * a_norm).log10() + trim + drive + AGE_HISS_DB * age) as f32
 }
 
 /// The weighted peaks a fresh transport is calibrated to read at each
@@ -3657,7 +4006,7 @@ fn weighted_parts(p: &TapeParams) -> f64 {
     let (_, kappa) = resonance_at(sr);
     let (_, band) = scrape_band(sr);
     let asked = at_the_top(&studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr)));
-    let reserve = reserve(jitter_um(p), v, sr);
+    let reserve = reserve(jitter_um(p), f64::from(norm_or(p.age, 0.0)), v, sr);
     let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
     let deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
     let mut sum = 0.0;
@@ -4042,10 +4391,11 @@ mod tests {
     /// (d) And an under-biased tape's grain is coarser, 2.1 dB more
     /// modulation noise for every dB under: at the bottom of Bias the same
     /// tone's skirt stands 12.6 dB over the aligned tape's, within 1.5.
-    /// Measured: a slope of -0.20 dB an octave; +4.07, -0.11, -0.11 and
+    /// (e) An old tape's grain modulates twice as hard: at full Age the
+    /// skirt stands 6.0 dB over new tape's, within 1. Measured: a slope of -0.20 dB an octave; +4.07, -0.11, -0.11 and
     /// -6.71 dB; a skirt of -70.9 dB that falls to -96.7 once the tone
-    /// stops, over a floor of 1.0e-4 RMS; and 12.56 dB more of it at the
-    /// bottom of Bias.
+    /// stops, over a floor of 1.0e-4 RMS; 12.56 dB more of it at the
+    /// bottom of Bias, and 5.99 dB more at full Age.
     #[test]
     fn the_hiss_is_white_behind_the_playback_eq_and_the_modulation_noise_rides_the_signal() {
         let sr = 48_000.0_f32;
@@ -4157,6 +4507,17 @@ mod tests {
             "at the bottom of Bias the tone's skirt stands {risen:+.1} dB over the aligned tape's, \
              where an under-biased tape's coarser grain puts it 12.6 dB higher"
         );
+
+        // (e) An old tape's grain modulates twice as hard ([`AGE_JITTER`]),
+        // so full Age carries the tone's skirt 6.0 dB higher.
+        let old = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &TapeParams { age: 1.0, ..p }));
+        let during = &old[(sr * 0.9) as usize..(sr * 0.9) as usize + second];
+        let risen = skirt_under(during, band(during, sr.into(), 1_000.0).powi(2)) - with;
+        assert!(
+            (risen - 6.0).abs() < 1.0,
+            "at full Age the tone's skirt stands {risen:+.1} dB over new tape's, where an old \
+             tape's coarser grain puts it 6.0 dB higher"
+        );
     }
 
     /// **The hiss floor and colour follow each speed's datasheet.**
@@ -4179,9 +4540,12 @@ mod tests {
     /// [`hiss_dbfs_a`] works the same level out from the dials alone, and it
     /// must agree with the measured A-weighted level within half a decibel
     /// at every speed, at Hiss 0.1, 0.5 and 1 as well as 0.25, with Roll at
-    /// half travel, with Trim at +6 dB, and at the bottom and the top of
+    /// half travel, with Trim at +6 dB, at the bottom and the top of
     /// Drive, where the hiss sits 23.0 dB over a fresh tape's and 18.4 dB
-    /// under the datasheet's; it reads minus infinity at Hiss 0, and a fresh
+    /// under the datasheet's, and at Age 0.5 and 1, where an old tape's
+    /// noise rises 3 dB at the top and its spacing dulls it again, most of
+    /// all on slow tape (so Age 1 is pinned at 3.75 ips too); it reads
+    /// minus infinity at Hiss 0, and a fresh
     /// tape reads -82.4 within a fifth of a decibel. The meter's bands are
     /// each scaled to the noise bandwidth they really pass, or their
     /// overlapping skirts would read a tenth of a decibel hot. Measured: the
@@ -4190,7 +4554,9 @@ mod tests {
     /// where the helper's band stops), 0.37 over at 30 ips and 0.32 with
     /// Roll at half travel, where the shelf's bilinear warp and Roll's
     /// one-pole pass a little more treble at 44.1 kHz than the analogue
-    /// figures the helper sums; and -82.45 dBFS(A) for a fresh tape.
+    /// figures the helper sums; at Age 0.5 and 1 at 15 ips the meter 0.09
+    /// and 0.06 over, at Age 1 at 3.75 ips 0.36 under; and -82.45
+    /// dBFS(A) for a fresh tape.
     #[test]
     fn the_hiss_floor_and_colour_follow_each_speeds_datasheet() {
         let sr = 44_100.0_f32;
@@ -4280,6 +4646,12 @@ mod tests {
             ("Trim at +6 dB", TapeParams { drive: fresh, hiss: 0.25, trim: 0.75, ..TapeParams::NEUTRAL }),
             ("Drive 0", TapeParams { drive: 0.0, hiss: 0.25, ..TapeParams::NEUTRAL }),
             ("Drive 1", TapeParams { drive: 1.0, hiss: 0.25, ..TapeParams::NEUTRAL }),
+            ("Age 0.5", TapeParams { drive: fresh, hiss: 0.25, age: 0.5, ..TapeParams::NEUTRAL }),
+            ("Age 1", TapeParams { drive: fresh, hiss: 0.25, age: 1.0, ..TapeParams::NEUTRAL }),
+            (
+                "Age 1 at 3.75 ips",
+                TapeParams { drive: fresh, hiss: 0.25, age: 1.0, speed: TapeSpeed::Ips3_75.dial(), ..TapeParams::NEUTRAL },
+            ),
         ] {
             let out = left(&feed(&mut Tape::new(sr), &silence, &p));
             face_agrees(&p, dba(&out), what);
@@ -4410,6 +4782,7 @@ mod tests {
             rate: f32::NAN,
             wow_range: f32::NAN,
             bias: f32::NAN,
+            age: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -4449,6 +4822,7 @@ mod tests {
                     rate: end,
                     wow_range: end,
                     bias: end,
+                    age: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -5057,7 +5431,7 @@ mod tests {
     ///
     /// The figure is asked of the settings, so it is also pinned against
     /// them: each head and the pair add up to its figure exactly, and of
-    /// every position of the eleven dials only the wow range moves it (the
+    /// every position of the twelve dials only the wow range moves it (the
     /// owner's ruling), the speed included, because a report that moved with
     /// a character dial would re-time the lane in the compensation graph
     /// every time somebody turned it. And the figure a face prints
@@ -5090,7 +5464,7 @@ mod tests {
                      to the {got} frames reported",
                     range.label()
                 );
-                for combo in 0..3_usize.pow(10) {
+                for combo in 0..3_usize.pow(11) {
                     let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
                     let p = TapeParams {
                         drive: at(0),
@@ -5104,6 +5478,7 @@ mod tests {
                         rate: at(8),
                         wow_range: range.dial(),
                         bias: at(9),
+                        age: at(10),
                     };
                     assert_eq!(
                         unit.latency_frames(&p),
@@ -5657,7 +6032,7 @@ mod tests {
         // Each floor is 3 dB under what the knob measured from a fresh
         // tape, rounded down to the whole decibel; the measured figure is
         // beside it.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 11] = [
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 12] = [
             // -3.7 dB.
             ("drive", |p, v| p.drive = v, -7.0),
             // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
@@ -5694,6 +6069,9 @@ mod tests {
             // -4.6 dB: the top of the dial dulls 10 kHz by seven decibels at
             // 15 ips, and the bottom lifts it and saturates the bass sooner.
             ("bias", |p, v| p.bias = v, -8.0),
+            // -5.2 dB: at 15 ips full Age takes 5 dB off 10 kHz and skews
+            // each track a quarter of a sample.
+            ("age", |p, v| p.age = v, -9.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -6317,6 +6695,213 @@ mod tests {
         }
     }
 
+    /// **Age takes the treble by spacing, and slow tape loses the most.**
+    ///
+    /// An old tape rides off a worn head, and Wallace's law makes that gap
+    /// a loss in decibels proportional to it over the wavelength, so the
+    /// same spacing costs a slow tape's short wavelengths far more. At
+    /// full Age, against new tape, with Drive 0 and a -20 dBFS tone, 10 kHz
+    /// loses 19.0 to 23.5 dB at 3.75 ips, 10.0 to 13.0 at 7.5, 4.3 to 6.5
+    /// at 15 and 1.7 to 3.3 at 30 (model -20.8, -11.4, -5.3 and -2.5: the
+    /// 3 µm spacing, the azimuth's loss at its angle, and the worn head's
+    /// over-bias, the machine lined up again at 1 kHz), each speed losing
+    /// more than the one above it; 1 kHz at 15 ips loses 0.2 to 0.8 dB
+    /// (model -0.52); and at 3.75 ips the loss at 10 kHz is the same at
+    /// 44.1, 48 and 96 kHz within 0.3 dB, every corner being matched at
+    /// 10 kHz.
+    ///
+    /// The head is held square in time for this ([`Tape::square_head`]): an
+    /// aged head's skew reads each track between samples, and the play
+    /// head's Hermite costs a 10 kHz tone up to half a decibel at 44.1 and
+    /// 48 kHz where it reads half way (a hundredth at 96), which the
+    /// parked head of Age 0 never pays. That loss is the play head's, not
+    /// Age's, and a moving transport pays it at any Age, so a ruler that
+    /// counted it would pin the interpolator, not the spacing; with the
+    /// skew in, 3.75 ips reads -21.80, -21.79 and -21.30 dB at the three
+    /// rates. Measured square: -21.27, -11.54, -5.22 and -2.34 dB at 48 kHz,
+    /// 1 kHz -0.53, and 3.75 ips -21.27, -21.27 and -21.28 at the three
+    /// rates.
+    #[test]
+    fn age_takes_the_treble_by_spacing_and_slow_tape_loses_the_most() {
+        let amp = 0.1_f32;
+        let loss = |speed: TapeSpeed, sr: f32, hz: f64| {
+            let at = |age: f32| {
+                let p = TapeParams {
+                    speed: speed.dial(),
+                    age,
+                    ..TapeParams::NEUTRAL
+                };
+                let frames = (sr * 0.7) as usize;
+                let mono: Vec<f32> = (0..frames)
+                    .map(|i| amp * (std::f64::consts::TAU * hz * i as f64 / f64::from(sr)).sin() as f32)
+                    .collect();
+                let mut unit = Tape::new(sr);
+                unit.square_head = true;
+                let out = left(&feed(&mut unit, &to_stereo(&mono), &p));
+                let lo = (sr * 0.3) as usize;
+                db(band(&out[lo..], sr.into(), hz) / band(&mono[lo..], sr.into(), hz))
+            };
+            at(1.0) - at(0.0)
+        };
+        let sr = 48_000.0_f32;
+        let tops: Vec<f64> = TapeSpeed::ALL.iter().map(|v| loss(*v, sr, 10_000.0)).collect();
+        for ((speed, top), range) in TapeSpeed::ALL.iter().zip(&tops).zip([-23.5..=-19.0, -13.0..=-10.0, -6.5..=-4.3, -3.3..=-1.7]) {
+            assert!(
+                range.contains(top),
+                "at {} full Age takes {top:+.2} dB off 10 kHz, outside {range:?}",
+                speed.label()
+            );
+        }
+        assert!(
+            tops.windows(2).all(|w| w[0] < w[1]),
+            "the loss is not ordered by speed: {tops:.2?} dB at 3.75, 7.5, 15 and 30 ips"
+        );
+        let low = loss(TapeSpeed::Ips15, sr, 1_000.0);
+        assert!(
+            (-0.8..=-0.2).contains(&low),
+            "at 15 ips full Age takes {low:+.2} dB off 1 kHz"
+        );
+        let rates: Vec<f64> = [44_100.0_f32, 48_000.0, 96_000.0]
+            .into_iter()
+            .map(|sr| loss(TapeSpeed::Ips3_75, sr, 10_000.0))
+            .collect();
+        let spread = rates.iter().fold(f64::MIN, |m, v| m.max(*v)) - rates.iter().fold(f64::MAX, |m, v| m.min(*v));
+        assert!(
+            spread < 0.3,
+            "full Age at 3.75 ips takes {rates:.2?} dB off 10 kHz at 44.1, 48 and 96 kHz"
+        );
+    }
+
+    /// **Age pulls the two tracks apart in time, like a skewed head.**
+    ///
+    /// A head's gap a thousand microradians off square, across the 4 mm
+    /// between the tracks, reads one track 42 µs after the other on
+    /// 3.75 ips tape, and the slitting's wander swings that angle half as
+    /// much again either way every 300 mm. So the same noise on both
+    /// tracks, through full Age at 3.75 ips and 48 kHz with every colour
+    /// off, comes out with the left 2.0 samples behind the right on
+    /// average, within half a sample, read window by window off their
+    /// cross-correlation; over 4 s, more than one turn of the wander, the
+    /// lag swings 2.0 samples peak to peak, within 30 %. And at Age 0 the
+    /// two tracks are bit for bit the same. The head keeps each track's
+    /// share of the widest skew out of the room its transport may sway, so
+    /// the skew can never carry a track off the line. Measured: a mean of
+    /// 2.20 samples (4 s is 1.3 turns of the wander, so the mean leans to
+    /// the turn it saw twice), swinging from 1.01 to 3.04; the room 1.512
+    /// samples less, against a widest share of 1.520 as the lag reads it.
+    #[test]
+    fn age_pulls_the_two_tracks_apart_in_time_like_a_skewed_head() {
+        let sr = 48_000.0_f32;
+        let frames = (sr * 4.5) as usize;
+        let mut seed = 0x0A6E_5EED_u32;
+        let mono: Vec<f32> = (0..frames).map(|_| 0.25 * white(&mut seed)).collect();
+        let run = |age: f32| {
+            let p = TapeParams {
+                speed: TapeSpeed::Ips3_75.dial(),
+                age,
+                ..TapeParams::NEUTRAL
+            };
+            let mut unit = Tape::new(sr);
+            let out = feed(&mut unit, &to_stereo(&mono), &p);
+            (out, unit.governed().room)
+        };
+        let (new, room_new) = run(0.0);
+        assert!(
+            new.chunks_exact(2).all(|f| f[0].to_bits() == f[1].to_bits()),
+            "at Age 0 the two tracks differ"
+        );
+        let (aged, room_aged) = run(1.0);
+        let (l, r) = (left(&aged), aged.chunks_exact(2).map(|f| f[1]).collect::<Vec<f32>>());
+        // Each window's lag of the left behind the right: the peak of their
+        // cross-correlation, placed between samples by a parabola.
+        let window = 2_048;
+        let lags: Vec<f64> = (0..)
+            .map(|k| (sr * 0.5) as usize + k * window)
+            .take_while(|at| at + window + 8 < frames)
+            .map(|at| {
+                let corr = |lag: i64| -> f64 {
+                    (at..at + window)
+                        .map(|n| f64::from(l[n]) * f64::from(r[(n as i64 - lag) as usize]))
+                        .sum()
+                };
+                let c: Vec<f64> = (-6..=6).map(corr).collect();
+                let k = (1..c.len() - 1).max_by(|a, b| c[*a].total_cmp(&c[*b])).expect("a peak");
+                let (a, b, cc) = (c[k - 1], c[k], c[k + 1]);
+                (k as f64 - 6.0) + 0.5 * (a - cc) / (a - 2.0 * b + cc)
+            })
+            .collect();
+        let mean = lags.iter().sum::<f64>() / lags.len() as f64;
+        let (lo, hi) = lags.iter().fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        assert!(
+            (mean - 2.0).abs() <= 0.5,
+            "at full Age on 3.75 ips tape the left runs {mean:.3} samples behind the right"
+        );
+        assert!(
+            ((hi - lo) / 2.0 - 1.0).abs() <= 0.3,
+            "at full Age the lag swings {:.3} samples peak to peak over 4 s",
+            hi - lo
+        );
+        // And the head keeps the skew's room: each track's share of the
+        // widest lag measured comes out of what the transport may sway,
+        // within the few hundredths of a sample the lag's parabola reads to.
+        assert!(
+            room_new - room_aged >= 0.5 * hi - 0.05,
+            "at full Age the head keeps {:.3} samples back for a skew that reached {:.3} a track",
+            room_new - room_aged,
+            0.5 * hi
+        );
+    }
+
+    /// **The magnetised head adds a second harmonic that does not follow
+    /// level.**
+    ///
+    /// A head left magnetised records a little of its own field onto every
+    /// pass, and what that does is even-order and the same share at every
+    /// level, unlike a curve's distortion, which grows with level. So at
+    /// full Age, Drive 0, a 220 Hz tone at -30, -18 and -10 dBFS carries
+    /// 0.5 % of second harmonic within 0.1 at all three; new tape carries
+    /// under 0.005 %; and the rectified DC is gone, under 1e-5 after a
+    /// second (the head's own low-end roll-off downstream would take it as
+    /// well, so this leg holds the chain, not the blocker alone). Measured:
+    /// 0.503 % at all three levels, new tape under a millionth, and 1.1e-6
+    /// of DC.
+    #[test]
+    fn the_magnetised_head_adds_a_second_harmonic_that_does_not_follow_level() {
+        let sr = 48_000.0_f32;
+        let at = |age: f32, dbfs: f32| {
+            let p = TapeParams {
+                age,
+                ..TapeParams::NEUTRAL
+            };
+            let amp = 10.0_f32.powf(dbfs / 20.0);
+            10.0_f64.powf(tone_through(&p, sr, 220.0, amp, 0.5, 0.5, Some(2.0)) / 20.0)
+        };
+        for dbfs in [-30.0, -18.0, -10.0] {
+            let h2 = at(1.0, dbfs);
+            assert!(
+                (h2 - 0.005).abs() <= 0.001,
+                "at full Age a 220 Hz tone at {dbfs} dBFS carries {:.3} % of second harmonic",
+                h2 * 100.0
+            );
+        }
+        let new = at(0.0, -18.0);
+        assert!(new < 5.0e-5, "new tape carries {:.4} % of second harmonic", new * 100.0);
+        let frames = (sr * 1.5) as usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 220.0 * i as f32 / sr).sin())
+            .collect();
+        let p = TapeParams {
+            age: 1.0,
+            ..TapeParams::NEUTRAL
+        };
+        let out = left(&feed(&mut Tape::new(sr), &to_stereo(&mono), &p));
+        let tail = &out[(sr * 1.0) as usize..];
+        let periods = (tail.len() as f32 * 220.0 / sr).floor() as usize;
+        let whole = (periods as f32 * sr / 220.0) as usize;
+        let dc = tail[..whole].iter().map(|v| f64::from(*v)).sum::<f64>() / whole as f64;
+        assert!(dc.abs() < 1.0e-5, "a second on, the magnetised head leaves {dc:.2e} of DC");
+    }
+
     /// **The transport reads a studio machine's weighted flutter at every
     /// speed.**
     ///
@@ -6438,9 +7023,10 @@ mod tests {
     /// **The play head never runs off its tape at any setting.**
     ///
     /// (a) Every speed, on either head, at the ends and middle of Rate, with
-    /// Wow, Flutter and Hiss at their tops and the bias at its bottom, whose
-    /// coarser grain asks the most of the modulation noise, ten seconds of
-    /// the transport at 44.1 kHz each: no head is ever held inside the line
+    /// Wow, Flutter, Hiss and Age at their tops and the bias at its bottom,
+    /// whose coarser grain asks the most of the modulation noise and whose
+    /// aged head skews the two tracks apart, ten seconds of the transport
+    /// at 44.1 kHz each: no head is ever held inside the line
     /// (the safety net catches nothing), and no track's head, its sway and
     /// its own modulation noise together, ever sits further from its rest
     /// than that head's travel. Where the parts ask for more than that, the governor shares
@@ -6481,6 +7067,7 @@ mod tests {
                         speed: speed.dial(),
                         wow_range: range.dial(),
                         bias: 0.0,
+                        age: 1.0,
                         ..TapeParams::default()
                     };
                     let mut unit = Tape::new(sr);
@@ -6783,7 +7370,7 @@ mod tests {
     /// the louder of the two settings' own steady state, plus 6 dB. And the
     /// range switch fades the heads with equal power, two copies of the tone
     /// 23 ms apart, so its level never rises past the steady tone's by more
-    /// than 3.2 dB. (Age and Damage join this when they land.) Bias's
+    /// than 3.2 dB. (Damage joins this when it lands.) Bias's
     /// under-bias shelf and its inverse straddle the record stage's
     /// oversampler, so the inverse takes each design over 44 frames after
     /// the shelf does; designed together, each design while the bias glided
@@ -6839,7 +7426,8 @@ mod tests {
                 7 => p.flutter = v,
                 8 => p.rate = v,
                 9 => p.wow_range = v,
-                _ => p.bias = v,
+                10 => p.bias = v,
+                _ => p.age = v,
             }
             p
         };
@@ -6847,7 +7435,7 @@ mod tests {
             6 => (TapeSpeed::Ips15.dial(), TapeSpeed::Ips3_75.dial()),
             _ => (0.0, 1.0),
         };
-        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias"];
+        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias", "age"];
         for k in 0..names.len() {
             let (a, b) = ends(k);
             for (x, y) in [(a, b), (b, a)] {

@@ -34638,7 +34638,7 @@ mod tests {
             // be old projects losing parameters.
             (EQ_PATH, "Tangent EQ", 25),
             (IMAGER_PATH, "Tangent Imager", 3),
-            (TAPE_PATH, "Tangent Tape", 11),
+            (TAPE_PATH, "Tangent Tape", 12),
             (COMP_PATH, "Tangent Comp", 7),
             (DENOISE_PATH, "Tangent Denoise", 9),
             (AMP_PATH, "Tangent Amp", 9),
