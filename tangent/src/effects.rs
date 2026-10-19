@@ -3037,6 +3037,56 @@ impl Effects {
         }
     }
 
+    /// **Every knob at rest**: the whole chain is skipped while both the
+    /// knobs and the mixes chasing them say so. One rule, asked by
+    /// [`Effects::process`] and [`Effects::lookahead`] alike, so the delay the
+    /// engine plans for and the delay the chain pays cannot drift apart.
+    fn rests(m: &Sends) -> bool {
+        m.reverb < OFF
+            && m.delay < OFF
+            && m.chorus < OFF
+            && m.phaser < OFF
+            && m.hpf < OFF
+            // The low-pass rests at the TOP of its travel, limiter-style.
+            && m.lpf > 1.0 - OFF
+            // The gain rests at the BOTTOM of its, like the sends.
+            && m.gain < OFF
+            && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
+    }
+
+    /// **Whether the limiter is in circuit for a call**, by the knob it is
+    /// turned to or the mix still gliding there. [`Effects::process`] decides
+    /// it once per call, before the first frame.
+    fn limits(want: &Sends, mix: &Sends) -> bool {
+        Sends::threshold_db(want.limiter) < LIMITER_IN_AT_DB || Sends::threshold_db(mix.limiter) < LIMITER_IN_AT_DB
+    }
+
+    /// **How many frames the next [`Effects::process`] holds the audio
+    /// back**, given the knobs it will be handed and whether the engine lands
+    /// them first (`land`): the true-peak limiter's lookahead while it is in
+    /// circuit (`look + TP_CENTRE`, 58 frames at 48 kHz), and nothing for the
+    /// room's copy (`new_live`, which holds nothing), with the limiter out,
+    /// or with every knob at rest.
+    ///
+    /// **Asked before the call, and exact.** The engine delays the click so
+    /// it is heard on the frame the mix is (`instrument::ClickHold`), and the
+    /// click is summed after this chain: it has to know the chain's delay
+    /// before the chain runs. Both answers come from [`Self::rests`] and
+    /// [`Self::limits`] over the same state, and the delay of a stereo call is
+    /// the limiter's alone: nothing else here looks ahead.
+    pub fn lookahead(&self, sends: Sends, landed: bool) -> usize {
+        let want = Self::wanted(sends);
+        let mix = if landed { want } else { self.mix };
+        if Self::rests(&want) && Self::rests(&mix) {
+            return 0;
+        }
+        if Self::limits(&want, &mix) && self.limiter.look > 0 {
+            self.limiter.look + TP_CENTRE
+        } else {
+            0
+        }
+    }
+
     /// **Every mix ON its knob now, not gliding there** (the engine's land,
     /// `Engine::land_gains_at`): a fresh chain's mixes start at
     /// `Sends::default`, so an export's head faded the reverb, the delay and
@@ -3068,18 +3118,7 @@ impl Effects {
         // else here. Getting this backwards would leave the whole effects
         // block running on a panel with nothing switched on — or, far worse,
         // skip a limiter that was set to -48 dB.
-        let quiet = |m: &Sends| {
-            m.reverb < OFF
-                && m.delay < OFF
-                && m.chorus < OFF
-                && m.phaser < OFF
-                && m.hpf < OFF
-                // The low-pass rests at the TOP of its travel, limiter-style.
-                && m.lpf > 1.0 - OFF
-                // The gain rests at the BOTTOM of its, like the sends.
-                && m.gain < OFF
-                && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
-        };
+        let quiet = Self::rests;
         if quiet(&want) && quiet(&self.mix) {
             // **A send returns silence, not its input.** The buffer holds a
             // copy of signal that is already reaching the master; handing it
@@ -3179,8 +3218,7 @@ impl Effects {
         //
         // It stays because it costs one comparison a block and stops being
         // free the day anything sets `mix` instead of easing it.
-        let limiter_on = Sends::threshold_db(want.limiter) < LIMITER_IN_AT_DB
-            || Sends::threshold_db(self.mix.limiter) < LIMITER_IN_AT_DB;
+        let limiter_on = Self::limits(&want, &self.mix);
         if !limiter_on {
             self.limiter.clear();
         }
@@ -5680,6 +5718,55 @@ mod tests {
             let (a, b) = (free_secs((k - 1) as f32 / 20.0), free_secs(k as f32 / 20.0));
             assert!(a > b, "the rate is not monotone at {k}: {a} then {b}");
         }
+    }
+
+    /// **What `lookahead` says a call will hold the audio back is what the
+    /// call holds it back**, asked before it, as the engine asks when it lines
+    /// the click up with the mix. An impulse quiet enough that no ceiling
+    /// touches it, through the master's chain with the limiter at the shipped
+    /// ceiling: `look + TP_CENTRE` frames late, 58 at 48 kHz, at every rate.
+    /// Through the room's copy, which holds nothing: at once. With the
+    /// limiter out and a knob still in (the drive, which moves no sample in
+    /// time), and with every knob at rest: at once as well. And a landed head
+    /// (`land`) is asked as the call will see it: knobs at rest landed from a
+    /// limiter still gliding out pays nothing, unlanded it pays the glide's
+    /// lookahead.
+    #[test]
+    fn the_lookahead_asked_before_a_call_is_the_delay_the_call_pays() {
+        const FRAMES: usize = 4096;
+        const AT: usize = 200;
+        let p = Params::default();
+        let ships = Sends { limiter: 47.0 / 48.0, ..Sends::default() };
+        let drive = Sends { gain: 0.25, ..Sends::default() };
+        for rate in [44_100.0f32, 48_000.0, 96_000.0] {
+            for (what, live, sends, want) in [
+                ("the master at the shipped ceiling", false, ships, Some(((LOOKAHEAD_MS * 0.001 * rate) as usize).max(TP_TAPS) + TP_CENTRE)),
+                ("the room at the shipped ceiling", true, ships, Some(0)),
+                ("the master with the limiter out and the drive in", false, drive, Some(0)),
+                ("the master at rest", false, Sends::default(), Some(0)),
+            ] {
+                let mut fx = if live { Effects::new_live(rate) } else { Effects::new(rate) };
+                let asked = fx.lookahead(sends, false);
+                assert_eq!(Some(asked), want, "{what} at {rate}: asked {asked}");
+                let mut buf = vec![0.0f32; FRAMES * 2];
+                buf[AT * 2] = 0.05;
+                buf[AT * 2 + 1] = 0.05;
+                fx.process(&mut buf, FRAMES, 2, sends, &p, 120.0);
+                let peak = buf.chunks_exact(2).enumerate().fold((0usize, 0.0f32), |b, (i, f)| if f[0].abs() > b.1 { (i, f[0].abs()) } else { b });
+                assert!(peak.1 > 0.02, "{what} at {rate}: the impulse is gone ({})", peak.1);
+                assert_eq!(peak.0, AT + asked, "{what} at {rate}: the call held the impulse {} frames, the ask said {asked}", peak.0 as i64 - AT as i64);
+            }
+        }
+        // A head landed at rest while the limiter is still gliding out: a
+        // second at the ceiling, so the mix has arrived there, then asked at
+        // rest.
+        let mut fx = Effects::new(48_000.0);
+        let mut buf = vec![0.0f32; FRAMES * 2];
+        for _ in 0..12 {
+            fx.process(&mut buf, FRAMES, 2, ships, &p, 120.0);
+        }
+        assert_eq!(fx.lookahead(Sends::default(), false), 58, "the glide out of the ceiling is still in circuit");
+        assert_eq!(fx.lookahead(Sends::default(), true), 0, "a head landed at rest holds nothing");
     }
 
 }

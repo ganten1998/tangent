@@ -1586,6 +1586,161 @@ impl DelayLine {
     }
 }
 
+/// **How many values a take's mark takes in its capture ring**: a NaN, which
+/// no frame of the tee can be (the interface's frames are made finite where
+/// they enter the desk, `scrub_samples`), then the song frame's high and low
+/// twenty-four bits and the hold, each an integer an `f32` holds exactly.
+/// Two whole frames' worth, so the frames after it stay whole.
+const CAPTURE_MARK_LEN: usize = 4;
+
+/// **The mark a take's first rolling frame carries** (`Shared::arr_mark`):
+/// see [`CAPTURE_MARK_LEN`] for its spelling, and `Engine::drain_capture`,
+/// which reads it out of the stream and hands it back.
+fn capture_mark(frame: u64, hold: usize) -> [f32; CAPTURE_MARK_LEN] {
+    const LOW: u64 = (1 << 24) - 1;
+    [
+        f32::NAN,
+        ((frame >> 24) & LOW) as f32,
+        (frame & LOW) as f32,
+        (hold as u64).min(LOW) as f32,
+    ]
+}
+
+/// **How far back the click can be held**, frames: four of the longest line
+/// a lane waits on ([`MAX_PDC_FRAMES`]), so a desk whose lanes are held as
+/// far as a lane can be still has three times that again for the master's
+/// racks and its limiter. A power of two, so a frame's place in the rings is
+/// a mask. A read is held at most this less one block (`ClickHold::MOST`):
+/// a chunk writes its frames before anything reads them, and the block a
+/// chunk writes must not overwrite a frame it still reads. Past that the
+/// click is early by the excess, which takes a master chain holding the mix
+/// back more than half a second at 48 kHz.
+const CLICK_HOLD_FRAMES: usize = 4 * MAX_PDC_FRAMES;
+const _: () = assert!(CLICK_HOLD_FRAMES.is_power_of_two());
+
+/// **The click, held back to the frame the mix is heard on** (the owner's
+/// ruling of 2026-10-19: delay compensation is done properly).
+///
+/// The lanes are aligned by DELAYING them: each waits for the slowest chain
+/// (`run_lane_pdc`), so the whole mix reaches the master the alignment
+/// target late (`Shared::max_latency`), and the master's racks and its
+/// limiter's lookahead hold it back further on its way out. The click is
+/// generated on the song's clock (`BarClock::tick`, a count-in on `Beats`)
+/// and summed after the master, so it led the mix by all of that: 25 ms
+/// with a Tape in its deep wow range anywhere on the desk.
+///
+/// **So the click is written down as it is made and read back as late as
+/// each destination's mix.** Three mono rings, one voice on both sides: the
+/// click after its rack as the speakers take it (`out`), the same through the
+/// take's gate as the file takes it (`taped`), and the click before its rack,
+/// which is what its Return 0 send has always been taken from (`raw`). Each
+/// destination reads them at its own hold (`HoldRead`): the speakers and the
+/// take at the target plus whatever their own master chain adds, the Return 0
+/// send at the target alone, where the lanes' own sends arrive, and a bus's
+/// send at the target less that bus's own way out (`gather_node`), so the
+/// click's wet copy leaves every bus with its dry copy and with the mix.
+/// The click's own rack pays its own latency, counted against each hold.
+///
+/// Everything else about the click stands: it is generated, gated by the
+/// motor and counted in exactly as before, summed after the master and its
+/// ceiling, never ducked, never in an export, a freeze or a bounce, and the
+/// desk's alignment target stays the channels' (`publish_latency`): the
+/// click never holds the desk back. On a desk that holds nothing every read
+/// is the frame just written, bit for bit.
+///
+/// Allocated whole with the renderer; nothing here allocates on the audio
+/// thread.
+struct ClickHold {
+    /// After its rack: what the speakers are handed.
+    out: Vec<f32>,
+    /// After its rack and the take's gate: what the file is handed.
+    taped: Vec<f32>,
+    /// Before its rack: what its Return 0 send takes.
+    raw: Vec<f32>,
+    /// **Frames written since the renderer was built.** Frame `k` sits at
+    /// `k % CLICK_HOLD_FRAMES`; a chunk writes from here, every read of the
+    /// chunk is against it, and the chunk's end advances it.
+    written: u64,
+    /// The speakers', the take's and the Return 0 send's reads.
+    room: HoldRead,
+    take: HoldRead,
+    fx: HoldRead,
+    /// This chunk's alignment target as a plain lane waits it, and the
+    /// click's own rack's latency, for the buses' reads (`gather_node`).
+    target: usize,
+    own: usize,
+    /// **What the speakers were held back by**, the last chunk that asked:
+    /// the hold a take's capture mark carries (`mix_monitor`'s tee).
+    room_hold: usize,
+}
+
+impl ClickHold {
+    /// The longest a read is held: see [`CLICK_HOLD_FRAMES`].
+    const MOST: usize = CLICK_HOLD_FRAMES - MAX_BLOCK as usize;
+
+    fn new() -> Self {
+        Self {
+            out: vec![0.0; CLICK_HOLD_FRAMES],
+            taped: vec![0.0; CLICK_HOLD_FRAMES],
+            raw: vec![0.0; CLICK_HOLD_FRAMES],
+            written: 0,
+            room: HoldRead::default(),
+            take: HoldRead::default(),
+            fx: HoldRead::default(),
+            target: 0,
+            own: 0,
+            room_hold: 0,
+        }
+    }
+
+    /// Where frame `k` lives in a ring.
+    #[inline]
+    fn slot(k: u64) -> usize {
+        (k % CLICK_HOLD_FRAMES as u64) as usize
+    }
+
+    /// **Frame `i` of the chunk written from `at`, as `read` hears it**:
+    /// `read.hold` frames back, and silence for a frame from before its hold
+    /// last moved.
+    #[inline]
+    fn read(ring: &[f32], read: &HoldRead, at: u64, i: usize) -> f32 {
+        read.frame(at, i).and_then(|k| ring.get(Self::slot(k)).copied()).unwrap_or(0.0)
+    }
+}
+
+/// **One destination's read of the click's rings**: how far back it reads,
+/// and the first frame it may read.
+///
+/// **A hold that moves starts afresh**, as a lane's line does when its length
+/// changes (`DelayLine::run` clears): nothing written before the move is read
+/// after it, so the read is silent for its new hold and then reads on. The
+/// beats inside the old hold are lost with the music the lanes lose there,
+/// and none is ever heard twice, which re-reading a ring at a longer hold
+/// would do.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HoldRead {
+    hold: usize,
+    from: u64,
+}
+
+impl HoldRead {
+    /// Aim this read `hold` frames back from the chunk written from `at`.
+    fn aim(&mut self, hold: usize, at: u64) {
+        if hold != self.hold {
+            self.hold = hold;
+            self.from = at;
+        }
+    }
+
+    /// The frame that frame `i` of the chunk written from `at` reads, if it
+    /// may read one.
+    #[inline]
+    fn frame(&self, at: u64, i: usize) -> Option<u64> {
+        let k = (at + i as u64).checked_sub(self.hold as u64)?;
+        (k >= self.from).then_some(k)
+    }
+}
+
 /// Every automated control's value for one block.
 ///
 /// Plain tables rather than a lookup, because the audio thread asks for
@@ -2920,6 +3075,32 @@ struct Shared {
     /// Frames the capture tee had to drop because a ring was full — the host
     /// stalled for seconds. Climbing means a take with a hole in it.
     cap_dropped: AtomicU64,
+    /// **Which picks owe their capture ring a mark**: a bit per pick, as
+    /// `arr_capture`'s, raised by the host with a pick's capture flag
+    /// (`Engine::set_capturing`) and taken down by the tee as it writes the
+    /// mark ahead of the take's first rolling frame (`capture_mark`). The mark
+    /// says which song frame that is and what the speakers were held back by
+    /// then, so the host places the take where it was played against what
+    /// was heard (`take_placement`). One per press: a take marked once is
+    /// placed by that mark, however its hold moves after.
+    arr_mark: Box<[AtomicU64]>,
+    /// **What the speakers are held back by**, frames: the alignment target
+    /// and whatever their own master chain adds to it (`ClickHold`), as the
+    /// last chunk had it. The host's word for a record that never rolled.
+    room_hold: AtomicU32,
+    /// **A record's anchor on the song**: the host asks for one at the press
+    /// (`Engine::request_record_anchor`, a new generation in `rec_req`), and
+    /// the first chunk that rolls after it writes the song frame it starts
+    /// on, the instant on the host's clock that frame stands for (the
+    /// chunk's `block_start`, the instant a live note is placed against) and
+    /// the speakers' hold, then publishes the generation (`rec_gen`,
+    /// Release) last. What a recorded MIDI part is placed by
+    /// (`record_song_s`).
+    rec_req: AtomicU64,
+    rec_gen: AtomicU64,
+    rec_frame: AtomicU64,
+    rec_ns: AtomicI64,
+    rec_hold: AtomicU32,
     /// The DRUM BUS fader and pan — the pads sum through this strip.
     drums_gain: AtomicU32,
     drums_pan: AtomicU32,
@@ -3151,7 +3332,8 @@ struct Shared {
     beat_now: AtomicU32,
     count_in_done: AtomicBool,
     /// Host-timebase instant the count-in downbeat will be **heard**, including
-    /// the device's own output delay. `i64::MIN` for "no downbeat yet".
+    /// the device's own output delay and the click's hold to the mix
+    /// (`ClickHold`). `i64::MIN` for "no downbeat yet".
     downbeat_ns: AtomicI64,
 
     /// Peak magnitude since the UI last read it. `fetch_max` on the bit pattern
@@ -3819,6 +4001,13 @@ impl Shared {
             armed: AtomicU32::new(u32::MAX),
             arr_capture: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             cap_dropped: AtomicU64::new(0),
+            arr_mark: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
+            room_hold: AtomicU32::new(0),
+            rec_req: AtomicU64::new(0),
+            rec_gen: AtomicU64::new(0),
+            rec_frame: AtomicU64::new(0),
+            rec_ns: AtomicI64::new(0),
+            rec_hold: AtomicU32::new(0),
             drums_gain: AtomicU32::new(1.0f32.to_bits()),
             drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
@@ -7514,6 +7703,11 @@ pub(crate) struct LaneBody {
     post: Vec<Vec<f32>>,
     /// What the node decided this chunk, for its run and its publish.
     node: NodePrep,
+    /// **Where a bus reads the click it is sent** (`ClickHold`): the target
+    /// less the bus's own way out, so the click's wet copy leaves it with
+    /// the lanes' and lands with the click's dry copy. Each bus keeps its
+    /// own, since each bus's way out is its own.
+    click_read: HoldRead,
     /// **This strip's signal for its sends to buses**, pre- and post-fader,
     /// filled only while the plan has it sending to one
     /// (`PostTable::sends_out`): the lane fold, the room and the kit add
@@ -7674,6 +7868,7 @@ impl Lane {
                 dry_pdc: DelayLine::new(),
                 post: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 node: NodePrep::default(),
+                click_read: HoldRead::default(),
                 send_pre: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 send_post: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 pre_gate: 0.0,
@@ -11756,6 +11951,13 @@ struct Renderer {
     /// beside the click, so an audition is never printed into a take.
     preview_out: Vec<f32>,
     click_taped: Vec<f32>,
+    /// **The click held back to the mix's frame**, both buffers above and
+    /// the click before its rack, read at each destination's hold. See
+    /// [`ClickHold`].
+    click_hold: ClickHold,
+    /// The record anchor's generation this renderer last wrote
+    /// (`Shared::rec_req`).
+    rec_seen: u64,
     /// A user effect ACROSS the effects bus, if one is loaded.
     ///
     /// **On the bus rather than on every channel**, and that is a design
@@ -13745,6 +13947,14 @@ impl Renderer {
             // click is one voice, so a pre-fader entry takes it as it is.
             let click_send = self.fx_send(Strip::Click);
             let click_fx_pre = self.fx_pre_send(Strip::Click);
+            // **Where each destination hears the mix this chunk**, and so
+            // where it hears the click (`ClickHold`): read before a single
+            // frame is made, so the go below is stamped where it is heard.
+            // A record asking for its anchor is answered here too, now the
+            // speakers' hold is known.
+            let go_late = self.aim_click(landed);
+            self.note_record_anchor(at, rolling, block_start);
+            let mark = self.click_hold.written;
             let mut click_peak = 0.0f32;
             for i in 0..n {
                 let frame_index = done + i;
@@ -13807,7 +14017,11 @@ impl Renderer {
                     }
                     self.shared.beat_now.store(beat.count_in, Ordering::Relaxed);
                     if beat.downbeat {
-                        let at = heard + (frame_index as f64 / self.rate * 1e9) as Nanos;
+                        // **The instant the go is HEARD**, which is its hold
+                        // later than it is made: through the click's rack and
+                        // then held to the mix, so the host's T0 and the
+                        // count's end stand on the beat the player heard.
+                        let at = heard + ((frame_index + go_late) as f64 / self.rate * 1e9) as Nanos;
                         self.shared.downbeat_ns.store(at, Ordering::Relaxed);
                         self.shared.count_in_done.store(true, Ordering::Relaxed);
                         // **And the bar clock must not sound it again.** The
@@ -13852,14 +14066,10 @@ impl Renderer {
                     0.0
                 };
                 click_peak = click_peak.max(click.abs());
-                let at = i * TAP_CHANNELS;
-                for c in 0..TAP_CHANNELS {
-                    if let Some(v) = self.aux.get_mut(at + c) {
-                        *v += click * click_send;
-                        if click_fx_pre != 0.0 {
-                            *v += click * click_fx_pre;
-                        }
-                    }
+                // Before its rack, for its Return 0 send: taken off the ring
+                // below, at the hold the lanes' own sends arrive at.
+                if let Some(v) = self.click_hold.raw.get_mut(ClickHold::slot(mark + i as u64)) {
+                    *v = click;
                 }
             }
             // **The click's rack, run here in strip order** — the same
@@ -13978,6 +14188,33 @@ impl Renderer {
             }
             // The click is one voice on both sides.
             self.shared.note_strip_peak(Strip::Click, [click_peak; 2]);
+            // **Into the rings, then its send into Return 0** at the hold the
+            // lanes' sends arrive at (`ClickHold::fx`): the click's reverb
+            // comes back with theirs. Bit for bit what the frame loop used to
+            // add, on a desk that holds nothing.
+            for i in 0..n {
+                let k = ClickHold::slot(mark + i as u64);
+                if let (Some(o), Some(t)) = (self.click_hold.out.get_mut(k), self.click_hold.taped.get_mut(k)) {
+                    *o = self.click_out[i];
+                    *t = self.click_taped[i];
+                }
+            }
+            {
+                let fx = self.click_hold.fx;
+                let raw = &self.click_hold.raw;
+                for i in 0..n {
+                    let click = ClickHold::read(raw, &fx, mark, i);
+                    let at = i * TAP_CHANNELS;
+                    for c in 0..TAP_CHANNELS {
+                        if let Some(v) = self.aux.get_mut(at + c) {
+                            *v += click * click_send;
+                            if click_fx_pre != 0.0 {
+                                *v += click * click_fx_pre;
+                            }
+                        }
+                    }
+                }
+            }
 
             // ── channel-to-channel sends ───────────────────────────────────
             //
@@ -14111,16 +14348,7 @@ impl Renderer {
             );
             self.shared.note_strip_peak(Strip::Fx, fx_peak);
 
-            let master_sends = crate::effects::Sends {
-                reverb: 0.0,
-                delay: 0.0,
-                chorus: 0.0,
-                phaser: 0.0,
-                hpf: Shared::f32_of(&self.shared.hpf_mix),
-                lpf: Shared::f32_of(&self.shared.lpf_mix),
-                gain: Shared::f32_of(&self.shared.gain_mix),
-                limiter: Shared::f32_of(&self.shared.limiter_mix),
-            };
+            let master_sends = self.master_sends();
             if landed {
                 // And the master's, the file's and the speakers' copies.
                 self.master_effects.land(master_sends);
@@ -14282,8 +14510,10 @@ impl Renderer {
 
                 map_frame(take, &mut self.frame[..TAP_CHANNELS]);
                 let tap_at = tap_frames * TAP_CHANNELS;
+                // The click as the take's own mix is held (`ClickHold::take`).
+                let taped = ClickHold::read(&self.click_hold.taped, &self.click_hold.take, mark, i);
                 for c in 0..TAP_CHANNELS {
-                    let s = self.frame[c] + self.click_taped[i];
+                    let s = self.frame[c] + taped;
                     self.tap_scratch[tap_at + c] = s;
                 }
                 tap_frames += 1;
@@ -14306,6 +14536,8 @@ impl Renderer {
                 self.reastream_scratch[ra_at + 1] = src.get(1).copied().unwrap_or(src[0]);
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
+                // And as the speakers' mix is held (`ClickHold::room`).
+                let heard_click = ClickHold::read(&self.click_hold.out, &self.click_hold.room, mark, i);
                 for c in 0..dev_ch {
                     // **The click and the preview live on the MAIN PAIR
                     // only** — the same two channels `map_frame` gives the
@@ -14314,7 +14546,7 @@ impl Renderer {
                     // tester's Babyface at once — phones, ADAT, the lot —
                     // which is where "deafeningly loud" auditions came from.
                     let cue = if c < 2 {
-                        self.click_out[i] + self.preview_out[i * 2 + c]
+                        heard_click + self.preview_out[i * 2 + c]
                     } else {
                         0.0
                     };
@@ -14432,6 +14664,8 @@ impl Renderer {
             if let Some(seg) = out.get_mut(done * dev_ch..(done + n) * dev_ch) {
                 self.shared.hw.fold(seg, dev_ch, n);
             }
+            // The click's rings move past the chunk, every read of it done.
+            self.click_hold.written += n as u64;
             done += n;
         }
         self.gain_coeff = desk_coeff;
@@ -15432,11 +15666,33 @@ impl Renderer {
             // would be had the flag landed a moment later. The ring still
             // drains.
             if self.spine.capturing.contains(input) && self.motor_at_speed {
+                // **The take's first rolling frame carries a mark**
+                // (`capture_mark`): the song frame it is and what the
+                // speakers were held back by, so the host places the take
+                // where it was played against what was heard
+                // (`take_placement`). Whatever the tee writes before the
+                // transport rolls stands before that frame, as it did in time.
+                // Only on a chunk that rolls and brings frames, and taken down
+                // only when the mark is written: a full ring drops the chunk,
+                // mark and all, and the next chunk marks itself.
+                let (word, bit) = (input / 64, 1u64 << (input % 64));
+                let mark = rolling
+                    && n > 0
+                    && self.shared.arr_mark.get(word).is_some_and(|w| w.load(Ordering::Acquire) & bit != 0);
                 // **The pick's ring on the spine** (design 7.4, `Capture`):
                 // the host swaps it by `Engine::set_capture_ring`, which the
                 // callback refuses while this pick's capture runs.
                 if let Some(tx) = self.spine.captures.get_mut(input).and_then(Option::as_mut) {
-                    if tx.slots() >= n * 2 {
+                    let need = n * 2 + if mark { CAPTURE_MARK_LEN } else { 0 };
+                    if tx.slots() >= need {
+                        if mark {
+                            for v in capture_mark(at, self.click_hold.room_hold) {
+                                let _ = tx.push(v);
+                            }
+                            if let Some(w) = self.shared.arr_mark.get(word) {
+                                w.fetch_and(!bit, Ordering::AcqRel);
+                            }
+                        }
                         for i in 0..n {
                             for c in 0..2 {
                                 let col = dev_col(c.min(width - 1));
@@ -16452,6 +16708,90 @@ impl Renderer {
         self.shared
             .total_latency
             .store(max.saturating_add(master), Ordering::Relaxed);
+    }
+
+    /// **The master insert's knobs**, as the master's own chain, the
+    /// speakers' copy of it and the click's hold (`aim_click`) are handed
+    /// them: the four that are inserts, the four sends at rest.
+    fn master_sends(&self) -> crate::effects::Sends {
+        crate::effects::Sends {
+            reverb: 0.0,
+            delay: 0.0,
+            chorus: 0.0,
+            phaser: 0.0,
+            hpf: Shared::f32_of(&self.shared.hpf_mix),
+            lpf: Shared::f32_of(&self.shared.lpf_mix),
+            gain: Shared::f32_of(&self.shared.gain_mix),
+            limiter: Shared::f32_of(&self.shared.limiter_mix),
+        }
+    }
+
+    /// **Aim the click's reads at where each destination hears the mix this
+    /// chunk** (`ClickHold`), and answer how late the go is heard after it
+    /// is made.
+    ///
+    /// Every term is one the engine itself adds between the song's clock and
+    /// the way out, each worked out here from the code that pays it:
+    ///
+    /// - **The alignment target**, `Shared::max_latency`, as a plain lane
+    ///   waits it: every lane waits `max - own - folded` behind its own chain
+    ///   (`run_lane_pdc`), so the mix reaches the master that late, and no
+    ///   lane's line waits past [`MAX_PDC_FRAMES`].
+    /// - **The master's two racks**, the second then the original
+    ///   (`run_insert_chain` on `MASTER_EXTRA_SEAT` and `LEGACY_STRIPS`), on
+    ///   the take's mix always and on the speakers' while the two are one mix.
+    ///   The speakers' own mix (`room_live`) is taken off before them and
+    ///   passes neither.
+    /// - **The limiter's lookahead**, 58 frames at 48 kHz while it is in
+    ///   circuit (`Effects::lookahead`, asked as the master's chain will be
+    ///   called this chunk, landed or not). The speakers' own copy of the
+    ///   chain looks nowhere ahead (`Effects::new_live`).
+    ///
+    /// **Less the click's own rack**, which the click pays before any of
+    /// them; a rack that pays more than the hold leaves the click late by the
+    /// difference, since the click never holds the desk back. The Return 0
+    /// send is taken before that rack, so it waits the target alone, where
+    /// the lanes' own sends arrive; a bus's send waits the target less the
+    /// bus's own way out (`gather_node`), read with what is kept here.
+    fn aim_click(&mut self, landed: bool) -> usize {
+        let frozen = &self.spine.ext.desk.frozen;
+        let lat = |seat: usize| Rack::latency(&self.shared, frozen, seat) as usize;
+        let target = (self.shared.max_latency.load(Ordering::Relaxed) as usize).min(MAX_PDC_FRAMES);
+        let racks = lat(MASTER_EXTRA_SEAT).saturating_add(lat(LEGACY_STRIPS));
+        let own = lat(Strip::Click.index())
+            .saturating_add(lat(tangent_ui::desk_legacy::bus_extra_seat(Strip::Click.index())));
+        let ahead = self.master_effects.lookahead(self.master_sends(), landed);
+        let take = target.saturating_add(racks).saturating_add(ahead);
+        let room = if self.room_live { target } else { take };
+        let at = self.click_hold.written;
+        let hold = &mut self.click_hold;
+        hold.room.aim(room.saturating_sub(own).min(ClickHold::MOST), at);
+        hold.take.aim(take.saturating_sub(own).min(ClickHold::MOST), at);
+        hold.fx.aim(target.min(ClickHold::MOST), at);
+        hold.target = target;
+        hold.own = own;
+        hold.room_hold = room;
+        self.shared.room_hold.store(u32::try_from(room).unwrap_or(u32::MAX), Ordering::Relaxed);
+        self.click_hold.room.hold.saturating_add(own)
+    }
+
+    /// **A record's anchor, written by the first chunk that rolls after the
+    /// host asked for one** (`Shared::rec_req`): the song frame the chunk
+    /// starts on, the instant on the host's clock the chunk's first frame
+    /// stands for, which is what a live note is placed against
+    /// (`collect_notes`), and the speakers' hold, then the generation,
+    /// Release, so a host that Acquires it reads the three it names.
+    fn note_record_anchor(&mut self, at: u64, rolling: bool, block_start: Nanos) {
+        let req = self.shared.rec_req.load(Ordering::Acquire);
+        if !rolling || req == self.rec_seen {
+            return;
+        }
+        self.rec_seen = req;
+        self.shared.rec_frame.store(at, Ordering::Relaxed);
+        self.shared.rec_ns.store(block_start, Ordering::Relaxed);
+        let hold = u32::try_from(self.click_hold.room_hold).unwrap_or(u32::MAX);
+        self.shared.rec_hold.store(hold, Ordering::Relaxed);
+        self.shared.rec_gen.store(req, Ordering::Release);
     }
 
     /// The mute mask with automation folded in.
@@ -22129,7 +22469,7 @@ impl Renderer {
             return false;
         };
         let live = {
-            let LaneBody { post, row_gate, .. } = boxed.body_mut();
+            let LaneBody { post, row_gate, click_read, .. } = boxed.body_mut();
             for c in post.iter_mut().take(TAP_CHANNELS) {
                 c[..frames].fill(0.0);
             }
@@ -22235,9 +22575,24 @@ impl Renderer {
                     };
                     match (s.from, src) {
                         (PlanSendFrom::Click, _) => {
+                            // **Held for what this bus's way out does not
+                            // pay of the target** (`ClickHold`), as a lane's
+                            // send waits for it (`run_lane_pdc`'s tap), less
+                            // the click's own rack: what the bus sends on
+                            // lands with the lanes' and with the click's dry
+                            // copy. A bus only the click feeds and the target
+                            // does not cover still pays its own lookahead,
+                            // because the click never holds the desk back.
+                            let hold = &self.click_hold;
+                            let wait = hold
+                                .target
+                                .saturating_sub(self.node_pay(rank as u32) as usize)
+                                .saturating_sub(hold.own)
+                                .min(ClickHold::MOST);
+                            click_read.aim(wait, hold.written);
                             // The click is one voice on both sides.
                             for f in 0..frames {
-                                let v = self.click_out.get(f).copied().unwrap_or(0.0) * level;
+                                let v = ClickHold::read(&hold.out, click_read, hold.written, f) * level;
                                 post[0][f] += v;
                                 post[1][f] += v;
                             }
@@ -23593,6 +23948,85 @@ pub type MonitorTap = (Consumer<f32>, u16, Box<[u8]>, u32, tangent_record::audio
 struct HostCapture {
     rx: Option<Consumer<f32>>,
     leaving: bool,
+    /// **A take's mark read so far** (`capture_mark`): the values after its
+    /// NaN that have arrived, and how many. A drain can meet the tee between
+    /// two of its pushes, so a mark may arrive over two drains; it is reset
+    /// whenever the pick's capture flag is raised (`set_capturing`).
+    mark: Cell<(u8, [f32; CAPTURE_MARK_LEN - 1])>,
+}
+
+/// **Where a take's first rolling frame stands**, read out of its capture
+/// ring by `Engine::drain_capture` (`capture_mark`): which frame of what was
+/// drained it is (`at`, counted from the start of the drained buffer), the
+/// song frame it was captured on, and what the speakers were held back by
+/// then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureMark {
+    pub at: usize,
+    pub frame: u64,
+    pub hold: u32,
+}
+
+/// **Where a take lands, and how much of its head goes**: the song frame of
+/// the first frame kept, and how many frames are cut off the front. See
+/// [`take_placement`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakePlace {
+    pub start: u64,
+    pub trim: usize,
+}
+
+/// **Where a recorded take is placed: on the song frame the player was
+/// hearing when each of its frames arrived** (the owner's ruling of
+/// 2026-10-19).
+///
+/// The tee captures on the song's clock, and the speakers play the song held
+/// back by the alignment target and the master chain (`ClickHold`), so a
+/// part played in time with the backing arrives that hold after the song
+/// frame it was played to. The mark (`CaptureMark`) says which song frame
+/// the take's first rolling frame was captured on, how many frames the tee
+/// wrote before it (the frames between the press and the roll, which stand
+/// before it in time as in the file), and the hold the speakers played at
+/// then, so frame `k` of the take lands on song frame `mark.frame - mark.at +
+/// k - mark.hold`. The hold at the take's first rolling frame places the
+/// whole take: a hold that moves while it records moves nothing already
+/// placed. The interface's own round trip (its buffers, its converters) is
+/// not the engine's and is not taken off, as before.
+///
+/// **Nothing lands before the song's start**: the frames that would are cut
+/// (`trim`), which is the hold and the frames before the roll on a record
+/// from 0:00, and the take starts at 0:00. `None` for a take with no mark,
+/// one whose transport never rolled, which the host places where the record
+/// was pressed, as before.
+pub fn take_placement(mark: Option<CaptureMark>, frames: usize) -> Option<TakePlace> {
+    let m = mark?;
+    let first = i128::from(m.frame) - m.at as i128 - i128::from(m.hold);
+    Some(if first >= 0 {
+        TakePlace { start: first as u64, trim: 0 }
+    } else {
+        TakePlace { start: 0, trim: usize::try_from(-first).unwrap_or(usize::MAX).min(frames) }
+    })
+}
+
+/// **A record's anchor on the song** (`Shared::rec_req`): the song frame the
+/// first chunk that rolled after the press started on, the instant on the
+/// host's clock that frame stood for, and the speakers' hold then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordAnchor {
+    pub frame: u64,
+    pub ns: Nanos,
+    pub hold: u32,
+}
+
+/// **The song second a note played at host instant `t` was played
+/// against**: the song where the engine places a live note stamped `t`
+/// (`collect_notes`, against the anchor chunk's own instant), less the hold
+/// the speakers played the backing at. A note played on the beat the player
+/// heard lands on it; the interface's latency is not taken off, as for
+/// audio (`take_placement`).
+pub fn record_song_s(anchor: RecordAnchor, t: Nanos, rate: f64) -> f64 {
+    let rate = rate.max(1.0);
+    (anchor.frame as f64 - f64::from(anchor.hold)) / rate + (t - anchor.ns) as f64 / 1e9
 }
 
 /// **Stem taps in flight at once**, either way: see the rings in
@@ -25169,6 +25603,8 @@ impl Engine {
             click_out: vec![0.0; MAX_BLOCK as usize],
             preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
+            click_hold: ClickHold::new(),
+            rec_seen: 0,
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -28077,9 +28513,17 @@ impl Engine {
         for &p in on.difference(&want) {
             let (w, b) = bit(p);
             self.shared.arr_capture[w].fetch_and(!b, Ordering::Release);
+            self.shared.arr_mark[w].fetch_and(!b, Ordering::Release);
         }
         for &p in want.difference(&on) {
             let (w, b) = bit(p);
+            // **The mark is owed before the flag goes up** (`arr_mark`), and
+            // whatever of an earlier mark was read is forgotten: the tee
+            // that sees this flag sees the mark asked for.
+            if let Some(c) = self.captures.get(&p) {
+                c.mark.set(Default::default());
+            }
+            self.shared.arr_mark[w].fetch_or(b, Ordering::Release);
             self.shared.arr_capture[w].fetch_or(b, Ordering::Release);
         }
         *on = want;
@@ -28093,13 +28537,61 @@ impl Engine {
 
     /// Drain one pick's captured frames (interleaved stereo) into `out`.
     /// Nothing for a pick with no ring.
-    pub fn drain_capture(&mut self, pick: PickId, out: &mut Vec<f32>) {
-        let Some(rx) = self.captures.get_mut(&pick.0).and_then(|c| c.rx.as_mut()) else {
-            return;
-        };
+    ///
+    /// **And the take's mark, read out of the stream** (`capture_mark`): its
+    /// values never reach `out`, and the first mark this drain completes is
+    /// handed back, its `at` counted in frames of `out` (whatever `out`
+    /// already held, then what this drain added before the mark).
+    pub fn drain_capture(&mut self, pick: PickId, out: &mut Vec<f32>) -> Option<CaptureMark> {
+        let c = self.captures.get_mut(&pick.0)?;
+        let rx = c.rx.as_mut()?;
+        let (mut got, mut vals) = c.mark.get();
+        let mut found = None;
         while let Ok(v) = rx.pop() {
-            out.push(v);
+            if got > 0 {
+                vals[usize::from(got) - 1] = v;
+                if usize::from(got) == CAPTURE_MARK_LEN - 1 {
+                    got = 0;
+                    let [hi, lo, hold] = vals;
+                    let frame = ((hi as u64) << 24) | lo as u64;
+                    found.get_or_insert(CaptureMark { at: out.len() / 2, frame, hold: hold as u32 });
+                } else {
+                    got += 1;
+                }
+            } else if v.is_nan() {
+                got = 1;
+            } else {
+                out.push(v);
+            }
         }
+        c.mark.set((got, vals));
+        found
+    }
+
+    /// **Ask for a record's anchor** (`Shared::rec_req`): the first chunk
+    /// that rolls from now writes it. Answers the generation to ask
+    /// [`Engine::record_anchor`] for.
+    pub fn request_record_anchor(&self) -> u64 {
+        self.shared.rec_req.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// **The anchor asked for as `gen`**, once the engine has written it,
+    /// and only it: an anchor written for an older press is no answer.
+    pub fn record_anchor(&self, gen: u64) -> Option<RecordAnchor> {
+        if self.shared.rec_gen.load(Ordering::Acquire) != gen {
+            return None;
+        }
+        Some(RecordAnchor {
+            frame: self.shared.rec_frame.load(Ordering::Relaxed),
+            ns: self.shared.rec_ns.load(Ordering::Relaxed),
+            hold: self.shared.rec_hold.load(Ordering::Relaxed),
+        })
+    }
+
+    /// **What the speakers are held back by**, frames, as the last chunk had
+    /// it (`ClickHold`).
+    pub fn room_hold(&self) -> u32 {
+        self.shared.room_hold.load(Ordering::Relaxed)
     }
 
     /// **Frames the capture tee had to drop** because a pick's ring was full:
@@ -28177,7 +28669,7 @@ impl Engine {
         if self.ops_tx.borrow_mut().push(op).is_err() {
             return Err(EngineBusy::Busy);
         }
-        self.captures.insert(pick.0, HostCapture { rx: Some(rx), leaving: false });
+        self.captures.insert(pick.0, HostCapture { rx: Some(rx), leaving: false, mark: Default::default() });
         Ok(())
     }
 
@@ -28831,7 +29323,7 @@ impl Engine {
                 c.leaving = true;
             }
         } else {
-            self.captures.insert(pick.0, HostCapture { rx: None, leaving: false });
+            self.captures.insert(pick.0, HostCapture { rx: None, leaving: false, mark: Default::default() });
         }
         Ok(())
     }
@@ -32380,6 +32872,8 @@ mod tests {
             click_out: vec![0.0; MAX_BLOCK as usize],
             preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
+            click_hold: ClickHold::new(),
+            rec_seen: 0,
             fx_return_gain: 1.0,
             clips: Vec::new(),
             midi_clips: Vec::new(),
@@ -47257,19 +47751,64 @@ mod slot_engine {
             col.chunks_exact(2).position(|f| f[0].abs() > 1e-4 || f[1].abs() > 1e-4)
         }
 
-        /// **The click pays a bus that looks ahead as it pays its own rack:
-        /// uncompensated, and holding the desk back for nothing** (W6's
-        /// leftover, proved and pinned rather than changed). The click is a
-        /// cue: it is summed after the master, at once, so the beat is heard
-        /// when it falls, and nothing it passes through is made up for, its
-        /// own rack's lookahead included. Its send into bus 40 is that rule
-        /// again: what it sends reaches the bus at once, the bus's lookahead
-        /// delays it by exactly the bus's figure, and the desk's alignment
-        /// target stays the channels' (none, on this desk). Giving the click a
-        /// rank would hold its beat back behind the mix it is a cue for.
+        /// **The click's send through a bus that looks ahead lands with its
+        /// dry copy and with the mix wherever the desk is held for it; a bus
+        /// only the click feeds still pays its own lookahead, and holds the
+        /// desk back for nothing** (the owner's ruling of 2026-10-19 on W6's
+        /// leftover, which pinned the second half alone).
+        ///
+        /// The click is a cue: summed after the master, and never in the
+        /// desk's alignment target. It is held to the mix now (`ClickHold`),
+        /// and its send into a bus waits for what that bus's way out does not
+        /// pay of the target (`gather_node`), as a lane's send does
+        /// (`run_lane_pdc`'s tap). So on a desk held 1,200 frames, with lane 1
+        /// sending an impulse on beat two into bus 40 and its denoise looking
+        /// ahead, the click's attack leaves the bus 30 frames after lane 1's
+        /// beat, as it is heard 30 frames after it in the master, its dry copy
+        /// and its wet together: it left the bus 1,056 frames early. With only
+        /// the click sending to bus 40 and nothing holding the desk, the target
+        /// stays the channels' (none), and the click through the bus is late
+        /// by exactly the bus's lookahead, as it always was: the click never
+        /// holds the desk back.
         #[test]
-        fn the_click_pays_a_lookahead_bus_uncompensated() {
-            let render = |ahead: bool| -> (Vec<f32>, u32, u32) {
+        fn the_clicks_send_through_a_lookahead_bus_lands_with_the_mix_where_the_desk_is_held() {
+            // Held, lane 1 sending its beat into bus 40 beside the click.
+            let held = |click: bool| -> (Vec<f32>, Vec<f32>, u32, u32) {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.sends = vec![
+                    InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 1.0, pre: false },
+                    send(1, 40, 1.0, false),
+                ];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                fake_hold(&mut e, 1_200);
+                e.set_clips_slotted(vec![impulse_at(&e, 1, BEAT_TWO)]);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(click);
+                e.set_metronome_gain(1.0);
+                let (master, stems) = roll(&mut e, 60);
+                let bays: u32 = (0..INSERTS)
+                    .filter_map(|b| e.shared.seat_cell(SeatKind::Latency, lane_seat(40, CHAIN_OWN) * INSERTS + b))
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .sum();
+                (master, column(&stems, e.stem_frame_width() / 2, 40), e.shared.max_latency.load(Ordering::Relaxed), bays)
+            };
+            let (quiet_master, quiet_bus, max, lat) = held(false);
+            assert!(lat > 100 && lat < 1_200, "fixture: the bus does not look ahead less than the desk is held ({lat})");
+            assert_eq!(max, 1_200, "fixture: the desk is not held");
+            let (click_master, click_bus, _, _) = held(true);
+            let beat = peak_at(&quiet_bus);
+            assert_eq!(beat, BEAT_TWO + 1_200, "fixture: lane 1's send leaves the bus at {beat}");
+            let wet = onset_from(&less(&click_bus, &quiet_bus), BEAT_TWO - 100, CROSS).expect("the click never reached the bus");
+            assert_eq!(wet, beat + ATTACK, "the click left the bus at {wet}, lane 1's beat at {beat}");
+            // Its dry copy: what the click adds to the master less what it
+            // adds through the bus.
+            let dry = less(&less(&click_master, &quiet_master), &less(&click_bus, &quiet_bus));
+            let heard = onset_from(&dry, BEAT_TWO - 100, CROSS).expect("the click is not heard");
+            assert_eq!(heard, beat + ATTACK, "the click's dry copy is heard at {heard}, lane 1's beat at {beat}");
+            // Only the click sending, nothing holding the desk.
+            let alone = |ahead: bool| -> (Vec<f32>, u32, u32) {
                 let mut e = wide(41);
                 let mut inputs = bus_plan(&e, 41, &[40]);
                 inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 1.0, pre: false }];
@@ -47286,14 +47825,14 @@ mod slot_engine {
                     .sum();
                 (column(&stems, e.stem_frame_width() / 2, 40), e.shared.max_latency.load(Ordering::Relaxed), bays)
             };
-            let (plain, _, _) = render(false);
-            let (ahead, max, lat) = render(true);
+            let (plain, _, _) = alone(false);
+            let (ahead, max, lat) = alone(true);
             assert!(lat > 100, "fixture: the bus does not look ahead ({lat})");
             assert_eq!(max, 0, "the click's send held the desk back");
             let (Some(at), Some(late)) = (onset(&plain), onset(&ahead)) else {
                 panic!("the click never reached the bus");
             };
-            assert_eq!(late, at + lat as usize, "the click through the bus is not late by exactly the bus's lookahead");
+            assert_eq!(late, at + lat as usize, "the click through a bus only it feeds is not late by exactly the bus's lookahead");
         }
 
         /// **A track in a folder that is also routed into a bus is summed by
@@ -47421,14 +47960,35 @@ mod slot_engine {
             }
         }
 
-        /// **The click pays a bus that looks ahead uncompensated at every
+        /// **The click's send through a bus that looks ahead lands with the
+        /// mix where the desk is held, and pays a bus only it feeds, at every
         /// width, as with the bus on lane 1** (item 6 at the width slots: the
-        /// pin above holds bus 40 only). The click sent into the lookahead
-        /// bus at each subject in turn: late by exactly the bus's lookahead,
-        /// the desk held back by nothing, on lane 1's frames.
+        /// pin above holds bus 40 only). The lookahead bus at each subject in
+        /// turn: on a desk held 1,200 frames, lane 150 sending its beat into
+        /// it beside the click, the click leaves the bus 30 frames after lane
+        /// 150's beat; with the click alone sending and nothing holding the
+        /// desk, late by exactly its lookahead, the desk held back by nothing.
+        /// Both on lane 1's frames.
         #[test]
-        fn the_click_pays_a_lookahead_bus_uncompensated_at_every_width() {
-            let render = |bus: usize, ahead: bool| -> (Vec<f32>, u32, u32) {
+        fn the_clicks_send_through_a_lookahead_bus_lands_with_the_mix_where_the_desk_is_held_at_every_width() {
+            let held = |bus: usize, click: bool| -> (Vec<f32>, u32) {
+                let mut e = wide(SPAN);
+                let mut inputs = bus_plan(&e, SPAN, &[bus]);
+                inputs.sends = vec![
+                    InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(bus as u32)), level: 1.0, pre: false },
+                    send(150, bus, 1.0, false),
+                ];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, bus, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                fake_hold(&mut e, 1_200);
+                e.set_clips_slotted(vec![impulse_at(&e, 150, BEAT_TWO)]);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(click);
+                e.set_metronome_gain(1.0);
+                let (_, stems) = roll(&mut e, 60);
+                (column(&stems, e.stem_frame_width() / 2, bus), e.shared.max_latency.load(Ordering::Relaxed))
+            };
+            let alone = |bus: usize, ahead: bool| -> (Vec<f32>, u32, u32) {
                 let mut e = wide(SPAN);
                 let mut inputs = bus_plan(&e, SPAN, &[bus]);
                 inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(bus as u32)), level: 1.0, pre: false }];
@@ -47447,16 +48007,22 @@ mod slot_engine {
             };
             let mut reference = None;
             for bus in WIDE {
-                let (plain, _, _) = render(bus, false);
-                let (ahead, max, lat) = render(bus, true);
+                let (quiet, max) = held(bus, false);
+                assert_eq!(max, 1_200, "fixture: bus {bus}'s desk is not held");
+                let (clicked, _) = held(bus, true);
+                let beat = peak_at(&quiet);
+                let wet = onset_from(&less(&clicked, &quiet), BEAT_TWO - 100, CROSS).unwrap_or_else(|| panic!("the click never reached bus {bus}"));
+                assert_eq!(wet, beat + ATTACK, "the click left bus {bus} at {wet}, lane 150's beat at {beat}");
+                let (plain, _, _) = alone(bus, false);
+                let (ahead, max, lat) = alone(bus, true);
                 assert!(lat > 100, "fixture: bus {bus} does not look ahead ({lat})");
                 assert_eq!(max, 0, "the click's send into bus {bus} held the desk back");
                 let (Some(at), Some(late)) = (onset(&plain), onset(&ahead)) else {
                     panic!("the click never reached bus {bus}");
                 };
-                assert_eq!(late, at + lat as usize, "the click through bus {bus} is not late by exactly its lookahead");
-                let lane_1 = *reference.get_or_insert((at, late));
-                assert_eq!((at, late), lane_1, "the click through bus {bus} lands on other frames than through bus 1");
+                assert_eq!(late, at + lat as usize, "the click through bus {bus} alone is not late by exactly its lookahead");
+                let lane_1 = *reference.get_or_insert((beat, wet, at, late));
+                assert_eq!((beat, wet, at, late), lane_1, "the click through bus {bus} lands on other frames than through bus 1");
             }
         }
 
@@ -47794,6 +48360,806 @@ mod slot_engine {
                     assert_eq!(at, None, "{road:?}: an input's {bad} left the speakers non-finite from sample {at:?}");
                     assert!(db.abs() < 0.5, "{road:?}: an input's {bad} left the speakers {db:.2} dB off: the reverb stopped playing");
                 }
+            }
+        }
+
+
+        // ── delay compensation as the player hears it (the owner's ruling of 2026-10-19) ──
+
+        /// Beat two at 120 BPM and 48 kHz, where the backing's impulse stands.
+        const BEAT_TWO: usize = 24_000;
+
+        /// The click's attack against its beat: where the click sample first
+        /// passes `CROSS` after the frame it is triggered on.
+        const ATTACK: usize = 30;
+
+        /// The level an onset is read at.
+        const CROSS: f32 = 1e-3;
+
+        /// The first frame from `from` on whose either side passes `level`.
+        fn onset_from(col: &[f32], from: usize, level: f32) -> Option<usize> {
+            col.chunks_exact(2).enumerate().skip(from).find(|(_, f)| f[0].abs() > level || f[1].abs() > level).map(|(i, _)| i)
+        }
+
+        /// `a - b`, sample by sample: what one render has that its twin has
+        /// not. A Tape on a silent lane still hisses, and the same Tape hisses
+        /// the same in both, so the difference is the one thing that differs.
+        fn less(a: &[f32], b: &[f32]) -> Vec<f32> {
+            a.iter().zip(b).map(|(x, y)| x - y).collect()
+        }
+
+        /// **A unit impulse as an IR's file**: the convolver is then an
+        /// honest wire, 512 frames late (`units::convolver`), wherever it is
+        /// put. Written once per process, as the IR bay's own test writes its
+        /// fixture.
+        fn wire_ir() -> Vec<u8> {
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::IR_PATH).expect("the IR");
+            let mut frames = vec![0.0f32; 512 * 2];
+            frames[0] = 1.0;
+            frames[1] = 1.0;
+            let mut wav = Vec::new();
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&0u32.to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&3u16.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&48_000u32.to_le_bytes());
+            wav.extend_from_slice(&0u32.to_le_bytes());
+            wav.extend_from_slice(&0u16.to_le_bytes());
+            wav.extend_from_slice(&32u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&((frames.len() * 4) as u32).to_le_bytes());
+            for s in &frames {
+                wav.extend_from_slice(&s.to_le_bytes());
+            }
+            let path = std::env::temp_dir().join(format!("tangent-pdc-wire-{}.wav", std::process::id()));
+            std::fs::write(&path, &wav).expect("the temp WAV writes");
+            crate::builtin_fx::state_text(spec, &spec.defaults(), &[("ir_path".to_owned(), path.display().to_string())]).into_bytes()
+        }
+
+        /// **The desks the mix is held back on**, and what holds it.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Held {
+            /// Nothing: the base every other desk is measured against.
+            Bare,
+            /// A Tape in the studio range on silent lane 2: 96 frames.
+            Studio,
+            /// A Tape in the deep wow range on silent lane 2: 1,200 frames.
+            Deep,
+            /// An IR with an impulse loaded on silent lane 2: 512 frames.
+            Ir,
+            /// The same IR across the master: 512 frames on the master's way
+            /// out, none in the desk's target.
+            MasterIr,
+            /// The limiter in circuit at the shipped ceiling: its 58 frames of
+            /// lookahead on the master's own chain.
+            Limiter,
+        }
+
+        impl Held {
+            const ALL: [Held; 6] = [Held::Bare, Held::Studio, Held::Deep, Held::Ir, Held::MasterIr, Held::Limiter];
+
+            /// Put what holds the desk back onto `e`.
+            fn hold(self, e: &mut Engine) {
+                use crate::builtin_fx::{IR_PATH, TAPE_PATH};
+                match self {
+                    Held::Bare => {}
+                    Held::Studio => unit(e, 2, 0, 0, TAPE_PATH, None),
+                    Held::Deep => unit(e, 2, 0, 0, TAPE_PATH, Some(knobs(TAPE_PATH, &[(9, 1.0)]))),
+                    Held::Ir => unit(e, 2, 0, 0, IR_PATH, Some(wire_ir())),
+                    Held::MasterIr => {
+                        e.load_insert_at(RackAddr { owner: RackOwner::Master, rack: 0 }, 0, Some(Path::new(IR_PATH)), Some(&wire_ir()))
+                            .expect("the IR loads")
+                            .expect("and seats");
+                    }
+                    Held::Limiter => e.set_effects(crate::effects::Sends {
+                        limiter: tangent_ui::recorder::LIMITER_SHIPS_AT,
+                        ..crate::effects::Sends::default()
+                    }),
+                }
+            }
+
+            /// **Where beat two of the song is heard**: in the speakers'
+            /// own mix (`split`, an input heard in the room) the target alone,
+            /// and in the take, or in the speakers while the two are one mix,
+            /// the target and the master's chain. These are the numbers the
+            /// CHANGELOG quotes.
+            fn beat_two(self, split: bool, take: bool) -> usize {
+                let target = match self {
+                    Held::Studio => 96,
+                    Held::Deep => 1_200,
+                    Held::Ir => 512,
+                    _ => 0,
+                };
+                let master = match self {
+                    Held::MasterIr => 512,
+                    Held::Limiter => 58,
+                    _ => 0,
+                };
+                BEAT_TWO + target + if split && !take { 0 } else { master }
+            }
+        }
+
+        /// **A held desk at 120 BPM**: lane 1 carries the backing's impulse
+        /// on beat two when `backing`, the click sounds when `click` (and is
+        /// in the take), lane 3 is an armed input, plugged and heard when
+        /// `split` so the speakers take their own mix. Answers the input's
+        /// device end when plugged.
+        fn held_desk(held: Held, click: bool, backing: bool, split: bool) -> (Engine, Option<Producer<f32>>) {
+            let mut e = wide(42);
+            let mut inputs = bus_plan(&e, 42, &[]);
+            inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+            e.publish_plan(&inputs).expect("the plan goes");
+            held.hold(&mut e);
+            e.set_tempo(120.0);
+            e.set_metronome_enabled(click);
+            e.set_metronome_gain(1.0);
+            e.set_metronome_in_take(true);
+            if backing {
+                e.set_clips_slotted(vec![impulse_at(&e, 1, BEAT_TWO)]);
+            }
+            let tx = split.then(|| {
+                let tx = plug(&mut e, 3);
+                e.set_monitor_on(true);
+                tx
+            });
+            (e, tx)
+        }
+
+        /// Roll `blocks` from 0:00, silence into the input if one is plugged:
+        /// the speakers' output and the take.
+        fn roll_held(e: &mut Engine, tx: &mut Option<Producer<f32>>, blocks: usize) -> (Vec<f32>, Vec<f32>) {
+            let mut tap = e.take_recorder_tap().expect("the take's tap");
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let (mut room, mut take) = (Vec::new(), Vec::new());
+            for _ in 0..blocks {
+                if let Some(tx) = tx.as_mut() {
+                    for _ in 0..BLOCK {
+                        let _ = tx.push(0.0);
+                    }
+                }
+                e.render_offline(&mut out);
+                room.extend_from_slice(&out);
+                tap.drain(&mut take);
+            }
+            (room, take)
+        }
+
+        /// **The click is heard on the frame the mix's beat is, on every
+        /// desk, in the room and in the take** (the owner's ruling of
+        /// 2026-10-19: delay compensation done properly).
+        ///
+        /// The lanes wait for the desk's alignment target, and the master's
+        /// racks and its limiter hold the mix back further on its way out; the
+        /// click is made on the song's clock and summed after the master, so it
+        /// led the mix by every frame of that, 1,200 with a deep-range Tape on
+        /// a silent lane. It is held to each destination's mix now
+        /// (`ClickHold`): its attack is as far from the backing's beat on every
+        /// desk as on a bare one, 30 frames, with a Tape in either range or an
+        /// IR on a lane, an IR across the master, and the limiter in circuit,
+        /// in the speakers whether they share the take's mix or take their own
+        /// (which passes neither the master's racks nor its lookahead), and in
+        /// the take. Each heard beat is where the CHANGELOG says, so the hold
+        /// is pinned term by term. Each signal is its render less the desk's
+        /// silent twin, which takes a silent Tape's hiss out exactly.
+        #[test]
+        fn the_click_lands_on_the_mixs_beat_in_the_room_and_the_take_on_every_desk() {
+            const BLOCKS: usize = 60;
+            for held in Held::ALL {
+                for split in [false, true] {
+                    let render = |click: bool, backing: bool| {
+                        let (mut e, mut tx) = held_desk(held, click, backing, split);
+                        roll_held(&mut e, &mut tx, BLOCKS)
+                    };
+                    let (quiet_room, quiet_take) = render(false, false);
+                    let (click_room, click_take) = render(true, false);
+                    let (back_room, back_take) = render(false, true);
+                    for (dest, quiet, click, back) in [
+                        ("room", &quiet_room, &click_room, &back_room),
+                        ("take", &quiet_take, &click_take, &back_take),
+                    ] {
+                        let take = dest == "take";
+                        let beat = onset_from(&less(back, quiet), 0, CROSS)
+                            .unwrap_or_else(|| panic!("{held:?}, split {split}: the backing never reached the {dest}"));
+                        assert_eq!(beat, held.beat_two(split, take), "{held:?}, split {split}: the {dest} heard beat two at {beat}");
+                        let tick = onset_from(&less(click, quiet), BEAT_TWO - 100, CROSS)
+                            .unwrap_or_else(|| panic!("{held:?}, split {split}: the click never reached the {dest}"));
+                        assert_eq!(
+                            tick,
+                            beat + ATTACK,
+                            "{held:?}, split {split}: the {dest}'s click attacks at {tick}, {} frames off the beat it heard at {beat}",
+                            tick as i64 - (beat + ATTACK) as i64
+                        );
+                    }
+                }
+            }
+        }
+
+        /// **Where the backing's beat two is heard**, on a desk built by
+        /// `held_desk` with its input plugged: the frame a player playing to
+        /// it plays on.
+        fn heard_beat_two(held: Held) -> usize {
+            let (mut e, mut tx) = held_desk(held, false, false, true);
+            let (quiet, _) = roll_held(&mut e, &mut tx, 60);
+            let (mut e, mut tx) = held_desk(held, false, true, true);
+            let (back, _) = roll_held(&mut e, &mut tx, 60);
+            onset_from(&less(&back, &quiet), 0, CROSS).expect("the backing sounds")
+        }
+
+        /// **A record on lane 3's input, played to the backing**: the tee
+        /// opened `pre` blocks before the transport rolls from 0:00 (or, with
+        /// `punch`, the transport rolling `punch` blocks before the tee
+        /// opens), an impulse played into the input on the frame the backing's
+        /// beat two is heard, counted from the roll. Answers the take as the
+        /// host drained it and the mark its ring handed over.
+        fn record_to_the_backing(held: Held, pre: usize, punch: usize) -> (Vec<f32>, Option<CaptureMark>) {
+            let heard = heard_beat_two(held);
+            let (mut e, tx) = held_desk(held, false, true, true);
+            let mut tx = tx.expect("an input");
+            e.sync_capture_rings(&[PickId(0)]).expect("a ring");
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let mut took = Vec::new();
+            let mut mark = None;
+            let mut fed = 0usize;
+            let mut block = |e: &mut Engine, tx: &mut Producer<f32>, took: &mut Vec<f32>, mark: &mut Option<CaptureMark>, rolled: bool| {
+                for _ in 0..BLOCK {
+                    let _ = tx.push(if rolled && fed == heard { 0.5 } else { 0.0 });
+                    if rolled {
+                        fed += 1;
+                    }
+                }
+                e.render_offline(&mut out);
+                if let Some(m) = e.drain_capture(PickId(0), took) {
+                    mark.get_or_insert(m);
+                }
+            };
+            // The ring lands, and what it held before the record is let go.
+            block(&mut e, &mut tx, &mut took, &mut mark, false);
+            took.clear();
+            if punch == 0 {
+                e.set_capturing(&[PickId(0)]);
+                for _ in 0..pre {
+                    block(&mut e, &mut tx, &mut took, &mut mark, false);
+                }
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                for _ in 0..80 {
+                    block(&mut e, &mut tx, &mut took, &mut mark, true);
+                }
+            } else {
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                for _ in 0..punch {
+                    block(&mut e, &mut tx, &mut took, &mut mark, true);
+                }
+                let _ = e.drain_capture(PickId(0), &mut Vec::new());
+                e.set_capturing(&[PickId(0)]);
+                for _ in punch..80 {
+                    block(&mut e, &mut tx, &mut took, &mut mark, true);
+                }
+            }
+            e.set_capturing(&[]);
+            if let Some(m) = e.drain_capture(PickId(0), &mut took) {
+                mark.get_or_insert(m);
+            }
+            (took, mark)
+        }
+
+        /// **A take played in time with the backing is placed on the beat it
+        /// was played to** (the owner's ruling of 2026-10-19), through the
+        /// placement the host lays a take down by (`take_placement`): the
+        /// clip's start plus the frame within its file.
+        ///
+        /// The tee captures on the song's clock, and the speakers play the
+        /// song held back by the target, so an impulse played into the input
+        /// on the frame the backing's beat two is heard arrived that hold after
+        /// beat two: 1,200 frames with a deep-range Tape on a silent lane, and
+        /// it was placed there, where the record was pressed. The take's first
+        /// rolling frame is marked in its ring now (`capture_mark`), with the
+        /// speakers' hold, so the impulse lands on frame 24,000 on every desk:
+        /// recorded from 0:00 with the tee open as the transport rolls and
+        /// with three blocks of it open before (frames that stand before the
+        /// roll, as they did in time), and punched in while the song plays. A
+        /// master chain moves nothing here: an armed input splits the
+        /// speakers' mix from the take's, and theirs passes neither the
+        /// master's racks nor its lookahead.
+        #[test]
+        fn a_take_played_to_the_backing_is_placed_on_the_beat_it_was_played_to() {
+            for held in [Held::Bare, Held::Studio, Held::Deep, Held::Ir, Held::MasterIr, Held::Limiter] {
+                for (pre, punch) in [(0usize, 0usize), (3, 0), (0, 20)] {
+                    let (took, mark) = record_to_the_backing(held, pre, punch);
+                    let mark = mark.unwrap_or_else(|| panic!("{held:?}, pre {pre}, punch {punch}: the take was never marked"));
+                    let place = take_placement(Some(mark), took.len() / 2).expect("a mark places");
+                    let kept = &took[place.trim * 2..];
+                    let at = onset_from(kept, 0, 0.25).unwrap_or_else(|| panic!("{held:?}: the impulse is not in the take"));
+                    assert_eq!(
+                        place.start + at as u64,
+                        BEAT_TWO as u64,
+                        "{held:?}, pre {pre}, punch {punch}: the impulse played to beat two landed on frame {} (the clip at {}, the impulse {at} into it, mark {mark:?})",
+                        place.start + at as u64,
+                        place.start
+                    );
+                }
+            }
+        }
+
+        /// **A record from 0:00 on a held desk lands at 0:00, trimmed**
+        /// (`take_placement`): nothing is placed before the song's start, so
+        /// the frames that would be are cut, the tee's frames before the roll
+        /// and the speakers' hold after it, and the take starts at 0:00 with
+        /// the frame captured the hold after the roll, which is the frame the
+        /// player heard 0:00 on. A take that never rolled has no mark and is
+        /// placed where it was pressed, as before.
+        #[test]
+        fn a_record_from_the_top_of_a_held_desk_lands_at_the_top_trimmed() {
+            for held in [Held::Bare, Held::Deep, Held::Ir] {
+                for pre in [0usize, 3] {
+                    let (took, mark) = record_to_the_backing(held, pre, 0);
+                    let mark = mark.expect("a mark");
+                    let hold = held.beat_two(true, false) - BEAT_TWO;
+                    assert_eq!((mark.frame, mark.at, mark.hold as usize), (0, pre * BLOCK, hold), "{held:?}, pre {pre}: the mark");
+                    let place = take_placement(Some(mark), took.len() / 2).expect("a mark places");
+                    assert_eq!(place, TakePlace { start: 0, trim: pre * BLOCK + hold }, "{held:?}, pre {pre}: the cut");
+                }
+            }
+            assert_eq!(take_placement(None, 1_000), None, "a take that never rolled is placed by its mark");
+            let m = CaptureMark { at: 100, frame: 40, hold: 1_200 };
+            assert_eq!(take_placement(Some(m), 500), Some(TakePlace { start: 0, trim: 500 }), "a cut is never longer than the take");
+        }
+
+        /// **A note played in time with the backing is placed on the beat it
+        /// was played to** (the owner's ruling of 2026-10-19), through the
+        /// placement the host lays a MIDI part down by (`record_song_s`, which
+        /// `desktop::midi_take_span` calls).
+        ///
+        /// Notes are stamped on the host's clock against the press. The
+        /// engine's anchor says which song frame the first chunk that rolled
+        /// after the press stood on, and which instant (`note_record_anchor`),
+        /// and the hold the speakers played at; a note played the instant the
+        /// backing's beat two is heard is then placed on beat two, on every
+        /// desk, with the press three blocks before the roll. The renders here
+        /// carry the device's clock: each block's first frame is heard the
+        /// instant it is rendered for, so the instant a frame is heard is its
+        /// frame over the rate. Before the anchor the part was placed against
+        /// the press: late by the hold, and by the gap between the press and
+        /// the roll.
+        #[test]
+        fn a_note_played_to_the_backing_is_placed_on_the_beat_it_was_played_to() {
+            const RATE_HZ: f64 = 48_000.0;
+            let ns = |frame: usize| (frame as f64 / RATE_HZ * 1e9) as Nanos;
+            for held in [Held::Bare, Held::Studio, Held::Deep, Held::Ir, Held::MasterIr, Held::Limiter] {
+                let heard = heard_beat_two(held);
+                let (mut e, tx) = held_desk(held, false, true, true);
+                let mut tx = tx.expect("an input");
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let mut frame = 0usize;
+                let mut pass = |e: &mut Engine, tx: &mut Producer<f32>, frame: &mut usize| {
+                    for _ in 0..BLOCK {
+                        let _ = tx.push(0.0);
+                    }
+                    let at = ns(*frame);
+                    e.offline.as_mut().expect("a renderer").render(&mut out, at, at);
+                    *frame += BLOCK;
+                };
+                pass(&mut e, &mut tx, &mut frame);
+                let gen = e.request_record_anchor();
+                assert_eq!(e.record_anchor(gen), None, "{held:?}: an anchor before anything rolled");
+                for _ in 0..3 {
+                    pass(&mut e, &mut tx, &mut frame);
+                }
+                assert_eq!(e.record_anchor(gen), None, "{held:?}: an anchor while the transport stood");
+                let rolled = frame;
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                for _ in 0..60 {
+                    pass(&mut e, &mut tx, &mut frame);
+                }
+                let anchor = e.record_anchor(gen).unwrap_or_else(|| panic!("{held:?}: no anchor was written"));
+                assert_eq!((anchor.frame, anchor.ns), (0, ns(rolled)), "{held:?}: the anchor is not the roll's first frame");
+                let played = ns(rolled + heard);
+                let at = record_song_s(anchor, played, RATE_HZ);
+                assert!(
+                    (at * RATE_HZ - BEAT_TWO as f64).abs() < 1.0,
+                    "{held:?}: a note played the instant beat two was heard landed on frame {:.1}",
+                    at * RATE_HZ
+                );
+                assert_eq!(e.record_anchor(gen + 1), None, "{held:?}: an anchor answered a press it was not asked by");
+            }
+        }
+
+        /// The target a fake chain on lane 2's seat holds the desk at, with
+        /// no audio of its own: a plugin reporting `frames` and passing
+        /// silence.
+        fn fake_hold(e: &mut Engine, frames: u32) {
+            e.set_seat_latency_for_test(lane_seat(2, CHAIN_OWN), 0, frames);
+        }
+
+        /// **A count-in's go is heard with the mix's first beat on a held
+        /// desk, and the go it publishes is the instant it is heard** (the
+        /// owner's ruling of 2026-10-19).
+        ///
+        /// The count belongs to the keypress (`Beats`) and the song to the bar
+        /// clock; the host rolls the transport when the count says go
+        /// (`count_in_done`), and here it does so the instant it does, on the
+        /// pass the go lands on: a 480-frame pass puts the go of a four-beat
+        /// count at 120 BPM on a pass's first frame. The mix's first beat then
+        /// comes out of the desk the hold after the go is made, and the go is
+        /// held to it (`ClickHold`), so the two are heard together, on a bare
+        /// desk and held 96 and 1,200 frames: the go's attack 30 frames past
+        /// the backing's first beat, as every click's is past its beat. And
+        /// `count_in_downbeat_ns`, which the host reads as the beat the player
+        /// heard (a take's T0, the count's end), names the frame the go is
+        /// heard on, each pass's first frame heard the instant it is rendered.
+        /// It named the frame the go was made on, the hold early.
+        #[test]
+        fn a_count_ins_go_is_heard_with_the_mixs_first_beat_on_a_held_desk() {
+            const PASS: usize = 480;
+            const GO: usize = 4 * BEAT_TWO;
+            const RATE_HZ: f64 = 48_000.0;
+            let render = |count: bool, backing: bool, hold: u32| -> (Vec<f32>, Option<Nanos>) {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                fake_hold(&mut e, hold);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(false);
+                e.set_metronome_gain(1.0);
+                if backing {
+                    e.set_clips_slotted(vec![impulse_at(&e, 1, 0)]);
+                }
+                if count {
+                    e.start_count_in(4, 120.0);
+                }
+                let mut out = vec![0.0f32; PASS * 2];
+                let mut heard = Vec::new();
+                for k in 0..(GO + 2 * BEAT_TWO) / PASS {
+                    if k * PASS == GO {
+                        e.set_transport(1, 0);
+                        e.set_rolling(true);
+                    }
+                    let at = (k as f64 * PASS as f64 / RATE_HZ * 1e9) as Nanos;
+                    e.offline.as_mut().expect("a renderer").render(&mut out, at, at);
+                    heard.extend_from_slice(&out);
+                }
+                (heard, e.count_in_downbeat_ns())
+            };
+            // The go is the accent, whose attack is its own: as far past the
+            // beat on every desk as on a bare one.
+            let mut attack = None;
+            for hold in [0u32, 96, 1_200] {
+                let (count, go_ns) = render(true, false, hold);
+                let (back, _) = render(false, true, hold);
+                let beat = onset_from(&back, 0, CROSS).expect("the backing's first beat");
+                assert_eq!(beat, GO + hold as usize, "hold {hold}: fixture: the mix's first beat is heard at {beat}");
+                let go = onset_from(&count, GO - 100, CROSS).expect("the go");
+                let lead = *attack.get_or_insert(go as i64 - beat as i64);
+                assert!((0..40).contains(&lead), "fixture: the go's attack is {lead} frames past its beat");
+                assert_eq!(go as i64 - beat as i64, lead, "hold {hold}: the go attacks at {go}, the mix's first beat is heard at {beat}");
+                // To the nanosecond the conversion rounds to.
+                let want = (GO + hold as usize) as f64 / RATE_HZ * 1e9;
+                let got = go_ns.unwrap_or_else(|| panic!("hold {hold}: no go was published"));
+                assert!((got as f64 - want).abs() <= 1.0, "hold {hold}: the published go {got} is not the instant it is heard, {want}");
+            }
+        }
+
+        /// **The song's click waits for the tape on a held desk too** (the
+        /// owner's tape-motor ruling, `the_song_click_waits_for_the_tape`, on
+        /// a desk held 1,200 frames). The click is not on the tape: a beat
+        /// crossed while it spins up is dropped, and the first click is the
+        /// first beat line the tape crosses at speed. Held to the mix now, it is
+        /// heard the hold after the bare desk's 34,663 frames from the press,
+        /// within a pass. And Stop's coast across a beat line clicks nothing
+        /// after the pass that met the press: the hold carries no beat the
+        /// coast crossed.
+        #[test]
+        fn the_song_click_waits_for_the_tape_on_a_held_desk_too() {
+            use crate::motor::MotorShow;
+            use crate::transport::Transport;
+            const PASS: usize = 256;
+            let desk = || {
+                let mut e = Engine::offline(48_000, Timebase::new()).expect("an offline engine needs no device");
+                e.set_armed(0);
+                e.set_midi_off(u64::MAX);
+                e.set_tempo(120.0);
+                e.set_metronome_gain(1.0);
+                e.set_metronome_enabled(true);
+                fake_hold(&mut e, 1_200);
+                e.set_tape_motor(true, 0.5, 0.7);
+                e
+            };
+            let pass = |e: &mut Engine, t: &mut Transport| -> Vec<f32> {
+                t.push(Some(&*e));
+                let mut out = vec![0.0f32; PASS * 2];
+                e.render_offline(&mut out);
+                out
+            };
+            let mut e = desk();
+            let mut t = Transport::new();
+            for _ in 0..8 {
+                pass(&mut e, &mut t);
+            }
+            t.toggle_play();
+            let heard: Vec<f32> = (0..(40_000 + 1_200) / PASS + 8).flat_map(|_| pass(&mut e, &mut t)).collect();
+            assert_eq!(e.shared.max_latency.load(Ordering::Relaxed), 1_200, "fixture: the desk is not held");
+            let first = onset_from(&heard, 0, CROSS).expect("the click never sounded");
+            assert!(
+                (first as f64 - (34_663.0 + 1_200.0)).abs() <= PASS as f64,
+                "the first click came {first} frames after the press, not the hold after 34663"
+            );
+            let mut e = desk();
+            let mut t = Transport::new();
+            t.toggle_play();
+            for _ in 0..183 {
+                pass(&mut e, &mut t);
+            }
+            let press = e.transport_position();
+            assert!(press + PASS as u64 + 12958 > 2 * 24_000 && press + (PASS as u64) < 2 * 24_000, "the stop is not placed to cross a beat");
+            t.stop();
+            let mut after = Vec::new();
+            for k in 0..400 {
+                t.push(Some(&e));
+                let mut out = vec![0.0f32; PASS * 2];
+                e.render_offline(&mut out);
+                if k > 0 {
+                    after.extend_from_slice(&out);
+                }
+                if e.motor_show() == MotorShow::Holding {
+                    break;
+                }
+            }
+            assert_eq!(e.motor_show(), MotorShow::Holding, "the motor never came to rest");
+            let loud = after.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(loud < 1e-4, "the coast clicked: {loud}");
+        }
+
+        /// **A hold that moves mid-roll moves the click as it moves the
+        /// lanes**: it loses no beat the lanes keep, and doubles none.
+        ///
+        /// A lane's line empties when the desk's target moves (`DelayLine::run`):
+        /// what it held is never heard, and it is silent for its new wait
+        /// before it plays on. The click's reads start afresh the same way
+        /// (`HoldRead::aim`), so the click and a lane playing the click's own
+        /// sound, the same samples on the same beats, are one signal through
+        /// every move: the target from 96 frames to 1,200 at block 47, with
+        /// beat two's attack 64 frames before it and so inside the held
+        /// window, and back to 96 at block 141, with beat four's 192 frames
+        /// inside. The moves cost the lane something (it differs from its own
+        /// render with the target steady), and the click exactly that.
+        #[test]
+        fn a_hold_that_moves_mid_roll_moves_the_click_as_it_moves_the_lanes() {
+            const FRAMES: usize = 6 * 48_000;
+            let click = Click::load(48_000.0).expect("the click asset");
+            // The click track the bar clock plays at 120 BPM in 4/4, laid as a
+            // clip: the accent on each bar's one, the plain click on every
+            // other beat, each cut where the next begins.
+            let mut track = vec![0.0f32; FRAMES * 2];
+            for beat in 0..FRAMES / BEAT_TWO {
+                let s = if beat % 4 == 0 { &click.accent } else { &click.normal };
+                for (k, v) in s.iter().take(BEAT_TWO).enumerate() {
+                    let at = beat * BEAT_TWO + k;
+                    if at < FRAMES {
+                        track[at * 2] = *v;
+                        track[at * 2 + 1] = *v;
+                    }
+                }
+            }
+            let track = Arc::new(tangent_record::decode::Clip { samples: track, rate: 48_000, source: PathBuf::from("click-track.wav") });
+            let render = |as_click: bool, moves: bool| -> Vec<f32> {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                fake_hold(&mut e, 96);
+                e.set_tempo(120.0);
+                e.set_metronome_gain(1.0);
+                e.set_metronome_enabled(as_click);
+                if !as_click {
+                    let gen = e.lane_gen(Slot(1)).expect("a lane");
+                    e.set_clips_slotted(vec![SlotPlaced {
+                        slot: Slot(1),
+                        gen,
+                        placed: Placed { clip: Arc::clone(&track), strip: 0, start: 0, offset: 0, len: FRAMES as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                    }]);
+                    e.set_lane_levels(Slot(1), 1.0, 0.0, 0.0);
+                }
+                let mut out = vec![0.0f32; BLOCK * 2];
+                // Every slew settled before the roll.
+                for _ in 0..100 {
+                    e.render_offline(&mut out);
+                }
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut heard = Vec::new();
+                for b in 0..FRAMES / BLOCK {
+                    if moves && b == 47 {
+                        fake_hold(&mut e, 1_200);
+                    }
+                    if moves && b == 141 {
+                        fake_hold(&mut e, 96);
+                    }
+                    e.render_offline(&mut out);
+                    heard.extend_from_slice(&out);
+                }
+                heard
+            };
+            let clicked = render(true, true);
+            let laned = render(false, true);
+            assert!(laned.iter().any(|v| v.abs() > 0.1), "fixture: the click track is silent");
+            // To a ten-thousandth: the click's gain and the lane's fader each
+            // glide to unity and stall a hair short of it in f32; a beat lost
+            // or doubled is the click's whole level.
+            for (k, (c, l)) in clicked.iter().zip(&laned).enumerate() {
+                assert!((c - l).abs() < 1e-4, "frame {}: the click is {c}, the lane playing its sound {l}", k / 2);
+            }
+            let steady = render(false, false);
+            assert!(laned.iter().zip(&steady).any(|(a, b)| (a - b).abs() > 0.1), "fixture: the moves cost the lane nothing");
+        }
+
+        /// **Desks that hold nothing, rendered and hashed**: the speakers, the
+        /// take and the stems of each, over FNV-1a of the bits (`fnv`). The
+        /// desk's target is 0, the master's racks are empty or report nothing
+        /// and the limiter is out, so nothing may move.
+        fn unheld_hashes() -> Vec<(&'static str, String)> {
+            use crate::builtin_fx::{EQ_PATH, TRIM_PATH};
+            let hash = |v: &[f32]| {
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                fnv(&mut h, v);
+                format!("{h:016x}")
+            };
+            let mut out = Vec::new();
+            // The click with its sends: into Return 0 at the knob and into a
+            // bus with a trim on it, beside lane 1's noise sending there too,
+            // the reverb up, the click in the take.
+            {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[40]);
+                inputs.sends = vec![
+                    InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 0.7, pre: false },
+                    send(1, 40, 0.5, false),
+                ];
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, TRIM_PATH, None);
+                e.set_clips_slotted(vec![clip_at(&e, 1, 0x7a11)]);
+                e.set_effects(crate::effects::Sends { reverb: 0.3, ..crate::effects::Sends::default() });
+                e.set_special_sends(0.0, 0.5);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                e.set_metronome_in_take(true);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                let (room, stems) = roll(&mut e, 120);
+                let mut take = Vec::new();
+                tap.drain(&mut take);
+                out.push(("click and sends: room", hash(&room)));
+                out.push(("click and sends: take", hash(&take)));
+                out.push(("click and sends: stems", hash(&stems)));
+            }
+            // A monitored input (the speakers on their own mix) under a count
+            // recorded into the take, then the song with its click.
+            {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, 1, 0x7a12)]);
+                let mut tx = plug(&mut e, 3);
+                e.set_monitor_on(true);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                e.set_count_in_in_take(true);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                e.start_count_in(2, 120.0);
+                let mut buf = vec![0.0f32; BLOCK * 2];
+                let (mut room, mut take) = (Vec::new(), Vec::new());
+                let mut n = 0u32;
+                for b in 0..200 {
+                    if b == 95 {
+                        e.set_transport(1, 0);
+                        e.set_rolling(true);
+                    }
+                    for _ in 0..BLOCK {
+                        let _ = tx.push((n as f32 * 0.0123).sin() * 0.3);
+                        n += 1;
+                    }
+                    e.render_offline(&mut buf);
+                    room.extend_from_slice(&buf);
+                    tap.drain(&mut take);
+                }
+                out.push(("monitored input and count: room", hash(&room)));
+                out.push(("monitored input and count: take", hash(&take)));
+                out.push(("monitored input and count: go", format!("{:?}", e.count_in_downbeat_ns())));
+            }
+            // An armed DX7 played live and a kit struck live on an armed drum
+            // lane, with stems.
+            {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for l in inputs.lanes.iter_mut() {
+                    l.flags = F::MIDI_OFF;
+                }
+                inputs.lanes[5].flags = F::ARMED | F::BUILTIN;
+                inputs.lanes[6].flags = F::ARMED | F::DRUM;
+                e.publish_plan(&inputs).expect("the plan goes");
+                let _ = e.sync_instruments(&[Slot(5)], &[]);
+                let gen = e.lane_gen(Slot(6)).expect("a lane");
+                e.attach(Slot(6), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                e.attach(Slot(6), gen, LanePart::Kit(Box::new(impulse_kit()))).expect("the kit");
+                e.set_stems(true);
+                let mut buf = vec![0.0f32; BLOCK * 2];
+                let (mut room, mut stems) = (Vec::new(), Vec::new());
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                for b in 0..60 {
+                    if b % 10 == 4 {
+                        e.send_midi(0, &[0x90, 60 + b as u8 / 10, 110]);
+                        e.send_midi(0, &[0x99, PAD_BASE, 120]);
+                    }
+                    if b % 10 == 8 {
+                        e.send_midi(0, &[0x80, 60 + b as u8 / 10, 0]);
+                    }
+                    e.render_offline(&mut buf);
+                    room.extend_from_slice(&buf);
+                    e.drain_stems(&mut stems);
+                }
+                out.push(("played live: room", hash(&room)));
+                out.push(("played live: stems", hash(&stems)));
+            }
+            // An EQ across the master, which reports nothing, the click in the
+            // take.
+            {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.load_insert_at(RackAddr { owner: RackOwner::Master, rack: 0 }, 0, Some(Path::new(EQ_PATH)), None)
+                    .expect("the EQ loads")
+                    .expect("and seats");
+                e.set_clips_slotted(vec![clip_at(&e, 1, 0x7a13)]);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(true);
+                e.set_metronome_gain(1.0);
+                e.set_metronome_in_take(true);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                let (room, _) = roll(&mut e, 60);
+                let mut take = Vec::new();
+                tap.drain(&mut take);
+                out.push(("master EQ: room", hash(&room)));
+                out.push(("master EQ: take", hash(&take)));
+            }
+            out
+        }
+
+        /// **A desk that holds nothing renders bit for bit what it did before
+        /// the click and the takes were held** (the owner's ruling of
+        /// 2026-10-19: nothing changes where nothing is held). Every hash here
+        /// was taken from the build before the change (aa94a2be): the click
+        /// sending into Return 0 and into a bus beside a lane's noise, with the
+        /// reverb up and the click in the take; a monitored input, which gives
+        /// the speakers their own mix, under a count recorded into the take,
+        /// and the go it published; an armed DX7 played live and a kit struck
+        /// live on an armed drum lane, with stems; and an EQ across the master
+        /// that reports no delay. The speakers, the take and the stems of each
+        /// are what they were.
+        #[test]
+        fn a_desk_that_holds_nothing_renders_what_it_did_before() {
+            let got = unheld_hashes();
+            let want = [
+                ("click and sends: room", "f9e51f52f5256d45"),
+                ("click and sends: take", "f9e51f52f5256d45"),
+                ("click and sends: stems", "741746ada221ba14"),
+                ("monitored input and count: room", "753c56b4b0d6faf6"),
+                ("monitored input and count: take", "f4e7231363b7c93f"),
+                ("monitored input and count: go", "Some(8000000)"),
+                ("played live: room", "bacc5da70df72919"),
+                ("played live: stems", "8cd97a48cfc26599"),
+                ("master EQ: room", "461bc352b771ad5b"),
+                ("master EQ: take", "461bc352b771ad5b"),
+            ];
+            assert_eq!(got.len(), want.len(), "the desks moved");
+            for ((name, h), (wname, wh)) in got.iter().zip(want) {
+                assert_eq!((*name, h.as_str()), (wname, wh), "{name} renders other than it did");
             }
         }
     }

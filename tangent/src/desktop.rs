@@ -1159,6 +1159,15 @@ struct ArrRec {
     start_s: f64,
     /// The same instant on the MIDI tap's clock, for stamping notes.
     start_ns: i64,
+    /// **The record's anchor on the song, as asked at the press**
+    /// (`Engine::request_record_anchor`): the generation the engine answers
+    /// with the first chunk that rolls, which is what the MIDI is placed by
+    /// (`midi_take_span`).
+    anchor: u64,
+    /// **What the speakers were held back by at the press**, frames
+    /// (`Engine::room_hold`): what a part is moved back by when the engine
+    /// wrote no anchor for it.
+    hold: u32,
     /// **One collection PER ARMED MIDI LANE, each with its own route.**
     ///
     /// This used to be a list of lane indices and ONE note list, given
@@ -1191,6 +1200,10 @@ struct ArrRecAudio {
     lane: Option<crate::engine_bridge::LaneAt>,
     pick: crate::desk_plan::PickId,
     frames: Vec<f32>,
+    /// **Where its first rolling frame stands** (`Engine::drain_capture`),
+    /// once its ring has handed the mark over: what places the take
+    /// (`instrument::take_placement`).
+    mark: Option<crate::instrument::CaptureMark>,
     /// **Its input is gone from the device**, and the line saying so stands
     /// (`say_deaf_takes`): kept so the line is raised once, taken down when
     /// the input comes back, and taken down with the record.
@@ -1264,6 +1277,7 @@ impl ArrRec {
                         lane: bridge.lane_of(*id),
                         pick,
                         frames: Vec::new(),
+                        mark: None,
                         deaf: false,
                     }),
                     // NO INPUT on an explicit desk: R is lit but there is no
@@ -1296,17 +1310,20 @@ impl ArrRec {
             let mut stale = Vec::new();
             for p in &picks {
                 let _ = e.arm_capture(*p);
-                e.drain_capture(*p, &mut stale);
+                let _ = e.drain_capture(*p, &mut stale);
                 stale.clear();
             }
             e.set_capturing(&picks);
         }
     }
 
-    /// What each take's ring holds, into the take.
+    /// What each take's ring holds, into the take, and the take's mark the
+    /// first time its ring hands one over.
     fn drain_tee(&mut self, e: &mut crate::instrument::Engine) {
         for a in &mut self.audio {
-            e.drain_capture(a.pick, &mut a.frames);
+            if let Some(m) = e.drain_capture(a.pick, &mut a.frames) {
+                a.mark.get_or_insert(m);
+            }
         }
     }
 
@@ -10745,6 +10762,11 @@ impl DesktopApp {
         let coasting = e.motor_coasting();
         let start_s = self.recorder.transport.position_s(Some(e), rate);
         let start_ns = e.timebase().now();
+        // **Where the record lands, asked now**: the engine answers with the
+        // first chunk that rolls from here (`midi_take_span`), and the hold
+        // the speakers play at is kept for a record that never rolls.
+        let anchor = e.request_record_anchor();
+        let hold = e.room_hold();
         // Parked BEFORE the tee opens, so a pass that sees the capture flag
         // sees the park (`Renderer::motor_plan`).
         e.park_tape_motor();
@@ -10783,6 +10805,8 @@ impl DesktopApp {
         self.recorder.arr_rec = Some(ArrRec {
             start_s,
             start_ns,
+            anchor,
+            hold,
             midi: midi_lanes
                 .into_iter()
                 .map(|(id, row)| ArrRecLane {
@@ -10824,10 +10848,27 @@ impl DesktopApp {
             .recorder
             .transport
             .position_s(self.recorder.engine.as_ref(), rate);
-        let len_s = (end_s - rec.start_s).max(0.0);
+        // **Where the MIDI lands**: against what the player heard, from the
+        // engine's anchor (`midi_take_span`).
+        let (anchor, end_ns) = match self.recorder.engine.as_ref() {
+            Some(e) => (e.record_anchor(rec.anchor), Some(e.timebase().now())),
+            None => (None, None),
+        };
+        let span = midi_take_span(MidiTake {
+            start_s: rec.start_s,
+            end_s,
+            start_ns: rec.start_ns,
+            end_ns,
+            anchor,
+            hold: rec.hold,
+            rate,
+        });
+        let len_s = span.len_s;
         // The keys still down end where the record does — per lane now, since
-        // each lane heard its own keyboards.
+        // each lane heard its own keyboards. Every time moved first by what
+        // the span moves it (`MidiSpan::shift`).
         for l in &mut rec.midi {
+            span.shift(&mut l.notes, &mut l.pedal, &mut l.open);
             for (key, (at, vel)) in l.open.drain() {
                 l.notes.push(tangent_ui::arrangement::ArrNote {
                     at_s: at,
@@ -10857,7 +10898,7 @@ impl DesktopApp {
                 };
                 out.push(tangent_ui::arrangement::RecordedClip {
                     lane,
-                    start_s: rec.start_s,
+                    start_s: span.start_s,
                     len_s,
                     path: None,
                     // **This lane's OWN notes.** They used to be one list
@@ -10891,7 +10932,14 @@ impl DesktopApp {
                 let _ = std::fs::create_dir_all(&media);
             }
             for a in &rec.audio {
-                let frames = &a.frames;
+                // **Placed where it was played against what was heard**
+                // (`instrument::take_placement`): from its mark, the frames
+                // that would land before the song's start cut. A take with no
+                // mark never rolled, and lands where it was pressed.
+                let (start_s, frames) = match crate::instrument::take_placement(a.mark, a.frames.len() / 2) {
+                    Some(p) => (p.start as f64 / rate, a.frames.get(p.trim * 2..).unwrap_or(&[])),
+                    None => (rec.start_s, &a.frames[..]),
+                };
                 // **The track's row now, asked of the track** (design 7.13):
                 // rows inserted above it while it rolled moved it, and the
                 // take follows. `None` for a track removed meanwhile, whose
@@ -10948,7 +10996,7 @@ impl DesktopApp {
                 match (write, row) {
                     (Ok(()), Some(lane)) => out.push(tangent_ui::arrangement::RecordedClip {
                         lane,
-                        start_s: rec.start_s,
+                        start_s,
                         len_s: seconds,
                         path: Some(format!("media/{name}")),
                         notes: Vec::new(),
@@ -18821,6 +18869,100 @@ fn deaf_take_line(app: &TangentApp, id: tangent_ui::desk_id::TrackId) -> String 
         |row| format!("Track {} ({})", row + 1, app.channel_display_name(row)),
     );
     format!("{who} is not recording: its input is gone from the audio device.")
+}
+
+/// **What places a recorded MIDI part** (`midi_take_span`): the press and
+/// the finish on the transport and on the host's clock, the engine's anchor
+/// when it wrote one (`Engine::record_anchor`), the hold the speakers played
+/// at the press, and the rate.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Copy, Debug)]
+struct MidiTake {
+    start_s: f64,
+    end_s: f64,
+    start_ns: i64,
+    end_ns: Option<i64>,
+    anchor: Option<crate::instrument::RecordAnchor>,
+    hold: u32,
+    rate: f64,
+}
+
+/// **Where a recorded MIDI part lands**: its clip's start and length on the
+/// song, and what every time stamped against the press moves by.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MidiSpan {
+    start_s: f64,
+    len_s: f64,
+    shift: f64,
+}
+
+/// **A MIDI part lands where it was played against what was heard** (the
+/// owner's ruling of 2026-10-19), as an audio take does
+/// (`instrument::take_placement`).
+///
+/// Its notes are stamped against the press on the MIDI tap's clock
+/// (`ArrRec::note_event`). The engine's anchor says which song frame the
+/// first chunk that rolled after the press started on and which instant that
+/// frame stood for, so an instant is a song position the way the engine
+/// places a live note (`instrument::record_song_s`), less the hold the
+/// speakers played the backing at: a note played on the beat the player
+/// heard lands on it, 25 ms earlier than it used to with a deep-range Tape on
+/// the desk, and a record from a stopped transport no longer lands the gap
+/// between the press and the roll late. With no anchor (a record that never
+/// rolled) the press's own place stands, moved back by the hold the
+/// speakers played at the press. The interface's own latency is not taken
+/// off, as for audio.
+///
+/// **Nothing lands before the song's start**: the clip starts there, and
+/// `shift` is what every time moves by to say so (`MidiSpan::shift`).
+#[cfg(feature = "recorder")]
+fn midi_take_span(t: MidiTake) -> MidiSpan {
+    let (press, end) = match (t.anchor, t.end_ns) {
+        (Some(a), Some(end_ns)) => (
+            crate::instrument::record_song_s(a, t.start_ns, t.rate),
+            crate::instrument::record_song_s(a, end_ns, t.rate),
+        ),
+        _ => {
+            let hold = f64::from(t.hold) / t.rate.max(1.0);
+            (t.start_s - hold, t.end_s - hold)
+        }
+    };
+    let start_s = press.max(0.0);
+    MidiSpan { start_s, len_s: (end - start_s).max(0.0), shift: press - start_s }
+}
+
+#[cfg(feature = "recorder")]
+impl MidiSpan {
+    /// **A lane's notes, pedal and keys still down, moved by `shift`**: a
+    /// note that would end before the song's start goes, one that would
+    /// begin before it begins on it and keeps its end, and a pedal move or a
+    /// key down before it is made on it. Nothing moves when nothing does.
+    fn shift(
+        &self,
+        notes: &mut Vec<tangent_ui::arrangement::ArrNote>,
+        pedal: &mut [tangent_ui::arrangement::ArrPedal],
+        open: &mut std::collections::HashMap<u8, (f64, u8)>,
+    ) {
+        if self.shift == 0.0 {
+            return;
+        }
+        notes.retain_mut(|n| {
+            let end = n.at_s + self.shift + n.dur_s;
+            if end <= 0.0 {
+                return false;
+            }
+            n.at_s = (n.at_s + self.shift).max(0.0);
+            n.dur_s = end - n.at_s;
+            true
+        });
+        for p in pedal {
+            p.at_s = (p.at_s + self.shift).max(0.0);
+        }
+        for (at, _) in open.values_mut() {
+            *at = (*at + self.shift).max(0.0);
+        }
+    }
 }
 
 /// **Where the arrangement record is replacing each lane's schedule**, in
@@ -39545,6 +39687,8 @@ mod arr_pedal {
         ArrRec {
             start_s: 0.0,
             start_ns: 0,
+            anchor: 0,
+            hold: 0,
             midi: vec![ArrRecLane {
                 id: tangent_ui::desk_id::TrackId(0),
                 route: tangent_ui::recorder::MidiRoute::EVERYTHING,
@@ -39658,6 +39802,8 @@ mod arr_pedal {
         let mut r = ArrRec {
             start_s: 0.0,
             start_ns: 0,
+            anchor: 0,
+            hold: 0,
             midi: vec![
                 ArrRecLane {
                     id: tangent_ui::desk_id::TrackId(1),
@@ -39723,6 +39869,8 @@ mod arr_pedal {
         let mut r = ArrRec {
             start_s: 0.0,
             start_ns: 0,
+            anchor: 0,
+            hold: 0,
             midi: vec![ArrRecLane {
                 id: tangent_ui::desk_id::TrackId(0),
                 route: narrow,
@@ -39772,6 +39920,77 @@ mod arr_pedal {
         assert!((only(&r).pedal[0].at_s - 0.0).abs() < 1e-9);
         assert_eq!(only(&r).pedal[0].value, 127, "the take opened with the pedal up");
         assert_eq!(only(&r).pedal[1].value, 0);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Where a recorded MIDI part lands (the owner's ruling of 2026-10-19)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "recorder"))]
+mod arr_place {
+    use super::*;
+    use tangent_ui::arrangement::{ArrNote, ArrPedal};
+
+    const RATE: f64 = 48_000.0;
+
+    fn note(at_s: f64, dur_s: f64, key: u8) -> ArrNote {
+        ArrNote { at_s, dur_s, key, vel: 100, muted: false }
+    }
+
+    /// **A MIDI part lands where it was played against what was heard, and
+    /// nothing of it before the song's start** (`midi_take_span`).
+    ///
+    /// The press 20 ms before the roll from 0:00, on a desk the speakers are
+    /// held 1,200 frames (25 ms) on, with the engine's anchor at the roll: the
+    /// press stands 45 ms before the song's start, so the clip starts there
+    /// and every time stamped against the press moves back 45 ms. A key
+    /// pressed 45 ms after the press was played to 0:00 and lands on it, one
+    /// 545 ms after on 0.5 s; a note that ended before 0:00 goes, one that
+    /// began before it begins on it and keeps its end, the pedal restated at
+    /// the press stays at 0:00 and its lift moves with the notes, and a key
+    /// still down moves too. The clip ends where the finish was heard. With no
+    /// anchor (a record that never rolled) the press stands, less the hold;
+    /// on a desk that holds nothing that is the placement this replaced,
+    /// exactly, and moves nothing.
+    #[test]
+    fn a_midi_part_is_placed_by_the_engines_anchor_less_the_speakers_hold() {
+        use crate::instrument::RecordAnchor;
+        let anchor = RecordAnchor { frame: 0, ns: 1_000_000_000, hold: 1_200 };
+        let take = MidiTake {
+            start_s: 0.0,
+            end_s: 3.0,
+            start_ns: 980_000_000,
+            end_ns: Some(4_000_000_000),
+            anchor: Some(anchor),
+            hold: 1_200,
+            rate: RATE,
+        };
+        let span = midi_take_span(take);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(span.start_s, 0.0), "the clip starts at {}", span.start_s);
+        assert!(near(span.shift, -0.045), "every time moves by {}", span.shift);
+        assert!(near(span.len_s, 3.0 - 0.025), "the clip lasts {}", span.len_s);
+        let mut notes = vec![note(0.045, 0.1, 60), note(0.545, 0.1, 61), note(0.0, 0.02, 62), note(0.03, 0.05, 63)];
+        let mut pedal = vec![ArrPedal { at_s: 0.0, cc: 64, value: 127 }, ArrPedal { at_s: 0.3, cc: 64, value: 0 }];
+        let mut open = std::collections::HashMap::new();
+        open.insert(64u8, (0.1, 90u8));
+        span.shift(&mut notes, &mut pedal, &mut open);
+        let at: Vec<(u8, f64, f64)> = notes.iter().map(|n| (n.key, n.at_s, n.dur_s)).collect();
+        assert_eq!(at.len(), 3, "a note that ended before the song's start was kept: {at:?}");
+        assert!(near(at[0].1, 0.0) && near(at[0].2, 0.1), "the key played to 0:00: {at:?}");
+        assert!(near(at[1].1, 0.5) && near(at[1].2, 0.1), "the key played to 0.5 s: {at:?}");
+        assert_eq!(at[2].0, 63, "{at:?}");
+        assert!(near(at[2].1, 0.0) && near(at[2].2, 0.035), "the note across the start: {at:?}");
+        assert!(near(pedal[0].at_s, 0.0) && near(pedal[1].at_s, 0.255), "the pedal: {pedal:?}");
+        assert!(near(open[&64].0, 0.055), "the key still down: {open:?}");
+        let pressed = MidiTake { start_s: 2.0, end_s: 5.0, start_ns: 0, end_ns: Some(0), anchor: None, hold: 0, rate: RATE };
+        assert_eq!(midi_take_span(pressed), MidiSpan { start_s: 2.0, len_s: 3.0, shift: 0.0 }, "a desk that holds nothing moved");
+        let held = midi_take_span(MidiTake { hold: 1_200, ..pressed });
+        assert!(near(held.start_s, 1.975) && near(held.len_s, 3.0) && held.shift == 0.0, "no anchor: {held:?}");
+        let mut kept = vec![note(0.5, 0.1, 60)];
+        held.shift(&mut kept, &mut [], &mut std::collections::HashMap::new());
+        assert!(near(kept[0].at_s, 0.5), "a span that moves nothing moved a note");
     }
 }
 
@@ -39898,7 +40117,7 @@ mod arr_identity {
         assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
         assert_eq!(takes.audio[0].id, app.track_ids()[3]);
         ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
-        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, anchor: 0, hold: 0, midi: Vec::new(), audio: takes.audio };
         let mut want = Vec::new();
         let mut out = vec![0.0f32; BLOCK * 2];
         for b in 0..16 {
@@ -39943,7 +40162,7 @@ mod arr_identity {
         ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
         let one_ring = e.capture_ring_bytes();
         assert!(one_ring > 0, "A's ring is not there at the press");
-        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, anchor: 0, hold: 0, midi: Vec::new(), audio: takes.audio };
         let mut want = Vec::new();
         let mut out = vec![0.0f32; BLOCK * 2];
         let mut b_armed = false;
@@ -40052,7 +40271,7 @@ mod arr_identity {
         assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
         let pick = takes.audio[0].pick;
         ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
-        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, anchor: 0, hold: 0, midi: Vec::new(), audio: takes.audio };
         let mut want = Vec::new();
         for blk in 0..24 {
             let mut rows = input_rows(&app);
@@ -40100,7 +40319,7 @@ mod arr_identity {
         assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
         let pick = takes.audio[0].pick;
         ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
-        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, anchor: 0, hold: 0, midi: Vec::new(), audio: takes.audio };
         let mut want = Vec::new();
         for blk in 0..24 {
             let mut rows = input_rows(&app);
@@ -40138,7 +40357,7 @@ mod deaf_takes {
     use tangent_ui::desk_id::TrackId;
 
     fn take(id: u32, pick: PickId) -> ArrRecAudio {
-        ArrRecAudio { id: TrackId(id), lane: None, pick, frames: Vec::new(), deaf: false }
+        ArrRecAudio { id: TrackId(id), lane: None, pick, frames: Vec::new(), mark: None, deaf: false }
     }
 
     /// **Each take's line goes up once when its input leaves the device and
@@ -40159,7 +40378,7 @@ mod deaf_takes {
         let _ = bridge.sync_input_rows(&rows, &mut e, &stream(4));
         let (a, b) = (bridge.pick_of(TrackId(7)).expect("a pick"), bridge.pick_of(TrackId(8)).expect("a pick"));
         bridge.hold_picks(&[a, b]);
-        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: vec![take(7, a), take(8, b)] };
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, anchor: 0, hold: 0, midi: Vec::new(), audio: vec![take(7, a), take(8, b)] };
         let mut frame = |dev: usize, rec: &mut ArrRec| {
             let _ = bridge.sync_input_rows(&rows, &mut e, &stream(dev));
             deaf_take_edges(rec, &bridge.held_reading_nothing())

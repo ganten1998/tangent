@@ -1445,15 +1445,19 @@ fn a_bare_kit_sent_into_a_bus_that_looks_ahead_lands_with_its_own_way_out_past_s
 }
 
 /// **The click pays a bus that looks ahead uncompensated past slot 31 as on
-/// row 1, live; and stays out of the export, holding it back by nothing**
-/// (W7-slot-gaps item 6, through the bridge, the pin kept). The click sends
-/// at unity, from the desk's file, into the bus at each subject in turn,
-/// which looks ahead or does not. Live, the click is a cue, summed at once
-/// so the beat is heard when it falls: what it sends reaches the bus at
+/// row 1, live, where nothing else holds the desk; and stays out of the
+/// export, holding it back by nothing** (W7-slot-gaps item 6, through the
+/// bridge, the pin kept). The click sends at unity, from the desk's file,
+/// into the bus at each subject in turn, which looks ahead or does not.
+/// Live, the click is a cue that never holds the desk back, and nothing else
+/// does here, so it is summed at once: what it sends reaches the bus at
 /// once, the bus's lookahead delays it by exactly what the bus looks ahead,
 /// and the desk's alignment stays at nothing, on row 1's frames at every
-/// width. The export leaves the click out of the file: the bus hears
-/// nothing, and the click's send holds the file back by nothing.
+/// width. (On a desk held for the bus, its send waits as the lanes' do and
+/// lands with the mix: `instrument`'s
+/// `the_clicks_send_through_a_lookahead_bus_lands_with_the_mix_where_the_desk_is_held`.)
+/// The export leaves the click out of the file: the bus hears nothing, and
+/// the click's send holds the file back by nothing.
 #[test]
 fn the_click_pays_a_bus_that_looks_ahead_uncompensated_past_slot_31_and_stays_out_of_the_export() {
     let dir = scratch("click");
