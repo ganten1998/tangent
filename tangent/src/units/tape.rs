@@ -1459,21 +1459,30 @@ fn fma(a: f32, b: f32, c: f32) -> f32 {
 /// A dot product the compiler will vectorise: eight accumulators, tap `t`
 /// into accumulator `t % 8`, each an explicit [`fma`], and a tree at the end
 /// so the compiler does not rebuild one long chain of adds. Eight because
-/// the pair's cost is latency: eight independent chains of `N / 8` each.
-/// `b` must be at least `N` long and `N` a multiple of eight, which the
-/// padding in [`OsTaps`] gives and the compiler checks.
+/// the cost is latency: eight independent chains of `N / 8` each. `b` must
+/// be at least `N` long and `N` a multiple of eight, which the read's sixteen
+/// taps ([`READ_TAPS`]) and the padding in [`OsTaps`] give and the compiler
+/// checks. The play head reads through it; the record stage's pair runs the
+/// same arithmetic a chunk at a time ([`fir`]).
+///
+/// **The eight sums are held as two halves of four**, sums 0 to 3 and 4 to
+/// 7, which is the same arithmetic in the same order. Held as one array of
+/// eight, the compiler paired each sum of the read's two rows into a vector
+/// of two and shuffled every tap into place; as halves, measured as A/B
+/// ratios on a whole Tape, it costs 0.98 of that at the defaults and 0.99
+/// fully engaged.
 #[inline(always)]
 fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
     const { assert!(N % 8 == 0, "a dot product runs whole chunks of eight") };
-    let (ac, _) = a.as_chunks::<8>();
-    let (bc, _) = b[..N].as_chunks::<8>();
-    let mut acc = [0.0_f32; 8];
-    for (x, y) in ac.iter().zip(bc) {
-        for k in 0..8 {
-            acc[k] = fma(x[k], y[k], acc[k]);
+    let b = &b[..N];
+    let (mut lo, mut hi) = ([0.0_f32; 4], [0.0_f32; 4]);
+    for c in 0..N / 8 {
+        for l in 0..4 {
+            lo[l] = fma(a[8 * c + l], b[8 * c + l], lo[l]);
+            hi[l] = fma(a[8 * c + 4 + l], b[8 * c + 4 + l], hi[l]);
         }
     }
-    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+    ((lo[0] + lo[1]) + (lo[2] + lo[3])) + ((hi[0] + hi[1]) + (hi[2] + hi[3]))
 }
 
 /// **How many frames the record stage takes at once**: a sub-block
