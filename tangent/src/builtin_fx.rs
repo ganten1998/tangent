@@ -241,7 +241,8 @@ const EQ_KNOBS_PER_NODE: u32 = 5;
 /// and is the one control that moves the delay the seat reports. Bias
 /// (id 10) is the record bias either side of the aligned point, which its
 /// middle is, and reads signed about it. Age (id 11) is an old tape on a
-/// worn head, and opens new. A session saved before these
+/// worn head, and Damage (id 12) what the tape has been through, laid along
+/// it per metre; both open new. A session saved before these
 /// existed reads them at their defaults, which is the owner's ruling for
 /// every appended control: nothing is pinned to how 5.0 sounded.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
@@ -257,6 +258,7 @@ const TAPE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 9, symbol: "wow_range", name: "Wow Range", units: "", default: 0.0, steps: crate::units::tape::WOW_RANGE_STEPS },
     ParamSpec { id: 10, symbol: "bias", name: "Bias", units: "dB", default: 0.5, steps: 0 },
     ParamSpec { id: 11, symbol: "age", name: "Age", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 12, symbol: "damage", name: "Damage", units: "%", default: 0.0, steps: 0 },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -2144,6 +2146,7 @@ fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32
         9 => Some(&mut p.wow_range),
         10 => Some(&mut p.bias),
         11 => Some(&mut p.age),
+        12 => Some(&mut p.damage),
         _ => None,
     }
 }
@@ -3636,6 +3639,7 @@ mod tests {
         let t = crate::units::tape::TapeParams::default();
         let fields = [
             t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate, t.wow_range, t.bias, t.age,
+            t.damage,
         ];
         assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
         for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
@@ -3979,7 +3983,7 @@ mod tests {
         let blob = b"tangentfx 1\ndrive=0.6\nbump=0.5\nroll=0.12\nwobble=0.3\nhiss=0.25\ntrim=0.5\n";
         let values = values_from_state(spec, blob).expect("a 5.0 blob reads");
         assert_eq!(&values[..6], &[0.6, 0.5, 0.12, 0.3, 0.25, 0.5], "the six 5.0 values moved");
-        assert_eq!(&values[6..12], &[2.0 / 3.0, 0.3, 0.5, 0.0, 0.5, 0.0], "an appended control read off its default");
+        assert_eq!(&values[6..13], &[2.0 / 3.0, 0.3, 0.5, 0.0, 0.5, 0.0, 0.0], "an appended control read off its default");
         for p in &spec.params[6..] {
             assert_eq!(values[p.id as usize], p.default, "{} read off its default", p.symbol);
             assert!(absent_reads_as(TAPE_PATH, p.symbol).is_none(), "{} is pinned to 5.0", p.symbol);
@@ -4009,7 +4013,10 @@ mod tests {
             panic!("the tape path built something that is not a tape");
         };
         let fields = |p: &crate::units::tape::TapeParams| {
-            [p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range, p.bias, p.age]
+            [
+                p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range, p.bias, p.age,
+                p.damage,
+            ]
         };
         assert_eq!(
             fields(&u.params).len(),
@@ -5091,13 +5098,14 @@ mod tests {
         assert_eq!(describe(TAPE_PATH, 10, 1.0, &[]), "+6.0 dB");
         assert_eq!(describe(TAPE_PATH, 10, 0.75, &[]), "+3.0 dB");
         assert!(choices(TAPE_PATH, 10).is_empty(), "Bias grew steps");
-        // And the five that are character rather than calibration keep
+        // And the six that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
         assert_eq!(describe(TAPE_PATH, 3, 0.3, &[]), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 4, 0.25, &[]), fmt_pct(0.25));
         assert_eq!(describe(TAPE_PATH, 7, 0.3, &[]), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 11, 0.5, &[]), fmt_pct(0.5));
+        assert_eq!(describe(TAPE_PATH, 12, 0.25, &[]), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
         assert_eq!(
             choices(DENOISE_PATH, 6),

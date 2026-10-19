@@ -155,6 +155,13 @@ pub struct TapeParams {
     /// ([`MAGNETISED_H2`]); and the hiss and the modulation noise rise. 0 is
     /// new tape on new heads, and a fresh tape opens there.
     pub age: f32,
+    /// **Damage**: what the tape itself has been through, laid along it per
+    /// metre: dropouts where the oxide is shed or dirt lifts the tape off
+    /// the head, creases that ripple it and twist its azimuth, and worn
+    /// edges that never quite touch ([`DROPOUTS_PER_M`]). A defect is a
+    /// stretch of tape, so a slow tape plays each one longer and meets
+    /// fewer a second. 0 is an unplayed reel, and a fresh tape opens there.
+    pub damage: f32,
 }
 
 impl Default for TapeParams {
@@ -190,6 +197,8 @@ impl Default for TapeParams {
             bias: 0.5,
             // New tape on new heads.
             age: 0.0,
+            // An unplayed reel.
+            damage: 0.0,
         }
     }
 }
@@ -199,7 +208,7 @@ impl TapeParams {
     /// Every colour off: the record level at the bottom of its travel, no
     /// bump, no roll, a parked head (no wow, no flutter), silent tape, unity
     /// trim, at the studio speed and the parts' own rate, the bias aligned,
-    /// new tape. The recipe the neutrality tests here and at the seat spell
+    /// new tape, never played. The recipe the neutrality tests here and at the seat spell
     /// out, in one place.
     pub(crate) const NEUTRAL: TapeParams = TapeParams {
         drive: 0.0,
@@ -214,6 +223,7 @@ impl TapeParams {
         wow_range: WowRange::Studio.dial(),
         bias: 0.5,
         age: 0.0,
+        damage: 0.0,
     };
 }
 
@@ -1041,15 +1051,16 @@ fn jitter_um(p: &TapeParams) -> f64 {
 }
 
 /// **What the head keeps in reserve for each track's own movement**, in
-/// samples at `sr`, on tape running at `v` ips: the skew an aged head's
+/// samples at `sr`, on tape running at `v` ips: the skew the head's
 /// azimuth puts between the tracks at its widest, half of it each way
-/// ([`skew_samples`] at the Age `age`), four sigma of modulation noise of
+/// ([`skew_samples`] at the widest angle `urad`, [`widest_urad`]), four
+/// sigma of modulation noise of
 /// `noise_um` µm RMS, which it never reaches, and a sample. The governor
 /// shares the head's travel only after this, so a track's own movement can
 /// never carry its head off the line. The one place the reserve is worked
 /// out: the kernel's governor and the figure a face prints both read it.
-fn reserve(noise_um: f64, age: f64, v: f64, sr: f64) -> f64 {
-    skew_samples(AZIMUTH_URAD.0 + AZIMUTH_URAD.1, age, v, sr) + 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0
+fn reserve(noise_um: f64, urad: f64, v: f64, sr: f64) -> f64 {
+    skew_samples(urad, v, sr) + 4.0 * noise_um * 1.0e-6 * sr / (0.0254 * v) + 1.0
 }
 
 // ── what the years do ───────────────────────────────────────────────────────
@@ -1118,11 +1129,19 @@ fn azimuth_gap(theta: f64, v_m: f64) -> f64 {
 }
 
 /// **What a skewed head puts between the tracks**, as each track's share of
-/// it in samples at `sr`, at an angle of `urad` microradians at full Age,
-/// at the Age `age`, on tape at `v` ips: half the gap across
-/// [`AZIMUTH_SPAN_MM`] in time.
-fn skew_samples(urad: f64, age: f64, v: f64, sr: f64) -> f64 {
-    0.5 * AZIMUTH_SPAN_MM * 1.0e-3 * (urad * 1.0e-6 * age).tan() / (0.0254 * v) * sr
+/// it in samples at `sr`, at an angle of `urad` microradians, on tape at
+/// `v` ips: half the gap across [`AZIMUTH_SPAN_MM`] in time.
+fn skew_samples(urad: f64, v: f64, sr: f64) -> f64 {
+    0.5 * AZIMUTH_SPAN_MM * 1.0e-3 * (urad * 1.0e-6).tan() / (0.0254 * v) * sr
+}
+
+/// **The widest the head's azimuth can stand off square**, in
+/// microradians, at the Age `age` and the Damage `damage`: Age's standing
+/// error at the top of its wander, and a crease's twist at its widest on
+/// top of it (any Damage at all can crease the tape).
+fn widest_urad(age: f64, damage: f64) -> f64 {
+    let crease = if damage > 0.0 { CREASE_URAD.0 + CREASE_URAD.1 * damage } else { 0.0 };
+    age * (AZIMUTH_URAD.0 + AZIMUTH_URAD.1) + crease
 }
 
 /// The worn record head's over-bias at full Age, in dB, on the bias's
@@ -1149,6 +1168,52 @@ const AGE_JITTER: f64 = 1.0;
 /// How long Age takes to arrive, as the time constant of its glide, in
 /// milliseconds: years are not a step.
 const AGE_GLIDE_MS: f64 = 100.0;
+
+// ── what the tape has been through ──────────────────────────────────────────
+
+/// **Damage's defects, per metre of tape at full Damage**, on the dial's
+/// square, so the lower half of it is a well-kept reel: dropouts at 4 a
+/// metre (1.5 a second at 15 ips, 0.38 at 3.75) and creases at half a
+/// metre's one. They live on the tape, so the count goes with the metres
+/// that pass the head, not with the seconds.
+const DROPOUTS_PER_M: f64 = 4.0;
+const CREASES_PER_M: f64 = 0.5;
+
+/// **A dropout**: a stretch of tape between these lengths in millimetres,
+/// log-uniform (1.3 to 21 ms at 15 ips, 7.1 on average; 5 to 84 ms at
+/// 3.75), lifted off the head to a peak spacing log-uniform from the first
+/// figure to the first plus the second times Damage, in micrometres, and
+/// deeper under-biased (times `10^(-b / 20)` for the bias `b` dB re
+/// aligned, the shallower record under-bias leaves). Its spacing rises and
+/// falls as `sin^2` along it. It takes both tracks [`DROPOUT_BOTH`] of the
+/// time, the left alone [`DROPOUT_LEFT`], the right alone the rest.
+const DROPOUT_MM: (f64, f64) = (0.5, 8.0);
+const DROPOUT_UM: (f64, f64) = (1.0, 19.0);
+const DROPOUT_BOTH: f32 = 0.6;
+const DROPOUT_LEFT: f32 = 0.2;
+
+/// **A crease**: a stretch of tape this long in millimetres, rippled at a
+/// pitch between these millimetres, lifted to a peak spacing from the first
+/// figure to the first plus the second times Damage in micrometres, and
+/// twisted off square by an angle of random sign from the first figure to
+/// the first plus the second times Damage in microradians, all uniform and
+/// all rising and falling as `sin^2` along it. On both tracks.
+const CREASE_MM: (f64, f64) = (10.0, 50.0);
+const CREASE_PITCH_MM: (f64, f64) = (2.0, 6.0);
+const CREASE_UM: (f64, f64) = (2.0, 6.0);
+const CREASE_URAD: (f64, f64) = (300.0, 1_200.0);
+
+/// **Worn edges**: each track's edge rides off the head by up to this many
+/// micrometres times Damage's square, a level drawn afresh every first
+/// figure's millimetres of tape and reached over the second's. Damage is
+/// heard at once, before its first dropout.
+const EDGE_UM: f64 = 2.0;
+const EDGE_MM: (f64, f64) = (30.0, 10.0);
+
+/// The seeds of the damage's draws and of each track's edge, restored by
+/// `clear`.
+const DAMAGE_SEED: u32 = 0xDA4A_6E01;
+const EDGE_SEEDS: [u32; 2] = [0xED6E_0001, 0xED6E_0002];
 
 /// Output trim, in dB across the knob. Midpoint is exactly unity.
 pub const TRIM_DB: (f32, f32) = (-12.0, 12.0);
@@ -2779,18 +2844,113 @@ impl Transport {
 /// voicing is at. What wears the tape lies along it, so it is laid out in
 /// metres and not in seconds: the azimuth's wander here, which a faster tape
 /// sweeps through faster, and the damage along it.
+///
+/// **The damage is drawn as the tape passes**: two unit-exponential
+/// distances, one to the next dropout and one to the next crease, drawn
+/// the first time Damage is up and again after each defect, and spent at
+/// Damage's rate per metre, so the count is exact under any glide of the
+/// speed or the dial, and at Damage 0 nothing is drawn at all. At most two
+/// dropouts and one crease play at once; a third dropout takes the place of
+/// the one nearer its end.
 struct Wear {
     metres: f64,
     x: f64,
+    /// Where the damage was last worked out, along the tape.
+    stepped: f64,
+    rng: u32,
+    /// The distances still to go to the next dropout and the next crease,
+    /// in expected defects (NaN until Damage first asks for one).
+    drop_due: f64,
+    crease_due: f64,
+    drops: [Option<Defect>; 2],
+    crease: Option<Defect>,
+    /// Each track's edge: its draws, where the level it is at came from and
+    /// where it is going, and where along the tape that stretch began (NaN
+    /// before the first).
+    edge_rng: [u32; 2],
+    edge: [[f64; 2]; 2],
+    edge_at: f64,
+    #[cfg(test)]
+    log: WearLog,
+}
+
+/// One defect on the tape: where it starts and how long it is in metres,
+/// its peak spacing in metres, the share of it each track takes, and for a
+/// crease its ripple's pitch in metres and its twist in radians.
+#[derive(Debug, Clone, Copy)]
+struct Defect {
+    at: f64,
+    len: f64,
+    peak: f64,
+    mask: [f64; 2],
+    pitch: f64,
+    twist: f64,
+}
+
+impl Defect {
+    /// How far along itself the tape at `x` is, 0 to 1, or None once past.
+    fn along(&self, x: f64) -> Option<f64> {
+        let p = (x - self.at) / self.len;
+        (p < 1.0).then_some(p.max(0.0))
+    }
+}
+
+/// What the wear has drawn, for the tests: dropouts and creases begun, the
+/// dropouts' lengths summed in metres, and how many took both tracks, the
+/// left alone and the right alone.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WearLog {
+    pub dropouts: u64,
+    pub creases: u64,
+    pub dropout_m: f64,
+    pub masks: [u64; 3],
+}
+
+/// A unit-exponential draw: the distance, in expected events, to the next.
+fn exponential(rng: &mut u32) -> f64 {
+    -f64::from(uniform(rng)).max(1.0e-9).ln()
+}
+
+/// A draw between `lo` and `hi`, uniform, or log-uniform when `log`.
+fn between(rng: &mut u32, lo: f64, hi: f64, log: bool) -> f64 {
+    let u = f64::from(uniform(rng));
+    if log {
+        lo * (hi / lo).powf(u)
+    } else {
+        lo + (hi - lo) * u
+    }
 }
 
 impl Wear {
     const fn new() -> Self {
-        Self { metres: 0.0, x: 0.0 }
+        Self {
+            metres: 0.0,
+            x: 0.0,
+            stepped: 0.0,
+            rng: DAMAGE_SEED,
+            drop_due: f64::NAN,
+            crease_due: f64::NAN,
+            drops: [None; 2],
+            crease: None,
+            edge_rng: EDGE_SEEDS,
+            edge: [[0.0; 2]; 2],
+            edge_at: f64::NAN,
+            #[cfg(test)]
+            log: WearLog {
+                dropouts: 0,
+                creases: 0,
+                dropout_m: 0.0,
+                masks: [0; 3],
+            },
+        }
     }
 
     fn clear(&mut self) {
-        self.x = 0.0;
+        *self = Self {
+            metres: self.metres,
+            ..Self::new()
+        };
     }
 
     /// One frame of tape past the head.
@@ -2805,6 +2965,161 @@ impl Wear {
     fn azimuth(&self, age: f64) -> f64 {
         let wander = (std::f64::consts::TAU * self.x / AZIMUTH_WANDER_M).sin();
         age * (AZIMUTH_URAD.0 + AZIMUTH_URAD.1 * wander) * 1.0e-6
+    }
+
+    /// **The damage where the tape is now**, at Damage `damage` and with
+    /// dropouts `deeper` times their depth (the bias's): each track's
+    /// spacing in metres from the dropouts, the crease and the edges, and
+    /// the crease's twist of the head's azimuth in radians. Spends the
+    /// metres since the last call on the draws first.
+    fn damage(&mut self, damage: f64, deeper: f64) -> ([f64; 2], f64) {
+        let passed = self.x - self.stepped;
+        self.stepped = self.x;
+        if damage > 0.0 {
+            if self.drop_due.is_nan() {
+                self.drop_due = exponential(&mut self.rng);
+                self.crease_due = exponential(&mut self.rng);
+            }
+            let square = damage * damage;
+            self.drop_due -= DROPOUTS_PER_M * square * passed;
+            while self.drop_due <= 0.0 {
+                self.dropout(damage, deeper);
+                self.drop_due += exponential(&mut self.rng);
+            }
+            self.crease_due -= CREASES_PER_M * square * passed;
+            while self.crease_due <= 0.0 {
+                self.crease_at(damage);
+                self.crease_due += exponential(&mut self.rng);
+            }
+        }
+
+        let mut gap = [0.0; 2];
+        let x = self.x;
+        for slot in &mut self.drops {
+            if let Some(d) = *slot {
+                match d.along(x) {
+                    Some(p) => {
+                        let s = d.peak * (std::f64::consts::PI * p).sin().powi(2);
+                        gap[0] += s * d.mask[0];
+                        gap[1] += s * d.mask[1];
+                    }
+                    None => *slot = None,
+                }
+            }
+        }
+        let mut twist = 0.0;
+        if let Some(c) = self.crease {
+            match c.along(x) {
+                Some(p) => {
+                    let rise = (std::f64::consts::PI * p).sin().powi(2);
+                    let ripple = (std::f64::consts::PI * (x - c.at) / c.pitch).sin().powi(2);
+                    gap[0] += c.peak * rise * ripple;
+                    gap[1] += c.peak * rise * ripple;
+                    twist = c.twist * rise;
+                }
+                None => self.crease = None,
+            }
+        }
+
+        // The edges, laid along the tape whatever the dial, so turning
+        // Damage up finds them where the tape is.
+        let (every, slew) = (EDGE_MM.0 * 1.0e-3, EDGE_MM.1 * 1.0e-3);
+        if self.edge_at.is_nan() {
+            for (e, rng) in self.edge.iter_mut().zip(&mut self.edge_rng) {
+                let q = f64::from(uniform(rng));
+                *e = [q, q];
+            }
+            self.edge_at = x;
+        }
+        while x - self.edge_at >= every {
+            self.edge_at += every;
+            for (e, rng) in self.edge.iter_mut().zip(&mut self.edge_rng) {
+                *e = [e[1], f64::from(uniform(rng))];
+            }
+        }
+        let t = ((x - self.edge_at) / slew).min(1.0);
+        let depth = EDGE_UM * 1.0e-6 * damage * damage;
+        for (g, e) in gap.iter_mut().zip(&self.edge) {
+            *g += depth * (e[0] + (e[1] - e[0]) * t);
+        }
+        (gap, twist)
+    }
+
+    /// A dropout begins here ([`DROPOUT_MM`]).
+    fn dropout(&mut self, damage: f64, deeper: f64) {
+        let len = between(&mut self.rng, DROPOUT_MM.0, DROPOUT_MM.1, true) * 1.0e-3;
+        let peak = between(&mut self.rng, DROPOUT_UM.0, DROPOUT_UM.0 + DROPOUT_UM.1 * damage, true) * 1.0e-6 * deeper;
+        let pick = uniform(&mut self.rng);
+        let (mask, which) = if pick < DROPOUT_BOTH {
+            ([1.0, 1.0], 0)
+        } else if pick < DROPOUT_BOTH + DROPOUT_LEFT {
+            ([1.0, 0.0], 1)
+        } else {
+            ([0.0, 1.0], 2)
+        };
+        self.place(Defect {
+            at: self.x,
+            len,
+            peak,
+            mask,
+            pitch: 1.0,
+            twist: 0.0,
+        });
+        #[cfg(test)]
+        {
+            self.log.dropouts += 1;
+            self.log.dropout_m += len;
+            self.log.masks[which] += 1;
+        }
+        #[cfg(not(test))]
+        let _ = which;
+    }
+
+    /// Put a dropout in a free place, or in the place of the one nearer its
+    /// end.
+    fn place(&mut self, d: Defect) {
+        let left = |s: &Option<Defect>| s.and_then(|o| o.along(self.x)).map_or(-1.0, |p| 1.0 - p);
+        let k = if left(&self.drops[0]) <= left(&self.drops[1]) { 0 } else { 1 };
+        self.drops[k] = Some(d);
+    }
+
+    /// A crease begins here ([`CREASE_MM`]).
+    fn crease_at(&mut self, damage: f64) {
+        let len = between(&mut self.rng, CREASE_MM.0, CREASE_MM.1, false) * 1.0e-3;
+        let pitch = between(&mut self.rng, CREASE_PITCH_MM.0, CREASE_PITCH_MM.1, false) * 1.0e-3;
+        let peak = between(&mut self.rng, CREASE_UM.0, CREASE_UM.0 + CREASE_UM.1 * damage, false) * 1.0e-6;
+        let sign = if uniform(&mut self.rng) < 0.5 { -1.0 } else { 1.0 };
+        let twist = sign * between(&mut self.rng, CREASE_URAD.0, CREASE_URAD.0 + CREASE_URAD.1 * damage, false) * 1.0e-6;
+        self.crease = Some(Defect {
+            at: self.x,
+            len,
+            peak,
+            mask: [1.0, 1.0],
+            pitch,
+            twist,
+        });
+        #[cfg(test)]
+        {
+            self.log.creases += 1;
+        }
+    }
+
+    /// **The wear alone, for the tests**: `frames` frames of tape at `ips`
+    /// at `sample_rate`, at Damage `damage` and the bias `bias_db`, worked
+    /// out on the grid the kernel works it on ([`WEAR_STEP`]): the wear as
+    /// it is left, its log with it.
+    #[cfg(test)]
+    fn run(ips: f64, sample_rate: f64, damage: f64, bias_db: f64, frames: u64) -> Wear {
+        let mut w = Wear::new();
+        w.metres = 0.0254 * ips / sample_rate;
+        let deeper = 10.0_f64.powf(-bias_db / 20.0);
+        for f in 0..frames {
+            if f.is_multiple_of(WEAR_STEP) {
+                w.damage(damage, deeper);
+            }
+            w.tick();
+        }
+        w
     }
 }
 
@@ -2980,6 +3295,11 @@ pub struct Tape {
     /// Age, and its per-frame step ([`AGE_GLIDE_MS`]).
     age: Glide,
     a_age: f64,
+    /// Damage, gliding as the other controls do.
+    damage: Glide,
+    /// Each track's spacing at the wear's last step, in metres.
+    #[cfg(test)]
+    gaps: [f64; 2],
     /// Where the tape is under the head ([`Wear`]).
     wear: Wear,
     /// **The wear's grid**, [`WEAR_STEP`] frames: the share of the tracks'
@@ -3109,6 +3429,9 @@ impl Tape {
             bias: Glide::new(1.0e-6),
             age: Glide::new(1.0e-9),
             a_age: step(AGE_GLIDE_MS),
+            damage: Glide::new(1.0e-9),
+            #[cfg(test)]
+            gaps: [0.0; 2],
             wear: Wear::new(),
             skew_from: 0.0,
             skew_to: 0.0,
@@ -3203,6 +3526,7 @@ impl Tape {
         self.jitter.target = jitter_um(p);
         self.bias.target = bias_db(p);
         self.age.target = f64::from(norm_or(p.age, 0.0));
+        self.damage.target = f64::from(norm_or(p.damage, 0.0));
         self.transport.aim(p, self.fresh);
         if self.fresh {
             // And the heads stand where the range is, not fading to it.
@@ -3223,6 +3547,7 @@ impl Tape {
                 &mut self.jitter,
                 &mut self.bias,
                 &mut self.age,
+                &mut self.damage,
             ] {
                 g.settle();
             }
@@ -3306,15 +3631,19 @@ impl Tape {
         let slowest = v.min(ips * self.speed.target.exp2());
         let noise_um = self.jitter.cur.max(self.jitter.target);
         let sr = f64::from(self.sample_rate);
-        let aged = self.age.cur.max(self.age.target);
-        self.transport.design(v, reserve(noise_um, aged, slowest, sr));
+        let widest = widest_urad(
+            self.age.cur.max(self.age.target),
+            self.damage.cur.max(self.damage.target),
+        );
+        self.transport.design(v, reserve(noise_um, widest, slowest, sr));
         self.wear.metres = 0.0254 * v / sr;
     }
 
     /// **One step of the wear's grid**, every [`WEAR_STEP`] frames: the
-    /// head's azimuth where the tape is now, the skew it puts between the
-    /// tracks, and each track's spacing (Age's, and the gap that costs what
-    /// the azimuth costs), as the coefficients the next frames move to. The
+    /// head's azimuth where the tape is now (Age's, and a crease's twist),
+    /// the skew it puts between the tracks, and each track's spacing (Age's,
+    /// the gap that costs what the azimuth costs, and the damage's), as the
+    /// coefficients the next frames move to. The
     /// spacing filter is in circuit only while some track has a spacing at
     /// all, and starts from the signal it meets when it comes back in: at no
     /// spacing its one-poles are wires that carry nothing.
@@ -3322,18 +3651,25 @@ impl Tape {
         let sr = f64::from(self.sample_rate);
         let v_m = self.wear.metres * sr;
         let age = self.age.cur;
-        let theta = self.wear.azimuth(age);
+        let deeper = 10.0_f64.powf(-self.bias.cur / 20.0);
+        let (defects, twist) = self.wear.damage(self.damage.cur, deeper);
+        let theta = self.wear.azimuth(age) + twist;
         let skew = if v_m > 0.0 {
             0.5 * AZIMUTH_SPAN_MM * 1.0e-3 * theta.tan() / v_m * sr
         } else {
             0.0
         };
         let gap = AGE_SPACING_UM * 1.0e-6 * age + if v_m > 0.0 { azimuth_gap(theta, v_m) } else { 0.0 };
+        let gaps = [gap + defects[0], gap + defects[1]];
+        #[cfg(test)]
+        {
+            self.gaps = gaps;
+        }
         // The first frame since `new` or `clear` (`frame` already counts
         // it) starts where it is, not ramping in from nothing.
         let first = self.frame == 1;
-        let to = [gap, gap].map(|d| self.spacing_bs(d, v_m));
-        let on = gap > 0.0 || self.spacing_to.iter().flatten().any(|b| *b != 0.0);
+        let to = gaps.map(|d| self.spacing_bs(d, v_m));
+        let on = gaps.iter().any(|d| *d > 0.0) || self.spacing_to.iter().flatten().any(|b| *b != 0.0);
         if on && !self.spacing_on {
             self.spacing_fresh = true;
         }
@@ -3563,6 +3899,7 @@ impl Tape {
             self.bump_db.tick(self.a_glide);
             self.roll.tick(self.a_glide);
             self.bias.tick(self.a_glide);
+            self.damage.tick(self.a_glide);
             let h2 = MAGNETISED_H2 * self.age.tick(self.a_age) as f32;
             let trim_gain = self.trim.tick(self.a_glide) as f32;
             // The dial's record level, scaled by this speed's headroom: the
@@ -3793,6 +4130,7 @@ impl Tape {
             self.roll.tick(self.a_glide);
             self.trim.tick(self.a_glide);
             self.bias.tick(self.a_glide);
+            self.damage.tick(self.a_glide);
             self.age.tick(self.a_age);
             self.drive.tick(self.a_glide);
             let skew = self.wear_frame();
@@ -3826,6 +4164,43 @@ impl Tape {
     #[cfg(test)]
     pub(crate) fn head_weights(&self) -> (f32, f32) {
         (self.fade_w[0] as f32, self.fade_w[1] as f32)
+    }
+
+    /// **Lay a dropout on the tape where it is under the head now**, on
+    /// both tracks: `peak_um` micrometres of spacing at its middle, over
+    /// `len_mm` millimetres of tape.
+    #[cfg(test)]
+    pub(crate) fn force_dropout(&mut self, peak_um: f64, len_mm: f64) {
+        self.wear.place(Defect {
+            at: self.wear.x,
+            len: len_mm * 1.0e-3,
+            peak: peak_um * 1.0e-6,
+            mask: [1.0, 1.0],
+            pitch: 1.0,
+            twist: 0.0,
+        });
+    }
+
+    /// **Lay a crease on the tape where it is under the head now**:
+    /// `peak_um` micrometres of spacing at its middle rippled every
+    /// `pitch_mm`, twisting the head `twist_urad` off square there, over
+    /// `len_mm` millimetres of tape.
+    #[cfg(test)]
+    pub(crate) fn force_crease(&mut self, peak_um: f64, len_mm: f64, pitch_mm: f64, twist_urad: f64) {
+        self.wear.crease = Some(Defect {
+            at: self.wear.x,
+            len: len_mm * 1.0e-3,
+            peak: peak_um * 1.0e-6,
+            mask: [1.0, 1.0],
+            pitch: pitch_mm * 1.0e-3,
+            twist: twist_urad * 1.0e-6,
+        });
+    }
+
+    /// Each track's spacing at the wear's last step, in micrometres.
+    #[cfg(test)]
+    pub(crate) fn spacing_um(&self) -> [f64; 2] {
+        self.gaps.map(|g| g * 1.0e6)
     }
 
     /// How many times a head has had to be held inside the line.
@@ -3897,7 +4272,8 @@ pub fn bump_hz(p: &TapeParams) -> f32 {
 /// frequency, which agrees with the integral to a hundredth of a decibel,
 /// and so is an old tape's spacing, which sits after the hiss and dulls it
 /// ([`SPACING_FIT`]'s three matched one-poles at [`DESIGN_RATE`], at Age's
-/// gap and the azimuth's standing angle: the digital poles, because at
+/// gap, the worn edges' mean and the azimuth's standing angle: the
+/// digital poles, because at
 /// 3.75 ips and full Age the spacing's top octave is a third of a decibel
 /// under its analogue form, and the meter hears the poles). Drive, Age and Trim add their own decibels: the record
 /// level's, 4.6 dB for every tenth of the dial under [`HISS_DRIVE`] and as
@@ -3928,7 +4304,10 @@ pub fn hiss_dbfs_a(p: &TapeParams) -> f32 {
     // as multiples of the frequency the gap costs a decibel at.
     let age = f64::from(norm_or(p.age, 0.0));
     let v_m = 0.0254 * TapeSpeed::ALL[i].ips();
-    let gap = AGE_SPACING_UM * 1.0e-6 * age + azimuth_gap(AZIMUTH_URAD.0 * 1.0e-6 * age, v_m);
+    let damage = f64::from(norm_or(p.damage, 0.0));
+    let gap = AGE_SPACING_UM * 1.0e-6 * age
+        + 0.5 * EDGE_UM * 1.0e-6 * damage * damage
+        + azimuth_gap(AZIMUTH_URAD.0 * 1.0e-6 * age, v_m);
     let f0 = if gap > 0.0 { v_m / (WALLACE_DB * gap) } else { f64::INFINITY };
     let (k_shelf, at_shelf, at_lp) = SPACING_FIT;
     let rate = f64::from(DESIGN_RATE);
@@ -4006,7 +4385,8 @@ fn weighted_parts(p: &TapeParams) -> f64 {
     let (_, kappa) = resonance_at(sr);
     let (_, band) = scrape_band(sr);
     let asked = at_the_top(&studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr)));
-    let reserve = reserve(jitter_um(p), f64::from(norm_or(p.age, 0.0)), v, sr);
+    let widest = widest_urad(f64::from(norm_or(p.age, 0.0)), f64::from(norm_or(p.damage, 0.0)));
+    let reserve = reserve(jitter_um(p), widest, v, sr);
     let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
     let deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
     let mut sum = 0.0;
@@ -4544,7 +4924,8 @@ mod tests {
     /// Drive, where the hiss sits 23.0 dB over a fresh tape's and 18.4 dB
     /// under the datasheet's, and at Age 0.5 and 1, where an old tape's
     /// noise rises 3 dB at the top and its spacing dulls it again, most of
-    /// all on slow tape (so Age 1 is pinned at 3.75 ips too); it reads
+    /// all on slow tape (so Age 1 is pinned at 3.75 ips too), and at full
+    /// Damage, whose worn edges dull it by their mean; it reads
     /// minus infinity at Hiss 0, and a fresh
     /// tape reads -82.4 within a fifth of a decibel. The meter's bands are
     /// each scaled to the noise bandwidth they really pass, or their
@@ -4555,7 +4936,8 @@ mod tests {
     /// Roll at half travel, where the shelf's bilinear warp and Roll's
     /// one-pole pass a little more treble at 44.1 kHz than the analogue
     /// figures the helper sums; at Age 0.5 and 1 at 15 ips the meter 0.09
-    /// and 0.06 over, at Age 1 at 3.75 ips 0.36 under; and -82.45
+    /// and 0.06 over, at Age 1 at 3.75 ips 0.36 under, at full Damage 0.02
+    /// over; and -82.45
     /// dBFS(A) for a fresh tape.
     #[test]
     fn the_hiss_floor_and_colour_follow_each_speeds_datasheet() {
@@ -4652,6 +5034,7 @@ mod tests {
                 "Age 1 at 3.75 ips",
                 TapeParams { drive: fresh, hiss: 0.25, age: 1.0, speed: TapeSpeed::Ips3_75.dial(), ..TapeParams::NEUTRAL },
             ),
+            ("Damage 1", TapeParams { drive: fresh, hiss: 0.25, damage: 1.0, ..TapeParams::NEUTRAL }),
         ] {
             let out = left(&feed(&mut Tape::new(sr), &silence, &p));
             face_agrees(&p, dba(&out), what);
@@ -4725,15 +5108,19 @@ mod tests {
         }
     }
 
-    /// **Nothing the six knobs can reach may blow up.** Every combination of
-    /// bottom, middle and top on all six at once, the controls appended since
-    /// at their defaults, against a signal with a step in the middle of every
-    /// block, on one unit whose state rides through the whole sweep: a knob
-    /// drag, not a bench test. Then NaN params, the end-to-end jumps, the
-    /// speed thrown between 3.75 and 30 ips and the range between the heads
-    /// every block, and a clear that must actually clear.
+    /// **Nothing any control can reach may blow up.** Every combination of
+    /// bottom, middle and top on the six 5.0 shipped with at once, the
+    /// controls appended since at their defaults, against a signal with a
+    /// step in the middle of every block, on one unit whose state rides
+    /// through the whole sweep: a knob drag, not a bench test. Then 1024
+    /// combinations of all thirteen drawn at random (the selectors on their
+    /// positions), and every control at its bottom and at its top at once.
+    /// Then NaN params, the end-to-end jumps (the hiss and the damage from
+    /// nothing to full and back on silence, then every control), the speed
+    /// thrown between 3.75 and 30 ips and the range between the heads every
+    /// block, and a clear that must actually clear.
     #[test]
-    fn no_setting_the_six_knobs_can_reach_makes_it_explode() {
+    fn no_setting_any_control_can_reach_makes_it_explode() {
         let sr = 48_000.0_f32;
         let mut unit = Tape::new(sr);
         let block: Vec<f32> = (0..128)
@@ -4768,6 +5155,40 @@ mod tests {
                 );
             }
         }
+        let mut seed = 0x7A9E_C0DE_u32;
+        for combo in 0..1_026 {
+            let mut x = [0.0_f32; 13];
+            for v in &mut x {
+                *v = uniform(&mut seed);
+            }
+            match combo {
+                1_024 => x = [0.0; 13],
+                1_025 => x = [1.0; 13],
+                _ => {}
+            }
+            let p = TapeParams {
+                drive: x[0],
+                bump: x[1],
+                roll: x[2],
+                wobble: x[3],
+                hiss: x[4],
+                trim: x[5],
+                speed: TapeSpeed::from_dial(x[6]).dial(),
+                flutter: x[7],
+                rate: x[8],
+                wow_range: WowRange::from_dial(x[9]).dial(),
+                bias: x[10],
+                age: x[11],
+                damage: x[12],
+            };
+            let mut buf = block.clone();
+            unit.process(&mut buf, 128, 2, &p);
+            assert!(
+                buf.iter().all(|v| v.is_finite() && v.abs() < 16.0),
+                "random combination {combo} ({x:?}) left the audio at {:?}",
+                buf.iter().find(|v| !v.is_finite() || v.abs() >= 16.0)
+            );
+        }
 
         // A settings file can hand a kernel NaN; the kernel must shrug.
         let p = TapeParams {
@@ -4783,6 +5204,7 @@ mod tests {
             wow_range: f32::NAN,
             bias: f32::NAN,
             age: f32::NAN,
+            damage: f32::NAN,
         };
         let mut buf = block.clone();
         unit.process(&mut buf, 128, 2, &p);
@@ -4807,6 +5229,7 @@ mod tests {
             let p = if k < 64 {
                 TapeParams {
                     hiss: end,
+                    damage: end,
                     ..TapeParams::NEUTRAL
                 }
             } else {
@@ -4823,6 +5246,7 @@ mod tests {
                     wow_range: end,
                     bias: end,
                     age: end,
+                    damage: end,
                 }
             };
             let mut buf = if k < 64 { silence.clone() } else { block.clone() };
@@ -5431,7 +5855,7 @@ mod tests {
     ///
     /// The figure is asked of the settings, so it is also pinned against
     /// them: each head and the pair add up to its figure exactly, and of
-    /// every position of the twelve dials only the wow range moves it (the
+    /// every position of the thirteen dials only the wow range moves it (the
     /// owner's ruling), the speed included, because a report that moved with
     /// a character dial would re-time the lane in the compensation graph
     /// every time somebody turned it. And the figure a face prints
@@ -5464,7 +5888,7 @@ mod tests {
                      to the {got} frames reported",
                     range.label()
                 );
-                for combo in 0..3_usize.pow(11) {
+                for combo in 0..3_usize.pow(12) {
                     let at = |k: u32| positions[combo / 3_usize.pow(k) % 3];
                     let p = TapeParams {
                         drive: at(0),
@@ -5479,6 +5903,7 @@ mod tests {
                         wow_range: range.dial(),
                         bias: at(9),
                         age: at(10),
+                        damage: at(11),
                     };
                     assert_eq!(
                         unit.latency_frames(&p),
@@ -6032,7 +6457,7 @@ mod tests {
         // Each floor is 3 dB under what the knob measured from a fresh
         // tape, rounded down to the whole decibel; the measured figure is
         // beside it.
-        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 12] = [
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 13] = [
             // -3.7 dB.
             ("drive", |p, v| p.drive = v, -7.0),
             // -36.5 dB: at 15 ips the contour's bell sits near 35 Hz, a
@@ -6072,6 +6497,9 @@ mod tests {
             // -5.2 dB: at 15 ips full Age takes 5 dB off 10 kHz and skews
             // each track a quarter of a sample.
             ("age", |p, v| p.age = v, -9.0),
+            // -15.5 dB: full Damage at 15 ips, its worn edges riding the
+            // tape up to 2 µm off the head and 1.5 dropouts a second.
+            ("damage", |p, v| p.damage = v, -19.0),
         ];
 
         let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
@@ -6902,6 +7330,346 @@ mod tests {
         assert!(dc.abs() < 1.0e-5, "a second on, the magnetised head leaves {dc:.2e} of DC");
     }
 
+    /// **Dropouts arrive per metre of tape and last as long as their
+    /// stretch.**
+    ///
+    /// A defect is a place on the tape, so how often one comes is per
+    /// metre and how long it plays is its length over the speed. Ten
+    /// minutes of the wear alone, at 8 kHz (the wear is laid out in metres,
+    /// so the rate is only its grid): at full Damage, 4 dropouts a metre
+    /// meet 15 ips tape 914 times (800 to 1030) and creases at half a metre's
+    /// one 114 times (85 to 145); 3.75 ips tape a quarter as often, 229 (190
+    /// to 270); half Damage at 15 ips, on the dial's square, 229 as well. A
+    /// dropout's length is log-uniform from 0.5 to 8 mm, 2.7 mm on average,
+    /// which plays 7.10 ms at 15 ips (6.25 to 7.95) and 28.4 at 3.75 (25.0 to
+    /// 31.8), four times as long (3.6 to 4.4). They take both tracks 60 % of
+    /// the time and each alone 20 %, within five points. At Damage 0 nothing
+    /// is drawn: no defect, and the stream still at its seed. And the same
+    /// minute of tape draws the same defects at 44.1, 48 and 96 kHz.
+    /// Measured: 955 dropouts and 121 creases at 15 ips, 225 dropouts at
+    /// 3.75 and at half Damage (the same draws spent at the same expected
+    /// count a metre); 7.15 and 27.70 ms, 3.87 times as long; 59.4, 21.2 and
+    /// 19.5 % of the masks.
+    #[test]
+    fn dropouts_arrive_per_metre_of_tape_and_last_as_long_as_their_stretch() {
+        let minutes = (600.0 * 8_000.0) as u64;
+        let wear = |ips: f64, damage: f64| Wear::run(ips, 8_000.0, damage, 0.0, minutes).log;
+        let ms = |log: &WearLog, ips: f64| log.dropout_m / log.dropouts as f64 / (0.0254 * ips) * 1_000.0;
+        let full = wear(15.0, 1.0);
+        let slow = wear(3.75, 1.0);
+        let half = wear(15.0, 0.5);
+        for (what, n, range) in [
+            ("dropouts at 15 ips", full.dropouts, 800..=1_030),
+            ("creases at 15 ips", full.creases, 85..=145),
+            ("dropouts at 3.75 ips", slow.dropouts, 190..=270),
+            ("dropouts at half Damage", half.dropouts, 190..=270),
+        ] {
+            assert!(range.contains(&n), "ten minutes of tape met {n} {what}, outside {range:?}");
+        }
+        let (fast_ms, slow_ms) = (ms(&full, 15.0), ms(&slow, 3.75));
+        assert!((6.25..=7.95).contains(&fast_ms), "a dropout plays {fast_ms:.2} ms on average at 15 ips");
+        assert!((25.0..=31.8).contains(&slow_ms), "a dropout plays {slow_ms:.2} ms on average at 3.75 ips");
+        assert!(
+            (3.6..=4.4).contains(&(slow_ms / fast_ms)),
+            "a dropout plays {:.2} times as long at 3.75 ips as at 15",
+            slow_ms / fast_ms
+        );
+        for (k, want) in [0.6, 0.2, 0.2].into_iter().enumerate() {
+            let share = full.masks[k] as f64 / full.dropouts as f64;
+            assert!(
+                (share - want).abs() <= 0.05,
+                "{:.3} of the dropouts took {}, not {want}",
+                share,
+                ["both tracks", "the left alone", "the right alone"][k]
+            );
+        }
+        let none = Wear::run(15.0, 8_000.0, 0.0, 0.0, minutes);
+        assert_eq!((none.log.dropouts, none.log.creases), (0, 0), "an undamaged tape had defects");
+        assert!(
+            none.rng == DAMAGE_SEED && none.drop_due.is_nan(),
+            "an undamaged tape drew on the damage's stream"
+        );
+        let counts: Vec<(u64, u64)> = [44_100.0, 48_000.0, 96_000.0]
+            .into_iter()
+            .map(|sr| {
+                let log = Wear::run(15.0, sr, 1.0, 0.0, (60.0 * sr) as u64).log;
+                (log.dropouts, log.creases)
+            })
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] == w[1]),
+            "a minute of the same tape met {counts:?} dropouts and creases at 44.1, 48 and 96 kHz"
+        );
+    }
+
+    /// **A dropout takes the treble and leaves the level.**
+    ///
+    /// Spacing costs `54.575 d / wavelength` dB, so the 20 µm peak of a
+    /// deep dropout is a near-silence for 10 kHz and a dip for the bass. An
+    /// 8 mm dropout laid on 15 ips tape under a steady tone, every colour
+    /// off: at its middle 10 kHz has lost at least 22 dB (the three-pole
+    /// fit -26.1), and 500 Hz 0.8 to 2.2 dB (the law -1.43); on 3.75 ips
+    /// tape 500 Hz loses 4.5 to 7.0 dB (the law -5.73), and the dropout
+    /// lasts its 8 mm, 84 ms, within 2. Measured: -26.06 and -1.46 dB at
+    /// 15 ips, -6.13 at 3.75, lasting 83.9 ms.
+    #[test]
+    fn a_dropout_takes_the_treble_and_leaves_the_level() {
+        let sr = 48_000.0_f32;
+        // The tone's amplitude over `w` frames from `from`, by quadrature.
+        let amp = |x: &[f32], from: usize, w: usize, hz: f64| {
+            let (mut c, mut s) = (0.0_f64, 0.0_f64);
+            for (n, v) in x[from..from + w].iter().enumerate() {
+                let ph = std::f64::consts::TAU * hz * n as f64 / f64::from(sr);
+                c += f64::from(*v) * ph.cos();
+                s += f64::from(*v) * ph.sin();
+            }
+            2.0 * (c * c + s * s).sqrt() / w as f64
+        };
+        // A dropout of 20 µm over 8 mm laid under a tone: the tone at the
+        // dropout's middle against the tone just before it, in dB, and how
+        // many frames the tape carried a spacing.
+        let dip = |speed: TapeSpeed, hz: f64, cycles: usize| {
+            let p = TapeParams {
+                speed: speed.dial(),
+                ..TapeParams::NEUTRAL
+            };
+            let mut unit = Tape::new(sr);
+            let tone = |n: usize| 0.1 * (std::f64::consts::TAU * hz * n as f64 / f64::from(sr)).sin() as f32;
+            let settle = (sr * 0.5) as usize;
+            let mut before: Vec<f32> = (0..settle).flat_map(|n| [tone(n), tone(n)]).collect();
+            unit.process(&mut before, settle, 2, &p);
+            unit.force_dropout(20.0, 8.0);
+            let len = 8.0e-3 / (0.0254 * speed.ips()) * f64::from(sr);
+            let more = len as usize + (sr * 0.05) as usize;
+            let mut during = Vec::with_capacity(more * 2);
+            let mut spaced = 0;
+            for n in settle..settle + more {
+                let mut frame = [tone(n), tone(n)];
+                unit.process(&mut frame, 1, 2, &p);
+                during.extend_from_slice(&frame);
+                if unit.spacing_um()[0] > 0.0 {
+                    spaced += 1;
+                }
+            }
+            let w = (cycles as f64 * f64::from(sr) / hz).round() as usize;
+            let steady = amp(&left(&before), settle - w, w, hz);
+            let middle = amp(&left(&during), (0.5 * len) as usize - w / 2, w, hz);
+            (db(middle / steady), f64::from(spaced) / f64::from(sr) * 1_000.0)
+        };
+        let (top, _) = dip(TapeSpeed::Ips15, 10_000.0, 5);
+        let (low, _) = dip(TapeSpeed::Ips15, 500.0, 2);
+        let (slow, lasted) = dip(TapeSpeed::Ips3_75, 500.0, 2);
+        assert!(top <= -22.0, "at 15 ips a 20 µm dropout leaves 10 kHz at {top:+.2} dB");
+        assert!((-2.2..=-0.8).contains(&low), "at 15 ips a 20 µm dropout costs 500 Hz {low:+.2} dB");
+        assert!((-7.0..=-4.5).contains(&slow), "at 3.75 ips a 20 µm dropout costs 500 Hz {slow:+.2} dB");
+        assert!((lasted - 84.0).abs() <= 2.0, "an 8 mm dropout lasted {lasted:.1} ms on 3.75 ips tape");
+    }
+
+    /// **A crease twists the head, and the head keeps room for it.**
+    ///
+    /// A creased stretch of tape stands off square under the head, so for
+    /// its length it skews the two tracks in time as an aged head does. A
+    /// 50 mm crease twisting the head 1500 µrad, the most full Damage draws,
+    /// laid on new 3.75 ips tape at 48 kHz under the same noise on both
+    /// tracks: across its middle the left runs 3.02 samples behind the
+    /// right (1500 µrad across the 4 mm between the tracks), within half a
+    /// sample. And because any Damage can crease the tape, the head keeps
+    /// each track's share of that widest twist out of the room its
+    /// transport may sway once Damage is up at all. Measured: a lag of
+    /// 3.008 samples, and the room 1.512 samples less, the share exactly.
+    #[test]
+    fn a_crease_twists_the_head_and_the_head_keeps_room_for_it() {
+        let sr = 48_000.0_f32;
+        let p = TapeParams {
+            speed: TapeSpeed::Ips3_75.dial(),
+            ..TapeParams::NEUTRAL
+        };
+        let mut seed = 0xC4EA_5E00_u32;
+        let settle = (sr * 0.2) as usize;
+        let len = (0.050 / (0.0254 * 3.75) * f64::from(sr)) as usize;
+        let mono: Vec<f32> = (0..settle + len).map(|_| 0.25 * white(&mut seed)).collect();
+        let stereo = to_stereo(&mono);
+        let mut unit = Tape::new(sr);
+        let mut out = stereo.clone();
+        unit.process(&mut out[..settle * 2], settle, 2, &p);
+        unit.force_crease(2.0, 50.0, 4.0, 1_500.0);
+        let mut rest = out[settle * 2..].to_vec();
+        let n = rest.len() / 2;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(512);
+            unit.process(&mut rest[done * 2..(done + k) * 2], k, 2, &p);
+            done += k;
+        }
+        let (l, r) = (left(&rest), rest.chunks_exact(2).map(|f| f[1]).collect::<Vec<f32>>());
+        let (at, window) = (len / 2 - 1_024, 2_048);
+        let corr = |lag: i64| -> f64 {
+            (at..at + window)
+                .map(|n| f64::from(l[n]) * f64::from(r[(n as i64 - lag) as usize]))
+                .sum()
+        };
+        let c: Vec<f64> = (-8..=8).map(corr).collect();
+        let k = (1..c.len() - 1).max_by(|a, b| c[*a].total_cmp(&c[*b])).expect("a peak");
+        let (a, b, cc) = (c[k - 1], c[k], c[k + 1]);
+        let lag = (k as f64 - 8.0) + 0.5 * (a - cc) / (a - 2.0 * b + cc);
+        let room = |damage: f32| {
+            let mut unit = Tape::new(sr);
+            unit.transport_trace(&TapeParams { damage, ..p }, 64);
+            unit.governed().room
+        };
+        let kept = room(0.0) - room(1.0);
+        let share = skew_samples(1_500.0, 3.75, f64::from(sr));
+        assert!(
+            (lag - 3.02).abs() <= 0.5,
+            "across a 1500 µrad crease the left runs {lag:.3} samples behind the right"
+        );
+        assert!(
+            kept >= share - 1.0e-9,
+            "at full Damage the head keeps {kept:.3} samples back for a crease's {share:.3} a track"
+        );
+    }
+
+    /// Everything engaged at once: the deep head at full Wow and Flutter, an
+    /// old, damaged, under-biased tape hissing at the top of the dial, at
+    /// 7.5 ips.
+    fn everything_engaged() -> TapeParams {
+        TapeParams {
+            wobble: 1.0,
+            flutter: 1.0,
+            hiss: 1.0,
+            speed: TapeSpeed::Ips7_5.dial(),
+            wow_range: WowRange::Deep.dial(),
+            bias: 0.2,
+            age: 1.0,
+            damage: 1.0,
+            ..TapeParams::default()
+        }
+    }
+
+    /// **Every noise starts again from its seed after `clear`.**
+    ///
+    /// A bounce must be the same bounce: every generator in the machine
+    /// (the hiss, the modulation noise, the transport's parts and its
+    /// wanders, the cassette's drift, the damage and the edges) draws from
+    /// its own seeded stream, and `clear` puts every stream, phase, history
+    /// and the tape's own position back. So with everything engaged, a unit
+    /// that has played a second of something else and been cleared plays
+    /// four seconds bit for bit as a fresh one does, and two fresh units are
+    /// bit for bit alike.
+    #[test]
+    fn every_noise_starts_again_from_its_seed_after_clear() {
+        let sr = 44_100.0_f32;
+        let p = everything_engaged();
+        let mut seed = 0x5EED_0C1E_u32;
+        let input: Vec<f32> = (0..(sr * 4.0) as usize).map(|_| 0.3 * white(&mut seed)).collect();
+        let input = to_stereo(&input);
+        let other: Vec<f32> = (0..(sr * 1.0) as usize * 2).map(|_| 0.5 * white(&mut seed)).collect();
+        let fresh = feed(&mut Tape::new(sr), &input, &p);
+        let mut used = Tape::new(sr);
+        feed(&mut used, &other, &p);
+        used.clear();
+        let again = feed(&mut used, &input, &p);
+        let twin = feed(&mut Tape::new(sr), &input, &p);
+        let first_off = |a: &[f32], b: &[f32]| a.iter().zip(b).position(|(x, y)| x.to_bits() != y.to_bits());
+        assert_eq!(first_off(&fresh, &again), None, "a cleared unit played something else");
+        assert_eq!(first_off(&fresh, &twin), None, "two fresh units played different tapes");
+    }
+
+    /// **A tape track sounds the same at any buffer size.**
+    ///
+    /// Everything in the machine runs on frames counted since `new`: the
+    /// designs on their sub-block grid, the wear on its own, every glide and
+    /// every draw per frame. So the same two seconds with everything engaged
+    /// at 48 kHz come out bit for bit alike through blocks of 7, 64, 333 and
+    /// 512 frames.
+    #[test]
+    fn a_tape_track_sounds_the_same_at_any_buffer_size() {
+        let sr = 48_000.0_f32;
+        let p = everything_engaged();
+        let mut seed = 0xB10C_5EED_u32;
+        let input: Vec<f32> = (0..(sr * 2.0) as usize).map(|_| 0.3 * white(&mut seed)).collect();
+        let input = to_stereo(&input);
+        let through = |block: usize| {
+            let mut unit = Tape::new(sr);
+            let mut out = input.clone();
+            let total = out.len() / 2;
+            let mut done = 0;
+            while done < total {
+                let n = (total - done).min(block);
+                unit.process(&mut out[done * 2..(done + n) * 2], n, 2, &p);
+                done += n;
+            }
+            out
+        };
+        let at_512 = through(512);
+        for block in [7, 64, 333] {
+            let other = through(block);
+            let off = at_512.iter().zip(&other).position(|(x, y)| x.to_bits() != y.to_bits());
+            assert_eq!(off, None, "blocks of {block} frames played another tape");
+        }
+    }
+
+    /// **The tape costs what its budget says.** By hand, in release, never
+    /// during a listening test:
+    ///
+    /// ```text
+    /// cargo test --release -p tangent --bin tangent -- the_tape_costs --ignored --nocapture
+    /// ```
+    ///
+    /// One unit, 128-frame blocks at 48 kHz for 10 s of noise, timed block
+    /// by block: at the defaults, and fully engaged (Age, Damage and Hiss
+    /// at the top, the deep head, the speed thrown between 15 and 3.75 ips
+    /// every half second, the range every second, Rate and Bias swept end to
+    /// end). Prints the mean, p99 and the worst block, and holds the mean at
+    /// the defaults to 21 µs and the p99 fully engaged to 24 µs.
+    #[test]
+    #[ignore = "a bench: run it by hand in release with --ignored --nocapture"]
+    fn the_tape_costs_what_its_budget_says() {
+        let sr = 48_000.0_f32;
+        let block = 128;
+        let blocks = (10.0 * sr) as usize / block;
+        let mut seed = 0xBE4C_0001_u32;
+        let input: Vec<f32> = (0..block * 2).map(|_| 0.25 * white(&mut seed)).collect();
+        let time = |what: &str, at: &dyn Fn(usize) -> TapeParams| {
+            let mut unit = Tape::new(sr);
+            let mut us = Vec::with_capacity(blocks);
+            for k in 0..blocks {
+                let p = at(k);
+                let mut buf = input.clone();
+                let start = std::time::Instant::now();
+                unit.process(&mut buf, block, 2, &p);
+                us.push(start.elapsed().as_secs_f64() * 1.0e6);
+                std::hint::black_box(&buf);
+            }
+            let mean = us.iter().sum::<f64>() / us.len() as f64;
+            us.sort_by(f64::total_cmp);
+            let p99 = us[us.len() * 99 / 100];
+            let max = us[us.len() - 1];
+            println!("tape, {what}: mean {mean:.2} us, p99 {p99:.2} us, max {max:.2} us per {block}-frame block");
+            (mean, p99)
+        };
+        let (mean, _) = time("defaults", &|_| TapeParams::default());
+        let per_second = (sr as usize / block) as f64;
+        let (_, p99) = time("fully engaged", &|k| {
+            let t = k as f64 / per_second;
+            let sweep = (1.0 - (t / 5.0 - 1.0).abs()) as f32;
+            TapeParams {
+                hiss: 1.0,
+                age: 1.0,
+                damage: 1.0,
+                wobble: 1.0,
+                flutter: 1.0,
+                speed: if (t * 2.0) as usize % 2 == 0 { TapeSpeed::Ips15.dial() } else { TapeSpeed::Ips3_75.dial() },
+                wow_range: if t as usize % 2 == 0 { WowRange::Deep.dial() } else { WowRange::Studio.dial() },
+                rate: sweep,
+                bias: sweep,
+                ..TapeParams::default()
+            }
+        });
+        assert!(mean <= 21.0, "a Tape at its defaults costs {mean:.2} us a block, over its 21 us ceiling");
+        assert!(p99 <= 24.0, "a Tape fully engaged costs {p99:.2} us at p99, over its 24 us");
+    }
+
     /// **The transport reads a studio machine's weighted flutter at every
     /// speed.**
     ///
@@ -7023,9 +7791,10 @@ mod tests {
     /// **The play head never runs off its tape at any setting.**
     ///
     /// (a) Every speed, on either head, at the ends and middle of Rate, with
-    /// Wow, Flutter, Hiss and Age at their tops and the bias at its bottom,
-    /// whose coarser grain asks the most of the modulation noise and whose
-    /// aged head skews the two tracks apart, ten seconds of the transport
+    /// Wow, Flutter, Hiss, Age and Damage at their tops and the bias at its
+    /// bottom, whose coarser grain asks the most of the modulation noise,
+    /// whose aged head skews the two tracks apart and whose creases twist it
+    /// further, ten seconds of the transport
     /// at 44.1 kHz each: no head is ever held inside the line
     /// (the safety net catches nothing), and no track's head, its sway and
     /// its own modulation noise together, ever sits further from its rest
@@ -7068,6 +7837,7 @@ mod tests {
                         wow_range: range.dial(),
                         bias: 0.0,
                         age: 1.0,
+                        damage: 1.0,
                         ..TapeParams::default()
                     };
                     let mut unit = Tape::new(sr);
@@ -7370,7 +8140,7 @@ mod tests {
     /// the louder of the two settings' own steady state, plus 6 dB. And the
     /// range switch fades the heads with equal power, two copies of the tone
     /// 23 ms apart, so its level never rises past the steady tone's by more
-    /// than 3.2 dB. (Damage joins this when it lands.) Bias's
+    /// than 3.2 dB. Bias's
     /// under-bias shelf and its inverse straddle the record stage's
     /// oversampler, so the inverse takes each design over 44 frames after
     /// the shelf does; designed together, each design while the bias glided
@@ -7427,7 +8197,8 @@ mod tests {
                 8 => p.rate = v,
                 9 => p.wow_range = v,
                 10 => p.bias = v,
-                _ => p.age = v,
+                11 => p.age = v,
+                _ => p.damage = v,
             }
             p
         };
@@ -7435,7 +8206,7 @@ mod tests {
             6 => (TapeSpeed::Ips15.dial(), TapeSpeed::Ips3_75.dial()),
             _ => (0.0, 1.0),
         };
-        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias", "age"];
+        let names = ["drive", "bump", "roll", "wow", "hiss", "trim", "speed", "flutter", "rate", "wow range", "bias", "age", "damage"];
         for k in 0..names.len() {
             let (a, b) = ends(k);
             for (x, y) in [(a, b), (b, a)] {
