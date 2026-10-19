@@ -9,16 +9,118 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Changed
+
+- **A fresh Tape's studio head is brighter than in 5.2.0**, because it now
+  keeps its top octave (see Fixed below): white noise through it comes out
+  0.4 dB brighter at 10 kHz, 0.9 dB at 12.5 kHz and 1.9 dB at 16 kHz at
+  44.1 kHz, up to 2.5 dB at 20 kHz at 48 kHz, and a quarter of a decibel at
+  most at 96 kHz.
+- **Tape's studio head has a little less room to sway at 44.1 kHz and
+  under.** The sixteen-point read needs eight of the 44 samples the head
+  rests behind the record head at 44.1 kHz, so the head may now sway 0.82 ms
+  either way there instead of 0.9, and 12 samples instead of 18 at 32 kHz.
+  Where the transport asks for more than that, such as Rate at its bottom at
+  slow speed or Wow and Flutter near their tops, it carries up to 12 % less
+  sway at 44.1 kHz than at 48 kHz and above, and at 32 kHz a fresh 3.75 ips
+  tape is shared too. Latency is unchanged at 32 kHz and above; at 8 and
+  22.05 kHz the studio head's grows from 48 to 54 samples.
+
 ### Fixed
 
-- **Tape's deep wow range reaches the 3 % it was meant to at full Wow, and
-  follows the Wow dial in proportion.** It peaked at 2.6 % at full Wow and,
-  lower down the dial, swung further than its share (0.98 % at the default
-  0.3), because the wander that varies the cassette's depth moved its long
-  sway fast enough to bend the pitch on its own. The depth now varies as
-  the cassette's tape pack turns, and the warble swings the pitch 3 % at
-  full Wow, 1.5 % at 0.5 and 0.9 % at the default 0.3. The studio range
-  sounds exactly as it did.
+- **Tape's deep wow range reaches the 3 % it was meant to at full Wow, at
+  any Rate, and follows the Wow dial in proportion.** It peaked at 2.6 to
+  2.9 % at full Wow, depending on Rate. Lower down the dial it swung further
+  than its share: 0.98 % at the default 0.3, and up to 1.33 % with Rate
+  slowed. The wander that varies the cassette's depth moved its long sway
+  fast enough to bend the pitch on its own. The depth now varies as the
+  cassette's tape pack turns, and the cassette's belt drifts at its own pace
+  whatever Rate. So the warble swings the pitch 3 % at full Wow (3.0 to
+  3.07 % over ten minutes from half to double Rate), 1.5 % at 0.5 and 0.9 %
+  at the default 0.3.
+- **Moving a Tape control no longer clicks.** While a control glided, the
+  Tape redesigned its filters every 32 samples and switched each new design
+  in at once. On a bass note that step sprayed treble: Bias thrown across
+  its travel on a 100 Hz tone put a burst up to 11.5 dB over the tape's own
+  treble at 15 ips, and up to 18 dB at 30 ips. Bump at 30 ips, with the note
+  on its 70 Hz bell, gave up to 11 dB. This is the tick a double-click
+  reset, a typed value or stepped automation could make. Every filter whose
+  step clicked now glides to its next design a sample at a time, and the
+  same throws read within about a tenth of a decibel of the steady treble.
+  Roll and a change of speed made smaller steps of the same kind, hidden
+  under the hiss; they glide now too. The glide changes nothing while the
+  controls are still.
+- **Tape's swaying play head keeps the top octave at 44.1 and 48 kHz.** Wow
+  and Flutter move the play head between samples, and the old read lost
+  treble each time the head sat half way between two, forty to fifty times a
+  second at the default settings. A 16 kHz tone pulsed by 4.6 dB at
+  44.1 kHz, and white noise came out 1.8 dB dull at 16 kHz there and 2.3 dB
+  dull at 20 kHz at 48, while 96 kHz sessions barely changed. The head now
+  reads through a sixteen-point interpolator, so at the defaults the top
+  octave stays within about a tenth of a decibel of a still head at every
+  rate, and a 16 kHz tone holds its level within 0.15 dB. An aged tape now
+  loses the same treble at every rate. A still tape plays exactly what it
+  did.
+- **The Tape panel's wow and flutter figure reads the meter when Rate is
+  slowed.** With Rate turned down, the figure beside Transport could read a
+  quarter of what a DIN 45507 / IEC 386 meter measures on the tape: 0.006 %
+  against 0.024 % at 3.75 ips with Rate at its bottom, Wow at its default
+  and Flutter off. It counted the parts' turns but not the pitch bend their
+  own breathing makes, which at that setting carries four fifths of the
+  power the meter hears. It now counts it, and across speeds, heads, Rate,
+  Wow and Flutter it reads within 11 % of ten minutes of the meter at
+  44.1 kHz, the rate it is worked out for. At 48 and 96 kHz, where Wow and
+  Flutter near their tops make the head share its room, it can read up to
+  15 % under, because the head there has a little more room than at 44.1 kHz
+  (see Changed above). Out of the box it still reads 0.04 %.
+- **Typing 0 into Tape's Bias lands on the aligned point.** It landed
+  0.047 dB under it and read "-0.0 dB". Any number that rounds to 0.0 dB now
+  lands and reads "aligned", and no Bias reading shows a signed zero.
+- **A Tape preset saved in 5.0 or 5.1 sounds the same on every track.** It
+  names six of the thirteen controls, and loading it left the other seven
+  where the track had them: on a Tape at 30 ips in the deep range it stayed
+  at 30 ips in the deep range. A preset from an older build now puts every
+  control it does not name at its default, as a 5.1 session does, so it
+  plays at 15 ips on the studio head. A Denoise preset from before the
+  kernel selector plays the kernel it was saved with.
+- **Tape start and stop stays with its project.** Opening a project saved
+  before 5.2, pressing New on a template saved before 5.2, or launching on
+  one kept the switch as the last session left it, so Play could spin up a
+  desk that never asked for it, and the next save wrote it in. These now
+  open with start and stop off. A project saved with it on opens on.
+- **One bad sample no longer stops the effects after it.** A plugin or an
+  audio interface that delivered a single NaN or infinity left every filter,
+  compressor, Tape and reverb after it making nothing but invalid samples
+  from then on. From the interface it reached further than its own track:
+  with monitoring off on a track that plays audio of its own, or with an
+  input on a folder, it went into the effects bus's built-in reverb and took
+  the whole mix with it, and through a hardware insert it stopped the Tape
+  after it. Such a sample is now silence where it comes in: where audio
+  enters every rack, after every hosted plugin, as the interface's input is
+  read, and in a hardware insert's return. Ordinary audio passes through bit
+  for bit.
+- **A track with the drum kit, armed and monitored, runs its effects once
+  per block.** With an input open and monitoring on, its effects ran twice
+  per block, once over the input and once over the kit, and a bypassed Tape,
+  Denoise or IR mixed the two signals. While the input is monitored the kit
+  now goes past the track's effects, in time with the rest of the mix.
+- **The Windows zip's permanent download link works again from this
+  release.** The version-less tangent-windows-x86_64.zip, which the
+  supporter emails sent before 3.0.0 hand out, was left off 5.2.0, so that
+  link answered 404. Every stable release uploads it again, and a release
+  without it is refused.
+
+### Known
+
+- **On a desk that delay compensation holds back, the click plays ahead of
+  the music, and a part played in time with the music records late by the
+  same amount.** Every track waits for the longest delay a plugin reports:
+  25 ms for a Tape in its deep wow range, 2 ms in the studio range, about
+  11 ms for an IR with an impulse loaded. The click is not held, so it is
+  heard that much ahead of the drums. A recording is placed where it was
+  played with nothing taken off, so a part played in time with the backing
+  lands 25 ms late with a deep-range Tape on the desk, and a part played in
+  time with the click lands on the beat.
 
 ## [5.2.0] - 2026-10-19
 
