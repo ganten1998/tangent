@@ -8844,11 +8844,11 @@ mod tests {
     /// trace the meter itself reads 0.018 to 0.029 % there, a spread no
     /// figure can stand within 15 % of, and over the eight 152 s windows of
     /// 21 minutes 0.020 to 0.025 %, so it reads 160 s. Measured, in that
-    /// order: -0.3, +4.3, -3.7, -7.3, -9.3,
+    /// order: -0.3, +4.6, -3.7, -7.3, -8.6,
     /// +1.5, -2.0, +11.4 and -5.7 %, where the turns alone, as 5.2.0's
     /// figure summed them, read -73, -44, -40, -37, -17, -24, +14 and +11 %
-    /// on the studio head, which sounds as it did in 5.2.0, and -14 % on the
-    /// deep head as it swings now.
+    /// against the studio head as 5.2.0 swung it, and -14 % on the deep head
+    /// as it swings now.
     #[test]
     fn the_face_reads_the_meter_where_rate_slows_the_wow() {
         let sr = 44_100.0_f32;
@@ -8905,11 +8905,16 @@ mod tests {
     /// it everywhere, 3.6 % on average; within 11.4 % of the 40 s meter
     /// everywhere but the one corner the short window cannot read (3.75 ips,
     /// Rate 0, Wow 0.3, Flutter 0: its first 32 s read 0.0294 %, its ten
-    /// minutes 0.0236 %, and the face 0.0228 %), and the same at 48 and
-    /// 96 kHz. The turns alone, as 5.2.0's figure summed them, missed the
-    /// 40 s meter by more than 15 % at 7 of the 240, every one with Flutter
-    /// at 0 on the studio head (which sounds as it did in 5.2.0), and read
-    /// 79 % under at that corner.
+    /// minutes 0.0236 %, and the face 0.0228 %). At 48 and 96 kHz the face
+    /// is the same figure, planned on the 0.82 ms the read's reach leaves
+    /// the studio head at 44.1 kHz, while the head there has all 0.9 ms, so
+    /// where the governor shares the head it reads under the meter: up to
+    /// 14.2 % under the 640 s meter at 48 kHz and 15.3 % at 96, both at
+    /// 7.5 ips with Rate at its bottom and Wow and Flutter at 1, which this
+    /// test, at 44.1 kHz, does not hold. The turns alone, as 5.2.0's figure
+    /// summed them, missed the 40 s meter by more than 15 % at 7 of the
+    /// 240, every one with Flutter at 0 on the studio head as 5.2.0 swung
+    /// it, and read 79 % under at that corner.
     #[test]
     #[ignore = "slow: run it by hand in release with --ignored --nocapture"]
     fn the_face_reads_the_meter_across_the_whole_grid() {
@@ -9604,8 +9609,9 @@ mod tests {
     /// deep head and +1.82 the second time, and not at all on the way back.
     /// With each design switched in once a sub-block, as 5.2.0 did, Bias read
     /// +8.7 dB on the 100 Hz tone at 15 ips and +15.5 at 30 ips, Bump +10.8
-    /// at 30 ips, and on silent tape Roll +12.3 and Speed +7.2; and the stale
-    /// Roll reads +11.4.
+    /// at 30 ips, and on silent tape Roll +12.3 and Speed +7.2, and through
+    /// the sixteen-tap read ([`READ_TAPS`]) +11.7, +16.3, +10.8, +12.3 and
+    /// +9.8; and the stale Roll reads +11.4.
     #[test]
     fn a_moving_control_never_clicks() {
         // Each control's ceiling over the louder steady state, in dB; the
