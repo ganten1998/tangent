@@ -3737,9 +3737,13 @@ impl Tape {
 
     /// A track's spacing filter for a spacing of `d` metres on tape at `v_m`
     /// metres a second: the `b` of its shelf's one-pole and of its double
-    /// low-pass ([`SPACING_FIT`]), read from the table. No spacing is a wire.
+    /// low-pass ([`SPACING_FIT`]), read from the table. No spacing is a wire,
+    /// and so is one that is not a finite number of metres: no setting
+    /// reaches that (the dials read through [`norm_or`], and the seat washes
+    /// what it hands in), but a NaN would otherwise fall through to the
+    /// table's 16 Hz end and hold the track near silence.
     fn spacing_bs(&self, d: f64, v_m: f64) -> [f32; 2] {
-        if d <= 0.0 || v_m <= 0.0 {
+        if !(d.is_finite() && d > 0.0 && v_m > 0.0) {
             return [0.0; 2];
         }
         let f0 = (v_m / (WALLACE_DB * d)).log2();
@@ -5460,6 +5464,50 @@ mod tests {
             buf.iter().all(|v| v.is_finite()),
             "NaN params reached the audio"
         );
+
+        // **And a NaN in any control appended since 5.0 is that control at
+        // its default**, bit for bit, because each reads through `norm_or`:
+        // a file that lost the field, or a host that hands it a NaN, hears
+        // the tape the field's default makes. Finite is not enough: Damage
+        // read raw passes the leg above, yet its NaN reaches the spacing and
+        // holds the tone near silence. Everything else is engaged, so a NaN
+        // anywhere in the wear or the transport has something to spoil. (The
+        // six 5.0 shipped read a NaN as the middle of their travel, as 5.0
+        // did.)
+        let heard = |p: &TapeParams| {
+            let mut unit = Tape::new(sr);
+            (0..40)
+                .flat_map(|_| {
+                    let mut buf = block.clone();
+                    unit.process(&mut buf, 128, 2, p);
+                    buf
+                })
+                .collect::<Vec<f32>>()
+        };
+        let base = everything_engaged();
+        let fresh = TapeParams::default();
+        let appended: [(&str, fn(&mut TapeParams, f32), f32); 7] = [
+            ("speed", |p, v| p.speed = v, fresh.speed),
+            ("flutter", |p, v| p.flutter = v, fresh.flutter),
+            ("rate", |p, v| p.rate = v, fresh.rate),
+            ("wow range", |p, v| p.wow_range = v, fresh.wow_range),
+            ("bias", |p, v| p.bias = v, fresh.bias),
+            ("age", |p, v| p.age = v, fresh.age),
+            ("damage", |p, v| p.damage = v, fresh.damage),
+        ];
+        for (name, set, default) in appended {
+            let (mut nan, mut unset) = (base, base);
+            set(&mut nan, f32::NAN);
+            set(&mut unset, default);
+            let off = heard(&nan).iter().zip(&heard(&unset)).position(|(x, y)| x.to_bits() != y.to_bits());
+            assert_eq!(off.map(|i| i / 2), None, "a NaN {name} played another tape than {name} at its default, from that frame on");
+        }
+        // The spacing a NaN would have made, had it got there, is no
+        // spacing at all.
+        let v_m = 0.0254 * TapeSpeed::Ips15.ips();
+        for d in [f64::NAN, f64::INFINITY] {
+            assert_eq!(Tape::new(sr).spacing_bs(d, v_m), [0.0; 2], "a spacing of {d} m is not a wire");
+        }
 
         // **Every control end to end on alternate blocks, and the hiss back
         // from silence.** A glide leaving the bottom of a level's travel is
