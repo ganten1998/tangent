@@ -142,7 +142,7 @@ pub const NOTE_PLAYBACK: &str = "playback";
 const NOTE_OF: [Option<(&str, &str)>; 4] = [
     Some((
         NOTE_TRANSPORT,
-        "weighted peak wow and flutter, the figure a spec sheet quotes; latency is what delay compensation is told this tape holds the sound",
+        "weighted peak wow and flutter, the figure a spec sheet quotes; latency is how long this tape holds the sound, the figure delay compensation is told",
     )),
     None,
     Some((NOTE_TAPE, "the tape's hiss on silence, A-weighted")),

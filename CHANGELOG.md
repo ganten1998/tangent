@@ -119,9 +119,11 @@ and a new session plays a grand piano.
   environment variables that turn on diagnostics and test hooks now start
   with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
   `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
-  a shell or a launcher that still sets it needs the new name. Every
-  release up to 5.1.0 reads only the old prefix, so the `TANGENT_` names in
-  the older entries below work from this release on.
+  a shell or a launcher that still sets it needs the new name. Of the
+  switches the older entries below name, only `TANGENT_LOG`, `TANGENT_PACE`
+  and `TANGENT_PACE_PROBE` are new spellings, which a release up to 5.1.0
+  reads only under the old prefix; the others have always had the names
+  those entries give them.
 - **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
   see its MIDI client as `tangent` and its input port as `tangent-in`. A
   patchbay that saved a connection to the names they had before (qpwgraph,
