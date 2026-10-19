@@ -8063,7 +8063,7 @@ mod tests {
         // The deep head: Rate from its bottom to its top at full Wow, under
         // the deep head's own 3 % of slew; and the cassette's pack alone,
         // whose excursion is the largest any part carries, never bends the
-        // pitch past 1.2 times its own depth, [`CASSETTE_DEPTH`] of Wow's
+        // pitch past 1.2 times its own depth, `CASSETTE_DEPTH` of Wow's
         // dial times its share (model 1.11). Measured: 3.25 % against the
         // settings' 2.87, and the pack 0.96 times its depth.
         let deep = |rate: f32| TapeParams {
@@ -8110,12 +8110,18 @@ mod tests {
     /// further than the pack's turn did, until the deep slew held it back
     /// ([`CASSETTE_BREATH`]). It reads a third of that weighted, within 15 %
     /// of 1 % times Wow, and the figure the face prints is within 15 % of
-    /// the meter at all three. With Wow and Flutter at 0 the deep head does
-    /// not move at all. The cassette ignores the tape speed: its pack turns
-    /// at 0.45 Hz within 5 % at 3.75 and at 30 ips. And nothing is ever held
-    /// inside the line. Measured: peaks of 3.011, 1.508 and 0.911 %, 1.002,
-    /// 0.500 and 0.301 % weighted, the face 1.4 to 1.6 % over the meter; the
-    /// pack at 0.4485 Hz at both speeds.
+    /// the meter at all three. And the pack alone, at the default Wow, peaks
+    /// within 5 % of its own depth: its breathing may bend the pitch by at
+    /// most a quarter of that depth, and does so across its turn, so it
+    /// adds about 3 % at most, while the breathing still carries the pack
+    /// to the top of its depth (5.2.0's took it to 1.6 times). With Wow and
+    /// Flutter at 0 the deep head does not move at all. The cassette
+    /// ignores the tape speed: its pack turns at 0.45 Hz within 5 % at
+    /// 3.75 and at 30 ips. And nothing is ever held inside the line.
+    /// Measured: peaks of 3.011, 1.508 and 0.911 %, 1.002, 0.500 and
+    /// 0.301 % weighted, the face 1.4 to 1.6 % over the meter; the pack
+    /// alone 1.026 times its depth; the pack's line at 0.4485 Hz at both
+    /// speeds.
     #[test]
     fn the_deep_range_swings_the_pitch_like_a_worn_cassette() {
         let sr = 44_100.0_f32;
@@ -8126,6 +8132,14 @@ mod tests {
             wow_range: WowRange::Deep.dial(),
             ..TapeParams::default()
         };
+        let wow = TapeParams::default().wobble;
+        let own = 100.0 * CASSETTE_DEPTH * CASSETTE_SHARE[0] * f64::from(wow);
+        let pack = flutter_peak(&Tape::new(sr).pack_trace(&deep(wow), (sr * 120.0) as usize), srf, skip);
+        assert!(
+            (pack / own - 1.0).abs() <= 0.05,
+            "the cassette's pack alone peaks at {pack:.3} % at the default Wow, not within 5 % of its \
+             own {own:.3} %"
+        );
         for wobble in [1.0_f32, 0.5, 0.3] {
             let p = deep(wobble);
             let mut unit = Tape::new(sr);
