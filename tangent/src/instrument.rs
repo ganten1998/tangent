@@ -5034,10 +5034,12 @@ pub(crate) struct Rack {
     /// **The last block this rack's hosted plugins were told about**: the
     /// chunk (`Shared::transport_chunk`) and the frame just past the block's
     /// end. A second run in the same chunk that does not start past it is
-    /// the same stretch of song arriving again (a send destination, a drum
-    /// lane's kit pass), and its plugins are left on the context they have
-    /// rather than told the same or an earlier place a second time. See
-    /// `run_rack`.
+    /// the same stretch of song arriving again (a send destination's run
+    /// over what is sent to it), and its plugins are left on the context
+    /// they have rather than told the same or an earlier place a second
+    /// time. See `run_rack`. Its chunk is also how a drum lane's kit pass
+    /// knows the room has already run the lane's chain this chunk, and
+    /// stands past it rather than clock it twice (`mix_pad_lane`).
     told: (u64, u64),
 }
 
@@ -10737,12 +10739,15 @@ fn run_rack(
     //
     // **Once per stretch of song.** A rack can run twice in a chunk over
     // the same frames: a send destination's own rack over what is sent to
-    // it, after its lane pass; a drum lane's rack over its kit. A plugin
-    // told the same or an earlier place twice a chunk fires a step twice or
-    // resets on the backwards jump, so the second run forwards nothing and
-    // its plugins keep the context the first gave them. A grained lane's
-    // second span in one chunk starts where the first ended, and is a new
-    // block. See `Rack::told`.
+    // it, after its lane pass. A plugin told the same or an earlier place
+    // twice a chunk fires a step twice or resets on the backwards jump, so
+    // the second run forwards nothing and its plugins keep the context the
+    // first gave them. A grained lane's second span in one chunk starts
+    // where the first ended, and is a new block. A drum lane's chain runs
+    // once a chunk: in its kit pass, or in the lane pass with the kit poured
+    // at its head, and the kit pass stands past a chain the room has run
+    // this chunk, which this record says (`mix_pad_lane`). See
+    // `Rack::told`.
     let anchor = shared.transport_anchor.load(Ordering::Relaxed);
     let base = if pos == u64::MAX { anchor } else { pos };
     let chunk = shared.transport_chunk.load(Ordering::Relaxed);
