@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Publish this version's artifacts to the GitHub release, in BOTH spellings:
-# the version-scoped names, and the version-less aliases that every permanent
-# download link resolves through.
+# Publish this version's artifacts to the GitHub release: every artifact under
+# its version-scoped name, a version-less alias for each name a permanent
+# download link resolves through, and one SHA256SUMS.
 #
 # Usage:
 #   scripts/publish-github.sh --notes-file <file>   # create the release
@@ -133,11 +133,25 @@ done < "$SUMS"
 echo "==> Checksums: $SUMS"
 
 # ── Build the alias set in a temp dir ────────────────────────────────────────
-# `Tangent-5.1.0-macos-universal.dmg` -> `Tangent-macos-universal.dmg`, and
-# the checksums go up twice: version-scoped for the record, bare for the
-# permalink.
+# **A version-less copy only where a permanent link asks for one.** The links
+# in README.md, the store page and the supporter email resolve by exact name
+# against the latest stable release (`check-store-links.sh --names` reads all
+# three), so `Tangent-5.1.0-macos-universal.dmg` also goes up as
+# `Tangent-macos-universal.dmg` because a link names that, and the Linux
+# aarch64 tarball, the Windows zip and the FreeBSD files go up once, under
+# their versioned names, because nothing links them bare. 5.1.0 first
+# carried a bare copy of every artifact and of the checksums, the FreeBSD
+# complete bundle's 489 MB among them, that no link reached. The checksums
+# go up once, as `SHA256SUMS`: the release they sit in is the version.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+
+NEED=""
+if [ "$PRERELEASE" = 0 ]; then
+  NEED="$(scripts/check-store-links.sh --names)" \
+    || { echo "could not read the permanent links (scripts/check-store-links.sh --names)" >&2; exit 1; }
+fi
+needed() { printf '%s\n' "$NEED" | grep -Fqx -- "$1"; }
 
 UPLOADS=()
 if [ "$PRERELEASE" = 1 ]; then
@@ -148,18 +162,15 @@ fi
 for a in "${ARTIFACTS[@]}"; do
   [ "$PRERELEASE" = 1 ] && break
   base="${a#dist/}"
+  UPLOADS+=("$a")
   alias_name="${base/-${VERSION}-/-}"
-  if [ "$alias_name" = "$base" ]; then
-    echo "refusing to guess an alias for '$base' (no -${VERSION}- in the name)" >&2
-    exit 1
-  fi
+  [ "$alias_name" != "$base" ] && needed "$alias_name" || continue
   cp "$a" "$STAGE/$alias_name"
-  UPLOADS+=("$a" "$STAGE/$alias_name")
+  UPLOADS+=("$STAGE/$alias_name")
 done
 if [ "$PRERELEASE" = 0 ]; then
-  cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
   cp "$SUMS" "$STAGE/SHA256SUMS"
-  UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
+  UPLOADS+=("$STAGE/SHA256SUMS")
 fi
 
 # **No third spelling.** Every asset also went up under its pre-rename name,
@@ -167,7 +178,7 @@ fi
 # that links in old supporter emails kept working. The owner retired both
 # sets: 5.1.0 carries neither, and those old links 404.
 
-echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
+echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, a version-less copy where a permanent link names one)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
 
 # **Every permanent link a buyer holds gets its asset.** The links in
@@ -178,8 +189,6 @@ for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
 # had paid. check-store-links.sh reads those three sources; nothing here
 # keeps a second list of the names.
 if [ "$PRERELEASE" = 0 ]; then
-  NEED="$(scripts/check-store-links.sh --names)" \
-    || { echo "could not read the permanent links (scripts/check-store-links.sh --names)" >&2; exit 1; }
   MISSING=""
   while IFS= read -r name; do
     [ -n "$name" ] || continue

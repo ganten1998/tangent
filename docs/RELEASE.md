@@ -356,11 +356,12 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    included) back on the mirror.
 9. **Publish**: `scripts/publish-github.sh --notes-file <notes>` (the
    `github` remote is the release channel; `DRY_RUN=1` to rehearse). It
-   uploads every artifact in TWO spellings: version-scoped, and the
-   version-less alias (`Tangent-macos.pkg`,
-   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...). The
-   pre-rename names and the arm64 names of the Mac build before 3.0.0 are
-   no longer uploaded, and old supporter emails that link them 404. The
+   uploads every artifact under its version-scoped name, a version-less
+   alias only for the names a permanent link uses (`Tangent-macos.pkg`,
+   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...; the
+   list is `scripts/check-store-links.sh --names`), and one `SHA256SUMS`.
+   The pre-rename names and the arm64 names of the Mac build before 3.0.0
+   are no longer uploaded, and old supporter emails that link them 404. The
    version-less aliases are what
    `releases/latest/download/<name>` resolves by exact name, and that
    permalink is the download link on the Gumroad post-purchase page, in the
