@@ -10752,12 +10752,12 @@ fn run_rack(
             // as late as the latency the bay reports, so an A/B against
             // bypass lines up and toggling it mid-play does not jump. The
             // Tangent Insert sends nothing and pings nothing (the owner's
-            // ruling); the Tape fades to its dry and stops its kernel. Every
-            // other unit's bypass is the untouched signal, as above, and a
-            // unit with a delay that does not keep it plays its lane that
-            // much early while it is out, because its figure stays in the
-            // graph: the denoise's lookahead is one, and opting in is one
-            // arm in that function.
+            // ruling); the Tape fades to its dry and stops its kernel; the
+            // denoise and the convolver read their input back from a dry line
+            // at the delay they report. Every other unit reports nothing, and
+            // its bypass is the untouched signal, as above. A new unit with a
+            // delay opts in with one arm in that function, or its lane plays
+            // early while it is out, because its figure stays in the graph.
             if let Backend::Builtin(u) = &mut p.backend {
                 if u.keeps_its_delay_when_bypassed() {
                     u.bypassed(planar, frames, out);

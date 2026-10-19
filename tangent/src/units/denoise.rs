@@ -2198,6 +2198,15 @@ impl Denoise {
         }
     }
 
+    /// **The most [`Denoise::latency`] can ever answer at this unit's rate**:
+    /// the Studio frame or the lookahead line, whichever is longer (Live is
+    /// half of Studio). A bypassed bay keeps the figure it reports, so its
+    /// dry line is sized by this once, at build, and never on the audio
+    /// thread.
+    pub fn max_latency(&self) -> u32 {
+        self.studio_n.max(self.la_len) as u32
+    }
+
     /// Each band's applied cut right now, in positive dB — the meter's
     /// numbers, post-constraint, exactly what the bells are doing.
     pub fn depth_db(&self) -> [f32; DENOISE_BANDS] {

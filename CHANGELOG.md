@@ -112,6 +112,14 @@ one, and the desk learned to start and stop the way a tape does.
 - **Tape's hiss and scrape are the same at every sample rate.** At 96 kHz the
   hiss was 6.8 dB too quiet and the scrape 3.4 dB too shallow (0.7 and 0.4 dB
   at 48 kHz).
+- **A bypassed Tangent Denoise or Tangent IR stays in time.** Each tells
+  delay compensation about a delay (the denoise's 3 ms lookahead or its
+  spectral frame, the IR's 512-frame partition once an impulse response is
+  loaded), and that figure stays in place while the bay is bypassed, so a
+  bypass that let the input straight past played its track that much early.
+  A bypassed bay now plays its input exactly as late as it reports, so
+  bypassing changes what you hear and never when, as the Tape and the
+  Tangent Insert already did.
 - **An input monitored under the PITCH CONT dial plays at its own pitch
   whatever its width.** A wide interface's input (64 channels, say) was played
   unstretched, a 1 kHz tone at 874.5 Hz, and a mono or six-channel input

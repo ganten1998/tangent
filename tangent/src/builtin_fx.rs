@@ -1850,10 +1850,15 @@ impl BuiltinUnit {
     /// that much early against the rest of the mix. The rack sends a bay of
     /// a unit that answers yes through [`BuiltinUnit::bypassed`] instead of
     /// past it: the hardware insert (its loop's round trip, the owner's
-    /// ruling) and the tape (its play head). Every other built-in reports
-    /// nothing, or, like the denoise's lookahead, has yet to opt in here.
+    /// ruling), the tape (its play head), the denoise (its lookahead or its
+    /// spectral frame) and the convolver (its partition, once an IR is in),
+    /// the last two through a [`DryLine`]. Every other built-in reports
+    /// nothing a bypass could owe.
     pub fn keeps_its_delay_when_bypassed(&self) -> bool {
-        matches!(self, BuiltinUnit::HwInsert(_) | BuiltinUnit::Tape(_))
+        matches!(
+            self,
+            BuiltinUnit::HwInsert(_) | BuiltinUnit::Tape(_) | BuiltinUnit::Denoise(_) | BuiltinUnit::Ir(_)
+        )
     }
 
     /// The bay bypassed, for a unit that
@@ -1864,6 +1869,14 @@ impl BuiltinUnit {
         match self {
             BuiltinUnit::HwInsert(u) => u.bypassed(input, frames, out),
             BuiltinUnit::Tape(u) => u.bypassed(input, frames, out),
+            BuiltinUnit::Denoise(u) => {
+                let late = u.kernel.latency() as usize;
+                u.dry.pass(input, frames, out, late);
+            }
+            BuiltinUnit::Ir(u) => {
+                let late = if u.has_ir { u.kernel.latency() as usize } else { 0 };
+                u.dry.pass(input, frames, out, late);
+            }
             _ => {
                 for (src, dst) in input.iter().zip(out.iter_mut()) {
                     let n = frames.min(src.len()).min(dst.len());
@@ -1893,7 +1906,10 @@ impl BuiltinUnit {
             // `set_param` before it calls this, `set_param` primes on every
             // write, and a second call would be a guard no revert could
             // turn red.
-            BuiltinUnit::Denoise(u) => u.kernel.clear(),
+            BuiltinUnit::Denoise(u) => {
+                u.kernel.clear();
+                u.dry.clear();
+            }
             BuiltinUnit::Amp(u) => u.kernel.clear(),
             BuiltinUnit::Drive(u) => u.kernel.clear(),
             BuiltinUnit::Trem(u) => u.kernel.clear(),
@@ -1903,7 +1919,10 @@ impl BuiltinUnit {
             BuiltinUnit::Wah(u) => u.kernel.clear(),
             // And the convolver's clear keeps the IR itself: tails go, the
             // loaded filter stays, the same knowledge-vs-signal split.
-            BuiltinUnit::Ir(u) => u.kernel.clear(),
+            BuiltinUnit::Ir(u) => {
+                u.kernel.clear();
+                u.dry.clear();
+            }
             // Every voice off, the dials settled where they stand.
             BuiltinUnit::Analog(u) => u.synth.clear(),
             // The same, and it keeps NOTHING about the file — because it
@@ -2482,6 +2501,72 @@ impl CompUnit {
 /// carries the learn edge-detector that feeds [`BuiltinUnit::learn_snapshot`]:
 /// the kernel freezes thresholds on the block AFTER the dial falls, so the
 /// snapshot must stay offered for exactly one block past the fall.
+/// **A bypassed bay's input, exactly as late as the unit says it is.**
+///
+/// A bypassed bay's latency stays in the compensation graph (the rack's
+/// bypass arm keeps it, so a bypass never re-times the desk), which means a
+/// unit with a delay that let its input past untouched would play its lane
+/// that many frames early: the denoise's 3 ms lookahead or its spectral
+/// frame, the convolver's 512-frame partition, a flam on every A/B. So the
+/// unit writes its input here on every block, in circuit or out, and its
+/// bypass reads it back at the latency it reports. Sized once, at build, for
+/// the most that unit can ever report; nothing here allocates afterwards.
+/// The switch itself is the instant one it always was: what changes is that
+/// the dry side now lands where the processed side did.
+struct DryLine {
+    line: [Vec<f32>; 2],
+    at: usize,
+}
+
+impl DryLine {
+    fn new(max_late: usize) -> Self {
+        Self { line: [vec![0.0; max_late + 1], vec![0.0; max_late + 1]], at: 0 }
+    }
+
+    /// Remember this block's input, the in-circuit half: a bay switched out
+    /// mid-song has its history ready.
+    fn write(&mut self, input: &[Vec<f32>], frames: usize) {
+        let len = self.line[0].len();
+        for f in 0..frames {
+            for (ch, d) in self.line.iter_mut().enumerate() {
+                d[self.at] = input.get(ch).and_then(|c| c.get(f)).copied().unwrap_or(0.0);
+            }
+            self.at = (self.at + 1) % len;
+        }
+    }
+
+    /// Remember this block's input and play it `late` frames back, the
+    /// bypassed half. `late` is held inside the line, so a figure the line
+    /// was not sized for reads its far end rather than out of bounds; a
+    /// third channel or more, which no unit here processes, goes past as it
+    /// always did.
+    fn pass(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>], late: usize) {
+        let len = self.line[0].len();
+        let late = late.min(len - 1);
+        for f in 0..frames {
+            let back = (self.at + len - late) % len;
+            for (ch, d) in self.line.iter_mut().enumerate() {
+                d[self.at] = input.get(ch).and_then(|c| c.get(f)).copied().unwrap_or(0.0);
+                if let Some(o) = out.get_mut(ch).and_then(|c| c.get_mut(f)) {
+                    *o = d[back];
+                }
+            }
+            self.at = (self.at + 1) % len;
+        }
+        for (src, dst) in input.iter().zip(out.iter_mut()).skip(2) {
+            let n = frames.min(src.len()).min(dst.len());
+            dst[..n].copy_from_slice(&src[..n]);
+        }
+    }
+
+    fn clear(&mut self) {
+        for d in &mut self.line {
+            d.fill(0.0);
+        }
+        self.at = 0;
+    }
+}
+
 pub struct DenoiseUnit {
     kernel: crate::units::denoise::Denoise,
     params: crate::units::denoise::DenoiseParams,
@@ -2491,16 +2576,21 @@ pub struct DenoiseUnit {
     /// Whether this block's thresholds are worth publishing — learn up, or
     /// the falling-edge block that froze them.
     publish: bool,
+    /// The input as late as the lookahead or the frame, for the bypass.
+    dry: DryLine,
 }
 
 impl DenoiseUnit {
     fn new(sample_rate: f32) -> Self {
+        let kernel = crate::units::denoise::Denoise::new(sample_rate);
+        let dry = DryLine::new(kernel.max_latency() as usize);
         Self {
-            kernel: crate::units::denoise::Denoise::new(sample_rate),
+            kernel,
             params: crate::units::denoise::DenoiseParams::default(),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             last_learn: false,
             publish: false,
+            dry,
         }
     }
 
@@ -2540,6 +2630,7 @@ impl DenoiseUnit {
         run_planar(&mut self.scratch, input, frames, out, |buf, n| {
             kernel.process(buf, n, 2, params);
         });
+        self.dry.write(input, frames);
         self.publish = learn_now || self.last_learn;
         self.last_learn = learn_now;
     }
@@ -2898,6 +2989,8 @@ pub struct IrUnit {
     /// Whether an IR ever landed, which is what decides the honest latency:
     /// the empty kernel is a wire and must not bill a partition for it.
     has_ir: bool,
+    /// The input as late as the partition, for the bypass.
+    dry: DryLine,
 }
 
 impl IrUnit {
@@ -2908,6 +3001,7 @@ impl IrUnit {
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
             sample_rate,
             has_ir: false,
+            dry: DryLine::new(crate::units::convolver::CONV_PARTITION),
         }
     }
 
@@ -2963,6 +3057,7 @@ impl IrUnit {
         run_planar(&mut self.scratch, input, frames, out, |buf, n| {
             kernel.process(buf, n, 2, params);
         });
+        self.dry.write(input, frames);
     }
 }
 
@@ -4301,6 +4396,70 @@ mod tests {
                 "frame {i} of the bay switched to the deep head while bypassed read {v}, not {want}"
             );
         }
+    }
+
+    /// **A bypassed denoise or convolver keeps the delay it reports.**
+    ///
+    /// Both bill the compensation graph for a delay (the denoise's
+    /// lookahead, the convolver's partition once an IR is in), and a bypassed
+    /// bay's figure stays in that graph, so a bypass that let the input past
+    /// untouched played the lane that many frames early. Each is held here
+    /// through the seat: it opts in to the rack's latency-keeping arm; an
+    /// impulse sent through the bypass leaves exactly the reported number of
+    /// frames late; the frames that open a bypass are the input the unit
+    /// heard in circuit just before (so the history is written on the
+    /// in-circuit road too); and a unit reporting nothing (the lookahead
+    /// down, no IR loaded) passes its input bit for bit, as before.
+    #[test]
+    fn a_bypassed_denoise_or_convolver_keeps_the_delay_it_reports() {
+        const FRAMES: usize = 2_048;
+        let impulse_at = 10;
+        let check = |unit: &mut BuiltinUnit, what: &str| {
+            assert!(unit.keeps_its_delay_when_bypassed(), "{what} does not keep its delay when bypassed");
+            let late = unit.latency() as usize;
+            assert!(late > 0 && late + impulse_at < FRAMES, "{what} reports {late} frames");
+            // In circuit first, on a ramp, so the bypass opens on history.
+            let ramp: Vec<Vec<f32>> = (0..2).map(|_| (0..FRAMES).map(|i| i as f32 / FRAMES as f32).collect()).collect();
+            let mut out = vec![vec![0.0f32; FRAMES]; 2];
+            unit.process(&ramp, FRAMES, &mut out);
+            let mut imp = vec![vec![0.0f32; FRAMES]; 2];
+            for c in &mut imp {
+                c[impulse_at] = 1.0;
+            }
+            unit.bypassed(&imp, FRAMES, &mut out);
+            for (ch, o) in out.iter().enumerate() {
+                for (i, v) in o.iter().enumerate().take(late) {
+                    let want = ramp[ch][FRAMES - late + i];
+                    assert!((v - want).abs() < 1.0e-7, "{what} ch {ch} frame {i}: {v}, wanted the ramp's {want}");
+                }
+                let peak = o.iter().enumerate().skip(late).fold((0, 0.0f32), |a, (i, v)| if v.abs() > a.1 { (i, v.abs()) } else { a });
+                assert_eq!(peak, (impulse_at + late, 1.0), "{what} ch {ch}: the impulse left at {peak:?}, {late} frames late wanted");
+            }
+        };
+        let untouched = |unit: &mut BuiltinUnit, what: &str| {
+            assert_eq!(unit.latency(), 0, "{what} reports a delay");
+            let input: Vec<Vec<f32>> = (0..2).map(|c| (0..FRAMES).map(|i| ((i + c) as f32 * 0.37).sin()).collect()).collect();
+            let mut out = vec![vec![0.0f32; FRAMES]; 2];
+            unit.bypassed(&input, FRAMES, &mut out);
+            assert_eq!(out, input, "{what} reporting nothing did not pass its input untouched");
+        };
+
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let mut values = spec.defaults();
+        values[5] = 1.0;
+        values[6] = crate::units::denoise::DenoiseKernel::Bank.dial();
+        check(&mut spec.create(48_000.0, &values), "the denoise with its lookahead up");
+        values[5] = 0.0;
+        untouched(&mut spec.create(48_000.0, &values), "the denoise with its lookahead down");
+
+        let spec = spec_for(IR_PATH).unwrap();
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        untouched(&mut unit, "the convolver with no IR");
+        let BuiltinUnit::Ir(u) = &mut unit else { panic!("the IR path seats a convolver") };
+        let mut ir = vec![0.0f32; 300];
+        ir[0] = 1.0;
+        assert_eq!(u.load_ir(&crate::wavread::WavData { rate: 48_000, channels: vec![ir] }), None);
+        check(&mut unit, "the convolver with an IR in");
     }
 
     /// **A bypassed tape keeps its lane in time, through the real rack.**
