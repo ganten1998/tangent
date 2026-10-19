@@ -548,9 +548,11 @@ struct Recorder {
     /// has done what the level asked (`Transport::caught_up`). Without it
     /// the reason to stand aside (the record, the count, the export) is gone
     /// a frame later, before a callback longer than a frame has seen the
-    /// level move, and a record's stop would wind down. Released in
-    /// `after_frame` beside the transport's push; cleared with the engine
-    /// (`forget_counts`).
+    /// level move, and a record's stop would wind down. And from an
+    /// engine's birth (`start_engine`), whose first push stores the locate
+    /// before the level: a read between the two cannot be told from a
+    /// stopped transport's. Released in `after_frame` beside the
+    /// transport's push; cleared with the engine (`forget_counts`).
     motor_hold: bool,
     /// **A take counted on the count whose downbeat has just come** - its
     /// own, or one it joined - so a song started on that downbeat started at
@@ -16260,6 +16262,18 @@ impl DesktopApp {
                 if let Some(tx) = self.recorder.engine.as_mut().and_then(|e| e.take_hw_midi()) {
                     self.midi_lane.install(tx);
                 }
+                // **And the tape's motor is held off over the birth**, until
+                // this engine has done what the first push tells it
+                // (`Recorder::motor_hold`). The new renderer adopts the
+                // host's first word (`motor::Motor::fresh`), but that push
+                // stores the locate before the level, and a read between the
+                // two sees the new generation beside the engine's own level,
+                // stopped, which is just what a stopped transport's push
+                // shows: adopted, the rise a moment later was a Play, and a
+                // song rebuilt mid-play spun up. The host knows what it sent,
+                // so the motor waits, and the rise lands at once as a hard
+                // edge. After `forget_counts`, which drops the old latch.
+                self.recorder.motor_hold = true;
                 self.push_monitor_settings();
                 // **Video defaults for a machine with no GPU driver.**
                 //
@@ -33491,7 +33505,11 @@ mod tests {").expect("the tests module")];
     /// arrangement record (its start and its stop) and every count-in start
     /// and stop at once, and so does the edge one of those makes, which a
     /// callback longer than a UI frame may not have seen when the reason goes
-    /// (`Recorder::motor_hold`). **A take is not one of them** (the owner's
+    /// (`Recorder::motor_hold`). So is an engine's birth, whose first push
+    /// stores the locate before the level: a read between the two looks like
+    /// a stopped transport's, and the rise after it would spin a song rebuilt
+    /// mid-play up (`transport::tests::an_engine_born_mid_song_rolls_at_once_however_its_first_push_meets_it`
+    /// drives the latch over it). **A take is not one of them** (the owner's
     /// ruling): a take films the desk as the room hears it, the tape's spin
     /// included, so no take term holds the motor and the cassette parks
     /// nothing. A scan, because `DesktopApp` cannot be built in a test.
@@ -33567,6 +33585,14 @@ mod tests {").expect("the tests module")];
             stop.contains("self.recorder.transport.stop();\n                    if quiet_stop {\n                        self.recorder.motor_hold = true;"),
             "a record's or an export's stop is not held instant"
         );
+        // An engine's birth: after the old engine's latch is dropped with its
+        // counts, and before the desk's first push tells the motor its word.
+        let born = body("fn start_engine(&mut self");
+        let forgot = born.find("self.forget_counts();").expect("an engine is born with the counts of the one before it");
+        let held = born.find("self.recorder.motor_hold = true;").expect("an engine's birth is not held instant");
+        let told = born.find("self.push_monitor_settings();").expect("a new engine is never told the desk");
+        assert!(forgot < held, "an engine's birth is held before the old latch is dropped");
+        assert!(held < told, "an engine's birth is held after the motor is told it may move");
         // A take parks nothing: the cassette's arm leaves the motor alone.
         let capture = arm("                R::Capture => {", "                R::Stop => {");
         assert!(!capture.contains("park_tape_motor"), "a take parks the motor again: a take films the spin");

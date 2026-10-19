@@ -882,6 +882,120 @@ mod tests {
         assert!(!hold, "the latch never let go: {shows:?}");
     }
 
+    /// **An engine born mid-song rolls at once however its first push meets
+    /// it** (the birth's latch: `start_engine` sets `Recorder::motor_hold`,
+    /// released on `caught_up`).
+    ///
+    /// A fresh engine adopts the host's first word (`motor::Motor::fresh`),
+    /// read whole with a generation. On the way up the push stores the
+    /// locate and then the level, and a callback between the two reads the
+    /// new generation whole beside the engine's own level, stopped: the very
+    /// read a stopped transport's first push gives (its level first, then
+    /// its locate), so no engine can tell the two apart, and one whose motor
+    /// was free to move took the rise after it for Play and spun up a song
+    /// rebuilt mid-play. The host can tell, and holds the motor off from the
+    /// birth until the engine has done what it was told. Driven as `update`
+    /// drives it: the song playing from one second, the old engine dropped,
+    /// a fresh armed one rendering 0 to 2 passes in the frame that built it
+    /// (its motor's word already held), then that frame's `after_frame` (the
+    /// word, the push met by a pass after none, one or both of its stores,
+    /// the latch), then a frame a pass. The tape rolls from the host's place
+    /// in the first pass that reads the level, a pass a pass from there; the
+    /// motor shows rest and then speed, nothing else; the latch lets go once
+    /// the engine is at speed; and a Stop after that winds down: the motor
+    /// is back.
+    #[test]
+    fn an_engine_born_mid_song_rolls_at_once_however_its_first_push_meets_it() {
+        use crate::motor::MotorShow;
+        let mut out = vec![0.0f32; 2 * 256];
+        let word = |e: &Engine, hold: bool| e.set_tape_motor(!hold, 0.5, 0.7);
+        let latch = |e: &Engine, t: &Transport, hold: &mut bool| {
+            if *hold && t.caught_up(e) {
+                *hold = false;
+            }
+        };
+        for before in 0..=2 {
+            for meet in 0..=2 {
+                let what = format!("{before} passes before the first push, met after {meet} of its stores");
+                // The song, on the engine a device change drops.
+                let (mut old, mut t) = armed();
+                t.locate(1.0);
+                t.toggle_play();
+                for _ in 0..40 {
+                    t.push(Some(&old));
+                    old.render_offline(&mut out);
+                }
+                drop(old);
+                // The frame that builds the new one: `start_engine` holds the
+                // latch and tells the motor its word, and the engine renders
+                // from there.
+                let (mut e, _) = armed();
+                let mut hold = true;
+                word(&e, hold);
+                for _ in 0..before {
+                    e.render_offline(&mut out);
+                }
+                // Its `after_frame`: the word, the push, the latch.
+                word(&e, hold);
+                let host = (t.position_s(None, 0.0) * 48_000.0) as u64;
+                let acked = e.transport_acked(t.generation());
+                let stores: Vec<Store> = t.stores(acked, e.transport_position(), 48_000.0).into_iter().flatten().collect();
+                assert_eq!(
+                    stores,
+                    [Store::Locate { generation: t.generation(), frames: host }, Store::Rolling(true)],
+                    "{what}: the first push is not the locate and then the level"
+                );
+                let apply = |e: &Engine, store: Store| match store {
+                    Store::Locate { generation, frames } => e.set_transport(generation, frames),
+                    Store::Rolling(rolling) => e.set_rolling(rolling),
+                };
+                for &store in stores.iter().take(meet) {
+                    apply(&e, store);
+                }
+                e.render_offline(&mut out);
+                let mut passes = vec![(e.motor_show(), e.transport_position())];
+                for &store in stores.iter().skip(meet) {
+                    apply(&e, store);
+                }
+                latch(&e, &t, &mut hold);
+                // A frame a pass.
+                for _ in 0..30 {
+                    word(&e, hold);
+                    t.push(Some(&e));
+                    latch(&e, &t, &mut hold);
+                    e.render_offline(&mut out);
+                    passes.push((e.motor_show(), e.transport_position()));
+                }
+                let rolled = passes
+                    .iter()
+                    .position(|&(_, pos)| pos != 0 && pos != host)
+                    .unwrap_or_else(|| panic!("{what}: the song never rolled: {passes:?}"));
+                assert!(rolled <= 1, "{what}: the song rolled {rolled} passes after its level: {passes:?}");
+                assert!(
+                    passes[rolled..].iter().enumerate().all(|(k, &(_, pos))| pos == host + 256 * (k as u64 + 1)),
+                    "{what}: the song did not roll at speed from the host's place {host}: {passes:?}"
+                );
+                assert!(
+                    passes[..=rolled].iter().all(|&(s, _)| s == MotorShow::Parked)
+                        && passes[rolled + 1..].iter().all(|&(s, _)| s == MotorShow::Running),
+                    "{what}: the tape moved for a rebuild: {passes:?}"
+                );
+                assert!(!hold, "{what}: the latch never let go: {passes:?}");
+                // The motor is back: a Stop winds the tape down.
+                t.stop();
+                let mut wound = false;
+                for _ in 0..8 {
+                    word(&e, hold);
+                    t.push(Some(&e));
+                    latch(&e, &t, &mut hold);
+                    e.render_offline(&mut out);
+                    wound |= e.motor_coasting();
+                }
+                assert!(wound, "{what}: the motor never came back after the birth");
+            }
+        }
+    }
+
     /// **Pinning the playhead leaves the cursor where the hand put it** (the
     /// review's C12).
     ///
