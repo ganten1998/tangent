@@ -742,7 +742,7 @@ const BASE_MS: f32 = 2.0;
 ///
 /// A studio head two milliseconds long cannot carry a cassette's warble,
 /// which swings the pitch by percent, not tenths of one: at full Wow the
-/// cassette's pack sways the head by over eight milliseconds. So the
+/// cassette sways the head by over ten milliseconds. So the
 /// warble plays from a head of its own, which may sway 22 ms either way of
 /// its rest, and only it carries the cassette's parts; Flutter's parts,
 /// governed by the studio head's travel, ride both heads, so either can take
@@ -760,17 +760,48 @@ const DEEP_SLEW: f64 = 0.03;
 /// neither following the tape speed (a cassette has its own), sharing
 /// 0.55 and 0.30 of [`CASSETTE_DEPTH`]; and the belt drifting, a
 /// sample-and-hold every 2.5 s through two poles at 0.2 Hz, both at Rate's
-/// pace, a delay of up to [`BELT_MS`]. Depths are linear in Wow's dial (the
-/// owner's ruling): at the default 0.3 the deep range already swings the
-/// pitch about 1 % at its peak, and at full Wow about 2.6 %
-/// (`the_deep_range_swings_the_pitch_like_a_worn_cassette`).
+/// pace, a delay of up to [`BELT_MS`].
+///
+/// **At full Wow the deep head swings the pitch 3 % at its peak, and the
+/// swing is linear in Wow's dial** (the owner's ruling): 0.9 % at the
+/// default 0.3, 1.5 % at 0.5. The depth is the one number that puts it
+/// there. The pack and the roller come into step every 6.7 s, three turns
+/// of one to ten of the other, and their depths then add, 1.93 and 1.05 %
+/// at the top of the wander; the wander seldom stands at its top just then,
+/// and the belt's drift and Flutter's parts ride on them, so over two
+/// minutes at 44.1 kHz the deep head peaks at 3.01 % at full Wow, 1.51 % at
+/// 0.5 and 0.91 % at 0.3, the same to within 0.6 % at 48 and 96 kHz, and
+/// at 3.02 % over ten minutes
+/// (`the_deep_range_swings_the_pitch_like_a_worn_cassette`). The belt
+/// follows Rate, so at twice the parts' speed its drift moves twice as
+/// fast and bends the pitch twice as far, and full Wow peaks at 3.2 % over
+/// two minutes there (3.4 % over ten); at half their speed, 3.0 %.
 const CASSETTE_HZ: [f64; 2] = [0.45, 1.5];
 const CASSETTE_SHARE: [f64; 2] = [0.55, 0.30];
-const CASSETTE_DEPTH: f64 = 0.03;
+const CASSETTE_DEPTH: f64 = 0.035;
 const BELT_MS: f64 = 3.5;
 const BELT_HOLD_S: f64 = 2.5;
 const BELT_POLE_HZ: f64 = 0.2;
 const BELT_SEED: u32 = 0xCA55_E77E;
+
+/// **How fast Wow's wander may breathe the cassette**: by at most a quarter
+/// of the cassette's depth for every radian the pack turns.
+///
+/// The wander scales the cassette's excursions, and an excursion that moves
+/// bends the pitch by how fast it moves. A studio part's excursion is a few
+/// samples, and breathing it bends nothing; the pack's is hundreds, and
+/// breathed at the wander's own pace, a tenth of a second, its breathing
+/// bent the pitch further than its turn did. That is why 5.2.0's deep head
+/// was not in proportion to Wow: at 0.3 it peaked at 0.98 % where 0.9 %
+/// was asked, and at full Wow, where the deep slew held the breathing
+/// back, at only 2.6 %. A drag that varies with the pack's wind varies as
+/// the pack turns, so the cassette breathes no faster than this per radian
+/// of the pack's turn, at any Rate: the movement then bends the pitch by at
+/// most a quarter of the pack's depth, across its turn and so in
+/// quadrature with it (the pack peaks within about 3 % of its depth), and
+/// it stays inside the deep slew at every setting, so the deep head's
+/// swing is in proportion to Wow all the way up the dial.
+const CASSETTE_BREATH: f64 = 0.25;
 
 /// The cassette's parts as the deep governor's arrays hold them, slowest
 /// first: the belt's drift, the pack, the roller.
@@ -2395,7 +2426,10 @@ struct Transport {
     /// The cassette, the deep head's own parts: the pack's and the roller's
     /// rotators, their rotation a frame and its angle, and every cassette
     /// part's excursion, target, ask and gift, slowest first ([`BELT`],
-    /// [`PACK`], [`ROLLER`]), with how far each may move a frame.
+    /// [`PACK`], [`ROLLER`]), with how far each may move a frame; and the
+    /// scale the wow wander gives the pack's and the roller's targets,
+    /// following the wander at most [`CASSETTE_BREATH`] a radian of the
+    /// pack's turn.
     cas_turn: [[f64; 2]; 2],
     cas_step: [[f64; 2]; 2],
     cas_omega: [f64; 2],
@@ -2404,6 +2438,7 @@ struct Transport {
     cas_asked: [f64; 3],
     cas_given: [f64; 3],
     cas_slew: f64,
+    cas_breath: f64,
     /// The deep head's travel either way of its rest, and what the cassette
     /// may use of it once the reserve and Flutter's shared parts have
     /// theirs, in samples.
@@ -2498,6 +2533,7 @@ impl Transport {
             cas_asked: [0.0; 3],
             cas_given: [0.0; 3],
             cas_slew: (DEEP_SLEW - 4.0 * STUDIO_SLEW / STUDIO_PARTS as f64) / 3.0,
+            cas_breath: 1.0,
             deep_travel: (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(base_deep as f64 - 2.0).max(0.0),
             deep_room: 0.0,
             belt_rng: BELT_SEED,
@@ -2518,9 +2554,9 @@ impl Transport {
     }
 
     /// The cassette from nothing: its rotators at a phase of zero, no
-    /// excursion, the belt's noise back at its seed. Where the deep head
-    /// starts when it is selected, and what it is reset to, silent, when it
-    /// has faded out.
+    /// excursion, the belt's noise back at its seed, and its breath where
+    /// Wow's wander is now. Where the deep head starts when it is selected,
+    /// and what it is reset to, silent, when it has faded out.
     fn reset_cassette(&mut self) {
         self.cas_turn = [[1.0, 0.0]; 2];
         self.cas_step = [[1.0, 0.0]; 2];
@@ -2531,6 +2567,7 @@ impl Transport {
         self.belt_hold = 0;
         self.belt_held = 0.0;
         self.belt_lp = [0.0; 2];
+        self.cas_breath = self.breaths().0 / DEPTH_WANDER.1;
     }
 
     /// Back to the moment the machine was built: every phase, noise and
@@ -2640,6 +2677,7 @@ impl Transport {
                 self.exc[j] = self.aim[j] * Self::breath(j, w, f);
             }
             let deep = w / DEPTH_WANDER.1;
+            self.cas_breath = deep;
             for (j, e) in self.cas_exc.iter_mut().enumerate() {
                 *e = self.cas_aim[j] * if j == BELT { 1.0 } else { deep };
             }
@@ -2649,13 +2687,16 @@ impl Transport {
 
     /// **Once a design, the cassette's turns and targets**, at Rate's
     /// multiple `r`. Its depths are linear in Wow's own dial and ignore the
-    /// tape speed; the wow wander breathes them too, scaled so its top is
-    /// the full depth. The deep head's room is its travel less the reserve
-    /// and less what Flutter's shared parts were given on the studio head,
-    /// which ride this one too; were the cassette ever to ask for more, the
-    /// slowest of its parts would give way first, the belt, then the pack,
-    /// then the roller. It never does: at full Wow and the bottom of Rate it
-    /// asks for under 18 ms of the 22.
+    /// tape speed; the wow wander breathes them too, through the cassette's
+    /// own breath ([`CASSETTE_BREATH`]), scaled so its top is the full
+    /// depth. The deep head's room is its travel less the reserve and less
+    /// what Flutter's shared parts were given on the studio head, which ride
+    /// this one too; were the cassette ever to ask for more, the slowest of
+    /// its parts would give way first, the belt, then the pack, then the
+    /// roller. It never does: at full Wow and the bottom of Rate it asks for
+    /// 19.3 ms, and the least room the head is ever left, at 3.75 ips with
+    /// Flutter, Hiss, Age and Damage at their tops and Bias at its bottom,
+    /// is 21.4 ms.
     fn design_cassette(&mut self, r: f64, reserve: f64) {
         let sr = self.sample_rate;
         for k in 0..2 {
@@ -2785,13 +2826,16 @@ impl Transport {
         self.sway
     }
 
-    /// One frame of the cassette, given Wow's wander scale `w`: its parts'
-    /// excursions moved toward their targets (shrinking first, growing only
-    /// into the deep head's room), its parts turned, the belt's drift, and
-    /// the sway they add up to, in samples.
+    /// One frame of the cassette, given Wow's wander scale `w`: its breath
+    /// moved toward the wander by at most [`CASSETTE_BREATH`] of the pack's
+    /// turn this frame, its parts' excursions moved toward their targets
+    /// (shrinking first, growing only into the deep head's room), its parts
+    /// turned, the belt's drift, and the sway they add up to, in samples.
     #[inline]
     fn cassette_tick(&mut self, w: f64) -> f64 {
-        let deep = w / DEPTH_WANDER.1;
+        let most = CASSETTE_BREATH * self.cas_omega[0];
+        self.cas_breath += (w / DEPTH_WANDER.1 - self.cas_breath).clamp(-most, most);
+        let deep = self.cas_breath;
         let mut used = 0.0;
         let mut asking = 0.0;
         let mut grow = [0.0_f64; 3];
@@ -4449,7 +4493,7 @@ fn weighted_parts(p: &TapeParams) -> f64 {
 /// and where Wow, Flutter and the governor have all moved it. On the deep
 /// head the parts are Flutter's and the cassette's, under the same fit, and
 /// `the_deep_range_swings_the_pitch_like_a_worn_cassette` holds it within
-/// 15 % there at Wow 0.3 and 1.
+/// 15 % there at Wow 0.3, 0.5 and 1.
 pub fn wow_flutter_weighted_pct(p: &TapeParams) -> f32 {
     let i = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())) as usize;
 
@@ -7828,10 +7872,10 @@ mod tests {
     /// the bottom of Rate at full Wow, starting at every speed, at 44.1, 48
     /// and 96 kHz, five seconds each, under the same two bars. The cassette
     /// stays on the deep head until that head has faded out, and starts
-    /// from nothing when it fades back in. Measured at worst: 33.2 of the
-    /// studio head's 39.7 samples (3.75 ips, Rate as built) and 563 of the
-    /// deep head's 970 (Rate at its bottom) at 44.1 kHz; thrown, 35.4 of
-    /// 43.2 and 410.9 of 2112 at 48 and 96 kHz.
+    /// from nothing when it fades back in. Measured at worst: 32.2 of the
+    /// studio head's 39.7 samples (15 ips, Rate at its bottom) and 645 of
+    /// the deep head's 970 (Rate at its bottom) at 44.1 kHz; thrown, 35.4 of
+    /// 43.2 and 430.5 of 2112 at 48 and 96 kHz.
     #[test]
     fn the_play_head_never_runs_off_its_tape_at_any_setting() {
         let held = |unit: &Tape, what: &str| {
@@ -8019,9 +8063,9 @@ mod tests {
         // The deep head: Rate from its bottom to its top at full Wow, under
         // the deep head's own 3 % of slew; and the cassette's pack alone,
         // whose excursion is the largest any part carries, never bends the
-        // pitch past 1.2 times its own depth, 3.0 % of Wow's dial times its
-        // share (model 1.11). Measured: 2.88 % against the settings' 2.59,
-        // and the pack 1.075 times its depth.
+        // pitch past 1.2 times its own depth, [`CASSETTE_DEPTH`] of Wow's
+        // dial times its share (model 1.11). Measured: 3.25 % against the
+        // settings' 2.87, and the pack 0.96 times its depth.
         let deep = |rate: f32| TapeParams {
             wobble: 1.0,
             rate,
@@ -8055,23 +8099,23 @@ mod tests {
 
     /// **The deep range swings the pitch like a worn cassette.**
     ///
-    /// The deep head carries a cassette's warble, linear in Wow's dial (the
-    /// owner's ruling): at full Wow, Rate as built, 120 s of its sway at
-    /// 44.1 kHz swings the speed by up to 2.0 to 3.05 % at its peak through
-    /// the meter's demodulator, and reads 0.6 to 1.0 % weighted (the model
-    /// of the same parts in the speed domain: 2.70 and 0.80 %); at the
-    /// default Wow 0.3 it already reads 0.16 to 0.34 % weighted (0.243) and
-    /// peaks 0.6 to 1.1 % (0.83), a plainly cassette-like swing. The figure
-    /// the face prints is within 15 % of both readings. With Wow and Flutter
-    /// at 0 the deep head does not move at all. The cassette ignores the
-    /// tape speed: its pack turns at 0.45 Hz within 5 % at 3.75 and at
-    /// 30 ips. And nothing is ever held inside the line. Measured: 2.615 %
-    /// and 0.899 % at full Wow, 0.981 % and 0.275 % at 0.3, the face 3.2 and
-    /// 4.4 % under; the pack at 0.448 Hz at both speeds. The weighted
-    /// readings sit above the model because a part's excursion carries the
-    /// depth wander, and on the pack's long excursion the wander's own
-    /// movement bends the pitch too, up to the deep slew's share; the model
-    /// breathes the depth of pitch instead.
+    /// The deep head carries a cassette's warble, 3 % of the speed at its
+    /// peak at full Wow and linear in Wow's dial (the owner's ruling). So at
+    /// Rate as built, 120 s of its sway at 44.1 kHz peaks through the
+    /// meter's demodulator within 5 % of 3 % times Wow: 2.85 to 3.15 % at
+    /// full Wow, 1.425 to 1.575 % at 0.5, and 0.855 to 0.945 % at the
+    /// default 0.3, a plainly cassette-like swing already. 5.2.0's deep head
+    /// peaked at 2.615, 1.618 and 0.981 %, outside all three, because the
+    /// wander's own movement on the pack's long excursion bent the pitch
+    /// further than the pack's turn did, until the deep slew held it back
+    /// ([`CASSETTE_BREATH`]). It reads a third of that weighted, within 15 %
+    /// of 1 % times Wow, and the figure the face prints is within 15 % of
+    /// the meter at all three. With Wow and Flutter at 0 the deep head does
+    /// not move at all. The cassette ignores the tape speed: its pack turns
+    /// at 0.45 Hz within 5 % at 3.75 and at 30 ips. And nothing is ever held
+    /// inside the line. Measured: peaks of 3.011, 1.508 and 0.911 %, 1.002,
+    /// 0.500 and 0.301 % weighted, the face 1.4 to 1.6 % over the meter; the
+    /// pack at 0.4485 Hz at both speeds.
     #[test]
     fn the_deep_range_swings_the_pitch_like_a_worn_cassette() {
         let sr = 44_100.0_f32;
@@ -8082,20 +8126,24 @@ mod tests {
             wow_range: WowRange::Deep.dial(),
             ..TapeParams::default()
         };
-        for (wobble, peak_band, weighted_band) in [(1.0, 2.0..=3.05, 0.6..=1.0), (0.3, 0.6..=1.1, 0.16..=0.34)] {
+        for wobble in [1.0_f32, 0.5, 0.3] {
             let p = deep(wobble);
             let mut unit = Tape::new(sr);
             let sway = unit.transport_trace(&p, (sr * 120.0) as usize);
             let peak = flutter_peak(&sway, srf, skip);
             let weighted = flutter_2sigma(&sway, srf, skip, true);
             let told = f64::from(wow_flutter_weighted_pct(&p));
+            let ruled = 3.0 * f64::from(wobble);
             assert!(
-                peak_band.contains(&peak),
-                "the deep head at Wow {wobble} peaks at {peak:.3} %, outside {peak_band:?}"
+                (peak / ruled - 1.0).abs() <= 0.05,
+                "the deep head at Wow {wobble} peaks at {peak:.3} %, not within 5 % of the ruled \
+                 {ruled:.2} %"
             );
+            let third = ruled / 3.0;
             assert!(
-                weighted_band.contains(&weighted),
-                "the deep head at Wow {wobble} reads {weighted:.4} % weighted, outside {weighted_band:?}"
+                (weighted / third - 1.0).abs() <= 0.15,
+                "the deep head at Wow {wobble} reads {weighted:.4} % weighted, not within 15 % of \
+                 {third:.2} %"
             );
             assert!(
                 (told / weighted - 1.0).abs() < 0.15,
