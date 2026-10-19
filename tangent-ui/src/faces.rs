@@ -36,7 +36,7 @@ pub const SUITE_UNITS: [(&str, &str, &str); 15] = [
     (
         "@tangent-tape",
         "Tangent Tape",
-        "an honest quarter-inch machine at its one speed",
+        "an honest quarter-inch machine at four speeds",
     ),
     (
         "@tangent-comp",

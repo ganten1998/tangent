@@ -1657,7 +1657,7 @@ pub(crate) mod fit {
     pub const FACES: &[FaceShape] = &[
         ("@tangent-eq", 15, &[0, 1, 5, 6, 10, 11], false, Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
         ("@tangent-imager", 3, &[], false, Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
-        ("@tangent-tape", 6, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-tape", 13, &[6, 9], false, Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
         ("@tangent-comp", 7, &[], false, Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
         ("@tangent-denoise", 6, &[0, 5], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-amp", 9, &[0, 5], true, Vec2::new(540.0, 360.0), Vec2::new(864.0, 576.0)),

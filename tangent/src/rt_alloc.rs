@@ -273,7 +273,10 @@ mod tests {
     /// smaller and larger than the planar adapter's scratch. Walked over the
     /// whole table so a unit added tomorrow is measured the day it lands;
     /// Tangent Bitcrush is the one this was written for, and it holds no
-    /// scratch at all.
+    /// scratch at all. A unit that keeps its delay while bypassed (the
+    /// hardware insert, the tape) runs a block of its own out of circuit, so
+    /// that block is measured too, with the way out and back in: the tape's
+    /// fade, its stopped kernel and its restart from a clean tape.
     #[test]
     fn no_built_in_effect_allocates_to_process_a_block() {
         for spec in crate::builtin_fx::UNITS.iter().filter(|u| !u.voice) {
@@ -296,6 +299,11 @@ mod tests {
                     let ((), c) = least_of(3, || {
                         unit.apply(&points);
                         unit.process(&input, frames, &mut out);
+                        if unit.keeps_its_delay_when_bypassed() {
+                            unit.bypassed(&input, frames, &mut out);
+                            unit.bypassed(&input, frames, &mut out);
+                            unit.process(&input, frames, &mut out);
+                        }
                     });
                     assert_eq!(
                         c,

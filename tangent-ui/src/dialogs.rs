@@ -6121,6 +6121,8 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // knob rows, here the stair over six rows where the comp has a needle
     // over seven.
     ("@tangent-bitcrush", Vec2::new(0.344, 0.582), Vec2::new(400.0, 440.0), Vec2::new(640.0, 704.0)),
+    // MERGE-ME(face): faces_tape's row replaces this one
+    ("@tangent-tape", Vec2::new(0.344, 0.688), Vec2::new(400.0, 520.0), Vec2::new(640.0, 832.0)),
     // The insert: the glass, two routing rows, four knobs and the ping row
     // stacked over the footer. Taller than the knob panels by those rows.
     (
@@ -21042,7 +21044,7 @@ at: None,
             ("@tangent-eq", Vec2::new(470.0, 470.0)),
             ("@tangent-imager", Vec2::new(340.0, 480.0)),
             ("@tangent-comp", Vec2::new(400.0, 430.0)),
-            ("@tangent-tape", Vec2::new(400.0, 360.0)),
+            ("@tangent-tape", Vec2::new(400.0, 520.0)),
             ("@tangent-bitcrush", Vec2::new(400.0, 440.0)),
         ];
         for (unit, floor) in was {

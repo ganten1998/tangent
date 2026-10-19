@@ -10747,21 +10747,30 @@ fn run_rack(
             .seat_cell(SeatKind::Bypass, seat * INSERTS + bay)
             .is_some_and(|c| c.load(Ordering::Relaxed) != 0)
         {
-            // **A bypassed Tangent Insert keeps its loop's delay** (the
-            // owner's ruling): the dry signal, as late as the latency the bay
-            // reports, so an A/B against bypass lines up and toggling it
-            // mid-play does not jump. No send, no ping. Every other unit's
-            // bypass is the untouched signal, as above.
-            if let Backend::Builtin(crate::builtin_fx::BuiltinUnit::HwInsert(u)) = &mut p.backend {
-                u.bypassed(planar, frames, out);
-                // And its figure, which only this path works out while it
-                // is out of circuit: a bay bypassed since it loaded would
-                // otherwise sit in the compensation graph at the figure it
-                // loaded with, and jump the day it is switched in.
-                Rack::set_latency(shared, seat, bay, u.latency());
-                for (dst, src) in planar.iter_mut().zip(out.iter()).take(TAP_CHANNELS) {
-                    let n = frames.min(dst.len()).min(src.len());
-                    dst[..n].copy_from_slice(&src[..n]);
+            // **A bypassed bay that keeps its delay keeps it here**
+            // (`BuiltinUnit::keeps_its_delay_when_bypassed`): the dry signal,
+            // as late as the latency the bay reports, so an A/B against
+            // bypass lines up and toggling it mid-play does not jump. The
+            // Tangent Insert sends nothing and pings nothing (the owner's
+            // ruling); the Tape fades to its dry and stops its kernel. Every
+            // other unit's bypass is the untouched signal, as above, and a
+            // unit with a delay that does not keep it plays its lane that
+            // much early while it is out, because its figure stays in the
+            // graph: the denoise's lookahead is one, and opting in is one
+            // arm in that function.
+            if let Backend::Builtin(u) = &mut p.backend {
+                if u.keeps_its_delay_when_bypassed() {
+                    u.bypassed(planar, frames, out);
+                    // And its figure, which only this path works out while
+                    // it is out of circuit: a bay bypassed since it loaded
+                    // would otherwise sit in the compensation graph at the
+                    // figure it loaded with, and jump the day it is
+                    // switched in.
+                    Rack::set_latency(shared, seat, bay, u.latency());
+                    for (dst, src) in planar.iter_mut().zip(out.iter()).take(TAP_CHANNELS) {
+                        let n = frames.min(dst.len()).min(src.len());
+                        dst[..n].copy_from_slice(&src[..n]);
+                    }
                 }
             }
             // **An armed tap still shows the truth**: what leaves a bypassed
@@ -35289,7 +35298,7 @@ mod tests {
             // be old projects losing parameters.
             (EQ_PATH, "Tangent EQ", 25),
             (IMAGER_PATH, "Tangent Imager", 3),
-            (TAPE_PATH, "Tangent Tape", 6),
+            (TAPE_PATH, "Tangent Tape", 13),
             (COMP_PATH, "Tangent Comp", 7),
             (DENOISE_PATH, "Tangent Denoise", 9),
             (AMP_PATH, "Tangent Amp", 9),

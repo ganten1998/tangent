@@ -225,16 +225,40 @@ const EQ_KIND_STEPS: i32 = 6;
 const EQ_FACE_NODES: usize = 5;
 const EQ_KNOBS_PER_NODE: u32 = 5;
 
-/// One knob per `units::tape::TapeParams` field, ids in declaration order.
-/// Defaults are `TapeParams::default()` verbatim — the shipped 388 at a
-/// healthy record level — and a test holds the two tables together.
+/// One knob per `units::tape::TapeParams` field, ids in declaration order:
+/// the six 5.0 shipped, then the ones appended after them, which never move.
+/// Defaults are `TapeParams::default()` verbatim, a fresh machine at the
+/// studio speed lined up at its tape's datasheet level, and a test holds the
+/// two tables together. Drive opens at 0.5 and Roll at 0 (out of circuit)
+/// for a fresh bay only: a saved one keeps every value it was saved with,
+/// because its state writes every symbol, so neither needs an
+/// [`absent_reads_as`] entry.
+///
+/// Id 3 keeps 5.0's symbol, `wobble`, and is named Wow: it drove wow and
+/// flutter together and drives the slow half alone now, Flutter (id 7) the
+/// fast half, and Rate (id 8) how fast every rotating part turns. Wow Range
+/// (id 9) moves the wow onto a second play head 25 ms back, a cassette's,
+/// and is the one control that moves the delay the seat reports. Bias
+/// (id 10) is the record bias either side of the aligned point, which its
+/// middle is, and reads signed about it. Age (id 11) is an old tape on a
+/// worn head, and Damage (id 12) what the tape has been through, laid along
+/// it per metre; both open new. A session saved before these
+/// existed reads them at their defaults, which is the owner's ruling for
+/// every appended control: nothing is pinned to how 5.0 sounded.
 const TAPE_FACE_PARAMS: &[ParamSpec] = &[
-    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.6, steps: 0 },
+    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.5, steps: 0 },
     ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
-    ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.12, steps: 0 },
-    ParamSpec { id: 3, symbol: "wobble", name: "Wobble", units: "%", default: 0.3, steps: 0 },
+    ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.0, steps: 0 },
+    ParamSpec { id: 3, symbol: "wobble", name: "Wow", units: "%", default: 0.3, steps: 0 },
     ParamSpec { id: 4, symbol: "hiss", name: "Hiss", units: "%", default: 0.25, steps: 0 },
     ParamSpec { id: 5, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 6, symbol: "speed", name: "Speed", units: "ips", default: 2.0 / 3.0, steps: crate::units::tape::TAPE_SPEED_STEPS },
+    ParamSpec { id: 7, symbol: "flutter", name: "Flutter", units: "%", default: 0.3, steps: 0 },
+    ParamSpec { id: 8, symbol: "rate", name: "Rate", units: "x", default: 0.5, steps: 0 },
+    ParamSpec { id: 9, symbol: "wow_range", name: "Wow Range", units: "", default: 0.0, steps: crate::units::tape::WOW_RANGE_STEPS },
+    ParamSpec { id: 10, symbol: "bias", name: "Bias", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 11, symbol: "age", name: "Age", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 12, symbol: "damage", name: "Damage", units: "%", default: 0.0, steps: 0 },
 ];
 
 /// One knob per `units::imager::ImagerParams` field. Defaults are the
@@ -946,14 +970,16 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         }
         (HWINSERT_PATH, 0 | 1) => fmt_db(lerp(crate::units::hwinsert::GAIN_DB)),
         (HWINSERT_PATH, 3) => (if v >= 0.5 { "inverted" } else { "normal" }).to_owned(),
-        // **The three tape dials that have an honest number.** Their
-        // `ParamSpec`s promise dB, Hz and dB, and the automation lane prints
-        // that promise beside the curve; the face used to fall through to
+        // **The tape dials that have an honest number.** Their `ParamSpec`s
+        // promise dB, Hz, dB and ips, and the automation lane prints that
+        // promise beside the curve; the face used to fall through to
         // percent, so the lane said "dB" and the panel said "50 %" about the
         // same knob. Which of the two was wrong is settled by the machine:
-        // the head bump is +2.5 dB at 70 Hz on the service data, the repro
-        // corner is a frequency, and a trim is decibels. The other three —
-        // drive, wobble, hiss — stay percent below, and their specs say so.
+        // the bump is the decibels its bell adds at the head's own bump
+        // frequency, the repro corner is a frequency, a trim is decibels,
+        // and the speed is the selector's own words, the same strings
+        // `choices` offers. Drive, Wow, Hiss and Flutter stay percent below,
+        // and their specs say so.
         (TAPE_PATH, 1) => fmt_db(lerp(crate::units::tape::BUMP_DB)),
         (TAPE_PATH, 2) => {
             // Zero is the stage out of circuit, not a 20 kHz corner: naming
@@ -966,6 +992,23 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
             }
         }
         (TAPE_PATH, 5) => fmt_db(lerp(crate::units::tape::TRIM_DB)),
+        (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::from_dial(v).label().to_owned(),
+        // Rate is a multiple of the parts' own speed, so it reads as one:
+        // half at the bottom, the machine as built at the middle, twice at
+        // the top.
+        (TAPE_PATH, 8) => format!("{:.2}x", crate::units::tape::rate_multiplier(v)),
+        (TAPE_PATH, 9) => crate::units::tape::WowRange::from_dial(v).label().to_owned(),
+        // Bias is decibels either side of the point the machine is aligned
+        // at, and the middle of the dial IS that point, so it says so in
+        // the machine's word rather than as a number: "aligned" there, and
+        // a signed reading either side of it, symmetric about it.
+        (TAPE_PATH, 10) => {
+            if v == 0.5 {
+                "aligned".to_owned()
+            } else {
+                fmt_db(crate::units::tape::BIAS_RANGE_DB * (2.0 * v - 1.0))
+            }
+        }
         // The rest of the tape speaks in percent on purpose: those knobs are
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
@@ -1105,6 +1148,14 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
         (HWINSERT_PATH, 3) => vec!["normal".to_owned(), "inverted".to_owned()],
+        (TAPE_PATH, 6) => crate::units::tape::TapeSpeed::ALL
+            .iter()
+            .map(|v| v.label().to_owned())
+            .collect(),
+        (TAPE_PATH, 9) => crate::units::tape::WowRange::ALL
+            .iter()
+            .map(|r| r.label().to_owned())
+            .collect(),
         (ANALOG_PATH, id) => analog_choices(id),
         (SAMPLER_PATH, id) => sampler_choices(id),
         _ => Vec::new(),
@@ -1495,14 +1546,21 @@ impl BuiltinUnit {
             BuiltinUnit::Eq(_) => 0,
             // Width, floor and velvet all read the sample they write.
             BuiltinUnit::Imager(_) => 0,
-            // The play head sits a couple of milliseconds behind the record
-            // head (`units::tape::BASE_MS`), but the figure is deliberately
-            // unreported this pass: the head also WANDERS around that point,
-            // so the number is nominal, and the suite ships every unit at
-            // zero. The road for the honest figure already exists —
-            // `Backend::reported_latency` reads this every block — so
-            // reporting it later is one arm here and no new plumbing.
-            BuiltinUnit::Tape(_) => 0,
+            // **The play head's delay, reported.** The studio head sits
+            // `units::tape::BASE_MS` behind the record head and the deep head
+            // `units::tape::DEEP_MS`, the record stage's oversampler inside
+            // either figure, and an impulse leaves on exactly the frame the
+            // kernel names, so the number is the real delay rather than a
+            // nominal one: the transport sways the head around it, never off
+            // it on average. Only the wow range moves it. The kernel answers
+            // from the params alone, so the figure is right straight after
+            // `UnitSpec::create` and for a bay restored bypassed, whose
+            // kernel never runs (the denoiser's lesson, in
+            // `DenoiseUnit::set_param`). `Backend::reported_latency`
+            // re-reads it every block in circuit, and the rack's bypass arm
+            // every block out of it, because a bypassed Tape keeps this
+            // delay ([`TapeUnit::bypassed`]).
+            BuiltinUnit::Tape(u) => u.kernel.latency_frames(&u.params) as u32,
             // Feed-forward with no lookahead window.
             BuiltinUnit::Comp(_) => 0,
             // The one honest mover: 3 ms with the lookahead up, nothing with
@@ -1785,6 +1843,36 @@ impl BuiltinUnit {
         }
     }
 
+    /// **Whether a bypassed bay of this unit keeps the delay it reports.**
+    ///
+    /// A bypassed bay's figure stays in the compensation graph, so a unit
+    /// with a delay that let its input past untouched would play its lane
+    /// that much early against the rest of the mix. The rack sends a bay of
+    /// a unit that answers yes through [`BuiltinUnit::bypassed`] instead of
+    /// past it: the hardware insert (its loop's round trip, the owner's
+    /// ruling) and the tape (its play head). Every other built-in reports
+    /// nothing, or, like the denoise's lookahead, has yet to opt in here.
+    pub fn keeps_its_delay_when_bypassed(&self) -> bool {
+        matches!(self, BuiltinUnit::HwInsert(_) | BuiltinUnit::Tape(_))
+    }
+
+    /// The bay bypassed, for a unit that
+    /// [keeps its delay](BuiltinUnit::keeps_its_delay_when_bypassed): its
+    /// input, as late as its latency says. Any other unit answers the
+    /// untouched signal, which is what its bypass is.
+    pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        match self {
+            BuiltinUnit::HwInsert(u) => u.bypassed(input, frames, out),
+            BuiltinUnit::Tape(u) => u.bypassed(input, frames, out),
+            _ => {
+                for (src, dst) in input.iter().zip(out.iter_mut()) {
+                    let n = frames.min(src.len()).min(dst.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                }
+            }
+        }
+    }
+
     /// Drop whatever the unit remembers of the signal, the way every unit in
     /// `effects.rs` can. The trim remembers only where its slew is, and
     /// clearing that snaps the gain to its target.
@@ -1793,7 +1881,8 @@ impl BuiltinUnit {
             BuiltinUnit::Trim(t) => t.clear(),
             BuiltinUnit::Eq(u) => u.kernel.clear(),
             BuiltinUnit::Imager(u) => u.kernel.clear(),
-            BuiltinUnit::Tape(u) => u.kernel.clear(),
+            // The tape, and the dry line its bypass keeps.
+            BuiltinUnit::Tape(u) => u.clear(),
             BuiltinUnit::Comp(u) => u.kernel.clear(),
             // The denoise's clear keeps what was LEARNED — its kernel
             // documents "forget what was playing, keep the thresholds",
@@ -2003,18 +2092,134 @@ impl ImagerUnit {
 
 // ── Tangent Tape, seated ────────────────────────────────────────────────────
 
+/// How long the seat's fade between the tape and its own dry takes, either
+/// way, in milliseconds.
+///
+/// **An equal-gain fade, because the two are one signal at one time.** The
+/// dry line holds the input exactly as late as the tape reports, and the
+/// tape's play head sways around that figure and never off it on average,
+/// so a linear fade between them is a fade between two takes of the same
+/// sound with nothing in it to cancel. Ten milliseconds is too short to
+/// hear as a fade and long enough that neither end can click.
+const TAPE_BYPASS_FADE_MS: f32 = 10.0;
+
+/// How long the dry line takes to move from one head's delay to the other's
+/// when the wow range is switched while the bay is bypassed, in
+/// milliseconds: the kernel's own head crossfade, so a switch sounds the same
+/// in circuit and out.
+const TAPE_DRY_FADE_MS: f32 = 25.0;
+
+/// How long a kernel started again after a bypass plays dry beyond the
+/// tape's own delay, before the fade back to it, in milliseconds.
+///
+/// A stopped kernel is cleared before it runs again, so it never replays what
+/// was on its tape before the bay went out. Its head then reads the silence
+/// of a clean tape for exactly the tape's delay while the new signal is
+/// recorded, and its filters settle from rest; the dry covers both, the
+/// delay and this much more, and only then fades back to the tape.
+const TAPE_REFILL_MS: f32 = 5.0;
+
+/// **The one map from a tape control's id to the field it drives**: an arm
+/// per row of [`TAPE_FACE_PARAMS`], and nothing for an id the table does not
+/// declare.
+///
+/// Every id names its field, and an id with no arm writes nothing.
+/// `TapeUnit::set_param` used to end in a catch-all into the trim, which was
+/// harmless while the table stopped at the trim and would not stay so: a row
+/// appended to the table without an arm would have driven the output level,
+/// and the seat's sweep would still have passed, because the trim moves the
+/// output. One map rather than a match inside `set_param`, so whatever else
+/// has to turn a bay's values into the kernel's params reads the same arms
+/// and cannot grow a second map that disagrees with this one.
+/// `every_tape_id_reaches_its_own_field` holds every arm to its row.
+fn tape_slot(p: &mut crate::units::tape::TapeParams, id: u32) -> Option<&mut f32> {
+    match id {
+        0 => Some(&mut p.drive),
+        1 => Some(&mut p.bump),
+        2 => Some(&mut p.roll),
+        3 => Some(&mut p.wobble),
+        4 => Some(&mut p.hiss),
+        5 => Some(&mut p.trim),
+        6 => Some(&mut p.speed),
+        7 => Some(&mut p.flutter),
+        8 => Some(&mut p.rate),
+        9 => Some(&mut p.wow_range),
+        10 => Some(&mut p.bias),
+        11 => Some(&mut p.age),
+        12 => Some(&mut p.damage),
+        _ => None,
+    }
+}
+
 pub struct TapeUnit {
     kernel: crate::units::tape::Tape,
     params: crate::units::tape::TapeParams,
     scratch: Vec<f32>,
+    /// **The input, as late as the tape.** A line per channel, written every
+    /// block whether the bay is in circuit or not and read at the latency
+    /// the kernel reports, so a bypassed bay is heard where the tape would
+    /// have been. Sized at build for the most a tape can ever report.
+    dry: [Vec<f32>; 2],
+    dry_at: usize,
+    /// **The dry line's two taps**: the delay it is reading at, the one it
+    /// is fading from, and how far through that equal-power fade it is (1 is
+    /// settled). A wow range switch moves the report between the two heads'
+    /// delays, and the dry follows it over [`TAPE_DRY_FADE_MS`], as the
+    /// kernel's heads do; a switch back mid-fade turns it round from where it
+    /// is. The first block after `new` or `clear` starts on the report.
+    dry_late: usize,
+    dry_was: usize,
+    dry_fade: f32,
+    dry_step: f32,
+    dry_fresh: bool,
+    /// How much of the output is the dry: 0 in circuit, 1 bypassed, and
+    /// between while one fades into the other.
+    mix: f32,
+    /// Whether the kernel has stopped. A bypassed bay runs it only for the
+    /// fade out; after that it costs nothing until the bay is back in
+    /// circuit, and then it starts again from a clean tape.
+    stale: bool,
+    /// Whether the kernel has run since the last clear. A bay opened
+    /// bypassed has nothing on its tape to fade away from, so it goes to the
+    /// dry at once.
+    live: bool,
+    /// Frames of dry still owed while a kernel started again refills its
+    /// tape, before the fade back to it begins.
+    warm: usize,
+    /// How far `mix` moves per frame: a whole fade in
+    /// [`TAPE_BYPASS_FADE_MS`].
+    fade: f32,
+    /// [`TAPE_REFILL_MS`] in frames at this unit's rate.
+    refill: usize,
+    /// How many blocks the kernel has been run, so a test can hold a
+    /// bypassed bay to costing nothing.
+    #[cfg(test)]
+    kernel_blocks: usize,
 }
 
 impl TapeUnit {
     fn new(sample_rate: f32) -> Self {
+        let sr = sample_rate.max(8_000.0);
+        let line = crate::units::tape::Tape::max_latency_frames(sample_rate) + 8;
         Self {
             kernel: crate::units::tape::Tape::new(sample_rate),
             params: crate::units::tape::TapeParams::default(),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
+            dry: [vec![0.0; line], vec![0.0; line]],
+            dry_at: 0,
+            dry_late: 0,
+            dry_was: 0,
+            dry_fade: 1.0,
+            dry_step: 1.0 / (TAPE_DRY_FADE_MS * 1.0e-3 * sr).max(1.0),
+            dry_fresh: true,
+            mix: 0.0,
+            stale: false,
+            live: false,
+            warm: 0,
+            fade: 1.0 / (TAPE_BYPASS_FADE_MS * 1.0e-3 * sr).max(1.0),
+            refill: (TAPE_REFILL_MS * 1.0e-3 * sr).round() as usize,
+            #[cfg(test)]
+            kernel_blocks: 0,
         }
     }
 
@@ -2022,22 +2227,127 @@ impl TapeUnit {
         let Some(spec) = TAPE_FACE_PARAMS.get(id as usize) else {
             return;
         };
-        let v = washed(spec, value);
-        match id {
-            0 => self.params.drive = v,
-            1 => self.params.bump = v,
-            2 => self.params.roll = v,
-            3 => self.params.wobble = v,
-            4 => self.params.hiss = v,
-            _ => self.params.trim = v,
+        if let Some(slot) = tape_slot(&mut self.params, id) {
+            *slot = washed(spec, value);
         }
     }
 
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
-        let (kernel, params) = (&mut self.kernel, &self.params);
-        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
-            kernel.process(buf, n, 2, params);
-        });
+        self.run(input, frames, out, false);
+    }
+
+    /// **The bay bypassed: its input, exactly as late as the tape it
+    /// stands in for.** The latency the tape reports stays in the
+    /// compensation graph while the bay is out, as every bypass in the rack
+    /// keeps it, so a bypass that passed the input untouched would play the
+    /// lane that many frames early against the rest of the mix: two
+    /// milliseconds, a flam on every A/B. So the dry leaves through a line
+    /// as long as the report. Going out, the kernel keeps running for
+    /// [`TAPE_BYPASS_FADE_MS`] while the output fades to the dry, then
+    /// stops and costs nothing; a bay opened bypassed has no tape to fade
+    /// from and goes to the dry at once. Coming back, see
+    /// [`TAPE_REFILL_MS`]. A wow range switch while bypassed moves the dry
+    /// between the two heads' delays over [`TAPE_DRY_FADE_MS`].
+    pub fn bypassed(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        self.run(input, frames, out, true);
+    }
+
+    /// One block, in circuit or bypassed: the one road both take, so the dry
+    /// line is written either way and the fade between the two is one
+    /// state whichever way it is going, a fade reversed halfway included.
+    fn run(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>], bypassed: bool) {
+        // Fewer than two channels is the planar adapter's copy-through, in
+        // circuit and out: a mono bay never runs the tape, so it has no
+        // delay of the tape's to keep.
+        if input.len() < 2 || out.len() < 2 {
+            run_planar(&mut self.scratch, input, frames, out, |_, _| {});
+            return;
+        }
+        let late = self.kernel.latency_frames(&self.params);
+        if self.dry_fresh {
+            // Nothing has left the line since it was cleared, so there is no
+            // fade to have been in: start on the report.
+            (self.dry_late, self.dry_was, self.dry_fade) = (late, late, 1.0);
+            self.dry_fresh = false;
+        } else if late != self.dry_late {
+            if late == self.dry_was && self.dry_fade < 1.0 {
+                std::mem::swap(&mut self.dry_late, &mut self.dry_was);
+                self.dry_fade = 1.0 - self.dry_fade;
+            } else {
+                (self.dry_was, self.dry_late, self.dry_fade) = (self.dry_late, late, 0.0);
+            }
+        }
+        if bypassed && !self.live {
+            self.mix = 1.0;
+            self.stale = true;
+        }
+        if !bypassed && self.stale {
+            self.kernel.clear();
+            self.stale = false;
+            self.warm = late + self.refill;
+        }
+        let wet = !self.stale;
+        if wet {
+            let (kernel, params) = (&mut self.kernel, &self.params);
+            run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+                kernel.process(buf, n, 2, params);
+            });
+            self.live = true;
+            #[cfg(test)]
+            {
+                self.kernel_blocks += 1;
+            }
+        }
+        let line = self.dry[0].len();
+        for f in 0..frames {
+            for (ch, d) in self.dry.iter_mut().enumerate() {
+                d[self.dry_at] = input[ch].get(f).copied().unwrap_or(0.0);
+            }
+            let back = (self.dry_at + line - self.dry_late) % line;
+            let mut dry = [self.dry[0][back], self.dry[1][back]];
+            if self.dry_fade < 1.0 {
+                let then = (self.dry_at + line - self.dry_was) % line;
+                let (now, was) = (self.dry_fade * std::f32::consts::FRAC_PI_2).sin_cos();
+                for (d, tape) in dry.iter_mut().zip(&self.dry) {
+                    *d = was * tape[then] + now * *d;
+                }
+                self.dry_fade = (self.dry_fade + self.dry_step).min(1.0);
+            }
+            self.dry_at = (self.dry_at + 1) % line;
+            if bypassed {
+                self.mix = (self.mix + self.fade).min(1.0);
+            } else if self.warm > 0 {
+                self.warm -= 1;
+            } else {
+                self.mix = (self.mix - self.fade).max(0.0);
+            }
+            let m = self.mix;
+            if m > 0.0 {
+                for (o, d) in out.iter_mut().zip(dry) {
+                    if let Some(o) = o.get_mut(f) {
+                        *o = if m >= 1.0 { d } else { *o + (d - *o) * m };
+                    }
+                }
+            }
+        }
+        if bypassed && self.mix >= 1.0 {
+            self.stale = true;
+        }
+    }
+
+    /// Forget the tape and the dry with it, and stand in circuit: a bay
+    /// that loads bypassed is told so by its first block.
+    fn clear(&mut self) {
+        self.kernel.clear();
+        for d in &mut self.dry {
+            d.fill(0.0);
+        }
+        self.dry_at = 0;
+        self.dry_fresh = true;
+        self.mix = 0.0;
+        self.stale = false;
+        self.live = false;
+        self.warm = 0;
     }
 }
 
@@ -3327,12 +3637,21 @@ mod tests {
     #[test]
     fn the_face_tables_open_at_the_kernels_shipped_defaults() {
         let t = crate::units::tape::TapeParams::default();
-        for (spec, want) in TAPE_FACE_PARAMS
-            .iter()
-            .zip([t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim])
-        {
+        let fields = [
+            t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim, t.speed, t.flutter, t.rate, t.wow_range, t.bias, t.age,
+            t.damage,
+        ];
+        assert_eq!(TAPE_FACE_PARAMS.len(), fields.len(), "a tape row has no field here");
+        for (spec, want) in TAPE_FACE_PARAMS.iter().zip(fields) {
             assert_eq!(spec.default, want, "{} drifted from TapeParams::default", spec.symbol);
         }
+        // **And where a fresh tape opens is the owner's ruling**, which the
+        // two tables agreeing cannot hold on its own: Drive 0.5, the
+        // high-output tape's datasheet alignment (its 3 % point about 10 dB
+        // over 0 VU at 15 ips), and Roll out of circuit, because each speed
+        // has its own top. A saved bay keeps the values it was saved with.
+        assert_eq!(t.drive, 0.5, "a fresh tape's Drive is not the datasheet alignment");
+        assert_eq!(t.roll, 0.0, "a fresh tape's Roll is in circuit");
         let i = crate::units::imager::ImagerParams::default();
         for (spec, want) in IMAGER_FACE_PARAMS.iter().zip([i.width, i.ensemble, i.mono_below]) {
             assert_eq!(spec.default, want, "{} drifted from ImagerParams::default", spec.symbol);
@@ -3517,6 +3836,9 @@ mod tests {
         };
         // Steady state only: past the envelope settling and the line fill.
         let (lo, hi) = ((sr * 0.25) as usize, (sr * 1.15) as usize);
+        // The six values are the 5.0 controls; `create` leaves every row it
+        // is not handed at the spec's default, so the speed is the studio
+        // 15 ips a fresh bay opens at.
         let at = |drive: f32| {
             let mut unit = spec.create(sr, &[drive, 0.0, 0.0, 0.0, 0.0, 0.5]);
             let mut out = vec![vec![0.0f32; frames]; 2];
@@ -3544,6 +3866,583 @@ mod tests {
             "the shipped tape moved the broadband level by {shipped:.3} dB \
              through the adapter"
         );
+    }
+
+    /// **The tape reports its head to delay compensation before its first
+    /// block.**
+    ///
+    /// The play head holds the tape `units::tape::BASE_MS` behind the
+    /// record head, and the seat used to tell the compensation graph zero,
+    /// so every Tape lane played two milliseconds late against the rest of
+    /// the mix. Now it reports the kernel's own figure, and the figure has to
+    /// be there the moment the bay is seated: `UnitSpec::create` sets the
+    /// parameters and `instrument`'s `prepare_builtin` reads `latency()` on
+    /// the next line, and a bay restored bypassed never runs the block that
+    /// could correct it: the denoiser's fault, pinned by
+    /// `a_denoise_seated_from_a_blob_reports_its_latency_before_the_first_block`.
+    ///
+    /// So it is read through the real load path, `state_text`,
+    /// `values_from_state`, `create`, with no block processed: two
+    /// milliseconds at 44.1, 48 and 96 kHz, which is 88, 96 and 192 frames,
+    /// and on the deep head 25, which is 1103, 1200 and 2400. And only Wow
+    /// Range moves it, the owner's ruling: set on a live unit it moves the
+    /// report at once, both ways, and every other id driven to both ends of
+    /// its travel leaves the figure where it was, because a report that
+    /// moved with a character dial would re-time the lane every time
+    /// somebody turned it.
+    #[test]
+    fn the_tape_reports_its_head_to_delay_compensation_before_its_first_block() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        for (sr, studio, deep) in [(44_100.0_f32, 88_u32, 1_103_u32), (48_000.0, 96, 1_200), (96_000.0, 192, 2_400)] {
+            for (range, want) in [(0.0_f32, studio), (1.0, deep)] {
+                let mut values = spec.defaults();
+                values[9] = range;
+                let text = state_text(spec, &values, &[]);
+                let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+                let unit = spec.create(sr, &back);
+                assert_eq!(
+                    unit.latency(),
+                    want,
+                    "a tape seated at {sr} Hz on Wow Range {range} reported {} frames before its \
+                     first block",
+                    unit.latency()
+                );
+            }
+            let mut unit = spec.create(sr, &spec.defaults());
+            for p in spec.params.iter().filter(|p| p.id != 9) {
+                for end in [0.0_f32, 1.0] {
+                    unit.set_param(p.id, end);
+                    assert_eq!(
+                        unit.latency(),
+                        studio,
+                        "{} at {end} moved the tape's report at {sr} Hz",
+                        p.symbol
+                    );
+                }
+            }
+            unit.set_param(9, 1.0);
+            assert_eq!(unit.latency(), deep, "the deep range did not move the report at {sr} Hz");
+            unit.set_param(9, 0.0);
+            assert_eq!(unit.latency(), studio, "the studio range did not move it back at {sr} Hz");
+        }
+    }
+
+    /// **The tape changes heads without the allocator**, in circuit and out.
+    /// A wow range switch starts the deep head's cassette from nothing,
+    /// fades the heads, and moves the bypassed dry line between its two
+    /// taps, all on the audio thread, so every one of those roads is walked
+    /// inside the counting window (full Wow, so the cassette runs): into the
+    /// deep head and out of it in circuit, each fade to its end so the
+    /// cassette starts and stops; switched mid-block, bypassed mid-fade,
+    /// switched back while bypassed, and back in circuit.
+    #[test]
+    fn the_tape_switches_heads_without_the_allocator() {
+        use crate::rt_alloc::{least_of, Counted};
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let mut values = spec.defaults();
+        values[3] = 1.0;
+        let mut unit = spec.create(48_000.0, &values);
+        let frames = 1_500;
+        let input: Vec<Vec<f32>> = (0..2)
+            .map(|c| (0..frames).map(|i| ((i + c) as f32 * 0.01).sin() * 0.5).collect())
+            .collect();
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        let ((), counted) = least_of(3, || {
+            // Into the deep head and out again in circuit, each fade run to
+            // its end, so the cassette starts and stops.
+            unit.set_param(9, 1.0);
+            unit.process(&input, frames, &mut out);
+            unit.set_param(9, 0.0);
+            unit.process(&input, frames, &mut out);
+            // Switched mid-block, then bypassed mid-fade, switched back while
+            // bypassed, and back in circuit.
+            unit.set_param(9, 1.0);
+            unit.process(&input, 256, &mut out);
+            unit.bypassed(&input, frames, &mut out);
+            unit.set_param(9, 0.0);
+            unit.bypassed(&input, 256, &mut out);
+            unit.bypassed(&input, frames, &mut out);
+            unit.process(&input, frames, &mut out);
+        });
+        assert_eq!(counted, Counted::default(), "the tape went to the allocator to change heads");
+    }
+
+    /// **A tape saved by 5.0 reads the new controls at their defaults.**
+    ///
+    /// The owner's ruling: a 5.0 or 5.1 session is not pinned to how it
+    /// sounded. Its blob carries the six symbols 5.0 had, and every control
+    /// appended since reads at its spec default, the studio speed, a
+    /// specified transport's Flutter, the parts' own Rate and the studio
+    /// head among them, with no `absent_reads_as` entry to say otherwise; so
+    /// the bay opens on the studio head's two milliseconds. The literal blob
+    /// is the one a fresh 5.0 Tape saved.
+    #[test]
+    fn a_5_0_tape_blob_reads_the_new_controls_at_their_defaults() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let blob = b"tangentfx 1\ndrive=0.6\nbump=0.5\nroll=0.12\nwobble=0.3\nhiss=0.25\ntrim=0.5\n";
+        let values = values_from_state(spec, blob).expect("a 5.0 blob reads");
+        assert_eq!(&values[..6], &[0.6, 0.5, 0.12, 0.3, 0.25, 0.5], "the six 5.0 values moved");
+        assert_eq!(&values[6..13], &[2.0 / 3.0, 0.3, 0.5, 0.0, 0.5, 0.0, 0.0], "an appended control read off its default");
+        for p in &spec.params[6..] {
+            assert_eq!(values[p.id as usize], p.default, "{} read off its default", p.symbol);
+            assert!(absent_reads_as(TAPE_PATH, p.symbol).is_none(), "{} is pinned to 5.0", p.symbol);
+        }
+        assert_eq!(spec.create(48_000.0, &values).latency(), 96, "a 5.0 tape opened off the studio head");
+    }
+
+    /// **Every tape id reaches its own field, and an id the table does not
+    /// name reaches none.**
+    ///
+    /// The seat's sweep (`every_imager_and_tape_control_moves_the_audio_through_the_seat`)
+    /// asks whether each id moves the sound, and an id wired to the wrong
+    /// field passes it whenever that field moves the sound too, which the
+    /// trim always does. `TapeUnit::set_param` used to end in a catch-all
+    /// into the trim, so the first row appended to the table without an arm
+    /// of its own would have driven the output level and nothing would have
+    /// said so. So each id is set to a value of its own and the kernel's
+    /// params are read back field by field: its field takes the value and no
+    /// other field moves. The field list must be exactly as long as the
+    /// table or this fails first, so a row appended to one is a row added to
+    /// the other. Ids past the table move nothing, and a NaN lands on the
+    /// row's default rather than on what was there.
+    #[test]
+    fn every_tape_id_reaches_its_own_field() {
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let BuiltinUnit::Tape(mut u) = spec.create(48_000.0, &spec.defaults()) else {
+            panic!("the tape path built something that is not a tape");
+        };
+        let fields = |p: &crate::units::tape::TapeParams| {
+            [
+                p.drive, p.bump, p.roll, p.wobble, p.hiss, p.trim, p.speed, p.flutter, p.rate, p.wow_range, p.bias, p.age,
+                p.damage,
+            ]
+        };
+        assert_eq!(
+            fields(&u.params).len(),
+            TAPE_FACE_PARAMS.len(),
+            "a tape row has no field in this list, or a field has no row"
+        );
+        for (k, row) in TAPE_FACE_PARAMS.iter().enumerate() {
+            assert_eq!(row.id as usize, k, "the tape's ids are not its rows");
+            let before = fields(&u.params);
+            let v = (k as f32 + 1.0) / 16.0;
+            u.set_param(row.id, v);
+            for (j, (was, now)) in before.iter().zip(fields(&u.params)).enumerate() {
+                if j == k {
+                    assert_eq!(now, v, "id {k} ({}) did not reach its own field", row.symbol);
+                } else {
+                    assert_eq!(
+                        now, *was,
+                        "id {k} ({}) moved {}",
+                        row.symbol, TAPE_FACE_PARAMS[j].symbol
+                    );
+                }
+            }
+        }
+        let before = u.params;
+        for id in [TAPE_FACE_PARAMS.len() as u32, 13, 99, u32::MAX] {
+            u.set_param(id, 0.875);
+        }
+        assert_eq!(u.params, before, "an id past the tape's table moved a knob");
+        for row in TAPE_FACE_PARAMS {
+            u.set_param(row.id, f32::NAN);
+            assert_eq!(
+                fields(&u.params)[row.id as usize],
+                row.default,
+                "NaN on {} did not read as its default",
+                row.symbol
+            );
+        }
+    }
+
+    /// Rising zero crossings of `v`, each placed between its two samples by
+    /// linear interpolation, past the first `skip` frames.
+    fn rising_crossings(v: &[f32], skip: usize) -> Vec<f64> {
+        (skip.max(1)..v.len())
+            .filter(|&i| v[i - 1] < 0.0 && v[i] >= 0.0)
+            .map(|i| (i - 1) as f64 + f64::from(v[i - 1]) / f64::from(v[i - 1] - v[i]))
+            .collect()
+    }
+
+    /// **A bypassed tape keeps its delay, and switching it out and back in
+    /// does not click.**
+    ///
+    /// The tape's report stays in the compensation graph while its bay is
+    /// bypassed, as every bypass in the rack keeps its bay's figure, so a
+    /// bypass that let the input past untouched played the lane two
+    /// milliseconds early: every A/B against the tape was a comparison of
+    /// two timings as well as two sounds. The seat now holds the dry signal
+    /// exactly as late as the tape reports and fades between the two.
+    ///
+    /// A 440 Hz sine at -12 dBFS through every colour off at 48 kHz, in
+    /// 512-frame blocks through `BuiltinUnit::process` and
+    /// `BuiltinUnit::bypassed`. Bypassed from creation it is the input
+    /// delayed by the 96 frames reported, to a millionth, and the kernel
+    /// never runs. Switched out at block 10 and back at block 40, against
+    /// the same sine left in circuit: no sample-to-sample step is more than
+    /// half as big again as the sine's own largest, so neither fade clicks;
+    /// every zero crossing stays within a sample of the in-circuit run's, so
+    /// the bypass never moved the lane; the kernel does not run once its
+    /// fade out is done; and 40 ms after the switch back the output is the
+    /// in-circuit run's within a thousandth, so the tape it went back to
+    /// plays as if it had never left. Measured: the worst step 1.02 times
+    /// the sine's own, the crossings 0.86 of a sample, the kernel idle from
+    /// block 11 to 39, and 4.5e-5 at 40 ms (the input transformer and the
+    /// head's roll-off settling from the clean start).
+    ///
+    /// The crossings' bar is the tape's own phase and not its timing: its
+    /// low-end high-passes lead a pure delay by most of a sample at 440 Hz,
+    /// while a bypass that dropped the tape's 96 frames would move a
+    /// crossing by 13. 440 Hz and not 1 kHz, because a 1 kHz period at
+    /// 48 kHz is 48 frames, which 96 is two of, and a lane that slipped by
+    /// exactly the report would cross zero where it always had.
+    ///
+    /// **And on the deep head.** Opened bypassed on it, the bay is the input
+    /// 1200 frames late, to a millionth, and the kernel never runs. Switched
+    /// to it while bypassed, the report moves to 1200 on that very block,
+    /// and the dry follows over the heads' own 25 ms equal-power fade with
+    /// no step past the same bar, after which it is the input 1200 frames
+    /// late again, to a millionth. Measured: the worst step through that
+    /// fade 1.30 times the sine's own, the equal-power fade of two copies of
+    /// one sine swelling it.
+    #[test]
+    fn a_bypassed_tape_keeps_its_delay_and_switches_without_a_click() {
+        const BLOCK: usize = 512;
+        const BLOCKS: usize = 64;
+        let sr = 48_000.0_f32;
+        let spec = spec_for(TAPE_PATH).unwrap();
+        // The 5.0 six with every colour off, the studio speed, and Flutter
+        // at 0 too, so the transport is still.
+        let neutral = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 2.0 / 3.0, 0.0];
+        let amp = 10.0_f64.powf(-12.0 / 20.0);
+        let sine: Vec<f32> = (0..BLOCK * BLOCKS)
+            .map(|i| (amp * (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(sr)).sin()) as f32)
+            .collect();
+        let largest = sine.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
+        // The sine through a fresh unit, bypassed on the blocks `out_of`
+        // names: the left channel, how many blocks the kernel had run by the
+        // end of each block, and the latency reported.
+        let run = |out_of: &dyn Fn(usize) -> bool| {
+            let mut unit = spec.create(sr, &neutral);
+            let mut heard = Vec::with_capacity(sine.len());
+            let mut ran = Vec::with_capacity(BLOCKS);
+            let mut out = vec![vec![0.0_f32; BLOCK]; 2];
+            for k in 0..BLOCKS {
+                let block = sine[k * BLOCK..(k + 1) * BLOCK].to_vec();
+                let input = vec![block.clone(), block];
+                if out_of(k) {
+                    unit.bypassed(&input, BLOCK, &mut out);
+                } else {
+                    unit.process(&input, BLOCK, &mut out);
+                }
+                heard.extend_from_slice(&out[0]);
+                let BuiltinUnit::Tape(t) = &unit else {
+                    panic!("the tape path built something that is not a tape");
+                };
+                ran.push(t.kernel_blocks);
+            }
+            (heard, ran, unit.latency() as usize)
+        };
+
+        let (dry, ran, late) = run(&|_| true);
+        assert_eq!(late, 96, "the tape reports {late} frames at 48 kHz");
+        for (i, v) in dry.iter().enumerate() {
+            let want = if i < late { 0.0 } else { sine[i - late] };
+            assert!(
+                (v - want).abs() < 1.0e-6,
+                "frame {i} of a bay bypassed since creation read {v}, and the input \
+                 {late} frames back is {want}"
+            );
+        }
+        assert_eq!(ran[BLOCKS - 1], 0, "a bay bypassed since creation ran its kernel");
+
+        let (live, _, _) = run(&|_| false);
+        let (flip, ran, _) = run(&|k| (10..40).contains(&k));
+        for (i, w) in flip.windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= 1.5 * largest,
+                "frame {i}: a step of {step:.4} against the sine's own {largest:.4}, so \
+                 the switch clicked"
+            );
+        }
+        let (was, now) = (rising_crossings(&live, 200), rising_crossings(&flip, 200));
+        assert_eq!(was.len(), now.len(), "the switched run crossed zero a different number of times");
+        let moved = was.iter().zip(&now).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
+        assert!(
+            moved < 1.0,
+            "a zero crossing moved {moved:.3} of a sample, so the bypass moved the lane"
+        );
+        assert_eq!(
+            ran[10], ran[39],
+            "the kernel ran while the bay was fully bypassed ({} blocks, then {})",
+            ran[10], ran[39]
+        );
+        assert!(ran[40] > ran[39], "the kernel did not start again when the bay came back");
+        let back = 40 * BLOCK + (0.040 * sr) as usize;
+        let off = live[back..]
+            .iter()
+            .zip(&flip[back..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            off < 1.0e-3,
+            "40 ms after the switch back the tape is {off:.2e} from the one that never left"
+        );
+
+        // The deep head, bypassed: opened on it, and switched to it at
+        // block 20.
+        let mut on_deep = neutral.to_vec();
+        on_deep.extend([0.5, 1.0]);
+        let bypassed_run = |values: &[f32], switch: Option<usize>| {
+            let mut unit = spec.create(sr, values);
+            let (mut heard, mut late) = (Vec::with_capacity(sine.len()), Vec::with_capacity(BLOCKS));
+            let mut out = vec![vec![0.0_f32; BLOCK]; 2];
+            for k in 0..BLOCKS {
+                if Some(k) == switch {
+                    unit.set_param(9, 1.0);
+                }
+                let block = sine[k * BLOCK..(k + 1) * BLOCK].to_vec();
+                unit.bypassed(&[block.clone(), block], BLOCK, &mut out);
+                heard.extend_from_slice(&out[0]);
+                late.push(unit.latency() as usize);
+            }
+            let BuiltinUnit::Tape(t) = &unit else {
+                panic!("the tape path built something that is not a tape");
+            };
+            (heard, late, t.kernel_blocks)
+        };
+        let delayed = |i: usize, by: usize| if i < by { 0.0 } else { sine[i - by] };
+        let (deep, late, ran) = bypassed_run(&on_deep, None);
+        assert_eq!(late[0], 1_200, "a deep tape reports {} frames at 48 kHz", late[0]);
+        for (i, v) in deep.iter().enumerate() {
+            assert!(
+                (v - delayed(i, 1_200)).abs() < 1.0e-6,
+                "frame {i} of a deep bay bypassed since creation read {v}, not the input 1200 back"
+            );
+        }
+        assert_eq!(ran, 0, "a deep bay bypassed since creation ran its kernel");
+        let (switched, late, _) = bypassed_run(&neutral, Some(20));
+        assert_eq!((late[19], late[20]), (96, 1_200), "the report did not move with the range at once");
+        for (i, w) in switched.windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= 1.5 * largest,
+                "frame {i}: a step of {step:.4} against the sine's own {largest:.4}, so the range \
+                 switch clicked"
+            );
+        }
+        let settled = 20 * BLOCK + (0.025 * sr) as usize + 1;
+        for (i, v) in switched.iter().enumerate() {
+            let want = if i < 20 * BLOCK {
+                delayed(i, 96)
+            } else if i >= settled {
+                delayed(i, 1_200)
+            } else {
+                continue;
+            };
+            assert!(
+                (v - want).abs() < 1.0e-6,
+                "frame {i} of the bay switched to the deep head while bypassed read {v}, not {want}"
+            );
+        }
+    }
+
+    /// **A bypassed tape keeps its lane in time, through the real rack.**
+    ///
+    /// The seat's dry line is half of the fix; the other half is the rack's
+    /// bypass arm, which used to send only the hardware insert through its
+    /// bypass and let every other bay's input past untouched while the bay's
+    /// figure stayed in the compensation graph. So a pad note on lane 5,
+    /// through a tape with every colour off in that lane's own first bay, is
+    /// played three ways in the offline engine: in circuit; bypassed from
+    /// before the note; and bypassed, then put back in circuit at the
+    /// twentieth block, mid-note. Bypassed it sounds on the very frame the
+    /// tape in circuit does, at the same level, and flipped mid-note it
+    /// never steps by more than the tone's own largest step and a
+    /// thousandth, which a lane jumping by the tape's 96 frames would, by
+    /// about the tone's whole height.
+    #[test]
+    fn a_bypassed_tape_keeps_its_lane_in_time() {
+        use crate::instrument::{ClipNote, Engine, PadKit, PlacedMidi};
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+        const BLOCK: usize = 256;
+        const LANE: usize = 5;
+        let spec = spec_for(TAPE_PATH).unwrap();
+        let neutral = state_text(spec, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 2.0 / 3.0, 0.0], &[]).into_bytes();
+        let amp = 0.05_f64;
+        let tone: Vec<f32> = (0..24_000)
+            .flat_map(|i| {
+                let v = (amp * (std::f64::consts::TAU * 440.0 * f64::from(i) / 48_000.0).sin()) as f32;
+                [v, v]
+            })
+            .collect();
+        let largest = tone
+            .chunks_exact(2)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+        let note = |bypassed: bool, flip_at: Option<usize>| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, tangent_record::audio::Timebase::new()).expect("offline");
+            e.load_insert(LANE, 0, Some(Path::new(TAPE_PATH)), Some(&neutral))
+                .expect("the tape loads")
+                .expect("the bay reports it");
+            if bypassed {
+                e.set_insert_bypass(&[(LANE, 0)]);
+            }
+            e.set_pad_kit(LANE, {
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+                    samples: tone.clone(),
+                    rate: 48_000,
+                    source: PathBuf::new(),
+                }));
+                kit
+            });
+            e.set_channel_gain(LANE, 1.0);
+            e.set_drum_strips(1 << LANE);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: LANE,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: 20_000,
+                    key: tangent_ui::recorder::DRUM_PAD_BASE,
+                    vel: 100,
+                }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut heard = Vec::new();
+            for k in 0..80 {
+                if Some(k) == flip_at {
+                    e.set_insert_bypass(&[]);
+                }
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard.extend(out.iter().step_by(2));
+            }
+            heard
+        };
+        let onset = |t: &[f32]| t.iter().position(|v| v.abs() > 1.0e-3).expect("a sound");
+        let level = |t: &[f32], at: usize| {
+            let w = &t[at + 1_000..at + 5_800];
+            (w.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / w.len() as f64).sqrt()
+        };
+        let through = note(false, None);
+        let at = onset(&through);
+        let bypassed = note(true, None);
+        assert_eq!(
+            onset(&bypassed),
+            at,
+            "the bypassed tape moved its lane by {} frames",
+            onset(&bypassed) as i64 - at as i64
+        );
+        let gain = 20.0 * (level(&bypassed, at) / level(&through, at)).log10();
+        assert!(gain.abs() < 0.1, "bypassed, the lane is {gain:+.3} dB from the tape in circuit");
+        let flipped = note(true, Some(20));
+        assert_eq!(onset(&flipped), at, "the lane bypassed until mid-note moved");
+        for (k, w) in flipped[at..at + 13_000].windows(2).enumerate() {
+            let step = (w[1] - w[0]).abs();
+            assert!(
+                step <= largest + 1.0e-3,
+                "frame {k} after the onset stepped by {step:.4}, against the tone's own \
+                 {largest:.4}: the lane jumped when the tape came back"
+            );
+        }
+    }
+
+    /// **The bias reads signed about aligned, and every reading reads back.**
+    ///
+    /// Bias is the record bias in decibels either side of the point the
+    /// machine is aligned at, and the middle of its dial is that point. So
+    /// the middle reads "aligned", the machine's own word, and a hand typing
+    /// the word lands exactly there, where a drag's catch and a double-click
+    /// home land too; either side reads signed decibels, the same figure
+    /// with its sign turned at the same distance either way; and every
+    /// reading the dial can show, typed back into it, lands where the
+    /// reading says the same: the word, or the same number. (Typed "+0.0"
+    /// may land a hair the other side of aligned, which reads "-0.0", the
+    /// same number: the dial's middle answers to its word, not to zero.)
+    #[test]
+    fn the_bias_reads_signed_about_aligned_and_every_reading_reads_back() {
+        assert_eq!(describe(TAPE_PATH, 10, 0.5, &[]), "aligned");
+        assert_eq!(value_for_reading(TAPE_PATH, 10, "aligned", &[]), Some(0.5));
+        assert_eq!(value_for_reading(TAPE_PATH, 10, "Aligned", &[]), Some(0.5));
+        for k in 1..=64 {
+            let x = k as f32 / 128.0;
+            let (up, down) = (describe(TAPE_PATH, 10, 0.5 + x, &[]), describe(TAPE_PATH, 10, 0.5 - x, &[]));
+            assert!(
+                up.starts_with('+') && down.starts_with('-') && up[1..] == down[1..],
+                "Bias reads {up} at {} and {down} at {}: not signed and symmetric about aligned",
+                0.5 + x,
+                0.5 - x
+            );
+        }
+        for i in 0..=96 {
+            let v = i as f32 / 96.0;
+            let shown = describe(TAPE_PATH, 10, v, &[]);
+            let typed = value_for_reading(TAPE_PATH, 10, &shown, &[])
+                .unwrap_or_else(|| panic!("Bias's own reading {shown} does not read back"));
+            let again = describe(TAPE_PATH, 10, typed, &[]);
+            assert!(
+                again == shown || (reading_number(&again).is_some() && reading_number(&again) == reading_number(&shown)),
+                "Bias at {v} reads {shown}, which typed back lands at {typed}, reading {again}"
+            );
+        }
+    }
+
+    /// **The tape's selectors offer exactly their positions.** A stepped row
+    /// cycles through `choices`, so the list must be as long as the steps
+    /// the spec declares and in the kernel's own order, the reading of the
+    /// default must be the choice the default lands on, and the default
+    /// must survive the state road bit for bit, or a fresh bay saved and
+    /// reopened would move off the studio speed by a rounding.
+    #[test]
+    fn the_tape_selectors_offer_exactly_their_positions() {
+        use crate::units::tape::{TapeSpeed, WowRange, TAPE_SPEED_STEPS, WOW_RANGE_STEPS};
+        let spec = spec_for(TAPE_PATH).unwrap();
+        assert_eq!(TAPE_SPEED_STEPS as usize, TapeSpeed::ALL.len());
+        assert_eq!(WOW_RANGE_STEPS as usize, WowRange::ALL.len());
+        for (id, positions) in [(6_u32, TapeSpeed::ALL.len()), (9, WowRange::ALL.len())] {
+            let row = &TAPE_FACE_PARAMS[id as usize];
+            assert_eq!(row.steps as usize, positions, "{} steps", row.symbol);
+            let offered = choices(TAPE_PATH, id);
+            assert_eq!(offered.len(), positions, "{} offers {offered:?}", row.symbol);
+            let at = (row.default * (positions - 1) as f32).round() as usize;
+            assert_eq!(
+                offered[at],
+                describe(TAPE_PATH, id, row.default, &[]),
+                "{}'s default reads as a position its choices do not name",
+                row.symbol
+            );
+        }
+        for (k, v) in TapeSpeed::ALL.iter().enumerate() {
+            assert_eq!(TapeSpeed::from_dial(v.dial()), *v, "{} does not round-trip", v.label());
+            assert_eq!(choices(TAPE_PATH, 6)[k], v.label());
+        }
+        assert_eq!(TAPE_FACE_PARAMS[6].default, TapeSpeed::Ips15.dial());
+        for (k, r) in WowRange::ALL.iter().enumerate() {
+            assert_eq!(WowRange::from_dial(r.dial()), *r, "{} does not round-trip", r.label());
+            assert_eq!(choices(TAPE_PATH, 9)[k], r.label());
+        }
+        assert_eq!(TAPE_FACE_PARAMS[9].default, WowRange::Studio.dial());
+        let text = state_text(spec, &spec.defaults(), &[]);
+        let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+        for (want, got) in spec.defaults().iter().zip(&back) {
+            assert_eq!(want.to_bits(), got.to_bits(), "a default changed on the state road");
+        }
     }
 
     /// **A block bigger than the scratch is chunked, not truncated or
@@ -4166,19 +5065,47 @@ mod tests {
         assert_eq!(describe(DRIVE_PATH, 2, 0.71, &[]), "+0.1 dB");
         assert_eq!(describe(DRIVE_PATH, 3, 0.0, &[]), "matched");
         assert_eq!(describe(IR_PATH, 1, 0.5, &[]), "+0.0 dB");
-        // The tape's three calibrated dials, at the positions it ships at:
-        // the bump's own +2.5 dB, the repro corner just under 16 kHz, unity
-        // trim. A face that printed "50 %" for any of these disagreed with
-        // the automation lane's declared unit about the same knob.
+        // The tape's calibrated dials, at the positions it opens at and the
+        // Roll 5.0 shipped: the bump's own +2.5 dB, the repro corner just
+        // under 16 kHz and off, unity trim, and the studio speed in the
+        // selector's words. A face that printed "50 %" for any of these
+        // disagreed with the automation lane's declared unit about the same
+        // knob.
         assert_eq!(describe(TAPE_PATH, 1, 0.5, &[]), "+2.5 dB");
         assert_eq!(describe(TAPE_PATH, 2, 0.12, &[]), "15.6 kHz");
         assert_eq!(describe(TAPE_PATH, 2, 0.0, &[]), "off");
         assert_eq!(describe(TAPE_PATH, 5, 0.5, &[]), "+0.0 dB");
-        // And the three that are character rather than calibration keep
+        assert_eq!(describe(TAPE_PATH, 6, 2.0 / 3.0, &[]), "15 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 0.0, &[]), "3.75 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 1.0 / 3.0, &[]), "7.5 ips");
+        assert_eq!(describe(TAPE_PATH, 6, 1.0, &[]), "30 ips");
+        assert_eq!(choices(TAPE_PATH, 6), vec!["3.75 ips", "7.5 ips", "15 ips", "30 ips"]);
+        // Rate as the multiple its parts turn at, and read back from it.
+        assert_eq!(describe(TAPE_PATH, 8, 0.0, &[]), "0.50x");
+        assert_eq!(describe(TAPE_PATH, 8, 0.5, &[]), "1.00x");
+        assert_eq!(describe(TAPE_PATH, 8, 1.0, &[]), "2.00x");
+        let v = value_for_reading(TAPE_PATH, 8, "1.5x", &[]).expect("a rate");
+        assert_eq!(describe(TAPE_PATH, 8, v, &[]), "1.50x");
+        assert!(choices(TAPE_PATH, 8).is_empty(), "Rate grew steps");
+        // The range in the selector's words.
+        assert_eq!(describe(TAPE_PATH, 9, 0.0, &[]), "studio");
+        assert_eq!(describe(TAPE_PATH, 9, 1.0, &[]), "deep");
+        assert_eq!(choices(TAPE_PATH, 9), vec!["studio", "deep"]);
+        // The bias, in the machine's word at its middle and in signed
+        // decibels either side of it.
+        assert_eq!(describe(TAPE_PATH, 10, 0.5, &[]), "aligned");
+        assert_eq!(describe(TAPE_PATH, 10, 0.0, &[]), "-6.0 dB");
+        assert_eq!(describe(TAPE_PATH, 10, 1.0, &[]), "+6.0 dB");
+        assert_eq!(describe(TAPE_PATH, 10, 0.75, &[]), "+3.0 dB");
+        assert!(choices(TAPE_PATH, 10).is_empty(), "Bias grew steps");
+        // And the six that are character rather than calibration keep
         // saying so.
         assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
         assert_eq!(describe(TAPE_PATH, 3, 0.3, &[]), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 4, 0.25, &[]), fmt_pct(0.25));
+        assert_eq!(describe(TAPE_PATH, 7, 0.3, &[]), fmt_pct(0.3));
+        assert_eq!(describe(TAPE_PATH, 11, 0.5, &[]), fmt_pct(0.5));
+        assert_eq!(describe(TAPE_PATH, 12, 0.25, &[]), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
         assert_eq!(
             choices(DENOISE_PATH, 6),
@@ -4316,7 +5243,8 @@ mod tests {
     /// The floor is deliberately low. This test's job is "did the value
     /// arrive"; whether the move is worth HEARING is pinned per knob in each
     /// kernel's own module, where the right measurement for a bump is dB at
-    /// 70 Hz and the right one for a drive is harmonic content.
+    /// the head's own bump frequency and the right one for a drive is
+    /// harmonic content.
     #[test]
     fn every_imager_and_tape_control_moves_the_audio_through_the_seat() {
         const FRAMES: usize = 24_000;
