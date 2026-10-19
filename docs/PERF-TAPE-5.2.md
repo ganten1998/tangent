@@ -10,7 +10,7 @@ measured"), which a busy machine moves far less.
 
 ## Tangent Tape
 
-| | 5.1 (main 825a91c3) | 5.2 (quiet, the day it shipped) | 5.2 kernel at aa94a2be (shared) | 5.3 (shared) |
+| | 5.1 (main 825a91c3) | 5.2 (quiet, the day it shipped) | aa94a2be, where 5.3 started (shared) | 5.3 (shared) |
 |---|---|---|---|---|
 | `rt_bench` row "16 lanes x Tape", mean per block | 370.5 us (23.2 per insert) | 470.6 us (29.4 per insert) | 372.0 us (23.3 per insert) | 194.8 to 195.1 us (12.2 per insert) |
 | `the_tape_costs_what_its_budget_says`, defaults, mean (warmed) | | 20.7 to 20.8 us | 22.5 to 22.8 us | 9.8 to 11.4 us |
