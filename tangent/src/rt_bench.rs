@@ -3148,54 +3148,65 @@ fn the_grain_knob_may_be_turned_while_the_transport_rolls() {
     }
 }
 
-/// `MEASURED` passes of `block` frames, each timed, after `warmup` untimed,
-/// with `between(e, k)` before pass `k`.
-fn timed(name: &str, e: &mut Engine, block: usize, warmup: usize, mut between: impl FnMut(&Engine, usize)) -> Stats {
-    let mut out = vec![0.0f32; block * 2];
-    for k in 0..warmup {
-        between(e, k);
-        e.render_offline(&mut out);
+/// **The bench thread at the scheduler's user-interactive class**, where
+/// the audio thread's own class sits, so the other work of a busy machine
+/// is not put ahead of it. macOS only; elsewhere the thread is left alone.
+fn interactive_bench_thread() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: sets the calling thread's own scheduling class and nothing
+    // else; the call takes no pointer.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
-    let mut us = Vec::with_capacity(MEASURED);
-    for k in warmup..warmup + MEASURED {
-        between(e, k);
-        let t = Instant::now();
-        e.render_offline(&mut out);
-        us.push(t.elapsed().as_nanos() as f64 / 1000.0);
-    }
-    let s = Stats::from(name, block, us);
-    println!("{}", s.line());
-    s
 }
+
+/// The `q` quantile of `v`, which is not empty: 0.5 its median.
+fn quantile(mut v: Vec<f64>, q: f64) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));
+    v[((v.len() - 1) as f64 * q).round() as usize]
+}
+
+/// Rounds of the start and stop probe, each one tape cycle of every desk:
+/// odd, so the median is a round's own.
+const START_STOP_ROUNDS: usize = 31;
 
 /// **What tape start and stop costs, against what the dial costs.**
 ///
 /// While the tape changes speed the desk is the varispeed path's, at a ratio
-/// that moves every pass, so it costs what the dial engaged costs, and the
-/// dearest passes are the near-unity ends: the first passes of a stop, the
-/// last tenth of a start, the hand-back. The bench's sixteen-lane desk
-/// through a plate, grains on, at 64 and 128 frames and 48 kHz: rolling at
-/// rest, rolling with the dial at 0.75, and repeated starts and stops at
-/// 0.1 s each way with every pass measured. **Fails** unless the cycles'
-/// p99 is at most 15 % of the deadline and their worst at most 50 %; prints
-/// p99 and the worst against the deadline for all three, and the cycles'
-/// ratio to the dial.
+/// that moves every pass, so a ramp's pass costs what the dial engaged costs
+/// at that speed. The bench's sixteen-lane desk through a plate, grains on,
+/// at 64 and 128 frames and 48 kHz: rolling at rest, rolling with the dial
+/// at 0.75, and repeated starts and stops at 0.1 s each way, the three
+/// INTERLEAVED, one tape cycle of each in turn, on the bench thread at the
+/// user-interactive class. The ratios are taken inside each of the rounds
+/// and their median is what is held, so the other work of a busy machine,
+/// which lands on all three alike, falls out of them; their middle half is
+/// printed beside it. **Fails** unless, at both sizes, the cycles' median
+/// p99 is at most 1.75 times the dial's and 1.4 times rest's, their median
+/// worst at most 1.6 times the dial's and 1.35 times rest's, and the
+/// cycles' p99 and worst, all rounds pooled, within 15 % and 50 % of the
+/// deadline.
 ///
-/// **The bar was 1.10 times the dial's p99 and 1.25 times its worst, and the
-/// motor does not meet it: that is an open issue.** On a quiet machine the
-/// cycles' p99 runs 6 to 9 % of the deadline (the dial's 4 to 6 %) and their
-/// worst block 32 % at 64 frames and 17 % at 128, about 1.4 and 2 times the
-/// dial's p99 and up to 5 times its worst. Each ramp engages and leaves the
-/// varispeed path and wakes every resting lane on the way in and out, which
-/// the dial engaged pays once; the worst block is one of those. It is safe
-/// against the deadline, which is what the bar now holds, and the owner
-/// wants it optimized later (`docs/PERF-TAPE-5.2.md`). Tighten the bar as it
-/// gets cheaper.
+/// **The design's bar was 1.10 times the dial's p99 and 1.25 times its
+/// worst, and no cycle with passes at rest in it can meet the first half**:
+/// the dial at 0.75 renders three quarters of the program a pass at rest
+/// renders, so rest itself runs about 1.2 times the dial's p99, and a third
+/// of the cycles' passes are at rest (at speed or parked), their dearest
+/// ramp passes near full speed. Measured on a shared machine, seven runs:
+/// the cycles run 1.36 to 1.52 times the dial's p99 at 64 frames and 1.22
+/// to 1.36 at 128, and 1.17 to 1.32 times its worst; against rest, 1.05 to
+/// 1.23 times its p99 and 0.97 to 1.14 its worst. The worst was 4.1 to 6.2
+/// times the dial's at 64 frames and 3.1 to 3.9 at 128, every lane's whole
+/// grain in the first block at rest after each start; the motor's way back
+/// into the grain render (`Renderer::regrain_hold`) lets the desk in a share
+/// at a time, and one lane's grain in a block is what is left of it
+/// (`docs/PERF-TAPE-5.2.md`).
 ///
 /// `cargo test --release -p tangent --bin tangent -- tape_start_and_stop_costs --ignored --nocapture`
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn tape_start_and_stop_costs_what_the_dial_costs_probe() {
+    interactive_bench_thread();
     let desk = || {
         let e = audio_desk(16, &[PLATE_PATH]);
         e.set_grain_ms(-1.0);
@@ -3203,33 +3214,105 @@ fn tape_start_and_stop_costs_what_the_dial_costs_probe() {
     };
     let mut failed = Vec::new();
     for block in [64usize, 128] {
-        println!("{block} frames, deadline {:.1} us:", deadline_us(block));
-        let rest = timed("rolling at rest, grains on", &mut desk(), block, WARMUP, |_, _| {});
-        let mut e = desk();
-        e.set_varispeed(0.75);
-        let dial = timed("rolling with the dial at 0.75", &mut e, block, WARMUP, |_, _| {});
-        let mut e = desk();
-        e.set_tape_motor(true, 0.1, 0.1);
+        let mut rest = desk();
+        let mut dial = desk();
+        dial.set_varispeed(0.75);
+        let mut cycles = desk();
+        cycles.set_tape_motor(true, 0.1, 0.1);
         // A start or a stop every 0.15 s: the 0.1 s ramp and a little either
-        // side of it, so most measured passes are ramping.
+        // side of it, so most of the cycles' passes are ramping. A round is
+        // one start and one stop of the cycles, and as many blocks of each
+        // of the other two.
         let half = (0.15 * f64::from(RATE)) as usize / block;
-        let cycles = timed("start and stop, 0.1 s each way", &mut e, block, WARMUP, |e, k| {
+        let per_round = 2 * half;
+        // Twelve seconds of noise must outlast the desk at rest.
+        assert!((WARMUP + START_STOP_ROUNDS * per_round) * block < 11 * RATE as usize, "the rounds outrun the noise");
+        println!(
+            "{block} frames, deadline {:.1} us, {START_STOP_ROUNDS} rounds of {per_round} blocks, the three interleaved in each:",
+            deadline_us(block)
+        );
+        let mut out = vec![0.0f32; block * 2];
+        let mut k = 0usize;
+        let mut cycle = |e: &mut Engine, out: &mut [f32]| {
             if k % half == 0 {
                 e.set_rolling((k / half) % 2 == 0);
             }
-        });
-        for s in [&rest, &dial, &cycles] {
-            println!("  {:<34} p99 {:6.1}% of the deadline, worst {:6.1}%", s.name, s.p99 / s.deadline * 100.0, s.max / s.deadline * 100.0);
+            k += 1;
+            let t = Instant::now();
+            e.render_offline(out);
+            t.elapsed().as_nanos() as f64 / 1000.0
+        };
+        let plain = |e: &mut Engine, out: &mut [f32]| {
+            let t = Instant::now();
+            e.render_offline(out);
+            t.elapsed().as_nanos() as f64 / 1000.0
+        };
+        for _ in 0..WARMUP.div_ceil(per_round) * per_round {
+            plain(&mut rest, &mut out);
+            plain(&mut dial, &mut out);
+            cycle(&mut cycles, &mut out);
         }
-        println!("  the cycles against the dial: p99 {:.2}x, worst {:.2}x", cycles.p99 / dial.p99, cycles.max / dial.max);
-        if cycles.p99 > 0.15 * cycles.deadline {
-            failed.push(format!("{block} frames: the cycles' p99 {:.1} us is over 15% of the {:.1} us deadline", cycles.p99, cycles.deadline));
+        let names = ["rolling at rest, grains on", "rolling with the dial at 0.75", "start and stop, 0.1 s each way"];
+        let mut rounds: [Vec<Stats>; 3] = Default::default();
+        let mut pooled: [Vec<f64>; 3] = Default::default();
+        for _ in 0..START_STOP_ROUNDS {
+            let taken = [
+                (0..per_round).map(|_| plain(&mut rest, &mut out)).collect::<Vec<f64>>(),
+                (0..per_round).map(|_| plain(&mut dial, &mut out)).collect(),
+                (0..per_round).map(|_| cycle(&mut cycles, &mut out)).collect(),
+            ];
+            for (i, us) in taken.into_iter().enumerate() {
+                pooled[i].extend_from_slice(&us);
+                rounds[i].push(Stats::from(names[i], block, us));
+            }
         }
-        if cycles.max > 0.50 * cycles.deadline {
-            failed.push(format!("{block} frames: the cycles' worst {:.1} us is over half the {:.1} us deadline", cycles.max, cycles.deadline));
+        let all: Vec<Stats> = (0..3).map(|i| Stats::from(names[i], block, pooled[i].clone())).collect();
+        for s in &all {
+            println!(
+                "  {:<34} p50 {:6.1} us, p99 {:6.1}% of the deadline, worst {:6.1}%",
+                s.name,
+                s.p50,
+                s.p99 / s.deadline * 100.0,
+                s.max / s.deadline * 100.0
+            );
+        }
+        // **The ratios taken inside each round**, where whatever else the
+        // machine was doing it did to all three: the median of the rounds,
+        // and their middle half.
+        let ratio = |of: usize, to: usize, f: fn(&Stats) -> f64| -> [f64; 3] {
+            let r: Vec<f64> = rounds[of].iter().zip(&rounds[to]).map(|(a, b)| f(a) / f(b)).collect();
+            [quantile(r.clone(), 0.5), quantile(r.clone(), 0.25), quantile(r, 0.75)]
+        };
+        let line = |what: &str, p: [f64; 3], w: [f64; 3]| {
+            println!(
+                "  {what:<28} p99 {:.2}x ({:.2} to {:.2}), worst {:.2}x ({:.2} to {:.2})",
+                p[0], p[1], p[2], w[0], w[1], w[2]
+            );
+        };
+        let (p99_dial, max_dial) = (ratio(2, 1, |s| s.p99), ratio(2, 1, |s| s.max));
+        let (p99_rest, max_rest) = (ratio(2, 0, |s| s.p99), ratio(2, 0, |s| s.max));
+        line("the cycles against the dial", p99_dial, max_dial);
+        line("the cycles against rest", p99_rest, max_rest);
+        line("rest against the dial", ratio(0, 1, |s| s.p99), ratio(0, 1, |s| s.max));
+        for (what, got, bar) in [
+            ("p99 against the dial's", p99_dial[0], 1.75),
+            ("worst against the dial's", max_dial[0], 1.6),
+            ("p99 against rest's", p99_rest[0], 1.4),
+            ("worst against rest's", max_rest[0], 1.35),
+        ] {
+            if got > bar {
+                failed.push(format!("{block} frames: the cycles' {what} is {got:.2}x, over {bar}x"));
+            }
+        }
+        let c = &all[2];
+        if c.p99 > 0.15 * c.deadline {
+            failed.push(format!("{block} frames: the cycles' p99 {:.1} us is over 15% of the {:.1} us deadline", c.p99, c.deadline));
+        }
+        if c.max > 0.50 * c.deadline {
+            failed.push(format!("{block} frames: the cycles' worst {:.1} us is over half the {:.1} us deadline", c.max, c.deadline));
         }
     }
-    assert!(failed.is_empty(), "tape start and stop runs too close to the deadline: {failed:#?}");
+    assert!(failed.is_empty(), "tape start and stop runs too dear: {failed:#?}");
 }
 
 /// **The grain render's A/B, paired, for a machine that is not quiet.**
