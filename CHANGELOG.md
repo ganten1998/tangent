@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
+## [Unreleased]
+
+### Fixed
+
+- **Tape's deep wow range reaches the 3 % it was meant to at full Wow, and
+  follows the Wow dial in proportion.** It peaked at 2.6 % at full Wow and,
+  lower down the dial, swung further than its share (0.98 % at the default
+  0.3), because the wander that varies the cassette's depth moved its long
+  sway fast enough to bend the pitch on its own. The depth now varies as
+  the cassette's tape pack turns, and the warble swings the pitch 3 % at
+  full Wow, 1.5 % at 0.5 and 0.9 % at the default 0.3. The studio range
+  sounds exactly as it did.
+
 ## [5.2.0] - 2026-10-19
 
 The version Tangent Tape became a tape machine with four speeds and the
