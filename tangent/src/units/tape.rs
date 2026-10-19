@@ -9110,21 +9110,20 @@ mod tests {
     /// at the top, the deep head, the speed thrown between 15 and 3.75 ips
     /// every half second, the range every second, Rate and Bias swept end to
     /// end). Prints the mean, p99 and the worst block, and holds the mean at
-    /// the defaults to 26 µs and the p99 fully engaged to 44 µs.
+    /// the defaults to 16 µs and the p99 fully engaged to 30 µs.
     ///
-    /// **Those bars are the measured machine with a margin, not the budget
-    /// the design set (21 and 24 µs), and that is an open issue.** On a
-    /// quiet machine, warmed, the defaults measure 20.7 to 20.8 µs and the
-    /// p99 fully engaged 34.7 to 35.8 µs, against the design's 21 and 24; on
-    /// the sixteen-lane `rt_bench` row 5.0's tape cost 23.2 µs an insert
-    /// against this one's 29.4. The record stage is most of it (a profile
-    /// with it switched off ran at about a fifth): the polyphase pair does
-    /// under half the
-    /// multiply-adds and still costs what the direct form did, so the code
-    /// the compiler makes of that stage is the first lead. The owner shipped
-    /// the cost honestly in 5.2 and wants it optimized later;
-    /// `docs/PERF-TAPE-5.2.md` has the numbers. Lower the bars as it gets
-    /// cheaper, never raise them.
+    /// **5.3 brought the cost under the design's budget**, 16 µs at the
+    /// defaults: the record stage runs a chunk at a time with its filters'
+    /// outputs side by side ([`record`]), the same arithmetic to the bit.
+    /// Warmed, on a machine two other builds were sharing, the defaults
+    /// measured 9.8 to 11.4 µs and the p99 fully engaged 17.5 to 20.3 µs,
+    /// where the kernel 5.3 started from read 22.5 to 22.8 and 32.5 to 34.3
+    /// on the same machine (5.2 read 20.7 and 35.8 on a quiet one); the
+    /// sixteen-lane `rt_bench` row read 195 µs a block against that
+    /// kernel's 372.0 and 5.1's 370.5. The mean's bar is the design's budget
+    /// and the p99's is the reading with a margin, both for a quiet machine
+    /// to tighten; `docs/PERF-TAPE-5.2.md` has the numbers. Lower the bars
+    /// as it gets cheaper, never raise them.
     #[test]
     #[ignore = "a bench: run it by hand in release with --ignored --nocapture"]
     fn the_tape_costs_what_its_budget_says() {
@@ -9178,8 +9177,8 @@ mod tests {
                 ..TapeParams::default()
             }
         });
-        assert!(mean <= 26.0, "a Tape at its defaults costs {mean:.2} us a block, over its 26 us ceiling");
-        assert!(p99 <= 44.0, "a Tape fully engaged costs {p99:.2} us at p99, over its 44 us");
+        assert!(mean <= 16.0, "a Tape at its defaults costs {mean:.2} us a block, over its 16 us ceiling");
+        assert!(p99 <= 30.0, "a Tape fully engaged costs {p99:.2} us at p99, over its 30 us");
     }
 
     /// **The transport reads a studio machine's weighted flutter at every
