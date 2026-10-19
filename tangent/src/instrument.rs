@@ -1831,12 +1831,19 @@ impl ClickHold {
 /// **One destination's read of the click's rings**: how far back it reads,
 /// and the first frame it may read.
 ///
-/// **A hold that moves starts afresh**, as a lane's line does when its length
-/// changes (`DelayLine::run` clears): nothing written before the move is read
-/// after it, so the read is silent for its new hold and then reads on. The
-/// beats inside the old hold are lost with the music the lanes lose there,
-/// and none is ever heard twice, which re-reading a ring at a longer hold
-/// would do.
+/// **A hold that moves with the target starts afresh**, as a lane's line does
+/// when its length changes (`DelayLine::run` clears): nothing written before
+/// the move is read after it, so the read is silent for its new hold and then
+/// reads on. The beats inside the old hold are lost with the music the lanes
+/// lose there, and none is ever heard twice, which re-reading a ring at a
+/// longer hold would do.
+///
+/// **A hold that moves only in the master's chain keeps what it has not
+/// played** ([`HoldRead::aim_kept`]): the lanes lose nothing there (the
+/// limiter thrown in or out, the speakers taking their own mix or the
+/// take's, a master plugin's delay moving), so neither does the click. A
+/// longer hold is silence for what it grew by, a shorter one skips what it
+/// shrank by, and nothing is heard twice.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct HoldRead {
     hold: usize,
@@ -1844,11 +1851,20 @@ struct HoldRead {
 }
 
 impl HoldRead {
-    /// Aim this read `hold` frames back from the chunk written from `at`.
+    /// Aim this read `hold` frames back from the chunk written from `at`,
+    /// afresh: the target moved, and the lanes' lines emptied with it.
     fn aim(&mut self, hold: usize, at: u64) {
+        self.aim_kept(hold, at, false);
+    }
+
+    /// **Aim this read, keeping every frame it has not yet played when
+    /// `kept`**: the frame it would have read next is `at - hold` at its old
+    /// hold, and it reads on from there at the new one. Not `kept`, it starts
+    /// afresh at `at`, as [`HoldRead::aim`].
+    fn aim_kept(&mut self, hold: usize, at: u64, kept: bool) {
         if hold != self.hold {
+            self.from = if kept { at.saturating_sub(self.hold as u64).max(self.from) } else { at };
             self.hold = hold;
-            self.from = at;
         }
     }
 
@@ -16891,6 +16907,12 @@ impl Renderer {
     /// send is taken before that rack, so it waits the target alone, where
     /// the lanes' own sends arrive; a bus's send waits the target less the
     /// bus's own way out (`gather_node`), read with what is kept here.
+    ///
+    /// **A move of the target starts the speakers' and the take's reads
+    /// afresh**, as the lanes' lines empty with it; a move in the master's
+    /// chain alone (the limiter, the speakers' split, a master plugin) keeps
+    /// what they have not played (`HoldRead::aim_kept`), as the lanes keep
+    /// theirs, so a beat in flight is heard, once.
     fn aim_click(&mut self, landed: bool) -> usize {
         let frozen = &self.spine.ext.desk.frozen;
         let lat = |seat: usize| Rack::latency(&self.shared, frozen, seat) as usize;
@@ -16903,8 +16925,9 @@ impl Renderer {
         let room = if self.room_live { target } else { take };
         let at = self.click_hold.written;
         let hold = &mut self.click_hold;
-        hold.room.aim(room.saturating_sub(own).min(ClickHold::MOST), at);
-        hold.take.aim(take.saturating_sub(own).min(ClickHold::MOST), at);
+        let kept = target == hold.target;
+        hold.room.aim_kept(room.saturating_sub(own).min(ClickHold::MOST), at, kept);
+        hold.take.aim_kept(take.saturating_sub(own).min(ClickHold::MOST), at, kept);
         hold.fx.aim(target.min(ClickHold::MOST), at);
         hold.target = target;
         hold.own = own;
@@ -49406,6 +49429,136 @@ mod slot_engine {
             }
             let steady = render(false, false);
             assert!(laned.iter().zip(&steady).any(|(a, b)| (a - b).abs() > 0.1), "fixture: the moves cost the lane nothing");
+        }
+
+        /// **The click track the bar clock plays at 120 BPM in 4/4, laid as a
+        /// clip `frames` long**: the accent on each bar's one, the plain click
+        /// on every other beat, each cut where the next begins, at `level`.
+        fn click_track(frames: usize, level: f32) -> Arc<tangent_record::decode::Clip> {
+            let click = Click::load(48_000.0).expect("the click asset");
+            let mut track = vec![0.0f32; frames * 2];
+            for beat in 0..frames / BEAT_TWO + 1 {
+                let s = if beat % 4 == 0 { &click.accent } else { &click.normal };
+                for (k, v) in s.iter().take(BEAT_TWO).enumerate() {
+                    let at = beat * BEAT_TWO + k;
+                    if at < frames {
+                        track[at * 2] = *v * level;
+                        track[at * 2 + 1] = *v * level;
+                    }
+                }
+            }
+            Arc::new(tangent_record::decode::Clip { samples: track, rate: 48_000, source: PathBuf::from("click-track.wav") })
+        }
+
+        /// **A hold that moves only in the master's chain keeps the click's
+        /// beat in flight**: the lanes lose nothing there, and neither does the
+        /// click.
+        ///
+        /// On a desk held 1,200 frames the speakers' hold moves without the
+        /// target four times, each with a beat made and not yet heard: the
+        /// limiter thrown in (58 frames more, a hole in the mix where its
+        /// lookahead fills), an input armed so the speakers take their own
+        /// mix (58 fewer, skipped), disarmed (58 more), and the limiter thrown
+        /// out (58 fewer). The click and a lane playing the click's own sound,
+        /// the same samples on the same beats at the same level, are one
+        /// signal through all four, beat in flight included; a read started
+        /// afresh at each move (as a move of the target does, with the lanes'
+        /// lines) lost the beat each time: beat two's click went silent, and
+        /// a lane playing it kept it. And every beat the song crosses is heard
+        /// once.
+        #[test]
+        fn a_hold_that_moves_only_in_the_masters_chain_keeps_the_clicks_beat_in_flight() {
+            const FRAMES: usize = 5 * 48_000;
+            // Each a few hundred frames past a beat line, so the beat on it is
+            // made and still held (`hold` is 1,200 or 1,258).
+            const LIMITER_IN: usize = 95;
+            const ARMED: usize = 189;
+            const DISARMED: usize = 282;
+            const LIMITER_OUT: usize = 376;
+            for b in [LIMITER_IN, ARMED, DISARMED, LIMITER_OUT] {
+                let past = (b * BLOCK) % BEAT_TWO;
+                assert!((300..1_100).contains(&past), "fixture: block {b} is {past} frames past its beat");
+            }
+            let track = click_track(FRAMES, 1.0);
+            let render = |as_click: bool| -> Vec<f32> {
+                let mut e = wide(42);
+                let [unarmed, armed] = [false, true].map(|a| {
+                    let mut inputs = bus_plan(&e, 42, &[]);
+                    inputs.lanes[3].flags = if a { F::ARMED | F::MIDI_OFF } else { F::MIDI_OFF };
+                    inputs
+                });
+                e.publish_plan(&unarmed).expect("the plan goes");
+                fake_hold(&mut e, 1_200);
+                e.set_tempo(120.0);
+                e.set_metronome_gain(0.25);
+                e.set_metronome_enabled(as_click);
+                if !as_click {
+                    let gen = e.lane_gen(Slot(1)).expect("a lane");
+                    e.set_clips_slotted(vec![SlotPlaced {
+                        slot: Slot(1),
+                        gen,
+                        placed: Placed { clip: Arc::clone(&track), strip: 0, start: 0, offset: 0, len: FRAMES as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                    }]);
+                    e.set_lane_levels(Slot(1), 0.25, 0.0, 0.0);
+                }
+                let mut tx = plug(&mut e, 3);
+                e.set_monitor_on(true);
+                let limiter = |e: &Engine, on: bool| {
+                    e.set_effects(crate::effects::Sends {
+                        limiter: if on { tangent_ui::recorder::LIMITER_SHIPS_AT } else { crate::effects::Sends::default().limiter },
+                        ..crate::effects::Sends::default()
+                    });
+                };
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let mut feed = |e: &mut Engine, out: &mut Vec<f32>| {
+                    for _ in 0..BLOCK {
+                        let _ = tx.push(0.0);
+                    }
+                    e.render_offline(out);
+                };
+                // Every slew settled before the roll.
+                for _ in 0..100 {
+                    feed(&mut e, &mut out);
+                }
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut heard = Vec::new();
+                for b in 0..FRAMES / BLOCK {
+                    match b {
+                        LIMITER_IN => limiter(&e, true),
+                        ARMED => {
+                            e.publish_plan(&armed).expect("the arm goes");
+                        }
+                        DISARMED => {
+                            e.publish_plan(&unarmed).expect("the disarm goes");
+                        }
+                        LIMITER_OUT => limiter(&e, false),
+                        _ => {}
+                    }
+                    feed(&mut e, &mut out);
+                    heard.extend_from_slice(&out);
+                }
+                assert_eq!(e.shared.max_latency.load(Ordering::Relaxed), 1_200, "fixture: the target moved");
+                heard
+            };
+            let clicked = render(true);
+            let laned = render(false);
+            assert!(laned.iter().any(|v| v.abs() > 0.05), "fixture: the click track is silent");
+            // To a ten-thousandth, as the target's own pin reads them: the
+            // click's gain and the lane's fader each glide to their level.
+            for (k, (c, l)) in clicked.iter().zip(&laned).enumerate() {
+                assert!((c - l).abs() < 1e-4, "frame {}: the click is {c}, the lane playing its sound {l}", k / 2);
+            }
+            // Every beat crossed, once: an onset per beat, none lost and none
+            // doubled, each attack where its beat is heard.
+            let mut onsets = Vec::new();
+            let mut from = 0;
+            while let Some(at) = onset_from(&clicked, from, CROSS) {
+                onsets.push(at);
+                from = at + BEAT_TWO / 2;
+            }
+            let beats = (FRAMES - 1_300) / BEAT_TWO + 1;
+            assert_eq!(onsets.len(), beats, "the click sounded {} beats of {beats}: {onsets:?}", onsets.len());
         }
 
         /// **Holding the click to the mix, marking a take's first frame and
