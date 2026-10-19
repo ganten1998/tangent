@@ -238,9 +238,10 @@ On Windows that folder is C:\Users\<you>\.config\tangent\. Deleting one of
 these files resets that part of Tangent and nothing else. Your projects live
 wherever you save them.
 
-Coming from Tangent 4.x: 5.0 does not read the old ~/.config/ivory folder and
-removes it the first time it starts. Paste your supporter key again
-(right-click > "Support Tangent..." > Activate); it is in the email it came in.
+Coming from Tangent 4.x: settings, taught chords and the supporter key do not
+carry over, because 5.0 and later never read the folder 4.x kept them in.
+Paste your supporter key again (right-click > "Support Tangent..." >
+Activate); it is in the email it came in.
 
 
 Privacy
@@ -306,6 +307,6 @@ THANKS
   Hatsu, for extensive Windows testing and feedback.
 
 Tangent is free with up to 32 tracks, and a supporter key removes the limit:
-https://ganten.gumroad.com/l/ivory
+https://ganten.gumroad.com/l/tangent
 Source code, release notes and the issue tracker:
 https://github.com/ganten1998/tangent

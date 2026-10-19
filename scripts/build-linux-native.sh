@@ -91,10 +91,10 @@ fi
 tar -C dist -czf "${STAGE}.tar.gz" "tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"
 echo "==> ${STAGE}.tar.gz"
-# `${STAGE}` and not a re-spelled path: this line said ivory-* long after the
-# tar above started writing tangent-*, and under `set -e` a failed `ls` exits
-# non-zero — so the script reported failure at the very end of a build that had
-# completely succeeded. Derive the name, never retype it.
+# `${STAGE}` and not a re-spelled path: this line kept the pre-2.3.0 name long
+# after the tar above started writing tangent-*, and under `set -e` a failed
+# `ls` exits non-zero — so the script reported failure at the very end of a
+# build that had completely succeeded. Derive the name, never retype it.
 ls -lh "${STAGE}.tar.gz" | sed 's/^/    /'
 
 # Prove the tarball actually contains a binary before anyone trusts it.

@@ -7,12 +7,13 @@
 # live that is NOT the GUI: cpal, a camera, an encoder and a file writer all
 # belong to the desktop binary and none of them belong in the GUI crate.
 #
-# So: `ivory` depends on this crate; `tangent-ui` and `tangent-core` must NEVER.
-# `scripts/check-firewall.sh` asserts that, and see docs/RECORDER-PLAN.md §10
-# item 5 for why that assertion needs `--target all` to mean anything.
+# So: the `tangent` binary depends on this crate; `tangent-ui` and
+# `tangent-core` must NEVER. `scripts/check-firewall.sh` asserts that, and
+# see docs/RECORDER-PLAN.md §10 item 5 for why that assertion needs
+# `--target all` to mean anything.
 #
 # No egui here either. The recorder produces bytes; drawing them is `tangent-ui`'s
-# job and compositing them is `ivory`'s (RECORDER-PLAN §6).
+# job and compositing them is the `tangent` binary's (RECORDER-PLAN §6).
 name = "tangent-record"
 version.workspace = true
 edition.workspace = true

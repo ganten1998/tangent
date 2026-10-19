@@ -4951,7 +4951,7 @@ fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
 /// Stable surface identity: a viewport id on the desktop, an `Area` id in a
 /// plugin. `dialog: Option<Dialog>` means there is never more than one open, so
 /// one id serves them all and the window keeps its place between dialogs.
-const DIALOG_ID: &str = "ivory-dialog";
+const DIALOG_ID: &str = "tangent-dialog";
 
 /// **The STACKED window's identity** — the amp's pedal, opened over the amp.
 ///
@@ -4975,7 +4975,7 @@ const DIALOG_ID: &str = "ivory-dialog";
 /// window's own recorded scar ([`EXPORT_ID`]), and [`held_geometry`] keyed
 /// on one id with two titles takes its "two windows share a name" arm and
 /// re-places both every frame.
-const PEDAL_ID: &str = "ivory-dialog-pedal";
+const PEDAL_ID: &str = "tangent-dialog-pedal";
 
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
@@ -5009,7 +5009,7 @@ struct DialogTheme {
 /// A dialog is a floating panel like any other — **made of the desk's own
 /// face**, through the one derivation every panel now shares.
 ///
-/// It was the frozen pair: black-on-ivory and its inverse, reachable by no
+/// It was the frozen pair: black-on-cream and its inverse, reachable by no
 /// theme. Worse, the only caller passed `false` forever, so a dialog never
 /// went dark either — it was a light card over a dark app.
 fn theme(face: Color32) -> DialogTheme {
@@ -5032,7 +5032,7 @@ fn theme_of(face: Color32) -> DialogTheme {
 }
 
 /// Where this frame's face is kept for the windows that are NOT dialogs.
-const FACE_ID: &str = "ivory-dialog-face";
+const FACE_ID: &str = "tangent-dialog-face";
 
 /// The face the frozen pair used to be made of, and the answer [`live_face`]
 /// gives on a frame [`show`] has not run yet — which, with `show` called
@@ -5044,8 +5044,8 @@ const FALLBACK_FACE: Color32 = Color32::from_rgb(0xE3, 0xD9, 0xBD);
 ///
 /// The export window is the customer: it is deliberately not a `Dialog` — it
 /// answers no question and takes no turn in the one dialog slot — so it never
-/// sees the `face` parameter and hard-coded the old ivory instead. That held
-/// for exactly as long as ivory was the only face; sixteen themes later it
+/// sees the `face` parameter and hard-coded the shipped bone instead. That
+/// held for exactly as long as bone was the only face; sixteen themes later it
 /// was the one surface that stayed beige, on screen for minutes at a time.
 /// `show` runs every frame whether or not a dialog is up, and runs before the
 /// export window draws, so what it leaves here is always THIS frame's answer.
@@ -6025,7 +6025,7 @@ fn shorten_middle(s: &str, max: usize) -> String {
 /// remembered geometry. Nothing else keyed off `DIALOG_ID` on its behalf:
 /// `pointer_over_dialog` and `dialog_drawn_inline` are both gated on a
 /// `Dialog` being open, which an export is not.
-const EXPORT_ID: &str = "ivory-export";
+const EXPORT_ID: &str = "tangent-export";
 
 /// **How much of the screen the export window takes.**
 ///
@@ -6676,7 +6676,7 @@ pub fn show_export_progress(
 ) {
     // The desk's own face, like every dialog — read from the frame's record
     // rather than taken as a parameter, because this window does not come
-    // through `show`. It hard-coded ivory here long after the dialogs
+    // through `show`. It hard-coded the bone here long after the dialogs
     // learned to follow the theme, and it is on screen for minutes at a
     // stretch. See `remember_face`.
     let t = theme(live_face(ctx));
@@ -10722,7 +10722,7 @@ fn show_on(
                                         // three-way match is the three numbers
                                         // — and the arm that says both is the
                                         // one that fires when the graph widens
-                                        // a request, when `IVORY_OUT_BUFFER`
+                                        // a request, when `TANGENT_OUT_BUFFER`
                                         // overrides it, or when the device's
                                         // own range clamps it.
                                         //
@@ -14307,7 +14307,7 @@ fn show_on(
             focus,
         } => {
             // ALWAYS the light theme — the owner's word ("keep the obs
-            // stream menu light"): ivory ground, black text, whatever the
+            // stream menu light"): bone ground, black text, whatever the
             // rest of the app is wearing.
             let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
             let dim = t.text.gamma_multiply(0.62);
@@ -14463,16 +14463,17 @@ fn show_on(
                                 // for a key and never used to say where one
                                 // comes from — the only purchase link lived
                                 // in the README, which a person inside the
-                                // app is not reading. Still `/l/ivory`: the
-                                // slug is the one commercial URL the rename
-                                // deliberately left alone, because every key
-                                // email ever sent points at it.
+                                // app is not reading. It is `/l/tangent`
+                                // since the store's permalink was renamed;
+                                // the old slug redirects to it, which keeps
+                                // the link in every key email ever sent
+                                // working.
                                 ui.hyperlink_to(
-                                    RichText::new("ganten.gumroad.com/l/ivory")
+                                    RichText::new("ganten.gumroad.com/l/tangent")
                                         .font(bold(11.0))
                                         .color(t.text)
                                         .underline(),
-                                    "https://ganten.gumroad.com/l/ivory",
+                                    "https://ganten.gumroad.com/l/tangent",
                                 );
                             }
                             ui.add_space(8.0);
@@ -16354,7 +16355,7 @@ mod tests {
     ///
     /// The owner's rule, and it needs no special case to hold. A FIRST
     /// install has no settings file, so it comes up on the Default theme,
-    /// whose strip face IS the shipped bone — the card is black on ivory and
+    /// whose strip face IS the shipped bone — the card is black on bone and
     /// matches the default right-click menus exactly, which is what a first
     /// launch should look like.
     ///
@@ -16376,7 +16377,7 @@ mod tests {
         );
         assert!(
             !crate::recorder_panel::wants_light_ink(card.bg),
-            "a first-install Welcome card is not black on ivory"
+            "a first-install Welcome card is not black on bone"
         );
         // And it is the SAME surface the default right-click menu is, which
         // is the whole of "matches the default theme's context menus".
@@ -20119,7 +20120,7 @@ at: None,
         });
         let (painted, _) = run_picker(&mut dialog);
         assert!(
-            painted.contains("ganten.gumroad.com/l/ivory"),
+            painted.contains("ganten.gumroad.com/l/tangent"),
             "no way to buy a key from the dialog that asks for one: {painted}"
         );
         // **What the key does, all three facts.** The free desk's size from
@@ -20547,7 +20548,7 @@ at: None,
         }
     }
 
-    /// The export window wears the desk's face, not the retired ivory.
+    /// The export window wears the desk's face, not the bone it hard-coded.
     ///
     /// It is not a `Dialog`, so it never sees `show`'s `face` parameter — it
     /// reads the face `show` remembered this frame instead (see
@@ -20555,7 +20556,7 @@ at: None,
     /// first with no dialog open, the export window after — and then asks
     /// what the window's ground was painted with.
     #[test]
-    fn the_export_window_wears_the_desks_face_not_ivory() {
+    fn the_export_window_wears_the_desks_face_not_the_old_bone() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
@@ -20564,7 +20565,7 @@ at: None,
         // still the fade never finishes and every fill compares unequal at
         // two-thirds opacity. No animation, no multiplication.
         ctx.style_mut(|s| s.animation_time = 0.0);
-        // Before `show` has ever run, the historical ivory — a frame the app
+        // Before `show` has ever run, the old hard-coded bone — a frame the app
         // cannot produce, because `show` is called unconditionally ahead of
         // the export window every update.
         assert_eq!(live_face(&ctx), FALLBACK_FACE);
@@ -20609,7 +20610,7 @@ at: None,
         );
         assert!(
             !fills.contains(&theme_of(FALLBACK_FACE).bg),
-            "ivory is still painted somewhere in the export window"
+            "the old hard-coded bone is still painted somewhere in the export window"
         );
     }
 
@@ -25102,13 +25103,13 @@ mod midi_inputs_tests {
 /// every triangle egui would have sent to the card, text included. It is why
 /// `midi_inputs_body` is a function of its own.
 ///
-///     IVORY_SHOT=/tmp/midi-dark.png \
+///     TANGENT_SHOT=/tmp/midi-dark.png \
 ///       cargo test -p tangent-ui --lib dialogs::shot -- --ignored --nocapture
 ///
-/// `IVORY_SHOT_THEME=<name>` and `IVORY_SHOT_LIGHT=1` pick the dress, the same
+/// `TANGENT_SHOT_THEME=<name>` and `TANGENT_SHOT_LIGHT=1` pick the dress, the same
 /// two every other shot in this repo honours.
 ///
-/// The rows are `app::demo_midi_rows`, shared with `IVORY_INLINE=midiinputs`,
+/// The rows are `app::demo_midi_rows`, shared with `TANGENT_INLINE=midiinputs`,
 /// so the picture and the running app show the same thing: a device that is
 /// on, one that is off, and one that is on and NOT PLUGGED IN — which is the
 /// row nobody developing this can produce by hand.
@@ -25119,12 +25120,12 @@ mod shot {
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn midi_inputs() {
-        let Ok(out) = std::env::var("IVORY_SHOT") else {
-            eprintln!("IVORY_SHOT not set");
+        let Ok(out) = std::env::var("TANGENT_SHOT") else {
+            eprintln!("TANGENT_SHOT not set");
             return;
         };
         let mut set = crate::settings::Settings::default();
-        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+        if let Ok(name) = std::env::var("TANGENT_SHOT_THEME") {
             match crate::theme::factory().into_iter().find(|t| t.name == name) {
                 Some(t) => {
                     t.apply(&mut set);
@@ -25133,7 +25134,7 @@ mod shot {
                 None => eprintln!("no theme called {name}"),
             }
         }
-        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+        if std::env::var("TANGENT_SHOT_LIGHT").is_ok() {
             set.dark_mode = false;
         }
         // The face the app hands `dialogs::show`, derived exactly as

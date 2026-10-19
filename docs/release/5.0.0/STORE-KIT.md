@@ -26,9 +26,9 @@ for the README, and nothing anywhere reports it. See `docs/RELEASE.md` step 9.
 | Linux | `tangent-linux-x86_64.tar.gz` |
 | checksums | `SHA256SUMS` |
 
-`Tangent-macos-arm64.{dmg,zip}` are still uploaded as aliases of the universal
-build, because they are the names in every email sent before 3.0.0. They are
-not what a new page should hand out.
+`Tangent-macos-arm64.{dmg,zip}`, the names in the emails sent before 3.0.0,
+are no longer uploaded: those links 404, and a new page hands out the
+universal names above.
 
 ---
 
@@ -267,7 +267,7 @@ Replaces the Tangent `<article>` in
 - it says `v3.0.0` and dates itself 2026-08-14;
 - it describes Tangent "inside your DAW, as a VST3 plugin", which is retired
   (owner ruling 2026-10-10: remove every user-facing mention);
-- every link uses the old slug `github.com/ganten1998/ivory`, which only works
+- every link uses the pre-rename repository slug, which only works
   through GitHub's rename redirect (and a deleted or recreated repository
   loses that redirect);
 - it says nothing about the 32-track free desk or what a key does.
@@ -352,7 +352,7 @@ a supporter key removes the limit.
               no account.
             </p>
             <p>
-              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/ivory" target="_blank" rel="noopener">Support it</a>
+              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/tangent" target="_blank" rel="noopener">Support it</a>
             </p>
             <p class="post__tags">
               <span class="tag">rust</span>
@@ -442,16 +442,12 @@ Two things to know before you upgrade from 4.x:
    remove the old Tangent.vst3 on macOS and Windows; on Linux, delete
    ~/.vst3/Tangent.vst3 yourself. Tangent still hosts your plugins.
 
-2. 5.0 keeps its settings in a new folder and deletes the old
-   ~/.config/ivory folder the first time it starts. That folder held your
-   settings, the chord names you taught Tangent, and your key. Your projects
-   and recordings are not in it and are not touched. After upgrading, paste
-   your key again (right-click anywhere, Support Tangent..., Activate). It is
-   in the email your key first came in, from this same address; if you
-   cannot find it, reply and I will send it again. If you taught Tangent
-   chord names you want to keep, copy the ~/.config/ivory folder somewhere
-   safe before you start 5.0, and the release notes say where to put it
-   back.
+2. 5.0 keeps its settings in a new folder and does not read the ones 4.x
+   kept, so your settings, taught chord names and key start fresh. Your
+   projects and recordings are not touched. After upgrading, paste your key
+   again (right-click anywhere, Support Tangent..., Activate). It is in the
+   email your key first came in. If you cannot find it, reply to this email
+   or to your Gumroad receipt and I will send it again.
 
 Download (these links always fetch the current version):
 

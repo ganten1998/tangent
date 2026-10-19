@@ -41,7 +41,7 @@ fn one_correction_blast_radius() {
     println!("corpus: {} voicings", sets.len());
 
     let mut path = std::env::temp_dir();
-    path.push(format!("ivory-blast-{}", std::process::id()));
+    path.push(format!("tangent-blast-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
     let mut det = ChordDetector::new().with_overrides(OverrideStore::load_from(&path));

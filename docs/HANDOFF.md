@@ -1,4 +1,4 @@
-# Ivory 2.0 — Handoff / Resume Document
+# Tangent 2.0 — Handoff / Resume Document
 
 **Last updated:** 2026-08-21. **The app is now called TANGENT.** Newest work is
 §2aa: hardware JPEG decode on Linux, and the camera's 15 fps ceiling turning
@@ -29,8 +29,7 @@ Before it, §2d: the fretboard voicing solver and the guitar view. §2c before i
 rename, the 2.2.0 tester-report UI fixes and the egui 0.33 downgrade; the
 MIT/GPLv3 split it also records ended with the VST3 plugin, which stopped
 shipping at 4.77.0 and whose crate was removed on 2026-10-10. Read §2c then §2d
-FIRST; everything above them still says "Ivory" and that is now the internal
-codename, not the product.
+FIRST.
 This file is the single source of truth for
 picking the project up cold. Read it top-to-bottom before touching anything.
 Pair it with `docs/DESIGN.md` (architecture), `docs/DIVERGENCES.md` (the chord
@@ -40,10 +39,10 @@ policy) and `docs/spec/` (the machine-verified extraction of the Python app).
 
 ## 1. What this is
 
-A ground-up Rust rewrite of **Ivory** — a MIDI keyboard monitor that draws an
+A ground-up Rust rewrite of **Tangent** — a MIDI keyboard monitor that draws an
 88-key piano and names the chord you're playing in real time. It replaces a
-Python/PySide6 app (v1.1.0) that lives at `~/Dropbox/Archive/Ivory`. Goals, in
-priority order (from the owner's brief):
+Python/PySide6 app (v1.1.0) that lives in the Python 1.x archive outside this
+repo. Goals, in priority order (from the owner's brief):
 
 1. **UI/UX parity** with the last working Python mac build — same look/feel.
 2. **Solidify & perfect the chord logic and all edge cases** — reproduce the
@@ -52,7 +51,7 @@ priority order (from the owner's brief):
    optional experiment where the app learns preferred names.
 4. **Sellable** under "pay what you can (incl. $0)" — clean licensing,
    packaged for macOS + Linux + Windows.
-5. **Clean and lean** — two crates, minimal deps. Retire the old `ivory-rust`.
+5. **Clean and lean** — two crates, minimal deps. Retire the first Rust attempt.
 
 **Repo:** `~/Dropbox/Projects/Apps/tangent` (git, branch `main`; `origin` =
 `git@codeberg.org:ganten1998/tangent.git`, pushed 2026-07-29 — see §7). The old
@@ -66,7 +65,7 @@ and has since been **trashed** (§7; do NOT push it anywhere).
 ### Done and committed
 | Commit | What |
 |---|---|
-| `cf71ba6` | Scaffold: workspace, engine base copied from ivory-rust, specs, fonts, golden corpus |
+| `cf71ba6` | Scaffold: workspace, engine base copied from the first Rust attempt, specs, fonts, golden corpus |
 | `c9e15a0` | Design + divergence policy (after a 3-lens adversarial critique) |
 | `c8be947` | GUI parity port (9 modules), packaging scripts, engine acceptance contract |
 | `5dbe50f` | **Engine surgery: all 20 D-rules then defined land; acceptance + 42 unit tests green** |
@@ -163,7 +162,7 @@ Built for a first hands-on test by a non-owner on macOS **and** Windows.
   correction without saying so). `Correct Chord Name...` is now also gated on
   `detection_enabled`, and is no longer a dead click if the notes were released
   while the menu was open.
-- **Feature flag**: `ivory` always enables `tangent-core/learning`, so both
+- **Feature flag**: `tangent` always enables `tangent-core/learning`, so both
   packaging scripts ship it with no changes. `tangent-core` keeps the gate, so
   `cargo test -p tangent-core` still exercises the stock engine.
 - **Safety invariants** (all test-asserted): exact overrides still short-circuit
@@ -217,7 +216,7 @@ platform coverage:
   the Python app's — it blocks nothing. See §7 and `docs/RELEASE.md` gate 1.
   (This bullet used to say "543-byte placeholder — blocks release"; that was
   wrong for a week. See §8.)
-- **Not Codeberg or `ivory-rust`.** Both done — see §7.
+- **Not Codeberg or the first Rust attempt.** Both done — see §7.
 - macOS and Windows artifacts build (§7). **Linux has never been built**: run
   `scripts/build-linux-native.sh` on a Linux host, once per arch.
 - Business decisions in `docs/RELEASE.md` (MIT retention, Developer ID signing
@@ -225,29 +224,33 @@ platform coverage:
   gate on a public release.
 - Optional polish: 6 cosmetic warnings in `tangent-core` — 5 unused variables
   (`pcs_set`, `best_root_pc`, `highest_pc`, `highest_note`, `matched_count`)
-  and one non-snake-case `has_M3`. The `ivory` crate emits none.
+  and one non-snake-case `has_M3`. The `tangent` crate emits none.
 
 ---
 
 ## 2c. 2026-08-13 — renamed to Tangent, tester fixes, egui 0.33, fretboard core
 
-**THE NAME.** The product is **Tangent**. "Ivory" is now the INTERNAL CODENAME
-and is deliberately everywhere it is invisible: crate names (`ivory`,
-`tangent-core`, `tangent-keygen`, `tangent-fulfil`), `~/.config/tangent/`, the settings
-and overrides paths, `IVORY_*` env switches, `assets/tangent.*`, and above all
-**`CFBundleIdentifier = org.codeberg.ganten1998.tangent`, which must never
-change** (it would reset Gatekeeper trust on every signed build). The binary is
-`tangent` via a `[[bin]]` entry, so the package stays `ivory`: **`cargo run -p
-tangent` does NOT resolve, use `--bin tangent`.** Why Tangent: the clavichord's
-tangent is the blade at the back of each key that strikes the string and stays
-in contact for as long as the note sounds, which is what the display does with
-a held note. Synthogy's Ivory is a famous virtual piano and a VST3 build would
-have put us in the same browser. Three naming rounds and a trademark analysis
-are behind this; do not reopen it.
+**THE NAME.** The product is **Tangent**, and so is everything inside it:
+crate names (`tangent`, `tangent-core`, `tangent-keygen`, `tangent-fulfil`),
+`~/.config/tangent/`, the settings and overrides paths, `TANGENT_*` env
+switches, `assets/tangent.*`, and above all **`CFBundleIdentifier =
+org.codeberg.ganten1998.tangent`, which must never change** (it would reset
+Gatekeeper trust on every signed build). The binary is `tangent`, and so is the
+package (`tangent/Cargo.toml`), so `cargo run -p tangent` resolves. Why Tangent:
+the clavichord's tangent is the blade at the back of each key that strikes the
+string and stays in contact for as long as the note sounds, which is what the
+display does with a held note. The old name belonged to a famous virtual piano,
+and a VST3 build would have put us in the same browser. Three naming rounds and
+a trademark analysis are behind this; do not reopen it.
+
+> **Retired (2026-10-18).** The next paragraph is the 2.3.0 record. The
+> owner retired the third set: 5.1.0 carries none of the pre-rename assets,
+> `publish-github.sh` no longer uploads them, and the old emails' links to
+> those names 404.
 
 **Artifacts renamed**, and `scripts/publish-github.sh` now uploads every
 artifact THREE times: version-scoped, version-less alias, and under the OLD
-`Ivory-*` names. That third set is not optional. Those exact links are in the
+pre-rename names. That third set is not optional. Those exact links are in the
 inbox of everyone who has already bought a supporter key, and they resolve by
 exact asset name. The `Tangent-*` aliases were also back-filled onto the v2.2.0
 release, because the fulfilment email was redeployed with new links before new
@@ -265,7 +268,7 @@ true of 0.33: eframe 0.33 uses `App::update(ctx)` not `App::ui(ui)`,
 `show_viewport_immediate` hands the closure a `Context` not a `Ui`,
 `Context::run` not `run_ui`, and `Stroke::new` takes `impl Into<f32>` so float
 literals need `_f32`. All of the Context-to-Ui bridging is one function,
-**`ivory/src/shell.rs::viewport_ui`**, which was also the shape the plugin
+**`tangent-ui/src/shell.rs::viewport_ui`**, which was also the shape the plugin
 editor needed. It is tested to hand over the whole viewport, because a default
 `CentralPanel` adds margin and would silently shift the piano.
 
@@ -383,7 +386,7 @@ is written down.
   points apart, where `position_per_fret` and `stretch` fight.
 - E4+F4 `64,65` → `x x x 9 6 x` (424) vs `x x x x 5 1` (435). Eleven points.
 
-### `ivory/src/fretboard_panel.rs` — the view (D-UI-15, full detail there)
+### `tangent-ui/src/fretboard_panel.rs` — the view (D-UI-15, full detail there)
 
 Dumb by design, like `piano.rs`. The app owns exactly ONE `VoicingSession` and
 re-solves on the same 100ms gate as chord detection. **Off by default**
@@ -468,10 +471,11 @@ overflow panic (`note_slack: usize::MAX`), but determinism was never reviewed.
 
 **2.3.0 IS PUBLIC** on all three platforms (macOS signed+notarized, Windows,
 Linux x86_64 — the first Linux build this project has ever produced). Every
-permalink, including the legacy `Ivory-*` names in supporter emails already
+permalink, including the legacy pre-rename names in supporter emails already
 sent, was byte-verified as serving 2.3.0. The nine existing purchasers were
 emailed via Resend; Gumroad refuses customer email below a payout or $100 in
-sales, and `keys@ivorymidi.com` can send but not receive, so Reply-To matters.
+sales, and the sender address of the day could send but not receive, so
+Reply-To matters.
 
 Since then, unreleased on `main`: the fretboard became an INPUT (click the neck
 with keytoggle on, positions are pinned so a hand-entered shape stays put),
@@ -501,7 +505,7 @@ corrects several confident wrong claims, and a progress log. Landed:
    its paint body can be driven by either host: route the remaining
    `send_viewport_cmd` sites (9) through a trait, and move `app.rs` into
    `tangent-ui` leaving `impl eframe::App` behind in the binary. The orphan rule
-   forces a thin wrapper type in `ivory` — that is expected, not a problem.
+   forces a thin wrapper type in `tangent` — that is expected, not a problem.
 6. **The quarantined `plugin/` workspace.** `plugin/Cargo.toml` opens with an
    empty `[workspace]` table, exactly like `tools/tangent-keygen`, so nih-plug and
    `vst3-sys` never enter the root `Cargo.lock`. That is not tidiness: without
@@ -553,7 +557,7 @@ one — it must be GATED, not merely left to no-op.
    bump belongs to the release commit, as it did for 2.2.0), move
    `CHANGELOG.md`'s `[Unreleased]` under the new heading, then
    `scripts/release.sh`. Remember `scripts/publish-github.sh` must still upload
-   the legacy `Ivory-*` names (§2c) — that is not optional.
+   the legacy pre-rename names (§2c, since retired).
 4. Then the `Shell`/`Caps` refactor, then `tangent-plugin` with
    `nih_export_vst3!`, then the installer. `Caps::detachable = false` for the
    plugin; the fretboard panel needs no detached variant either.
@@ -581,7 +585,7 @@ firewall intact.
 ### The plugin, in one paragraph
 
 `plugin/` is its own workspace (empty `[workspace]` table). `plugin/src/lib.rs`
-is a shell: everything on screen is `tangent_ui::app::IvoryApp`, the same code
+is a shell: everything on screen is `tangent_ui::app::TangentApp`, the same code
 the standalone runs. Notes cross from the audio thread on a pre-allocated
 `crossbeam::ArrayQueue` — never a mutex, because the editor holds its state
 locked for a whole frame. State persists into the DAW project as the same JSON
@@ -681,7 +685,7 @@ rewriting rather than re-deriving.
    `release.sh` passes.
 5. **No release cut.** Bump the workspace version, move `[Unreleased]` under
    the new heading, then `scripts/release.sh`. `publish-github.sh` must still
-   upload the legacy `Ivory-*` names (§2c).
+   upload the legacy pre-rename names (§2c, since retired).
 
 ### Commands added this round
 
@@ -703,10 +707,10 @@ reserved for after the full code audit the owner asked for.
 `tangent/src/dx7/` is a faithful six-operator FM engine: `voice.rs` unpacks the
 128 packed bytes of a patch, `sysex.rs` reads a 4104-byte cartridge,
 `algorithms.rs` is the transcribed routing table, `synth.rs` is the DSP.
-Validated against 11,756 real cartridges (`IVORY_SYX_CORPUS=... cargo test -p
-ivory --bins the_whole_corpus -- --ignored --nocapture`).
+Validated against 11,756 real cartridges (`TANGENT_SYX_CORPUS=... cargo test -p
+tangent --bins the_whole_corpus -- --ignored --nocapture`).
 
-`ivory/src/builtin.rs` is **gone** — the two-operator sketch it held is fully
+`tangent/src/builtin.rs` is **gone** — the two-operator sketch it held is fully
 superseded.
 
 **The default patch is `Voice::electric_piano()`, written into the source.**
@@ -728,7 +732,7 @@ Not a bundled VST3 — a sentinel path (`dialogs::BUILTIN_PATH`) inserted at the
 top of the existing slot picker. No second bundle to sign, notarize or install,
 and no scan that can fail. `desktop.rs::reconcile_plugin` intercepts it.
 
-`IvoryApp::open_slot_editor` forks on it: a VST3 gets its own window, the
+`TangentApp::open_slot_editor` forks on it: a VST3 gets its own window, the
 built-in gets `Dialog::PatchPicker`. **Selecting is auditioning** — no Load
 button, because a patch applies between buffers and dialing one in means
 playing while you move down the list. `settings.dx7_cartridge` /
@@ -763,7 +767,7 @@ mid-session. `composite.rs` has an ignored test that renders a frame offscreen
 through the real compositor and writes a PNG:
 
 ```
-IVORY_SHOT=/tmp/x.png IVORY_SHOT_ROWS=210 \
+TANGENT_SHOT=/tmp/x.png TANGENT_SHOT_ROWS=210 \
   cargo test -p tangent --bins shot::window -- --ignored --nocapture
 ```
 
@@ -820,7 +824,7 @@ per-platform too; it was macOS text on all three.
 ### Six knobs, in two rows
 
 `Fx` grew from three to six: REVERB / DELAY / CHORUS on top in Tascam blue,
-then HPF and LPF in ivory and LIMITER in red. `METER_SHARE` went 0.62 → 0.46 to
+then HPF and LPF in cream and LIMITER in red. `METER_SHARE` went 0.62 → 0.46 to
 pay for the second row — the meters gave up the height, because six knobs that
 do not fit are worse than a shorter VU.
 
@@ -891,7 +895,7 @@ checked with the same filter that made it is the detector agreeing with itself.
   firewall and `RecorderView` has no route for them. It needs a display-unit
   hint on `EffectDefaults`; it is not hard, it was just more than the knob was
   worth today.
-- `IVORY_SHOT_FX` renders no panel — for the reverb either, so it predates
+- `TANGENT_SHOT_FX` renders no panel — for the reverb either, so it predates
   this work. The panels are covered by `every_panel_row_reaches_its_own_parameter`
   instead, which walks all six.
 - Everything in §2g's "take next" that is still open, plus Void finding 1: the
@@ -1023,7 +1027,7 @@ travel.
 
 ### The filters are violet, and the GR ladder is gone
 
-The filter caps were ivory, which made two of the eight read as blank caps with
+The filter caps were cream, which made two of the eight read as blank caps with
 no colour rather than as a pair. Violet sits opposite the panel's warm brown
 and competes with nothing else on it.
 
@@ -1162,9 +1166,9 @@ panel prints is what the field accepts, which is asserted.
 `MIN_TRIM` stops the handles crossing: an out-point before the in-point is a
 track that plays nothing, discovered by pressing Record and hearing silence.
 
-**It does not screenshot.** `IVORY_SHOT_TRACK=open` loads a fake clip, but the
+**It does not screenshot.** `TANGENT_SHOT_TRACK=open` loads a fake clip, but the
 compositor draws BANDS for the video and not overlay panels — the same gap
-`IVORY_SHOT_FX` has. The panel is covered by hit-test and layout tests instead.
+`TANGENT_SHOT_FX` has. The panel is covered by hit-test and layout tests instead.
 
 ### Two things moved
 
@@ -1383,7 +1387,7 @@ cannot answer for it. The Circle and the Tonnetz are unchanged.
 ### Nothing detaches any more
 
 Four surfaces could be popped into their own window. All four are retired: the
-menu rows are gone, and `IvoryApp::new` clears all four `*_detached` flags
+menu rows are gone, and `TangentApp::new` clears all four `*_detached` flags
 UNCONDITIONALLY on the way in. That clamp is the important half — the flags
 persist, so an upgrade would otherwise zero a band, put it in a window nothing
 opens, and offer no Attach row to undo it. That failure is not hypothetical; it
@@ -1539,7 +1543,7 @@ macOS one did, which is where the reset had accidentally been fixed.
 ### One line that would have halved the investigation
 
 The Linux build said **nothing** when a capture stream opened, even at
-`IVORY_LOG=debug`, so establishing what the device actually negotiated took
+`TANGENT_LOG=debug`, so establishing what the device actually negotiated took
 inspecting the PipeWire graph from outside the app. There is a `debug!` at the
 open now: device, channels, rate, format, buffer. What is ASKED for is nothing
 like what arrives, and every future field report that mentions channels or rate
@@ -1642,7 +1646,7 @@ The goal in their words: **"potato running like new".**
 ### The mic fader was connected to nothing
 
 `gains.input` was packaged by the settings, drawn on the fader, written by the
-drag, and read by NOBODY in `ivory/src`. `push_monitor_settings` pushed slots,
+drag, and read by NOBODY in `tangent/src`. `push_monitor_settings` pushed slots,
 metronome, master, track gain and trim, and stopped.
 
 It goes to the SESSION, not the engine: the engine has no input in it. Applied
@@ -1701,7 +1705,7 @@ and pads the rest, instead of spending the whole UI budget every pump and
 leaving the window at four frames a second. Input has priority.
 
 **Not done: moving the compositor to a worker thread.** The paint pass needs
-`&IvoryApp`, which is not `Send`; the split would be UI-paints-shapes /
+`&TangentApp`, which is not `Send`; the split would be UI-paints-shapes /
 worker-renders, and the shapes are `Send` so it is possible. It was not needed
 once the wait was gone, and it should be re-measured before it is attempted.
 
@@ -1869,7 +1873,7 @@ to `devices::restore` at startup, exactly as the chosen device's own uid already
 is. The grammar stays on the host's side of the firewall; `tangent-ui` cannot
 spell one and must not learn to.
 
-`IVORY_INLINE=channels` opens it against a fake eighteen-in interface, because
+`TANGENT_INLINE=channels` opens it against a fake eighteen-in interface, because
 the chooser only offers itself above two inputs and nobody developing this owns
 such a box.
 
@@ -1944,7 +1948,7 @@ band's fader are ONE value in settings that both read
 muted; the effects return takes no send either, because a bus that can feed
 itself is a bus that howls.
 
-`IVORY_INLINE=mixer` opens the view on the first frame. Use it: photographing
+`TANGENT_INLINE=mixer` opens the view on the first frame. Use it: photographing
 the view otherwise means sending a keystroke at a desktop that may not be
 listening, and a stray keystroke on a shared machine lands somewhere else.
 
@@ -2279,7 +2283,7 @@ The withholding is SLEWED (`room_gain`), not switched, because a whole
 microphone appearing in one sample is a click; the same slew closes the send,
 so a channel nobody can hear cannot arrive back in the speakers through the
 reverb. Feedback is why the room half exists and why monitoring is still off at
-every launch — see `IvoryApp::input_monitor`.
+every launch — see `TangentApp::input_monitor`.
 
 ### The take is as wide as the desk
 
@@ -2564,9 +2568,9 @@ reshuffle, and moving it out would mean copying the whole uncompressed frame —
 ## 3. Repo layout
 
 ```
-ivory/
-├── Cargo.toml              workspace (tangent-core, ivory); version 2.1.0, MIT
-├── tangent-core/             ── PURE ENGINE, no GUI deps, exhaustively tested ──
+tangent/
+├── Cargo.toml              workspace (tangent-core, tangent); version 2.1.0, MIT
+├── tangent-core/           ── PURE ENGINE, no GUI deps, exhaustively tested ──
 │   ├── src/
 │   │   ├── lib.rs          public API re-exports
 │   │   ├── patterns.rs     chord/scale tables (ORDER IS LOAD-BEARING)
@@ -2583,19 +2587,20 @@ ivory/
 │       ├── diffcorpus.rs   engine vs golden corpus (see §5)
 │       ├── probe.rs        candidate-score dumper for one input (debug tool)
 │       └── voiceprobe.rs   the same for shapes: winner + runners-up in points
-├── ivory/                  ── GUI binary (eframe/egui 0.33 PINNED, midir 0.11) ──
+├── tangent/                ── GUI binary (eframe/egui 0.33 PINNED, midir 0.11) ──
 │   └── src/                main, app, piano, chord_strip, fretboard_panel, menu,
 │                           dialogs, midi, settings, fonts, shell
 │                           (see docs/DESIGN.md; egui is pinned at 0.33, see §2c)
-├── assets/                 ivory.png (128×128 original art), ivory.ico, ivory.desktop, fonts/
+├── assets/                 tangent.png (128×128 original art), tangent.ico, tangent.desktop, fonts/
 ├── tests/golden/           corpus.json (13,133 rows), gen_corpus.py, + classifier outputs
 ├── scripts/                build-macos.sh, build-cross.sh, build-linux-native.sh, gen-third-party-licenses.sh
 └── docs/                   DESIGN.md, DIVERGENCES.md, HANDOFF.md(this), RELEASE.md,
-                            spec/ (extracted Python spec), reference/ (old ivory-rust GUI)
+                            spec/ (extracted Python spec)
 ```
 
-`docs/reference/` holds the old ivory-rust GUI files (egui 0.29 API, stale but
-logic/geometry sound) — reference only, not compiled.
+The first Rust attempt's GUI files (egui 0.29 API, stale but logic/geometry
+sound) were kept in `docs/reference/`, never compiled, until that folder was
+deleted; `git log -- docs/reference` finds them.
 
 ---
 
@@ -2668,7 +2673,7 @@ instrumentation before committing.**
 To reverse-engineer what Python actually does (its spec has bugs, so "differs
 from Python" ≠ wrong — judge musical correctness):
 ```bash
-cd ~/Dropbox/Archive/Ivory && python3 -c \
+cd <python-engine-folder> && python3 -c \
  "from chord_detector import ChordDetector as C; print(C().detect_chord({64,70,74,78}))"
 ```
 
@@ -2702,8 +2707,8 @@ cargo test -p tangent-core --features learning --test blast_radius --release -- 
 
 # run the app (needs no MIDI device to launch)
 cargo run -p tangent                             # GUI
-./target/debug/ivory --list                    # CLI: list MIDI ports (parity strings)
-./target/debug/ivory -p "USB-MIDI"             # connect a specific port
+./target/debug/tangent --list                    # CLI: list MIDI ports (parity strings)
+./target/debug/tangent -p "USB-MIDI"             # connect a specific port
 
 # engine debugging (see §4)
 cargo run -p tangent-core --example diffcorpus --release
@@ -2752,21 +2757,22 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
 ## 7. Finalization checklist (task 8)
 
 - [x] Icon — **NOT a placeholder** (corrected 2026-08-04). `assets/tangent.png`
-      is byte-identical (sha256 `0dc37a25…`) to the Python app's
-      `~/Dropbox/Archive/Ivory/icons/ivory.png`: the original piano-keys art,
+      is byte-identical (sha256 `0dc37a25…`) to the Python app's 128×128
+      icon in the Python 1.x archive: the original piano-keys art,
       which the owner wants kept. It is only 128×128, so Dock/Finder sizes
       above that are upscaled and look soft. Optional polish, not a blocker:
       a nearest-neighbour 8× re-render to 1024px would keep the exact art and
       sharpen every frame. The build scripts now say this instead of shouting
       "unshippable placeholder".
 - [x] `scripts/build-macos.sh` — **verified 2026-07-29 (v2.0.0), re-run
-      2026-08-10 for v2.1.0**: builds `Ivory.app` (bundle id
-      `com.github.ganten7.ivory`; the Info.plist version is interpolated from
-      the root `Cargo.toml`, so it tracks the workspace automatically), ad-hoc
-      codesigns, bundles LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, stages the app
-      together with READ-ME-FIRST.md, zip + dmg; the packaged app launches.
+      2026-08-10 for v2.1.0**: builds `Tangent.app` (bundle id
+      `org.codeberg.ganten1998.tangent`; the Info.plist version is
+      interpolated from the root `Cargo.toml`, so it tracks the workspace
+      automatically), ad-hoc codesigns, bundles
+      LICENSE+OFL+THIRD-PARTY-LICENSES+fonts, stages the app together with
+      READ-ME-FIRST.md, zip + dmg; the packaged app launches.
       (dist/ is gitignored.)
-- [x] Windows cross-build — **verified**: `cargo xwin` produces `ivory.exe`
+- [x] Windows cross-build — **verified**: `cargo xwin` produces `tangent.exe`
       (7.5MB) from this Mac. `build-cross.sh` Windows stage works.
 - [ ] Linux build — cross-building is **BLOCKED**: `midir` links ALSA and
       `alsa-sys` can't cross-compile from macOS without a sysroot. Details +
@@ -2784,12 +2790,12 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
       Settings → Branches for tidiness (then `master` can be deleted). A stray
       `cursor/ai-stream-connection-error-b1a2` branch predates this and is
       harmless.
-- [x] `ivory-rust` retired to Trash (recoverable); its guide PDF preserved at
-      `docs/reference/Ivory-Rust-Guide.pdf`.
+- [x] The first Rust attempt retired to Trash (recoverable); its guide PDF was
+      kept in `docs/reference/` and is in git history now.
 - [ ] Business decisions in `docs/RELEASE.md`: keep MIT? Developer-ID signing +
       notarization ($99/yr — macOS 15+ has no right-click-Open bypass, a real
-      blocker for selling to strangers); Windows SmartScreen; the "Ivory" name
-      collides with Synthogy's Ivory piano VST if commercialized.
+      blocker for selling to strangers); Windows SmartScreen; the old name
+      collided with a commercial piano VST (closed by the 2.3.0 rename).
 
 ---
 
@@ -2884,8 +2890,9 @@ rely on Ubuntu Light. Do not disable `default_fonts`.
 
 `docs/spec/*.md` were produced by 6 parallel readers over the Python source and
 machine-verified (chord tables imported and counted; 146 test vectors executed
-byte-for-byte). Trust them over the Python app's own `Ivory Info/` docs, which
-are aspirational and self-contradictory in places. The reference Python app:
-`~/Dropbox/Archive/Ivory` (`ivory.py` 2035 lines PySide6, `chord_detector.py`
-2153 lines). A native arm64 reference build was extracted to the session
-scratchpad `refapp/Ivory.app` for side-by-side comparison.
+byte-for-byte). Trust them over the notes in the Python app's own notes
+folder, which are aspirational and self-contradictory in places. The
+reference Python app: the Python 1.x archive (main script 2035 lines PySide6,
+`chord_detector.py` 2153 lines). A native arm64 reference build was extracted
+to the session scratchpad (`refapp/`, the Python app's bundle) for
+side-by-side comparison.

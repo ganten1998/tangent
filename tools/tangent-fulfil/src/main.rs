@@ -284,12 +284,9 @@ fn sale_acceptable(
 // went out ahead of its assets and 404'd for ten minutes.
 const DOWNLOAD_MACOS: &str =
     "https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg";
-// tangent-*, matching the macOS line above. Both spellings resolve —
-// `publish-github.sh` uploads the legacy `ivory-*` names on every stable
-// release precisely so the links in emails already sent keep working — but a
-// NEW email should hand out the product's own name. Changing these requires
-// the aliases to exist on the current stable release FIRST: this email was
-// once redeployed ahead of the assets and 404'd for ten minutes.
+// tangent-*, matching the macOS line above. Changing these requires the
+// assets to exist on the current stable release FIRST: this email was once
+// redeployed ahead of the assets and 404'd for ten minutes.
 const DOWNLOAD_WINDOWS: &str =
     "https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe";
 const DOWNLOAD_LINUX: &str =

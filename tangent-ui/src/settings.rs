@@ -1086,7 +1086,7 @@ pub struct Settings {
     /// Its own role rather than a shade of `fx_knob_color`, because it is not
     /// one of the six: it is the one control on the band that changes the
     /// PITCH of everything, and a theme has to be able to say so. Ships as
-    /// the app's own ivory, which is what the owner asked the default to be.
+    /// the app's own cream, which is what the owner asked the default to be.
     pub varispeed_color: Rgb,
     /// **The velocity lane's two ends**: the colour a note at 127 wears and
     /// the colour one at 1 does, with every velocity between them on the line.
@@ -1198,7 +1198,7 @@ pub struct Settings {
     /// different KIND of surface — a set of controls rather than an instrument
     /// — and telling them apart at a glance while playing is worth a colour.
     /// Warm rather than neutral because everything else in this app already is,
-    /// from the ivory ink to the rosewood fretboard.
+    /// from the light ink to the rosewood fretboard.
     pub recorder_bg_color: Rgb,
     /// Show the welcome/support note at startup. Cleared by its own checkbox.
     pub show_welcome: bool,
@@ -2294,7 +2294,7 @@ impl Default for Settings {
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
             // The leather trim on a Tascam 388, sampled from a photograph of
             // one: the median of the hide rather than its mean, because the
-            // photograph is lit and the mean carries the lamp. The ivory ink is
+            // photograph is lit and the mean carries the lamp. The light ink is
             // chosen against it at better than 6:1, so the band is comfortable
             // and not merely legible. See `SUPERSEDED_RECORDER_BG`.
             // 97, 55, 58 — the owner's wine, shipped and reset to.
@@ -2786,7 +2786,7 @@ impl Settings {
         // frame writes the user's own settings file. That is not theoretical:
         // an offscreen screenshot test did exactly that and emptied the
         // owner's instrument slots.
-        if let Some(p) = std::env::var_os("IVORY_SETTINGS_PATH") {
+        if let Some(p) = std::env::var_os("TANGENT_SETTINGS_PATH") {
             return PathBuf::from(p);
         }
         #[cfg(test)]
@@ -4637,13 +4637,13 @@ impl Settings {
     /// alternative is what this app did until now, which is that a default,
     /// once shipped, could never be corrected for anybody who already had it.
     ///
-    /// **Since 5.0 no file in `~/.config/tangent` can be older than v19** —
-    /// `purge_pre_5_0` deletes the old directory unread — so versions below
-    /// 19 are reachable only through a hand-copied pre-5.0 file or
-    /// `IVORY_SETTINGS_PATH`. They are kept anyway, decided on audit: a
-    /// settings file copied between machines is a supported flow (see the
-    /// `config` module doc), and these migrations are the only code that
-    /// makes an old one land right.
+    /// **Since 5.0 no file in `~/.config/tangent` can be older than v19**:
+    /// 5.0 started that directory fresh, and no build since reads the 4.x
+    /// one, so versions below 19 are reachable only through a hand-copied
+    /// pre-5.0 file or `TANGENT_SETTINGS_PATH`. They are kept anyway, decided
+    /// on audit: a settings file copied between machines is a supported flow
+    /// (see the `config` module doc), and these migrations are the only code
+    /// that makes an old one land right.
     fn migrate_from(
         &mut self,
         was: u64,
@@ -7882,7 +7882,7 @@ mod tests {
         assert_eq!(json.matches("settings_version").count(), 1, "{json}");
     }
 
-    /// **`IVORY_SETTINGS_PATH` is process-global, and tests are not.**
+    /// **`TANGENT_SETTINGS_PATH` is process-global, and tests are not.**
     ///
     /// Two tests below point it at their own directory and take it away
     /// again. Cargo runs them on parallel threads in ONE process, so without
@@ -7917,9 +7917,9 @@ mod tests {
         std::fs::write(&path, "\u{feff}{ \"transpose\": -28, \"audio_system\": \"ASIO\" }").unwrap();
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
         assert_eq!(s.transpose, -28, "the marked file was not read");
         assert_eq!(s.audio_system(), Some("ASIO"));
         assert!(s.unreadable.is_none(), "a readable file was reported as unreadable");
@@ -7948,9 +7948,9 @@ mod tests {
         std::fs::write(&path, b"{ \"dark_mode\": true, and then the disk died").unwrap();
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
 
         assert!(
             aside.exists(),
@@ -8268,7 +8268,7 @@ mod tests {
     #[test]
     fn a_backup_is_a_way_back_to_the_live_desk() {
         let dir = std::env::temp_dir()
-            .join(format!("ivory-backup-{}-{:?}", std::process::id(), std::thread::current().id()));
+            .join(format!("tangent-backup-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.backup.json");
         let _ = std::fs::remove_file(&path);
@@ -8311,9 +8311,9 @@ mod tests {
         let path = dir.join("settings.json");
         let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lock above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        unsafe { std::env::set_var("TANGENT_SETTINGS_PATH", &path) };
         let s = Settings::load();
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        unsafe { std::env::remove_var("TANGENT_SETTINGS_PATH") };
 
         assert!(!dir.join("settings.json.unreadable").exists());
         assert!(s.show_recorder);

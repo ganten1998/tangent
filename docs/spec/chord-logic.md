@@ -1,7 +1,7 @@
-# Ivory Chord Detection Engine — Definitive Algorithm Specification
+# Tangent Chord Detection Engine — Definitive Algorithm Specification
 
-Source of truth: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/chord_detector.py` (2153 lines, class `ChordDetector`).
-Companion docs: `Ivory Info/01_Special_Cases_and_Resolutions.md`, `Ivory Info/02_Code_and_Logic_Summary.md`.
+Source of truth: `chord_detector.py` in the Python 1.x archive outside this repo (2153 lines, class `ChordDetector`).
+Companion docs: the archive notes' `01_Special_Cases_and_Resolutions.md` and `02_Code_and_Logic_Summary.md`.
 
 **Goal**: behavior-identical Rust port. This spec describes what the code ACTUALLY does (verified by executing the Python on 160+ inputs), including bugs. Every divergence between code and docs is flagged. Line numbers refer to the Python source.
 

@@ -11,9 +11,9 @@
 //! the engine's side (`DesktopApp::host_frame_due`). It used to be a
 //! 50 ms tick regardless, which egui delivered as 33 ms: an idle desk paid
 //! the whole per-frame bill thirty times a second for nothing. That tick is
-//! one variable away: `IVORY_PACE=tick`.
+//! one variable away: `TANGENT_PACE=tick`.
 //!
-//! `IVORY_PACE=gesture` will instead pace the window to the DISPLAY while a
+//! `TANGENT_PACE=gesture` will instead pace the window to the DISPLAY while a
 //! gesture is in flight — a bare `request_repaint`, which puts eframe's loop
 //! in `Poll` and lets vsync throttle. It is off by default: it costs four to
 //! eight times the frames on the thread that also feeds the engine, which is
@@ -59,7 +59,7 @@ enum Pace {
     /// default — see the module doc and `animation_due`.
     Off,
     /// The behaviour before resting existed: a 50 ms tick, always. Kept
-    /// reachable (`IVORY_PACE=tick`) so a state that stops animating under
+    /// reachable (`TANGENT_PACE=tick`) so a state that stops animating under
     /// `Off` can be confirmed as a missing ledger entry rather than argued
     /// about, and so the owner can flip back in one launch.
     Tick,
@@ -69,7 +69,7 @@ enum Pace {
     Always,
 }
 
-/// `IVORY_PACE=off|tick|gesture|always`, read once. **Off by default.**
+/// `TANGENT_PACE=off|tick|gesture|always`, read once. **Off by default.**
 ///
 /// `tick` is the escape hatch for the resting policy: the unconditional
 /// 50 ms tick every version before this one ran on.
@@ -93,21 +93,21 @@ enum Pace {
 /// can be re-run on a machine with headroom.
 fn pace_mode() -> Pace {
     static MODE: std::sync::OnceLock<Pace> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("IVORY_PACE").as_deref() {
+    *MODE.get_or_init(|| match std::env::var("TANGENT_PACE").as_deref() {
         Ok("gesture") => Pace::Gesture,
         Ok("always") => Pace::Always,
         Ok("tick") => Pace::Tick,
         _ => Pace::Off,
     })
 }
-/// `IVORY_INLINE=<what>`, read once. The demo hooks in `paint` open a menu,
+/// `TANGENT_INLINE=<what>`, read once. The demo hooks in `paint` open a menu,
 /// a dialog or a panel on the first frame so it can be photographed; they
 /// are guarded by `demo_menu_done`, which only flips when a hook FIRES, so
 /// with the variable unset every frame used to walk the environment six
 /// times to learn nothing. Same OnceLock discipline as `pace_mode`.
 fn inline_hook() -> Option<&'static str> {
     static HOOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::env::var("IVORY_INLINE").ok()).as_deref()
+    HOOK.get_or_init(|| std::env::var("TANGENT_INLINE").ok()).as_deref()
 }
 const DETECT_TICK: Duration = Duration::from_millis(100);
 /// Quiet period after a move or resize before window geometry is written back.
@@ -855,7 +855,7 @@ pub struct TangentApp {
     /// progress. Only ever set by that gesture.
     manual_barre: Option<tangent_core::voicing::Barre>,
     barre_drag: Option<(usize, u8)>,
-    /// One-shot latch for the IVORY_INLINE=menu debug hook.
+    /// One-shot latch for the TANGENT_INLINE=menu debug hook.
     demo_menu_done: bool,
     /// A MIDI event was drained this frame. The host takes it
     /// (`take_midi_activity`) to keep frames coming for a moment after a
@@ -1805,7 +1805,7 @@ pub struct TangentApp {
     /// the analyzer. See [`Self::HEART_TICK`].
     looked_at: bool,
     /// The delay `frame` last asked egui for on the app's own account, or
-    /// `None` when it rested — for `IVORY_PACE_PROBE`, which prints the
+    /// `None` when it rested — for `TANGENT_PACE_PROBE`, which prints the
     /// smallest seen in a second beside who asked.
     debug_asked: Option<Duration>,
     /// **Everything the app has to SAY**, as opposed to ask.
@@ -4374,7 +4374,7 @@ enum KeepPath {
     Leave,
 }
 
-/// **The MIDI Inputs dialog's demo rows**, shared by the `IVORY_INLINE` hook
+/// **The MIDI Inputs dialog's demo rows**, shared by the `TANGENT_INLINE` hook
 /// and by the `#[ignore]`d shot in `dialogs.rs`.
 ///
 /// One place, because the whole point of both is to look at the same picture
@@ -5197,12 +5197,12 @@ impl TangentApp {
     /// every one of them was correct in isolation when tested here. This
     /// prints all four at once, from the machine where it actually happens.
     ///
-    ///   IVORY_DBG_FRET=/tmp/fret.log /Applications/Tangent.app/Contents/MacOS/tangent
+    ///   TANGENT_DBG_FRET=/tmp/fret.log /Applications/Tangent.app/Contents/MacOS/tangent
     ///
     /// One line per CHANGE of the displayed set, so holding a key writes one
     /// line rather than sixty a second.
     fn log_fret_state(&mut self) {
-        let Ok(path) = std::env::var("IVORY_DBG_FRET") else {
+        let Ok(path) = std::env::var("TANGENT_DBG_FRET") else {
             return;
         };
         let display = self.display_notes();
@@ -5814,8 +5814,8 @@ impl TangentApp {
         // store screenshots and for eyeballing display work (a glow or a
         // segment readout can only be judged lit). Environment-gated, so a
         // normal launch cannot reach it and it ships inert.
-        //   IVORY_DEMO_NOTES=60,64,67,71 /Applications/Tangent.app/Contents/MacOS/ivory
-        if let Ok(spec) = std::env::var("IVORY_DEMO_NOTES") {
+        //   TANGENT_DEMO_NOTES=60,64,67,71 /Applications/Tangent.app/Contents/MacOS/tangent
+        if let Ok(spec) = std::env::var("TANGENT_DEMO_NOTES") {
             let demo: HashSet<u8> = spec
                 .split(&[',', ' '][..])
                 .filter_map(|t| t.trim().parse::<u8>().ok())
@@ -8317,7 +8317,7 @@ impl TangentApp {
     /// MINIMUM asked, that one line set the pace of the whole window: with
     /// nothing playing, the owner's desk painted fifty-six frames a second
     /// for as long as the app was open — about half a core — for a sprite
-    /// seven pixels wide. Measured 2026-09-15: `IVORY_PACE_PROBE=1` named
+    /// seven pixels wide. Measured 2026-09-15: `TANGENT_PACE_PROBE=1` named
     /// this call site on every frame of every second, and egui subtracts
     /// its predicted frame time from every ask, so 33 ms lands as an 18 ms
     /// cadence. Every resting test had passed, because `quiet_desktop`
@@ -8457,7 +8457,7 @@ impl TangentApp {
     ) {
         let resp = ui.interact(
             ui.max_rect(),
-            egui::Id::new("ivory-main-bg"),
+            egui::Id::new("tangent-main-bg"),
             egui::Sense::click_and_drag(),
         );
         // **Ending a gesture is not interacting, and it happens first.**
@@ -10142,14 +10142,14 @@ impl TangentApp {
         true
     }
 
-    /// **The dev hook alone.** `IVORY_ARRANGEMENT_PATH` names an explicit
+    /// **The dev hook alone.** `TANGENT_ARRANGEMENT_PATH` names an explicit
     /// document; a launch that finds it set stands on that and touches no
     /// settings — a developer aiming the app at a file, not a session coming
     /// back. Answers `false` when the variable is unset, and is the only part
     /// of [`Self::reopen_remembered_project`] the host still asks for at
     /// launch — see `Desktop::open_project_at_launch`.
     pub fn reopen_dev_hook_project(&mut self) -> bool {
-        let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") else {
+        let Some(p) = std::env::var_os("TANGENT_ARRANGEMENT_PATH") else {
             return false;
         };
         self.project_doc = std::path::PathBuf::from(p);
@@ -33273,18 +33273,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.maximized_now
     }
 
-    /// How many window-size commands have gone out. For `IVORY_PACE_PROBE`.
+    /// How many window-size commands have gone out. For `TANGENT_PACE_PROBE`.
     pub fn debug_inner_size_sends(&self) -> u64 {
         self.inner_size_sends
     }
 
-    /// Whether a window manager owns the main window. For `IVORY_PACE_PROBE`.
+    /// Whether a window manager owns the main window. For `TANGENT_PACE_PROBE`.
     pub fn debug_wm_managed(&self) -> bool {
         self.main_wm_managed
     }
 
     /// What `frame` last asked egui for on the app's own account, if
-    /// anything. For `IVORY_PACE_PROBE` only.
+    /// anything. For `TANGENT_PACE_PROBE` only.
     pub fn debug_asked(&self) -> Option<Duration> {
         self.debug_asked
     }
@@ -33775,7 +33775,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// picker, which IS its editor. An empty bay opens the picker, which is
     /// the same question one step earlier.
     ///
-    /// Public because the host's `IVORY_OPEN_EDITOR` hook drives it too, and a
+    /// Public because the host's `TANGENT_OPEN_EDITOR` hook drives it too, and a
     /// dev hook that took a different path would exercise a path no user has.
     /// Raise the drumpad window — the key, the bay's face and a fresh
     /// load all come through here so the media list is never stale.
@@ -33917,7 +33917,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **Open a bay**: its face, its editor, its instrument's panel, or the
     /// picker for an empty one - the one door every bay press comes
-    /// through, by identity, and the host's dev hook's (`IVORY_OPEN_EDITOR`).
+    /// through, by identity, and the host's dev hook's (`TANGENT_OPEN_EDITOR`).
     pub fn open_bay_face(&mut self, sb: crate::desk_id::SeatBay) {
         // The desk's latched pair, which is the right keyboard for every
         // caller here: a press on a rack bay happens in the MAIN window.
@@ -36687,7 +36687,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Names, inserts and colours go through the ordinary setters, so what the
     /// picture shows is what a saved settings file would produce.
-    /// The settings popup, open, for the shot harness — `IVORY_INLINE`
+    /// The settings popup, open, for the shot harness — `TANGENT_INLINE`
     /// only works in the running app.
     pub fn open_setup_for_shot(&mut self) {
         self.setup_open = true;
@@ -39468,7 +39468,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Apply what a dialog asked for.
     ///
-    /// Public so the host's `IVORY_OPEN_EDITOR` hook can drive it: the patch
+    /// Public so the host's `TANGENT_OPEN_EDITOR` hook can drive it: the patch
     /// editor is two clicks in and there is no other way to reach it from a
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
@@ -42446,7 +42446,7 @@ impl TangentApp {
     /// milliseconds apart, for as long as the app was open — and since
     /// `request_repaint_after` keeps the MINIMUM asked, that one request beat
     /// every resting cadence the rest of the app had negotiated. Measured on
-    /// the owner's machine 2026-09-15 with `IVORY_PACE_PROBE=1`: `fps=59
+    /// the owner's machine 2026-09-15 with `TANGENT_PACE_PROBE=1`: `fps=59
     /// p99=18.3ms` with nothing playing, against the 4 Hz
     /// `ENGINE_IDLE_POLL` the window is supposed to rest at, at a cost of
     /// about half a core. `TANGENT_FRAME_LOG=1` priced the frame it was
@@ -42552,11 +42552,11 @@ impl TangentApp {
             self.dialog = self.pending_welcome.take();
         }
 
-        // Dev hook, alongside IVORY_DEMO_NOTES: open the menu on the first
+        // Dev hook, alongside TANGENT_DEMO_NOTES: open the menu on the first
         // frame so it can be photographed without anyone having to click,
         // and therefore without taking focus from whatever else is being
         // tested. Environment-gated; ships inert.
-        //   IVORY_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("menu") {
             self.demo_menu_done = true;
             let at = ui.max_rect().min + Vec2::new(20.0, 20.0);
@@ -42565,7 +42565,7 @@ impl TangentApp {
         // The same hook for the take-settings popup, which cannot be
         // photographed any other way: it is dismissed by a press anywhere
         // outside it, and taking a screenshot is a press somewhere outside it.
-        //   IVORY_INLINE=setup /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=setup /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("setup") {
             self.demo_menu_done = true;
             self.setup_open = true;
@@ -42574,7 +42574,7 @@ impl TangentApp {
         // the one surface whose faults are all proportional and which cannot
         // be photographed any other way: it is a child viewport on the
         // desktop, so the compositor's shot never sees it.
-        //   IVORY_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("track") {
             self.demo_menu_done = true;
             self.dialog = Some(Dialog::Track {
@@ -42601,7 +42601,7 @@ impl TangentApp {
         // handed over `audio_setup`: opened on the first frame the panel would
         // list no systems and no rates, which is a picture of a different
         // dialog.
-        //   IVORY_INLINE=audio /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=audio /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done
             && self.audio_setup.is_some()
             && inline_hook() == Some("audio")
@@ -42612,7 +42612,7 @@ impl TangentApp {
         // The mixer, on the first frame, so it can be photographed without a
         // keypress — which on a shared desktop is a keypress that might land
         // somewhere else.
-        //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
         //
         if !self.demo_menu_done && inline_hook() == Some("mixer") {
             self.demo_menu_done = true;
@@ -42622,7 +42622,7 @@ impl TangentApp {
         // has: it only offers itself on an interface with more than two
         // inputs. A fake eighteen-in device is the only way to look at the two
         // columns at the size they will really be.
-        //   IVORY_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("channels") {
             self.demo_menu_done = true;
             self.dialog = Some(Dialog::InputChannels {
@@ -42635,7 +42635,7 @@ impl TangentApp {
         // developing this has TWICE OVER: two keyboards to tick, and a third
         // that has been unplugged so the "not connected" row can be looked at
         // at all. Every state the dialog has, in one picture.
-        //   IVORY_INLINE=midiinputs /Applications/Tangent.app/Contents/MacOS/tangent
+        //   TANGENT_INLINE=midiinputs /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("midiinputs") {
             self.demo_menu_done = true;
             self.dialog_serial = self.dialog_serial.wrapping_add(1);
@@ -71044,7 +71044,7 @@ mod tests {
     /// Saying yes does the narrow thing, and leaves a way back.
     #[test]
     fn a_confirmed_reset_does_its_scope_and_offers_undo() {
-        // **No `IVORY_SETTINGS_PATH` here, deliberately.** It is a
+        // **No `TANGENT_SETTINGS_PATH` here, deliberately.** It is a
         // process-global, so a test that points it somewhere safe points it
         // there for every test running beside it — which is exactly how this
         // one made `a_plugin_does_not_write_the_shared_settings_file` fail
@@ -71231,7 +71231,7 @@ mod tests {
     #[test]
     fn a_new_session_reclaims_an_unsaved_untitled() {
         let root = std::env::temp_dir().join(format!(
-            "ivory-fresh-dir-{}",
+            "tangent-fresh-dir-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -71269,7 +71269,7 @@ mod tests {
     #[test]
     fn a_scratch_with_a_built_kit_is_not_reclaimed() {
         let root = std::env::temp_dir().join(format!(
-            "ivory-kit-guard-{}",
+            "tangent-kit-guard-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -73120,7 +73120,7 @@ mod tests {").expect("the tests module")];
     /// The window ran at 59 frames a second for as long as it was open, at
     /// about half a core, on the owner's machine with the modelled piano and Brusfri
     /// loaded and nothing playing. Measured 2026-09-15 with
-    /// `IVORY_PACE_PROBE=1`: `fps=59 p99=18.3ms`, which is the 16 ms request
+    /// `TANGENT_PACE_PROBE=1`: `fps=59 p99=18.3ms`, which is the 16 ms request
     /// plus the frame it buys. See [`TangentApp::VU_VISIBLE`].
     #[test]
     fn a_loaded_but_idle_desk_rests_although_its_meters_never_read_zero() {
@@ -73386,7 +73386,7 @@ mod tests {").expect("the tests module")];
     }
 
     /// **Neither `frame` nor `paint` reads the environment.** Six
-    /// `IVORY_INLINE` reads a frame used to run in `paint`, guarded by a
+    /// `TANGENT_INLINE` reads a frame used to run in `paint`, guarded by a
     /// latch that only flips when a hook fires — with the variable unset,
     /// six environment walks a frame forever. The read is a `OnceLock`
     /// now (`inline_hook`), and this keeps it that way.
@@ -73413,7 +73413,7 @@ mod tests {").expect("the tests module")];
         assert!(asked <= GUI_TICK, "a host that does not own the window rested: {asked:?}");
     }
 
-    /// **The old cadence is one variable away.** `IVORY_PACE=tick` is read
+    /// **The old cadence is one variable away.** `TANGENT_PACE=tick` is read
     /// once into a `OnceLock`, so it cannot be flipped inside a test; the
     /// arm is pinned by reading it instead.
     #[test]
@@ -73421,7 +73421,7 @@ mod tests {").expect("the tests module")];
         let whole = include_str!("app.rs");
         let src = &whole[..whole.find("#[cfg(test)]
 mod tests {").expect("the tests module")];
-        assert!(src.contains("Ok(\"tick\") => Pace::Tick,"), "IVORY_PACE=tick no longer names the old cadence");
+        assert!(src.contains("Ok(\"tick\") => Pace::Tick,"), "TANGENT_PACE=tick no longer names the old cadence");
         let tail = src.rfind("let paced = match pace_mode()").expect("the pacing decision");
         assert!(
             src[tail..].contains("pace_mode() == Pace::Tick || !self.caps.window_sizing"),
@@ -76599,7 +76599,7 @@ mod tests {").expect("the tests module")];
     #[test]
     fn reset_everything_never_hands_new_a_session_to_write_back() {
         // No settings file and no backup written: `Settings::path()` is one
-        // shared file whenever `IVORY_SETTINGS_PATH` is set, and the backup
+        // shared file whenever `TANGENT_SETTINGS_PATH` is set, and the backup
         // beside it is what `a_confirmed_reset_does_its_scope_and_offers_undo`
         // undoes from.
         let (ctx, mut app) = headless(Caps { persist_global_settings: false, ..Caps::DESKTOP });

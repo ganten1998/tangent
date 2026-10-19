@@ -42,7 +42,7 @@
 //! inventing a number. A physical output-to-input cable is the better path
 //! where there is one, and needs no change here.
 //!
-//! `IVORY_AUDIO_SYSTEM` picks the host by name (`JACK`, `ALSA`), matching the
+//! `TANGENT_AUDIO_SYSTEM` picks the host by name (`JACK`, `ALSA`), matching the
 //! Audio Setup panel, so the same probe compares backends on one box.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -84,7 +84,7 @@ fn main() {
     // a resampler in a path being measured for latency without saying so.
     let rate_arg: Option<u32> = args.next().and_then(|s| s.parse().ok());
 
-    let host = match std::env::var("IVORY_AUDIO_SYSTEM").ok().filter(|s| !s.is_empty()) {
+    let host = match std::env::var("TANGENT_AUDIO_SYSTEM").ok().filter(|s| !s.is_empty()) {
         Some(want) => cpal::available_hosts()
             .into_iter()
             .find(|id| id.name().eq_ignore_ascii_case(&want))
@@ -98,13 +98,13 @@ fn main() {
     println!("hosts available : {:?}", cpal::available_hosts().iter().map(|h| h.name()).collect::<Vec<_>>());
     println!("host            : {}", host.id().name());
 
-    // `IVORY_AUDIO_DEVICE` picks a device by name instead of taking the
+    // `TANGENT_AUDIO_DEVICE` picks a device by name instead of taking the
     // default, which matters more on FreeBSD than anywhere else: the shim
     // offers "default" (which asound.conf maps to `plug:oss`, adding a
     // conversion layer) and "oss" (which is the OSS plugin raw). Those are the
     // same hardware down two different paths, and the difference between them
     // is worth being able to measure.
-    let want_dev = std::env::var("IVORY_AUDIO_DEVICE").ok().filter(|s| !s.is_empty());
+    let want_dev = std::env::var("TANGENT_AUDIO_DEVICE").ok().filter(|s| !s.is_empty());
     // **Raw mode: trust no backend's arithmetic, only the wall clock.**
     //
     // The adjusted measurement adds the driver's own `playback` lead and
@@ -115,7 +115,7 @@ fn main() {
     // starts when the callback that wrote the click returns and stops when the
     // callback that saw it is entered, so every host is measured by the same
     // rule: app to app, no claims involved.
-    let raw = std::env::var("IVORY_RAW_TIMING").is_ok();
+    let raw = std::env::var("TANGENT_RAW_TIMING").is_ok();
     let by_name = |name: &str, input: bool| -> Option<cpal::Device> {
         let iter: Vec<cpal::Device> = if input {
             host.input_devices().ok()?.collect()

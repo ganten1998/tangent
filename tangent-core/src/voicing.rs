@@ -278,7 +278,7 @@ pub struct History<'a> {
     /// Arrival ordinal per pitch; lower means held longer, 0 is unknown.
     /// `None` means "everything arrived at once". Indexed by the full u8 range
     /// rather than 0..128: a pitch above 127 is reachable through `solve`'s
-    /// `&[u8]` and through `IVORY_DEMO_NOTES`, and folding the index aliased
+    /// `&[u8]` and through `TANGENT_DEMO_NOTES`, and folding the index aliased
     /// two different notes onto one slot.
     pub arrival: Option<&'a [u32; 256]>,
     /// Reserved hook to the chord engine. MUST be `None`: see the module doc.
@@ -619,7 +619,7 @@ struct Search<'a> {
     prev_anchor: Option<u8>,
     /// `1 + string * 256 + fret` per pitch placed in the previous solve, 0 for
     /// "was not placed". Indexed by the FULL u8 range: `solve` takes `&[u8]`
-    /// and `IVORY_DEMO_NOTES` parses with `parse::<u8>()`, so a pitch of 200 is
+    /// and `TANGENT_DEMO_NOTES` parses with `parse::<u8>()`, so a pitch of 200 is
     /// reachable, and folding it into 128 slots aliased it onto pitch 72.
     prev_pos: [u16; 256],
 
@@ -696,7 +696,7 @@ fn run(
     // Step 2 - fold each pitch to ONE target, up preferred on ties. A too-low
     // bass is the common case and folding it up reads better than down. The
     // sweep runs to +-21 rather than a comfortable +-10 because
-    // `IVORY_DEMO_NOTES` parses with `parse::<u8>()` and can inject 200.
+    // `TANGENT_DEMO_NOTES` parses with `parse::<u8>()` and can inject 200.
     let mut entries: Vec<Entry> = Vec::with_capacity(pitches.len());
     for &p in &pitches {
         if reachable(spec, p) {
@@ -2745,7 +2745,7 @@ mod tests {
 
     #[test]
     fn a_pitch_above_127_gets_its_own_slot() {
-        // `solve` takes `&[u8]` and `IVORY_DEMO_NOTES` parses with
+        // `solve` takes `&[u8]` and `TANGENT_DEMO_NOTES` parses with
         // `parse::<u8>()`, so 242 is reachable. The arrival and previous-
         // position arrays were indexed `% 128`, which aliased 242 onto 114 and
         // - worse - meant the expiry pass wiped 242's ordinal in the same call

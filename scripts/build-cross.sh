@@ -573,13 +573,13 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # **The zip is a DELIVERABLE again, as well as the installer's input.** It was
 # briefly demoted to a transient — deleted the moment setup.exe existed, on
 # the ruling that one Windows download is one thing to support — but the
-# versionless permalinks derived from it, `tangent-windows-x86_64.zip` and the
-# legacy `ivory-windows-x86_64.zip`, are already printed in README.md, on the
-# store page and in every supporter email sent, and `publish-github.sh` can
-# only upload an alias for a file that actually exists in dist/. Deleting the
-# zip here meant the FIRST stable publish would silently drop both aliases and
-# every one of those links would 404 — for exactly the people who paid (see
-# publish-github.sh's header: uploading the aliases is the release contract).
+# versionless permalink derived from it, `tangent-windows-x86_64.zip`, is on
+# the store page and in the supporter emails sent before 3.0.0, and
+# `publish-github.sh` can only upload an alias for a file that actually exists
+# in dist/. Deleting the zip here meant the FIRST stable publish would
+# silently drop that alias and every one of those links would 404 — for
+# exactly the people who paid (see publish-github.sh's header: uploading the
+# aliases is the release contract).
 # `build-installer.sh` still unzips exactly this file, so the installed files
 # and the portable files are one build's: a failed installer build leaves no
 # setup.exe (it removes the old one first), and check-artifacts.sh compares

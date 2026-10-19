@@ -292,11 +292,11 @@ pub struct MenuColors {
 /// `face` is the theme's strip face — the same role the mixer's bays and the
 /// arrangement's chips wear — so a menu opened over any surface in the app is
 /// made of the same material as that surface. On the DEFAULT theme that face
-/// is the shipped bone, so the menu keeps the ivory-and-black signature it
+/// is the shipped bone, so the menu keeps the bone-and-black signature it
 /// has always had; every other theme gets its own, and the text is measured
 /// rather than assumed.
 ///
-/// It was a frozen pair before: black-on-ivory light, ivory-on-black dark, on
+/// It was a frozen pair before: black-on-cream light, cream-on-black dark, on
 /// all sixteen themes.
 pub fn colors(dark_mode: bool, face: Color32) -> MenuColors {
     let _ = dark_mode;
@@ -809,8 +809,8 @@ const ARM_SLOP: f32 = 6.0;
 
 /// Stable surface identities. As windows these are viewport ids; inline they
 /// are `Area` ids. One string each, so the two paths cannot drift.
-const MENU_ID: &str = "ivory-menu";
-const SUBMENU_ID: &str = "ivory-menu-sub";
+const MENU_ID: &str = "tangent-menu";
+const SUBMENU_ID: &str = "tangent-menu-sub";
 
 /// The menu, in four compartments.
 ///
@@ -2817,11 +2817,11 @@ mod tests {
 
 
     /// **Every right-click menu is readable, on every theme, in both modes —
-    /// and the DEFAULT theme keeps its ivory-and-black signature.**
+    /// and the DEFAULT theme keeps its bone-and-black signature.**
     ///
     /// The owner's ruling: the shipped look stays the shipped look, and the
     /// rest are themed and checked. It was a frozen pair before, black on
-    /// ivory and its inverse, on all sixteen.
+    /// cream and its inverse, on all sixteen.
     #[test]
     fn every_theme_dresses_the_menus_readably() {
         let mut bad: Vec<String> = Vec::new();

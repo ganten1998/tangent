@@ -1,35 +1,36 @@
-# Ivory — Chord Learning beta-test notes (INTERNAL)
+# Tangent — Chord Learning beta-test notes (INTERNAL)
 
 > Historical. This was the 2.1.0 beta hand-off, shipped inside every artifact as
 > `READ-ME-FIRST.md`. The public in-artifact readme is now
 > `docs/ARTIFACT-README.md`. This file is kept for the measured blast-radius
 > numbers and the teach-vs-correct distinction — **do not package it**.
 
-Thanks for trying this. Ivory watches your MIDI keyboard, draws the notes, and
+Thanks for trying this. Tangent watches your MIDI keyboard, draws the notes, and
 names the chord you are playing. **Chord Learning** is the new, experimental
-part: you can tell Ivory you would rather see a different name, and it adjusts.
+part: you can tell Tangent you would rather see a different name, and it
+adjusts.
 
 No MIDI keyboard? You can still test everything: right-click → **Enable
 Keytoggle**, then click keys on the drawn piano to hold notes.
 
 ## Running it
 
-**Windows** — unzip anywhere and run `ivory.exe`. Windows will say *"Windows
+**Windows** — unzip anywhere and run `tangent.exe`. Windows will say *"Windows
 protected your PC"*, because the app is not code-signed: click **More info** →
 **Run anyway**. (It is a plain Rust program, no installer, no network access.)
 
-**macOS** — open the `.dmg`, drag `Ivory.app` to Applications. The app is
+**macOS** — open the `.dmg`, drag `Tangent.app` to Applications. The app is
 ad-hoc signed but not notarized, so the first launch is blocked: double-click it,
 accept the warning, then go to **System Settings → Privacy & Security**, scroll
-to Security, and click **Open Anyway** next to Ivory. (The old right-click →
+to Security, and click **Open Anyway** next to Tangent. (The old right-click →
 Open trick no longer works on macOS 15 and later.)
 
 **Linux** — untar anywhere and run `./tangent` (`chmod +x tangent` first if your
 unpacker dropped the executable bit). It needs ALSA plus X11 or Wayland. To get
-it into your application menu: copy `ivory` somewhere on your `PATH` (e.g.
-`~/.local/bin/`), `ivory.png` to
-`~/.local/share/icons/hicolor/128x128/apps/ivory.png`, and `ivory.desktop` to
-`~/.local/share/applications/`.
+it into your application menu: copy `tangent` somewhere on your `PATH` (e.g.
+`~/.local/bin/`), `tangent.png` to
+`~/.local/share/icons/hicolor/128x128/apps/tangent.png`, and `tangent.desktop`
+to `~/.local/share/applications/`.
 
 Everything is in the **right-click menu** — that is the entire interface.
 
@@ -40,31 +41,32 @@ They are easy to confuse, so:
 | Menu item | What it does |
 |---|---|
 | **Teach Chord Name...** | Pins an exact name to that exact voicing, forever. A dictionary entry. Precise, boring, always works. |
-| **Correct Chord Name...** | Trains a general *preference*. It does not memorise this one chord — it nudges how Ivory weighs readings, so similar chords shift too. This is the experiment. |
+| **Correct Chord Name...** | Trains a general *preference*. It does not memorise this one chord — it nudges how Tangent weighs readings, so similar chords shift too. This is the experiment. |
 
 ## What to try
 
-1. Hold a chord Ivory names in a way you disagree with.
+1. Hold a chord Tangent names in a way you disagree with.
 2. Right-click → **Correct Chord Name...**
 3. Pick the name you would rather see from the list, then **Learn**.
-   - The list only contains readings Ivory actually considered. If the name you
-     want is not there, Ivory cannot be talked into it — use *Teach Chord
+   - The list only contains readings Tangent actually considered. If the name
+     you want is not there, Tangent cannot be talked into it — use *Teach Chord
      Name...* to pin it instead.
    - The number on the right is that reading's score. Small gaps move easily;
      large gaps will not move at all.
 4. Read the message. It will tell you one of:
    - **Learned** — it worked, and what the chord now reads as.
    - **could not be nudged that far** — the gap was too big; *nothing changed*.
-   - **already wins** — that name was already Ivory's choice.
+   - **already wins** — that name was already Tangent's choice.
 5. Play some other chords and see whether anything else changed. **This is the
    interesting part** — the feature is meant to generalise, so it is supposed to
    affect similar voicings. Whether it does so usefully or annoyingly is exactly
    what we do not know yet.
 
 Good first case if you want one: hold **C–E–G–A with C as the lowest note**.
-Ivory says `C6`; many players would call it `Am7`. Correct it and see what else
-moves. (Voice it with E at the bottom instead and Ivory names it by a fixed
-rule, so it will tell you there is nothing to re-rank — that is expected.)
+Tangent says `C6`; many players would call it `Am7`. Correct it and see what
+else moves. (Voice it with E at the bottom instead and Tangent names it by a
+fixed rule, so it will tell you there is nothing to re-rank — that is
+expected.)
 
 **How far one correction reaches, measured:** against a 13,133-voicing test
 corpus, that single `C6 → Am7` correction changes **1,279 readings (about 1 in
@@ -80,9 +82,9 @@ all 13,133 exactly in testing.
   many corrections you have made, and what it has picked up. **Forget Learning**
   wipes all of it and restores stock behaviour.
 - Right-click → **Disable Chord Learning** silences it without erasing anything.
-- Nothing is sent anywhere. Everything lives in `~/.config/tangent/overrides.json`
-  (on Windows: `C:\Users\<you>\.config\ivory\overrides.json`). Deleting that file
-  is a full reset.
+- Nothing is sent anywhere. Everything lives in one file, `overrides.json`, in
+  the folder your settings are in, under `~/.config` (on Windows, under
+  `C:\Users\<you>\.config`). Deleting that file is a full reset.
 
 ## What is worth reporting back
 

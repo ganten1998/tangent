@@ -2200,7 +2200,7 @@ pub struct Loudness {
     /// The ladder is two bars tied together — one stereo meter with a seam
     /// down it, the master's own shape — and this is what fills them. There
     /// is no integrated pair on purpose: see
-    /// `ivory::loudness::Loudness::read_stereo`.
+    /// `tangent::loudness::Loudness::read_stereo`.
     pub pair: [f32; 4],
 }
 

@@ -6,7 +6,7 @@
 //! it really runs, hardware decode and all, rather than a decode in isolation.
 //!
 //!   cargo run --release -p tangent-record --example camcost -- 10
-//!   IVORY_NO_VAAPI=1 cargo run --release -p tangent-record --example camcost -- 10
+//!   TANGENT_NO_VAAPI=1 cargo run --release -p tangent-record --example camcost -- 10
 //!
 //! The difference between those two runs is what `camera/vaapi.rs` is worth.
 
@@ -72,7 +72,7 @@ pub fn main() {
         fmt.width,
         fmt.height,
         fmt.fps,
-        if std::env::var_os("IVORY_NO_VAAPI").is_some() { "disabled" } else { "enabled if available" }
+        if std::env::var_os("TANGENT_NO_VAAPI").is_some() { "disabled" } else { "enabled if available" }
     );
 
     // Let the first frames pay for decoder setup, then measure a steady state.

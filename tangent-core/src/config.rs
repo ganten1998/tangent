@@ -5,20 +5,6 @@
 //! deliberately ignores. That is parity with the Python original and it is
 //! why a settings file copied between machines works at all.
 //!
-//! **It used to be `~/.config/ivory/`, and that directory is DELETED.** Not
-//! migrated: 5.0 is a clean break, the tester group is ten people who are
-//! known personally, and new supporter keys go out by email. Carrying a
-//! second read path forward for a decade to spare ten people one email is the
-//! wrong trade, and a migration that runs once and is then dead code forever
-//! is worse than no migration at all.
-//!
-//! What the old directory held, so that nobody is surprised by what goes:
-//! `license.key`, `settings.json`, `overrides.json`, `my-patches.syx`.
-//!
-//! The deletion is [`purge_pre_5_0`], and only the HOST calls it: a library
-//! function that every test and probe can reach must not be deleting
-//! directories in the user's home.
-//!
 //! **`TANGENT_CONFIG_DIR` points a build anywhere**, a developer's switch:
 //! a build under test, or one pointed at a copy of somebody's files, reads
 //! and writes there and leaves `~/.config/tangent` alone. The
@@ -62,9 +48,6 @@ const NAME: &str = "tangent";
 /// The override, honoured by every build. An empty value is not a path:
 /// it would put the config in the working directory.
 const OVERRIDE: &str = "TANGENT_CONFIG_DIR";
-
-/// What it was called before 5.0. Only ever used to find it and remove it.
-const PRE_5_0: &str = "ivory";
 
 /// **Whether this build keeps every home path in a scratch folder**: this
 /// crate's unit tests, and any build with the `test-home` feature, which only
@@ -180,33 +163,6 @@ pub fn file(name: &str) -> PathBuf {
     dir().join(name)
 }
 
-/// **Delete `~/.config/ivory` if it is there.** Once, at launch, by the host.
-///
-/// A hard pivot rather than a migration — see the module docs. Nothing is
-/// read out of it first and nothing is kept.
-///
-/// Deliberately narrow: it builds the path itself from `$HOME` and a
-/// hardcoded name, so there is no argument a caller could pass that would
-/// make this remove something else. `remove_dir_all` on a path that is not
-/// there is an error, not a panic, and the error is dropped — a machine that
-/// never ran a pre-5.0 build is the common case, not a fault. That home is
-/// [`home`]'s, so a test build that runs this removes nothing of anybody's.
-///
-/// Answers whether it removed anything, for the log.
-pub fn purge_pre_5_0() -> bool {
-    let old = config_root().join(PRE_5_0);
-    // `is_dir` follows symlinks, and a symlink here would make the recursive
-    // delete walk into wherever it points. Refuse anything that is not a real
-    // directory rather than being clever about it.
-    let Ok(meta) = std::fs::symlink_metadata(&old) else {
-        return false;
-    };
-    if !meta.is_dir() {
-        return false;
-    }
-    std::fs::remove_dir_all(&old).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,28 +192,6 @@ mod tests {
             d.join("license.key"),
             "file() does not agree with dir()"
         );
-        assert!(
-            !d.to_string_lossy().contains(PRE_5_0),
-            "the pre-5.0 name is still reachable as a read path"
-        );
-    }
-
-    /// **The purge takes a real directory and refuses a symlink.**
-    ///
-    /// Mirrored against a scratch root rather than the real `$HOME`, because a
-    /// test that touches the actual config directory would delete the licence
-    /// of whoever ran it — and this crate has already been bitten once by a
-    /// test reading the real `~/.config/ivory/license.key` and concluding the
-    /// build was a supporter's.
-    fn purge_at(root: &std::path::Path) -> bool {
-        let old = root.join(PRE_5_0);
-        let Ok(meta) = std::fs::symlink_metadata(&old) else {
-            return false;
-        };
-        if !meta.is_dir() {
-            return false;
-        }
-        std::fs::remove_dir_all(&old).is_ok()
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -269,42 +203,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("scratch");
         p
-    }
-
-    #[test]
-    fn an_old_config_directory_and_everything_in_it_goes() {
-        let root = scratch("purge");
-        let old = root.join(PRE_5_0);
-        std::fs::create_dir_all(old.join("nested")).expect("old");
-        std::fs::write(old.join("license.key"), b"stale").expect("key");
-        std::fs::write(old.join("nested/settings.json"), b"{}").expect("settings");
-
-        assert!(purge_at(&root), "the purge reported doing nothing");
-        assert!(!old.exists(), "the pre-5.0 directory survived");
-        // A second launch is a quiet no-op, not an error.
-        assert!(!purge_at(&root), "the purge claimed to remove it twice");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A symlink where the old directory was must not be followed — the
-    /// recursive delete would walk out of `~/.config` entirely.
-    #[test]
-    fn a_symlink_in_place_of_the_old_directory_is_refused() {
-        let root = scratch("symlink");
-        let elsewhere = root.join("precious");
-        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
-        std::fs::write(elsewhere.join("keep.txt"), b"do not delete").expect("write");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&elsewhere, root.join(PRE_5_0)).expect("symlink");
-        #[cfg(not(unix))]
-        return;
-
-        assert!(!purge_at(&root), "a symlink was treated as the old directory");
-        assert!(
-            elsewhere.join("keep.txt").is_file(),
-            "the purge followed a symlink and deleted what it pointed at"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A test build's home is a scratch folder, and every path built on it
@@ -343,25 +241,6 @@ mod tests {
         // One home per process: every thread asks and gets the same answer.
         let other = std::thread::spawn(super::home).join().expect("a second thread");
         assert_eq!(other, Some(home));
-    }
-
-    /// **The purge, run for real in a test build, removes only the scratch
-    /// home's old directory.** The path is checked before anything is made
-    /// or removed, so with the redirect gone this fails without touching a
-    /// real `~/.config`.
-    #[test]
-    fn the_purge_in_a_test_build_reaches_only_the_scratch_home() {
-        let root = config_root();
-        assert!(
-            root.starts_with(std::env::temp_dir()),
-            "the purge would reach {}, not a scratch folder",
-            root.display()
-        );
-        let old = root.join(PRE_5_0);
-        std::fs::create_dir_all(old.join("nested")).expect("the scratch home's old directory");
-        std::fs::write(old.join("license.key"), b"stale").expect("an old key");
-        assert!(purge_pre_5_0(), "the purge did not find the scratch home's old directory");
-        assert!(!old.exists(), "the scratch home's old directory survived");
     }
 
     /// **A scratch home starts empty**, whatever a dead process with the same

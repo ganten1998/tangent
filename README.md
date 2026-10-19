@@ -4,7 +4,7 @@
 
 Free with up to 32 tracks; a supporter key removes the limit.
 
-### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
+### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/tangent)
 
 ![The arrangement: drum, piano and audio tracks with MIDI and audio clips, a volume automation lane under the piano track, and the recorder band with its spectrum, clock and transport above](docs/img/screenshot-arrangement.png)
 
@@ -23,7 +23,7 @@ on a guitar neck and draws it on the circle of fifths. A take can also film
 the window itself, with your camera in it.
 
 Tangent is free and MIT licensed. The free app holds up to 32 tracks, and a
-[supporter key](https://ganten.gumroad.com/l/ivory) removes the limit. It
+[supporter key](https://ganten.gumroad.com/l/tangent) removes the limit. It
 works offline, with no account and no telemetry.
 
 ## Download
@@ -167,7 +167,7 @@ MIDI tracks, audio tracks and folders count. Buses, returns, sends and routes
 have no limit for anyone and are never counted. Every feature on this page is
 in the free app, with no trial, no time limit and no account.
 
-A [supporter key](https://ganten.gumroad.com/l/ivory) ($9 or more, pay what
+A [supporter key](https://ganten.gumroad.com/l/tangent) ($9 or more, pay what
 you want) removes the track limit. Keys have no expiry and cover every
 version, so a key bought for 4.x does the same in 5.0. The limit only ever
 stops a new track: a project with more than 32 tracks opens, plays, edits,
@@ -192,23 +192,9 @@ program, so what it connects to is up to its maker.
 
 ## A note on the name
 
-Tangent was called **Ivory** until 2.3.0. For a while the rename was surface
-deep, and this file used to claim the internals would never follow, so that
-nobody's settings would be orphaned. That stopped being true in 5.0, which
-finished the job deliberately: the crates are `tangent-*`, the macOS bundle
-identifier is Tangent's own, and configuration moved to `~/.config/tangent/`.
-5.0 treats the old `~/.config/ivory/` directory as a clean break rather than
-migrating it, and removes it at first launch; 5.0 was also the point where
-projects, desks and themes made the old files historical. What survives of
-"ivory" in the source (some type names, the `IVORY_*` developer switches) is
-internal and on its way out.
-
 The clavichord's tangent is the brass blade at the back of each key. It
 strikes the string and stays in contact with it for as long as the note
 sounds, which is what the display does with a held note.
-
-Downloads published under the old `Ivory-*` asset names keep working; every
-release uploads those alongside the current ones.
 
 ## Licensing
 

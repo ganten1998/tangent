@@ -356,7 +356,7 @@ fn parse_cli() -> CliArgs {
 /// hides the actual cause. (Seen under CrossOver: "extension to create ES
 /// context with wgl is not present", which is the second failure, not the first.)
 ///
-/// Quiet by default; `IVORY_LOG=debug ivory` turns it on. On Windows pair it
+/// Quiet by default; `TANGENT_LOG=debug tangent` turns it on. On Windows pair it
 /// with a console — the binary is windows-subsystem and reattaches to the
 /// parent, so running it from a shell shows this output.
 ///
@@ -368,17 +368,17 @@ fn parse_cli() -> CliArgs {
 struct StderrLogger(log::LevelFilter);
 
 /// The file the logger drains to, once [`attach_log_file`] has opened it.
-/// `None` until then, so nothing touches the config directory before the
-/// pre-5.0 purge has had its turn. A mutex because `log::Log` is `&self` from
-/// any thread; acceptable in the log path because nothing on the audio
-/// callback logs, warnings are exceptional, and each record is one
-/// pre-formatted `write_all` — no formatting and no flush loop inside the lock.
+/// `None` until then, so a record emitted earlier goes to stderr only. A
+/// mutex because `log::Log` is `&self` from any thread; acceptable in the log
+/// path because nothing on the audio callback logs, warnings are exceptional,
+/// and each record is one pre-formatted `write_all` — no formatting and no
+/// flush loop inside the lock.
 static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
-/// What the file keeps no matter what `IVORY_LOG` says.
+/// What the file keeps no matter what `TANGENT_LOG` says.
 ///
 /// The file exists for the field, where nobody has set an environment
-/// variable — a terminal quieted with `IVORY_LOG=off` must not also blind the
+/// variable — a terminal quieted with `TANGENT_LOG=off` must not also blind the
 /// one artifact a user can send after the fact.
 ///
 /// **INFO, not WARN, because the lines written to BE evidence are all INFO
@@ -400,12 +400,12 @@ const FILE_LOG_FLOOR: log::LevelFilter = log::LevelFilter::Info;
 /// Rotate at half a megabyte. With exactly one predecessor kept, the pair is
 /// bounded near 1 MB total — attachable to an email, never worth a cleanup
 /// tool. Rotation happens only at startup, so a single very chatty
-/// `IVORY_LOG=debug` run can overshoot until the next launch; bounded per
+/// `TANGENT_LOG=debug` run can overshoot until the next launch; bounded per
 /// run, which is bounded enough.
 const MAX_LOG_LEN: u64 = 512 * 1024;
 
 impl StderrLogger {
-    /// The union of what either sink wants — stderr at its `IVORY_LOG` level,
+    /// The union of what either sink wants — stderr at its `TANGENT_LOG` level,
     /// the file never below [`FILE_LOG_FLOOR`]. `log::set_max_level` must be
     /// set from this, not from the stderr level, or the `log!` macros drop
     /// warn records before `log()` ever sees them.
@@ -511,12 +511,9 @@ fn rotate_log(path: &std::path::Path, max_len: u64) {
 
 /// Open `~/.config/tangent/tangent.log` and hand it to the logger.
 ///
-/// Called from `main` AFTER `purge_pre_5_0` — the ordering comment there is
-/// load-bearing, and this is exactly the kind of config-file creation it
-/// exists to forbid, which is why this is not simply part of
-/// [`install_logger`]. Until it runs the logger has only stderr; the handful
-/// of records startup emits before this point go to the terminal as they
-/// always did.
+/// Called from `main` once [`install_logger`] has run. Until it runs the
+/// logger has only stderr; the handful of records startup emits before this
+/// point go to the terminal as they always did.
 ///
 /// Every failure in here is shrugged off: a read-only home costs the log
 /// file, never the launch.
@@ -601,7 +598,7 @@ fn attach_log_file() {
 }
 
 fn install_logger() {
-    let level = match std::env::var("IVORY_LOG")
+    let level = match std::env::var("TANGENT_LOG")
         .unwrap_or_default()
         .to_lowercase()
         .as_str()
@@ -902,14 +899,6 @@ fn main() {
     install_logger();
     install_panic_hook();
 
-    // **Before anything reads or creates a config file.** `acquire_single_instance`
-    // below does a `create_dir_all` on the new directory, and Settings::load
-    // follows it — either would have to run after this, not before, or the
-    // pre-5.0 directory would still be sitting there next to a new one.
-    if tangent_core::config::purge_pre_5_0() {
-        log::info!("removed the 4.x settings folder ~/.config/ivory");
-    }
-
     // **The graph-clock claim's crash road.** The claim (see
     // `tangent_record::audio::claim_graph_clock`) releases on every clean
     // exit; a crash cannot, so each launch checks whether the force still
@@ -923,8 +912,7 @@ fn main() {
         tangent_record::audio::recover_graph_claim();
     }
 
-    // The earliest legal moment — see the ordering comment above and the one
-    // on the function. Everything the logger says from here on is on disk.
+    // Everything the logger says from here on is on disk.
     attach_log_file();
 
     // **After the log is on disk**, so the line it writes is kept, and before
@@ -1048,7 +1036,7 @@ fn main() {
     // Confirmed by switching renderers with nothing else changed: under Metal
     // the flicker is gone. Metal shares nothing with the plugin's GL.
     //
-    // `IVORY_RENDERER=glow` goes back, because this is the renderer every
+    // `TANGENT_RENDERER=glow` goes back, because this is the renderer every
     // shipped build until now has used and an escape hatch costs one line.
     //
     // Windows and Linux stay on glow — but NOT because they are safe from the
@@ -1061,7 +1049,7 @@ fn main() {
     // rather than riding along on a comment fix. If the flicker is ever
     // reproduced on Windows or Linux, the macOS arm above is the template.
     #[cfg(target_os = "macos")]
-    let renderer = match std::env::var("IVORY_RENDERER").as_deref() {
+    let renderer = match std::env::var("TANGENT_RENDERER").as_deref() {
         Ok("glow") => eframe::Renderer::Glow,
         _ => eframe::Renderer::Wgpu,
     };
@@ -1518,7 +1506,7 @@ mod home_tests {
             named.push(("the config directory", tangent_core::config::dir()));
             named.push(("the licence", tangent_core::license::LicenseStore::default_path()));
             named.push(("the taught chords", tangent_core::overrides::OverrideStore::default_path()));
-            if std::env::var_os("IVORY_SETTINGS_PATH").is_none() {
+            if std::env::var_os("TANGENT_SETTINGS_PATH").is_none() {
                 named.push(("the settings file", Settings::path()));
                 named.push(("the user themes", tangent_ui::theme::user_dir()));
                 #[cfg(feature = "recorder")]

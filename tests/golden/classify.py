@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential classifier: map every Ivory engine / Python golden-corpus
+"""Differential classifier: map every Rust engine / Python golden-corpus
 divergence to a DIVERGENCES.md rule id (or flag it for hand audit).
 
 Inputs (same directory):

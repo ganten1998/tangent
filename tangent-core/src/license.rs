@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn corrupt_file_keeps_raw_and_stays_free() {
-        let dir = std::env::temp_dir().join(format!("ivory-lic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tangent-lic-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("license.key");
         std::fs::write(&p, "not a key at all").unwrap();
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn install_rejects_bad_key_without_touching_disk() {
-        let dir = std::env::temp_dir().join(format!("ivory-lic2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tangent-lic2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("license.key");
         let mut s = LicenseStore::load_from(&p);
@@ -925,11 +925,14 @@ mod tests {
 
     #[test]
     fn refusal_messages_name_the_app_by_its_current_name() {
-        // "That does not look like an Ivory supporter key" survived the
+        // A refusal that named the app by its pre-2.3 name survived the
         // rename for a year — and it is the first thing a paying supporter
         // reads when a paste goes wrong, under a window title that says
-        // Tangent. Every message is checked, not just the three that were
-        // wrong, so the next variant added cannot reintroduce the old name.
+        // Tangent. The old name cannot come back in one now: the name leg
+        // in scripts/check.sh refuses it on every line of the tree, these
+        // messages included, so this test no longer spells it to refuse
+        // it. Every message is still checked for the em dash, not just the
+        // three that were wrong.
         let all = [
             LicenseError::Empty,
             LicenseError::Malformed,
@@ -944,11 +947,9 @@ mod tests {
         for e in all {
             assert!(!e.message().contains('\u{2014}'), "{e:?} has an em dash");
         }
-        for e in all {
-            assert!(!e.message().contains("Ivory"), "{e:?}: {}", e.message());
-        }
-        // And not merely absent: where the app is named at all, it is named
-        // by what the title bar and the store call it.
+        // And not merely absent, which the name leg sees to: where the app
+        // is named at all, it is named by what the title bar and the store
+        // call it.
         assert!(LicenseError::Malformed.message().contains("Tangent"));
     }
 }

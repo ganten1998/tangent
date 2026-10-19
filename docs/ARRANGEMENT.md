@@ -189,7 +189,7 @@ channels play back their clips and nothing else. "Ready to play" and
 ## The machinery underneath (implementation shape)
 
 - **Doc** (`tangent-ui/src/arrangement.rs`, already stubbed: versioned,
-  atomic save, `IVORY_ARRANGEMENT_PATH`): clips carry
+  atomic save, `TANGENT_ARRANGEMENT_PATH`): clips carry
   `(lane, start_s, len_s, source, source_offset_s, fade_in_s, fade_out_s,
   name, id)`. Lanes are plain indices — variable count later stays cheap.
 - **Engine**: the single backing `Placed` generalises to per-channel clip
@@ -388,8 +388,8 @@ channels play back their clips and nothing else. "Ready to play" and
     duplicate a grid step ahead, arrows nudge (alt = fine), Cmd+A, Z fit
     clip, Delete; draw previews audition through the live path.
   - **Right-click a channel** (either view) → Remove Track / colour
-    swatches / auto-palette. Auto-palette is ON by default (five staged:
-    IVORY, EMBER, TIDE, MOSS, NEON), colours are per SLOT, and manual
+    swatches / auto-palette. Auto-palette is ON by default (five staged,
+    among them EMBER, TIDE, MOSS and NEON), colours are per SLOT, and manual
     paint overrides per strip. The mixer × retired with it.
   - **The dial standard**: every dial in the program — band, mixer
     strips, arrange headers, drumpad inspector — reads VALUE on top,
@@ -432,7 +432,7 @@ channels play back their clips and nothing else. "Ready to play" and
   adds the track, instruments bind midi:all, the kind ask and cycle are
   gone, v16 migrates); arrange headers wear the chip on every lane,
   double-click renames, the header seam drags (persisted); dark mode
-  scoped to THEORY+ARRANGE (arrange defaults grey-ivory); the band's
+  scoped to THEORY+ARRANGE (arrange defaults grey-cream); the band's
   columns reach the camera's line; mixer knob caps live inside their
   band; drumpad explorer follows symlinks (~/Dropbox!) at a readable
   size; **EXPORT**: one dialog (source master/stems/both, rate,
@@ -1057,7 +1057,7 @@ channels play back their clips and nothing else. "Ready to play" and
   no redist, no app-local DLLs, no installer step. The bundled
   `tangent-ffmpeg.exe` is BtbN's mingw-static build and needs no
   redist either. And the NSIS installer wears the app's own logo now:
-  `MUI_ICON`/`MUI_UNICON` point at the same `ivory.ico` build.rs
+  `MUI_ICON`/`MUI_UNICON` point at the same `tangent.ico` build.rs
   embeds into the exe, so the setup, the app, and the Add/Remove
   entry are one mark instead of NSIS's placeholder.
 

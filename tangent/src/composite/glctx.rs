@@ -398,8 +398,8 @@ impl Gl {
     /// build its indirect-validation compute shader and finds GLSL 330 too old.
     /// The caller walks the candidates so one refusal is not the end of it.
     pub(super) fn create_from(skip: usize) -> Option<(Self, usize)> {
-        if std::env::var_os("IVORY_NO_GL_COMPOSITE").is_some() {
-            log::debug!("compositor GL: disabled by IVORY_NO_GL_COMPOSITE");
+        if std::env::var_os("TANGENT_NO_GL_COMPOSITE").is_some() {
+            log::debug!("compositor GL: disabled by TANGENT_NO_GL_COMPOSITE");
             return None;
         }
         let egl = Egl::load()?;

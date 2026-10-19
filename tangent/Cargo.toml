@@ -1,11 +1,4 @@
 [package]
-# What still wears the codename, and why. "Ivory" survives only where
-# changing it would cost a user something real: the macOS bundle id
-# (Gatekeeper trust and every external binding are keyed to it), the settings
-# and override file FORMATS, and the IVORY_* developer switches scripts and
-# muscle memory depend on. The crates, the config dir and the app struct are
-# all tangent-named now; none of what remains is visible to anyone using the
-# app.
 name = "tangent"
 version.workspace = true
 edition.workspace = true
@@ -233,7 +226,7 @@ core-graphics = "0.23"
 # host ends up drawing into the wrong drawable. Confirmed by switching
 # renderers with nothing else changed: under Metal the flicker is gone.
 #
-# `glow` is still compiled in and `IVORY_RENDERER=glow` selects it, because it
+# `glow` is still compiled in and `TANGENT_RENDERER=glow` selects it, because it
 # is what every shipped build until now has used.
 #
 # macOS-only deliberately: Windows and Linux have no plugin editor yet, so no

@@ -283,13 +283,13 @@ pub const FINE_STEP: f32 = 0.01;
 /// A single ring in a themed accent is the eighth instance of the mistake
 /// this app has now made seven times — a colour picked once and then asked to
 /// be legible against every surface it can land on. A focus ring lands on
-/// ALL of them: the near-black meter well, the ivory keys, sixteen palettes
+/// ALL of them: the near-black meter well, the cream keys, sixteen palettes
 /// of channel colour, the wine of the band. There is no single colour that
 /// contrasts with all of it, and the dead zone at 0.12–0.22 luminance is
 /// exactly where several of those grounds sit.
 ///
 /// So the ring does not try. It is drawn twice, once in each of the two inks
-/// this app has — near-black inside, ivory outside — and whichever one the
+/// this app has — near-black inside, light outside — and whichever one the
 /// ground is not, wins. That is how the platforms solve it too, and it makes
 /// the ring's legibility independent of the theme rather than something that
 /// has to be re-verified on every palette anyone ever adds.

@@ -1,10 +1,10 @@
-# Audit: abandoned Rust rewrite of Ivory (`ivory-rust`)
+# Audit: abandoned first Rust rewrite of Tangent
 
 Audited 2026-07-28.
 Rust code: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent-rust/`
-Python original: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/` (PySide6, `ivory.py` 2035 lines, `chord_detector.py` 2153 lines)
+Python original: the Python 1.x archive outside this repo (PySide6, main script 2035 lines, `chord_detector.py` 2153 lines)
 
-Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree, remote `dropbox`.
+Repo state: single git commit (the initial Rust-rewrite commit), clean tree, remote `dropbox`.
 
 ---
 
@@ -13,7 +13,7 @@ Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree
 **Layout: sound.** Two-crate workspace:
 
 - `tangent-core` — pure, zero-dependency library (patterns.rs 391 lines, detector.rs 1265 lines incl. 42 unit tests). Fully testable without a GUI. This separation is the single best structural decision in the attempt and should be kept in any rewrite.
-- `ivory` — binary: `main.rs` (20 lines), `app.rs` (317), `piano_widget.rs` (184), `midi.rs` (67), `settings.rs` (95).
+- `tangent` — binary: `main.rs` (20 lines), `app.rs` (317), `piano_widget.rs` (184), `midi.rs` (67), `settings.rs` (95).
 
 **Dependencies (Cargo.toml → locked → current on crates.io):**
 
@@ -76,13 +76,13 @@ Caveat: 42 tests is thin coverage for a 95-pattern engine whose behavior is defi
 
 - `tangent-core/src/patterns.rs` — the entire data layer: 95 chord patterns in priority order, essential/optional tables, 28 scales, mode lists. This encodes many hours of tuning against the Python. (Restore the `7` in `altered` or document its removal.)
 - `tangent-core/src/detector.rs` — the whole detection engine incl. its 42 tests. It is a *superset* of the Python's correctness. Port more Python test cases into it rather than re-porting the engine.
-- `tangent/src/midi.rs` — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
-- `ivory/src/piano_widget.rs` — correct 88-key geometry (A0 edge cases handled), hit-testing, aspect-ratio helper. Keep the math; the draw function needs its signature widened (see gaps).
+- `midi.rs` (kept in `docs/reference/`, now in git history) — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
+- `piano_widget.rs` (kept in `docs/reference/`, now in git history) — correct 88-key geometry (A0 edge cases handled), hit-testing, aspect-ratio helper. Keep the math; the draw function needs its signature widened (see gaps).
 
 **Rewrite / discard:**
 
-- `ivory/src/app.rs` — keep as a reference skeleton only. It has two real rendering bugs (below), an unconditional-repaint busy loop, a no-op font setup (`FontDefinitions::default()` then `set_fonts` — comment claims it installs Unicode-capable fonts; it installs nothing), and it targets egui 0.29 APIs that no longer exist (`Frame::none`, `close_menu`).
-- `ivory/src/settings.rs` — rewrite. It reads/writes the **same file as the Python app** (`~/.config/tangent/settings.json`) but with an incompatible color encoding (`{r,g,b}` object vs Python's `"#rrggbb"` string): loading a Python-written file fails silently → defaults → Save clobbers the user's Python settings. Either serialize colors as hex strings for round-trip compatibility or use a different path. Also `chord_window_detached` key is missing, and four of its fields (window_size_percent, borderless_mode, detached_chord_height) are loaded but wired to nothing.
+- `app.rs` (kept in `docs/reference/`, now in git history) — keep as a reference skeleton only. It has two real rendering bugs (below), an unconditional-repaint busy loop, a no-op font setup (`FontDefinitions::default()` then `set_fonts` — comment claims it installs Unicode-capable fonts; it installs nothing), and it targets egui 0.29 APIs that no longer exist (`Frame::none`, `close_menu`).
+- `settings.rs` (kept in `docs/reference/`, now in git history) — rewrite. It reads/writes the **same file as the Python app** (`~/.config/tangent/settings.json`) but with an incompatible color encoding (`{r,g,b}` object vs Python's `"#rrggbb"` string): loading a Python-written file fails silently → defaults → Save clobbers the user's Python settings. Either serialize colors as hex strings for round-trip compatibility or use a different path. Also `chord_window_detached` key is missing, and four of its fields (window_size_percent, borderless_mode, detached_chord_height) are loaded but wired to nothing.
 - `main.rs`, workspace Cargo.tomls — trivial, recreate.
 
 **Known bugs in the GUI crate (found in this audit):**
@@ -94,7 +94,7 @@ Caveat: 42 tests is thin coverage for a 95-pattern engine whose behavior is defi
 
 ## 5. UI-parity gaps vs the PySide6 app
 
-Python `ivory.py` features absent from the Rust GUI:
+Python main-script features absent from the Rust GUI:
 
 | Feature | Python | Rust status |
 |---|---|---|

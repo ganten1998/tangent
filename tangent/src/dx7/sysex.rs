@@ -393,13 +393,13 @@ mod tests {
     /// mentions. Ignored because the corpus is not in the repository; point it
     /// at a folder of `.syx` and it will walk the lot.
     ///
-    ///   IVORY_SYX_CORPUS=~/Dropbox/Audio/Sysex cargo test -p tangent --bins \
+    ///   TANGENT_SYX_CORPUS=~/Dropbox/Audio/Sysex cargo test -p tangent --bins \
     ///     the_whole_corpus -- --ignored --nocapture
     #[test]
     #[ignore = "needs a folder of cartridges"]
     fn the_whole_corpus_parses() {
-        let Ok(root) = std::env::var("IVORY_SYX_CORPUS") else {
-            eprintln!("IVORY_SYX_CORPUS not set; nothing was checked");
+        let Ok(root) = std::env::var("TANGENT_SYX_CORPUS") else {
+            eprintln!("TANGENT_SYX_CORPUS not set; nothing was checked");
             return;
         };
         let mut walked = 0usize;
@@ -451,7 +451,7 @@ mod tests {
             "walked {walked} .syx, parsed {carts} cartridges ({bad_sum} with a bad checksum), \
              {named} named voices"
         );
-        assert!(carts > 0, "no cartridges were found under IVORY_SYX_CORPUS");
+        assert!(carts > 0, "no cartridges were found under TANGENT_SYX_CORPUS");
     }
 }
 
@@ -460,13 +460,13 @@ mod write_a_bank {
     /// Write the shipped bank out as an ordinary `.syx`, for looking at the
     /// picker with a cartridge loaded.
     ///
-    ///   IVORY_BANK_OUT=/tmp/bank.syx cargo test -p tangent --bins \
+    ///   TANGENT_BANK_OUT=/tmp/bank.syx cargo test -p tangent --bins \
     ///     dx7::sysex::write_a_bank -- --ignored --nocapture
     #[test]
     #[ignore = "writes a file for a person to load"]
     fn a_syx_for_the_picker() {
-        let Ok(out) = std::env::var("IVORY_BANK_OUT") else {
-            eprintln!("IVORY_BANK_OUT not set");
+        let Ok(out) = std::env::var("TANGENT_BANK_OUT") else {
+            eprintln!("TANGENT_BANK_OUT not set");
             return;
         };
         std::fs::write(&out, super::factory().to_bytes()).expect("write the bank");

@@ -987,7 +987,7 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "ivory-wav-{}-{}-{}.wav",
+            "tangent-wav-{}-{}-{}.wav",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed),
             name

@@ -8,8 +8,8 @@
 //! raw sequence numbers, and can hold each buffer for a while on purpose:
 //!
 //!   ./seqprobe 40 0                      # sequence should step by exactly 1
-//!   IVORY_V4L2_BUFFERS=2 ./seqprobe 40 120   # a slow consumer on a shallow queue
-//!   IVORY_V4L2_BUFFERS=8 ./seqprobe 40 120   # ... and on a deep one
+//!   TANGENT_V4L2_BUFFERS=2 ./seqprobe 40 120   # a slow consumer on a shallow queue
+//!   TANGENT_V4L2_BUFFERS=8 ./seqprobe 40 120   # ... and on a deep one
 //!
 //! If the middle run shows gaps and the first does not, the instrument works
 //! and the queue depth is doing something measurable.
@@ -20,8 +20,8 @@
 //! up until something stalls it. Two more arguments model that — stall this
 //! many milliseconds, every this many frames:
 //!
-//!   IVORY_V4L2_BUFFERS=2 ./seqprobe 60 0 300 15
-//!   IVORY_V4L2_BUFFERS=6 ./seqprobe 60 0 300 15
+//!   TANGENT_V4L2_BUFFERS=2 ./seqprobe 60 0 300 15
+//!   TANGENT_V4L2_BUFFERS=6 ./seqprobe 60 0 300 15
 
 #[cfg(not(target_os = "linux"))]
 pub fn main() {
@@ -41,7 +41,7 @@ pub fn main() {
     let hold_ms: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let stall_ms: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let every: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let buffers: u32 = std::env::var("IVORY_V4L2_BUFFERS")
+    let buffers: u32 = std::env::var("TANGENT_V4L2_BUFFERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);

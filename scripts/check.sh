@@ -265,4 +265,34 @@ for s in scripts/build-freebsd.sh scripts/release.sh scripts/publish-github.sh; 
   grep -q "sed -E 's/-beta" "$s" || { echo "$s lost its FreeBSD version sed" >&2; exit 1; }
 done
 
+echo "==> the old name is gone  (no tracked line or file name spells it)"
+# **Tangent had another name until 2.3.0, and the tree no longer spells it
+# anywhere**: not in the code, the scripts, the docs, what a download
+# carries or a file name, and not as the colour that shared it (cream,
+# bone and the light ink say that now). Git history keeps the old name and
+# is left alone; the tree is what is built, shipped and read, and this leg
+# holds it at none, in place of the guards that each refused the name by
+# spelling it (the licence refusals' test was the last). The brackets keep
+# the pattern from matching its own text. A binary file that matches
+# prints a line too, and fails like any other.
+#
+# **Both searches run in the C locale.** Under a UTF-8 one the pattern
+# finds nothing on a line after a byte it cannot decode, and a binary file
+# has such bytes ahead of any text it carries (so does Latin-1 text): a
+# PNG whose text chunk named the app passed this leg while the same word
+# in a source file failed it. What no search reads is a name in a
+# picture's pixels, or text stored as UTF-16 (nothing tracked is); the two
+# screenshots that showed the name in their title bar were taken out by
+# hand.
+#
+# `git grep` exits 1 when nothing matches, which is the pass, and higher
+# when git itself fails, which is not: `|| [ $? = 1 ]` tells them apart.
+OLD_NAME="$(LC_ALL=C git grep -n -i '[i]vory' || [ $? = 1 ])"
+OLD_PATHS="$(git ls-files | LC_ALL=C grep -i '[i]vory' || [ $? = 1 ])"
+if [ -n "$OLD_NAME$OLD_PATHS" ]; then
+  echo "the old name is back in the tree:" >&2
+  printf '%s\n' "$OLD_NAME" "$OLD_PATHS" | grep . | sed 's/^/    /' >&2
+  exit 1
+fi
+
 echo "==> check.sh: all green"

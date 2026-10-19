@@ -1,6 +1,6 @@
 # Gumroad product page for Tangent 5.0.0
 
-Paste-ready copy for <https://ganten.gumroad.com/l/ivory>, for 5.0.0, the
+Paste-ready copy for <https://ganten.gumroad.com/l/tangent>, for 5.0.0, the
 first stable release with unlimited tracks. The folder is `next` because the
 version is `release.sh`'s to write; rename it to `5.0.0` when the release is
 cut (`copy_scan.rs` follows the rename and scans whichever folder is newest).

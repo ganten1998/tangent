@@ -47,8 +47,9 @@ counted. Do not rewrite history to tidy burnt numbers away.
    This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (the
    three commands above, a compile of the Minimal build with
    `cargo check -p tangent --no-default-features`, the crate firewall
-   `scripts/check-firewall.sh`, the clippy lint policy, and the check that
-   three scripts spell the FreeBSD version alike) and
+   `scripts/check-firewall.sh`, the clippy lint policy, the check that
+   three scripts spell the FreeBSD version alike, and the check that no
+   tracked line or file name spells the old name) and
    refuses to cut a release on any failure. The checklist entry remains so
    a human knows what the refusal means.
 
@@ -59,12 +60,16 @@ counted. Do not rewrite history to tidy burnt numbers away.
    on drift.
 
 3. **The name is Tangent everywhere a buyer looks.** The old trademark gate
-   here was about "Ivory" colliding with Synthogy Ivory; the 2.3.0 rename
-   retired that collision, and reviving the old name in copy is the only way
-   to get it back. New marketing text, release notes and store edits say
-   Tangent. The Gumroad short link `/l/ivory` and the legacy `Ivory-*` asset
-   aliases are deliberate survivals (published links must keep resolving) and
-   are not an invitation to write the word anywhere new.
+   here was about the old name colliding with a commercial piano instrument;
+   the 2.3.0 rename retired that collision, and reviving the old name in copy
+   is the only way to get it back. New marketing text, release notes and store
+   edits say Tangent. The Gumroad short link and the download names were the
+   deliberate survivals, and neither is left: the Gumroad permalink is
+   `/l/tangent` (the old one redirects to it), and `publish-github.sh` no
+   longer uploads the pre-rename asset names. Also
+   ENFORCED now: `scripts/check.sh` fails on any tracked line or file name
+   that spells the old name, the colour word spelled the same included, so
+   the tree cannot take it back by accident.
 
 4. **Store links resolve.** See the last section; the check is
    `scripts/check-store-links.sh` and the rule is publish, check, paste,
@@ -192,11 +197,10 @@ Notes on the set:
   exactly it into the NSIS payload, so one build's installed files and
   portable files are the same bytes. It must ship: its version-less alias
   `tangent-windows-x86_64.zip` is the store content's Windows archive
-  (`docs/STORE-CONTENT.md`), the legacy `ivory-windows-x86_64.zip` is in
-  supporter emails sent before the installers took over at 3.0.0, and
-  `publish-github.sh` can only upload an alias for a file that exists in
-  `dist/`. If `makensis` is missing, only the zip is built and the run
-  fails, saying no setup.exe was produced. The
+  (`docs/STORE-CONTENT.md`) and is in supporter emails sent before the
+  installers took over at 3.0.0, and `publish-github.sh` can only upload an
+  alias for a file that exists in `dist/`. If `makensis` is missing, only
+  the zip is built and the run fails, saying no setup.exe was produced. The
   `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
   function name; it is not a deliverable, `publish-github.sh` does not
   upload it, and `release.sh` leaves it out of `SHA256SUMS` (a summed file
@@ -352,11 +356,13 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    included) back on the mirror.
 9. **Publish**: `scripts/publish-github.sh --notes-file <notes>` (the
    `github` remote is the release channel; `DRY_RUN=1` to rehearse). It
-   uploads every artifact in THREE spellings: version-scoped, the
-   version-less alias (`Tangent-macos.pkg`,
-   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...), and the
-   legacy `Ivory-*` names that every supporter-key email sent before the
-   rename still links. The version-less aliases are what
+   uploads every artifact under its version-scoped name, a version-less
+   alias only for the names a permanent link uses (`Tangent-macos.pkg`,
+   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...; the
+   list is `scripts/check-store-links.sh --names`), and one `SHA256SUMS`.
+   The pre-rename names and the arm64 names of the Mac build before 3.0.0
+   are no longer uploaded, and old supporter emails that link them 404. The
+   version-less aliases are what
    `releases/latest/download/<name>` resolves by exact name, and that
    permalink is the download link on the Gumroad post-purchase page, in the
    supporter-key email and in `README.md`; **a release published without the
@@ -371,9 +377,6 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    `latest/download` resolves against the latest stable, so a correctly
    marked beta leaves the permanent links alone. Release notes must include
    the SmartScreen note.
-   For 5.0.0 specifically they must also say that the pre-5.0
-   `~/.config/ivory/` directory is removed at first launch rather than
-   migrated (a clean break; supporter keys are re-sent by email).
 10. **Verify as a stranger**: download each artifact on a clean machine or VM
     (quarantine attribute present) and confirm the documented first-launch
     paths work. Then put `main` back on the next `X.Y.Z-dev`.

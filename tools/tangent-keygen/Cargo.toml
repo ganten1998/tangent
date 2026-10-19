@@ -1,7 +1,7 @@
 # DELIBERATELY OUTSIDE the main workspace (note the empty [workspace] table).
 #
 # This is the structural guarantee that the SIGNING key material and its crypto
-# dependencies can never reach a shipped Ivory binary:
+# dependencies can never reach a shipped Tangent binary:
 #   - `cargo build -p tangent-keygen` from the repo root cannot resolve it,
 #   - its dependencies never enter the workspace Cargo.lock,
 #   - so they never appear in THIRD-PARTY-LICENSES or any release artifact.

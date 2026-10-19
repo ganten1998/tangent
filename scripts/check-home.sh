@@ -16,13 +16,13 @@
 # **`run` is the proof, and the net.** It runs a command (check.sh's test
 # legs) with HOME pointed at a fresh folder seeded with decoys where Tangent
 # keeps a person's files: a settings file, the taught chords, a licence and
-# its Konami marker, a legacy plugin state, the pre-5.0 config, an Untitled
-# project, a take. Anything the command creates, changes or deletes under
-# those folders fails the run, named. Decoys and not an empty home, because
-# the owner's home is not empty, and the roads that matter most only write
-# over something that is already there (a migration saved at load, a reset
-# that relocks the marker, a New over Untitled). The scratch home also takes
-# whatever a hosted plugin writes into a home of its own.
+# its Konami marker, a legacy plugin state, an Untitled project, a take.
+# Anything the command creates, changes or deletes under those folders fails
+# the run, named. Decoys and not an empty home, because the owner's home is
+# not empty, and the roads that matter most only write over something that
+# is already there (a migration saved at load, a reset that relocks the
+# marker, a New over Untitled). The scratch home also takes whatever a
+# hosted plugin writes into a home of its own.
 #
 # The real folders are watched as well, read-only: a listing and every
 # modification time against a stamp in the temp folder, before and after,
@@ -89,7 +89,7 @@ watched() {
   local h="$1" d
   local -a found=()
   shopt -s nullglob
-  found=("$h"/.config/tangent* "$h"/.config/ivory "$h"/Documents/Tangent* \
+  found=("$h"/.config/tangent* "$h"/Documents/Tangent* \
          "$h"/Movies/Tangent* "$h"/Videos/Tangent* "$h"/Music/Tangent*)
   shopt -u nullglob
   for d in ${found[@]+"${found[@]}"}; do
@@ -130,7 +130,7 @@ touched() {
 # touches is newer than the stamp.
 seed() {
   local h="$1" d
-  mkdir -p "$h/.config/tangent" "$h/.config/ivory" \
+  mkdir -p "$h/.config/tangent" \
     "$h/Documents/Tangent Media/Projects/Untitled" \
     "$h/Movies/Tangent/2026-01-01_12-00-00_take" "$h/Music/Tangent"
   printf '{"decoy": "scripts/check-home.sh"}\n' > "$h/.config/tangent/settings.json"
@@ -139,7 +139,6 @@ seed() {
   printf 'decoy\n' > "$h/.config/tangent/license.key"
   printf 'konami\n' > "$h/.config/tangent/cheat.unlock"
   printf 'decoy\n' > "$h/.config/tangent/insert-state-3-0.bin"
-  printf 'decoy\n' > "$h/.config/ivory/license.key"
   printf '{"decoy": "scripts/check-home.sh"}\n' \
     > "$h/Documents/Tangent Media/Projects/Untitled/project.tan"
   printf '{}\n' > "$h/Movies/Tangent/2026-01-01_12-00-00_take/take.json"
@@ -191,7 +190,7 @@ run() {
   (
     export CARGO_HOME="${CARGO_HOME:-$real/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real/.rustup}"
     export HOME="$scratch"
-    unset TANGENT_CONFIG_DIR TANGENT_MEDIA_ROOT IVORY_SETTINGS_PATH \
+    unset TANGENT_CONFIG_DIR TANGENT_MEDIA_ROOT TANGENT_SETTINGS_PATH TANGENT_ARRANGEMENT_PATH \
       XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME
     exec "$@"
   ) || status=$?
@@ -244,7 +243,7 @@ run() {
     rm -rf "$scratch"
   else
     # A home handed in is left as it was found: the decoys go.
-    rm -rf "$scratch/.config/tangent" "$scratch/.config/ivory" "$scratch/Documents/Tangent Media" \
+    rm -rf "$scratch/.config/tangent" "$scratch/Documents/Tangent Media" \
       "$scratch/Movies/Tangent" "$scratch/Music/Tangent"
     rmdir "$scratch/.config" "$scratch/Documents" "$scratch/Movies" "$scratch/Music" 2>/dev/null || true
   fi
@@ -419,9 +418,10 @@ selftest() {
   expect_run pass running "a write elsewhere in HOME passes, the app running" \
     sh -c 'mkdir -p "$HOME/elsewhere" && printf x > "$HOME/elsewhere/f"'
   expect_run pass absent "nothing written passes" true
-  TANGENT_CONFIG_DIR=/nowhere TANGENT_MEDIA_ROOT=/nowhere IVORY_SETTINGS_PATH=/nowhere \
+  TANGENT_CONFIG_DIR=/nowhere TANGENT_MEDIA_ROOT=/nowhere TANGENT_SETTINGS_PATH=/nowhere \
+    TANGENT_ARRANGEMENT_PATH=/nowhere \
     expect_run pass absent "the developer's switches do not reach the command" \
-    sh -c '[ -z "${TANGENT_CONFIG_DIR:-}${TANGENT_MEDIA_ROOT:-}${IVORY_SETTINGS_PATH:-}" ]'
+    sh -c '[ -z "${TANGENT_CONFIG_DIR:-}${TANGENT_MEDIA_ROOT:-}${TANGENT_SETTINGS_PATH:-}${TANGENT_ARRANGEMENT_PATH:-}" ]'
   expect_run fail absent "a failing command's status comes through" false
   return "$fails"
 }

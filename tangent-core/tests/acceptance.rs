@@ -1,4 +1,4 @@
-//! Acceptance contract for the Ivory 2.0 chord engine.
+//! Acceptance contract for the 2.0 chord engine.
 //!
 //! Sources of truth, in precedence order:
 //!   1. docs/DIVERGENCES.md          — K-rules (kept identity) and D-rules (engine fixes)

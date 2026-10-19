@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Publish this version's artifacts to the GitHub release, in BOTH spellings:
-# the version-scoped names, and the version-less aliases that every permanent
-# download link resolves through.
+# Publish this version's artifacts to the GitHub release: every artifact under
+# its version-scoped name, a version-less alias for each name a permanent
+# download link resolves through, and one SHA256SUMS.
 #
 # Usage:
 #   scripts/publish-github.sh --notes-file <file>   # create the release
@@ -14,17 +14,15 @@
 # The Gumroad post-purchase page, the supporter-key email and README.md all
 # link through it, using the version-less names:
 #
-#   Tangent-macos-arm64.dmg   Tangent-macos-arm64.zip
+#   Tangent-macos.pkg             Tangent-windows-setup.exe
+#   Tangent-macos-universal.dmg   Tangent-macos-universal.zip
 #   tangent-windows-x86_64.zip   tangent-linux-x86_64.tar.gz   SHA256SUMS
 #
-# Ship a release carrying only `Tangent-2.3.0-macos-arm64.dmg` and every one of
-# those links 404s for everybody, including people who have already paid, with
-# nothing in any log to say so. That is the whole reason this script exists:
-# uploading the aliases is not optional polish, it is the release contract.
-#
-# AND, since the 2.3.0 rename from Ivory to Tangent, the same four assets go up
-# a THIRD time under their old Ivory-* names, because those are the links in
-# every supporter-key email already sent. See the legacy block below.
+# Ship a release carrying only `Tangent-5.1.0-macos-universal.dmg` and every
+# one of those links 404s for everybody, including people who have already
+# paid, with nothing in any log to say so. That is the whole reason this script
+# exists: uploading the aliases is not optional polish, it is the release
+# contract.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -63,8 +61,8 @@ TAG="v${VERSION}"
 # beta to people who paid for a finished app.
 #
 # For the same reason a pre-release uploads ONLY version-scoped names. The
-# version-less aliases and the legacy Ivory-* set are the permanent-link
-# contract, and a beta has no business owning them even by accident.
+# version-less aliases are the permanent-link contract, and a beta has no
+# business owning them even by accident.
 PRERELEASE=0
 case "$VERSION" in *-*) PRERELEASE=1 ;; esac
 
@@ -92,8 +90,8 @@ fi
 PKG_VERSION="$(printf '%s' "$VERSION" | sed -E 's/-beta\.?/.b/; s/-alpha\.?/.a/; s/-rc\.?/.r/; s/-/./g')"
 shopt -s nullglob
 ARTIFACTS=()
-# Tangent-* since the 2.3.0 rename. This glob still said Ivory-* long after
-# build-macos.sh stopped producing that name, so the script exited "no
+# Tangent-* since the 2.3.0 rename. This glob kept the pre-rename prefix long
+# after build-macos.sh stopped producing that name, so the script exited "no
 # artifacts in dist/" on the first release it was asked to publish.
 for f in dist/Tangent-"${VERSION}"-macos-*.zip dist/Tangent-"${VERSION}"-macos-*.dmg \
          dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip \
@@ -135,10 +133,25 @@ done < "$SUMS"
 echo "==> Checksums: $SUMS"
 
 # ── Build the alias set in a temp dir ────────────────────────────────────────
-# `Ivory-2.2.0-macos-arm64.dmg` -> `Ivory-macos-arm64.dmg`, and the checksums
-# go up twice: version-scoped for the record, bare for the permalink.
+# **A version-less copy only where a permanent link asks for one.** The links
+# in README.md, the store page and the supporter email resolve by exact name
+# against the latest stable release (`check-store-links.sh --names` reads all
+# three), so `Tangent-5.1.0-macos-universal.dmg` also goes up as
+# `Tangent-macos-universal.dmg` because a link names that, and the Linux
+# aarch64 tarball, the Windows zip and the FreeBSD files go up once, under
+# their versioned names, because nothing links them bare. 5.1.0 first
+# carried a bare copy of every artifact and of the checksums, the FreeBSD
+# complete bundle's 489 MB among them, that no link reached. The checksums
+# go up once, as `SHA256SUMS`: the release they sit in is the version.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+
+NEED=""
+if [ "$PRERELEASE" = 0 ]; then
+  NEED="$(scripts/check-store-links.sh --names)" \
+    || { echo "could not read the permanent links (scripts/check-store-links.sh --names)" >&2; exit 1; }
+fi
+needed() { printf '%s\n' "$NEED" | grep -Fqx -- "$1"; }
 
 UPLOADS=()
 if [ "$PRERELEASE" = 1 ]; then
@@ -149,62 +162,23 @@ fi
 for a in "${ARTIFACTS[@]}"; do
   [ "$PRERELEASE" = 1 ] && break
   base="${a#dist/}"
+  UPLOADS+=("$a")
   alias_name="${base/-${VERSION}-/-}"
-  if [ "$alias_name" = "$base" ]; then
-    echo "refusing to guess an alias for '$base' (no -${VERSION}- in the name)" >&2
-    exit 1
-  fi
+  [ "$alias_name" != "$base" ] && needed "$alias_name" || continue
   cp "$a" "$STAGE/$alias_name"
-  UPLOADS+=("$a" "$STAGE/$alias_name")
+  UPLOADS+=("$STAGE/$alias_name")
 done
 if [ "$PRERELEASE" = 0 ]; then
-  cp "$SUMS" "$STAGE/SHA256SUMS-${VERSION}"
   cp "$SUMS" "$STAGE/SHA256SUMS"
-  UPLOADS+=("$STAGE/SHA256SUMS-${VERSION}" "$STAGE/SHA256SUMS")
+  UPLOADS+=("$STAGE/SHA256SUMS")
 fi
 
-# ── Legacy Ivory-named aliases ───────────────────────────────────────────────
-# The product was renamed to Tangent at 2.3.0, but the permanent download links
-# under the OLD name are already sitting in the inbox of everyone who has bought
-# a supporter key, and in the 2.2.0 README. Those links resolve by exact asset
-# name, so dropping these four would 404 for exactly the people who paid.
-# They cost 26MB per release and they are not optional.
-for a in "${ARTIFACTS[@]}"; do
-  [ "$PRERELEASE" = 1 ] && break
-  base="${a#dist/}"
-  legacy="${base/-${VERSION}-/-}"          # Tangent-macos-arm64.dmg
-  legacy="${legacy/#Tangent-/Ivory-}"      # Ivory-macos-arm64.dmg
-  legacy="${legacy/#tangent-/ivory-}"      # ivory-windows-x86_64.zip
-  if [ "$legacy" != "${base/-${VERSION}-/-}" ]; then
-    cp "$a" "$STAGE/$legacy"
-    UPLOADS+=("$STAGE/$legacy")
-  fi
-done
+# **No third spelling.** Every asset also went up under its pre-rename name,
+# and the universal Mac build under the arm64 names it had before 3.0.0, so
+# that links in old supporter emails kept working. The owner retired both
+# sets: 5.1.0 carries neither, and those old links 404.
 
-# ── arm64-named aliases for the universal build ──────────────────────────────
-# The macOS app was Apple Silicon only until 3.0.0 and shipped as
-# `Tangent-macos-arm64.{zip,dmg}`. Those exact names are the permanent links in
-# the README, in every supporter email already sent, and on the store page.
-# Going universal renames the artifact, so without this they 404 for everyone
-# who has ever been given a link — the same failure the legacy Ivory-* block
-# exists to prevent, one rename later.
-#
-# The file is the same file. A universal binary IS an arm64 binary, so an old
-# link keeps working and now happens to run on an Intel Mac too.
-for a in "${ARTIFACTS[@]}"; do
-  [ "$PRERELEASE" = 1 ] && break
-  base="${a#dist/}"
-  case "$base" in *-universal.*) ;; *) continue ;; esac
-  for name in "${base/-${VERSION}-/-}" ; do
-    for spelled in "${name}" "${name/#Tangent-/Ivory-}"; do
-      arm="${spelled/-universal./-arm64.}"
-      cp "$a" "$STAGE/$arm"
-      UPLOADS+=("$STAGE/$arm")
-    done
-  done
-done
-
-echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
+echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, a version-less copy where a permanent link names one)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
 
 # **Every permanent link a buyer holds gets its asset.** The links in
@@ -215,8 +189,6 @@ for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
 # had paid. check-store-links.sh reads those three sources; nothing here
 # keeps a second list of the names.
 if [ "$PRERELEASE" = 0 ]; then
-  NEED="$(scripts/check-store-links.sh --names)" \
-    || { echo "could not read the permanent links (scripts/check-store-links.sh --names)" >&2; exit 1; }
   MISSING=""
   while IFS= read -r name; do
     [ -n "$name" ] || continue

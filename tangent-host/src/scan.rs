@@ -1218,7 +1218,7 @@ mod tests {
     fn a_single_file_vst3_is_found_and_is_its_own_binary() {
         // Windows reaplugs ship PLAIN .vst3 DLLs, no bundle folder. The
         // walk and the loader both take that form.
-        let dir = std::env::temp_dir().join(format!("ivory-flat-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tangent-flat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("reaeq.vst3"), b"not really a dll").unwrap();
@@ -1248,7 +1248,7 @@ mod tests {
     /// Windows bundles ship .pdb and resource DLLs beside the plugin.
     #[test]
     fn the_bundle_binary_beats_its_neighbours() {
-        let dir = std::env::temp_dir().join(format!("ivory-bundle-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tangent-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bundle = dir.join("Foo.vst3");
         let inner = bundle.join("Contents").join(CONTENTS_SUBDIR);

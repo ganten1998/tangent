@@ -455,8 +455,8 @@ fn palette(s: &Settings) -> Palette {
     // **The ground is the THEME's, and everything on it is measured against
     // it.** These were two frozen pairs — near-black and cream — so every one
     // of the sixteen themes drew its theory modules on the same two
-    // backgrounds, which is what the owner saw: "ivory on every light mode,
-    // black on every dark mode".
+    // backgrounds, which is what the owner saw: one cream for every light
+    // mode and one black for every dark mode.
     let bg = crate::piano::themed_bg(s);
     // **Derived against THIS page**, like the line and the ground beside it.
     // The theme names one lit colour and it is drawn on the keyboard, on the
@@ -1454,10 +1454,11 @@ mod tests {
     /// **Every theme brings its own theory ground, in both modes — and the
     /// two modes are not the same ground.**
     ///
-    /// The owner: "ivory on every light mode, black on every dark mode when
-    /// they should be per theme". Two frozen pairs meant sixteen themes drew
-    /// their modules on the same two backgrounds. This checks that the ground
-    /// MOVES with the theme, and that everything printed on it still reads.
+    /// The owner's report: one cream for every light mode and one black for
+    /// every dark mode, when each should be the theme's own. Two frozen pairs
+    /// meant sixteen themes drew their modules on the same two backgrounds.
+    /// This checks that the ground MOVES with the theme, and that everything
+    /// printed on it still reads.
     ///
     /// **And that the toggle does something, which is the half it was missing
     /// for three releases.** Everything above measures colours AGAINST the

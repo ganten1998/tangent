@@ -98,7 +98,7 @@ https://<your-app>.fly.dev/hook/<your hook secret>
 
 ## 6. Test it for real, before anyone else can
 
-1. Create a **100% off discount code** (e.g. `IVORYGIFT`).
+1. Create a **100% off discount code** (e.g. `TANGENTGIFT`).
 2. Buy your own product with it, using a **Gmail address** — Gmail is the
    strictest filter and the likeliest inbox for your buyers.
 3. Confirm the key arrives, and **check the spam folder** if it does not.

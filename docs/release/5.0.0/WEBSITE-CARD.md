@@ -7,7 +7,7 @@ Replaces the Tangent `<article>` in
 - it says `v3.0.0` and dates itself 2026-08-14;
 - it describes Tangent "inside your DAW, as a VST3 plugin", which is retired
   (owner ruling 2026-10-10: remove every user-facing mention);
-- every link uses the old slug `github.com/ganten1998/ivory`, which only works
+- every link uses the pre-rename repository slug, which only works
   through GitHub's rename redirect (and a deleted or recreated repository
   loses that redirect);
 - it says nothing about the 32-track free desk or what a key does.
@@ -92,7 +92,7 @@ a supporter key removes the limit.
               no account.
             </p>
             <p>
-              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/ivory" target="_blank" rel="noopener">Support it</a>
+              <a href="https://github.com/ganten1998/tangent/releases/latest" target="_blank" rel="noopener">Download</a><span class="sep">&middot;</span><a href="https://github.com/ganten1998/tangent" target="_blank" rel="noopener">Source</a><span class="sep">&middot;</span><a href="https://ganten.gumroad.com/l/tangent" target="_blank" rel="noopener">Support it</a>
             </p>
             <p class="post__tags">
               <span class="tag">rust</span>

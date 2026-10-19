@@ -31,7 +31,7 @@ pub const HEART_COLORS: [Color32; 7] = [
     Color32::from_rgb(0x6C, 0x9B, 0xD2), // blue
     Color32::from_rgb(0x5E, 0xD6, 0x8A), // green
     Color32::from_rgb(0xB8, 0x8F, 0xE0), // violet
-    Color32::from_rgb(0xE8, 0xDC, 0xC0), // ivory
+    Color32::from_rgb(0xE8, 0xDC, 0xC0), // cream
 ];
 
 /// The transpose arrows, top-left: `(up, down)`.

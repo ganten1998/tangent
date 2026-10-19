@@ -1,11 +1,11 @@
 # The 3.0.0 announcement email
 
 Draft for the people who have already bought a supporter key. Send from
-`keys@ivorymidi.com` via Resend, the same way the 2.3.0 note went out — Gumroad
-still refuses customer email below a payout or $100 in sales.
+`keys@tangentdaw.org` via Resend, the same way the 2.3.0 note went out —
+Gumroad still refuses customer email below a payout or $100 in sales.
 
-`keys@ivorymidi.com` can send but cannot receive, so **Reply-To must be a real
-inbox** or a reply disappears.
+The sender address of that time could send but not receive, so **Reply-To
+must be a real inbox** or a reply disappears.
 
 **Send it AFTER the release is published.** Every link below resolves by exact
 asset name against whatever release is currently latest, so they 404 until the
@@ -81,7 +81,7 @@ sed -n '/^Hello,$/,/^Ganten$/p' docs/RELEASE-EMAIL-3.0.0.md > /tmp/body.txt
 cd tools/tangent-fulfil                                       # 2. DRY RUN first
 cargo run -- announce --subject "..." --body /tmp/body.txt --ledger ~/ledger.jsonl
 
-RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
+RESEND_API_KEY=... MAIL_FROM='Tangent <keys@tangentdaw.org>' \
   cargo run -- announce --subject "..." --body /tmp/body.txt \
     --ledger ~/ledger.jsonl --send                          # 3. and only then
 ```
@@ -98,9 +98,10 @@ three URLs every future announcement uses. What changes is the prose.
 ## Checklist before sending
 
 - [ ] 3.0.0 is published and all three installer links resolve (click each one)
-- [ ] `Tangent-macos-arm64.dmg` and `Ivory-macos-arm64.dmg` still resolve — the
-      universal build renamed the artifact, and `publish-github.sh` uploads the
-      arm64-named aliases so older emails keep working. Check both.
+- [ ] `Tangent-macos-arm64.dmg` and its pre-rename alias still resolve: the
+      universal build renamed the artifact, and `publish-github.sh` uploaded the
+      arm64-named aliases so older emails kept working. Check both. (Retired
+      2026-10-18: neither is uploaded any more, and those links 404.)
 - [ ] The fulfil service is redeployed, so NEW buyers get the installer links
       (`tools/tangent-fulfil`, then `fly deploy`)
 - [ ] Reply-To set to an inbox that exists

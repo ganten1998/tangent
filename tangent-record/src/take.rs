@@ -1552,7 +1552,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             static N: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "ivory-take-{tag}-{}-{}",
+                "tangent-take-{tag}-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));

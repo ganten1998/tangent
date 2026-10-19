@@ -1,12 +1,32 @@
 # Changelog
 
-All notable changes to Tangent are documented in this file. Entries before 2.3.0
-refer to the app under its former name, Ivory.
+All notable changes to Tangent are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
+
+## [Unreleased]
+
+### Changed
+
+- **The developer switches are spelled with Tangent's name.** The
+  environment variables that turn on diagnostics and test hooks now start
+  with `TANGENT_` (`TANGENT_LOG=debug`, `TANGENT_RENDERER=glow`,
+  `TANGENT_OUT_BUFFER` and the rest), and the old prefix is no longer read:
+  a shell or a launcher that still sets it needs the new name. Every
+  release up to 5.1.0 reads only the old prefix, so the `TANGENT_` names in
+  the older entries below work from this release on.
+- **On Linux, Tangent's MIDI input carries Tangent's name.** Other programs
+  see its MIDI client as `tangent` and its input port as `tangent-in`. A
+  patchbay that saved a connection to the names they had before (qpwgraph,
+  qjackctl, aj-snapshot) no longer makes it by itself: connect it again and
+  save. Choosing a MIDI input in Tangent works as before.
+- **Tangent no longer deletes a 4.x settings folder at launch.** 5.0.0 and
+  5.1.0 deleted the folder 4.x kept its settings in, unread, when they
+  started; from this release it is left where it is. It is still not read,
+  so paste a 4.x supporter key again, as with 5.0.
 
 ## [5.1.0] - 2026-10-18
 
@@ -124,20 +144,14 @@ published.
   folder; on Linux, delete `~/.vst3/Tangent.vst3` (or the one under your
   install prefix's `lib/vst3`) yourself. A DAW project that used it will report the plugin as missing. Tangent still
   hosts VST3 plugins on every platform, and LV2 on Linux and FreeBSD.
-- **4.x settings are cleared on the first launch.** Before 5.0, Tangent kept
-  its settings in `~/.config/ivory/` (on Windows,
-  `%USERPROFILE%\.config\ivory`). 5.0 keeps them in `~/.config/tangent/`
-  and deletes the old `ivory` folder, without reading it, the first time it
-  starts. That folder held your supporter key, the chord names you taught
-  Tangent, and your settings. Your projects and recordings were never in it
-  and are not touched. What to do when upgrading from 4.x:
+- **4.x settings do not carry over.** Before 5.0, Tangent kept its settings
+  in another folder; 5.0 keeps them in `~/.config/tangent/` and does not
+  read the old ones. Your supporter key, the chord names you taught Tangent
+  and your settings start fresh; your projects and recordings are not
+  affected. What to do when upgrading from 4.x:
   - Paste your supporter key again: right-click anywhere, Support
     Tangent..., Activate. The key is in the email it came in; if you cannot
     find it, reply to your Gumroad receipt and it will be sent again.
-  - To keep chord names you taught 4.x, copy the `ivory` folder somewhere
-    safe **before you start 5.0 for the first time**; the file that holds
-    them is `overrides.json`. Bringing it back into 5.0 has not been tested
-    on every 4.x version, so keep the copy until you have checked.
 
 ### Security
 
@@ -2412,9 +2426,9 @@ published.
   with the recorder showing and no camera selected at all was held at
   `LIVE_TICK` for as long as the band was open, collecting frames from a thread
   that did not exist. Found last, after every other pin below had been removed
-  and `IVORY_PACE_PROBE` still read `host_live=[camera]` on every second with
+  and `TANGENT_PACE_PROBE` still read `host_live=[camera]` on every second with
   nothing selected. The ledger now counts the camera only while a capture is
-  actually running. `IVORY_PACE_PROBE` prints `host_live=[...]`, the host's
+  actually running. `TANGENT_PACE_PROBE` prints `host_live=[...]`, the host's
   reasons for staying awake, so the next one of these names itself.
 
 - **The heart no longer sets the pace of the whole window.** The animated
@@ -2423,7 +2437,7 @@ published.
   MINIMUM asked, that one line beat every resting cadence the rest of the app
   had negotiated: with nothing playing, the owner's desk painted fifty-six
   frames a second for as long as it was open, about half a core, for a sprite
-  seven pixels wide. Found by adding `asked_by=` to `IVORY_PACE_PROBE`, which
+  seven pixels wide. Found by adding `asked_by=` to `TANGENT_PACE_PROBE`, which
   prints egui's own record of every call site that asked for a frame that
   second; it named this one on every frame. Every resting test had passed,
   because the test fixture turns the heart off - the one animator this machine
@@ -2432,7 +2446,7 @@ published.
   ten seconds) and only while the window is focused and not minimised; unseen,
   it still moves at the idle poll, for free. The analyzer answers to the same
   rule, since a noise floor moves its bins by more than its settling threshold
-  on every frame. `IVORY_PACE_PROBE` now also prints the smallest delay the
+  on every frame. `TANGENT_PACE_PROBE` now also prints the smallest delay the
   app's ledger and the host's ledger each asked for in the second.
 
 - **An idle desk rests, whatever is loaded on it.** Two more reasons a
@@ -2470,7 +2484,7 @@ published.
   the ballistics are untouched.
 
   Measured on the owner's machine with the modelled piano and Brusfri loaded and the
-  transport stopped: `IVORY_PACE_PROBE=1` read `fps=59 p99=18.3ms`, which is
+  transport stopped: `TANGENT_PACE_PROBE=1` read `fps=59 p99=18.3ms`, which is
   the 16 ms request plus the frame it buys, and `TANGENT_FRAME_LOG=1` priced
   that frame at `update 1.0/1.1/1.1 | cpu(prev) 2.7/3.0/3.1`. The resting
   policy had a test for an idle desk already; it rested its meters at exactly
@@ -2898,7 +2912,7 @@ published.
   second forever. Now every animator (the transport, live meters, a
   notification, the busy cover, the splash, a drag, the camera, the
   analyzer with signal) asks for its own frames, and a still window asks for
-  none. `IVORY_PACE` still forces the old cadence; `IVORY_PACE_PROBE=1`
+  none. `TANGENT_PACE` still forces the old cadence; `TANGENT_PACE_PROBE=1`
   shows the frame rate; `TANGENT_FRAME_LOG=1` logs where each second of
   frames went, section by section.
 
@@ -4515,16 +4529,15 @@ take is now simply the window it was played in.
 
 ### Changed
 
-- **Renamed from Ivory to Tangent.** Synthogy's Ivory is a well-known virtual
+- **Renamed to Tangent.** The old name was already a well-known virtual
   piano instrument, and a plugin build would have put this app in the same
   browser. The clavichord's tangent is the blade at the back of each key that
   strikes the string and stays in contact with it for as long as the note
   sounds, which is what the display does with a held note.
 - The binary is now `tangent`; artifacts are `Tangent-<version>-macos-*`,
   `tangent-<version>-windows-*` and `tangent-<version>-linux-*`.
-- Nothing you have is affected. `~/.config/tangent/` keeps your settings and
-  taught chords, existing supporter keys keep working, and downloads published
-  under the old `Ivory-*` names keep resolving.
+- Nothing you have is affected. Your settings and taught chords stay in the
+  folder they were in, and existing supporter keys keep working.
 
 ### Fixed (from the 2.2.0 tester report)
 
@@ -4543,7 +4556,7 @@ take is now simply the window it was played in.
 
 ### Added
 
-- **Supporter keys.** Ivory stays free and complete; a supporter key is a thank
+- **Supporter keys.** Tangent stays free and complete; a supporter key is a thank
   you, not a gate. Nothing is removed from the free app — chord detection,
   Chord Learning, every font and setting all stay exactly as they are. Keys are
   verified entirely offline: no network call, no account, no expiry, no machine
@@ -4566,7 +4579,7 @@ take is now simply the window it was played in.
   13,133-voicing test corpus, in both the stock and Chord Learning builds.
 - Diminished, half-diminished and augmented chords now use standard lead-sheet
   symbols: `C°`, `C°7`, `Cø7`, `C+` in place of the spelled-out forms.
-- `IVORY_LOG=debug` turns on diagnostic logging. Quiet by default; the app
+- `TANGENT_LOG=debug` turns on diagnostic logging. Quiet by default; the app
   writes nothing unless asked.
 
 ### Fixed
@@ -4590,7 +4603,7 @@ take is now simply the window it was played in.
   merely contains — it reads `Dm11`. Genuine pentatonics and exact six-note
   scales are unchanged; all twelve pitch classes together read
   `Chromatic Scale`.
-- The Dock showed a generic hexagon instead of Ivory's icon on macOS, and the
+- The Dock showed a generic hexagon instead of Tangent's icon on macOS, and the
   icon itself is now a properly rounded, padded squircle rather than a
   full-bleed square.
 
@@ -4598,7 +4611,7 @@ take is now simply the window it was played in.
 
 ### Added
 
-- **Chord Learning.** *Correct Chord Name…* lists the readings Ivory actually
+- **Chord Learning.** *Correct Chord Name…* lists the readings Tangent actually
   weighed for the voicing you are holding, with their scores, and trains a
   general preference toward the one you pick — so similar voicings shift too,
   rather than just the chord in front of you. Measured reach: one correction
@@ -4610,7 +4623,7 @@ take is now simply the window it was played in.
   corrections have been made, and which leanings have been picked up.
 - Every training attempt reports its outcome in plain language: learned,
   already wins, outranked by a later naming rule, too far behind to nudge, or
-  not one of the readings Ivory weighed.
+  not one of the readings Tangent weighed.
 
 ### Fixed
 
@@ -4641,19 +4654,19 @@ Python runtime, no Qt, a single self-contained executable per platform.
 
 - **Teach Chord Name…** — pin your own name to an exact voicing, optionally in
   all keys. Taught names are consulted before detection and stored in
-  `~/.config/tangent/overrides.json`, separate from your settings.
+  `overrides.json`, a file of their own beside your settings.
 - **Manage Taught Chords…** — review and delete taught names.
 - **Reset Settings to Default** in the context menu.
 - `custom_font_path` — an optional settings key pointing at any TTF/OTF on your
   machine, loaded ahead of the bundled fonts in every text style.
 - Courier Prime (Regular and Bold) is embedded in the binary on all three
-  platforms, so Ivory looks identical everywhere. `OFL.txt` and the font files
+  platforms, so Tangent looks identical everywhere. `OFL.txt` and the font files
   ship in every release artifact.
 - Real application icons: an `.icns` bundle on macOS and an embedded `.ico` on
   Windows.
 - Single-instance handling via a lock file. A crashed instance no longer blocks
   relaunch.
-- Any panic now surfaces as an "Ivory Error" dialog with the message and a
+- Any panic now surfaces as a "Tangent Error" dialog with the message and a
   backtrace instead of vanishing.
 
 ### Changed
@@ -4680,11 +4693,11 @@ Python runtime, no Qt, a single self-contained executable per platform.
   Linux build no longer needs a `pip install` to start.
 - Courier New is never bundled or redistributed. Courier Prime replaces it.
 
-> **One-way caveat when downgrading.** Ivory 2.x reads Python 1.1.0's
-> `~/.config/tangent/settings.json` in place, so upgrading is seamless. Going back
-> to Python 1.1.0 is not: it rewrites that file with its own fixed set of 13
-> keys, discarding `custom_font_path` and any other key it does not recognize.
-> Taught chord names live in a separate file, `~/.config/tangent/overrides.json`,
+> **One-way caveat when downgrading.** Tangent 2.x reads Python 1.1.0's
+> `settings.json` in place, so upgrading is seamless. Going back to Python
+> 1.1.0 is not: it rewrites that file with its own fixed set of 13 keys,
+> discarding `custom_font_path` and any other key it does not recognize.
+> Taught chord names live in a separate file beside it, `overrides.json`,
 > which the Python app never touches.
 
 ## [1.1.0] - 2025-12-31
@@ -4720,7 +4733,7 @@ First tagged release, ported from the original GTK3 prototype to Qt.
 - MIDI device selection, and a flats/sharps preference.
 - Window size presets (50%, 75%, 100%, 125%, 150%, 175%, 200%) and borderless
   mode with drag support.
-- Settings persistence at `~/.config/tangent/settings.json`.
+- Settings persistence in a `settings.json` under `~/.config`.
 - Cross-platform builds for Linux, Windows and macOS.
 
 ### Changed

@@ -45,11 +45,11 @@ ed25519-compact = { version = "2.3", default-features = false, features = ["opt_
 # `tests/` links this library built without `cfg(test)`, so with nothing
 # else asking for `test-home` (as nothing does under check.sh's two `cargo
 # test -p tangent-core` legs; a workspace run unified the binary's line in,
-# which hid it) `config::home`, `dir`, `file` and `purge_pre_5_0` were the
-# real ones there. Naming the crate itself turns the feature on for this
-# crate's test builds alone, the same road the binary and tangent-ui take;
-# dev edges are never followed for a crate that is somebody's dependency, so
-# no build that links this one sees it. `tests/test_home.rs` pins it, and
+# which hid it) `config::home`, `dir` and `file` were the real ones there.
+# Naming the crate itself turns the feature on for this crate's test builds
+# alone, the same road the binary and tangent-ui take; dev edges are never
+# followed for a crate that is somebody's dependency, so no build that links
+# this one sees it. `tests/test_home.rs` pins it, and
 # `scripts/check-home.sh features` reads it. `test-keyring` the same way, for
 # `tests/license_fixtures.rs`.
 tangent-core = { path = ".", features = ["test-home", "test-keyring"] }

@@ -64,11 +64,12 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   **DONE WHEN** the Windows arm folds into the software-encoder arm.
 - [ ] **W11 · About still says "Simple MIDI Keyboard Monitor with Advanced Chord Detection"**
   (`dialogs.rs:5656`), directly above "Version 5.0.0-beta.15". Draw the Tonnetz mark there too.
-- [ ] **W12 · README sells the retired VST3 plugin** (`:37, :45, :53-64, :134-137`) and links
-  Gumroad at **`/l/ivory`** — the one commercial URL the rename was supposed to protect.
+- [X] **W12 · README sells the retired VST3 plugin** (`:37, :45, :53-64, :134-137`) and links
+  Gumroad at the pre-rename permalink — the one commercial URL the rename was supposed to protect.
   *(2026-10-10: the plugin half is closed. The README no longer sells it (012aebd), and with the
-  plugin crate removed its "every crate in this repo is MIT" line is true. The Gumroad link
-  still reads `/l/ivory`.)*
+  plugin crate removed its "every crate in this repo is MIT" line is true. 2026-10-18: so is the
+  Gumroad half. The permalink is `/l/tangent`, the old one redirects to it, and the README,
+  README.txt and the key dialog link the new one.)*
 - [ ] **W13 · README claims the config path was never changed** so nobody's settings are orphaned.
   False in all three of its claims now (crates renamed, bundle id renamed, config path changed).
 - [ ] **W14 · `docs/ARTIFACT-README.md`** — shipped as `README.txt` inside *every* artifact — says
@@ -77,10 +78,11 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 - [ ] **W15 · `docs/RELEASE.md` is the stalest doc in the repo and it is the release checklist.**
   Old product name in the title, "ad-hoc signed only" (contradicted for many releases), old artifact
   names, and a trademark gate about the *previous* name. Following it ships the wrong thing.
-- [ ] **W16 · "That does not look like an Ivory supporter key."** `license.rs:96, :102, :106` — the
-  first thing a new supporter sees when a paste goes wrong.
-- [ ] **W17 · Store copy names the wrong sender.** `STORE-CONTENT.md:174` tells buyers the key
-  arrives from `keys@ivorymidi.com`.
+- [X] **W16 · The key-paste error named the old product.** `license.rs:96, :102, :106` — the
+  first thing a new supporter sees when a paste goes wrong. *(2026-08-31, 99c658ee: it says "a
+  Tangent supporter key", and a test holds it there.)*
+- [X] **W17 · Store copy names the wrong sender.** `STORE-CONTENT.md:174` tells buyers the key
+  arrives from the old sender domain. *(2026-08-31, 2cf184b5: it names keys@tangentdaw.org.)*
 - [ ] **W18 · `vst3_locations()` points FreeBSD at a path the scanner excludes.** `dialogs.rs:2222`
   else-arm names `/usr/lib/vst3`; `scan.rs:158` deliberately excludes it. Never mentions LV2, which
   on FreeBSD is the only format that exists.
@@ -88,7 +90,7 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   opposite (`instrument.rs:4061` zeroes `route_direct`). The dialog copy is correct; the module doc
   is backwards and is the first thing anyone reads before touching routing.
 - [ ] **W20 · All four README screenshots predate the 5.0 batch.** They show a chord monitor: no
-  recorder, mixer, arrangement, editor, drum machine or themes. `IVORY_SHOT` already renders
+  recorder, mixer, arrangement, editor, drum machine or themes. `TANGENT_SHOT` already renders
   deterministic frames headlessly, so this is a script.
 
 ### Tier 3 · packaging and release machinery
@@ -128,9 +130,12 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   about the *old* name's collision.
 - [ ] **W33 · Ledger backup stale since 11 August**, Dropbox-only (violating the keygen tool's own
   threat model), and the folder still carries the old name.
-- [ ] **W34 · Fulfilment runbook drifted from the service.** `SETUP.md` step 4 says
-  `fly volumes create ivory_data`; `fly.toml` mounts `tangent_data`. Following the runbook stands up
-  a service whose ledger is ephemeral. Confirm the historical ledger rode across the rename.
+- [ ] **W34 · Fulfilment runbook drifted from the service.** `SETUP.md` step 4 said
+  `fly volumes create` with the pre-rename volume name; `fly.toml` mounts `tangent_data`.
+  Following the runbook stood up a service whose ledger is ephemeral. Confirm the historical
+  ledger rode across the rename. *(2026-08-31, 2cf184b5: the runbook half is closed. Step 4
+  creates `tangent_data`, and the runbook asks for the ledger check before a deploy. What is
+  left is the check itself, the owner's, on Fly: `fly volumes list -a tangent-fulfil`.)*
 - [ ] **W35 · Double-minting bug.** `tangent-fulfil/src/main.rs:113` uses `?` on a per-line parse
   *inside* the loop, so one blank or malformed row makes every later sale look unfulfilled and mint
   a second key. The sibling function skips bad lines deliberately.
@@ -174,8 +179,9 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 
 - [ ] **W49 · The drum machine reaches no theme** — `drumpad_panel.rs:78` hard-codes face and ink.
   On Porcelain or Iris the whole app moves and it stays walnut.
-- [ ] **W50 · The export progress window is hard-coded ivory** (`dialogs.rs:2877`) and is on screen
+- [X] **W50 · The export progress window is hard-coded bone** (`dialogs.rs:2877`) and is on screen
   for minutes, with no stated rationale (unlike the ReaStream dialog, which has one).
+  *(2026-08-31, 99c658ee: it wears the desk's face, and a test holds it there.)*
 - [ ] **W51 · There is no dark theme.** All sixteen factory backgrounds are light; "Dusk" is a pale
   lilac. Decide the light/dark question and add two or three.
 - [ ] **W52 · The 16 px icon is an illegible smudge** — the source art has no silhouette at that
@@ -200,8 +206,10 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   warning-free (it emits ~670, or 998 with `--all-targets`, mostly one cosmetic lint it enabled
   itself), claims 33 unwraps against 242, and cites version 2.1.0. `cargo fmt --check` is 2,169
   hunks against a documented 171.
-- [ ] **W60 · The rename is incomplete in code.** `IvoryApp` (164 refs), `IVORY_*` env vars,
-  `rustfmt.toml:1` "Ivory formatting config", `tests/golden/README.md`.
+- [X] **W60 · The rename is incomplete in code.** The app struct (now `TangentApp`), the
+  old-prefix env vars (now `TANGENT_*`), `rustfmt.toml:1`'s old-name header,
+  `tests/golden/README.md`. *(2026-10-18: all four are done, and `scripts/check.sh` now fails on
+  any tracked line or file name that spells the old name.)*
 - [ ] **W61 · Stray tracked files:** `docs/FREEBSD-5.0-FINDINGS.md-e`,
   `tangent-record/examples/rtlatency.rs-e`, four `Cargo.toml.orig` under vendor/.
 - [ ] **W62 · ~25 dead items**, including `fn luma` defined twice and dead in both
@@ -213,7 +221,7 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
   telemetry (deliberate), no update check (deliberate), **no contact address anywhere in the app**,
   no issue link in the README, and no purchase link in the Supporter Key dialog.
 - [X] **W65 · Settings migrations 0–18 are now unreachable.** DECIDED KEEP 2026-08-31 (migrate_from doc says why). The only place a pre-19 file could live
-  was the directory `purge_pre_5_0` deletes unread. Decide whether to keep them.
+  was the 4.x directory, which 5.x never reads. Decide whether to keep them.
 - [ ] **W66 · `main.rs:524` says plugin editors are not implemented on Windows and Linux.** False on
   all four platforms — and that false premise is what keeps those platforms on the glow renderer.
   Re-evaluate the renderer choice once the comment is corrected.

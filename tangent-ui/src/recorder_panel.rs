@@ -353,8 +353,8 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// It MEASURES both candidates rather than testing a brightness threshold, and
 /// the difference is not academic: a mid grey sits below any sensible threshold
 /// and yet takes dark ink far better than light — 5.3 against 2.7. A threshold
-/// picked the ivory and produced the one genuinely unreadable band this whole
-/// mechanism exists to prevent.
+/// picked the light ink and produced the one genuinely unreadable band this
+/// whole mechanism exists to prevent.
 ///
 /// The worst case is a background whose luminance falls where the two curves
 /// cross, at about 0.17, where the better of the two still gives 3.57 — above
@@ -366,7 +366,7 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// there must be one answer rather than two that can drift apart.
 /// Everything a floating PANEL is made of, derived from one colour.
 ///
-/// **The same frozen pair kept turning up**: black-on-ivory in light mode and
+/// **The same frozen pair kept turning up**: black-on-cream in light mode and
 /// its inverse in dark, hard-coded separately in the right-click menus, the
 /// help card, the chord hover card, the dialogs, the theory band, the staff
 /// and the arrangement's chips. Seven copies of one decision, none of which
@@ -504,8 +504,8 @@ pub fn delta_e(a: Color32, b: Color32) -> f32 {
 /// The nearest shade of `c` that can actually CARRY its own ink at 4.5:1.
 ///
 /// **There is a dead zone**, and a derived surface lands in it sooner or
-/// later. Between roughly 0.12 and 0.22 relative luminance neither the ivory
-/// nor the near-black clears 4.5:1 — a mid tone is equally far from both — so
+/// later. Between roughly 0.12 and 0.22 relative luminance neither ink, light
+/// or near-black, clears 4.5:1 — a mid tone is equally far from both — so
 /// a panel derived from a pale theme's roles can come out a colour that
 /// nothing can be written on. Rather than let the ink lose, the SURFACE moves:
 /// away from whichever ink is already winning, by the least it takes.
@@ -4429,7 +4429,7 @@ fn draw_timeline_captions(painter: &Painter, r: Rect, view: &RecorderView<'_>, p
     }
 }
 
-/// The playhead, over the top: ivory at rest, the record button's own red
+/// The playhead, over the top: cream at rest, the record button's own red
 /// while the transport moves, with a small cap so it reads as a marker
 /// rather than a scratch on the picture.
 fn draw_timeline_playhead(painter: &Painter, r: Rect, view: &RecorderView<'_>) {
@@ -5154,15 +5154,15 @@ fn draw_caption_caret(
 /// **Fixed rather than taken from the palette**, and it is the one thing in
 /// this band that does not follow the background colour. A cap is a physical
 /// object sitting in a slot cut into the panel: it reads as bone on walnut and
-/// as bone on ivory, because it is always outlined and it always sits in a dark
-/// channel. A cap that restyled itself for a light background would be a
-/// painted-on rectangle, which is exactly the "strip of colour" the owner
+/// as bone on a light ground, because it is always outlined and it always sits
+/// in a dark channel. A cap that restyled itself for a light background would
+/// be a painted-on rectangle, which is exactly the "strip of colour" the owner
 /// rejected in the first place.
 pub(crate) const CAP_BONE: Color32 = Color32::from_rgb(0xE8, 0xDE, 0xC4);
 
 /// The channel the cap runs in: black, and the same black in every view.
 ///
-/// **From the owner's photograph of the real desk**, where the caps are ivory
+/// **From the owner's photograph of the real desk**, where the caps are bone
 /// and the slots they run in are cut black into the panel — not a shade of the
 /// panel, which is what a slider tinted from `well` produced: a pale line with
 /// a slightly-less-pale block on it, a diagram of a fader rather than a fader.
@@ -5958,7 +5958,7 @@ fn draw_ladder(painter: &Painter, r: Rect, filled: f32, hold: Option<f32>) {
 /// across a room, because a varispeed left engaged ruins a take silently.
 ///
 /// The face is the theme's `varispeed` role, which ships as the app's own
-/// ivory. The WELL is derived from the band's own ground so the recess reads
+/// cream. The WELL is derived from the band's own ground so the recess reads
 /// as a recess whatever the band is coloured, exactly as `Palette::well` is;
 /// and the ink on the face is measured against the face, never inherited —
 /// see `surface_of`.
@@ -6536,7 +6536,7 @@ fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
 
 /// The filters' caps.
 ///
-/// **Violet, and it is the one hue nothing else here uses.** They were ivory,
+/// **Violet, and it is the one hue nothing else here uses.** They were cream,
 /// which made two of the eight knobs read as blank caps with no colour at all
 /// — the odd ones out rather than a pair. Violet sits opposite the panel's
 /// warm brown, so it separates cleanly without competing with the sends'
@@ -8521,7 +8521,7 @@ mod tests {
 
     /// **One derivation for every floating panel, checked on every theme.**
     ///
-    /// The frozen pair — black-on-ivory light, its inverse dark — was
+    /// The frozen pair — black-on-cream light, its inverse dark — was
     /// hard-coded SEVEN times: the right-click menus, the help card, the
     /// chord hover card, the dialogs, the theory band, the staff and the
     /// arrangement's chips. Each was found by a screenshot rather than a

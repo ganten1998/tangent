@@ -953,7 +953,7 @@ mod tests {
     /// Render the default patch, and a cartridge patch if one is offered, to a
     /// `.wav` so a human can hear it.
     ///
-    ///   IVORY_SYX_DEMO=/path/to/bank.syx cargo test -p tangent --bins dx7_demo \
+    ///   TANGENT_SYX_DEMO=/path/to/bank.syx cargo test -p tangent --bins dx7_demo \
     ///     -- --ignored --nocapture
     #[test]
     #[ignore = "writes a file for a person to listen to"]
@@ -963,7 +963,7 @@ mod tests {
         let mut left = Vec::<f32>::new();
 
         let mut banks: Vec<(String, Voice)> = vec![("default".into(), Voice::default())];
-        if let Ok(path) = std::env::var("IVORY_SYX_DEMO") {
+        if let Ok(path) = std::env::var("TANGENT_SYX_DEMO") {
             match super::super::Cartridge::load(std::path::Path::new(&path)) {
                 Ok(c) => {
                     println!(

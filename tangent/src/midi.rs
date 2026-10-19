@@ -325,7 +325,7 @@ fn listening_input(client_name: &str) -> Option<midir::MidiInput> {
 
 /// Names of all available MIDI input ports.
 pub fn list_port_names() -> Vec<String> {
-    let Some(input) = new_input("ivory-scan") else {
+    let Some(input) = new_input("tangent-scan") else {
         return Vec::new();
     };
     input
@@ -379,7 +379,7 @@ pub fn connect_by_name(
     tap: Arc<RawMidiTap>,
     lane: Arc<MidiFastLane>,
 ) -> Result<MidiConnection, String> {
-    let input = listening_input("ivory").ok_or_else(|| "MIDI system unavailable".to_string())?;
+    let input = listening_input("tangent").ok_or_else(|| "MIDI system unavailable".to_string())?;
     let port = input
         .ports()
         .into_iter()
@@ -389,7 +389,7 @@ pub fn connect_by_name(
     let conn = input
         .connect(
             &port,
-            "ivory-in",
+            "tangent-in",
             move |stamp_us, message, _| {
                 // The raw tee comes FIRST and unconditionally. `stamp_us` is
                 // MICROSECONDS on every midir backend — the CoreMIDI one is

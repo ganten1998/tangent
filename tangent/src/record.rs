@@ -1192,9 +1192,9 @@ pub struct Session {
     /// setting that quietly stops being true.
     ///
     /// It had no consumer at all until 4.20.0. The fader was drawn, dragged and
-    /// persisted, and nothing in `ivory/src` ever read it — the owner reported
-    /// it as "moving it changes neither the VUs nor the recorded level", which
-    /// was exactly right.
+    /// persisted, and nothing in the app's source ever read it — the owner
+    /// reported it as "moving it changes neither the VUs nor the recorded
+    /// level", which was exactly right.
     audio: Option<Audio>,
     /// Why the audio device is not open, if it is not.
     audio_error: Option<String>,

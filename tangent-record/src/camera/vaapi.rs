@@ -342,8 +342,8 @@ macro_rules! sym {
 }
 
 fn debug(msg: &str) {
-    if std::env::var_os("IVORY_VAAPI_DEBUG").is_some() {
-        eprintln!("ivory vaapi: {msg}");
+    if std::env::var_os("TANGENT_VAAPI_DEBUG").is_some() {
+        eprintln!("tangent vaapi: {msg}");
     }
 }
 
@@ -663,8 +663,8 @@ impl Decoder {
     /// machine cannot do it — in which case the caller keeps `zune-jpeg` and
     /// nothing else changes.
     pub(super) fn new(width: u32, height: u32, sample: &[u8]) -> Option<Self> {
-        if std::env::var_os("IVORY_NO_VAAPI").is_some() {
-            debug("disabled by IVORY_NO_VAAPI");
+        if std::env::var_os("TANGENT_NO_VAAPI").is_some() {
+            debug("disabled by TANGENT_NO_VAAPI");
             return None;
         }
         let h = parse(sample)?;
@@ -684,7 +684,7 @@ impl Decoder {
 
         // A render node, not a card node: rendering needs no DRM master, so
         // this works in a plain user session with no X or Wayland involved.
-        let path = std::env::var("IVORY_VAAPI_DEVICE")
+        let path = std::env::var("TANGENT_VAAPI_DEVICE")
             .unwrap_or_else(|_| "/dev/dri/renderD128".to_owned());
         let mut cpath = path.clone().into_bytes();
         cpath.push(0);
@@ -1414,7 +1414,7 @@ mod tests {
     /// can assume, and neither is a corpus of camera frames. Point it at real
     /// ones to actually exercise the hardware —
     ///
-    ///   IVORY_VAAPI_TEST_FRAMES='frames/*.jpg' cargo test -p tangent-record
+    ///   TANGENT_VAAPI_TEST_FRAMES='frames/*.jpg' cargo test -p tangent-record
     ///
     /// The tolerance is not zero and cannot be: the two decoders round chroma
     /// upsampling differently, and this module converts in 7-bit fixed point.
@@ -1422,7 +1422,7 @@ mod tests {
     /// swapped plane, which are the failures that matter.
     #[test]
     fn hardware_matches_software_on_real_frames() {
-        let Some(pattern) = std::env::var_os("IVORY_VAAPI_TEST_FRAMES") else {
+        let Some(pattern) = std::env::var_os("TANGENT_VAAPI_TEST_FRAMES") else {
             return;
         };
         let pattern = pattern.to_string_lossy().into_owned();

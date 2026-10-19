@@ -25,7 +25,8 @@ is `tangent-fulfil announce --subject <text> --body <file> [--ledger <path>]
 
 "Replies come to me": the deployed `MAIL_REPLY_TO` is keys@tangentdaw.org,
 which Porkbun forwards to a read inbox (owner, 2026-10-12). Past keys were
-sent from keys@ivorymidi.com, so the body names that address for the search.
+sent from the old sender domain, so the body offers a resend on reply
+instead of naming the address.
 
 ---
 
@@ -62,16 +63,12 @@ Two things to know before you upgrade from 4.x:
    remove the old Tangent.vst3 on macOS and Windows; on Linux, delete
    ~/.vst3/Tangent.vst3 yourself. Tangent still hosts your plugins.
 
-2. 5.0 keeps its settings in a new folder and deletes the old
-   ~/.config/ivory folder the first time it starts. That folder held your
-   settings, the chord names you taught Tangent, and your key. Your projects
-   and recordings are not in it and are not touched. After upgrading, paste
-   your key again (right-click anywhere, Support Tangent..., Activate). It is
-   in the email your key first came in: search your inbox for
-   keys@ivorymidi.com. If you cannot find it, reply and I will send it
-   again. If you taught Tangent chord names you want to keep, copy the
-   ~/.config/ivory folder somewhere safe before you start 5.0; the names
-   are in overrides.json.
+2. 5.0 keeps its settings in a new folder and does not read the ones 4.x
+   kept, so your settings, taught chord names and key start fresh. Your
+   projects and recordings are not touched. After upgrading, paste your key
+   again (right-click anywhere, Support Tangent..., Activate). It is in the
+   email your key first came in. If you cannot find it, reply to this email
+   or to your Gumroad receipt and I will send it again.
 
 Download (these links always fetch the current version):
 
