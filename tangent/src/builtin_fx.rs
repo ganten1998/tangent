@@ -1001,12 +1001,15 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // Bias is decibels either side of the point the machine is aligned
         // at, and the middle of the dial IS that point, so it says so in
         // the machine's word rather than as a number: "aligned" there, and
-        // a signed reading either side of it, symmetric about it.
+        // a signed reading either side of it, symmetric about it. Every
+        // figure that would print as zero says the word too
+        // ([`bias_reads_aligned`]), so no reading is ever a signed nothing.
         (TAPE_PATH, 10) => {
-            if v == 0.5 {
+            let db = crate::units::tape::BIAS_RANGE_DB * (2.0 * v - 1.0);
+            if bias_reads_aligned(db) {
                 "aligned".to_owned()
             } else {
-                fmt_db(crate::units::tape::BIAS_RANGE_DB * (2.0 * v - 1.0))
+                fmt_db(db)
             }
         }
         // The rest of the tape speaks in percent on purpose: those knobs are
@@ -1059,6 +1062,21 @@ pub fn reading_number(text: &str) -> Option<f64> {
     Some(n * scale)
 }
 
+/// **Whether a bias of `db` decibels reads as the aligned point**: every
+/// figure the reading would print as zero, of either sign.
+///
+/// The dial's middle is exactly 0.5, but a reading has a tenth of a
+/// decibel, so the knob a hair either side of it printed "+0.0 dB" or
+/// "-0.0 dB": the aligned point in the panel's own precision, signed as if
+/// it were not. Decided by printing the figure the way the reading does and
+/// reading the number back, so the word's span is exactly the span the
+/// format rounds to zero, whatever its rounding rule. [`describe`] prints
+/// the word over that span, and [`value_for_reading`] lands a typed number
+/// it covers on the middle itself.
+fn bias_reads_aligned(db: f32) -> bool {
+    reading_number(&tangent_ui::face::fmt_db(db)) == Some(0.0)
+}
+
 /// **A knob position for words typed into its reading**, on the unit's own
 /// scale - `None` when the unit cannot read them.
 ///
@@ -1081,6 +1099,19 @@ pub fn value_for_reading(path: &str, id: u32, typed: &str, siblings: &[f32]) -> 
     let at = |i: usize| i as f32 / N as f32;
     let read = |v: f32| describe(path, id, v, siblings);
     let lower = want.to_lowercase();
+    // **Bias's word, and any bias typed as nothing, is the aligned point
+    // itself**: the middle of the dial, where a drag's catch and a
+    // double-click land. Asked before the search, because the word reads
+    // over a span either side of the middle ([`bias_reads_aligned`]), whose
+    // first sample is not the middle, and no sample reads a zero for a
+    // typed 0 to find: it used to land on the first reading that parsed to
+    // one, 127/256, which printed "-0.0 dB" and ran the tape 0.047 dB
+    // under-biased.
+    if (path, id) == (TAPE_PATH, 10)
+        && (lower == "aligned" || reading_number(want).is_some_and(|n| bias_reads_aligned(n as f32)))
+    {
+        return Some(0.5);
+    }
     if let Some(i) = (0..=N).find(|&i| read(at(i)).trim().to_lowercase() == lower) {
         return Some(at(i));
     }
@@ -4585,9 +4616,9 @@ mod tests {
     /// home land too; either side reads signed decibels, the same figure
     /// with its sign turned at the same distance either way; and every
     /// reading the dial can show, typed back into it, lands where the
-    /// reading says the same: the word, or the same number. (Typed "+0.0"
-    /// may land a hair the other side of aligned, which reads "-0.0", the
-    /// same number: the dial's middle answers to its word, not to zero.)
+    /// reading says the same: the word, or the same number. The middle
+    /// answers to zero as well as to its word now, and no reading is a
+    /// signed zero: the test after this one holds that.
     #[test]
     fn the_bias_reads_signed_about_aligned_and_every_reading_reads_back() {
         assert_eq!(describe(TAPE_PATH, 10, 0.5, &[]), "aligned");
@@ -4614,6 +4645,47 @@ mod tests {
                 "Bias at {v} reads {shown}, which typed back lands at {typed}, reading {again}"
             );
         }
+    }
+
+    /// **A bias typed as zero lands aligned, and no reading is a signed
+    /// zero.**
+    ///
+    /// A reading has a tenth of a decibel, so the dial a hair either side
+    /// of its middle printed "+0.0 dB" or "-0.0 dB", and a hand typing 0
+    /// into the row, meaning aligned, landed on the first of those the
+    /// search met: 127/256, reading "-0.0 dB", the tape 0.047 dB
+    /// under-biased and off the panel's centre mark. Every figure the
+    /// reading would print as zero is the aligned point in its own
+    /// precision, so it reads the word, and a typed number that rounds to
+    /// zero, of either sign, with or without its unit, lands on the middle
+    /// exactly, as the word does. The word covers that span and no more:
+    /// a figure that prints a tenth of a decibel still prints it, signed.
+    #[test]
+    fn a_bias_typed_as_zero_lands_aligned_and_no_reading_is_a_signed_zero() {
+        for typed in ["0", "0 dB", "+0.0", "-0.0", "-0.0 dB", "+0.0 dB", "0.04", "-0.04 dB"] {
+            assert_eq!(
+                value_for_reading(TAPE_PATH, 10, typed, &[]),
+                Some(0.5),
+                "Bias typed {typed:?} did not land on the aligned point"
+            );
+        }
+        // The whole travel, finely, and closer still about the middle, where
+        // the signed zeroes stood (within 1/240 of it, at 6 dB a side).
+        let fine = (0..=65_536).map(|i| i as f32 / 65_536.0);
+        let near = (1..=2_000).flat_map(|k| [0.5 + k as f32 * 2.5e-6, 0.5 - k as f32 * 2.5e-6]);
+        for v in fine.chain(near) {
+            let shown = describe(TAPE_PATH, 10, v, &[]);
+            assert!(
+                shown == "aligned" || reading_number(&shown).is_some_and(|n| n != 0.0),
+                "Bias at {v} reads {shown}: a signed zero, not the aligned point"
+            );
+        }
+        // The word's span is the one the format rounds to zero, no wider.
+        let step = 0.1 / (2.0 * crate::units::tape::BIAS_RANGE_DB);
+        assert_eq!(describe(TAPE_PATH, 10, 0.5 + 0.8 * step / 2.0, &[]), "aligned");
+        assert_eq!(describe(TAPE_PATH, 10, 0.5 - 0.8 * step / 2.0, &[]), "aligned");
+        assert_eq!(describe(TAPE_PATH, 10, 0.5 + 1.2 * step / 2.0, &[]), "+0.1 dB");
+        assert_eq!(describe(TAPE_PATH, 10, 0.5 - 1.2 * step / 2.0, &[]), "-0.1 dB");
     }
 
     /// **The tape's selectors offer exactly their positions.** A stepped row
