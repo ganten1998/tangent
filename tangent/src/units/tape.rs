@@ -7829,7 +7829,19 @@ mod tests {
     /// designs on their sub-block grid, the wear on its own, every glide and
     /// every draw per frame. So the same two seconds with everything engaged
     /// at 48 kHz come out bit for bit alike through blocks of 7, 64, 333 and
-    /// 512 frames.
+    /// 512 frames. Held still, though, the voicing is designed once and
+    /// never again, which cannot tell a design grid counted from `new` from
+    /// one counted from each block's start. So the two seconds play again
+    /// with the controls the voicing is designed from moving every 4096
+    /// frames (the speed through all four, the range between the heads, the
+    /// bias across aligned, Age, Damage, Bump and Roll), each block cut at
+    /// the moves so every block size meets each one on the same frame:
+    /// blocks of 1, 7, 31, 32, 64, 333, 512 and 1000 frames play what blocks
+    /// of 4096 do, bit for bit. With the designs counted from each block's
+    /// start instead, the still leg passes and this one does not: every
+    /// size that is not a whole number of sub-blocks parts from 4096's at
+    /// its first block after a move that starts off the grid, frame 4097 in
+    /// blocks of 1, 4429 in blocks of 333 and 5096 in blocks of 1000.
     #[test]
     fn a_tape_track_sounds_the_same_at_any_buffer_size() {
         let sr = 48_000.0_f32;
@@ -7854,6 +7866,41 @@ mod tests {
             let other = through(block);
             let off = at_512.iter().zip(&other).position(|(x, y)| x.to_bits() != y.to_bits());
             assert_eq!(off, None, "blocks of {block} frames played another tape");
+        }
+
+        // Moving: a new setting every 4096 frames, which no block straddles.
+        let moved = |k: usize| TapeParams {
+            speed: (k % 4) as f32 / 3.0,
+            wow_range: [0.0, 1.0, 1.0, 0.0, 1.0][k % 5],
+            bias: [0.5, 0.0, 1.0, 0.3][k % 4],
+            age: [0.0, 1.0, 0.5][k % 3],
+            damage: [0.0, 1.0][k % 2],
+            bump: [0.5, 1.0, 0.0][k % 3],
+            roll: [0.0, 0.4, 0.8][k % 3],
+            ..everything_engaged()
+        };
+        let automated = |block: usize| {
+            let mut unit = Tape::new(sr);
+            let mut out = input.clone();
+            let total = out.len() / 2;
+            let mut done = 0;
+            while done < total {
+                let next = (done / 4096 + 1) * 4096;
+                let n = block.min(total - done).min(next - done);
+                unit.process(&mut out[done * 2..(done + n) * 2], n, 2, &moved(done / 4096));
+                done += n;
+            }
+            out
+        };
+        let at_4096 = automated(4096);
+        for block in [1, 7, 31, 32, 64, 333, 512, 1000] {
+            let other = automated(block);
+            let off = at_4096.iter().zip(&other).position(|(x, y)| x.to_bits() != y.to_bits());
+            assert_eq!(
+                off.map(|i| i / 2),
+                None,
+                "with the controls moving, blocks of {block} frames played another tape from that frame on"
+            );
         }
     }
 
