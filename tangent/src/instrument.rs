@@ -17506,12 +17506,29 @@ impl Renderer {
         // master. "The drum rack doesn't feed into subsequent effects" is
         // exactly that, and the two names being different is the whole bug.
         //
-        // Running the lane's rack here means it can run twice in a block —
-        // once over the lane's own clips and once over what arrives from the
-        // pads. That is the bargain this engine already makes for SENDS, and
-        // the comment on the send-destination pass says so: a destination's
-        // rack processes what is sent to it, exactly as the drum bus
-        // processes its summed kit. The drums are one more thing arriving.
+        // **Once a chunk, and this is the once.** A kit that reaches this
+        // pass is a kit-alone lane's or a resting one's, and the lane pass
+        // runs no chain for either; a kit layered with another instrument is
+        // poured into the head of its lane's own chain (`pour_kits`) and is
+        // passed by here. So the lane's chain runs here and nowhere else
+        // that chunk, kit and all
+        // (`a_kit_layered_with_other_instruments_runs_its_lanes_chain_once_a_block`).
+        // It used to run twice a block for a lane with an instrument beside
+        // its kit, once over the lane's own pass and once over the pads.
+        // **Nor over a chain the room has already clocked this chunk.** A
+        // drum lane armed with an input open and monitored has its chain run
+        // by the room over what is played (`mix_monitor`, which runs before
+        // this pass), and running it again here over the kit clocked every
+        // unit on it twice a block and played a bypassed Denoise's, IR's or
+        // Tape's two inputs through one dry line, each run reading the
+        // other's frames back. So the kit goes past the chain while the room
+        // holds it, as an instrument or a poured kit on a lane the room is
+        // playing does (`render_lane`), and waits for the whole of the
+        // compensation below, having paid none of it
+        // (`a_drum_lane_the_room_is_monitoring_runs_its_chain_once_a_chunk`).
+        // The chain's own record of the stretch it was told (`Rack::told`)
+        // says whether it ran this chunk: nothing else runs a drum lane's
+        // chain before this pass.
         // **Not over a kit standing on a FOLDER.** That folder's rack runs
         // once, in `fold_folders`, over the whole group — see the note in
         // `mix_channels`. Running it here as well processed the kit twice a
@@ -17523,7 +17540,10 @@ impl Renderer {
         // index names a special's seat, never the lane's.
         let bus_rack = drum_lane.map_or(bus_strip.index(), |ch| lane_seat(ch, CHAIN_OWN));
         let folded_here = drum_lane.is_some_and(|ch| self.spine.ext.folder_is[ch]);
-        if !folded_here && seat_rack(&self.racks, &self.spine.lanes, bus_rack).is_some_and(|r| !r.is_empty()) {
+        let chunk = self.shared.transport_chunk.load(Ordering::Relaxed);
+        let room_ran = drum_lane.is_some()
+            && seat_rack(&self.racks, &self.spine.lanes, bus_rack).is_some_and(|r| r.told.0 == chunk);
+        if !folded_here && !room_ran && seat_rack(&self.racks, &self.spine.lanes, bus_rack).is_some_and(|r| !r.is_empty()) {
             // **This seat's own parameter queue, not the empty one.** Every rack
             // outside the general channels used to be handed an empty queue,
             // which was true while the only writer was an automation curve —
@@ -17593,10 +17613,16 @@ impl Renderer {
             // (`Layer::effects_only`), so it is that much earlier than the
             // lane's own audio, and waits that much longer to meet it. A
             // chain with no voice pays none, and the wait is what it was.
-            let own = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, bus_rack).saturating_sub(
-                seat_rack(&self.racks, &self.spine.lanes, bus_rack)
-                    .map_or(0, |r| voices_paid(r, &self.shared, bus_rack)),
-            );
+            // A kit that went past a chain the room ran (`room_ran`) paid
+            // none of it, and waits for all of it.
+            let own = if room_ran {
+                0
+            } else {
+                Rack::latency(&self.shared, &self.spine.ext.desk.frozen, bus_rack).saturating_sub(
+                    seat_rack(&self.racks, &self.spine.lanes, bus_rack)
+                        .map_or(0, |r| voices_paid(r, &self.shared, bus_rack)),
+                )
+            };
             let folded = drum_lane.map_or(0, |c| self.spine.ext.folder_lat[c]);
             let wait = usize::try_from(
                 self.shared
@@ -45311,6 +45337,104 @@ mod slot_engine {
                 let lane = column(&stems, e.lane_capacity(), LANE);
                 assert!(peak(&lane) > 1e-3, "with the DX7 {with_dx7}: the layered kit track is silent");
             }
+        }
+
+        /// **A drum lane the room is monitoring runs its chain ONCE a
+        /// chunk**, the kit and the input both reaching it, and its kit lands
+        /// on the frame it lands on when nobody is monitoring.
+        ///
+        /// One rack per seat, one clock per chunk: the room runs a lane's
+        /// chain over the input somebody is playing (`mix_monitor`, on the
+        /// chunks after its claim), and the kit pass runs a drum lane's chain
+        /// over its kit (`mix_pad_lane`). A kit-alone drum lane, armed with
+        /// an input open and monitored, is the one lane both reach in a
+        /// chunk: run twice, every unit on it was clocked twice a block, and
+        /// a bypassed Denoise, IR or Tape played the two runs' inputs through
+        /// one dry line, each run reading the other's frames back. The rig is
+        /// `a_kit_layered_with_other_instruments_runs_its_lanes_chain_once_a_block`'s
+        /// drum lane with a lookahead Denoise in its first bay, armed, the
+        /// kit struck at frame 6,000 (the room's claim has landed by then),
+        /// once with a pick bound to the lane, silence arriving on it every
+        /// block and the room listening, and once
+        /// with no input at all: once the kit sounds, its own seat is clocked
+        /// once a block either way, and the kit's first frame in the lane's
+        /// stem is the same, since a kit the room's chain stands past waits
+        /// for the whole of the compensation, having paid none of the
+        /// Denoise's lookahead.
+        #[test]
+        fn a_drum_lane_the_room_is_monitoring_runs_its_chain_once_a_chunk() {
+            use crate::lane_bank::{MonitorPick, MonitorPlan};
+            // Twenty-four blocks, counted from the thirteenth: the kit has
+            // sounded since the twelfth (6,000 / 512), so from there both
+            // passes want the chain every block.
+            const BLOCKS: usize = 24;
+            const FROM: usize = 12;
+            let render = |monitored: bool| -> (u64, bool, Vec<f32>) {
+                let mut e = wide(WIDTH);
+                let slot = Slot(LANE as u32);
+                let gen = e.lane_gen(slot).expect("a lane");
+                e.attach(slot, gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                e.attach(slot, gen, LanePart::Kit(Box::new(kit_with(0)))).expect("the kit");
+                let own = LaneFlags::DRUM.with(LaneFlags::MIDI_OFF, true).with(LaneFlags::ARMED, true);
+                let inputs = plan(&e, WIDTH, &|s| if s == LANE { own } else { LaneFlags::MIDI_OFF });
+                e.publish_plan(&inputs).expect("the plan goes");
+                let addr = RackAddr { owner: RackOwner::Lane(slot), rack: 0 };
+                e.load_insert_at(addr, 0, Some(Path::new(crate::builtin_fx::DENOISE_PATH)), None)
+                    .expect("the denoiser loads")
+                    .expect("and seats");
+                let (mut jack, rx) = RingBuffer::<f32>::new(1 << 16);
+                if monitored {
+                    let picks = tangent_record::audio::Picks::EVERYTHING;
+                    e.set_monitor(Some((rx, 1, vec![1].into_boxed_slice(), BLOCK as u32, picks.clone())));
+                    let pick = MonitorPick { pick: PickId(0), slot, gen, width: 1, cols: [0, 0] };
+                    e.set_monitor_plan(MonitorPlan { layout_only: true, ..MonitorPlan::with_picks(vec![pick], picks) })
+                        .expect("never refused");
+                    e.set_monitor_on(true);
+                }
+                e.set_midi_slotted(vec![SlotPlacedMidi {
+                    slot,
+                    gen,
+                    placed: PlacedMidi {
+                        strip: 0,
+                        start: 0,
+                        len: 48_000,
+                        notes: Arc::new(vec![ClipNote { at: 6_000, dur: 20_000, key: PAD_BASE, vel: 110 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                }]);
+                e.set_stems(true);
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let mut stems = Vec::new();
+                for b in 0..BLOCKS {
+                    if b == FROM {
+                        let r = e.offline.as_ref().expect("a renderer");
+                        r.shared.rack_count_seat.store(lane_seat(LANE, CHAIN_OWN), Ordering::Relaxed);
+                        r.shared.rack_count.store(0, Ordering::Relaxed);
+                    }
+                    // The input arrives every block and is silence, so the
+                    // lane's stem carries the kit alone.
+                    for _ in 0..BLOCK {
+                        let _ = jack.push(0.0);
+                    }
+                    e.render_offline(&mut out);
+                    e.drain_stems(&mut stems);
+                }
+                let r = e.offline.as_ref().expect("a renderer");
+                let held = r.spine.ext.stood_aside.contains(LANE);
+                (r.shared.rack_count.load(Ordering::Relaxed), held, column(&stems, e.lane_capacity(), LANE))
+            };
+            let (alone, alone_held, alone_lane) = render(false);
+            let (runs, held, lane) = render(true);
+            assert!(held && !alone_held, "the room holds the drum lane's chain {held} with an input and {alone_held} without, so nothing is proved");
+            let counted = (BLOCKS - FROM) as u64;
+            assert_eq!(alone, counted, "the drum lane's chain ran {alone} times in {counted} blocks with no input");
+            assert_eq!(runs, counted, "the monitored drum lane's chain ran {runs} times in {counted} blocks");
+            let onset = |col: &[f32]| col.chunks_exact(2).position(|f| f[0].abs() > 1e-3 || f[1].abs() > 1e-3);
+            let (at, alone_at) = (onset(&lane), onset(&alone_lane));
+            assert!(alone_at.is_some_and(|f| f > 6_000), "the kit did not sound after its strike ({alone_at:?})");
+            assert_eq!(at, alone_at, "the monitored drum lane's kit lands at frame {at:?}, at {alone_at:?} with no input");
         }
 
         /// **A track not listening hears no live note on any of its
