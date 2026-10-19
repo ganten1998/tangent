@@ -1,35 +1,138 @@
-# Tape's processor cost in 5.2 (open issue)
+# Tape's processor cost in 5.3
 
-Measured 2026-10-18 on the M-series Mac the project is built on, release build,
-quiet machine, each bench run alone with `--test-threads=1`.
+Measured 2026-10-19 on the M-series Mac the project is built on, release
+build, each bench run alone with `--test-threads=1`. **Every 5.3 figure in
+microseconds here was taken on a shared machine**: two other lanes were
+compiling and running their suites at the same time, so each is a
+ceiling, not the final word, and a quiet machine will read lower. What
+decided each change is an interleaved A/B ratio (see "How it was
+measured"), which a busy machine moves far less.
 
 ## Tangent Tape
 
-| | 5.1 (main 825a91c3) | 5.2 (tape/machine) |
+| | 5.1 (main 825a91c3) | 5.2 (quiet, the day it shipped) | 5.2 kernel at aa94a2be (shared) | 5.3 (shared) |
+|---|---|---|---|---|
+| `rt_bench` row "16 lanes x Tape", mean per block | 370.5 us (23.2 per insert) | 470.6 us (29.4 per insert) | 372.0 us (23.3 per insert) | 194.8 to 195.1 us (12.2 per insert) |
+| `the_tape_costs_what_its_budget_says`, defaults, mean (warmed) | | 20.7 to 20.8 us | 22.5 to 22.8 us | 9.8 to 11.4 us |
+| the same, fully engaged, p99 | | 34.7 to 35.8 us | 32.5 to 34.3 us | 17.5 to 20.3 us |
+
+The design's budget was 16 us at the defaults (the bench's bars were 21
+and 24 us) and never above 5.1's cost. 5.3 is under all of it: the
+sixteen-lane row is 0.53 of 5.1's and 0.52 of the kernel this work
+started from, the defaults are under the budget, and the p99 fully
+engaged is under its 24 us bar. The base this
+work started from (aa94a2be: 5.2 with the sixteen-tap play head and the
+filters that glide while a control moves) was measured on the same
+machine in the same hour, and that column is the one to compare with: the
+5.2 row read 470.6 us the day it shipped, on a quiet machine and another
+build of the engine, and the kernel this work started from reads 372.0
+here today. The machine was a little slower when 5.3's rows were taken:
+the Drive's row, which nothing here touches, read 572.1 us beside the
+372.0 and 593.1 and 603.8 beside 5.3's two.
+
+The single-unit bench now holds the mean at the defaults to the design's
+16 us and the p99 fully engaged to 30 us (the shared-machine reading with
+a margin); tighten them with quiet numbers, never raise them.
+
+## What 5.3 changed
+
+**The record stage runs a chunk at a time** (`units::tape::record`). It
+was about three quarters of what a Tape cost. Its polyphase pair ran a sample at
+a time: every sample was pushed into a history newest first and the
+whole window read back at once, before the processor could hand the load
+the sample just stored, and every dot product waited on the one before.
+Compiled, the dot products were unrolled into scalar multiply-adds with
+the taps spilled to the stack, about one multiply-add a cycle, which is
+why the polyphase pair's 226 multiply-adds cost what the old direct
+form's 484 did.
+
+`Tape::process` now runs a block as chunks that end at the next design
+(32 frames) or at the end of the block, each in two halves around the
+record stage. The first half runs frame by frame as far as the record
+stage (the moving designs' turn, the glides, the heads, the transformer,
+the erasure's envelope, the NAB and under-bias shelves) and leaves what
+the second half needs of each frame in a `Cue`. The record stage then
+takes the whole chunk on both channels: the interpolators and the
+decimators as block filters (`fir`, `fir_halves`) whose outputs, eight at
+a time, sit in the lanes of two vectors, and each channel's four
+sub-phases as eight curves side by side a frame. The second half runs
+frame by frame from there. Every output keeps its eight partial sums and
+their tree, so not a bit of the sound moved.
+
+How the filters are written mattered as much as what they compute. The
+same arithmetic written as one array of eight lanes and inlined had every
+tap hoisted out of every loop and spilled: 32 outputs of an 80-tap filter
+took 348 ns, where the shape that shipped takes 56, within a tenth of the
+processor's own vector instructions written by hand. And the 2x
+decimator's first version picked each tap's half of its input with an
+index worked out at run time, which kept its sums in memory; written as
+one even and one odd sum a step, it fell from 18 % of a Tape's time to
+4 %.
+
+**The play head's dot product holds its eight sums as two halves of
+four**, the same arithmetic in the same order. Held as one array of
+eight, the compiler paired each sum of the read's two rows into a vector
+of two lanes and shuffled every tap into place.
+
+**Both are bit-exact.** A grid of 1408 renders outside the tree (every
+control at its ends and between, each speed, both ranges, NaN and
+out-of-range params, automation on the 4096-frame grid and inside blocks,
+8 to 192 kHz, blocks of 1, 7, 128, 333 and 4096 frames, mono, stereo and a
+wider stride, `clear()` mid-render, silence, impulses and non-finite
+samples in the input) plays 42.4 million samples a side, bit for bit the
+same as aa94a2be, on this machine and on the x86-64 baseline (built for
+x86_64-apple-darwin and run under Rosetta, where `fma` is a multiply and
+an add). A test in the tree holds the chunked record stage to the
+sample-at-a-time pair, kept in the tests as its reference, bit for bit.
+
+## How it was measured
+
+A harness outside the tree includes aa94a2be's kernel byte for byte and
+this tree's by path, and alternates the two on one thread at
+user-interactive QoS (so it stays on a performance core), in rounds of
+2000 blocks of 128 stereo frames at 48 kHz each, the order swapped every
+round; each round gives a ratio of thread CPU time, and the median of the
+ratios decides. Two kernels placed differently on the stack read up to 4 %
+apart while running the same code, so both are placed alike on the heap,
+and a kernel then reads within 1 % of itself (0.996 to 1.008).
+Changes of a few percent were measured again with loops and functions
+aligned to 64 bytes in both, to keep where the code lands out of it.
+
+| change | defaults | fully engaged |
 |---|---|---|
-| `rt_bench` row "16 lanes x Tape", mean per block | 370.5 us (23.2 per insert) | 470.6 us (29.4 per insert) |
-| `the_tape_costs_what_its_budget_says`, defaults, mean (warmed) | | 20.7 to 20.8 us |
-| the same, fully engaged, p99 | | 34.7 to 35.8 us |
+| the record stage a chunk at a time, against aa94a2be | 0.446 (IQR 0.443 to 0.451) | 0.523 (0.519 to 0.527) |
+| the dot product as two halves, against the line above | 0.982 (0.976 to 0.988) | 0.992 (0.986 to 0.997) |
+| 5.3, against aa94a2be (two runs of 100 rounds) | 0.436 and 0.447 (IQR 0.432 to 0.443, 0.435 to 0.457) | 0.543 and 0.535 (0.535 to 0.573, 0.521 to 0.544) |
 
-The design's budget was 16 us at the defaults and never above 5.1's cost; the
-bench's own bars were 21 and 24 us. On the sixteen-lane row, which warms both
-builds the same way, the new Tape costs about 27 % more than 5.1's: a little
-over 1 % of one core per insert at 48 kHz and 128 frames. The single-unit
-bench now holds the measured figures with a margin (26 and 44 us); lower the
-bars as the cost comes down. Unwarmed, a fresh binary's first seconds read
-about 30 % dearer (the thread starting on an efficiency core, or the clock
-ramping), so the bench runs a second untimed first.
+## Measured and not kept
 
-Where the time goes, from a throwaway profile that switched stages off:
+- **The per-frame record level worked out once a chunk while it stands
+  still** (its `exp2`, the division and the line-up table), and the wear
+  step's sine, tangent and power skipped at Age 0 and Damage 0: bit-exact,
+  but 0.980 at the defaults and 1.034 fully engaged, so not kept. A memo of
+  the same numbers read 0.978 and 1.030.
+- **The play head's read in the processor's own vector instructions**:
+  0.936 at the defaults and 0.957 fully engaged, bit-exact, but it needs
+  unsafe loads in a unit that has none, for a gain no target needs.
+  Inlining the read changed nothing (1.002 and 1.007).
+- **Skipping exact wires**: at 30 ips the NAB pair designs to a section
+  that passes a negative zero as a positive one and turns an infinity into
+  a NaN state, so a skip is not the same bits in silence; at Bump 0 the
+  contour's bells add nothing but their states run on, and a skip would
+  freeze them. Neither is a wire.
+- **A vector-friendly `tanh`** (not bit-exact) was not tried: every target
+  is met with the sound unchanged.
 
-- the record stage (the 4x polyphase pair and the four `tanh` a channel-sample)
-  is most of it: without it a Tape costs about a fifth;
-- the transport and the wear grid, the contour bells and the per-sub-block
-  design are each about 1 to 2 us;
-- a rational `tanh` saved only about 1 us, so the curve itself is not the cost;
-- the polyphase pair does 226 multiply-adds against the old direct form's 484
-  and still costs what that did, so how the compiler lays out the record stage
-  (inlining, vectorisation of the 4x pair) is the first lead.
+## Where the time goes now
+
+A sampling profile of 5.3 at the defaults: what is inlined into
+`Tape::process` (the two frame-by-frame halves with the transport and
+the heads, and the record stage's own bookkeeping around its filters and
+its curve) about 47 %; the record stage's curve, 1024 calls of the
+library's `tanh` a block, 18 %; the record stage's three filters 17 %;
+the play head's reads 10 %; the record level's `exp2` and the wear
+step's `sin`, `tan` and power most of the rest. The curve is the largest
+single part left, and only a different `tanh` would make it cheaper.
 
 ## Tape start and stop
 
