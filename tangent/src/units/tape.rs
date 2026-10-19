@@ -4302,7 +4302,10 @@ pub(crate) struct GovernorView {
 // push and every automated frame, and hands the face the answers. That is
 // why each is a pure function of the params and nothing else: no allocation,
 // no noise, no tape to run, and a few dozen multiply-adds and a handful of
-// roots at most, so a drag that asks sixty times a second costs nothing.
+// roots at most, so a drag that asks sixty times a second costs nothing. The
+// weighted wow and flutter is the one that sums a spectrum, a few hundred
+// points for each turning part, which sixty times a second is still
+// nothing.
 // Each reads the speed a dial is heading for, not the glide's position,
 // because the face shows where the machine is going.
 
@@ -4420,14 +4423,67 @@ fn flutter_weight(f: f64) -> f64 {
     GAIN * hp2 * (f / (ff + f1 * f1).sqrt()) * (fl / (ff + fl * fl).sqrt())
 }
 
-/// What the transport's parts add up to through the weighting, before the
-/// detector: the square root of the sum of every governed part's peak
-/// speed deviation at the top of its wander, weighted at its own frequency
-/// (the capstan's harmonic at twice the capstan's, the resonance as the
-/// sine of its RMS), planned by the same arithmetic the kernel's governor
-/// runs at the design rate.
-fn weighted_parts(p: &TapeParams) -> f64 {
+/// **What a 2-sigma detector reads of a sum of steady sines, over its
+/// RMS**, against the sum's excess kurtosis in tenths from -1.5 to 0. One
+/// sine spends most of its time near its peaks, so the level it exceeds
+/// 5 % of the time is 1.41 times its RMS; a sum of many is Gaussian, 1.96
+/// times. Read off sums of one to four sines of random depths and turns,
+/// half of them sharing a slowly wandering depth, some with Gaussian noise
+/// added, through the detector's own rule: every sum sat within 3 % of
+/// this line.
+const SINES_C95: [f64; 16] = [
+    1.410, 1.539, 1.614, 1.664, 1.706, 1.752, 1.786, 1.815, 1.846, 1.867, 1.898, 1.908, 1.922, 1.933, 1.944, 1.960,
+];
+
+/// **What a 2-sigma detector reads of the parts' breathing, over its
+/// RMS.** An excursion that grows or shrinks bends the pitch while it
+/// moves, in a burst after each step of its wander, and bursts stand far
+/// above their own RMS: ten minutes of the breathing alone, at every
+/// setting where it carries a twentieth of the sway or more, read 2.06 to
+/// 2.41 times its RMS, 2.20 at the median and 2.33 where it is most of
+/// the sway.
+const BREATHING_C95: f64 = 2.3;
+
+/// **The sizes of a wander's steps, as three Gauss nodes and weights.** A
+/// step is the difference of two uniform draws, so its size `x` is spread
+/// as `2 (1 - x)` over `0..1`, and its pulse carries `x^2` of power: these
+/// are exact for every polynomial up to the fifth under `x^2 (1 - x)`.
+const STEP_NODES: [(f64, f64); 3] = [(0.246_106, 0.161_227), (0.566_150, 0.542_341), (0.854_410, 0.296_432)];
+
+/// Where the breathing's spectrum is summed: every [`BREATH_STEP_HZ`] from
+/// minus to plus [`BREATH_SPAN_HZ`] around each part's turn. The step
+/// samples each lobe of the slowest wander's spectrum (its hold's `sinc^2`,
+/// lobes of 1 / 0.7 s, 1.43 Hz) about six times, and summed out to 40 Hz
+/// in steps of 0.05 Hz the figure moves 0.4 % at most (0.03 % on average
+/// over the grid of `the_face_reads_the_meter_across_the_whole_grid`).
+const BREATH_SPAN_HZ: f64 = 20.0;
+const BREATH_STEP_HZ: f64 = 0.25;
+
+/// One turning part as the weighted figure sees it: its turn in hertz, its
+/// depth of pitch at a wander scale of one (a fraction of the speed), the
+/// wander that breathes it (0 Wow's, 1 Flutter's, 2 the cassette's breath)
+/// and how fast its excursion can follow that wander, in wander units a
+/// second.
+#[derive(Clone, Copy, Default)]
+struct Turning {
+    hz: f64,
+    depth: f64,
+    wander: usize,
+    limit: f64,
+}
+
+/// **The transport's turning parts as the governor plans them**, at
+/// [`DESIGN_RATE`]: up to seven (the studio head's reel and pinch roller
+/// or the cassette's pack and roller, then the guides and the capstan with
+/// its harmonic), how many, and the tape resonance's RMS depth at a wander
+/// of one. The arithmetic is the kernel's own (the same wants, reserve and
+/// governor), so the figure and the tape cannot plan differently. The
+/// drifts, the studio head's and the belt's, are left out: they move too
+/// slowly for the weighting, under a thousandth of the weighted power at
+/// any setting.
+fn turning_parts(p: &TapeParams) -> ([Turning; 7], usize, f64) {
     let sr = f64::from(DESIGN_RATE);
+    let tau = std::f64::consts::TAU;
     let v = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())).ips();
     let r = f64::from(rate_multiplier(p.rate));
     let at = f64::from(DIAL_AT_SPEC);
@@ -4436,56 +4492,188 @@ fn weighted_parts(p: &TapeParams) -> f64 {
         (f64::from(norm_or(p.flutter, DIAL_AT_SPEC)) / at).powi(2),
     ];
     let hz: [f64; 4] = std::array::from_fn(|k| ROTOR_HZ_PER_IPS[k] * v * r);
-    let omega = hz.map(|f| std::f64::consts::TAU * f / sr);
+    let omega = hz.map(|f| tau * f / sr);
     let (_, kappa) = resonance_at(sr);
     let (_, band) = scrape_band(sr);
-    let asked = at_the_top(&studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr)));
+    let want = studio_wants(v, &omega, m, sr, kappa, band * scrape_per_m(sr));
+    let asked = at_the_top(&want);
     let widest = widest_urad(f64::from(norm_or(p.age, 0.0)), f64::from(norm_or(p.damage, 0.0)));
     let reserve = reserve(jitter_um(p), widest, v, sr);
     let keep = govern(&asked, studio_travel(sr, head_rest(sr as f32, BASE_MS)) - reserve);
     let deep = WowRange::from_dial(norm_or(p.wow_range, WowRange::Studio.dial())) == WowRange::Deep;
-    let mut sum = 0.0;
+    // A studio part's excursion follows its aim times the wander's scale by
+    // at most its share of the slew a frame: in wander units a second, that
+    // share over the scale's span of the aim.
+    let span = DEPTH_WANDER.1 - DEPTH_WANDER.0;
+    let slew = STUDIO_SLEW / STUDIO_PARTS as f64 * sr / span;
+    let mut parts = [Turning::default(); 7];
+    let mut n = 0;
     for k in 0..4 {
         let part = REEL + k;
+        let aim = want[part] * keep[part];
         // The deep head carries Flutter's parts and its own cassette, not
         // the studio head's wow.
-        if deep && part <= PINCH {
+        if (deep && part <= PINCH) || aim <= 0.0 {
             continue;
         }
-        let depth = asked[part] * keep[part] / PEAK[part] * omega[k];
-        sum += (depth * flutter_weight(hz[k])).powi(2);
+        let depth = aim / PEAK[part] * omega[k];
+        let wander = usize::from(part > PINCH);
+        parts[n] = Turning { hz: hz[k], depth, wander, limit: slew / aim };
+        n += 1;
         if part == CAPSTAN {
             let second = depth * CAPSTAN_2ND / ROTOR_DEPTH[3];
-            sum += (second * flutter_weight(2.0 * hz[k])).powi(2);
+            parts[n] = Turning { hz: 2.0 * hz[k], depth: second, wander, limit: slew / aim };
+            n += 1;
         }
     }
     let ladder = (15.0 / v).powf(SPEED_LADDER);
-    let resonance = std::f64::consts::SQRT_2 * TRANSPORT_K * RESONANCE_DEPTH * ladder * m[1] * DEPTH_WANDER.1;
-    sum += (resonance * flutter_weight(RESONANCE_HZ)).powi(2);
+    let resonance = TRANSPORT_K * RESONANCE_DEPTH * ladder * m[1] * keep[RESONANCE];
     if deep {
-        // The cassette, governed by the deep head's own room, at the top of
-        // its wander, which is its full depth. The belt drifts too slowly
-        // for the weighting to see.
+        // The cassette, governed by the deep head's own room. Its breath
+        // follows the wander over the wander's top by at most
+        // CASSETTE_BREATH of the pack's turn a frame.
         let dial = f64::from(norm(p.wobble));
         let cassette_hz = CASSETTE_HZ.map(|f| f * r);
         let want = [
             BELT_MS * 1.0e-3 * sr * dial,
-            CASSETTE_DEPTH * CASSETTE_SHARE[0] * dial / (std::f64::consts::TAU * cassette_hz[0] / sr),
-            CASSETTE_DEPTH * CASSETTE_SHARE[1] * dial / (std::f64::consts::TAU * cassette_hz[1] / sr),
+            CASSETTE_DEPTH * CASSETTE_SHARE[0] * dial / (tau * cassette_hz[0] / sr),
+            CASSETTE_DEPTH * CASSETTE_SHARE[1] * dial / (tau * cassette_hz[1] / sr),
         ];
         let shared: f64 = [GUIDES, CAPSTAN, RESONANCE, SCRAPE].iter().map(|&j| asked[j] * keep[j]).sum();
         let travel = (DEEP_TRAVEL_MS * 1.0e-3 * sr).min(head_rest(sr as f32, DEEP_MS) as f64 - 2.0);
         let mut over = want.iter().sum::<f64>() - (travel - reserve - shared).max(0.0);
+        let limit = CASSETTE_BREATH * tau * cassette_hz[0] * DEPTH_WANDER.1 / span;
         for (j, w) in want.iter().enumerate() {
             let kept = w - w.min(over.max(0.0));
             over -= w - kept;
-            if j > BELT {
-                let depth = kept * std::f64::consts::TAU * cassette_hz[j - PACK] / sr;
-                sum += (depth * flutter_weight(cassette_hz[j - PACK])).powi(2);
+            if j > BELT && kept > 0.0 {
+                let f = cassette_hz[j - PACK];
+                parts[n] = Turning { hz: f, depth: kept * tau * f / sr, wander: 2, limit };
+                n += 1;
             }
         }
     }
-    sum.sqrt()
+    (parts, n, resonance)
+}
+
+/// **The pulse a wander's step of `x` makes in an excursion's speed**, as
+/// the time constant, in seconds, of the one-pole pulse with the same area
+/// and energy. The wander slews each step through its one-pole
+/// ([`WANDER_SLEW_S`]); an excursion that may follow at no more than
+/// `limit` wander units a second keeps up with a small step, and slews a
+/// large one at its limit until the wander's own slowing lets it catch up,
+/// which spreads the same area over a longer, flatter pulse.
+fn step_pulse_s(x: f64, limit: f64) -> f64 {
+    let tau = WANDER_SLEW_S;
+    // The limit over the step's own steepest slope.
+    let k = limit * tau / x;
+    if k >= 1.0 {
+        return tau;
+    }
+    // It catches up `s` time constants in, where `k s = 1 - e^-s`: Newton
+    // from the limited slew's `1 / k`, above the root, where the curve is
+    // convex and the steps never overshoot.
+    let mut s = 1.0 / k;
+    for _ in 0..16 {
+        let e = (-s).exp();
+        let step = (k * s - 1.0 + e) / (k - e);
+        s -= step;
+        if step.abs() <= 1.0e-9 * s {
+            break;
+        }
+    }
+    // Its energy: the limit held for `s`, then the one-pole's tail.
+    tau / (2.0 * k * k * s + (-2.0 * s).exp())
+}
+
+/// **A part's breathing, as the meter hears it and as it is.** The
+/// wander's scale is a sample-and-hold of uniform draws held `hold`
+/// seconds, slewed, which the excursion follows by at most `limit`: its
+/// spectrum is the hold's `sinc^2` under the steps' pulses. Carried to the
+/// part's turn `hz`, a sideband `u` hertz away bends the pitch at `hz + u`,
+/// so it is weighted there and by `(hz + u) / hz`. Returns that weighted
+/// power and the scale's own variance, both per unit of the wander's span
+/// squared and of the depth squared.
+fn breathing(hz: f64, limit: f64, hold: f64) -> (f64, f64) {
+    let pulses = STEP_NODES.map(|(x, w)| (step_pulse_s(x, limit), w));
+    let points = (2.0 * BREATH_SPAN_HZ / BREATH_STEP_HZ).round() as usize;
+    let (mut heard, mut own) = (0.0, 0.0);
+    for i in 0..=points {
+        let u = -BREATH_SPAN_HZ + i as f64 * BREATH_STEP_HZ;
+        let x = std::f64::consts::PI * u * hold;
+        let sinc2 = if x == 0.0 { 1.0 } else { (x.sin() / x).powi(2) };
+        let shape: f64 = pulses.iter().map(|(t, w)| w / (1.0 + (std::f64::consts::TAU * u * t).powi(2))).sum();
+        let power = hold * sinc2 / 12.0 * shape * BREATH_STEP_HZ;
+        own += power;
+        heard += power * ((hz + u) / hz * flutter_weight((hz + u).abs())).powi(2);
+    }
+    (heard, own)
+}
+
+/// **What the meter reads of the transport**, as a fraction of the speed:
+/// the weighted 2-sigma of every turning part, its breathing included, at
+/// the speed and Rate the dials are heading for.
+///
+/// Each wander's parts are steady sines whose depth breathes: their
+/// weighted powers and the fourth cumulant of their sum, with the tape's
+/// resonance as Gaussian noise among Flutter's, read through
+/// [`SINES_C95`]; their depth breathing as its loudest part's does, the
+/// scale's moments of a uniform spread of that variance. And each part's
+/// breathing bends the pitch on its own wherever the weighting hears its
+/// sidebands louder than its turn ([`breathing`]): a slow part's sidebands
+/// reach the weighting's band where its turn cannot, which is why the
+/// figure needs them once Rate slows the wow under the weighting's 0.45 Hz
+/// corner. That excess reads through [`BREATHING_C95`], and the two
+/// readings add as squares, which ten-minute meters on every part of the
+/// grid bear out.
+fn weighted_reading(p: &TapeParams) -> f64 {
+    let (parts, n, resonance) = turning_parts(p);
+    let (lo, hi) = DEPTH_WANDER;
+    let mut breaths = [(0.0, 0.0); 7];
+    for (b, t) in breaths.iter_mut().zip(&parts[..n]) {
+        let hold = if t.wander == 1 { FLUTTER_HOLD_S } else { WOW_HOLD_S };
+        *b = breathing(t.hz, t.limit, hold);
+    }
+    let (mut steady, mut cumulant, mut excess) = (0.0, 0.0, 0.0);
+    for wander in 0..3 {
+        // The cassette's breath is the wander's scale over its top.
+        let over = if wander == 2 { 1.0 / hi } else { 1.0 };
+        let (mean, swing) = (over * 0.5 * (lo + hi), over * (hi - lo));
+        let noise = if wander == 1 { (resonance * flutter_weight(RESONANCE_HZ)).powi(2) } else { 0.0 };
+        let group = || (0..n).filter(move |&j| parts[j].wander == wander);
+        let loud = |j: &usize| parts[*j].depth * flutter_weight(parts[*j].hz);
+        // With no part turning, the resonance breathes as the wander itself:
+        // a uniform draw's twelfth, less what the slew rounds off each hold.
+        let hold = if wander == 1 { FLUTTER_HOLD_S } else { WOW_HOLD_S };
+        let slewed = (1.0 - WANDER_SLEW_S / hold * (1.0 - (-hold / WANDER_SLEW_S).exp())) / 12.0;
+        let var = group()
+            .max_by(|a, b| loud(a).total_cmp(&loud(b)))
+            .map_or(slewed, |j| breaths[j].1)
+            * swing
+            * swing;
+        let (m2, m4) = (mean * mean + var, mean.powi(4) + 6.0 * mean * mean * var + 1.8 * var * var);
+        let (mut sum, mut fourth) = (noise, 0.0);
+        for j in group() {
+            let a = loud(&j);
+            sum += 0.5 * a * a;
+            fourth += a.powi(4);
+            let heard = 0.5 * (mean * a).powi(2) + 0.5 * (swing * parts[j].depth).powi(2) * breaths[j].0;
+            excess += (heard - 0.5 * m2 * a * a).max(0.0);
+        }
+        if sum > 0.0 {
+            let power = m2 * sum;
+            steady += power;
+            cumulant += m4 * (3.0 * sum * sum - 0.375 * fourth) - 3.0 * power * power;
+        }
+    }
+    let read = if steady > 0.0 {
+        let x = ((cumulant / (steady * steady) + 1.5) * 10.0).clamp(0.0, 15.0);
+        let i = (x as usize).min(14);
+        (SINES_C95[i] + (SINES_C95[i + 1] - SINES_C95[i]) * (x - i as f64)) * steady.sqrt()
+    } else {
+        0.0
+    };
+    read.hypot(BREATHING_C95 * excess.sqrt())
 }
 
 /// **The whole transport's weighted flutter**, in percent of the speed: what
@@ -4493,27 +4681,32 @@ fn weighted_parts(p: &TapeParams) -> f64 {
 /// and flutter together, as the governor shares the head, at the speed and
 /// Rate the dials are heading for.
 ///
-/// The parts' weighted depths summed as squares ([`weighted_parts`]) scale
-/// with every dial the way the meter does; how far the detector's 2-sigma
-/// sits above that sum depends on how the speed's parts are mixed, so it is
-/// fitted at each speed's fresh transport, where the figure reads the
-/// machine it is calibrated to be, 0.10, 0.06, 0.04 and 0.03 %
-/// ([`WEIGHTED_SPEC_PCT`]). Away from it the figure follows the parts:
+/// [`weighted_reading`] is the meter's reading, worked out from the parts,
+/// and it is anchored at each speed's fresh transport to the machine it is
+/// calibrated to be, 0.10, 0.06, 0.04 and 0.03 % ([`WEIGHTED_SPEC_PCT`]).
+/// The reading itself is 0.100, 0.062, 0.041 and 0.028 % there, within 2 %
+/// of ten minutes of the meter, so the anchor moves the figure by 3.3 % at
+/// most at the three slower speeds, and at 30 ips, whose median the 0.03 %
+/// rounds up, it stands 8 % over the meter throughout. Away from the fresh
+/// transport the figure follows the reading.
 /// `the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed`
-/// holds it within 15 % of a meter on the head's own sway, at every speed
-/// and where Wow, Flutter and the governor have all moved it. On the deep
-/// head the parts are Flutter's and the cassette's, under the same fit, and
+/// holds it within 15 % of a meter on the head's own sway at every speed
+/// and where Wow, Flutter and the governor have all moved it, and
+/// `the_face_reads_the_meter_where_rate_slows_the_wow` where Rate slows the
+/// parts under the weighting and their breathing is most of what the meter
+/// hears. On the deep head the parts are Flutter's and the cassette's, and
 /// `the_deep_range_swings_the_pitch_like_a_worn_cassette` holds it within
-/// 15 % there at Wow 0.3, 0.5 and 1.
+/// 15 % there at Wow 0.3, 0.5 and 1. The breathing is summed at 161 points
+/// of spectrum for each of up to seven parts ([`BREATH_SPAN_HZ`]), for the
+/// dials and again for the fresh transport, against the dozens of
+/// multiply-adds the other figures cost.
 pub fn wow_flutter_weighted_pct(p: &TapeParams) -> f32 {
     let i = TapeSpeed::from_dial(norm_or(p.speed, TapeSpeed::Ips15.dial())) as usize;
-
     let fresh = TapeParams {
         speed: TapeSpeed::ALL[i].dial(),
         ..TapeParams::default()
     };
-    let calibrated = weighted_parts(&fresh);
-    (WEIGHTED_SPEC_PCT[i] * weighted_parts(p) / calibrated) as f32
+    (WEIGHTED_SPEC_PCT[i] * weighted_reading(p) / weighted_reading(&fresh)) as f32
 }
 
 // ── proof ───────────────────────────────────────────────────────────────────
@@ -7765,8 +7958,8 @@ mod tests {
     /// has begun to share the head, and at 3.75 ips with them at 1 and Rate
     /// at its bottom, where it has shed most of the head's parts. Measured:
     /// 0.0967, 0.0595, 0.0415 and 0.0279 %, unweighted 1.30, 1.30, 1.65 and
-    /// 1.42 times that, the face 3.5, 0.8, 3.7 and 7.5 % off; 4.9 % off at
-    /// full Wow and Flutter at 15 ips (0.2959 % measured) and 8.1 % in the
+    /// 1.42 times that, the face 3.5, 0.8, 3.7 and 7.5 % off; 0.4 % off at
+    /// full Wow and Flutter at 15 ips (0.2959 % measured) and 5.3 % in the
     /// governed corner (0.3470 %).
     #[test]
     fn the_transport_reads_a_studio_machines_weighted_flutter_at_every_speed() {
@@ -7864,6 +8057,171 @@ mod tests {
             (read / 0.040 - 1.0).abs() < 0.35,
             "a 3150 Hz tone through a fresh tape reads {read:.4} % weighted, not 0.040 %"
         );
+    }
+
+    /// `f(0..count)` on three hands, the answers in order: the meters below
+    /// are independent traces, and three hands keep a gate that runs this
+    /// binary beside other work moving.
+    fn on_hands<T: Send>(count: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut got: Vec<(usize, T)> = std::thread::scope(|sc| {
+            let hands: Vec<_> = (0..3)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= count {
+                                break;
+                            }
+                            mine.push((i, f(i)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            hands.into_iter().flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
+        });
+        got.sort_by_key(|(i, _)| *i);
+        got.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// **The face reads the meter where Rate slows the wow.**
+    ///
+    /// A part's depth breathes with its wander, and an excursion that
+    /// breathes bends the pitch on its own, in a burst after each of the
+    /// wander's steps. Where Rate slows the wow's parts under the
+    /// weighting's 0.45 Hz corner, their turns barely reach the meter but
+    /// those bursts do: at 3.75 ips with Rate at its bottom, Wow 0.3 and
+    /// Flutter 0 the breathing carries four fifths of the power the meter
+    /// hears, and 5.2.0's figure, which summed the turns alone, read 73 %
+    /// under. So the figure the face prints is held within 15 % of the
+    /// meter (the weighted 2-sigma on the head's own sway at 44.1 kHz,
+    /// after 8 s of settling) where Rate and Flutter most change what it
+    /// reads: the slow
+    /// corners of the studio head with Flutter at 0, where its breathing is
+    /// most of the sway; a lone part turning at the top of Rate, where one
+    /// sine reads lowest over its RMS; full Flutter at 30 ips, where the
+    /// figure reads furthest over; and the deep head at the bottom of Rate,
+    /// where the cassette's breath is a sixth of the power. Each reads 40 s
+    /// (the deep head 120 s), except the slowest corner, whose reel turns
+    /// once in 12.5 s: over the nineteen 32 s windows of one ten-minute
+    /// trace the meter itself reads 0.018 to 0.029 % there, a spread no
+    /// figure can stand within 15 % of, and over the eight 152 s windows of
+    /// 21 minutes 0.020 to 0.025 %, so it reads 160 s. Measured, in that
+    /// order: -0.3, +4.3, -3.7, -7.3, -9.3,
+    /// +1.5, -2.0, +11.4 and -5.7 %, where 5.2.0's figure was -73, -44,
+    /// -40, -37, -17, -24, +14, +11 and -14 %.
+    #[test]
+    fn the_face_reads_the_meter_where_rate_slows_the_wow() {
+        let sr = 44_100.0_f32;
+        let at = |speed: TapeSpeed, rate: f32, wobble: f32, flutter: f32| TapeParams {
+            speed: speed.dial(),
+            rate,
+            wobble,
+            flutter,
+            ..TapeParams::default()
+        };
+        let cases = [
+            ("3.75 ips, Rate 0, Wow 0.3, Flutter 0", at(TapeSpeed::Ips3_75, 0.0, 0.3, 0.0), 160.0),
+            ("3.75 ips, Rate 0, Wow 1, Flutter 0", at(TapeSpeed::Ips3_75, 0.0, 1.0, 0.0), 40.0),
+            ("3.75 ips, Rate 0.25, Wow 0.3, Flutter 0", at(TapeSpeed::Ips3_75, 0.25, 0.3, 0.0), 40.0),
+            ("7.5 ips, Rate 0, Wow 0.3, Flutter 0", at(TapeSpeed::Ips7_5, 0.0, 0.3, 0.0), 40.0),
+            ("7.5 ips, Rate 0, Wow 1, Flutter 0", at(TapeSpeed::Ips7_5, 0.0, 1.0, 0.0), 40.0),
+            ("15 ips, Rate 0, Wow 0.3, Flutter 0", at(TapeSpeed::Ips15, 0.0, 0.3, 0.0), 40.0),
+            ("3.75 ips, Rate 1, Wow 1, Flutter 0", at(TapeSpeed::Ips3_75, 1.0, 1.0, 0.0), 40.0),
+            ("30 ips, Rate 0, Wow 0.3, Flutter 1", at(TapeSpeed::Ips30, 0.0, 0.3, 1.0), 40.0),
+            (
+                "the deep head at 7.5 ips, Rate 0, Wow 1",
+                TapeParams {
+                    wow_range: WowRange::Deep.dial(),
+                    ..at(TapeSpeed::Ips7_5, 0.0, 1.0, 0.3)
+                },
+                120.0,
+            ),
+        ];
+        let read = on_hands(cases.len(), |i| {
+            let (_, p, secs) = &cases[i];
+            let sway = Tape::new(sr).transport_trace(p, (sr * secs) as usize);
+            flutter_2sigma(&sway, sr.into(), (sr * 8.0) as usize, true)
+        });
+        for ((what, p, _), read) in cases.iter().zip(read) {
+            let told = f64::from(wow_flutter_weighted_pct(p));
+            assert!(
+                (told / read - 1.0).abs() < 0.15,
+                "{what}: the face is told {told:.4} % weighted, and a meter reads {read:.4} %"
+            );
+        }
+    }
+
+    /// **The face reads the meter across the whole grid**: every speed, both
+    /// heads, Rate in quarters, Wow 0.3 and 1, Flutter 0, 0.3 and 1, 240
+    /// settings at 44.1 kHz, each read by the meter over 40 s (the deep head
+    /// 120 s) and over 640 s, after 8 s of settling. By hand, in release:
+    ///
+    /// ```text
+    /// cargo test --release -p tangent --bin tangent -- the_face_reads_the_meter_across --ignored --nocapture
+    /// ```
+    ///
+    /// Prints every setting and holds the face within 15 % of the 640 s
+    /// meter, which is what the machine reads. Measured: within 10.9 % of
+    /// it everywhere, 3.6 % on average; within 11.4 % of the 40 s meter
+    /// everywhere but the one corner the short window cannot read (3.75 ips,
+    /// Rate 0, Wow 0.3, Flutter 0: its first 32 s read 0.0294 %, its ten
+    /// minutes 0.0236 %, and the face 0.0228 %), and the same at 48 and
+    /// 96 kHz. 5.2.0's figure was within 15 % of the 40 s meter at 233 of
+    /// the 240 and 79 % under at that corner.
+    #[test]
+    #[ignore = "slow: run it by hand in release with --ignored --nocapture"]
+    fn the_face_reads_the_meter_across_the_whole_grid() {
+        let sr = 44_100.0_f32;
+        let mut grid = Vec::new();
+        for speed in TapeSpeed::ALL {
+            for range in WowRange::ALL {
+                for rate in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+                    for wobble in [0.3_f32, 1.0] {
+                        for flutter in [0.0_f32, 0.3, 1.0] {
+                            grid.push(TapeParams {
+                                speed: speed.dial(),
+                                wow_range: range.dial(),
+                                rate,
+                                wobble,
+                                flutter,
+                                ..TapeParams::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let read = on_hands(grid.len(), |i| {
+            let p = &grid[i];
+            let short = if WowRange::from_dial(p.wow_range) == WowRange::Deep { 120.0 } else { 40.0 };
+            let sway = Tape::new(sr).transport_trace(p, (sr * 648.0) as usize);
+            let skip = (sr * 8.0) as usize;
+            (
+                flutter_2sigma(&sway[..(sr * short) as usize], sr.into(), skip, true),
+                flutter_2sigma(&sway, sr.into(), skip, true),
+            )
+        });
+        let mut worst = 0.0_f64;
+        for (p, (short, long)) in grid.iter().zip(read) {
+            let told = f64::from(wow_flutter_weighted_pct(p));
+            let off = told / long - 1.0;
+            worst = worst.max(off.abs());
+            println!(
+                "{} {} Rate {} Wow {} Flutter {}: face {told:.5} %, meter {long:.5} % over 640 s ({:+.1} %), {short:.5} % over the short window ({:+.1} %)",
+                TapeSpeed::from_dial(p.speed).label(),
+                WowRange::from_dial(p.wow_range).label(),
+                p.rate,
+                p.wobble,
+                p.flutter,
+                100.0 * off,
+                100.0 * (told / short - 1.0)
+            );
+            assert!(off.abs() < 0.15, "the face is told {told:.5} % and ten minutes of the meter read {long:.5} %");
+        }
+        println!("worst against 640 s: {:.1} %", 100.0 * worst);
     }
 
     /// **The play head never runs off its tape at any setting.**
@@ -8135,7 +8493,7 @@ mod tests {
     /// ignores the tape speed: its pack turns at 0.45 Hz within 5 % at
     /// 3.75 and at 30 ips. And nothing is ever held inside the line.
     /// Measured: peaks of 3.011, 1.508 and 0.911 %, 1.002, 0.500 and
-    /// 0.301 % weighted, the face 1.4 to 1.6 % over the meter; the pack
+    /// 0.301 % weighted, the face 1.8 to 2.2 % under the meter; the pack
     /// alone 1.026 times its depth; at Rate's ends 3.068 and 1.555 % at
     /// half speed, 3.015 and 1.530 % at twice (3.216 and 1.630 % while the
     /// drift followed Rate); the pack's line at 0.4485 Hz at both speeds.
