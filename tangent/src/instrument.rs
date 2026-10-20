@@ -19031,24 +19031,34 @@ impl Renderer {
     /// 8192 to 8496, no block of the way back more than 1728, and it closes
     /// 17 to 19 blocks after the hand-back.
     ///
-    /// **Why that is the same sound at speed, bit for bit.** A lane is held
-    /// only when no span can change its sound (`Rack::spans_free`): clips
-    /// through Tangent's own effects, whose racks walk forward through the
-    /// same frames however their spans are cut, so once the lane is level its
-    /// rack is where the clock's would be and every render from then on is
-    /// the clock's. A voice is not: the Analog draws its oscillators' wander
-    /// once a chunk of its own frame count, so a span cut where the clock
-    /// would not cut it plays different dice; the first draft of this held
-    /// every lane, and an Analog desk then played 15 to 37 dB under its notes
-    /// off the clock's for the rest of the song after every start. Nor is a
-    /// lane with a hosted plugin, which may block internally. Those lanes
-    /// come back as they always did, their whole grain at once. What a hold
-    /// cannot give back is the look-ahead itself: until a lane is level its
-    /// rack has been through less of the song than the clock's would have,
-    /// so a stop, a locate, a wrap or the dial in those blocks plays that
-    /// rack's tail from a little earlier, at the same level, nearer the desk
-    /// with the look-ahead off. The first draft never brought a lane level,
-    /// so it was every such event after a start until the rings next cleared.
+    /// **Why that is the same sound at speed, bit for bit, once every lane
+    /// is level.** A lane is held only when no span can change its sound
+    /// (`Rack::spans_free`): clips through Tangent's own effects, whose racks
+    /// walk forward through the same frames however their spans are cut, so
+    /// once the lane is level its rack is where the clock's would be and
+    /// every render from then on is the clock's. A voice is not: the Analog
+    /// draws its oscillators' wander once a chunk of its own frame count, so
+    /// a span cut where the clock would not cut it plays different dice; the
+    /// first draft of this held every lane, and an Analog desk then played
+    /// 15 to 37 dB under its notes off the clock's for the rest of the song
+    /// after every start. Nor is a lane with a hosted plugin, which may block
+    /// internally. Those lanes come back as they always did, their whole
+    /// grain at once.
+    ///
+    /// **What a hold cannot give back is the look-ahead itself.** Until a
+    /// lane is level its rack has been through up to about two grains less
+    /// of the song than the clock's would have, and whatever meets it there
+    /// leaves that rack running from another state: a stop, a locate, a
+    /// wrap, the dial, a knob moved on one of its bays (the held lane plays
+    /// the move from its next chunk, the clock's lane from the next grain it
+    /// renders), or the lane parking there at the end of its `RACK_PARK_S`
+    /// of quiet, with nothing pressed at all. Its tails take another path at
+    /// the same level, nearer the desk with the look-ahead off, and a unit
+    /// with motion of its own (the plate, Tape's wow and flutter, the
+    /// chorus) stays off the clock's bits for the rest of the song, at the
+    /// same level (`docs/PERF-TAPE-5.2.md`). The first draft never brought
+    /// a lane level, so it was every such event after a start until the
+    /// rings next cleared.
     ///
     /// The way back closes when no lane is held, and at once on a locate,
     /// a wrap, a stop, a stems export or the path engaged again, which take
