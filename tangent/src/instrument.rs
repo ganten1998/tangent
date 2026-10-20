@@ -51886,14 +51886,22 @@ mod slot_engine {
         /// target four times, each with a beat made and not yet heard: the
         /// limiter thrown in (58 frames more, a hole in the mix where its
         /// lookahead fills), an input armed so the speakers take their own
-        /// mix (58 fewer, skipped), disarmed (58 more), and the limiter thrown
+        /// mix (58 fewer: a crossing now, not a move in the master's chain,
+        /// the speakers fading from the take's mix into their own over 10 ms
+        /// with the click's read crossing beside them, `HoldRead::cross`),
+        /// disarmed (58 more, crossed back the same way), and the limiter thrown
         /// out (58 fewer). The click and a lane playing the click's own sound,
         /// the same samples on the same beats at the same level, are one
         /// signal through all four, beat in flight included; a read started
         /// afresh at each move (as a move of the target does, with the lanes'
         /// lines) lost the beat each time: beat two's click went silent, and
         /// a lane playing it kept it. And every beat the song crosses is heard
-        /// once.
+        /// once: each move falls a few hundred frames past its beat, so no
+        /// attack lies in the 58 frames a crossing skips or plays again. The
+        /// crossing itself is pinned where it is heard, by
+        /// `the_click_crosses_roads_with_the_speakers_mix_frame_for_frame` and
+        /// its IR's 512 frames: over 58, the click's tail here moves by under
+        /// a ten-thousandth whether its read crosses or moves at once.
         #[test]
         fn a_hold_that_moves_only_in_the_masters_chain_keeps_the_clicks_beat_in_flight() {
             const FRAMES: usize = 5 * 48_000;
