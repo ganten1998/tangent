@@ -778,6 +778,9 @@ trait Cued {
     fn tell(&mut self, cue: &Cue);
     /// Add `frames` of interleaved audio at `TAP_CHANNELS` into `out`.
     fn play(&mut self, out: &mut [f32], frames: usize);
+    /// The next frame played is frame `frame` of its timeline: the
+    /// keyboard's grid falls there (`Keys::set_grid`). The DX7 has no grid.
+    fn grid(&mut self, _frame: u64) {}
 }
 
 impl Cued for crate::dx7::Dx7 {
@@ -812,6 +815,9 @@ impl Cued for crate::keys::Keys {
         // Silent, a render is what `Keys::idle` is: the frames go by.
         self.render(out, frames, TAP_CHANNELS);
     }
+    fn grid(&mut self, frame: u64) {
+        self.set_grid(frame);
+    }
 }
 
 /// **The instrument over its stretch, every cue on its own frame.** The
@@ -821,19 +827,30 @@ impl Cued for crate::keys::Keys {
 /// called whole or cut anywhere (`keys::tests::a_stretch_renders_the_same_
 /// called_whole_or_split_anywhere`). `out` holds the stretch at
 /// `TAP_CHANNELS`; answers whether the instrument sounded in any piece.
-fn play_cues(inst: &mut impl Cued, cues: &[Cue], out: &mut [f32], frames: usize) -> bool {
+/// `grid` is where its timeline stands at the head of each span of the
+/// stretch that rolls, `(offset, frame)` in offset order (`Cued::grid`),
+/// told before a cue on its frame: it moves nothing a cue reads.
+fn play_cues(inst: &mut impl Cued, cues: &[Cue], grid: &[(u32, u64)], out: &mut [f32], frames: usize) -> bool {
     let frames = frames.min(out.len() / TAP_CHANNELS);
     let mut from = 0usize;
     let mut sounded = false;
-    for cue in cues {
+    let (mut c, mut g) = (0usize, 0usize);
+    while c < cues.len() || g < grid.len() {
+        let grid_next = g < grid.len() && (c == cues.len() || grid[g].0 <= cues[c].at());
         // An offset past the stretch is told after its last frame.
-        let at = (cue.at() as usize).min(frames);
+        let at = (if grid_next { grid[g].0 } else { cues[c].at() } as usize).min(frames);
         if at > from {
             sounded |= inst.active();
             inst.play(&mut out[from * TAP_CHANNELS..at * TAP_CHANNELS], at - from);
             from = at;
         }
-        inst.tell(cue);
+        if grid_next {
+            inst.grid(grid[g].1);
+            g += 1;
+        } else {
+            inst.tell(&cues[c]);
+            c += 1;
+        }
     }
     if frames > from {
         sounded |= inst.active();
@@ -8483,6 +8500,12 @@ pub(crate) struct LaneBody {
     /// beside the notes by the same swap, and played by the render
     /// (`play_cues`).
     cues: Vec<Cue>,
+    /// **Where its keyboard is told its timeline stands** (`Keys::set_grid`):
+    /// the block offset and the frame of its own timeline at the head of each
+    /// span of the block that rolls, `keys_grid_n` of them, the decide walk's
+    /// for the render.
+    keys_grid: [(u32, u64); 2],
+    keys_grid_n: u8,
     /// **What the decide walk decided about this lane, for the render and
     /// the fold**: whether it is a folder (the fold owns its fader, pan and
     /// send), whether it is armed (the meter's source), and the rest.
@@ -8766,6 +8789,8 @@ impl Lane {
                 notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
                 controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
                 cues: Vec::with_capacity(MAX_CUES_PER_BLOCK),
+                keys_grid: [(0, 0); 2],
+                keys_grid_n: 0,
                 prep: LanePrep::default(),
                 at: 0,
                 len: 0,
@@ -10640,6 +10665,9 @@ struct LanePlan<'a> {
     controls: &'a [Control],
     /// What its DX7 and keyboard are told, each on its own frame (`Cue`).
     cues: &'a [Cue],
+    /// Where its keyboard's grid is told its timeline stands, at the head of
+    /// each span that rolls (`LaneBody::keys_grid`).
+    keys_grid: &'a [(u32, u64)],
     sample: Option<&'a SamplerSample>,
     /// **Where the part it plays stands**: the frame its board and racks are
     /// told they render, and the transport they are told around it. `at`
@@ -11314,7 +11342,7 @@ fn render_lane(
             scratch.fill(0.0);
             if active || cued {
                 if let Some(d) = seats.dx7.as_mut() {
-                    voiced |= play_cues(&mut d.inst, plan.cues, scratch, frames);
+                    voiced |= play_cues(&mut d.inst, plan.cues, &[], scratch, frames);
                 }
             }
             if dx7_head {
@@ -11342,6 +11370,9 @@ fn render_lane(
         // harp's strings follow the knobs by the audio, and here on the lane's
         // own worker rather than in the walk's next visit, which is serial
         // over every lane. With cues, its pieces render silent ones as idle.
+        // Its grid is told where its timeline stands by the pieces alone
+        // (`play_cues`): a block that idles holds no sound for a recount to
+        // move, and the next block that sounds or begins a sound is told.
         if !active && !cued {
             if let Some(k) = seats.keys.as_mut() {
                 k.idle(frames);
@@ -11355,7 +11386,7 @@ fn render_lane(
             scratch.fill(0.0);
             if active || cued {
                 if let Some(k) = seats.keys.as_mut() {
-                    voiced |= play_cues(&mut k.inst, plan.cues, scratch, frames);
+                    voiced |= play_cues(&mut k.inst, plan.cues, plan.keys_grid, scratch, frames);
                 }
             }
             if keys_head {
@@ -22695,6 +22726,26 @@ impl Renderer {
                     }
                     sort_cues(&mut lane_cues);
                 }
+                // **And where the keyboard's timeline stands at the head of
+                // each span that rolls** (`Keys::set_grid`): its grid falls on
+                // the lane's own frames, the song's for every lane but one
+                // reading its part behind the song, whose are its own, so a
+                // part renders the same wherever it was started and however
+                // far behind the song it is read. Told at every span its
+                // render plays in pieces (`play_cues`), which moves nothing
+                // while a run goes on; a new run (Play, a locate, a wrap, the
+                // hold moving under a lane behind the song) sets it, and so
+                // does the first block that sounds after a lane's rest.
+                lane.keys_grid_n = 0;
+                if is_keys {
+                    for span in spans.iter().filter(|s| s.rolls && s.len > 0) {
+                        let n = usize::from(lane.keys_grid_n);
+                        if let Some(slot) = lane.keys_grid.get_mut(n) {
+                            *slot = (span.off, span.t0);
+                            lane.keys_grid_n += 1;
+                        }
+                    }
+                }
 
                 // Each goes quiet only when neither is speaking for it. The
                 // keyboard asks the instrument rather than the note list, as
@@ -23160,6 +23211,8 @@ impl Renderer {
                     notes,
                     controls,
                     cues,
+                    keys_grid,
+                    keys_grid_n,
                     prep,
                     at,
                     len,
@@ -23219,6 +23272,7 @@ impl Renderer {
                     notes,
                     controls,
                     cues,
+                    keys_grid: &keys_grid[..usize::from(*keys_grid_n).min(keys_grid.len())],
                     // The lane's own file, out of its own box.
                     sample: sample.as_ref(),
                     // **A lane reading its own part behind the song** is told
@@ -54801,14 +54855,19 @@ mod slot_engine {
             /// One desk rendered twice, its lane armed (it reads its timeline
             /// the hold behind the song, `plan_live_lanes`) and not (it waits in
             /// its line), nothing played live. Held 1,024 frames, two whole
-            /// passes, a looped part with a note on the loop's head, one running
-            /// past its end, two tied notes on one key and the sustain down and
-            /// up: Play, three laps, a locate, Stop, and the passes after, for a
-            /// DX7, the keyboard and a kit. The speakers and the take are the
-            /// waiting lane's to the bit, the DX7 and the keyboard as exactly as
-            /// the kit, each strike on its own frame (`Cue`). Again from a Play
-            /// a second in, a note 500 frames before it on the clip: it sounds
-            /// on neither. And held by the deep-range Tape (1,200 frames, not a
+            /// passes, and 1,200, neither whole passes nor whole steps of the
+            /// keyboard's 128-frame grid, a looped part with a note on the loop's
+            /// head, one running past its end, two tied notes on one key and the
+            /// sustain down and up: Play, three laps, a locate, Stop, and the
+            /// passes after, for a DX7, the keyboard and a kit. The speakers and
+            /// the take are the waiting lane's to the bit, the DX7 and the
+            /// keyboard as exactly as the kit, each strike on its own frame
+            /// (`Cue`) and the keyboard's grid on the lane's own frames
+            /// (`Keys::set_grid`: without it, held 1,200 from a Play a second in,
+            /// its note tails were -114.4 dB re peak apart from 51,585). Again
+            /// from a Play a second in, a note 500 frames before it on the clip:
+            /// it sounds on neither. And held by the deep-range Tape (1,200
+            /// frames, not a
             /// whole number of passes) at 448-frame passes, rolled by a count's
             /// go on the go's own frame (`go_split`), with notes on the song's
             /// first frame (the loop's head, owed at every wrap) and just inside
@@ -54827,11 +54886,11 @@ mod slot_engine {
             /// waiting lane's: the same notes on the same frames).
             #[test]
             fn a_lagged_lane_renders_what_a_waiting_lane_renders() {
-                for plays in [Plays::Dx7, Plays::Keys, Plays::Kit] {
+                for (plays, hold) in [(Plays::Dx7, 1_024u32), (Plays::Keys, 1_024), (Plays::Kit, 1_024), (Plays::Dx7, 1_200), (Plays::Keys, 1_200), (Plays::Kit, 1_200)] {
                     let key = if plays == Plays::Kit { PAD_BASE } else { 60 };
                     for from in [0u64, 48_000] {
                         let render = |armed: bool| {
-                            let mut e = live_desk(5, plays, armed, Some(1_024), |_| {});
+                            let mut e = live_desk(5, plays, armed, Some(hold), |_| {});
                             let notes = [(0, 3_000, key), (20_000, 5_000, key), (25_000, 4_000, key), (47_500, 300, key), (47_950, 2_000, key), (60_000, 3_000, key), (70_123, 2_000, key)];
                             e.set_midi_slotted(vec![part(&e, 5, &notes, &[(10_000, 127), (40_000, 0)])]);
                             if from == 0 {
@@ -54848,15 +54907,15 @@ mod slot_engine {
                             })
                         };
                         let (armed, unarmed) = (render(true), render(false));
-                        assert!(armed.lagged[1..340].iter().all(|l| *l), "fixture: {plays:?} from {from}: the armed lane did not read its part behind the song");
+                        assert!(armed.lagged[1..340].iter().all(|l| *l), "fixture: {plays:?} held {hold} from {from}: the armed lane did not read its part behind the song");
                         assert!(unarmed.lagged.iter().all(|l| !*l), "fixture: {plays:?}: the unarmed lane read its part behind the song");
                         assert!(unarmed.room.iter().any(|v| v.abs() > 1e-3), "fixture: {plays:?}: the part is silent");
-                        assert_eq!(first_difference(&armed.room, &unarmed.room), None, "{plays:?} from {from}: the speakers differ");
-                        assert_eq!(first_difference(&armed.take, &unarmed.take), None, "{plays:?} from {from}: the take differs");
+                        assert_eq!(first_difference(&armed.room, &unarmed.room), None, "{plays:?} held {hold} from {from}: the speakers differ");
+                        assert_eq!(first_difference(&armed.take, &unarmed.take), None, "{plays:?} held {hold} from {from}: the take differs");
                         if from == 48_000 {
                             // Nothing of the clip before the Play's frame sounds.
                             let first = onset_from(&armed.room, 0, 1e-4).expect("the part sounds");
-                            assert!(first >= 1_024 + (60_000 - 48_000) as usize, "{plays:?}: a note from before the Play sounded at {first}");
+                            assert!(first >= hold as usize + (60_000 - 48_000) as usize, "{plays:?} held {hold}: a note from before the Play sounded at {first}");
                         }
                     }
                 }
@@ -54908,6 +54967,72 @@ mod slot_engine {
                 assert!(armed.lagged[1..].iter().all(|l| *l), "fixture: the armed kit did not read its part behind the song");
                 assert_eq!(onsets(&unarmed.column(6), 1e-3).iter().map(|o| o.0).collect::<Vec<_>>(), [1_200, 3_200], "fixture: the unarmed kit's strikes from a Play at 48,000");
                 assert_eq!(first_difference(&armed.room, &unarmed.room), None, "from a Play at 48,000 on the deep Tape's hold, the speakers differ");
+            }
+
+            /// **Tangent Keys reading its part behind the song keeps its grid on
+            /// the lane's own frames, at any hold** (`Keys::set_grid`, told at the
+            /// head of every span of its timeline that rolls, the span a run of it
+            /// begins inside a block among them). The keyboard's recount, which
+            /// hands a finished voice's string back to the harp, fell every 128
+            /// frames of its own rendered frames, so a part read a hold behind the
+            /// song that is no whole number of 128 frames put each recount at
+            /// another frame of the part than the unarmed lane did. Piano 1,
+            /// Piano 2 and the electric grand under the sustain from 0:00, a note
+            /// on the loop's head and silent presses 40 and 130 frames after it
+            /// (a key pressed without a strike, whose voice ends within a few
+            /// hundred frames, so its recount falls just after each wrap, inside
+            /// the block the lane's run begins in), a loop of [0, 20,000) for
+            /// three laps, a locate, Stop: held 1,200 and 1,201 frames at
+            /// 512-frame passes and 1,344 at 448 (three whole passes), the armed
+            /// lane's speakers and take are the unarmed lane's to the bit. They
+            /// were apart from the first silent press after the lane's Play
+            /// (1,409, held 1,200), by -77.0 dB re peak on Piano 1, -68.5 on
+            /// Piano 2 and -67.7 on the electric grand; told only at a block's
+            /// head, and not where its run begins inside one, from 74,993.
+            #[test]
+            fn the_keyboard_behind_the_song_keeps_its_grid_at_any_hold() {
+                use crate::keys::Patch;
+                // `(at, dur, key, velocity)`: velocity 0 is a silent press.
+                let notes = [(0u64, 2_000u64, 48u8, 100u8), (40, 300, 64, 0), (130, 200, 67, 0), (9_000, 1_500, 60, 90), (15_000, 300, 72, 0), (15_100, 900, 55, 70)];
+                for patch in [Patch::Piano1, Patch::Piano2, Patch::ElectricGrand] {
+                    for (hold, pass) in [(1_200u32, BLOCK), (1_201, BLOCK), (1_344, 448usize)] {
+                        let render = |armed: bool| {
+                            let mut e = live_desk(5, Plays::Keys, armed, Some(hold), |_| {});
+                            e.set_keys_patch(Slot(5), patch);
+                            let gen = e.lane_gen(Slot(5)).expect("a lane");
+                            e.set_midi_slotted(vec![SlotPlacedMidi {
+                                slot: Slot(5),
+                                gen,
+                                placed: PlacedMidi {
+                                    strip: 5,
+                                    start: 0,
+                                    len: 400_000,
+                                    notes: Arc::new(notes.iter().map(|&(at, dur, key, vel)| ClipNote { at, dur, key, vel }).collect()),
+                                    pedal: Arc::new(vec![ClipPedal { at: 0, cc: 64, value: 127 }, ClipPedal { at: 17_000, cc: 64, value: 0 }]),
+                                },
+                            }]);
+                            e.set_loop(0, 20_000);
+                            let blocks = 160 * BLOCK / pass;
+                            run(&mut e, 5, pass, blocks, |e, b| {
+                                if b == 0 {
+                                    e.set_transport(1, 0);
+                                    e.set_rolling(true);
+                                }
+                                if b == 120 * BLOCK / pass {
+                                    e.set_transport(2, 8_000);
+                                }
+                                if b == 150 * BLOCK / pass {
+                                    e.set_rolling(false);
+                                }
+                            })
+                        };
+                        let (armed, unarmed) = (render(true), render(false));
+                        assert!(armed.lagged[1..].iter().filter(|l| **l).count() > armed.lagged.len() / 2, "fixture: {patch:?} held {hold}: the armed lane did not read its part behind the song");
+                        assert!(unarmed.room.iter().any(|v| v.abs() > 1e-3), "fixture: {patch:?}: the part is silent");
+                        assert_eq!(first_difference(&armed.room, &unarmed.room), None, "{patch:?} held {hold} at {pass}-frame passes: the speakers differ");
+                        assert_eq!(first_difference(&armed.take, &unarmed.take), None, "{patch:?} held {hold} at {pass}-frame passes: the take differs");
+                    }
+                }
             }
 
             /// **A hold that moves under a lane reading its part behind the
@@ -63184,6 +63309,78 @@ mod strikes {
                 let take = render(engine(inst, clip(&long, &[])), how, until);
                 let rule = render(engine(inst, clip(&drawn, &[])), how, until);
                 assert_same(&take, how.start, &rule, how.start, how.start, until, 0, &format!("{inst:?}: sixteen notes a frame past each next strike, {how:?}, against each let up at the next"));
+            }
+        }
+    }
+
+    /// **The keyboard plays back what it exports wherever Play is pressed.**
+    /// Its grid (`Keys::harp_due`: the recount that hands a finished voice's
+    /// string back to the harp and frees its slot, the harp's payments, the
+    /// reed amp's flush) fell every 128 frames of the instrument's own
+    /// rendered frames, so a part played from a frame off that grid, the
+    /// song's frames counted from 0:00, put every recount at another frame
+    /// than the export did: the same notes on the same frames, their sound
+    /// apart from the first silent press under the pedal (a key pressed
+    /// without a strike, which lifts its damper off a string the harp
+    /// sounds), by -69.0 dB re peak on Piano 2, -62.3 on the electric grand
+    /// and -75.2 on Piano 1 played from 14,767, and on Piano 1 from 15,100 at
+    /// -99.9 (the seven other patches were the same already: nothing of
+    /// theirs moves with the recount here). The grid falls on the song's
+    /// frames now, told where each stretch of them begins (`Keys::set_grid`).
+    /// A chord under the sustain, three silent presses under it, the pedal
+    /// up, the sostenuto and the soft pedal down and up under a later phrase:
+    /// every patch played from 15,100 at a 256-frame buffer with the
+    /// look-ahead on AUTO, from 14,767 at 1,024 with it off and from 15,013
+    /// pinned at 64, all three off the grid, and Piano 1 from those and from
+    /// 15,104 (on it) at 64 frames with the look-ahead off and on AUTO, at
+    /// 256 pinned and off and at 1,024 on AUTO, is the export's take to the
+    /// bit, to 70,000, where the voices have long ended.
+    #[test]
+    fn the_keyboard_plays_back_what_it_exports_wherever_play_is_pressed() {
+        // `(at, dur, key, velocity)`: velocity 0 is a silent press.
+        let notes = [
+            (16_000u64, 3_000u64, 48u8, 100u8),
+            (16_300, 2_500, 55, 90),
+            (16_700, 9_000, 60, 70),
+            (18_100, 400, 64, 0),
+            (19_300, 500, 67, 0),
+            (20_900, 300, 72, 0),
+            (27_000, 1_200, 62, 110),
+            (27_400, 900, 65, 100),
+            (33_000, 600, 57, 80),
+            (41_000, 2_000, 69, 60),
+        ];
+        let pedal = [(15_900u64, 64u8, 127u8), (30_500, 64, 0), (36_000, 66, 127), (38_000, 67, 127), (44_000, 66, 0), (50_000, 67, 0)];
+        let part = || PlacedMidi {
+            strip: L,
+            start: 0,
+            len: 4 * 48_000,
+            notes: Arc::new(notes.iter().map(|&(at, dur, key, vel)| ClipNote { at, dur, key, vel }).collect()),
+            pedal: Arc::new(pedal.iter().map(|&(at, cc, value)| ClipPedal { at, cc, value }).collect()),
+        };
+        let until = 70_000;
+        for patch in crate::keys::Patch::ALL {
+            let take = |how: How| {
+                let e = engine(Inst::Keys, part());
+                e.set_keys_patch(Slot(L as u32), patch);
+                render(e, how, until)
+            };
+            let export = take(EXPORT);
+            assert!(first_sound(&export, 0).is_some(), "fixture: {patch:?}: the export is silent");
+            let mut hows = vec![
+                How { buf: 256, grain_ms: -1.0, start: 15_100, pinned: false },
+                How { buf: 1024, grain_ms: 0.0, start: 14_767, pinned: false },
+                How { buf: 64, grain_ms: -1.0, start: 15_013, pinned: true },
+            ];
+            if patch == crate::keys::Patch::Piano1 {
+                for start in [15_100u64, 14_767, 15_013, 15_104] {
+                    for (buf, grain_ms, pinned) in [(64, 0.0, false), (64, -1.0, false), (256, -1.0, true), (256, 0.0, false), (1024, -1.0, false)] {
+                        hows.push(How { buf, grain_ms, start, pinned });
+                    }
+                }
+            }
+            for how in hows {
+                assert_same(&take(how), how.start, &export, 0, how.start, until, 0, &format!("Keys {patch:?} played {how:?} against the export"));
             }
         }
     }

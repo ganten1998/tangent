@@ -1536,7 +1536,11 @@ pub struct Keys {
     /// moved with the host's call size (up to 896 frames early at
     /// 1024-frame calls: the electric grand -65 dB re peak off the
     /// 128-frame take, `every_patch_renders_the_same_at_any_host_call`).
-    /// The frame's recount falls on the same grid (`count_block`).
+    /// The frame's recount falls on the same grid (`count_block`). The
+    /// host sets where the grid falls against the timeline it plays the
+    /// instrument on (`set_grid`), so its lines fall every 128 frames of that
+    /// timeline, not of the instrument's own frames counted from wherever it
+    /// started.
     harp_due: usize,
     /// How many times the shared side has been cleared (`clear_shared`):
     /// what the tests hold a repeated all notes off's cost to.
@@ -1757,6 +1761,22 @@ impl Keys {
     pub fn idle(&mut self, frames: usize) {
         self.follow_designs(Audio::Went(frames));
         self.pass_harp_grid(frames);
+    }
+
+    /// **The next frame rendered or told of is frame `frame` of the
+    /// timeline**: the grid (`harp_due`) falls on the timeline's own frames
+    /// from here, a line wherever `frame` is a whole number of
+    /// `modal::BLOCK`s. The host says so where a run of its frames begins
+    /// (Play, a locate, a loop's wrap) and at every stretch it renders of
+    /// one, so the recount, the harp's payments and the reed amp's flush
+    /// fall on the same frames of a part wherever it was started, whatever
+    /// the instrument rendered before it (silence while stopped, a lane's
+    /// rests) and however far behind the song the part is read. Told of a
+    /// frame the grid already falls on, which is every stretch of a run
+    /// after its first, it moves nothing.
+    pub fn set_grid(&mut self, frame: u64) {
+        let block = modal::BLOCK as u64;
+        self.harp_due = ((block - frame % block) % block) as usize;
     }
 
     /// What the knobs make of the strings, brought to them as they move and
@@ -4751,6 +4771,95 @@ mod tests {
             }
             println!("{patch:?}: nine performances, whole, at 333-frame calls and at 64 random cuts: the same to the bit");
         }
+    }
+
+    /// `at_cuts` with no cuts, on an instrument that first rendered
+    /// `silence` frames of nothing in 512-frame calls and was then told, or
+    /// not, that the performance begins on frame `told` of its timeline.
+    fn after_silence(patch: Patch, events: &[(usize, PedalEv)], frames: usize, silence: usize, told: Option<u64>) -> Vec<f32> {
+        let mut k = Keys::new(SR);
+        k.set_patch(patch);
+        let mut quiet = vec![0.0_f32; 2 * 512];
+        let mut left = silence;
+        while left > 0 {
+            let n = left.min(512);
+            k.render(&mut quiet[..2 * n], n, 2);
+            left -= n;
+        }
+        if let Some(frame) = told {
+            k.set_grid(frame);
+        }
+        let mut cc = [0u8; 3];
+        let mut out = vec![0.0_f32; 2 * frames];
+        let (mut next, mut f) = (0, 0);
+        while f < frames {
+            while next < events.len() && events[next].0 <= f {
+                match events[next].1 {
+                    PedalEv::On(p, v) => k.note_on(p, f32::from(v) / 127.0),
+                    PedalEv::Off(p) => k.note_off(p),
+                    PedalEv::Cc(slot, v) => {
+                        cc[slot] = v;
+                        k.set_pedals(cc);
+                    }
+                    PedalEv::Knob(i, v) => k.set_param(i, v),
+                    PedalEv::Patch(p) => k.set_patch(p),
+                    PedalEv::AllOff => k.all_notes_off(),
+                }
+                next += 1;
+            }
+            let end = if next < events.len() { events[next].0.min(frames) } else { frames };
+            k.render(&mut out[2 * f..2 * end], end - f, 2);
+            f = end;
+        }
+        out
+    }
+
+    /// **A part told where its timeline stands renders the same whatever the
+    /// instrument rendered before it** (`Keys::set_grid`). The grid fell every
+    /// 128 frames of the frames the instrument had rendered, so the same
+    /// performance after another length of silence (a host starting the part
+    /// at another frame of its song, a part read a hold behind the song, a
+    /// lane back from a rest) put its recounts at other frames of it. Every
+    /// patch, silent presses under a pedalled C2 and a pedalled chord let up:
+    /// after 4,096 frames of silence and after 4,144 and 4,223, each told the
+    /// performance begins on frame 4,096 of its timeline, it renders the same
+    /// bits; untold, 4,144 frames moved Piano 1, Piano 2 and the electric
+    /// grand, whose recounts hand the strings back to the harp.
+    #[test]
+    fn a_part_told_its_timeline_renders_the_same_after_any_silence() {
+        let mut moved = Vec::new();
+        for patch in Patch::ALL {
+            let key = |k: u8| if patch == Patch::Guitar { k.clamp(40, 83) } else { k };
+            let f = |t: f32| (t * SR).round() as usize;
+            let mut events = vec![(0, PedalEv::Cc(0, 127)), (f(0.0101), PedalEv::On(key(36), 110))];
+            for (i, k) in [43u8, 48, 52, 55, 60].into_iter().enumerate() {
+                let t = 0.1003 + 0.0611 * i as f32;
+                events.extend([(f(t), PedalEv::On(key(k), 0)), (f(t + 0.0233), PedalEv::Off(key(k)))]);
+            }
+            for (i, k) in [50u8, 57, 62].into_iter().enumerate() {
+                events.extend([(f(0.5003 + 0.0127 * i as f32), PedalEv::On(key(k), 90)), (f(0.6011), PedalEv::Off(key(k)))]);
+            }
+            events.extend([(f(0.7013), PedalEv::Off(key(36))), (f(1.1009), PedalEv::Cc(0, 0))]);
+            events.sort_by_key(|e| e.0);
+            let frames = f(1.6);
+            let first = after_silence(patch, &events, frames, 4_096, Some(4_096));
+            let peak = first.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(peak > 1.0e-3, "{patch:?}: the performance is silent, so its silences prove nothing");
+            assert_eq!(after_silence(patch, &events, frames, 4_096, None), first, "{patch:?}: telling the frame the grid already falls on moved it");
+            for d in [48usize, 127] {
+                let told = after_silence(patch, &events, frames, 4_096 + d, Some(4_096));
+                if let Some(i) = told.iter().zip(&first).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                    panic!("{patch:?}: told its timeline after {} frames of silence, it first differs at frame {}", 4_096 + d, i / 2);
+                }
+            }
+            if after_silence(patch, &events, frames, 4_144, None) != first {
+                moved.push(patch);
+            }
+        }
+        assert!(
+            [Patch::Piano1, Patch::Piano2, Patch::ElectricGrand].iter().all(|p| moved.contains(p)),
+            "fixture: the silences did not move the patches with a harp untold ({moved:?}), so telling proves nothing"
+        );
     }
 
     /// **A cleared key noise is a new one** (`grand::KeyNoise`, the frame's
