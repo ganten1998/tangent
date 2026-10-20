@@ -109,12 +109,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   look-ahead it would have had, so the dearest block of a start or a stop
   costs 1.0 to 1.4 times what the varispeed dial's dearest block does, where
   it cost 2.5 to 5.7 times, measured in two quiet sittings. This changes
-  nothing the desk plays with start and stop off, or with the tape at rest
-  or at speed, except that a stop, a locate, a loop wrap or a dial move in
-  the first 30 or so blocks after the tape reaches speed (about a tenth of a
-  second at a 128-frame buffer) plays its reverb tails along a slightly
-  different path, at the same level. Tracks with an instrument or a hosted
-  plugin still come back all at once, as before.
+  nothing the desk plays with start and stop off, and after a start the
+  tracks play exactly what they would have without it once every one is
+  back, within about a tenth of a second of the tape reaching speed (just
+  under a fifth of a second at buffers over 256 frames). A stop, a locate,
+  a loop wrap, a dial move or a knob turned on one of Tangent's own effects
+  inside that moment, or a quiet track's effects standing down there after
+  eight silent seconds, finds those tracks' effects up to about 20 ms
+  behind where 5.2 had them: their tails take a slightly different path,
+  nearer what the desk plays with the look-ahead off, and an effect with
+  motion of its own (the plate, Tape's wow and flutter, the chorus) stays
+  that little bit off 5.2's for the rest of the session, the same sound at
+  the same level but not the same bits. Tracks with an instrument or a
+  hosted plugin still come back all at once, as before.
 - **One bad sample no longer stops the effects after it.** A plugin or an
   audio interface that delivered a single NaN or infinity left every filter,
   compressor, Tape and reverb after it making nothing but invalid samples

@@ -283,10 +283,11 @@ lane-frames at 64 frames and 2448 at 128, against 1664 and 2688), but every
 stop, locate, wrap or dial move after a start played its tails along another
 path until the rings next cleared, and an Analog desk played other dice for the
 rest of the song, 15 to 37 dB under its notes, with nothing happening at all.
-Alternated in the sitting above, bringing every lane back onto the clock costs
-about 7 % on the worst block over that draft (1.23 to 1.28x the dial's at 64
-frames and 1.24 to 1.27x at 128) and 9 % on the p99 (1.33 to 1.37x and 1.30 to
-1.36x), all of it in the 17 to 19 blocks the way back is open.
+Alternated in the motor lane's sitting, bringing every lane back onto the
+clock costs about 7 % on the worst block over that draft (1.23 to 1.28x the
+dial's at 64 frames and 1.24 to 1.27x at 128) and 9 % on the p99 (1.33 to
+1.37x and 1.30 to 1.36x), all of it in the 17 to 19 blocks the way back is
+open.
 
 **The design's bar, 1.10 times the dial's p99 and 1.25 times its worst, is out
 of reach.** The dial at 0.75 renders three quarters of the program a block at
