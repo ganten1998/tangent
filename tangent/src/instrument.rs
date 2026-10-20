@@ -5622,6 +5622,20 @@ impl Rack {
             .iter()
             .any(|s| s.0.as_ref().is_some_and(|h| h.voice))
     }
+
+    /// **Is every bay empty or one of Tangent's own effects?** Such a rack
+    /// walks forward through the same frames however its spans are cut
+    /// (`a_grain_that_is_not_a_whole_number_of_blocks_is_the_same_audio`),
+    /// which is what lets the motor's way back hold its lane
+    /// (`Renderer::regrain_hold`). A voice is not one: the Analog computes
+    /// its chunk's work on a grid of its own frame count and draws its
+    /// wander there, so a span cut anywhere else plays different dice; nor
+    /// is a hosted plugin, which may block internally.
+    fn spans_free(&self) -> bool {
+        self.slots
+            .iter()
+            .all(|s| s.0.as_ref().is_none_or(|h| !h.voice && matches!(h.backend, Backend::Builtin(_))))
+    }
 }
 
 /// **How long a stopped desk goes on running an effect chain before it
@@ -9658,6 +9672,14 @@ struct GrainKey {
     /// How many frames of it are valid. **Zero means the slot holds
     /// nothing** - what the ring starts as and what a flush leaves behind.
     frames: u32,
+    /// **Where the grain clock counts this grain's look-ahead phase from**
+    /// (`Renderer::grain_span`): its own first frame, `at`, for every grain
+    /// the clock renders. A grain the motor's way back renders to an end of
+    /// the clock's own ring for its lane (`Renderer::regrain_turns`) is
+    /// stamped with the first frame of the clock's grain that ends there
+    /// instead, so a lane brought level looks ahead on the very chunk the
+    /// clock would have.
+    origin: u64,
     /// Whether the render put anything in it the fold should sum.
     ///
     /// This is `LaneBody::folds` made a property of the SPAN rather than of the
@@ -9678,67 +9700,22 @@ struct GrainKey {
     armed: bool,
 }
 
-/// **One lane's rendered audio, as a ring of grains keyed by position.**
+/// **The keys of a grain ring without its audio**: all the grain clock reads
+/// to decide a lane's span (`Renderer::grain_span`).
 ///
-/// The row this replaces was the render's seed, the render's output, the
-/// delay line's in-place buffer at consumption and the fold's source, all at
-/// once, which is only coherent while those are the same chunk. A grain that
-/// covers more than one callback needs them told apart, so the audio lives
-/// in a slot with a key and the fold copies the span it wants into a staging
-/// pair of its own.
-struct LaneGrains {
-    slots: [Vec<Vec<f32>>; GRAIN_SLOTS],
+/// A [`LaneGrains`] keeps its slots' keys in one. The motor's way back keeps
+/// a second one beside it for a lane it holds (`LaneGrains::shadow`): the
+/// ring the lane would have had if the way back had not held it, advanced
+/// chunk by chunk by the clock's own decisions and never rendered, so the
+/// way back knows where to bring the lane level.
+#[derive(Clone, Copy, Default)]
+struct GrainRing {
     keys: [GrainKey; GRAIN_SLOTS],
     /// The slot the next render fills.
     next: usize,
-    /// **Let back in by the tape's motor** (`Renderer::regrain_hold`): the
-    /// lane renders its next grain only when this one runs out, so its
-    /// grains keep the phase of the chunk it was let in on and never look
-    /// ahead at its lane's phase. Gone with the ring.
-    let_in: bool,
 }
 
-impl LaneGrains {
-    fn new(frames: usize) -> Self {
-        Self {
-            slots: std::array::from_fn(|_| vec![vec![0.0; frames]; TAP_CHANNELS]),
-            keys: [GrainKey::default(); GRAIN_SLOTS],
-            next: 0,
-            let_in: false,
-        }
-    }
-
-    /// **Take the next slot for a grain at `at`, and hand back its rows.**
-    ///
-    /// The key is stamped as EMPTY here and filled in by [`Self::keep`] once
-    /// the render has finished, so a render that walks away leaves a slot
-    /// that answers "nothing", never a slot that claims audio it does not
-    /// hold.
-    fn hold(&mut self, at: u64, frames: usize) -> &mut Vec<Vec<f32>> {
-        let slot = self.next;
-        self.keys[slot] = GrainKey { at, frames: 0, ..GrainKey::default() };
-        for row in &mut self.slots[slot] {
-            if row.len() < frames {
-                row.resize(frames, 0.0);
-            }
-        }
-        &mut self.slots[slot]
-    }
-
-    /// Finish the grain the last [`Self::hold`] opened.
-    fn keep(&mut self, frames: usize, folded: bool, is_folder: bool, armed: bool) {
-        let slot = self.next;
-        let at = self.keys[slot].at;
-        self.keys[slot] = GrainKey {
-            at,
-            frames: u32::try_from(frames).unwrap_or(0),
-            folded,
-            is_folder,
-            armed,
-        };
-        self.next = (slot + 1) % GRAIN_SLOTS;
-    }
-
+impl GrainRing {
     /// The slot holding the frame at `at`, **newest first**, if any does.
     ///
     /// The order is the whole of it, and it is not tidiness. Two slots can
@@ -9758,39 +9735,6 @@ impl LaneGrains {
                 let k = self.keys[i];
                 k.frames > 0 && at >= k.at && at < k.at + u64::from(k.frames)
             })
-    }
-
-    /// **Copy `frames` from `at` into `dst`, across a grain boundary if the
-    /// span straddles one.** `None` when the ring does not hold the whole
-    /// span, which is what a locate and a cold start leave behind.
-    fn gather(&self, at: u64, frames: usize, dst: &mut [Vec<f32>]) -> Option<GrainKey> {
-        let first = self.slot_at(at)?;
-        let mut done = 0usize;
-        let mut key = self.keys[first];
-        while done < frames {
-            let here = at + done as u64;
-            let Some(i) = self.slot_at(here) else {
-                return None;
-            };
-            let k = self.keys[i];
-            let off = (here - k.at) as usize;
-            let n = (k.frames as usize - off).min(frames - done);
-            for c in 0..TAP_CHANNELS {
-                let (Some(src), Some(row)) = (self.slots[i].get(c), dst.get_mut(c)) else {
-                    continue;
-                };
-                if row.len() < frames {
-                    row.resize(frames, 0.0);
-                }
-                row[done..done + n].copy_from_slice(&src[off..off + n]);
-            }
-            // A span that straddles two grains folds if EITHER half has
-            // audio: the alternative is dropping half a block of a lane
-            // whose clip started mid-grain.
-            key.folded |= k.folded;
-            done += n;
-        }
-        Some(key)
     }
 
     /// The key of the grain that starts LATEST, if the ring holds one.
@@ -9836,14 +9780,6 @@ impl LaneGrains {
         true
     }
 
-    /// Forget everything. A locate, a transport stop or start, a varispeed
-    /// change.
-    fn clear(&mut self) {
-        self.keys = [GrainKey::default(); GRAIN_SLOTS];
-        self.next = 0;
-        self.let_in = false;
-    }
-
     /// **Whether nothing in the ring can be read at or after `floor`**:
     /// every slot empty or ending at or before it. A ring like that answers
     /// `None` to every `gather` and `covers` a later chunk can ask and puts
@@ -9854,6 +9790,150 @@ impl LaneGrains {
         self.keys
             .iter()
             .all(|k| k.frames == 0 || k.at.saturating_add(u64::from(k.frames)) <= floor)
+    }
+
+    /// **Stamp a grain the clock decided on, without rendering it**: what the
+    /// render's `hold` and `keep` leave in the keys, for the way back's
+    /// [`LaneGrains::shadow`].
+    fn stamp(&mut self, at: u64, frames: usize) {
+        let frames = u32::try_from(frames).unwrap_or(0);
+        self.keys[self.next] = GrainKey { at, frames, origin: at, ..GrainKey::default() };
+        self.next = (self.next + 1) % GRAIN_SLOTS;
+    }
+}
+
+/// **One lane's rendered audio, as a ring of grains keyed by position.**
+///
+/// The row this replaces was the render's seed, the render's output, the
+/// delay line's in-place buffer at consumption and the fold's source, all at
+/// once, which is only coherent while those are the same chunk. A grain that
+/// covers more than one callback needs them told apart, so the audio lives
+/// in a slot with a key and the fold copies the span it wants into a staging
+/// pair of its own.
+struct LaneGrains {
+    slots: [Vec<Vec<f32>>; GRAIN_SLOTS],
+    ring: GrainRing,
+    /// **Held by the tape's motor on its way back into the grain render**
+    /// (`Renderer::regrain_hold`): the clock does not plan this lane, the way
+    /// back does, and [`Self::shadow`] is the ring the clock would have kept
+    /// for it. Gone with the ring, and the moment the lane is level.
+    held: bool,
+    /// The ring this lane would hold if the way back had not held it, while
+    /// [`Self::held`]: keys only, advanced by the clock's own decisions.
+    shadow: GrainRing,
+    /// **The look-ahead origin the next [`Self::keep`] stamps**, when the way
+    /// back gave this chunk's render a turn (`GrainKey::origin`). `None`, the
+    /// grain's own first frame, for every other render.
+    phase_from: Option<u64>,
+}
+
+impl LaneGrains {
+    fn new(frames: usize) -> Self {
+        Self {
+            slots: std::array::from_fn(|_| vec![vec![0.0; frames]; TAP_CHANNELS]),
+            ring: GrainRing::default(),
+            held: false,
+            shadow: GrainRing::default(),
+            phase_from: None,
+        }
+    }
+
+    /// **Take the next slot for a grain at `at`, and hand back its rows.**
+    ///
+    /// The key is stamped as EMPTY here and filled in by [`Self::keep`] once
+    /// the render has finished, so a render that walks away leaves a slot
+    /// that answers "nothing", never a slot that claims audio it does not
+    /// hold.
+    fn hold(&mut self, at: u64, frames: usize) -> &mut Vec<Vec<f32>> {
+        let slot = self.ring.next;
+        self.ring.keys[slot] = GrainKey { at, frames: 0, origin: at, ..GrainKey::default() };
+        for row in &mut self.slots[slot] {
+            if row.len() < frames {
+                row.resize(frames, 0.0);
+            }
+        }
+        &mut self.slots[slot]
+    }
+
+    /// Finish the grain the last [`Self::hold`] opened.
+    fn keep(&mut self, frames: usize, folded: bool, is_folder: bool, armed: bool) {
+        let slot = self.ring.next;
+        let at = self.ring.keys[slot].at;
+        self.ring.keys[slot] = GrainKey {
+            at,
+            frames: u32::try_from(frames).unwrap_or(0),
+            origin: self.phase_from.take().unwrap_or(at),
+            folded,
+            is_folder,
+            armed,
+        };
+        self.ring.next = (slot + 1) % GRAIN_SLOTS;
+    }
+
+    /// See [`GrainRing::slot_at`].
+    fn slot_at(&self, at: u64) -> Option<usize> {
+        self.ring.slot_at(at)
+    }
+
+    /// **Copy `frames` from `at` into `dst`, across a grain boundary if the
+    /// span straddles one.** `None` when the ring does not hold the whole
+    /// span, which is what a locate and a cold start leave behind.
+    fn gather(&self, at: u64, frames: usize, dst: &mut [Vec<f32>]) -> Option<GrainKey> {
+        let first = self.slot_at(at)?;
+        let mut done = 0usize;
+        let mut key = self.ring.keys[first];
+        while done < frames {
+            let here = at + done as u64;
+            let Some(i) = self.slot_at(here) else {
+                return None;
+            };
+            let k = self.ring.keys[i];
+            let off = (here - k.at) as usize;
+            let n = (k.frames as usize - off).min(frames - done);
+            for c in 0..TAP_CHANNELS {
+                let (Some(src), Some(row)) = (self.slots[i].get(c), dst.get_mut(c)) else {
+                    continue;
+                };
+                if row.len() < frames {
+                    row.resize(frames, 0.0);
+                }
+                row[done..done + n].copy_from_slice(&src[off..off + n]);
+            }
+            // A span that straddles two grains folds if EITHER half has
+            // audio: the alternative is dropping half a block of a lane
+            // whose clip started mid-grain.
+            key.folded |= k.folded;
+            done += n;
+        }
+        Some(key)
+    }
+
+    /// See [`GrainRing::newest`].
+    fn newest(&self) -> Option<GrainKey> {
+        self.ring.newest()
+    }
+
+    /// See [`GrainRing::next_is_free`].
+    fn next_is_free(&self, at: u64) -> bool {
+        self.ring.next_is_free(at)
+    }
+
+    /// See [`GrainRing::covers`].
+    fn covers(&self, at: u64, frames: usize) -> bool {
+        self.ring.covers(at, frames)
+    }
+
+    /// Forget everything. A locate, a transport stop or start, a varispeed
+    /// change.
+    fn clear(&mut self) {
+        self.ring = GrainRing::default();
+        self.held = false;
+        self.phase_from = None;
+    }
+
+    /// See [`GrainRing::dead_before`].
+    fn dead_before(&self, floor: u64) -> bool {
+        self.ring.dead_before(floor)
     }
 }
 
@@ -12704,8 +12784,13 @@ struct Renderer {
     motor_jumped: bool,
     /// **The motor's way back into the grain render is open**: the
     /// varispeed path the motor alone engaged was left, and lanes are still
-    /// being let back in a share at a time (`Renderer::regrain_hold`).
+    /// being brought level with the grain clock a share at a time
+    /// (`Renderer::regrain_hold`).
     regrain: bool,
+    /// Chunks since the way back last gave a lane a turn
+    /// (`Renderer::regrain_turns`): a grain's worth of them and it gives one
+    /// whatever the desk is doing, so a held lane always comes level.
+    regrain_wait: u64,
     /// **The master meter's scale for this pass**: the motor's gain at the
     /// pass's start, so the meter reads what the speakers play through a
     /// fade and silence through a hold. 1.0 leaves the meter untouched.
@@ -18915,8 +19000,9 @@ impl Renderer {
         ((grain / frames.max(1)) as u64).clamp(1, GRAIN_PHASE_CAP)
     }
 
-    /// **The motor's way back into the grain render: a share of the desk a
-    /// chunk, never the whole desk in one block** (`Renderer::regrain`).
+    /// **The motor's way back into the grain render: the desk comes back a
+    /// share at a time, and every lane comes back to the grain clock it
+    /// would have kept** (`Renderer::regrain`).
     ///
     /// While the tape changes speed every lane renders the chunk it is
     /// asked for and its ring holds nothing ahead (`plan_grains`), so the
@@ -18928,50 +19014,63 @@ impl Renderer {
     /// and the next block refilled two phases at once.
     ///
     /// So while the way back is open, a lane that rendered last chunk
-    /// (`folds`) and holds nothing past the playhead keeps rendering its
-    /// chunk, out of `free` as a pinned lane is, until it is let in. Each
-    /// chunk lets in a quarter of the desk's work in extra work, at least
-    /// one lane: a lane let in renders a grain where it would have rendered
-    /// a chunk, `phases - 1` chunks more, which on that desk is one lane a
-    /// chunk and its first block at rest 1486 lane-frames against 1024. A
-    /// lane let in renders its next grain when its ring runs out
-    /// (`LaneGrains::let_in`), so its grains fall on the chunk it was let in
-    /// on, and the lanes let in one chunk after another refill one chunk
-    /// after another, as spread as the phases spread a cold start; and since
-    /// it is served from that grain up to the chunk its ring runs out on, it
-    /// is never a lane that rendered last chunk with nothing ahead, so its
-    /// next grain is never held and never spends a turn. A lane with nothing
-    /// to render, or one already ahead, is never held either. The way back
-    /// closes when no lane is held, and at once on a locate, a wrap, a stop,
-    /// a stems export or the path engaged again, which take the rings with
-    /// them as they always did.
+    /// (`folds`), holds nothing past the playhead and has a sound no span can
+    /// change (below) is HELD (`LaneGrains::held`). The clock does not plan
+    /// it; beside its ring it keeps the ring the clock would have given it
+    /// (`LaneGrains::shadow`), advanced every chunk by the clock's own
+    /// decision (`Renderer::grain_span`) and never rendered. A held lane
+    /// renders its chunk as a lane the clock does not grain does, served
+    /// while its ring holds it and live from where its ring ends, until the
+    /// way back gives it a turn (`Renderer::regrain_turns`): one render from
+    /// where its ring ends to an end of the shadow, which brings it level,
+    /// its ring ending where the clock's would and the clock counting its
+    /// phase from where it would have (`GrainKey::origin`). From then on the
+    /// clock plans it as any lane and decides, chunk for chunk, what it would
+    /// have decided without the way back. On the bench desk the first block
+    /// back renders the desk's chunks, 1024 lane-frames, where the clock
+    /// alone renders 8192 to 8496; no block of the way back renders more than
+    /// 1555 to 1664, and it closes 20 to 27 blocks after the hand-back.
     ///
-    /// Only the motor opens it (`render_inner`), so a desk the motor never
-    /// moves plans every chunk as it always did; and a lane is only ever
-    /// moved between rendering its chunk and being served from a grain, two
-    /// roads a running rack takes bit for bit
-    /// (`the_pins_that_arrive_mid_roll_do_not_re_run_a_rack`).
-    fn regrain_hold(&mut self, at: u64, frames: usize, rolling: bool, flush: bool, grain: usize, free: &mut LaneSet) {
+    /// **Why that is the same sound at speed, bit for bit.** A lane is held
+    /// only when no span can change its sound (`Rack::spans_free`): clips
+    /// through Tangent's own effects, whose racks walk forward through the
+    /// same frames however their spans are cut, so once the lane is level its
+    /// rack is where the clock's would be and every render from then on is
+    /// the clock's. A voice is not: the Analog draws its oscillators' wander
+    /// once a chunk of its own frame count, so a span cut where the clock
+    /// would not cut it plays different dice; the first draft of this held
+    /// every lane, and an Analog desk then played 15 to 37 dB under its notes
+    /// off the clock's for the rest of the song after every start. Nor is a
+    /// lane with a hosted plugin, which may block internally. Those lanes
+    /// come back as they always did, their whole grain at once. What a hold
+    /// cannot give back is the look-ahead itself: until a lane is level its
+    /// rack has been through less of the song than the clock's would have,
+    /// so a stop, a locate, a wrap or the dial in those blocks plays that
+    /// rack's tail from a little earlier, at the same level, nearer the desk
+    /// with the look-ahead off. The first draft never brought a lane level,
+    /// so it was every such event after a start until the rings next cleared.
+    ///
+    /// The way back closes when no lane is held, and at once on a locate,
+    /// a wrap, a stop, a stems export or the path engaged again, which take
+    /// the rings with them as they always did. Only the motor opens it
+    /// (`render_inner`), so a desk the motor never moves plans every chunk
+    /// as it always did.
+    fn regrain_hold(&mut self, at: u64, rolling: bool, flush: bool, free: &LaneSet) {
         if !self.regrain {
             return;
         }
         if !rolling || flush || self.stems_live || self.vs_now.engaged {
-            self.regrain = false;
+            self.regrain_off();
             return;
         }
-        let phases = Self::grain_phases(grain, frames) as usize;
-        let ahead = |l: &LaneBody| l.grain.newest().is_some_and(|k| k.at + u64::from(k.frames) > at);
-        // The desk's work: the lanes that rendered last chunk or are being
-        // served a grain they rendered.
-        let mut work = 0usize;
-        for walk_at in 0..self.walk_len() {
-            let ch = self.walk_lane(walk_at);
-            if self.spine.lanes.get(ch).and_then(Option::as_deref).is_some_and(|l| l.peek().folds || ahead(l.peek())) {
-                work += 1;
+        // A held lane gone to rest is let go: the walks pass it by, and its
+        // shadow would fall behind the clock it stands for.
+        let resting = &self.spine.ext.resting;
+        for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+            if let Some(l) = l.as_deref_mut().filter(|_| resting.contains(ch)) {
+                l.body_mut().grain.held = false;
             }
         }
-        let mut turn = (work / (4 * phases.saturating_sub(1).max(1))).max(1);
-        let mut held = false;
         for walk_at in 0..self.walk_len() {
             let ch = self.walk_lane(walk_at);
             if !free.contains(ch) {
@@ -18981,19 +19080,227 @@ impl Renderer {
                 continue;
             };
             let lane = lane.body_mut();
-            if !lane.folds || ahead(lane) {
+            // **Only a lane whose sound no span can change** (`Rack::spans_free`):
+            // clips through Tangent's own effects. A lane with an instrument
+            // or a hosted plugin comes back as it always did, its grain at
+            // once. A drum lane is never in `free` (`pinned_lanes`).
+            let spans_free = lane.dx7.is_none()
+                && lane.keys.is_none()
+                && lane.chains.iter().chain(lane.board.iter()).all(Rack::spans_free);
+            let g = &mut lane.grain;
+            if g.held || !spans_free || !lane.folds || g.newest().is_some_and(|k| k.at + u64::from(k.frames) > at) {
                 continue;
             }
-            if turn > 0 {
-                turn -= 1;
-                lane.grain.let_in = true;
-            } else {
-                free.remove(ch);
-                held = true;
+            // The ring as the clock left it is the ring the clock would keep.
+            g.held = true;
+            g.shadow = g.ring;
+        }
+    }
+
+    /// **Close the way back**: every lane it held is the clock's again, as it
+    /// stands (`Renderer::regrain_hold`).
+    fn regrain_off(&mut self) {
+        self.regrain = false;
+        self.regrain_wait = 0;
+        for l in self.spine.lanes.iter_mut().flatten() {
+            l.body_mut().grain.held = false;
+        }
+    }
+
+    /// **The way back's turns this chunk** (`Renderer::regrain_hold`), after
+    /// `plan_grains` has planned every lane, the ones it holds included.
+    ///
+    /// A turn is one render from where a held lane's ring ends to an end of
+    /// the clock's ring for it (`LaneGrains::shadow`), no longer than the
+    /// clock's own catch-up, so it is a span the clock itself could render,
+    /// and to the newest end it can reach: that brings the lane level when
+    /// the clock's whole look-ahead is in reach, and else leaves it a grain
+    /// or less short for a second turn to finish. A lane whose phase refills
+    /// at the head of every grain is always more than a grain ahead on the
+    /// clock, so it needs the two.
+    ///
+    /// Turns go to the lanes they bring level first, cheapest first, while
+    /// the chunk's renders stay within the desk's chunks plus the larger of
+    /// one turn and a quarter of the desk's work. A chunk the clock already
+    /// loads past that gives none, unless a grain's worth of chunks went by
+    /// without a turn, so every held lane comes level. On the bench desk the
+    /// dearest block is then the clock's own: two lanes of one phase
+    /// refilling while most of the rest are still held, at most 1664
+    /// lane-frames.
+    fn regrain_turns(&mut self, at: u64, frames: usize, grain: usize) {
+        let end_of = |k: GrainKey| k.at + u64::from(k.frames);
+        let (mut work, mut load, mut held) = (0usize, 0usize, 0usize);
+        for walk_at in 0..self.walk_len() {
+            let ch = self.walk_lane(walk_at);
+            if self.spine.ext.buses.contains(ch) {
+                continue;
+            }
+            let Some(b) = self.spine.lanes.get(ch).and_then(Option::as_deref).map(Lane::peek) else {
+                continue;
+            };
+            held += usize::from(b.grain.held);
+            if b.folds || b.grain.newest().is_some_and(|k| end_of(k) > at) {
+                work += 1;
+            }
+            if !b.skip {
+                load += b.len;
             }
         }
-        if !held {
-            self.regrain = false;
+        if held == 0 {
+            self.regrain_off();
+            return;
+        }
+        let reach = grain + GRAIN_GRID as usize - 1;
+        let cap = work * frames + reach.max(work * frames / 4);
+        let mut gave = false;
+        loop {
+            // The cheapest turn left: whether it brings its lane level, the
+            // frames it adds to the chunk, the lane, and the span with the
+            // origin its grain is stamped with.
+            let mut best: Option<(bool, usize, usize, u64, u64, u64)> = None;
+            for walk_at in 0..self.walk_len() {
+                let ch = self.walk_lane(walk_at);
+                let Some(l) = self.spine.lanes.get(ch).and_then(Option::as_deref) else {
+                    continue;
+                };
+                let b = l.peek();
+                let g = &b.grain;
+                // One turn a chunk, and only into a slot the fold is not
+                // still reading when the ring holds the chunk already.
+                if !g.held || g.phase_from.is_some() || (b.skip && !g.next_is_free(at)) {
+                    continue;
+                }
+                let from = g.newest().map(end_of).filter(|e| *e > at).unwrap_or(at);
+                let need = at.saturating_add(frames as u64).max(from + 1);
+                let Some(k) = g
+                    .shadow
+                    .keys
+                    .iter()
+                    .copied()
+                    .filter(|k| k.frames > 0 && end_of(*k) >= need && end_of(*k) - from <= reach as u64)
+                    .max_by_key(|k| end_of(*k))
+                else {
+                    continue;
+                };
+                let to = end_of(k);
+                let level = g.shadow.newest().is_some_and(|n| end_of(n) == to);
+                let extra = ((to - from) as usize).saturating_sub(if b.skip { 0 } else { b.len });
+                if best.is_none_or(|(l, x, ..)| (!level, extra) < (!l, x)) {
+                    best = Some((level, extra, ch, from, to, k.at));
+                }
+            }
+            let Some((level, extra, ch, from, to, origin)) = best else {
+                break;
+            };
+            if load + extra > cap && (gave || self.regrain_wait < Self::grain_phases(grain, frames)) {
+                break;
+            }
+            let Some(b) = self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut).map(Lane::body_mut) else {
+                break;
+            };
+            b.at = from;
+            b.len = (to - from) as usize;
+            b.skip = false;
+            b.grain.phase_from = Some(origin);
+            b.grain.held = !level;
+            load += extra;
+            gave = true;
+        }
+        if gave {
+            self.regrain_wait = 0;
+        } else {
+            self.regrain_wait += 1;
+        }
+    }
+
+    /// **What the grain clock renders for lane `ch` this chunk, from its
+    /// ring's keys**: `None` when the ring already holds the chunk's span and
+    /// it is not this lane's turn to look ahead, else the span `(from, len)`,
+    /// a `len` of zero rendering nothing (a grain the loop's end clips away).
+    ///
+    /// The clock's two arms, asked by `plan_grains` of a lane's own ring and
+    /// of the ring the motor's way back keeps for a lane it holds
+    /// (`LaneGrains::shadow`), so the two cannot drift apart.
+    #[allow(clippy::too_many_arguments)]
+    fn grain_span(
+        &self,
+        ch: usize,
+        gen: u32,
+        ring: &GrainRing,
+        at: u64,
+        frames: usize,
+        grain: usize,
+        loop_b: Option<u64>,
+    ) -> Option<(u64, usize)> {
+        // Where the lane's newest grain ends, and whether the chunk is
+        // being served from it rather than from the one behind it.
+        let newest = ring.newest();
+        let holds = ring.covers(at, frames);
+        match (holds, newest) {
+            // The ring cannot answer: render the chunk's span, widened
+            // to a grain so the next callbacks are served from it.
+            // The ring cannot answer: render on from where it ends.
+            //
+            // **From the END of the newest grain, never from the
+            // playhead**, and that is the whole of it. A lane's rack is
+            // a stateful chain walking forward through the song, and
+            // audio it has already been through must not be handed to
+            // it again - which is the same rule that made speculation
+            // the wrong shape for this feature in the first place.
+            //
+            // Catching up from `at` looked right and was not. With a
+            // grain that is a whole number of blocks it never fires
+            // after the first chunk, so it went unseen. With a grain
+            // that is NOT - 5 ms against a 128-frame buffer is 240
+            // frames - `covers` fails on the very next chunk, because
+            // the ring ends part way through the span the fold wants;
+            // the lane then caught up from `at` and re-ran the overlap
+            // through its rack. Measured: 199 overlapping catch-ups in
+            // 200 chunks, and a plate reverb 15.7 dB wrong.
+            (false, _) => {
+                let from = match newest {
+                    Some(k) if k.at + u64::from(k.frames) > at => k.at + u64::from(k.frames),
+                    // Cold, or the ring is behind the playhead after a
+                    // locate or a park: there is nothing to continue.
+                    _ => at,
+                };
+                // Long enough to finish the span the fold is asking
+                // for, however little of it is left.
+                let need = usize::try_from(at.saturating_add(frames as u64).saturating_sub(from)).unwrap_or(frames);
+                // **The clip may shorten the look-ahead and never the
+                // span the fold is owed.** The wrap is taken at BLOCK
+                // granularity - `run_transport` folds `pos` back only
+                // once the whole block is out - so the block that
+                // straddles the loop end really does play up to a
+                // block past `loop_b`, and a lane whose grain was cut
+                // short at the boundary has to render the rest of it.
+                // Clipping that to nothing is what made the straddling
+                // block silent.
+                let want = Self::to_grid(from, grain.max(need));
+                let len = Self::clip_grain(from, want, loop_b).max(need);
+                Some((from, self.clip_pedal(ch, gen, at, frames, from, len, need)))
+            }
+            // Served from the newest grain, so the older slot is free.
+            // Look ahead when this lane's phase has come up, counted from
+            // where the clock counts it (`GrainKey::origin`).
+            (true, Some(key)) if at >= key.origin => {
+                let into = at - key.origin;
+                let phases = Self::grain_phases(grain, frames);
+                let phase = (ch as u64 % phases) * grain as u64 / phases;
+                let end = key.at + u64::from(key.frames);
+                // **And only into a slot nothing still owes the fold.**
+                // See `LaneGrains::next_is_free`.
+                if into >= phase && end > at && ring.next_is_free(at) {
+                    let want = Self::to_grid(end, grain);
+                    let len = Self::clip_grain(end, want, loop_b);
+                    Some((end, self.clip_pedal(ch, gen, at, frames, end, len, 0)))
+                } else {
+                    None
+                }
+            }
+            // Served from the older slot: the look-ahead is already
+            // rendered and there is nothing to do.
+            (true, _) => None,
         }
     }
 
@@ -19039,6 +19346,7 @@ impl Renderer {
             b.at = at;
             b.len = frames;
             b.skip = false;
+            b.grain.phase_from = None;
         }
         // **Off, or on a desk where a grain cannot mean anything.** A
         // stopped transport re-reads one position for ever; varispeed sizes
@@ -19088,7 +19396,11 @@ impl Renderer {
             };
             let lane_gen = boxed.gen;
             'grain: {
+                let clocked = grain > frames && self.grain_ok(ch, free);
                 let lane = boxed.body_mut();
+                // A lane the way back holds that the clock may no longer
+                // grain is let go, to be served and then go live below.
+                lane.grain.held &= clocked;
                 let g = &lane.grain;
                 // Where the lane's newest grain ends, and whether the chunk is
                 // being served from it rather than from the one behind it.
@@ -19116,7 +19428,19 @@ impl Renderer {
                 // In all three the ring is ahead of the playhead and the lane
                 // was rendering the chunk anyway. Serve while the ring can
                 // answer, then go live from where it ENDS.
-                if grain <= frames || !self.grain_ok(ch, free) {
+                //
+                // **A lane the motor's way back holds renders the same way**
+                // (`Renderer::regrain_hold`) until it is given a turn
+                // (`Renderer::regrain_turns`), and the clock's decision for it
+                // goes to the ring the clock would have kept for it instead.
+                if lane.grain.held {
+                    if let Some((from, len)) =
+                        self.grain_span(ch, lane_gen, &lane.grain.shadow, at, frames, grain, loop_b).filter(|s| s.1 > 0)
+                    {
+                        lane.grain.shadow.stamp(from, len);
+                    }
+                }
+                if !clocked || lane.grain.held {
                     if holds {
                         lane.skip = true;
                     } else if let Some(end) = newest
@@ -19132,80 +19456,12 @@ impl Renderer {
                     // before any of this existed.
                     break 'grain;
                 }
-                match (holds, newest) {
-                    // The ring cannot answer: render the chunk's span, widened
-                    // to a grain so the next callbacks are served from it.
-                    // The ring cannot answer: render on from where it ends.
-                    //
-                    // **From the END of the newest grain, never from the
-                    // playhead**, and that is the whole of it. A lane's rack is
-                    // a stateful chain walking forward through the song, and
-                    // audio it has already been through must not be handed to
-                    // it again - which is the same rule that made speculation
-                    // the wrong shape for this feature in the first place.
-                    //
-                    // Catching up from `at` looked right and was not. With a
-                    // grain that is a whole number of blocks it never fires
-                    // after the first chunk, so it went unseen. With a grain
-                    // that is NOT - 5 ms against a 128-frame buffer is 240
-                    // frames - `covers` fails on the very next chunk, because
-                    // the ring ends part way through the span the fold wants;
-                    // the lane then caught up from `at` and re-ran the overlap
-                    // through its rack. Measured: 199 overlapping catch-ups in
-                    // 200 chunks, and a plate reverb 15.7 dB wrong.
-                    (false, _) => {
-                        let from = match newest {
-                            Some(k) if k.at + u64::from(k.frames) > at => {
-                                k.at + u64::from(k.frames)
-                            }
-                            // Cold, or the ring is behind the playhead after a
-                            // locate or a park: there is nothing to continue.
-                            _ => at,
-                        };
-                        // Long enough to finish the span the fold is asking
-                        // for, however little of it is left.
-                        let need = usize::try_from(
-                            at.saturating_add(frames as u64).saturating_sub(from),
-                        )
-                        .unwrap_or(frames);
+                match self.grain_span(ch, lane_gen, &lane.grain.ring, at, frames, grain, loop_b) {
+                    Some((from, len)) => {
                         lane.at = from;
-                        // **The clip may shorten the look-ahead and never the
-                        // span the fold is owed.** The wrap is taken at BLOCK
-                        // granularity - `run_transport` folds `pos` back only
-                        // once the whole block is out - so the block that
-                        // straddles the loop end really does play up to a
-                        // block past `loop_b`, and a lane whose grain was cut
-                        // short at the boundary has to render the rest of it.
-                        // Clipping that to nothing is what made the straddling
-                        // block silent.
-                        let want = Self::to_grid(from, grain.max(need));
-                        let len = Self::clip_grain(from, want, loop_b).max(need);
-                        lane.len = self.clip_pedal(ch, lane_gen, at, frames, from, len, need);
+                        lane.len = len;
                     }
-                    // Served from the newest grain, so the older slot is free.
-                    // Look ahead when this lane's phase has come up, unless
-                    // the motor let it back in: then its next grain waits
-                    // for the ring to run out, and the arm above renders it
-                    // from where the ring ends (`Renderer::regrain_hold`).
-                    (true, Some(key)) if at >= key.at && !g.let_in => {
-                        let into = at - key.at;
-                        let phases = Self::grain_phases(grain, frames);
-                        let phase = (ch as u64 % phases) * grain as u64 / phases;
-                        let end = key.at + u64::from(key.frames);
-                        // **And only into a slot nothing still owes the fold.**
-                        // See `LaneGrains::next_is_free`.
-                        if into >= phase && end > at && g.next_is_free(at) {
-                            lane.at = end;
-                            let want = Self::to_grid(end, grain);
-                            let len = Self::clip_grain(end, want, loop_b);
-                            lane.len = self.clip_pedal(ch, lane_gen, at, frames, end, len, 0);
-                        } else {
-                            lane.skip = true;
-                        }
-                    }
-                    // Served from the older slot: the look-ahead is already
-                    // rendered and there is nothing to do.
-                    (true, _) => lane.skip = true,
+                    None => lane.skip = true,
                 }
                 if lane.len == 0 {
                     lane.skip = true;
@@ -19214,6 +19470,9 @@ impl Renderer {
             if let Some(cell) = self.spine.lanes.get_mut(ch) {
                 *cell = Some(boxed);
             }
+        }
+        if self.regrain {
+            self.regrain_turns(at, frames, grain);
         }
     }
 
@@ -20001,9 +20260,9 @@ impl Renderer {
                     }
                     free.insert(ch);
                 }
-                self.regrain_hold(at, frames, rolling, flush, grain, &mut free);
-            } else {
-                self.regrain = false;
+                self.regrain_hold(at, rolling, flush, &free);
+            } else if self.regrain {
+                self.regrain_off();
             }
             self.plan_grains(at, frames, rolling, grain, &free);
             self.spine.ext.grain_free = free;
@@ -21175,6 +21434,11 @@ impl Renderer {
                 let b = l.body_mut();
                 if b.wants {
                     b.grain.keep(b.len, b.folds, b.prep.is_folder, b.prep.armed);
+                } else if b.grain.held && !b.skip {
+                    // A held lane whose render the decide walk passed by left
+                    // its ring where the clock's, which is not told of that,
+                    // cannot follow: let go (`Renderer::regrain_hold`).
+                    b.grain.held = false;
                 }
             }
         }
@@ -26400,6 +26664,7 @@ impl Engine {
             motor_landed: false,
             motor_jumped: false,
             regrain: false,
+            regrain_wait: 0,
             meter_scale: 1.0,
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
@@ -33584,6 +33849,7 @@ mod tests {
             motor_landed: false,
             motor_jumped: false,
             regrain: false,
+            regrain_wait: 0,
             meter_scale: 1.0,
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
@@ -57228,9 +57494,9 @@ mod tape_motor {
     }
 
     /// How many lanes, how many frames of look-ahead and how long a pass the
-    /// way back's test plays: eight phases of a 512-frame grain at 64, two
-    /// lanes to a phase, so lanes are still let in when the first ones'
-    /// grains run out.
+    /// way back's tests play: eight phases of a 512-frame grain at 64, two
+    /// lanes to a phase, so lanes are still being brought level when the
+    /// first ones' grains run out.
     const BACK_LANES: usize = 16;
     const BACK_GRAIN: usize = 512;
     const BACK_PASS: usize = 64;
@@ -57298,87 +57564,225 @@ mod tape_motor {
         panic!("the tape never reached speed");
     }
 
+    /// One pass of `BACK_PASS` frames of each desk of `desks`, the second
+    /// one's way back shut after it (`Renderer::regrain`): its lanes then
+    /// come back from every start as the grain clock brings them back on its
+    /// own, every lane's grain in the first block at rest, which is the desk
+    /// the way back must sound like.
+    fn passes<const N: usize>(desks: &mut [(Engine, Transport); N]) -> [Pass; N] {
+        let p = desks.each_mut().map(|(e, t)| one(e, t, BACK_PASS));
+        if let Some(r) = desks.get_mut(1).and_then(|d| d.0.offline.as_mut()) {
+            r.regrain = false;
+        }
+        p
+    }
+
+    /// Whether two passes played the same audio, bit for bit.
+    fn same(a: &Pass, b: &Pass) -> bool {
+        a.out.iter().zip(&b.out).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// Where each lane's newest grain ends and the frame its look-ahead
+    /// phase counts from: what the grain clock decides a lane's next span
+    /// by (`Renderer::grain_span`).
+    fn clocks(e: &Engine) -> Vec<Option<(u64, u64)>> {
+        let r = e.offline.as_ref().expect("an offline renderer");
+        r.spine
+            .lanes
+            .iter()
+            .map(|l| l.as_deref().and_then(|l| l.peek().grain.newest()).map(|k| (k.at + u64::from(k.frames), k.origin)))
+            .collect()
+    }
+
+    /// Whether the way back holds any lane of `e` (`LaneGrains::held`).
+    fn holds_any(e: &Engine) -> bool {
+        let r = e.offline.as_ref().expect("an offline renderer");
+        r.spine.lanes.iter().flatten().any(|l| l.peek().grain.held)
+    }
+
     /// **The tape's way back into the grain render lets the desk in a
-    /// share at a time, and it is the same sound.**
+    /// share at a time, and onto the grain clock it would have kept, so it
+    /// is the same sound.**
     ///
     /// While the tape changes speed the lanes render their chunks and hold
     /// nothing ahead, so the first block at rest after a start found every
     /// ring cold and rendered a whole grain on every lane at once: here
     /// sixteen lanes' grains, 8192 frames and more, in one block where one
-    /// at rest renders 1024, the dearest block of every start. The way back
-    /// (`Renderer::regrain_hold`) lets one lane in a chunk on this desk, so
-    /// from Play on no block renders more than the desk's chunks and one
-    /// lane's grain beyond them (each grain to the grain grid); every lane is
-    /// back on its grain within a chunk a lane once the tape is at speed,
-    /// the lanes let in first refilling as the last are let in, and the way
-    /// back closes; and from then on no block renders more grains than the
-    /// two lanes a phase holds, as spread as the phases spread a cold start.
-    /// The desk with the grain off is the reference: from a parked desk,
-    /// through the dip, the start and on at speed, the two play the same
-    /// bits, so no lane re-ran audio its plate had already been through.
+    /// at rest renders 1024, the dearest block of every start. Three desks
+    /// play side by side from parked, through the dip and the start and on
+    /// at speed: the way back's; the same desk with it shut, which renders
+    /// that whole grain; and the desk with the grain off. All three play the
+    /// same bits throughout, so no lane re-ran audio its plate had already
+    /// been through, and none was cut where the clock would not have cut it.
+    /// The way back's desk never renders more in a block than the desk's
+    /// chunks and one turn beyond them (`Renderer::regrain_turns`) with the
+    /// clock's own lump of two lanes a phase on top, nor a quarter of what
+    /// the shut desk's first block at rest renders; it closes within two
+    /// turns a lane at one a pass, and from then on every lane's ring ends
+    /// where the shut desk's does and counts its phase from where that one
+    /// does, and no block renders more grains than the two lanes a phase
+    /// holds. Then a stop: the motor winds both down through their plates'
+    /// tails, which carry everything each rack has been through, look-ahead
+    /// and all, and the two play the same bits again, where the grain-off
+    /// desk, its racks behind the look-ahead, does not.
     ///
     /// Twice: from a playhead that comes to rest off the grain grid, where a
     /// grain's end falls inside a block, and from one that comes to rest on
-    /// it, where every grain's end is a block's start and a lane let in
-    /// first finds its ring run out just as the later lanes wait for their
-    /// turn. That lane's next grain is due, and it is not one of theirs.
+    /// it, where every grain's end is a block's start.
     #[test]
     fn the_tapes_way_back_into_the_grain_render_lets_the_desk_in_a_share_at_a_time() {
         let grid = crate::analog::voice::CHUNK as u64;
         let second = u64::from(RATE);
         let on = second + (grid - first_at_rest(second) % grid) % grid;
         assert_eq!(first_at_rest(on) % grid, 0, "the start from {on} does not come to rest on the grain grid");
+        let per_phase = BACK_LANES.div_ceil(BACK_GRAIN / BACK_PASS);
+        let reach = BACK_GRAIN + crate::analog::voice::CHUNK - 1;
         for (what, from) in [("off the grid", on + 13), ("on the grid", on)] {
-            let (mut grained, mut tg) = plate_desk(BACK_GRAIN, from);
-            let (mut chunked, mut tc) = plate_desk(0, from);
-            // Both desks a pass at a time; the grained one's blocks at
-            // speed, off the varispeed path, as `rendered` saw them.
-            let mut at_rest = Vec::new();
-            let mut both = |grained: &mut Engine, tg: &mut Transport, chunked: &mut Engine, tc: &mut Transport, n: usize| {
-                for k in 0..n {
-                    let a = one(grained, tg, BACK_PASS);
-                    let b = one(chunked, tc, BACK_PASS);
-                    assert!(
-                        a.out.iter().zip(&b.out).all(|(x, y)| x.to_bits() == y.to_bits()),
-                        "{what}, pass {k}: the grained desk played other audio than the chunked one ({:?})",
-                        a.show
-                    );
-                    if a.show == MotorShow::Running && !grained.offline.as_ref().is_some_and(|r| r.vs_now.engaged) {
-                        at_rest.push(rendered(grained));
-                    }
+            let mut desks = [plate_desk(BACK_GRAIN, from), plate_desk(BACK_GRAIN, from), plate_desk(0, from)];
+            for _ in 0..20 {
+                passes(&mut desks);
+            }
+            for (_, t) in &mut desks {
+                t.toggle_play();
+            }
+            // The dip, a 0.1 s start in 64-frame passes, and well past it:
+            // the way back's blocks at speed, with whether it was still open
+            // after each, and the shut desk's first.
+            let mut at_rest: Vec<(usize, usize, bool)> = Vec::new();
+            let mut shut_first = None;
+            for k in 0..400 {
+                let [back, shut, chunked] = passes(&mut desks);
+                assert!(same(&back, &shut), "{what}, pass {k}: the way back played other audio than the desk without it ({:?})", back.show);
+                assert!(same(&back, &chunked), "{what}, pass {k}: the way back played other audio than the chunked desk ({:?})", back.show);
+                let engaged = |e: &Engine| e.offline.as_ref().is_some_and(|r| r.vs_now.engaged);
+                if back.show == MotorShow::Running && !engaged(&desks[0].0) {
+                    at_rest.push({
+                        let (n, f) = rendered(&desks[0].0);
+                        (n, f, desks[0].0.offline.as_ref().is_some_and(|r| r.regrain))
+                    });
                 }
-            };
-            both(&mut grained, &mut tg, &mut chunked, &mut tc, 20);
-            tg.toggle_play();
-            tc.toggle_play();
-            // The dip, a 0.1 s start in 64-frame passes, and well past it.
-            both(&mut grained, &mut tg, &mut chunked, &mut tc, 400);
+                if shut.show == MotorShow::Running && !engaged(&desks[1].0) && shut_first.is_none() {
+                    shut_first = Some(rendered(&desks[1].0).1);
+                }
+            }
             assert!(at_rest.len() > 200, "{what}: only {} passes at speed, so little was proved", at_rest.len());
-            let grain = BACK_GRAIN + crate::analog::voice::CHUNK - 1;
-            let worst = at_rest.iter().map(|(_, f)| *f).max().unwrap_or(0);
-            let per_phase = BACK_LANES.div_ceil(BACK_GRAIN / BACK_PASS);
+            let shut_first = shut_first.unwrap_or(0);
             assert!(
-                worst <= BACK_LANES * BACK_PASS + BACK_GRAIN - BACK_PASS + per_phase * (crate::analog::voice::CHUNK - 1),
-                "{what}: a block at speed rendered {worst} lane-frames, more than the desk's chunks and one lane's grain"
+                shut_first >= BACK_LANES * BACK_GRAIN,
+                "{what}: without the way back the first block at rest rendered {shut_first} lane-frames, not every lane's grain"
+            );
+            assert!(at_rest[0].2, "{what}: the way back held no lane in the first block at rest");
+            let open = at_rest.iter().take_while(|b| b.2).count();
+            assert!(
+                open <= 2 * BACK_LANES,
+                "{what}: the way back was still open {open} passes after the tape reached speed, more than two turns a lane at one a pass"
+            );
+            let worst = at_rest.iter().map(|b| b.1).max().unwrap_or(0);
+            assert!(
+                worst <= BACK_LANES * BACK_PASS + reach + per_phase * reach,
+                "{what}: a block at speed rendered {worst} lane-frames, more than the desk's chunks, one turn and one phase's grains"
             );
             assert!(
-                !grained.offline.as_ref().is_some_and(|r| r.regrain),
-                "{what}: the way back was still open {} passes after the tape reached speed",
-                at_rest.len()
+                worst * 4 <= shut_first,
+                "{what}: the dearest block at speed rendered {worst} lane-frames, more than a quarter of the {shut_first} the desk renders without the way back"
             );
-            let steady = &at_rest[BACK_LANES + 2..];
-            let spread = steady.iter().map(|(n, _)| *n).max().unwrap_or(0);
-            assert!(spread <= per_phase, "{what}: {spread} lanes rendered in one block once every lane was back on its grain");
-            // And they rendered the desk: every lane's chunks, give or take
-            // the grain each holds ahead.
-            let frames: usize = steady.iter().map(|(_, f)| *f).sum();
-            let want = steady.len() * BACK_LANES * BACK_PASS;
-            assert!(
-                frames.abs_diff(want) <= BACK_LANES * grain,
-                "{what}: the lanes rendered {frames} frames in {} blocks, where the desk plays {want}",
-                steady.len()
-            );
+            assert_eq!(clocks(&desks[0].0), clocks(&desks[1].0), "{what}: once the way back closed, the lanes' rings were not the grain clock's");
+            let spread = at_rest[open..].iter().map(|b| b.0).max().unwrap_or(0);
+            assert!(spread <= per_phase, "{what}: {spread} lanes rendered in one block once the way back had closed");
+            // And a stop: every tail the racks carry, look-ahead and all.
+            for (_, t) in &mut desks {
+                t.toggle_play();
+            }
+            let mut chunked_apart = false;
+            for k in 0..300 {
+                let [back, shut, chunked] = passes(&mut desks);
+                assert!(same(&back, &shut), "{what}, stop pass {k}: the way back's tails were not the desk's without it ({:?})", back.show);
+                chunked_apart |= !same(&back, &chunked);
+            }
+            assert!(chunked_apart, "{what}: the stop's tails were the grain-off desk's too, so the stop proved nothing about the look-ahead");
         }
+    }
+
+    /// [`BACK_LANES`] Analog lanes, each at its own pitches, a note every 700
+    /// frames 500 long, parked at frame `from` with the motor on at 0.1 s
+    /// each way, at a grain of `grain` frames.
+    fn analog_desk(lanes: usize, grain: usize, from: u64) -> (Engine, Transport) {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&tangent_ui::desk_legacy::V32Desk {
+            send: std::array::from_fn(|_| 0.0),
+            muted: std::array::from_fn(|_| false),
+            soloed: std::array::from_fn(|_| false),
+        });
+        e.set_midi_clips(
+            (0..lanes)
+                .map(|strip| PlacedMidi {
+                    strip,
+                    start: 0,
+                    len: u64::from(RATE) * 12,
+                    notes: Arc::new(
+                        (0..800u64)
+                            .map(|i| ClipNote { at: i * 700, dur: 500, key: 40 + (strip as u8 % 8) * 5 + (i % 4) as u8, vel: 90 })
+                            .collect(),
+                    ),
+                    pedal: Arc::new(Vec::new()),
+                })
+                .collect(),
+        );
+        for lane in 0..lanes {
+            e.load_insert(lane, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                .expect("the Analog loads")
+                .expect("and is seated");
+        }
+        e.set_grain_ms(1000.0 * grain as f64 / f64::from(RATE));
+        e.set_tape_motor(true, 0.1, 0.1);
+        let mut t = Transport::new();
+        t.locate((from as f64 + 0.5) / f64::from(RATE));
+        (e, t)
+    }
+
+    /// **A lane whose sound its spans can change comes back from a start as
+    /// it always did**, its whole grain in the first block at rest.
+    ///
+    /// The way back renders a lane it holds in spans the grain clock never
+    /// cuts (`Renderer::regrain_hold`). Through Tangent's own effects that is
+    /// the same sound; through an Analog it is not, because the voice draws
+    /// its oscillators' wander once a chunk of its own frame count, and a
+    /// span ending inside one of those chunks splits it and draws twice:
+    /// the first draft of the way back held these lanes too, and every start
+    /// then played the rest of the song with other dice, 15 to 37 dB under
+    /// the notes with nothing else happening. So it holds none of them
+    /// (`Rack::spans_free`): four Analog lanes from a parked playhead off
+    /// the grain grid, through the start, at speed and through a stop, play
+    /// the same bits as the desk with the way back shut, and no pass holds
+    /// a lane.
+    #[test]
+    fn a_lane_whose_sound_its_spans_can_change_comes_back_from_a_start_as_it_always_did() {
+        let from = u64::from(RATE) + 13;
+        let mut desks = [analog_desk(4, BACK_GRAIN, from), analog_desk(4, BACK_GRAIN, from)];
+        for _ in 0..20 {
+            passes(&mut desks);
+        }
+        for (_, t) in &mut desks {
+            t.toggle_play();
+        }
+        let mut loudest = 0.0f32;
+        let mut ran = 0usize;
+        for k in 0..700 {
+            if k == 400 {
+                for (_, t) in &mut desks {
+                    t.toggle_play();
+                }
+            }
+            let [back, shut] = passes(&mut desks);
+            assert!(!holds_any(&desks[0].0), "pass {k}: the way back held an Analog lane");
+            assert!(same(&back, &shut), "pass {k}: the Analog desk played other audio than the desk without the way back ({:?})", back.show);
+            loudest = loudest.max(peak(&back.out));
+            ran += usize::from(back.show == MotorShow::Running);
+        }
+        assert!(ran > 200, "only {ran} passes at speed, so little was proved");
+        assert!(loudest > 0.01, "the Analog lanes were silent, so their sameness proves nothing");
     }
 
     /// The audio track an input is bound to, beside the tone's lane.
