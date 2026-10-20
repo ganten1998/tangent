@@ -43,11 +43,14 @@ converters, is still not taken off a recording.
 
 ## Hear the master while you track
 
-While you track with monitoring through Tangent, the speakers play every
-plugin across the master, exactly as the recording gets it. In 5.2 the
-speakers dropped them all as soon as an audio input was armed, so a Tape or
-a trim on the master went silent in your headphones while the take kept it.
-Arming and disarming now crossfade instead of clicking, a balance curve on
+While you track, the speakers play every plugin across the master: with
+monitoring through Tangent exactly as the recording gets it, and with an
+armed input kept out of them (monitoring off, the armed track muted, or
+another track soloed) on everything else. In 5.2 the speakers dropped them
+all as soon as an audio input was armed, so a Tape or a trim on the master
+went silent in your headphones while the take kept it, and a solo on
+another track while a vocal was armed took a master Tape and its dials out
+of the speakers. Arming and disarming now crossfade instead of clicking, a balance curve on
 the master moves the speakers too, and the click and a recorded part's
 placement wait with the master's plugins, so both stay on the beat.
 
@@ -301,10 +304,11 @@ and a Keys track sounds the same at any buffer size.
 
 ## Known
 
-- With monitoring off, as with an interface's direct monitoring, the
-  speakers still leave out the plugins across the master while an audio
-  input is armed. Hearing them there needs a second copy of every master
-  plugin, which is planned next.
+- An armed input kept out of the speakers (monitoring off, as with an
+  interface's direct monitoring, or its track muted or soloed out) reaches
+  the take without the plugins across the master; the rest of the take and
+  exports keep them. Putting them on that input too needs a second copy of
+  every master plugin, which is planned next.
 - While you track with monitoring on, the take carries your playing as late
   as the master's plugins hold the mix, just as you heard it. A part
   recorded onto a track is placed on the beat either way.

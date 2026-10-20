@@ -46,16 +46,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
-- **While you track with monitoring on, the speakers play the plugins
-  across the master.** As soon as an audio input was armed, the speakers
-  dropped every plugin on the master while the take kept them, so a -12 dB
-  trim on the master sounded 12 dB louder in the speakers than in the take,
-  and a Tape across the master was not heard at all while you tracked. With
-  monitoring on, the speakers now play the master's whole chain exactly as
-  the take does, every plugin on both of its racks, so you hear a Tape or an
-  IR across the master while you play. Only the limiter's lookahead stays
-  out of the speakers. The song and your own playing then come as late as
-  those plugins hold the mix (see Known). The click, a count-in's go and
+- **While you track, the speakers play the plugins across the master.** As
+  soon as an audio input was armed, the speakers dropped every plugin on the
+  master while the take kept them, so a -12 dB trim on the master sounded
+  12 dB louder in the speakers than in the take, and a Tape across the master
+  was not heard at all while you tracked. The speakers now play the master's
+  whole chain, every plugin on both of its racks, so you hear a Tape or an
+  IR across the master while you play: with monitoring on exactly as the
+  take does, and with an armed input kept out of the speakers (monitoring
+  off, or the armed track muted, or another track soloed) on everything but
+  that input. A solo on another track while a vocal was armed took a Tape
+  across the master out of the speakers, and every one of its dials with
+  it, which sounded like the Tape dying a few seconds after the song began.
+  Only the limiter's lookahead stays out of the speakers. The song and your
+  own playing then come as late as those plugins hold the mix (see Known).
+  The click, a count-in's go and
   where a recorded part is placed wait with them, so the click stays on the
   music's beat and a part you record onto a track, played to what you
   heard, is placed on that beat.
@@ -327,26 +332,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   take, and a part you record onto a track is placed on the beat you played
   it to either way. To keep a take tight, or to play with less in the way,
   take the plugins that add delay off the master while you track.
-- **With monitoring off, the speakers still leave out the plugins across the
-  master while an audio input is armed.** This applies whenever an armed
-  input is kept out of the speakers: monitoring off, or the armed track
-  muted or soloed out, as when you listen through your interface's direct
-  monitoring. The speakers then play the mix without the master's plugins,
-  while the take and exports keep them. Hearing them there needs a second
+- **An armed input kept out of the speakers reaches the take without the
+  plugins across the master.** This applies whenever an armed input is kept
+  out of the speakers: monitoring off, or the armed track muted or soloed
+  out, as when you listen through your interface's direct monitoring. The
+  master's plugins run once, on what the speakers play, so the take carries
+  that input with its own track's effects but none of the master's, on the
+  beat you played it to; the rest of the take, and exports, keep them.
+  Plugins across the master on that input in the take as well needs a second
   copy of every master plugin, one for the take and one for the speakers,
   planned for after 5.3.0. Arming an audio track with monitoring off, or
   arming one that is muted or soloed out, also still switches the speakers
-  to that mix at once. With plugins or the limiter on the master this can
-  click, because a crossfade would play the input you chose not to hear.
-- **Moving between those mixes while the song plays skips or repeats a
-  little of the song in the speakers.** Arming or disarming an audio track
-  with monitoring on skips or repeats only the limiter's lookahead, 1.2 ms
-  at 48 kHz, and nothing with the limiter out. Turning monitoring off while
-  an audio input is armed skips as much of the song as the plugins across
-  the master delay it (10.7 ms with an IR, 25 ms with a Tape in its deep wow
-  range), and turning it back on plays that much again. Each crossfades
-  over 10 ms with the click; a repeat longer than the crossfade plays on at
-  full level past its end.
+  to their own mix at once. With the limiter on the master this can click,
+  because a crossfade would play the input you chose not to hear.
+- **Arming or disarming an audio track while the song plays skips or
+  repeats a little of the song in the speakers**: the limiter's lookahead,
+  1.2 ms at 48 kHz, and nothing with the limiter out. Turning monitoring off
+  or on while an audio input is armed skips and repeats nothing. Each move
+  crossfades over 10 ms with the click.
 - **Some armed instrument tracks still wait with the mix while the song plays
   them back, so their keys come late by the hold then.** These are a track
   sending into a bus whose own effects delay it more than the track's own

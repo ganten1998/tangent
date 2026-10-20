@@ -614,8 +614,16 @@ channels play back their clips and nothing else. "Ready to play" and
     waited for none of them and a Tape or an IR across the master was not
     heard while tracking.) With the input withheld (monitoring off, or its
     track muted or soloed out), as when you listen through an interface's
-    direct monitoring, the speakers skip both racks: hearing them there
-    needs a second copy of every master plugin.
+    direct monitoring, the input comes out of the mix ahead of both racks
+    and goes back into the take's after them (`RoomRoad::Withheld`), so the
+    speakers hear every master plugin on the rest of the mix, held as on
+    the heard road, and the take carries that input without the master's
+    plugins, on the beat it was played to. (Until 2026-10-20 the withheld
+    road skipped both racks, so a solo on another track while a vocal was
+    armed took a master Tape and its dials out of the speakers: the
+    owner's "inaudible and unresponsive to dial changes".) Putting the
+    master's plugins on a withheld input in the take as well needs a
+    second copy of every master plugin.
   - **Still known: with monitoring on, the take carries what you play as
     late against the song and the click as the master's plugins hold the
     mix.** The take the cassette records is the desk's one mix: an armed
@@ -641,20 +649,16 @@ channels play back their clips and nothing else. "Ready to play" and
   - **Still known: moving between those roads while the song plays skips,
     in the speakers, what their holds part by, or plays it again, over the
     10 ms crossfade, the click with the mix.** The take's mix waits for the
-    master's racks and the limiter's lookahead, the heard road for the
-    racks alone, the withheld road for neither. So arming or disarming an
-    audio input with monitoring on skips or plays again only the
-    lookahead, 1.2 ms at 48 kHz with the limiter in circuit and nothing
-    with it out; throwing monitoring off while an input is armed skips as
-    much of the song as the master's racks hold it (10.7 ms with an IR
-    across the master, 25 ms with a deep-range Tape there), and throwing
-    it back on plays that much again; disarming with monitoring off plays
-    the racks and the lookahead again. A repeat longer than the fade plays
-    on at full level past the fade's end. Arming with the input withheld
-    (monitoring off, or a muted or soloed-out track) skips the racks and
-    the lookahead and switches at once, which with plugins or the limiter
-    on the master can click: a fade out of the take's mix would play the
-    input the speakers may not hear.
+    master's racks and the limiter's lookahead, the heard road and the
+    withheld one for the racks alone. So arming or disarming an audio
+    input skips or plays again only the lookahead, 1.2 ms at 48 kHz with
+    the limiter in circuit and nothing with it out, and throwing
+    monitoring off or on while an input is armed moves the speakers not at
+    all (until 2026-10-20 it skipped or repeated as much of the song as the
+    master's racks hold it). Arming with the input withheld (monitoring
+    off, or a muted or soloed-out track) switches at once, which with the
+    limiter on the master can click: a fade out of the take's mix would
+    play the input the speakers may not hear.
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip
