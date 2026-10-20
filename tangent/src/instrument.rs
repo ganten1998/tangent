@@ -52472,19 +52472,27 @@ mod slot_engine {
         /// the take's click is the speakers' to the bit on every frame with the
         /// click in the take, plate or IR; with a count-in in the take instead,
         /// on every frame of the count's first beat, its tail included.
+        ///
+        /// **And kept out of the take, the click leaves nothing of itself
+        /// there**, its rack's ring no more than the dry click: with the click
+        /// or its count-in out of the take, the take is silent on every frame,
+        /// plate or IR, while the speakers ring. A carry that stayed on would
+        /// write the processed click into the file whenever the click strip
+        /// holds a unit.
         #[test]
         fn the_takes_click_rings_out_as_the_speakers_does_with_a_reverb_on_the_click() {
             use crate::builtin_fx::{IR_PATH, PLATE_PATH};
             for (what, path, state) in [("a plate", PLATE_PATH, None), ("a wire IR", IR_PATH, Some(wire_ir()))] {
-                for count in [false, true] {
+                // The click or its count-in in the take, and each kept out.
+                for (count, taped) in [(false, true), (true, true), (false, false), (true, false)] {
                     let mut e = wide(LEGACY_LANES);
                     e.set_tempo(120.0);
                     e.set_metronome_enabled(true);
                     e.set_metronome_gain(1.0);
                     if count {
-                        e.set_count_in_in_take(true);
+                        e.set_count_in_in_take(taped);
                     } else {
-                        e.set_metronome_in_take(true);
+                        e.set_metronome_in_take(taped);
                     }
                     e.load_insert_at(RackAddr { owner: RackOwner::Click, rack: 0 }, 0, Some(Path::new(path)), state.as_deref())
                         .expect("the built-in loads")
@@ -52513,6 +52521,14 @@ mod slot_engine {
                     assert!(take.len() / 2 >= frames, "fixture: {what}, count {count}: the take is short");
                     let rings = (2_700..BEAT_TWO).filter(|&f| room[f * 2].abs() > 1e-4).count();
                     assert!(rings > 0 || path == IR_PATH, "fixture: {what}: the plate did not ring past the dry click");
+                    if !taped {
+                        assert!(take.len() / 2 >= BEAT_TWO, "fixture: {what}, count {count}: the take is short");
+                        assert!(room[..BEAT_TWO * 2].iter().any(|v| v.abs() > CROSS), "fixture: {what}, count {count}: the speakers heard no click");
+                        if let Some(k) = take.iter().position(|v| *v != 0.0) {
+                            panic!("{what}, count {count}, kept out of the take: frame {}: the take carries the click at {}", k / 2, take[k]);
+                        }
+                        continue;
+                    }
                     for f in 0..frames {
                         assert_eq!(
                             take[f * 2].to_bits(),
