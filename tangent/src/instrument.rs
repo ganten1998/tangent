@@ -2311,7 +2311,7 @@ impl SongTrail {
     }
 
     /// The mark `back` places older than the newest kept (0 is the newest).
-        fn back(&self, back: usize) -> TrailMark {
+    fn back(&self, back: usize) -> TrailMark {
         self.marks[(self.head + TRAIL_MARKS - back % TRAIL_MARKS) % TRAIL_MARKS]
     }
 
@@ -2323,7 +2323,7 @@ impl SongTrail {
     /// younger than the wait, or more breaks inside it than the trail
     /// holds). In both the run begins after `t`, which its reader takes as a
     /// pause. At most [`TRAIL_MARKS`] steps.
-        fn run_at(&self, t: i64, min_seq: u64) -> (TrailMark, Option<TrailMark>) {
+    fn run_at(&self, t: i64, min_seq: u64) -> (TrailMark, Option<TrailMark>) {
         let mut back = 0;
         while back + 1 < self.len {
             let m = self.back(back);
@@ -2402,8 +2402,14 @@ impl TlSpan {
 /// `Some(tap.map_or(want, |t| want.min(t)))`, which keeps every copy aligned
 /// and makes the keys late by the bus's extra path in every state, stopped
 /// included. (c), the keys first: `Some(want)`, the keys at once and the
-/// track's own copy on that bus late by the extra path. Each moves only the
-/// pins of `an_armed_lanes_sends_land_with_the_mix`.
+/// track's own copy on that bus late by the extra path. Either one, tried,
+/// moves five tests and no others: the pins of
+/// `an_armed_lanes_sends_land_with_the_mix`, the gate case of
+/// `a_rule_closing_mid_song_hands_the_lane_back_to_the_wait_losing_nothing`
+/// (the lane no longer leaves), and the three that pin 5.3.0's glide on a
+/// lane sending into a slower bus (`slow_send`), whose fixtures then find
+/// that lane reading its part behind the song: they would need another of
+/// the rules that keep a lane on 5.3.0's, such as an audio clip on it.
 fn live_lag(want: usize, tap: Option<usize>) -> Option<usize> {
     tap.is_none_or(|t| t >= want).then_some(want)
 }
@@ -52011,11 +52017,12 @@ mod slot_engine {
         /// (`a_record_carves_an_armed_lanes_part_where_the_player_hears_it`).
         ///
         /// Lane 6, an armed kit, rings a continuous tone struck live on a desk
-        /// held 1,200 frames, its own stem measured. Played back (rolling, not recording) it waits
-        /// with the mix; the record punching it out at block 40 stands it
-        /// outside the wait (`plays_live`), and the record ending at block 80
-        /// brings it back. Each change GLIDES (`DelayLine::run_glide`): over
-        /// ten milliseconds the line's old read fades out under its new one.
+        /// held 1,200 frames, its own stem measured. Played back (rolling, not
+        /// recording) it waits with the mix; the record punching it out at
+        /// block 40 stands it outside the wait (`plays_live`), and the record
+        /// ending at block 80 brings it back. Each change GLIDES
+        /// (`DelayLine::run_glide`): over ten milliseconds the line's old read
+        /// fades out under its new one.
         /// So the speakers play the tone held back 1,200 frames up to the
         /// record, exactly; then, past the glide, exactly the tone as a lane
         /// recording from the start plays it, at once; and past the end's
@@ -54866,6 +54873,66 @@ mod slot_engine {
                 assert!((at(22_400) - one).abs() < 1e-6, "the strike at 20,000 is not heard at 22,400 ({})", at(22_400));
                 assert!((at(40_960) - 2.0 * one).abs() < 1e-6, "the strikes at 39,000 and 40,000 are not heard together at 40,960 ({})", at(40_960));
                 assert!((at(41_600) - one).abs() < 1e-6, "the strike at 41,000 is not heard at 41,600 ({})", at(41_600));
+            }
+
+            /// **A rule that closes under a lane reading its part behind the
+            /// song, mid-song, hands it back to the wait losing nothing of its
+            /// part** (the 5.3.1 live lane's roads out while the song rolls,
+            /// `plan_live_lanes`). A kit strikes a one-frame impulse every 1,000
+            /// frames from 10,000 to 60,000, 51 strikes, on a desk held 1,200
+            /// frames, and at pass 40 (frame 20,480 of the song) the rule closes:
+            /// the hold drops to nothing, or the bus the lane sends into reports
+            /// 512 frames, longer than the lane's own way out (`live_lag`). The
+            /// lane leaves on that pass, and what it had not read of its part,
+            /// from its cursor (19,280) to the song's frame, is handed to it at
+            /// the pass's head. With no hold its line goes from nothing to
+            /// nothing: the strike at 20,000 is heard at 20,480, every strike
+            /// once, and from the next frame on the lane is the unarmed lane's to
+            /// the bit. With the gate closed its line glides back into the wait
+            /// as 5.3.0's moves do: the last hold is heard again (the strike at
+            /// 19,000 at 20,200 and at 21,400), the strike at 20,000 at the pass's
+            /// head through the read that fades and at 21,680 on the one that
+            /// waits, and from there the lane is the unarmed lane's to the bit:
+            /// 53 strikes summed, none lost. (A lane waiting with the mix loses
+            /// what its line held in both, as a moved target does: the unarmed
+            /// lane never hears the strike at 20,000.)
+            #[test]
+            fn a_rule_closing_mid_song_hands_the_lane_back_to_the_wait_losing_nothing() {
+                for slow in [false, true] {
+                    let render = |armed: bool| {
+                        let mut e = live_desk(6, Plays::Kit, armed, Some(1_200), |p| {
+                            if slow {
+                                slow_send(p, 6);
+                            }
+                        });
+                        let hits: Vec<(u64, u64, u8)> = (0..51).map(|k| (10_000 + k * 1_000, 10, PAD_BASE)).collect();
+                        e.set_midi_slotted(vec![part(&e, 6, &hits, &[])]);
+                        run(&mut e, 6, BLOCK, 140, |e, b| {
+                            play(e, b);
+                            if b == 40 {
+                                if slow {
+                                    slow_bus(e);
+                                } else {
+                                    fake_hold(e, 0);
+                                }
+                            }
+                        })
+                    };
+                    let (armed, unarmed) = (render(true), render(false));
+                    assert!(armed.lagged[..40].iter().all(|l| *l), "slow {slow}: fixture: the lane did not read its part behind the song");
+                    assert!(armed.lagged[40..].iter().all(|l| !*l), "slow {slow}: the lane did not leave on the pass its rule closed");
+                    let col = armed.column(6);
+                    let one = onsets(&col, 1e-3).first().map(|o| o.1).expect("a strike");
+                    let total: f32 = col.chunks_exact(2).map(|f| f[0].abs()).sum();
+                    let (heard, back): (&[usize], usize) = if slow { (&[20_200, 20_480, 21_400, 21_680, 22_200], 21_681) } else { (&[20_200, 20_480, 21_000, 22_000], 20_481) };
+                    let near: Vec<usize> = onsets(&col, 1e-3).into_iter().map(|o| o.0).filter(|f| (19_500..22_500).contains(f)).collect();
+                    assert_eq!(near, heard, "slow {slow}: the strikes around the leave");
+                    let strikes = if slow { 53.0 } else { 51.0 };
+                    assert!((total - strikes * one).abs() < 1e-4, "slow {slow}: the strikes sum to {total}, where {strikes} of {one} are {}", strikes * one);
+                    let skip = back * 2;
+                    assert_eq!(first_difference(&col[skip..], &unarmed.column(6)[skip..]), None, "slow {slow}: the lane is not back with the mix from {back}");
+                    assert_eq!(first_difference(&armed.room[skip..], &unarmed.room[skip..]), None, "slow {slow}: the speakers are not the unarmed lane's from {back}");
+                }
             }
 
             /// **Arming a lane mid-song, quiet or sounding, and disarming it,

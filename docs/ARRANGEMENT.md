@@ -434,7 +434,16 @@ channels play back their clips and nothing else. "Ready to play" and
         realtime export takes every armed track back before it moves the
         song) its notes end and what it had not read is dropped; when a
         rule below closes on it mid-song, what it had not read is squeezed
-        to its next block's head and its line glides back into the wait.
+        to its next block's head and its line glides back into the wait, so
+        nothing of its part is lost. On a desk held 1,200 frames, with the
+        hold thrown to nothing at frame 20,480 a strike at 20,000 is heard
+        at 20,480 and every other on its own frame; with the bus it sends
+        into turned slower than its way out there, the last hold is heard
+        again, as in 5.3.0's moves below (a strike at 19,000 at 20,200 and
+        at 21,400), the one at 20,000 at 20,480 on the read that fades and
+        at 21,680 on the one that waits, and the lane is the mix's from
+        there. A lane waiting with the mix loses the strike at 20,000 in
+        both.
       - **Who keeps 5.3.0's rule.** A lane with a send whose path is
         longer than its own way out (a bus whose rack reports more delay
         than the lane's own folder: the owner's ruling, one function,
