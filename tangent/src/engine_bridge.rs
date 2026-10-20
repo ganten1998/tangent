@@ -3209,12 +3209,16 @@ mod tests {
     /// that level, so even an engine armed by hand after the build exports
     /// the same file. The first corpus project, its span rendered as
     /// `start_offline_render` renders it, with the setting off, on, and on
-    /// with the built engine armed: the same bytes, file for file.
+    /// with the built engine armed: the same bytes, file for file. The
+    /// corpus's documents carry no desk, and a document with no desk opens
+    /// with start and stop off whatever the session had, so this one is
+    /// given the desk its settings describe, saying the switch.
     #[test]
     fn an_export_is_the_same_file_with_tape_start_and_stop_on() {
         let render = |on: bool, arm: bool| {
             let mut c = corpus().into_iter().next().expect("a corpus project");
             c.settings.start_stop = tangent_ui::motor::StartStop::new(on, 0.1, 0.1);
+            c.doc.desk = Some(TangentApp::desk_snapshot_of(&c.settings));
             let dir = scratch(&format!("tape-motor-{on}-{arm}"));
             let app = open(&c, &dir);
             assert_eq!(app.start_stop().on(), on, "the setting did not reach the app");

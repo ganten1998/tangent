@@ -10960,8 +10960,9 @@ impl TangentApp {
     /// live app — which is what stops seeding the template from capturing
     /// whatever session happens to be open. Built from `desk_view`, so a
     /// snapshot and the once-a-frame fingerprint read the settings through
-    /// one derivation.
-    fn desk_snapshot_of(settings: &Settings) -> crate::arrangement::DeskSnap {
+    /// one derivation. Public for the export tests, which give a corpus
+    /// document the desk its settings describe.
+    pub fn desk_snapshot_of(settings: &Settings) -> crate::arrangement::DeskSnap {
         Self::desk_view(settings).to_snap()
     }
 
@@ -14756,6 +14757,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // whatever was touched after the last document save.
         if let Some(desk) = self.arrangement.desk.clone() {
             self.apply_desk_snapshot(&desk);
+        } else {
+            // **No desk at all** (a missing or empty document, one from
+            // before the desk was written, a template folder whose document
+            // is missing): the live desk stands for it, all but tape start
+            // and stop, which is the project's and off until switched on
+            // (`apply_desk_snapshot`). A document like this never switched it
+            // on, and the live switch carried the motor of whichever session
+            // had it into the project, and into its next save.
+            self.settings.start_stop = crate::motor::StartStop::default();
         }
         // And the window onto it: this document's, never the last one's.
         self.adopt_doc_viewport();
@@ -78913,10 +78923,9 @@ mod tests {").expect("the tests module")];
     /// road (`adopt_template`). The other way, a 5.2 document that says on,
     /// at its own times, opens on from a session that is off, so only the
     /// unsaid reads as off. A document with NO desk at all (a missing or
-    /// empty one, one from before the desk was written) is another thing:
-    /// it opens on the live desk whole, by `inhabit_document`'s rule, and
-    /// start and stop stands with the rest of that desk, as the export
-    /// corpus's documents rely on.
+    /// empty one, one from before the desk was written) opens on the live
+    /// desk, by `inhabit_document`'s rule, all but start and stop, which it
+    /// never switched on either: it opens off too.
     #[test]
     fn a_document_that_says_nothing_of_start_and_stop_opens_with_it_off() {
         use crate::motor::StartStop;
@@ -78970,7 +78979,7 @@ mod tests {").expect("the tests module")];
         assert!(crate::arrangement::Arrangement::load_from(&bare).desk.is_none(), "fixture: the bare document has a desk");
         app.settings.start_stop = on;
         app.open_project(&bare);
-        assert_eq!(app.settings.start_stop, on, "a document with no desk did not open on the live desk whole");
+        assert_eq!(app.settings.start_stop, StartStop::default(), "a document with no desk opened with the last session's start and stop");
         let said = write(&root.join("New"), Some(StartStop::new(true, 1.5, 3.0)));
         app.settings.start_stop = StartStop::default();
         app.open_project(&said);
