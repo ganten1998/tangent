@@ -21379,10 +21379,27 @@ impl Renderer {
             if lagged {
                 let lag = rule.unwrap_or_default();
                 // **Entering**: the lane stood on the song's run, and its last
-                // span ended here.
+                // span ended here. **Unless the song began a run on this very
+                // chunk** (a Stop, a locate, the chunk after a loop's wrap, a
+                // count's go): the lane never read that run on the song's
+                // time, so it stands in the run before, where that run had
+                // carried to, and enters the new one with its flush and the
+                // head it owes when its own time reaches it, the hold later,
+                // as every lane behind the song takes a break. Standing in the
+                // new run from its first frame it took neither flush, the
+                // song's (which passes a lane behind the song by) nor its own:
+                // what it had told rang on, and after a wrap the head the run
+                // owes was skipped.
                 if !was_lagged {
-                    lane.tl_seq = trail.newest().seq;
-                    lane.tl_end = at;
+                    let newest = trail.newest();
+                    if newest.prog == trail.now && trail.len > 1 {
+                        let before = trail.back(1);
+                        lane.tl_seq = before.seq;
+                        lane.tl_end = if before.rolling { before.at.saturating_add(trail.now - before.prog) } else { before.at };
+                    } else {
+                        lane.tl_seq = newest.seq;
+                        lane.tl_end = at;
+                    }
                 }
                 let time = lane_time(trail, lag, frames, lane.tl_seq, lane.tl_end);
                 lane.tl_lag = lag as u32;
@@ -55045,6 +55062,115 @@ mod slot_engine {
                     let skip = back * 2;
                     assert_eq!(first_difference(&col[skip..], &unarmed.column(6)[skip..]), None, "slow {slow}: the lane is not back with the mix from {back}");
                     assert_eq!(first_difference(&armed.room[skip..], &unarmed.room[skip..]), None, "slow {slow}: the speakers are not the unarmed lane's from {back}");
+                }
+            }
+
+            /// What lane `lane` still holds after the passes run: the clip
+            /// notes it has told and not let up (`LaneBody::told`), and
+            /// whether its DX7 still sounds. (The keyboard's strings and board
+            /// ring on for seconds after its last key is let up, so whether it
+            /// sounds says nothing of a key held.)
+            fn holds(e: &Engine, lane: usize) -> (u32, bool) {
+                e.offline.as_ref().map_or((u32::MAX, true), |r| {
+                    let body = r.lane_body(lane);
+                    (body.told.count_ones(), body.dx7.as_ref().is_some_and(|d| d.active()))
+                })
+            }
+
+            /// **A lane that begins reading its part behind the song on the very
+            /// chunk the song begins a run stands in the run before, and takes
+            /// the new run's flush and the head it owes the hold later**
+            /// (`plan_live_lanes`' entry). It stood in the new run from its first
+            /// frame, so the song's flush on that chunk, which a waiting lane
+            /// takes, passed it by (its notes are its own then), and its own
+            /// never came: entering, it had not left the run it stood in. What it
+            /// had told rang on, and after a loop's wrap the head the run owes
+            /// was skipped. Each edge on its own chunk is the same edge a pass
+            /// earlier, the lane entering on a chunk that carries its run on, to
+            /// the bit from the pass after the later one (an arm or the host's
+            /// word glides the lane's line out of the wait on its own pass), and
+            /// at the end the lane has told nothing it did not let up and its DX7
+            /// is quiet. On a desk held 1,200 frames, a DX7 and the keyboard on
+            /// lane 5, 512-frame passes: the hold rising from nothing on a Stop's
+            /// chunk, with a note held from 20,000 (the lane still held it told
+            /// at the end, 2.8 s after the Stop, its last second's energy 580 on
+            /// the DX7 and 3.0 on the keyboard, where its release leaves none and
+            /// 1.5e-7); the host's word rising on it (a realtime export's end,
+            /// its Stop and the word's return in one callback; the same); the
+            /// lane armed on the chunk after a loop's wrap, a note running past
+            /// the loop's end (told through every pass of lap two, 57, where 9 is
+            /// its own notes'); and the hold rising on a locate's chunk, back
+            /// from 30,720 to 4,000, a note held across it. Each differed from
+            /// the entry a pass earlier from the frame that entry takes the
+            /// break's flush on, the hold later: 31,920, and 31,408 after the
+            /// wrap.
+            #[test]
+            fn a_lane_entering_on_a_break_of_the_songs_takes_that_breaks_flush() {
+                #[derive(Clone, Copy, Debug)]
+                enum Edge {
+                    HoldAtStop,
+                    WordAtStop,
+                    ArmAtWrap,
+                    HoldAtLocate,
+                }
+                for plays in [Plays::Dx7, Plays::Keys] {
+                    let own = if plays == Plays::Dx7 { F::BUILTIN } else { F::KEYS };
+                    for edge in [Edge::HoldAtStop, Edge::WordAtStop, Edge::ArmAtWrap, Edge::HoldAtLocate] {
+                        // The pass the song breaks its run on, and its chunk's own
+                        // first pass: the Stop and the locate on pass 60, the wrap
+                        // of [0, 30,000) inside pass 58 and its flush on 59.
+                        let brk = if matches!(edge, Edge::ArmAtWrap) { 59 } else { 60 };
+                        let notes: &[(u64, u64, u8)] = match edge {
+                            Edge::HoldAtStop | Edge::WordAtStop => &[(20_000, 200_000, 60)],
+                            Edge::ArmAtWrap => &[(100, 300, 64), (25_000, 10_000, 60)],
+                            Edge::HoldAtLocate => &[(5_000, 500, 64), (20_000, 15_000, 60)],
+                        };
+                        let render = |at: usize| {
+                            let mut e = live_desk(5, plays, !matches!(edge, Edge::ArmAtWrap), Some(1_200), |_| {});
+                            let mut armed = bus_plan(&e, 42, &[]);
+                            for l in armed.lanes.iter_mut() {
+                                l.flags = F::MIDI_OFF;
+                            }
+                            armed.lanes[5].flags = own | F::ARMED;
+                            e.set_midi_slotted(vec![part(&e, 5, notes, &[])]);
+                            let h = run(&mut e, 5, BLOCK, 320, |e, b| {
+                                if b == 0 {
+                                    match edge {
+                                        Edge::HoldAtStop | Edge::HoldAtLocate => fake_hold(e, 0),
+                                        Edge::WordAtStop => e.set_live_play(false),
+                                        Edge::ArmAtWrap => e.set_loop(0, 30_000),
+                                    }
+                                }
+                                play(e, b);
+                                if b == at {
+                                    match edge {
+                                        Edge::HoldAtStop | Edge::HoldAtLocate => fake_hold(e, 1_200),
+                                        Edge::WordAtStop => e.set_live_play(true),
+                                        Edge::ArmAtWrap => {
+                                            e.publish_plan(&armed).expect("the arm");
+                                        }
+                                    }
+                                }
+                                match (edge, b) {
+                                    (Edge::HoldAtStop | Edge::WordAtStop, 60) => e.set_rolling(false),
+                                    (Edge::HoldAtLocate, 60) => e.set_transport(2, 4_000),
+                                    (Edge::ArmAtWrap | Edge::HoldAtLocate, 200) => e.set_rolling(false),
+                                    _ => {}
+                                }
+                            });
+                            let held = holds(&e, 5);
+                            (h, held)
+                        };
+                        let ((on, on_holds), (before, _)) = (render(brk), render(brk - 1));
+                        assert!(on.lagged[brk..brk + 20].iter().all(|l| *l), "{plays:?} {edge:?}: fixture: the lane did not read its part behind the song");
+                        let from = (brk + 1) * BLOCK * 2;
+                        assert_eq!(
+                            first_difference(&on.room[from..], &before.room[from..]).map(|f| f + (brk + 1) * BLOCK),
+                            None,
+                            "{plays:?} {edge:?}: entering on the break's own chunk differs from entering a pass before it"
+                        );
+                        assert_eq!(on_holds, (0, false), "{plays:?} {edge:?}: the lane still holds what it told (notes told, its DX7 sounding)");
+                    }
                 }
             }
 
