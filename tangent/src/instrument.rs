@@ -8351,9 +8351,10 @@ pub struct PadBank {
     /// last ran in, as a lane's (`LaneBody::pdc_live`, `LaneBody::pdc_ran`).
     pdc_live: bool,
     pdc_ran: u64,
-    /// **Frames the kit's line still owes the mix**: what it holds of the
-    /// last chunk it was fed sound, which it plays out over its wait.
-    /// `mix_pads` runs the kits while any owes, as while any pad sounds.
+    /// **Frames the kit's line still owes the mix**: what its lane's chain
+    /// and its line hold of the last chunk the kit sounded, which they play
+    /// out over the chain's delay and the line's wait. `mix_pads` runs the
+    /// kits while any owes, as while any pad sounds.
     pdc_owed: usize,
     dry_pdc: DelayLine,
     /// **This kit's strikes this chunk**, live and clip both, in the order
@@ -18355,6 +18356,14 @@ impl Renderer {
         // **The kit itself**: its voices and its pads' own bays, summed
         // into `fx_in` (and its dry sum into `dry_io`). See `render_kit`.
         self.render_kit(lane_ix, frames);
+        // **Whether the kit sounded this chunk, read before its lane's
+        // chain**: what its line owes the mix runs from its last sound
+        // (`PadBank::pdc_owed`, below). Read after the chain, a chain that
+        // makes sound of its own from silence (a Tape's hiss, any noisy
+        // plugin) fed the line on every chunk: once struck, the kit owed for
+        // good, so the kits never rested again and the chain's noise played
+        // on, stopped or rolling, for as long as the project stayed open.
+        let voiced = self.fx_in.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
         // **The rack of the strip the kit actually lands on**, over the
         // summed kit.
         //
@@ -18521,13 +18530,16 @@ impl Renderer {
             let chunk = self.chunks;
             let began = self.roll_began;
             let live_ok = self.shared.live_ok.load(Ordering::Relaxed);
-            // **Whether the kit fed its line any sound this chunk**: its line
-            // then owes the mix its wait's worth of frames, and the kits run
-            // until it has played them (`PadBank::pdc_owed`). A hit shorter
-            // than the wait was never heard: its voice ended, `mix_pads`
-            // returned before every line, and the hit stood in its ring.
-            let fed = self.fx_in.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
-            let owes = if live { 0 } else { wait.max(tap.unwrap_or(0)) };
+            // **Whether the kit sounded this chunk** (`voiced`, above): its
+            // line then owes the mix what the chain still holds of it, the
+            // chain's own delay, and its wait's worth of frames after that,
+            // and the kits run until it has played them (`PadBank::pdc_owed`).
+            // A hit shorter than the wait was never heard: its voice ended,
+            // `mix_pads` returned before every line, and the hit stood in its
+            // ring. The chain's delay is owed outside the wait too, where the
+            // line waits nothing and the chain still holds the hit.
+            let fed = voiced;
+            let owes = if live { 0 } else { wait.max(tap.unwrap_or(0)) }.saturating_add(own as usize);
             if let Some(bank) = self.spine.lanes.get_mut(lane_ix).and_then(Option::as_deref_mut).and_then(|l| l.body_mut().pads.as_deref_mut()) {
                 bank.pdc_owed = if fed { owes } else { bank.pdc_owed.saturating_sub(frames).min(owes) };
             }
@@ -49896,6 +49908,113 @@ mod slot_engine {
                     let (h, b) = (held[(k + 1_200) * 2 + c], bare[k * 2 + c]);
                     assert!((h - b).abs() < 1e-6, "frame {k} of the bare desk's hits is {b}, the held desk's {h}");
                 }
+            }
+        }
+
+        /// **A 10 ms drum hit on lane 6 whose own chain is a Tape** (`deep`
+        /// its deep range, else its studio range), on a desk held 1,200
+        /// frames by a silent chain on lane 2 when `held`: lane 6 armed with
+        /// the song stopped when `live` (so it stands outside the wait), else
+        /// unarmed and rolling. Struck live at block 10 of `blocks`, the song
+        /// stopped at block `stop` when one is given. Answers the speakers,
+        /// and what the kit's line owes the mix after each block
+        /// (`PadBank::pdc_owed`).
+        fn hit_through_a_tape(deep: bool, held: bool, live: bool, blocks: usize, stop: Option<usize>) -> (Vec<f32>, Vec<usize>) {
+            use crate::builtin_fx::TAPE_PATH;
+            let mut e = wide(42);
+            let mut inputs = bus_plan(&e, 42, &[]);
+            for l in inputs.lanes.iter_mut() {
+                l.flags = F::MIDI_OFF;
+            }
+            inputs.lanes[6].flags = if live { F::DRUM | F::ARMED } else { F::DRUM };
+            e.publish_plan(&inputs).expect("the plan goes");
+            let gen = e.lane_gen(Slot(6)).expect("a lane");
+            e.attach(Slot(6), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+            let samples = (0..480)
+                .flat_map(|k| {
+                    let v = (k as f64 * std::f64::consts::TAU * 1_000.0 / 48_000.0).sin() as f32 * 0.5 * (-(k as f32) / 120.0).exp();
+                    [v, v]
+                })
+                .collect();
+            let mut kit = PadKit::default();
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::new() }));
+            e.attach(Slot(6), gen, LanePart::Kit(Box::new(kit))).expect("the kit");
+            unit(&mut e, 6, 0, 0, TAPE_PATH, deep.then(|| knobs(TAPE_PATH, &[(9, 1.0)])));
+            if held {
+                fake_hold(&mut e, 1_200);
+            }
+            e.set_live_play(true);
+            e.set_lane_levels(Slot(6), 1.0, 0.0, 0.0);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..20 {
+                e.render_offline(&mut out);
+            }
+            assert_eq!(e.shared.max_latency.load(Ordering::Relaxed), 1_200, "fixture: the desk is not held 1,200 frames");
+            e.set_transport(1, 0);
+            e.set_rolling(!live);
+            let owed = |e: &Engine| {
+                e.offline
+                    .as_ref()
+                    .and_then(|r| r.spine.lanes.get(6))
+                    .and_then(|l| l.as_deref())
+                    .and_then(|l| l.peek().pads.as_deref())
+                    .map_or(0, |b| b.pdc_owed)
+            };
+            let (mut heard, mut owes) = (Vec::new(), Vec::new());
+            for b in 0..blocks {
+                if b == 10 {
+                    e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                }
+                if stop == Some(b) {
+                    e.set_rolling(false);
+                }
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+                owes.push(owed(&e));
+            }
+            (heard, owes)
+        }
+
+        /// **A drum lane whose own chain makes sound of its own rests once its
+        /// hit has played out, and a hit its chain holds longer than it lasts
+        /// is heard** (a verifier's finding on the held lines' play-out).
+        ///
+        /// The kits run while a line owes the mix (`PadBank::pdc_owed`), and
+        /// whether a kit had fed its line was read after its lane's chain had
+        /// run over it. A chain whose output is never exactly silent, such as
+        /// a Tape's hiss, then fed the line on every chunk: once struck, a
+        /// drum lane with a Tape on it owed its wait for good (1,104 frames,
+        /// at every block measured), the kits never rested again, and the
+        /// Tape's hiss played on at about -74 dBFS, rolling and stopped, for
+        /// as long as the project stayed open, where the lane fell silent
+        /// after its hit before. And the chain's own delay was owed nothing,
+        /// so a hit the chain holds longer than the hit lasts stood in the
+        /// chain when the kits rested and was never heard, as a hit shorter
+        /// than the desk's wait once stood in the line. The line owes from
+        /// the kit's own sound now, read before the chain, the chain's delay
+        /// and its wait after it. With a studio-range Tape on the drum lane
+        /// and the desk held 1,200 frames elsewhere the debt is gone within
+        /// the chunks those 1,200 frames take after the hit, and the speakers
+        /// are silent from there on, rolling and then stopped. With a
+        /// deep-range Tape on the drum lane alone (its own 1,200 frames, the
+        /// desk's whole hold, so its line waits nothing), the hit is heard,
+        /// unarmed with the song rolling and armed with it stopped.
+        #[test]
+        fn a_drum_lane_whose_chain_hisses_rests_once_its_hit_has_played_out() {
+            let loud = |v: &[f32], from: usize, to: usize| v[from * 2..to * 2].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let hit = 10 * BLOCK;
+            let (room, owes) = hit_through_a_tape(false, true, false, 300, Some(150));
+            assert!(loud(&room, hit + 1_000, hit + 2_500) > 0.1, "fixture: the hit is not heard ({})", loud(&room, hit + 1_000, hit + 2_500));
+            // The hit's own chunk, the chunks its 1,200 frames of delay and
+            // wait take, and one more.
+            let paid = 10 + 1_200usize.div_ceil(BLOCK) + 1;
+            assert!(owes[paid..].iter().all(|o| *o == 0), "the kit's line still owes {:?} from block {paid}", &owes[paid..paid + 4]);
+            let after = loud(&room, (paid + 1) * BLOCK, room.len() / 2);
+            assert!(after == 0.0, "the drum lane's chain plays on after its hit has played out ({after})");
+            for live in [false, true] {
+                let (room, _) = hit_through_a_tape(true, false, live, 20, None);
+                let heard = loud(&room, hit + 1_000, hit + 2_500);
+                assert!(heard > 0.1, "live {live}: a hit its own chain holds 1,200 frames was not heard ({heard})");
             }
         }
 

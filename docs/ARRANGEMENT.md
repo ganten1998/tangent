@@ -425,7 +425,13 @@ channels play back their clips and nothing else. "Ready to play" and
       lost its last 1,200 frames, which played out ahead of the next hit or
       note. Each line now runs on until it has played out its wait's worth
       after the last sound it was fed, and a held kit or DX7 lane is the
-      bare desk's, sample for sample, the hold later.
+      bare desk's, sample for sample, the hold later. A kit's line counts
+      from the kit's own last sound, read before its lane's chain, and owes
+      the chain's delay as well as its wait: read after the chain, a chain
+      that makes sound of its own (a Tape's hiss) fed the line for good once
+      the kit was struck, and the hiss played on, stopped or rolling, with
+      the drum pass never resting; and a hit the chain held longer than it
+      lasted (a deep-range Tape on the drum lane itself) was never heard.
   - **Still known: the interface's own round trip is not compensated.**
     Its input and output buffers and its converters are the device's, not
     the desk's, so a part played in time with what was heard lands late by
