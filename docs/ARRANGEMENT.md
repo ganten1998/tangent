@@ -379,48 +379,108 @@ channels play back their clips and nothing else. "Ready to play" and
         A tone played from the heard go now lands whole on the song frame
         the record began on, on a bare desk and a held one, whatever the
         device's callback and wherever the go falls in it.
-    - **An armed track played live is heard at once while its own timeline
-      is silent.** A lane armed and listening to MIDI stands outside the
-      wait while the song is stopped and while it records (its clips are
-      punched out then), the way a monitored input does: a key into a DX7
-      on it with a deep-range Tape on another lane is heard 110 frames after
-      it is pressed, as on a bare desk, where it was 1,310; a pad struck on
-      an armed drum lane at once, where it was 1,200 frames late. While the
-      song plays the track back and it is not recording, it waits with the
-      mix, so its own clips stay on the beat and an export lays down what
-      was heard; keys played along with playback then come late by the hold,
-      as in 5.2. (A first draft stood every armed lane outside the wait
-      whatever it was doing, and the shipped default session arms its
-      piano: on a held desk that track played its own part 25 ms early. The
-      proper fix for a lane both played and played back is to read its
-      whole timeline a wait behind the song, which reaches every walk of
-      the render; it is not built.) A lane moves out of the wait at a
-      record's start and at Stop, and back into it at a record's end and
-      at Play. A move glides over 10 ms, the old read fading under the new
-      one, and a steady sound passes without a step, but a tone the two
-      reads put out of phase dips through the fade (a DX7's A3 to about a
-      quarter of its level for 4 to 6 ms). Out of the wait, what the lane
-      made in the last hold before the move is skipped after its first
-      10 ms. Into it, that last hold is heard again, and what the lane makes
-      in the first 10 ms after the move is heard early as well, faded: on a
-      held desk a note an armed track plays just after a record ends while
-      the song plays, or just after a loop wraps back before the record's
-      start, is heard once early and faded, then on the beat. **Play does
-      not glide**: the lane takes its wait at once, its line emptied. A
-      glide there played the first 10 ms of the track's part at once,
-      faded, and again on the beat, a flam on the part's first note
-      whenever the track carried a plugin or was still ringing (a DX7 with
-      an EQ in its rack sounded its clip's note from frame 113 at 0.037 and
-      again at 1,310; a kit still ringing a pad played its clip's hit at
-      full level at once, and again 1,200 frames later). The part now starts
-      once, on the beat, and a note still ringing on the track when Play is
-      pressed drops out for the hold.
-      A line that did not run in the chunk before (a kit between strikes,
-      an instrument whose voices have ended) takes its new wait at once,
-      so the first strike after a quiet move is heard once, where it
-      belongs. Under a realtime export every lane waits with the mix, as in
-      the full-speed one. A lane that only listens (the one open in the
-      MIDI editor) waits as before.
+    - **An armed track played live is heard at once, and plays its own
+      part on the beat (5.3.1).** A lane armed and listening to MIDI reads
+      its own timeline the hold behind the song
+      (`Renderer::plan_live_lanes`), and its line waits nothing: its clips'
+      notes and offs, its clip pedal, its kit's strikes, the place and
+      transport its plugins are told and the points their curves are read
+      at all reach it the hold after the song plays them, which is where its
+      line would have put them, and nothing after the line moves. So its
+      part lands with the mix, sample for sample, in the speakers and the
+      take: at a hold of whole blocks a DX7, Tangent Keys and a kit armed
+      render what the same track unarmed renders, to the bit, over Play,
+      three laps of a loop, a locate and Stop. And a key into it is heard
+      after its own chain alone, playing, stopped or recording: a key into a
+      DX7 on it with a deep-range Tape on another lane is heard 110 frames
+      after it is pressed, as on a bare desk, where it was 1,310; a pad
+      struck on an armed drum lane at once, where it was 1,200 frames late.
+      5.3.0 stood the lane outside the wait only while its timeline was
+      silent (the song stopped, or the track recording) and made it wait
+      with the mix while it played back, so keys played along with playback
+      came late by the hold; a first draft of that had stood every armed
+      lane outside the wait whatever it was doing, and on a held desk the
+      default session's armed piano played its own part 25 ms early.
+      - **Where the song stood.** Every engine writes down the song's runs
+        (`SongTrail`: a mark wherever a chunk does not carry the run on, at
+        Play, Stop, a locate, the chunk after a loop's wrap, a count's go,
+        the end of the tape's coast), and a lane reads each block of its
+        own timeline off it: one span, or two where the song began a run
+        inside the stretch (the end of the one, then the next with its
+        flush and the loop head it owes). A cursor keeps it from reading
+        anything twice or skipping it. A hold that grows mid-song pauses
+        the part on the frame it reached (the hold going from 1,200 frames
+        to 2,400 at 20,480, the strike at 20,000 is heard at 22,400); one
+        that shrinks hands it what it skipped at its next block's head
+        (from 2,400 to 600 at 40,960, the strikes at 39,000 and 40,000
+        sound together there, and the one at 41,000 at 41,600); and its
+        plugins are never told an earlier place on one run. A loop's seam,
+        a record's punch and a count's go fall on its part where they fall
+        on a waiting lane's: a record punching from 48,000 on a desk held
+        1,200 keeps the strike at 47,900, heard at 49,100, and the one at
+        48,100 never sounds. The varispeed dial and the tape motor's start
+        and coast move its part with the mix, and a realtime export lays it
+        down as the full-speed one does.
+      - **Its edges.** A lane enters once the look-ahead has nothing of it
+        left to serve, and stays while its own timeline rolls or its line
+        ran the chunk before. Armed while quiet it moves nothing: its part
+        steps back the hold and pauses on the frame it reached. Armed while
+        it sounds, its line glides out of the wait once (as the moves below
+        do), and the hold's worth of the sound it is making is not heard. A
+        disarm, or the MIDI editor opened on another track, moves nothing
+        mid-song: the lane leaves stopped and quiet, and played again it
+        waits with the mix. A Stop with a key held ends its part as an
+        export ends it, and the key at once. When the host's word falls (a
+        realtime export takes every armed track back before it moves the
+        song) its notes end and what it had not read is dropped; when a
+        rule below closes on it mid-song, what it had not read is squeezed
+        to its next block's head and its line glides back into the wait.
+      - **Who keeps 5.3.0's rule.** A lane with a send whose path is
+        longer than its own way out (a bus whose rack reports more delay
+        than the lane's own folder: the owner's ruling, one function,
+        `live_lag`, whose doc gives the alternatives), a route or send
+        destination, a folder, a bus, a lane the room plays, a frozen one,
+        one holding a hardware loop and one carrying an audio clip. A send
+        into a bus that pays nothing, and a folder's into a bus, land with
+        the mix to the bit. An offline engine, a realtime export and a desk
+        that holds nothing lag no lane, and a lane that only listens (the
+        one open in the MIDI editor) waits as before. On 5.3.0's rule a
+        lane stands outside the wait while the song is stopped and while it
+        records (its clips are punched out then), the way a monitored input
+        does, and waits with the mix while the song plays the track back.
+        It moves out of the wait at a record's start and at Stop, and back
+        into it at a record's end and at Play. A move glides over 10 ms,
+        the old read fading under the new one, and a steady sound passes
+        without a step, but a tone the two reads put out of phase dips
+        through the fade (a DX7's A3 to about a quarter of its level for 4
+        to 6 ms). Out of the wait, what the lane made in the last hold
+        before the move is skipped after its first 10 ms. Into it, that
+        last hold is heard again, and what the lane makes in the first
+        10 ms after the move is heard early as well, faded: on a held desk
+        a note such a track plays just after a record ends while the song
+        plays, or just after a loop wraps back before the record's start,
+        is heard once early and faded, then on the beat. **Play does not
+        glide**: the lane takes its wait at once, its line emptied. A glide
+        there played the first 10 ms of the track's part at once, faded,
+        and again on the beat, a flam on the part's first note whenever the
+        track carried a plugin or was still ringing (a DX7 with an EQ in its
+        rack sounded its clip's note from frame 113 at 0.037 and again at
+        1,310; a kit still ringing a pad played its clip's hit at full level
+        at once, and again 1,200 frames later). The part starts once, on
+        the beat, and a note still ringing on the track when Play is pressed
+        drops out for the hold. A line that did not run in the chunk before
+        (a kit between strikes, an instrument whose voices have ended) takes
+        its new wait at once, so the first strike after a quiet move is
+        heard once, where it belongs.
+      - **Still known.** Tangent Analog renders to the bit only on its own
+        32-frame grid: it computes its coefficients in 32-frame chunks on an
+        absolute grid and cuts a chunk where a note lands, so a part read
+        off that grid plays the same notes on the same frames a little
+        apart (on its lane the deep Tape's hold leaves 1,132 frames, and the
+        speakers are -14.7 dB off the waiting lane's), as it renders 0.126
+        apart at 287- and 448-frame passes on a desk that lags nothing. A
+        curve is read once a chunk, at its head, so at a lane's entry or
+        leave its plugins' points are a chunk off once.
     - **A held line plays out what it holds.** A kit's line ran only while
       one of its pads sounded, and a built-in instrument's only while its
       lane had a voice, so whatever a line held when its source fell silent
