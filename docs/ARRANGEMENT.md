@@ -306,12 +306,16 @@ channels play back their clips and nothing else. "Ready to play" and
       - A move of the target (a plugin added, the deep range thrown) loses
         the click's beats inside the old hold, as the lanes lose the music
         there, and doubles none. A move in the master's chain alone (the
-        limiter thrown in or out, the speakers taking their own mix or the
-        take's, a master plugin's delay) keeps every beat not yet heard, as
-        the lanes keep theirs: a longer hold is silence for what it grew
-        by, a shorter one skips what it shrank by. Where the speakers go
-        back to the take's mix the lanes repeat the master chain's frames;
-        the click is silent for them instead, and never sounds a beat twice.
+        limiter thrown in or out, a master plugin's delay) keeps every beat
+        not yet heard, as the lanes keep theirs: a longer hold is silence
+        for what it grew by, a shorter one skips what it shrank by. The
+        speakers crossing between the take's mix and a mix of their own
+        crossfade over 10 ms, and the click crosses with them, read at both
+        holds at the fade's weights: what the mix skips or plays again
+        across the fade, the click skips or plays again with it. Arming an
+        audio input with monitoring off, or on a track that is muted or
+        soloed out, switches at once and moves the click as a move in the
+        master's chain does.
       - The song's click still waits for the tape (the owner's tape-motor
         ruling): with tape start and stop on, the first click is the first
         beat made at full speed, the hold after it, and a Stop's coast
@@ -443,6 +447,22 @@ channels play back their clips and nothing else. "Ready to play" and
     within a callback of the record's start), the take is placed off by
     the master chain's delay (58 frames with the limiter, 512 with an IR
     across the master).
+  - **Still known: arming an audio input while the song plays skips, in
+    the speakers, as much of the song as the master's chain holds the take
+    back, and disarming it plays that much again, crossfaded.** While an
+    audio input is armed the speakers take a mix of their own, through
+    their own copy of the master's built-in chain, whose limiter does not
+    look ahead: with the input heard, the master's racks up to their first
+    unit that adds delay; with it withheld (monitoring off, or its track
+    muted or soloed out), neither rack. Neither waits for the master's
+    delay, so an arm moves the speakers that far ahead in the song and a
+    disarm moves them back, each over the 10 ms crossfade, the click with
+    the mix: at 48 kHz, 10.7 ms with an IR across the master, 25 ms with a
+    Tape in its deep wow range there, 1.2 ms with the limiter alone. A
+    repeat longer than the fade plays on at full level past the fade's
+    end. An arm with the input withheld switches at once instead, which
+    with plugins or the limiter on the master can click: a fade out of the
+    take's mix would play the input the speakers may not hear.
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip
