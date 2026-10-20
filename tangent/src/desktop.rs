@@ -7354,7 +7354,16 @@ impl DesktopApp {
                         // the owner's ask: the bars from the settings click
                         // first, and the record begins on the downbeat.
                         let beats = self.app.count_in_beats();
-                        if beats > 0 && !self.recorder.transport.playing() {
+                        // **A record with nothing to record is refused at the
+                        // press**, not counted in: the go rolls the song
+                        // (`Engine::set_roll_on_go`), and a count ending on a
+                        // record that then refuses itself would play a UI
+                        // frame of it for nothing. `start_arr_record` says why.
+                        let records = self.app.project_doc().is_some() && {
+                            let takes = ArrRec::press_takes(&self.app, &self.bridge);
+                            !(takes.midi.is_empty() && takes.audio.is_empty())
+                        };
+                        if beats > 0 && records && !self.recorder.transport.playing() {
                             if let Some(e) = self.recorder.engine.as_ref() {
                                 e.start_count_in(beats, self.app.tempo_bpm());
                                 self.recorder.arr_rec_wait = true;
@@ -11162,7 +11171,13 @@ impl DesktopApp {
     /// the count joins at the record's press, as every take did. Asked every
     /// frame, so a count called off by any door closes it.
     fn reconcile_count_tee(&mut self) {
-        let waiting = self.recorder.arr_rec_wait && self.recorder.arr_rec.is_none() && self.recorder.bounce.is_none();
+        // Only over a stopped song, which every count is (a count waits for
+        // Play, and starts none over a playing song): a tee opened over a
+        // playing one would write from the press, the count and all.
+        let waiting = self.recorder.arr_rec_wait
+            && self.recorder.arr_rec.is_none()
+            && self.recorder.bounce.is_none()
+            && !self.recorder.transport.playing();
         match (waiting, self.recorder.count_tee.is_some()) {
             (true, false) => {
                 let PressTakes { audio, .. } = ArrRec::press_takes(&self.app, &self.bridge);
@@ -16673,7 +16688,9 @@ impl DesktopApp {
                 // armed lane played live stays outside the desk's wait across
                 // the go (`Renderer::plays_live`).
                 let punches = match (self.recorder.arr_rec.as_ref(), self.recorder.arr_rec_wait) {
-                    (None, true) => count_punches(&ArrRec::press_takes(app, &self.bridge), e.transport_position(), |id| app.row_of(id)),
+                    (None, true) if !self.recorder.transport.playing() => {
+                        count_punches(&ArrRec::press_takes(app, &self.bridge), e.transport_position(), |id| app.row_of(id))
+                    }
                     (rec, _) => live_punches(rec, rate, |id| app.row_of(id)),
                 };
                 self.bridge.punch_at(punches);
