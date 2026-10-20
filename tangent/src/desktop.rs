@@ -34092,20 +34092,6 @@ mod tests {").expect("the tests module")];
         );
     }
 
-    /// **The tape motor is held off for every road that must not spin.**
-    ///
-    /// Tape start and stop is the live desk's: an export, a freeze, an
-    /// arrangement record (its start and its stop) and every count-in start
-    /// and stop at once, and so does the edge one of those makes, which a
-    /// callback longer than a UI frame may not have seen when the reason goes
-    /// (`Recorder::motor_hold`). So is an engine's birth, whose first push
-    /// stores the locate before the level: a read between the two looks like
-    /// a stopped transport's, and the rise after it would spin a song rebuilt
-    /// mid-play up (`transport::tests::an_engine_born_mid_song_rolls_at_once_however_its_first_push_meets_it`
-    /// drives the latch over it). **A take is not one of them** (the owner's
-    /// ruling): a take films the desk as the room hears it, the tape's spin
-    /// included, so no take term holds the motor and the cassette parks
-    /// nothing. A scan, because `DesktopApp` cannot be built in a test.
     /// **A realtime export takes the armed tracks back into the desk's wait
     /// before it moves the song** (the 5.3.1 live lane). A track reading its
     /// own part behind the song leaves when the host's word falls
@@ -34130,6 +34116,20 @@ mod tests {").expect("the tests module")];
         assert!(off < stopped && off < located, "the export takes the armed tracks back after it moves the song");
     }
 
+    /// **The tape motor is held off for every road that must not spin.**
+    ///
+    /// Tape start and stop is the live desk's: an export, a freeze, an
+    /// arrangement record (its start and its stop) and every count-in start
+    /// and stop at once, and so does the edge one of those makes, which a
+    /// callback longer than a UI frame may not have seen when the reason goes
+    /// (`Recorder::motor_hold`). So is an engine's birth, whose first push
+    /// stores the locate before the level: a read between the two looks like
+    /// a stopped transport's, and the rise after it would spin a song rebuilt
+    /// mid-play up (`transport::tests::an_engine_born_mid_song_rolls_at_once_however_its_first_push_meets_it`
+    /// drives the latch over it). **A take is not one of them** (the owner's
+    /// ruling): a take films the desk as the room hears it, the tape's spin
+    /// included, so no take term holds the motor and the cassette parks
+    /// nothing. A scan, because `DesktopApp` cannot be built in a test.
     #[test]
     fn the_tape_motor_is_held_off_for_every_road_that_must_not_spin() {
         let whole = include_str!("desktop.rs");
