@@ -12526,6 +12526,13 @@ struct Renderer {
     /// beside the click, so an audition is never printed into a take.
     preview_out: Vec<f32>,
     click_taped: Vec<f32>,
+    /// **Whether the take carries the click, frame by frame** (1.0 or 0.0):
+    /// the song's click in the take, or a count-in in the take while it is
+    /// still sounding. What the click's rack gives back is gated by this, so
+    /// a reverb on the click strip rings on in the take as it does in the
+    /// speakers; gated by the click before the rack, it was cut where the
+    /// dry click ended, 54 ms after each beat.
+    click_carry: Vec<f32>,
     /// **The click held back to the mix's frame**, both buffers above and
     /// the click before its rack, read at each destination's hold. See
     /// [`ClickHold`].
@@ -14669,12 +14676,13 @@ impl Renderer {
                 //
                 // Kept as a second BUFFER rather than a flag, so the pass that
                 // writes the take does not have to re-derive a per-frame
-                // condition it can no longer see.
-                self.click_taped[i] = if in_take || (count_in_recorded && counting_in) {
-                    click
-                } else {
-                    0.0
-                };
+                // condition it can no longer see. **And as the flag beside
+                // it** (`click_carry`), for the click's rack below, which
+                // has to know where the take carries the click after the
+                // dry click itself has ended.
+                let carried = in_take || (count_in_recorded && counting_in);
+                self.click_carry[i] = if carried { 1.0 } else { 0.0 };
+                self.click_taped[i] = if carried { click } else { 0.0 };
                 click_peak = click_peak.max(click.abs());
                 // Before its rack, for its Return 0 send: taken off the ring
                 // below, at the hold the lanes' own sends arrive at.
@@ -14786,13 +14794,18 @@ impl Renderer {
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
                 // frame the take was not carrying stays absent however the
-                // rack coloured it.
+                // rack coloured it. **The gate is the take's carry, frame by
+                // frame** (`click_carry`), not the click before the rack:
+                // gated by the dry click, the take kept a reverb on the
+                // click strip only where the dry click was still sounding,
+                // and cut its tail 54 ms after every beat, a gated reverb in
+                // the file that the speakers never played. On every frame
+                // the take carries, the take's click is the speakers'.
                 click_peak = 0.0;
                 for i in 0..n {
                     let wet = self.fx_in.first().map_or(0.0, |b| b[i]);
-                    let gate = if self.click_taped[i] != 0.0 { 1.0 } else { 0.0 };
                     self.click_out[i] = wet;
-                    self.click_taped[i] = wet * gate;
+                    self.click_taped[i] = wet * self.click_carry[i];
                     click_peak = click_peak.max(wet.abs());
                 }
             }
@@ -27069,6 +27082,7 @@ impl Engine {
             click_out: vec![0.0; MAX_BLOCK as usize],
             preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
+            click_carry: vec![0.0; MAX_BLOCK as usize],
             click_hold: ClickHold::new(),
             rec_seen: 0,
             go_rolls: false,
@@ -34392,6 +34406,7 @@ mod tests {
             click_out: vec![0.0; MAX_BLOCK as usize],
             preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
+            click_carry: vec![0.0; MAX_BLOCK as usize],
             click_hold: ClickHold::new(),
             rec_seen: 0,
             go_rolls: false,
@@ -52343,6 +52358,73 @@ mod slot_engine {
             assert!(again.clone().any(|f| laned[f * 2].abs() > 0.01), "fixture: the disarm brought no beat back");
             for (k, (c, l)) in clicked.iter().zip(&laned).enumerate() {
                 assert!((c - l).abs() < 1e-4, "frame {}: the click is {c}, the lane playing its sound {l}", k / 2);
+            }
+        }
+
+        /// **The take's click rings out as the speakers' does, with a reverb on
+        /// the click strip** (`click_carry`).
+        ///
+        /// The click's rack hands back both of its buffers, and the take's was
+        /// gated by the click before the rack, so the take kept a plate on the
+        /// click strip only while the dry click was still sounding: its tail
+        /// was cut 54 ms after every beat, 107,988 of the frames the speakers
+        /// rang over in 240 blocks, a gated reverb in the file the speakers
+        /// never played; with a wire IR on the strip, its last 343 frames a
+        /// beat. Gated by where the take carries the click now, frame by frame,
+        /// the take's click is the speakers' to the bit on every frame with the
+        /// click in the take, plate or IR; with a count-in in the take instead,
+        /// on every frame of the count's first beat, its tail included.
+        #[test]
+        fn the_takes_click_rings_out_as_the_speakers_does_with_a_reverb_on_the_click() {
+            use crate::builtin_fx::{IR_PATH, PLATE_PATH};
+            for (what, path, state) in [("a plate", PLATE_PATH, None), ("a wire IR", IR_PATH, Some(wire_ir()))] {
+                for count in [false, true] {
+                    let mut e = wide(LEGACY_LANES);
+                    e.set_tempo(120.0);
+                    e.set_metronome_enabled(true);
+                    e.set_metronome_gain(1.0);
+                    if count {
+                        e.set_count_in_in_take(true);
+                    } else {
+                        e.set_metronome_in_take(true);
+                    }
+                    e.load_insert_at(RackAddr { owner: RackOwner::Click, rack: 0 }, 0, Some(Path::new(path)), state.as_deref())
+                        .expect("the built-in loads")
+                        .expect("and seats");
+                    let mut out = vec![0.0f32; BLOCK * 2];
+                    let mut tap = e.take_recorder_tap().expect("the take's tap");
+                    // The IR's fade-up, run out before a click is made, and
+                    // what the take's tap carried meanwhile let go.
+                    for _ in 0..8 {
+                        e.render_offline(&mut out);
+                    }
+                    tap.drain(&mut Vec::new());
+                    if count {
+                        e.start_count_in(4, 120.0);
+                    } else {
+                        e.set_transport(1, 0);
+                        e.set_rolling(true);
+                    }
+                    let (mut room, mut take) = (Vec::new(), Vec::new());
+                    for _ in 0..240 {
+                        e.render_offline(&mut out);
+                        room.extend_from_slice(&out);
+                        tap.drain(&mut take);
+                    }
+                    let frames = if count { BEAT_TWO } else { room.len().min(take.len()) / 2 };
+                    assert!(take.len() / 2 >= frames, "fixture: {what}, count {count}: the take is short");
+                    let rings = (2_700..BEAT_TWO).filter(|&f| room[f * 2].abs() > 1e-4).count();
+                    assert!(rings > 0 || path == IR_PATH, "fixture: {what}: the plate did not ring past the dry click");
+                    for f in 0..frames {
+                        assert_eq!(
+                            take[f * 2].to_bits(),
+                            room[f * 2].to_bits(),
+                            "{what}, count {count}: frame {f}: the take's click is {}, the speakers' {}",
+                            take[f * 2],
+                            room[f * 2]
+                        );
+                    }
+                }
             }
         }
 
