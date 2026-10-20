@@ -732,10 +732,12 @@ const ERASE_RELEASE_MS: f32 = 80.0;
 /// stage's oversampler is already holding that many samples: the two together
 /// come to [`BASE_MS`] (or [`DEEP_MS`]) and that is what the host is told.
 /// The studio head may sway [`STUDIO_TRAVEL_MS`] either way of its rest,
-/// which is more than a fresh machine asks for at any speed, and the deep
-/// head [`DEEP_TRAVEL_MS`], each short of the read's reach from the record
-/// head ([`READ_REACH`]); the line holds both at any rate the tape can be
-/// built at.
+/// and the deep head [`DEEP_TRAVEL_MS`], each short of the read's reach
+/// from the record head ([`READ_REACH`]). From 44.1 kHz up that is more
+/// than a fresh machine asks for at any speed; at 32 kHz the reach leaves
+/// the studio head 12 samples, a fresh 3.75 ips machine asks for more, and
+/// the governor shares it out. The line holds both at any rate the tape can
+/// be built at.
 const LINE_MS: f32 = 50.0;
 const BASE_MS: f32 = 2.0;
 
@@ -2032,9 +2034,9 @@ const READ_REACH: usize = READ_TAPS / 2;
 /// at 96 kHz where Hermite put 0.01, and 0.08 dB on 3 kHz noise at 44.1.
 /// These rows read a tone closer to its exact delay than Hermite did at
 /// every frequency measured from 1 to 20 kHz at 44.1, 48 and 96 kHz, by
-/// 9 dB at the least: the error is 105 dB under a 1 kHz tone at 44.1 kHz
-/// where Hermite's was 87, and 51 under a 10 kHz tone where Hermite's was
-/// 22.
+/// 9 dB at the least: at the fraction where each reads worst, the error is
+/// 99.5 dB under a 1 kHz tone at 44.1 kHz where Hermite's was 87, and 51
+/// under a 10 kHz tone where Hermite's was 22.
 ///
 /// Measured through the machine, white noise at the default sway against
 /// the parked head, in third octaves: -0.02, -0.00, +0.02 and +0.08 dB at

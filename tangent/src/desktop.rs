@@ -2929,8 +2929,10 @@ fn eq_curve_db(values: &[f32], sample_rate: f32) -> Vec<f32> {
 /// with the latency delay compensation is told about at this engine rate,
 /// the hiss on silence, and where the head bump sits at this speed. One
 /// function for the saved face and the automated one, so a note cannot be
-/// worked out two ways (`eq_curve_db`'s bargain). Closed-form helpers only:
-/// this runs on every push and on every automated host frame.
+/// worked out two ways (`eq_curve_db`'s bargain). Pure helpers only, closed
+/// form but for the weighted figure, which sums a few hundred points of
+/// spectrum a turning part (`units::tape`'s note on what a face shows): this
+/// runs on every push and on every automated host frame.
 #[cfg(feature = "recorder")]
 fn tape_notes(values: &[f32], sample_rate: f32) -> Vec<(String, String)> {
     use crate::units::tape as k;
