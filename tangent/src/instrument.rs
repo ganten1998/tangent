@@ -17425,8 +17425,18 @@ impl Renderer {
         // everything wait for a delay it is going to pay again anyway.
         self.shared.max_latency.store(max, Ordering::Relaxed);
         // ...and the READOUT is the whole of it, because a figure that hides
-        // latency somebody is paying is worth nothing.
-        let master = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, LEGACY_STRIPS);
+        // latency somebody is paying is worth nothing: **both of the master's
+        // racks** (the second runs first, `render_program`; it was left out,
+        // so an IR there held the take 512 frames and read none), **and the
+        // limiter's lookahead while it is in circuit**, 58 frames at 48 kHz,
+        // which the take pays on every frame. The terms the take's click is
+        // held by (`aim_click`), asked as the chain stands at the chunk's
+        // head; the speakers' own road while an input is armed pays less
+        // (`RoomRoad`), and that is the hold the click and a take's
+        // placement read, not this.
+        let lat = |seat: usize| Rack::latency(&self.shared, &self.spine.ext.desk.frozen, seat);
+        let ahead = u32::try_from(self.master_effects.lookahead(self.master_sends(), false)).unwrap_or(u32::MAX);
+        let master = lat(MASTER_EXTRA_SEAT).saturating_add(lat(LEGACY_STRIPS)).saturating_add(ahead);
         self.shared
             .total_latency
             .store(max.saturating_add(master), Ordering::Relaxed);
@@ -52425,6 +52435,50 @@ mod slot_engine {
                         );
                     }
                 }
+            }
+        }
+
+        /// **The latency readout is what the take pays, both of the master's
+        /// racks and its limiter included** (`publish_latency`).
+        ///
+        /// The readout (`total_latency`) counted the alignment target and the
+        /// master's original rack, so an IR on the master's second rack held the
+        /// take 512 frames and read 0, and IRs on both read 512 for 1,024. It
+        /// counts both racks now, and the limiter's lookahead while it is in
+        /// circuit, 58 frames at 48 kHz: the terms the take's click is held by
+        /// (`aim_click`). On each desk the readout is how late the backing's
+        /// impulse lands in the take.
+        #[test]
+        fn the_latency_readout_is_what_the_take_pays_both_master_racks_and_the_limiter_included() {
+            use crate::builtin_fx::IR_PATH;
+            let limiter = |e: &Engine| {
+                e.set_effects(crate::effects::Sends { limiter: tangent_ui::recorder::LIMITER_SHIPS_AT, ..crate::effects::Sends::default() });
+            };
+            for (what, ir_on_lane, racks, limited, paid) in [
+                ("an IR on the master's second rack", false, &[1u16][..], false, 512usize),
+                ("an IR on the master's first rack", false, &[0][..], false, 512),
+                ("an IR on both", false, &[0, 1][..], false, 1_024),
+                ("the limiter", false, &[][..], true, 58),
+                ("an IR on a lane, one on the second rack, and the limiter", true, &[1][..], true, 1_082),
+            ] {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                if ir_on_lane {
+                    unit(&mut e, 5, 0, 0, IR_PATH, Some(wire_ir()));
+                }
+                for &rack in racks {
+                    master_unit(&mut e, rack, 0, IR_PATH, Some(wire_ir()));
+                }
+                if limited {
+                    limiter(&e);
+                }
+                e.set_clips_slotted(vec![impulse_at(&e, 1, BEAT_TWO)]);
+                let (_, take) = roll_held(&mut e, &mut None, 60);
+                let (at, _) = loudest(&take);
+                assert_eq!(at, BEAT_TWO + paid, "fixture: {what}: the take pays {} frames", at as i64 - BEAT_TWO as i64);
+                let (_, shown) = e.latency_frames();
+                assert_eq!(shown as usize, paid, "{what}: the readout shows {shown} where the take pays {paid}");
             }
         }
 
