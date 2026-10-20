@@ -2901,13 +2901,21 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// strings: a card whose text overflows its own window is a first impression
 /// nobody recovers from, and it is exactly the sort of thing that breaks when
 /// somebody adds a line.
-const WELCOME_LINES: [&str; 18] = [
-    "Welcome to Tangent 5.0!",
+///
+/// **It comes up once on every new version** (`Settings::welcome_seen`), so
+/// its greeting names the version and its middle paragraph says what is new:
+/// `scripts/release.sh` refuses a release whose card greets another version.
+const WELCOME_LINES: [&str; 22] = [
+    "Welcome to Tangent 5.3!",
     "",
     "Tangent is a DAW now. Record audio and MIDI,",
     "arrange and edit it, mix it, and export it,",
     "with your own plugins or with the instruments",
     "and effects that come with it.",
+    "",
+    "New lately: Tangent Tape is a tape machine,",
+    "a new session opens on a grand piano, and the",
+    "click and your takes stay in time on every desk.",
     "",
     "TAB moves between three views: the keyboard,",
     "the arrangement and the mixer. Hold 'H' for",

@@ -4496,8 +4496,11 @@ impl TangentApp {
 
         let (midi_tx, midi_rx) = mpsc::channel();
 
-        let welcome = settings.show_welcome.then(|| Dialog::Welcome {
-            dont_show_again: false,
+        // **Once a version, whatever its box says** (`Settings::welcome_seen`):
+        // a card that comes up for a new version shows the box as it stands.
+        let new_version = !settings.welcome_seen.is_empty() && settings.welcome_seen != crate::VERSION;
+        let welcome = (settings.show_welcome || new_version).then(|| Dialog::Welcome {
+            dont_show_again: !settings.show_welcome,
         });
 
         let spec = settings.fretboard_spec();
@@ -42632,7 +42635,14 @@ impl TangentApp {
         // stops reporting a splash, and only into an empty dialog slot so it
         // can never displace something the user opened first.
         if !self.splash_up && self.dialog.is_none() {
-            self.dialog = self.pending_welcome.take();
+            if let Some(card) = self.pending_welcome.take() {
+                self.dialog = Some(card);
+                // Seen on this version, so its next launch asks the box alone.
+                if self.settings.welcome_seen != crate::VERSION {
+                    self.settings.welcome_seen = crate::VERSION.to_owned();
+                    self.save_settings();
+                }
+            }
         }
 
         // Dev hook, alongside TANGENT_DEMO_NOTES: open the menu on the first
@@ -78985,6 +78995,53 @@ mod tests {").expect("the tests module")];
         app.open_project(&said);
         assert_eq!(app.settings.start_stop, StartStop::new(true, 1.5, 3.0), "a document that says on did not open on");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The Welcome card comes up once on every new version, whatever its
+    /// box says.**
+    ///
+    /// The owner, 2026-10-19: "every time there's a new version, we need the
+    /// welcome card to come up for now -- features are coming in hot". A
+    /// settings file from before `welcome_seen`, its box ticked, reads as
+    /// version "0": the card comes up on the first frame, its box shown
+    /// ticked as it stands, and coming up records this version. The same
+    /// settings on this version again: no card. A box ticked on an older
+    /// version's card: the card again. A fresh install: the card, its box
+    /// clear, as before, and it records this version; one whose box is
+    /// ticked before any card came up (every test fixture's): no card. And
+    /// the version survives a save. Revert-checked: with the box alone
+    /// deciding, the upgrader is never greeted.
+    #[test]
+    fn the_welcome_card_comes_up_once_on_every_new_version() {
+        let card = |settings: Settings| {
+            let (ctx, mut app) = headless_with(Caps::DESKTOP, settings);
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let shown = match &app.dialog {
+                Some(Dialog::Welcome { dont_show_again }) => Some(*dont_show_again),
+                _ => None,
+            };
+            (shown, app.settings.welcome_seen.clone())
+        };
+        let old = Settings::from_json(r#"{"show_welcome": false}"#);
+        assert_eq!(old.welcome_seen, "0", "a file from before the key did not read as older than any version");
+        assert_eq!(
+            card(old.clone()),
+            (Some(true), crate::VERSION.to_owned()),
+            "an upgrader who ticked the box was not greeted once, or the greeting was not recorded"
+        );
+        let seen = Settings { welcome_seen: crate::VERSION.to_owned(), ..old.clone() };
+        assert_eq!(card(seen).0, None, "the card came up twice on one version");
+        let older = Settings { welcome_seen: "5.2.0".to_owned(), ..old };
+        assert_eq!(card(older).0, Some(true), "a box ticked on an older version kept this one's card down");
+        assert_eq!(
+            card(Settings::default()),
+            (Some(false), crate::VERSION.to_owned()),
+            "a fresh install was not greeted, or its greeting was not recorded"
+        );
+        let quiet = Settings { show_welcome: false, ..Settings::default() };
+        assert_eq!(card(quiet).0, None, "a box ticked before any card came up was overruled");
+        let saved = Settings { welcome_seen: "5.2.0".to_owned(), ..Settings::default() }.to_json();
+        assert_eq!(Settings::from_json(&saved).welcome_seen, "5.2.0", "the version did not survive a save");
     }
 
     /// **A typed Start or Stop is one moment on every road that lands it**:

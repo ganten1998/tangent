@@ -1121,8 +1121,11 @@ fn fnv(text: &str) -> u64 {
 /// Moved once since, for 5.2, by the shipped piano's path alone
 /// (`@tangent-keys` where `@tangent-dx7` was, one byte longer): the new
 /// bytes with the old path put back hash to the old pin, 0xe028_4149_425a_c38c
-/// over 30430.
-const DEFAULT_V2_BYTES: (u64, usize) = (0x6a72_ca52_e572_89f1, 30431);
+/// over 30430. Moved again for 5.3 by `"welcome_seen":""` alone
+/// (`Settings::welcome_seen`, empty on a fresh install so the bytes never
+/// follow the version): taken out, the bytes hash to the 5.2 pin,
+/// 0x6a72_ca52_e572_89f1 over 30431.
+const DEFAULT_V2_BYTES: (u64, usize) = (0x909e_1ec0_9e9c_0cc9, 30449);
 
 /// **Production writes the format-2 bytes**, stamps included, for every
 /// fixture and for the default settings: `WRITE_V8` is on, so what a user's
@@ -1395,21 +1398,27 @@ fn a_refused_desk_refuses_the_open_and_touches_nothing() {
 /// and in the appended sounds' shipped defaults, checked structurally
 /// against the earlier writer's output (`default-settings.json` is dumped
 /// beside them for the same check).
+///
+/// Moved again for 5.3, every settings file and DAW blob by one line alone,
+/// `"welcome_seen": "0"` (`Settings::welcome_seen`: a file from before the
+/// key reads as older than any version): with that line taken out, each
+/// hashes to its earlier pin. The documents carry no settings and did not
+/// move.
 const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
-    ("settings-v12.json", 0xf80e_d0d9_6db1_cc82, 77160),
-    ("settings-v17-pads16.json", 0x4d20_e813_09b9_5c46, 77376),
-    ("settings-v18.json", 0xc90d_44e1_3b60_6ee5, 77377),
-    ("settings-v19.json", 0x4fc2_14c5_5b32_5053, 78677),
+    ("settings-v12.json", 0xa470_7f4f_e31c_e6d0, 77183),
+    ("settings-v17-pads16.json", 0xc551_8ae6_e64e_12e0, 77399),
+    ("settings-v18.json", 0xa405_20a6_61a9_2567, 77400),
+    ("settings-v19.json", 0xbac8_06a1_730a_980d, 78700),
     // Lifted (`desk_lift::V24_LIFT`, on with the switch since W4-integrate
     // (B)): the window's buses and master on the specials, its pads on
     // their rows. Unlifted it wrote 0xbee3_aa56_2a6b_446b, 72152.
-    ("settings-v20-27.json", 0xc33d_7c4f_ad06_84ef, 79905),
-    ("settings-v20.json", 0x9e7e_be7f_44bb_7a4d, 81022),
-    ("settings-v21.json", 0x2096_b471_2d6c_7348, 79829),
-    ("settings-v22.json", 0x55be_1dc5_3ee3_ede8, 79864),
-    ("daw-3x.json", 0x2847_627a_ed64_d912, 76666),
-    ("daw-4x.json", 0xaf17_1b77_e6ed_e0ff, 77065),
-    ("daw-5x.json", 0xc049_f263_aa3a_3d59, 78002),
+    ("settings-v20-27.json", 0xb498_f5bf_7031_5ec9, 79928),
+    ("settings-v20.json", 0x0cd4_0366_5e9b_7b3f, 81045),
+    ("settings-v21.json", 0x32d3_850d_c563_2682, 79852),
+    ("settings-v22.json", 0x56e2_8870_5674_407a, 79887),
+    ("daw-3x.json", 0x7354_c8db_4e34_21d8, 76689),
+    ("daw-4x.json", 0x4f61_170f_aff8_0569, 77088),
+    ("daw-5x.json", 0x98be_ad91_7144_8817, 78025),
     // **The documents read their drum row's badge** (W6): a document from
     // before the badges derives them as it is read, the drum where the
     // drumpad stands, where the derivation ran at the apply while the desk

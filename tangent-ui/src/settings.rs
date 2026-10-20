@@ -1202,6 +1202,19 @@ pub struct Settings {
     pub recorder_bg_color: Rgb,
     /// Show the welcome/support note at startup. Cleared by its own checkbox.
     pub show_welcome: bool,
+    /// **The version whose Welcome card was last shown** ([`crate::VERSION`]).
+    ///
+    /// The owner, 2026-10-19: "every time there's a new version, we need the
+    /// welcome card to come up for now -- features are coming in hot". So a
+    /// launch on any other version shows the card once, whatever
+    /// `show_welcome` says, and its checkbox hides it only until the next
+    /// version. A settings file written before this key reads as "0", a
+    /// version older than any, so its first launch on this build greets it
+    /// (`from_map`). Empty is a fresh install's, or one whose card has not
+    /// come up yet: `show_welcome` alone decides, as it always has, and the
+    /// first card to come up writes its version. Never the version itself
+    /// by default, so the settings a build writes do not change with it.
+    pub welcome_seen: String,
     /// Stream the master out over ReaStream (to OBS/REAPER on the network).
     pub reastream_enabled: bool,
     /// The ReaStream identifier both ends match on. Default "default".
@@ -2310,6 +2323,7 @@ impl Default for Settings {
                 b: 0xC0,
             },
             show_welcome: true,
+            welcome_seen: String::new(),
             reastream_enabled: false,
             reastream_identifier: "default".to_owned(),
             reastream_host: "127.0.0.1".to_owned(),
@@ -3223,6 +3237,11 @@ impl Settings {
                 s.show_welcome = b;
             }
         }
+        // A file that does not say is older than the key: version "0".
+        s.welcome_seen = map
+            .shift_remove("welcome_seen")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "0".to_owned());
         if let Some(v) = map.shift_remove("reastream_enabled") {
             if let Some(b) = v.as_bool() {
                 s.reastream_enabled = b;
@@ -5012,6 +5031,7 @@ impl Settings {
             Value::String(self.recorder_bg_color.to_hex()),
         );
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
+        map.insert("welcome_seen".into(), Value::String(self.welcome_seen.clone()));
         map.insert(
             "reastream_enabled".into(),
             Value::Bool(self.reastream_enabled),
@@ -6054,6 +6074,7 @@ impl Settings {
         self.midi_editor_floating = fresh.midi_editor_floating;
         self.arr_header_w = fresh.arr_header_w;
         self.show_welcome = fresh.show_welcome;
+        self.welcome_seen = fresh.welcome_seen.clone();
         self.show_take_summary = fresh.show_take_summary;
         self.drumpad_page = fresh.drumpad_page;
     }

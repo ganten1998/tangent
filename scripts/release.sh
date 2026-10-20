@@ -123,6 +123,18 @@ if ! grep -qE "^#+ +\[?${VERSION//./\.}\]?( |\$|	)" CHANGELOG.md 2>/dev/null; th
   exit 2
 fi
 
+# 3b. The Welcome card must greet this version. Every new version opens it
+#     once, whatever its box says (`Settings::welcome_seen`, the owner's ruling
+#     of 2026-10-19), so a card still greeting the last one is the first thing
+#     every upgrader reads. Its first line names the major and the minor.
+GREETS="${VERSION%%-*}"
+GREETS="${GREETS%.*}"
+if ! grep -qF "\"Welcome to Tangent ${GREETS}!\"" tangent-ui/src/dialogs.rs 2>/dev/null; then
+  echo "refusing: the Welcome card does not greet ${GREETS}." >&2
+  echo "  Update WELCOME_LINES in tangent-ui/src/dialogs.rs: its greeting and what is new." >&2
+  exit 2
+fi
+
 # 4. Pre-releases are rc.N, capped at rc.3. Needing rc.4 means the freeze was
 #    not a freeze — the answer is to stop cutting candidates and fix the thing
 #    that keeps moving.
