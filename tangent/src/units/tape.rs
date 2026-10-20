@@ -4605,7 +4605,10 @@ impl Tape {
             }
             for ((d, j), s) in delays[h].iter_mut().zip(jitter).zip([skew, -skew]) {
                 let want = rests[h] + sways[h] + j + s;
-                let held = want.clamp(READ_REACH as f32, last);
+                // `max` and `min`, not `clamp`: `clamp` hands a delay that
+                // is no number on to `Line::read`, which indexes the line
+                // below its start with it; these read it at the floor.
+                let held = want.max(READ_REACH as f32).min(last);
                 if held != want {
                     self.clamp_hits += 1;
                 }
@@ -9599,6 +9602,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A head asked off its tape, or for a delay that is no number, is
+    /// held on it.**
+    ///
+    /// The governor keeps every sway inside the head's travel (the test
+    /// above) and the params are scrubbed before they reach a head (T5), so
+    /// neither can be asked from the dials; this is the net under both. The
+    /// one term of a head's delay that is state, the modulation noise's
+    /// band-limit, is put far past either end and then made no number, by
+    /// hand: a delay past the newest end is held [`READ_REACH`] samples from
+    /// it, one past the oldest [`READ_REACH`] and two from it, and one that
+    /// is no number at the floor, each counted; and a block longer than the
+    /// line, so the record head laps it, plays every sample finite.
+    /// Revert-checked: `clamp` in `heads` hands the NaN on to `Line::read`,
+    /// which indexes below the line's start with it.
+    #[test]
+    fn a_head_asked_off_its_tape_or_for_no_number_is_held_on_it() {
+        let p = TapeParams::default();
+        let mut unit = Tape::new(48_000.0);
+        let frames = unit.line[0].len + 512;
+        let tone = |frames: usize| -> Vec<f32> {
+            (0..2 * frames).map(|i| 0.25 * ((i / 2) as f32 * 0.05).sin()).collect()
+        };
+        let mut buf = tone(frames);
+        unit.process(&mut buf, frames, 2, &p);
+        assert_eq!(unit.clamp_hits(), 0, "fixture: the default tape was held inside the line");
+        let (floor, last) = (READ_REACH as f32, (unit.line[0].len - READ_REACH - 2) as f32);
+        for (noise, want, what) in [
+            ([1.0e30_f32, -1.0e30], [last, floor], "past either end"),
+            ([f32::NAN; 2], [floor; 2], "for no number"),
+        ] {
+            let hits = unit.clamp_hits();
+            unit.jitter_lp = noise;
+            let (delays, weights) = unit.heads(0.0);
+            assert_eq!(weights, [1.0, 0.0], "fixture: the studio head is not the one heard");
+            assert_eq!(delays[0], want, "a head asked {what} was not held on its tape");
+            assert_eq!(unit.clamp_hits(), hits + 2, "a head asked {what} was not counted");
+        }
+        unit.jitter_lp = [f32::NAN; 2];
+        let mut buf = tone(frames);
+        unit.process(&mut buf, frames, 2, &p);
+        assert!(buf.iter().all(|x| x.is_finite()), "a head asked for no number played a sample that is none");
     }
 
     /// **The head is shared when the tape asks for more than it holds.**
