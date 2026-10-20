@@ -12295,6 +12295,10 @@ struct Renderer {
     /// **This chunk began on the go and rolled on it**: the go stands in for
     /// the song's first beat (`BarClock::sounded_elsewhere`).
     go_rolled_now: bool,
+    /// **The program frames the go cut off this chunk** (`go_split`), which
+    /// the chunks after it in the same callback render: the input this chunk
+    /// may leave in the ring (`mix_monitor`) is the whole chunk's.
+    go_cut: usize,
     /// A user effect ACROSS the effects bus, if one is loaded.
     ///
     /// **On the bus rather than on every channel**, and that is a design
@@ -15688,7 +15692,31 @@ impl Renderer {
         // under the final fade. A wider allowance only carries them to the
         // ramp's end, to be dropped at full level.
         // `tape_motor::the_input_keeps_its_place_through_a_ramp` bounds them.
-        let in_flight = want + self.monitor_block * ch_in;
+        //
+        // **A chunk a count's go cut short is allowed the whole chunk's
+        // frames** (`go_split`, `go_cut`). The device delivered the callback
+        // whole, and the frames past the go belong to the chunks after this
+        // one in the same callback: allowed only its own, this chunk threw
+        // away as much real input as the ring stood above a block less the
+        // go's place in its callback, and every input frame after it was then
+        // read that much sooner, so a record begun on the go landed early by
+        // it and from 0:00 lost that much of its head (376 frames with
+        // 1,024-frame callbacks at 44.1 kHz, the go 136 frames in), while its
+        // MIDI landed where it was played. Allowed the whole chunk, it drops
+        // what the chunk would have dropped uncut, and the record keeps the
+        // plain record's latency.
+        let allowed = if self.go_cut == 0 {
+            real_frames
+        } else {
+            let whole = frames + self.go_cut;
+            match vs.engaged.then(|| vs.steps(self.vs_chunk_from, whole)) {
+                None => whole,
+                Some(_) if vs.handback => whole,
+                Some((s0, s1)) if s0 == s1 => self.vs_in_phase.program_frames(whole, s0),
+                Some((s0, s1)) => self.vs_in_phase.program_frames_ramp(whole, s0, s1),
+            }
+        };
+        let in_flight = (allowed + self.monitor_block) * ch_in;
         let backlog = ring.slots();
         self.shared
             .monitor_backlog
@@ -17177,8 +17205,13 @@ impl Renderer {
     /// is then the song's first beat, made on the same frame and held to
     /// the mix with it. The roll is held until the host's word goes, which it
     /// takes down once its own level says play (or the count is called off).
+    ///
+    /// **The cut chunk is the whole chunk to the input** (`go_cut`): the
+    /// device delivered the callback's frames, and the ones past the go are
+    /// read by the chunks after it.
     fn go_split(&mut self, n: usize) -> usize {
         self.go_rolled_now = false;
+        self.go_cut = 0;
         if !self.shared.roll_on_go.load(Ordering::Acquire) {
             if self.go_rolls {
                 self.go_rolls = false;
@@ -17195,7 +17228,10 @@ impl Renderer {
                 self.go_rolled_now = true;
                 n
             }
-            Some(k) => k,
+            Some(k) => {
+                self.go_cut = n - k;
+                k
+            }
             None => n,
         }
     }
@@ -26176,6 +26212,7 @@ impl Engine {
             rec_seen: 0,
             go_rolls: false,
             go_rolled_now: false,
+            go_cut: 0,
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -33488,6 +33525,7 @@ mod tests {
             rec_seen: 0,
             go_rolls: false,
             go_rolled_now: false,
+            go_cut: 0,
             fx_return_gain: 1.0,
             clips: Vec::new(),
             midi_clips: Vec::new(),
@@ -47915,10 +47953,15 @@ mod slot_engine {
         /// playing onto that lane at its generation. Answers the device's
         /// end of the ring.
         fn plug(e: &mut Engine, lane: usize) -> Producer<f32> {
+            plug_with_block(e, lane, BLOCK)
+        }
+
+        /// [`plug`], the device delivering `block` frames a callback.
+        fn plug_with_block(e: &mut Engine, lane: usize, block: usize) -> Producer<f32> {
             use crate::lane_bank::{MonitorPick, MonitorPlan};
             let (tx, rx) = RingBuffer::<f32>::new(1 << 16);
             let picks = tangent_record::audio::Picks::EVERYTHING;
-            e.set_monitor(Some((rx, 1, vec![1].into_boxed_slice(), BLOCK as u32, picks.clone())));
+            e.set_monitor(Some((rx, 1, vec![1].into_boxed_slice(), block as u32, picks.clone())));
             let gen = e.lane_gen(Slot(lane as u32)).expect("a lane");
             let pick = MonitorPick { pick: PickId(0), slot: Slot(lane as u32), gen, width: 1, cols: [0, 0] };
             let plan = MonitorPlan { layout_only: true, ..MonitorPlan::with_picks(vec![pick], picks) };
@@ -50413,6 +50456,121 @@ mod slot_engine {
                         assert!((f[0] - tone(j)).abs() < 1e-4, "hold {hold}, from {from}: song frame {} holds {}, the tone played there {}", place.start + k as u64, f[0], tone(j));
                     }
                 }
+            }
+        }
+
+        /// **A record from a stopped transport, begun on a `beats`-beat count's
+        /// go at 120 BPM when `beats` is given, the engine rolling the song on
+        /// it** (`Engine::set_roll_on_go`, the tee open from the roll), or
+        /// plainly from the press: lane 3's input a counter, played in
+        /// callbacks of `cb` frames, the monitor's block the same, over a ring
+        /// standing `stand` frames above a block. Answers how many frames
+        /// sooner than its record's first device frame the take's first frame
+        /// was played, whether the take is one unbroken run of the counter,
+        /// and how many frames the monitor dropped as stale during the record.
+        #[cfg(feature = "recorder")]
+        fn take_lead(cb: usize, stand: usize, beats: Option<u32>) -> (i64, bool, u64) {
+            const RATE_HZ: f64 = 48_000.0;
+            let value = |i: usize| (i % 4_000_000 + 1) as f32 * 1e-7;
+            let index = |v: f32| (f64::from(v) / 1e-7).round() as i64 - 1;
+            let mut e = wide(42);
+            let mut inputs = bus_plan(&e, 42, &[]);
+            inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+            e.publish_plan(&inputs).expect("the plan goes");
+            let mut tx = plug_with_block(&mut e, 3, cb);
+            e.set_monitor_on(true);
+            e.sync_capture_rings(&[PickId(0)]).expect("a ring");
+            e.set_tempo(120.0);
+            e.set_metronome_enabled(false);
+            e.set_transport(1, 0);
+            let ns = |frame: usize| (frame as f64 / RATE_HZ * 1e9) as Nanos;
+            let mut out = vec![0.0f32; cb * 2];
+            let (mut fed, mut made) = (0usize, 0usize);
+            for _ in 0..stand {
+                let _ = tx.push(value(fed));
+                fed += 1;
+            }
+            let mut pass = |e: &mut Engine, fed: &mut usize, made: &mut usize| {
+                for _ in 0..cb {
+                    let _ = tx.push(value(*fed));
+                    *fed += 1;
+                }
+                e.offline.as_mut().expect("a renderer").render(&mut out, ns(*made), ns(*made));
+                *made += cb;
+            };
+            for _ in 0..48_000 / cb {
+                pass(&mut e, &mut fed, &mut made);
+            }
+            let dropped = e.shared.monitor_slip.load(Ordering::Relaxed);
+            let _ = e.arm_capture(PickId(0));
+            let _ = e.drain_capture(PickId(0), &mut Vec::new());
+            let begins = match beats {
+                Some(beats) => {
+                    e.start_count_in(beats, 120.0);
+                    e.set_roll_on_go(true);
+                    e.set_capturing_from_roll(&[PickId(0)]);
+                    while !e.count_in_done() {
+                        pass(&mut e, &mut fed, &mut made);
+                    }
+                    let go = e.count_in_downbeat_ns().expect("the go");
+                    let begins = (go as f64 / 1e9 * RATE_HZ).round() as usize;
+                    // The host's next frame: the record adopts the tee, and
+                    // takes the roll over.
+                    pass(&mut e, &mut fed, &mut made);
+                    e.set_capturing(&[PickId(0)]);
+                    e.set_rolling(true);
+                    e.set_roll_on_go(false);
+                    begins
+                }
+                None => {
+                    e.set_capturing(&[PickId(0)]);
+                    e.set_rolling(true);
+                    made
+                }
+            };
+            let mut took = Vec::new();
+            for _ in 0..48_000 / cb {
+                pass(&mut e, &mut fed, &mut made);
+                let _ = e.drain_capture(PickId(0), &mut took);
+            }
+            let first = took.first().map_or(-1, |v| index(*v));
+            let whole = took.chunks_exact(2).enumerate().all(|(k, f)| index(f[0]) == first + k as i64);
+            (begins as i64 - first, whole, e.shared.monitor_slip.load(Ordering::Relaxed) - dropped)
+        }
+
+        /// **A record begun on a count's go mid-callback reads its input as a
+        /// plain record does, every frame kept** (a verifier's finding: it
+        /// landed early by up to a device block, and from 0:00 lost as much of
+        /// its head).
+        ///
+        /// The engine rolls the song on the go's own frame by ending a chunk
+        /// there (`Renderer::go_split`), and the monitor drops whatever the
+        /// input ring holds past what a chunk reads and a block more
+        /// (`mix_monitor`). The chunk the go cut short read only its own
+        /// frames, so it threw away as much real input as the ring stood
+        /// above a block less the go's place in its chunk, and every input
+        /// frame after it was read that much sooner: the take landed that
+        /// much early, from 0:00 its head was cut by as much, and its MIDI,
+        /// which the drop never touches, disagreed with it by the same. With
+        /// 256-frame callbacks over a ring standing 240 frames above a block,
+        /// a go 64 frames in dropped 176. The cut chunk is allowed the whole
+        /// chunk's input now (`Renderer::go_cut`): a counter played into the
+        /// input over a ring standing above a block, gos 64, 384 and 320
+        /// frames into callbacks of 256, 512 and 1,024 frames, and in each the
+        /// take's first frame is the input frame a plain record's is, nothing
+        /// is dropped, and the take is the counter unbroken.
+        #[test]
+        #[cfg(feature = "recorder")]
+        fn a_record_begun_on_a_go_mid_callback_reads_its_input_as_a_plain_record_does() {
+            for (cb, stand, beats) in [(256usize, 240usize, 3u32), (512, 496, 2), (1_024, 512, 3)] {
+                let (plain, plain_whole, plain_dropped) = take_lead(cb, stand, None);
+                assert_eq!((plain, plain_whole, plain_dropped), (0, true, 0), "fixture: callbacks of {cb}, the ring {stand} above a block: the plain record");
+                let (lead, whole, dropped) = take_lead(cb, stand, Some(beats));
+                assert_eq!(
+                    (lead, whole, dropped),
+                    (plain, true, 0),
+                    "callbacks of {cb}, the ring {stand} above a block, a {beats}-beat count: the take's first frame was played {lead} frames before the go, whole {whole}, {dropped} frames dropped"
+                );
             }
         }
 

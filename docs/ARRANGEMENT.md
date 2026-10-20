@@ -366,8 +366,15 @@ channels play back their clips and nothing else. "Ready to play" and
         begins on the go; and the tap's last second of MIDI is replayed into
         a record begun on a go, from the instant the go was made, where a
         note played on the go was drained to nobody before the record
-        existed. A tone played from the heard go now lands whole on the song
-        frame the record began on, on a bare desk and a held one.
+        existed. The chunk the go cuts short keeps its whole callback's
+        input: it was allowed only its own frames, and threw away as much
+        input as the ring stood above a block less the go's place in its
+        callback (376 frames with 1,024-frame callbacks at 44.1 kHz, the go
+        136 frames in), which landed the take that much early and from 0:00
+        cut its head by as much, while its MIDI landed where it was played.
+        A tone played from the heard go now lands whole on the song frame
+        the record began on, on a bare desk and a held one, whatever the
+        device's callback and wherever the go falls in it.
     - **An armed track played live is heard at once while its own timeline
       is silent.** A lane armed and listening to MIDI stands outside the
       wait while the song is stopped and while it records (its clips are
