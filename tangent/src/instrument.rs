@@ -2175,21 +2175,27 @@ impl HoldRead {
 }
 
 /// **The road the speakers' mix takes through the master** (the owner's
-/// ruling of 2026-10-19), chosen a chunk at a time by what monitoring does
-/// with the armed inputs (`mix_monitor`, `Renderer::aim_click`).
+/// rulings of 2026-10-19 and 2026-10-20), chosen a chunk at a time by what
+/// monitoring does with the armed inputs (`mix_monitor`,
+/// `Renderer::aim_click`).
 ///
 /// - **`OneMix`**: no input is armed and heard and none is withheld, so the
 ///   speakers play the take's own mix: the whole master chain, its
 ///   limiter's lookahead included.
 /// - **`Tapped`**: an armed input is heard and nothing is withheld
-///   (monitoring on, the ordinary tracking desk). The speakers hear the
-///   master's chain exactly as the take does up to its first unit that adds
-///   delay, in the order the two racks run (`Renderer::room_tap_at`); that
-///   unit and every one after it are left out while the input is armed, so
-///   what the player hears of their own playing waits for no master plugin.
-///   Then the speakers' own copy of the built-in chain, whose limiter does
-///   not look ahead (`Effects::new_live`). Each rack still runs once: the
-///   speakers' copy is taken inside the run, a unit at a time (`Rack::tap`).
+///   (monitoring on, the ordinary tracking desk). The speakers take the mix
+///   after both of the master's racks, every unit in them exactly as the
+///   take has it (the owner, 2026-10-20: "master plugins should work when
+///   inputs are armed"), so a Tape across the master is heard as it is
+///   taped. **What the player hears of their own playing comes as late as
+///   the master's racks hold the mix**, 25 ms at 48 kHz with a Tape in its
+///   deep wow range there: that is the owner's choice, made over the
+///   2026-10-19 rule, which left out every master unit from the first that
+///   adds delay so the input waited for none of them, and left a Tape
+///   across the master out of the speakers while an input was heard. Then
+///   the speakers' own copy of the built-in chain, whose limiter does not
+///   look ahead (`Effects::new_live`): the speakers wait for everything the
+///   take waits for but the lookahead.
 /// - **`Withheld`**: some of an armed input is withheld from the speakers
 ///   (monitoring off, its track muted or soloed out), as with an
 ///   interface's direct monitoring. The take's mix less that input, taken
@@ -2197,8 +2203,12 @@ impl HoldRead {
 ///   be taken back out of its output, so hearing the racks here needs a
 ///   second instance of every master plugin, which is for after 5.3.0.
 ///
-/// Neither road of the speakers' own adds a delay of the master's, so their
-/// hold is the alignment target on either, and the take's on `OneMix`.
+/// **The hold each road reads** (`aim_click`): on `OneMix` the take's, the
+/// alignment target, both racks and the lookahead; on `Tapped` the target
+/// and both racks; on `Withheld` the target alone. So the take's mix and
+/// the heard road part by the lookahead alone (58 frames at 48 kHz with the
+/// limiter in circuit, none with it out), the heard road and the withheld
+/// one by both racks, and the take's mix and the withheld road by both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RoomRoad {
     #[default]
@@ -2213,13 +2223,21 @@ enum RoomRoad {
 /// The road moves where an input is armed or disarmed, or where monitoring,
 /// a mute or a solo moves while one is armed, and two roads differ in what
 /// they hear and in how late: a switch stepped both, a 0.21 sample step on
-/// a 0.25 tone with a trim and an IR across the master. So the speakers
-/// fade from the one to the other over ten milliseconds ([`LIVE_GLIDE_S`]),
-/// in a straight line, as a lane played live glides in and out of the wait
-/// (`DelayLine::run_glide`), and the click's read crosses with them, frame
-/// for frame (`ClickHold::room_was`), so it is heard with the mix's beat on
-/// either side of the fade. A move while one is under way fades again from
-/// the road it was going to.
+/// a 0.25 tone with a trim and an IR across the master while the heard road
+/// skipped both racks. So the speakers fade from the one to the other over
+/// ten milliseconds ([`LIVE_GLIDE_S`]), in a straight line, as a lane played
+/// live glides in and out of the wait (`DelayLine::run_glide`), and the
+/// click's read crosses with them, frame for frame (`ClickHold::room_was`),
+/// so it is heard with the mix's beat on either side of the fade. A move
+/// while one is under way fades again from the road it was going to.
+///
+/// **What a fade skips or plays again of the song is what the two roads'
+/// holds part by** ([`RoomRoad`]): an arm or a disarm with monitoring on,
+/// between the take's mix and the heard road, the limiter's lookahead
+/// alone, 58 frames with the limiter in circuit and none with it out;
+/// monitoring thrown off or on while an input is armed, between the heard
+/// road and the withheld one, both master racks' delay; an arm or a disarm
+/// with monitoring off, both racks and the lookahead.
 ///
 /// **One crossing does not fade: from the take's own mix into the withheld
 /// road**, an input armed with monitoring off or its strip muted. The
@@ -6060,31 +6078,6 @@ pub(crate) struct Rack {
     /// knows the room has already run the lane's chain this chunk, and
     /// stands past it rather than clock it twice (`mix_pad_lane`).
     told: (u64, u64),
-    /// **The speakers' tap, on the master's two racks alone** ([`RackTap`]):
-    /// what enters one bay, copied out as the rack reaches it. While an
-    /// input is armed and heard, the speakers take the master's chain up to
-    /// its first unit that adds delay (the owner's ruling of 2026-10-19,
-    /// `RoomRoad::Tapped`), and a rack runs once a chunk however many mixes
-    /// listen to it, so the speakers' copy is taken inside the one run.
-    /// `None` on every other rack; the two are bought with the bank
-    /// (`spine_from_bank`).
-    tap: Option<Box<RackTap>>,
-}
-
-/// **What enters one bay of a master rack, for the speakers** ([`Rack::tap`]):
-/// the bay a chunk's run copies at, whether the run reached it (a rack with
-/// nothing in it does not run at all), and the copy, a buffer a channel, as
-/// long as the longest chunk.
-struct RackTap {
-    bay: Option<usize>,
-    took: bool,
-    audio: [Vec<f32>; TAP_CHANNELS],
-}
-
-impl RackTap {
-    fn new() -> Self {
-        Self { bay: None, took: false, audio: std::array::from_fn(|_| vec![0.0; MAX_BLOCK as usize]) }
-    }
 }
 
 impl Rack {
@@ -10120,19 +10113,10 @@ impl crate::lane_bank::SpineExt for Wide {
 /// and leaves `None` in their places. Every lane is installed at `Slot(ch)`
 /// with generation `gen`: a desk built today is a legacy desk, row r at
 /// slot r (design section 3).
-///
-/// **And the master's two racks get the speakers' tap** ([`Rack::tap`]),
-/// bought here on the host with the rest of the bank: the callback only
-/// ever copies into it.
 fn spine_from_bank(bank: Vec<Rack>, gen: u32) -> (Vec<Option<Rack>>, Spine<Lane, Wide>) {
     use tangent_ui::recorder::AMP_PEDALS;
     use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
     let mut bank: Vec<Option<Rack>> = bank.into_iter().map(Some).collect();
-    for seat in [MASTER_EXTRA_SEAT, MASTER_SEAT] {
-        if let Some(Some(rack)) = bank.get_mut(seat) {
-            rack.tap = Some(Box::new(RackTap::new()));
-        }
-    }
     let mut spine = Spine::with_ext(LEGACY_LANES, FIRST_PICKS, Wide::new(LEGACY_LANES));
     for ch in 0..LEGACY_LANES {
         let mut take = |seat: usize| bank.get_mut(seat).and_then(Option::take);
@@ -12269,16 +12253,6 @@ fn run_rack(
     // the `dry` parameter. `None` while nothing has.
     let mut paid: Option<u32> = None;
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
-        // **The speakers' tap, ahead of this bay** (`Rack::tap`, a master
-        // rack's alone): what the bays before it have made, copied out
-        // before this one runs.
-        if let Some(t) = rack.tap.as_deref_mut().filter(|t| t.bay == Some(bay)) {
-            for (dst, src) in t.audio.iter_mut().zip(planar.iter()) {
-                let n = frames.min(dst.len()).min(src.len());
-                dst[..n].copy_from_slice(&src[..n]);
-            }
-            t.took = true;
-        }
         // **A DX7 or keyboard whose bay this is enters here**, ahead of
         // whatever the bay holds (nothing: a sentinel's bay is never
         // seated), aligned to what the chain ahead of it has paid.
@@ -13239,10 +13213,6 @@ struct Renderer {
     /// **The crossfade under way from the road the speakers left**
     /// ([`RoomFade`]), and the click's speakers' read crosses with it.
     room_fade: Option<RoomFade>,
-    /// **The mix where the speakers' tap took it** (`RoomRoad::Tapped`),
-    /// interleaved like `mix`: the master's chain up to its first unit that
-    /// adds delay.
-    room_tap: Vec<f32>,
     /// How much of the input the room is hearing, slewed 0..1 by
     /// `Shared::monitor_on`.
     ///
@@ -15764,10 +15734,10 @@ impl Renderer {
             //
             // **That is the withheld road** (`RoomRoad::Withheld`), and the
             // speakers take one of three a chunk, decided with the click's
-            // reads (`aim_click`): the take's own mix, the master's chain
-            // tapped ahead of its first unit that adds delay while an input
-            // is heard (`RoomRoad::Tapped`), or this. While they cross from
-            // one road to another (`RoomFade`), both of the two are made.
+            // reads (`aim_click`): the take's own mix, the mix after both of
+            // the master's racks while an input is heard (`RoomRoad::Tapped`,
+            // the owner's ruling of 2026-10-20), or this. While they cross
+            // from one road to another (`RoomFade`), both of the two are made.
             let road = self.room_road;
             let leaving = self.room_fade.map(|f| f.from);
             let on = |r: RoomRoad| road == r || leaving == Some(r);
@@ -15784,7 +15754,6 @@ impl Renderer {
                     }
                 }
             }
-            let tap = on(RoomRoad::Tapped).then(|| self.room_tap_at());
             // **The master's own rack, before the master's built-in insert.**
             // The limiter stays last on the way out, which is what a limiter
             // is for: an effect after it would undo the ceiling it just made.
@@ -15796,13 +15765,12 @@ impl Renderer {
             // chain, with three empty bays added in front of them (and an
             // empty rack returns immediately).
             let aligned = self.shared.max_latency.load(Ordering::Relaxed);
-            self.run_master_rack(MASTER_EXTRA_SEAT, 0, tap, n, aligned);
+            self.run_insert_chain(MASTER_EXTRA_SEAT, false, n, aligned);
             let ahead = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, MASTER_EXTRA_SEAT);
-            self.run_master_rack(LEGACY_STRIPS, INSERTS, tap, n, aligned.saturating_add(ahead));
-            if tap == Some(2 * INSERTS) {
-                // No master unit adds delay: the speakers hear both racks.
-                self.copy_mix_to_room_tap(n);
-            }
+            self.run_insert_chain(LEGACY_STRIPS, false, n, aligned.saturating_add(ahead));
+            // **Here, after both racks and before the built-in insert, is
+            // where the heard road takes the mix** (`RoomRoad::Tapped`): every
+            // unit of the master's, each run once, as the take has them.
             if split {
                 self.room_before_its_chain(road, leaving, n);
             }
@@ -17731,13 +17699,13 @@ impl Renderer {
         // running a second limiter forever over a rounding error.
         //
         // ...and a live input splits them whatever the levels say, so that the
-        // player hears the room's undelayed chain rather than the file's. See
-        // `live_in_room`.
+        // player hears the room's built-in chain, which does not look ahead,
+        // rather than the file's. See `live_in_room`.
         self.room_live = withheld > 1.0e-4 || live_in_room;
         // **Which of the two the difference is** (`RoomRoad`): an input
         // monitoring is asked to withhold keeps the speakers off both master
-        // racks, and heard ones alone take them up to the first unit that
-        // adds delay.
+        // racks, and heard ones alone take both racks whole, every unit, as
+        // the take does (the owner's ruling of 2026-10-20).
         self.room_withholds = withholds;
         // **A tracking desk**: an armed input, bound and heard, with the room
         // listening. The tape's motor stands aside for it (`motor_allowed`).
@@ -18207,8 +18175,9 @@ impl Renderer {
         // limiter's lookahead while it is in circuit**, 58 frames at 48 kHz,
         // which the take pays on every frame. The terms the take's click is
         // held by (`aim_click`), asked as the chain stands at the chunk's
-        // head; the speakers' own road while an input is armed pays less
-        // (`RoomRoad`), and that is the hold the click and a take's
+        // head; the speakers on a road of their own while an input is armed
+        // pay less (`RoomRoad`: heard, all but the lookahead; withheld, the
+        // target alone), and that is the hold the click and a take's
         // placement read, not this.
         let lat = |seat: usize| Rack::latency(&self.shared, &self.spine.ext.desk.frozen, seat);
         let ahead = u32::try_from(self.master_effects.lookahead(self.master_sends(), false)).unwrap_or(u32::MAX);
@@ -18234,105 +18203,35 @@ impl Renderer {
         }
     }
 
-    /// **Where the speakers take the master's chain while an input is
-    /// heard** (`RoomRoad::Tapped`): the first unit, in the order the two
-    /// racks run (the second rack's three bays, then the original's), that
-    /// reports a delay, as a place along the six; six when none does, and
-    /// the speakers hear both racks whole.
-    ///
-    /// **By the figure each bay reports** (`Rack::set_latency`), the one the
-    /// click's hold and the readout count: a bypassed unit that keeps its
-    /// delay keeps its place here too, and an emptied bay reports none.
-    fn room_tap_at(&self) -> usize {
-        let delays = |(seat, bay): (usize, usize)| {
-            self.shared
-                .seat_cell(SeatKind::Latency, seat * INSERTS + bay)
-                .is_some_and(|c| c.load(Ordering::Relaxed) > 0)
-        };
-        [MASTER_EXTRA_SEAT, LEGACY_STRIPS]
-            .into_iter()
-            .flat_map(|seat| (0..INSERTS).map(move |bay| (seat, bay)))
-            .position(delays)
-            .unwrap_or(2 * INSERTS)
-    }
-
-    /// **One of the master's two racks over the mix, the speakers' tap taken
-    /// on the way** (`room_tap_at`): `base` is the rack's first bay as a
-    /// place along the six, and `tap` the place the speakers take the chain
-    /// at, while they do.
-    ///
-    /// With the tap in this rack, the speakers' copy is the mix entering it,
-    /// and the rack overwrites it with what enters the tapped bay as it runs
-    /// (`Rack::tap`). The copy taken first is the tap's own when the bay is
-    /// the rack's first, and when the rack does not run because it holds
-    /// nothing, which passes the mix as it was.
-    fn run_master_rack(&mut self, seat: usize, base: usize, tap: Option<usize>, n: usize, lag: u32) {
-        let bay = tap.and_then(|p| p.checked_sub(base)).filter(|b| *b < INSERTS);
-        if bay.is_some() {
-            self.copy_mix_to_room_tap(n);
-        }
-        let inside = bay.filter(|b| *b > 0);
-        if let Some(t) = inside.and_then(|_| seat_rack_mut(&mut self.racks, &mut self.spine.lanes, seat)?.tap.as_deref_mut()) {
-            t.bay = inside;
-            t.took = false;
-        }
-        self.run_insert_chain(seat, false, n, lag);
-        if inside.is_none() {
-            return;
-        }
-        let Some(t) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, seat).and_then(|r| r.tap.as_deref_mut()) else {
-            return;
-        };
-        t.bay = None;
-        if t.took {
-            if let Some(room) = self.room_tap.get_mut(..n * TAP_CHANNELS) {
-                for (f, fr) in room.chunks_exact_mut(TAP_CHANNELS).enumerate() {
-                    for (c, v) in fr.iter_mut().enumerate() {
-                        if let Some(s) = t.audio.get(c).and_then(|b| b.get(f)) {
-                            *v = *s;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The mix as it stands, into the speakers' tap (`room_tap`).
-    fn copy_mix_to_room_tap(&mut self, n: usize) {
-        let end = n * TAP_CHANNELS;
-        if let (Some(room), Some(mix)) = (self.room_tap.get_mut(..end), self.mix.get(..end)) {
-            room.copy_from_slice(mix);
-        }
-    }
-
     /// **What the speakers' own copy of the master's built-in chain is
     /// handed** (`room`), from the road they are on and the one they leave
     /// ([`RoomRoad`]): the mix less a withheld input, made before the racks,
-    /// which `room` holds already, or the mix where the tap took it, and the
-    /// two crossfaded while the speakers cross from the one to the other.
-    /// The chain after it is one instance with one state, so the two roads
-    /// meet ahead of it.
+    /// which `room` holds already, or the mix after both racks, which `mix`
+    /// holds as this is asked (the heard road, every master unit as the take
+    /// has it: the owner's ruling of 2026-10-20), and the two crossfaded
+    /// while the speakers cross from the one to the other. The chain after
+    /// it is one instance with one state, so the two roads meet ahead of it.
     fn room_before_its_chain(&mut self, road: RoomRoad, leaving: Option<RoomRoad>, n: usize) {
         let end = n * TAP_CHANNELS;
         let fade = self.room_fade;
-        let (Some(room), Some(tap)) = (self.room.get_mut(..end), self.room_tap.get(..end)) else {
+        let (Some(room), Some(tapped)) = (self.room.get_mut(..end), self.mix.get(..end)) else {
             return;
         };
         let weight = |f: usize| fade.map_or(1.0, |g| g.weight(f));
         match (leaving, road) {
             (Some(RoomRoad::Tapped), RoomRoad::Withheld) => {
-                for (k, (v, t)) in room.iter_mut().zip(tap).enumerate() {
+                for (k, (v, t)) in room.iter_mut().zip(tapped).enumerate() {
                     let a = weight(k / TAP_CHANNELS);
                     *v = *t * (1.0 - a) + *v * a;
                 }
             }
             (Some(RoomRoad::Withheld), RoomRoad::Tapped) => {
-                for (k, (v, t)) in room.iter_mut().zip(tap).enumerate() {
+                for (k, (v, t)) in room.iter_mut().zip(tapped).enumerate() {
                     let a = weight(k / TAP_CHANNELS);
                     *v = *v * (1.0 - a) + *t * a;
                 }
             }
-            (_, RoomRoad::Tapped) | (Some(RoomRoad::Tapped), RoomRoad::OneMix) => room.copy_from_slice(tap),
+            (_, RoomRoad::Tapped) | (Some(RoomRoad::Tapped), RoomRoad::OneMix) => room.copy_from_slice(tapped),
             _ => {}
         }
     }
@@ -18372,14 +18271,17 @@ impl Renderer {
     ///   lane's line waits past [`MAX_PDC_FRAMES`].
     /// - **The master's two racks**, the second then the original
     ///   (`run_insert_chain` on `MASTER_EXTRA_SEAT` and `LEGACY_STRIPS`), on
-    ///   the take's mix always and on the speakers' while the two are one mix
-    ///   (`RoomRoad::OneMix`). On a road of the speakers' own they pass no
-    ///   unit that adds delay: on `Tapped` the units ahead of the first one
-    ///   that does, which add none, and on `Withheld` neither rack.
+    ///   the take's mix always, and on the speakers' while they share it
+    ///   (`RoomRoad::OneMix`) and while an input is heard (`RoomRoad::Tapped`,
+    ///   which takes the mix after both, every unit: the owner's ruling of
+    ///   2026-10-20). With an input withheld (`RoomRoad::Withheld`) the
+    ///   speakers pass neither rack.
     /// - **The limiter's lookahead**, 58 frames at 48 kHz while it is in
     ///   circuit (`Effects::lookahead`, asked as the master's chain will be
-    ///   called this chunk, landed or not). The speakers' own copy of the
-    ///   chain looks nowhere ahead (`Effects::new_live`).
+    ///   called this chunk, landed or not), on the take's mix and on the
+    ///   speakers' while they share it. The speakers' own copy of the chain,
+    ///   which both of their own roads take, looks nowhere ahead
+    ///   (`Effects::new_live`).
     ///
     /// **Less the click's own rack**, which the click pays before any of
     /// them; a rack that pays more than the hold leaves the click late by the
@@ -18429,7 +18331,16 @@ impl Renderer {
             self.room_fade = faded.then_some(RoomFade { from: self.room_road, left: total, total });
             self.room_road = road;
         }
-        let hold_on = |r: RoomRoad| if r == RoomRoad::OneMix { take } else { target };
+        // **Each road's hold** ([`RoomRoad`]): the heard road waits for both
+        // racks as the take does, so the click is heard with the mix's beat
+        // and a part played to that beat is placed on it (`capture_mark`,
+        // `note_record_anchor` read this), and only the lookahead parts it
+        // from the take's.
+        let hold_on = |r: RoomRoad| match r {
+            RoomRoad::OneMix => take,
+            RoomRoad::Tapped => target.saturating_add(racks),
+            RoomRoad::Withheld => target,
+        };
         let room = hold_on(road);
         let was = self.room_fade.map(|f| hold_on(f.from));
         let read = |h: usize| h.saturating_sub(own).min(ClickHold::MOST);
@@ -26835,7 +26746,6 @@ fn new_rack() -> (Rack, [Handoff; INSERTS]) {
         incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
         retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
         told: (u64::MAX, 0),
-        tap: None,
     };
     (rack, std::array::from_fn(|_| ends.next().expect("one per insert")))
 }
@@ -28325,7 +28235,6 @@ impl Engine {
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
                 told: (u64::MAX, 0),
-                tap: None,
             }
         }).collect();
         let mut rack_ends = rack_ends.into_iter();
@@ -28540,7 +28449,6 @@ impl Engine {
             room_withholds: false,
             room_road: RoomRoad::OneMix,
             room_fade: None,
-            room_tap: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             racks,
@@ -35748,7 +35656,6 @@ mod tests {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             told: (u64::MAX, 0),
-            tap: None,
         }
     }
 
@@ -35781,7 +35688,6 @@ mod tests {
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
                 told: (u64::MAX, 0),
-                tap: None,
             }
         }).collect();
         let (racks, spine) = spine_from_bank(racks, LEGACY_GEN);
@@ -35897,7 +35803,6 @@ mod tests {
             room_withholds: false,
             room_road: RoomRoad::OneMix,
             room_fade: None,
-            room_tap: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -36626,7 +36531,6 @@ mod tests {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             told: (u64::MAX, 0),
-            tap: None,
         };
 
         // Bay 0's retiring ring is full — the UI thread timed out and never
@@ -36690,7 +36594,6 @@ mod tests {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             told: (u64::MAX, 0),
-            tap: None,
         };
         rack.retiring[0]
             .push(PluginBox(None))
@@ -51529,13 +51432,31 @@ mod slot_engine {
             /// lookahead on the master's own chain.
             Limiter,
             /// A -12 dB trim ahead of the same IR in the master's second rack:
-            /// 512 frames on the take's way out, and the speakers' own road
-            /// with an input heard takes the trim and leaves the IR.
+            /// 512 frames on the take's way out, and on the speakers' with an
+            /// input heard, whose own road takes both racks whole, the trim
+            /// and the IR alike (`RoomRoad::Tapped`).
             MasterChain,
+            /// A Tape in the studio range across the master, its transport
+            /// parked and its tape silent (Wow, Flutter and Hiss at 0), so it
+            /// holds the mix exactly the 96 frames it reports. Its sway is the
+            /// Tape's sound around that delay, which no hold follows.
+            MasterStudio,
+            /// The same Tape in the deep wow range: 1,200 frames.
+            MasterDeep,
         }
 
         impl Held {
-            const ALL: [Held; 7] = [Held::Bare, Held::Studio, Held::Deep, Held::Ir, Held::MasterIr, Held::Limiter, Held::MasterChain];
+            const ALL: [Held; 9] = [
+                Held::Bare,
+                Held::Studio,
+                Held::Deep,
+                Held::Ir,
+                Held::MasterIr,
+                Held::Limiter,
+                Held::MasterChain,
+                Held::MasterStudio,
+                Held::MasterDeep,
+            ];
 
             /// Put what holds the desk back onto `e`.
             fn hold(self, e: &mut Engine) {
@@ -51562,14 +51483,24 @@ mod slot_engine {
                                 .expect("and seats");
                         }
                     }
+                    Held::MasterStudio | Held::MasterDeep => {
+                        let mut still = vec![(3, 0.0), (4, 0.0), (7, 0.0)];
+                        if self == Held::MasterDeep {
+                            still.push((9, 1.0));
+                        }
+                        e.load_insert_at(RackAddr { owner: RackOwner::Master, rack: 0 }, 0, Some(Path::new(TAPE_PATH)), Some(&knobs(TAPE_PATH, &still)))
+                            .expect("the Tape loads")
+                            .expect("and seats");
+                    }
                 }
             }
 
-            /// **Where beat two of the song is heard**: in the speakers'
-            /// own mix (`split`, an input heard in the room) the target alone,
-            /// and in the take, or in the speakers while the two are one mix,
-            /// the target and the master's chain. These are the numbers the
-            /// CHANGELOG quotes.
+            /// **Where beat two of the song is heard**: in the take, and in
+            /// the speakers while the two are one mix, the target and the
+            /// master's whole chain; in the speakers' own mix with an input
+            /// heard (`split`, `RoomRoad::Tapped`) the target and both master
+            /// racks, every unit, and no lookahead (the owner's ruling of
+            /// 2026-10-20). These are the numbers the CHANGELOG quotes.
             fn beat_two(self, split: bool, take: bool) -> usize {
                 let target = match self {
                     Held::Studio => 96,
@@ -51577,12 +51508,14 @@ mod slot_engine {
                     Held::Ir => 512,
                     _ => 0,
                 };
-                let master = match self {
+                let racks = match self {
                     Held::MasterIr | Held::MasterChain => 512,
-                    Held::Limiter => 58,
+                    Held::MasterStudio => 96,
+                    Held::MasterDeep => 1_200,
                     _ => 0,
                 };
-                BEAT_TWO + target + if split && !take { 0 } else { master }
+                let ahead = if self == Held::Limiter { 58 } else { 0 };
+                BEAT_TWO + target + racks + if split && !take { 0 } else { ahead }
             }
         }
 
@@ -51644,14 +51577,16 @@ mod slot_engine {
         /// a silent lane. It is held to each destination's mix now
         /// (`ClickHold`): its attack is as far from the backing's beat on every
         /// desk as on a bare one, 30 frames, with a Tape in either range or an
-        /// IR on a lane, an IR across the master, and the limiter in circuit,
-        /// in the speakers whether they share the take's mix or take their own
-        /// (which passes no master unit that adds delay and no lookahead: a
-        /// trim ahead of the master's IR is heard there and the IR is not,
-        /// `RoomRoad::Tapped`), and in the take. Each heard beat is where the
-        /// CHANGELOG says, so the hold is pinned term by term. Each signal is
-        /// its render less the desk's silent twin, which takes a silent Tape's
-        /// hiss out exactly.
+        /// IR on a lane, an IR, a trim and an IR, or a Tape in either range
+        /// across the master, and the limiter in circuit, in the speakers
+        /// whether they share the take's mix or take their own (which passes
+        /// both master racks, every unit, and no lookahead: `RoomRoad::Tapped`,
+        /// the owner's ruling of 2026-10-20), and in the take. Each heard beat
+        /// is where the CHANGELOG says, so the hold is pinned term by term.
+        /// Each signal is its render less the desk's silent twin, which takes a
+        /// silent Tape's hiss out exactly, and the beat is the backing's
+        /// loudest frame: a Tape across the master puts its peak on the delay
+        /// it reports, and its oversampler rings a few frames ahead of it.
         #[test]
         fn the_click_lands_on_the_mixs_beat_in_the_room_and_the_take_on_every_desk() {
             const BLOCKS: usize = 60;
@@ -51669,8 +51604,8 @@ mod slot_engine {
                         ("take", &quiet_take, &click_take, &back_take),
                     ] {
                         let take = dest == "take";
-                        let beat = onset_from(&less(back, quiet), 0, CROSS)
-                            .unwrap_or_else(|| panic!("{held:?}, split {split}: the backing never reached the {dest}"));
+                        let (beat, peak) = loudest(&less(back, quiet));
+                        assert!(peak > CROSS, "{held:?}, split {split}: the backing never reached the {dest}");
                         assert_eq!(beat, held.beat_two(split, take), "{held:?}, split {split}: the {dest} heard beat two at {beat}");
                         let tick = onset_from(&less(click, quiet), BEAT_TWO - 100, CROSS)
                             .unwrap_or_else(|| panic!("{held:?}, split {split}: the click never reached the {dest}"));
@@ -51687,13 +51622,16 @@ mod slot_engine {
 
         /// **Where the backing's beat two is heard**, on a desk built by
         /// `held_desk` with its input plugged: the frame a player playing to
-        /// it plays on.
+        /// it plays on, its loudest (a Tape across the master rings a few
+        /// frames ahead of the peak it puts on its delay).
         fn heard_beat_two(held: Held) -> usize {
             let (mut e, mut tx) = held_desk(held, false, false, true);
             let (quiet, _) = roll_held(&mut e, &mut tx, 60);
             let (mut e, mut tx) = held_desk(held, false, true, true);
             let (back, _) = roll_held(&mut e, &mut tx, 60);
-            onset_from(&less(&back, &quiet), 0, CROSS).expect("the backing sounds")
+            let (at, peak) = loudest(&less(&back, &quiet));
+            assert!(peak > CROSS, "{held:?}: the backing is silent");
+            at
         }
 
         /// **A record on lane 3's input, played to the backing**: the tee
@@ -51769,11 +51707,14 @@ mod slot_engine {
         /// speakers' hold, so the impulse lands on frame 24,000 on every desk:
         /// recorded from 0:00 with the tee open as the transport rolls and
         /// with three blocks of it open before (frames that stand before the
-        /// roll, as they did in time), and punched in while the song plays. A
-        /// master chain moves nothing here: an armed input splits the
-        /// speakers' mix from the take's, and theirs passes no master unit
-        /// that adds delay and no lookahead, the trim ahead of a master IR
-        /// heard and the IR not (`RoomRoad::Tapped`).
+        /// roll, as they did in time), and punched in while the song plays. An
+        /// armed input heard splits the speakers' mix from the take's, and
+        /// theirs passes both master racks, every unit, and no lookahead
+        /// (`RoomRoad::Tapped`, the owner's ruling of 2026-10-20): with an IR,
+        /// a trim and an IR, or a Tape in either range across the master, the
+        /// beat is heard that much later, played to that much later, and the
+        /// mark's hold carries that much more, so the part lands on the beat
+        /// with every master as with none.
         #[test]
         fn a_take_played_to_the_backing_is_placed_on_the_beat_it_was_played_to() {
             for held in Held::ALL {
@@ -51800,10 +51741,13 @@ mod slot_engine {
         /// and the speakers' hold after it, and the take starts at 0:00 with
         /// the frame captured the hold after the roll, which is the frame the
         /// player heard 0:00 on. A take that never rolled has no mark and is
-        /// placed where it was pressed, as before.
+        /// placed where it was pressed, as before. With an IR or a deep-range
+        /// Tape across the master the mark carries the master's racks too,
+        /// 512 and 1,200 frames, since the speakers heard the input through
+        /// them (`RoomRoad::Tapped`, the owner's ruling of 2026-10-20).
         #[test]
         fn a_record_from_the_top_of_a_held_desk_lands_at_the_top_trimmed() {
-            for held in [Held::Bare, Held::Deep, Held::Ir] {
+            for held in [Held::Bare, Held::Deep, Held::Ir, Held::MasterIr, Held::MasterDeep] {
                 for pre in [0usize, 3] {
                     let (took, mark) = record_to_the_backing(held, pre, 0);
                     let mark = mark.expect("a mark");
@@ -53620,7 +53564,8 @@ mod slot_engine {
         /// waits the target where the lanes' sends arrive (`ClickHold::fx`),
         /// the bus's send what the bus's way out does not pay, the speakers
         /// and the take the target, both racks and the lookahead, and the
-        /// speakers' own mix (an input armed and heard) the target alone. So
+        /// speakers' own mix (an input armed and heard) the target and both
+        /// racks, all but the lookahead (`RoomRoad::Tapped`). So
         /// the click less the quiet desk is the lane less the quiet desk, in
         /// the room and the take, the speakers sharing the take's mix and on
         /// their own, to a ten-thousandth (the click's gain and the lane's
@@ -53723,37 +53668,38 @@ mod slot_engine {
             col.chunks_exact(2).enumerate().fold((0, 0.0f32), |best, (i, f)| if f[0].abs() > best.1 { (i, f[0].abs()) } else { best })
         }
 
-        /// **With an input heard, the speakers hear the master's chain up to
-        /// its first unit that adds delay, a unit at a time; with an input
+        /// **With an input heard, the speakers hear the master's whole chain,
+        /// every unit of both racks as the take has it; with an input
         /// withheld, they skip both racks as they always have** (the owner's
-        /// ruling of 2026-10-19).
+        /// rulings of 2026-10-19 and 2026-10-20).
         ///
         /// The speakers took their own mix before both of the master's racks
         /// whenever an input was armed, heard or withheld, so a player tracked
         /// against a master whose plugins were silently off: a -12 dB trim on
         /// the second rack read 12 dB louder in the speakers than in the take.
-        /// Heard now (monitoring on), they take the master's chain as the take
-        /// does up to the first unit that reports a delay (`RoomRoad::Tapped`),
-        /// in the order the racks run: the backing's impulse on beat two (0.25)
-        /// is trimmed in the speakers as in the take, on its own beat, while
-        /// the take waits for the IR's 512 frames. A trim after the IR in the
-        /// same rack is left out with it, so the tap is a unit's and not a
-        /// rack's; and with no unit that delays, the speakers hear both racks
-        /// whole, the take's own level on the take's own frame. Withheld
+        /// The first fix took the chain up to the first unit that reports a
+        /// delay and left that unit and every one after it out, so an IR or a
+        /// Tape across the master was still not heard while an input was: the
+        /// backing's impulse on beat two (0.25) reached the speakers trimmed
+        /// but on its own beat, 512 frames ahead of the take's, and a trim
+        /// after the IR was left out with it. Heard now (monitoring on), the
+        /// speakers take the mix after both racks (`RoomRoad::Tapped`): the
+        /// beat is trimmed in the speakers as in the take and as late, the
+        /// IR's 512 frames and the trim after it included, and with no unit
+        /// that delays it is the take's level on the take's frame. Withheld
         /// (monitoring off), the speakers still skip both racks, the backing
         /// whole on its beat: hearing them there needs a second instance of
         /// every master plugin. With no input armed the speakers are the take.
         #[test]
-        fn the_speakers_hear_the_masters_chain_up_to_its_first_unit_that_adds_delay() {
+        fn the_speakers_hear_the_masters_whole_chain_with_an_input_heard() {
             use crate::builtin_fx::{IR_PATH, TRIM_PATH};
             let level = |db: f32| 0.25 * 10f32.powf(db / 20.0);
-            // Each master, and where the backing's beat two is heard: in the
-            // speakers with an input heard, and in the take.
-            let masters: [(&str, Vec<(u16, usize, &str, Option<Vec<u8>>)>, (usize, f32), (usize, f32)); 3] = [
+            // Each master, and where the backing's beat two is heard in the
+            // take, and so in the speakers with an input heard.
+            let masters: [(&str, Vec<(u16, usize, &str, Option<Vec<u8>>)>, (usize, f32)); 3] = [
                 (
                     "a trim on the second rack, an IR on the first",
                     vec![(1, 0, TRIM_PATH, Some(trim_at(-12.0))), (0, 0, IR_PATH, Some(wire_ir()))],
-                    (BEAT_TWO, level(-12.0)),
                     (BEAT_TWO + 512, level(-12.0)),
                 ),
                 (
@@ -53763,17 +53709,15 @@ mod slot_engine {
                         (1, 1, IR_PATH, Some(wire_ir())),
                         (1, 2, TRIM_PATH, Some(trim_at(-6.0))),
                     ],
-                    (BEAT_TWO, level(-12.0)),
                     (BEAT_TWO + 512, level(-18.0)),
                 ),
                 (
                     "a trim on each rack and nothing that delays",
                     vec![(1, 0, TRIM_PATH, Some(trim_at(-12.0))), (0, 0, TRIM_PATH, Some(trim_at(-6.0)))],
                     (BEAT_TWO, level(-18.0)),
-                    (BEAT_TWO, level(-18.0)),
                 ),
             ];
-            for (what, units, heard, took) in masters {
+            for (what, units, took) in masters {
                 for input in [None, Some(true), Some(false)] {
                     let mut e = wide(42);
                     let mut inputs = bus_plan(&e, 42, &[]);
@@ -53795,8 +53739,7 @@ mod slot_engine {
                     assert_eq!(at, took.0, "{what}, input {input:?}: the take heard beat two at {at}");
                     assert!((peak - took.1).abs() < 1e-4, "{what}, input {input:?}: the take heard beat two at {peak}, not {}", took.1);
                     let want = match input {
-                        None => took,
-                        Some(true) => heard,
+                        None | Some(true) => took,
                         Some(false) => (BEAT_TWO, 0.25),
                     };
                     let (at, peak) = loudest(&room);
@@ -53807,6 +53750,115 @@ mod slot_engine {
                         want.1,
                         if peak > want.1 { "kept from" } else { "forced on" }
                     );
+                }
+            }
+        }
+
+        /// **Two live inputs, on lanes `lanes`**: a two-input device, pick 0
+        /// on its first column playing onto the first lane and pick 1 on its
+        /// second onto the second. Answers the device's end of the ring, which
+        /// takes a frame as two samples, the first input's and the second's.
+        fn plug_two(e: &mut Engine, lanes: [usize; 2]) -> Producer<f32> {
+            use crate::lane_bank::{MonitorPick, MonitorPlan};
+            let (tx, rx) = RingBuffer::<f32>::new(1 << 16);
+            let picks = tangent_record::audio::Picks::EVERYTHING;
+            e.set_monitor(Some((rx, 2, vec![1, 1].into_boxed_slice(), BLOCK as u32, picks.clone())));
+            let gens = lanes.map(|l| e.lane_gen(Slot(l as u32)).expect("a lane"));
+            let on = |p: usize| MonitorPick { pick: PickId(p as u32), slot: Slot(lanes[p] as u32), gen: gens[p], width: 1, cols: [p as u16, p as u16] };
+            let plan = MonitorPlan { layout_only: true, ..MonitorPlan::with_picks(vec![on(0), on(1)], picks) };
+            e.set_monitor_plan(plan).expect("never refused");
+            tx
+        }
+
+        /// **A Tape across the master is heard as the take has it while two
+        /// audio inputs are armed and heard, and every one of its controls
+        /// moves the speakers** (the owner, 2026-10-20: "master plugins should
+        /// work when inputs are armed").
+        ///
+        /// The owner's own case, from 5.2.0: a Tape across the master, two
+        /// audio inputs armed, monitoring through Tangent, and nothing of the
+        /// Tape heard. The 2026-10-19 rule still left the Tape out, since it
+        /// reports a delay (96 frames in its studio range, 1,200 in its deep
+        /// one): the speakers played a mix the Tape was never put on, 0.68 from
+        /// the take with the studio range and 1.0 with the deep, and none of
+        /// its thirteen controls moved them past the start-up fade. Here a
+        /// 1 kHz tone at 0.25 plays on lane 1, the two inputs play 220 Hz and
+        /// 3.3 kHz into lanes 3 and 4, and a Tape at its defaults sits on the
+        /// master's second rack in the studio range and on its first in the
+        /// deep, so each rack is heard. The speakers are the take on every
+        /// frame to a millionth, the Tape's sound and both inputs through it
+        /// included (the limiter is out: it is the one unit where the speakers'
+        /// chain and the take's part), and they are held as the take is, by
+        /// the Tape's delay. Every control of the Tape's, moved from where the
+        /// desk has it to the far end of its travel, moves the speakers by
+        /// more than a thousandth, and leaves them the take.
+        #[test]
+        fn a_tape_across_the_master_is_heard_with_two_inputs_armed_and_every_control_moves_the_speakers() {
+            use crate::builtin_fx::TAPE_PATH;
+            const BLOCKS: usize = 120;
+            // Past the start-up crossing from the take's mix, 10 ms.
+            const SETTLED: usize = 4 * BLOCK;
+            let spec = crate::builtin_fx::spec_for(TAPE_PATH).expect("the Tape");
+            let render = |deep: bool, moved: Option<(usize, f32)>, played: bool| -> (Vec<f32>, Vec<f32>, u32, u32) {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for lane in [3, 4] {
+                    inputs.lanes[lane].flags = F::ARMED | F::MIDI_OFF;
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                let mut set: Vec<(usize, f32)> = if deep { vec![(9, 1.0)] } else { Vec::new() };
+                if let Some((id, to)) = moved {
+                    set.retain(|(k, _)| *k != id);
+                    set.push((id, to));
+                }
+                master_unit(&mut e, if deep { 0 } else { 1 }, 0, TAPE_PATH, Some(knobs(TAPE_PATH, &set)));
+                let gen = e.lane_gen(Slot(1)).expect("a lane");
+                e.set_clips_slotted(vec![SlotPlaced {
+                    slot: Slot(1),
+                    gen,
+                    placed: Placed { clip: tone(BLOCKS * BLOCK, 1_000.0, 0.25), strip: 0, start: 0, offset: 0, len: (BLOCKS * BLOCK) as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                }]);
+                let mut tx = plug_two(&mut e, [3, 4]);
+                e.set_monitor_on(true);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let (mut room, mut take) = (Vec::new(), Vec::new());
+                let level = if played { 1.0 } else { 0.0 };
+                let mut n = 0u32;
+                for _ in 0..BLOCKS {
+                    for _ in 0..BLOCK {
+                        let t = f64::from(n) / 48_000.0;
+                        let _ = tx.push((t * std::f64::consts::TAU * 220.0).sin() as f32 * 0.2 * level);
+                        let _ = tx.push((t * std::f64::consts::TAU * 3_300.0).sin() as f32 * 0.1 * level);
+                        n += 1;
+                    }
+                    e.render_offline(&mut out);
+                    room.extend_from_slice(&out);
+                    tap.drain(&mut take);
+                }
+                (room, take, e.room_hold(), e.latency_frames().1)
+            };
+            let worst = |a: &[f32], b: &[f32], from: usize| a.iter().zip(b).skip(from * 2).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            for (deep, delay) in [(false, 96u32), (true, 1_200)] {
+                let (room, take, hold, paid) = render(deep, None, true);
+                let (_, unplayed, ..) = render(deep, None, false);
+                assert_eq!(paid, delay, "fixture: deep {deep}: the take pays {paid}");
+                assert_eq!(room.len(), take.len(), "fixture: deep {deep}: the speakers and the take are not as long");
+                assert!(worst(&take, &unplayed, SETTLED) > 0.05, "fixture: deep {deep}: the take does not carry the inputs");
+                assert_eq!(hold, paid, "deep {deep}: the speakers are held {hold} where the take is held {paid}");
+                let off = worst(&room, &take, 0);
+                assert!(off < 1e-6, "deep {deep}: the speakers are {off} from the take: the Tape across the master is left out of them");
+                for p in spec.params {
+                    let id = p.id as usize;
+                    let at = if id == 9 && deep { 1.0 } else { p.default };
+                    let to = if at < 0.5 { 1.0 } else { 0.0 };
+                    let (moved_room, moved_take, ..) = render(deep, Some((id, to)), true);
+                    let off = worst(&moved_room, &moved_take, 0);
+                    assert!(off < 1e-6, "deep {deep}, {} at {to}: the speakers are {off} from the take", p.symbol);
+                    let moved = worst(&moved_room, &room, SETTLED);
+                    assert!(moved > 1e-3, "deep {deep}: the Tape's {} from {at} to {to} moved the speakers {moved}", p.symbol);
                 }
             }
         }
@@ -53826,9 +53878,10 @@ mod slot_engine {
         /// moves while the song plays** (`RoomFade`).
         ///
         /// A 1 kHz tone at 0.25 on lane 1, a -12 dB trim on the master's second
-        /// rack and an IR on its first: the take hears the tone at 0.063, 512
-        /// frames late; so do the speakers on the take's own mix, and on their
-        /// own road they hear the trimmed tone on time with an input heard, the
+        /// rack, an IR on its first and the limiter in circuit: the take hears
+        /// the tone at 0.063, 570 frames late; so do the speakers on the take's
+        /// own mix, and on their own road they hear it 512 frames late with an
+        /// input heard (both racks, no lookahead: `RoomRoad::Tapped`), the
         /// whole tone on time with it withheld. Each road used to switch at
         /// once: arming with monitoring on stepped the speakers 0.208 on a tone
         /// whose own steps are 0.008 and 0.033, a disarm 0.198, and a disarm
@@ -53836,7 +53889,11 @@ mod slot_engine {
         /// out. Each of those, and monitoring thrown off and back on while
         /// armed, crosses now over ten milliseconds, so no frame steps further
         /// than the louder road's own tone does, with the fade's own slope on
-        /// top. Arming with monitoring off still switches at once, by design:
+        /// top. The limiter is in circuit so that an arm and a disarm with
+        /// monitoring on still cross two signals: with it out the take's mix
+        /// and the heard road are the same signal on the same frames, and a
+        /// switch there would step nothing. Arming with monitoring off still
+        /// switches at once, by design:
         /// the take's mix carries the input from that block, and a fade out of
         /// it would play the input the speakers may not hear. So there, with
         /// nothing across the master that delays the take's mix past the fade,
@@ -53847,7 +53904,8 @@ mod slot_engine {
             use crate::builtin_fx::{IR_PATH, TRIM_PATH};
             const BLOCKS: usize = 120;
             const MOVE: usize = 40;
-            let render = |before: (bool, bool), after: (bool, bool), played: f32, ir: bool| -> (Vec<f32>, Vec<f32>) {
+            // `held`: the IR and the limiter, or neither.
+            let render = |before: (bool, bool), after: (bool, bool), played: f32, held: bool| -> (Vec<f32>, Vec<f32>) {
                 let mut e = wide(42);
                 let [unarmed, armed] = [false, true].map(|a| {
                     let mut inputs = bus_plan(&e, 42, &[]);
@@ -53857,8 +53915,9 @@ mod slot_engine {
                 let plan_of = |a: bool| if a { &armed } else { &unarmed };
                 e.publish_plan(plan_of(before.0)).expect("the plan goes");
                 master_unit(&mut e, 1, 0, TRIM_PATH, Some(trim_at(-12.0)));
-                if ir {
+                if held {
                     master_unit(&mut e, 0, 0, IR_PATH, Some(wire_ir()));
+                    e.set_effects(crate::effects::Sends { limiter: tangent_ui::recorder::LIMITER_SHIPS_AT, ..crate::effects::Sends::default() });
                 }
                 let gen = e.lane_gen(Slot(1)).expect("a lane");
                 e.set_clips_slotted(vec![SlotPlaced {
@@ -53914,6 +53973,106 @@ mod slot_engine {
             assert!(held > 0.1, "fixture: the take does not hold the input armed with monitoring off ({held})");
             for (k, (p, s)) in played.iter().zip(&silent).enumerate() {
                 assert!((p - s).abs() < 1e-6, "armed with monitoring off: frame {}: the speakers played the input ({p} against {s})", k / 2);
+            }
+        }
+
+        /// **What an arm or a disarm skips or plays again in the speakers is
+        /// the limiter's lookahead alone, and monitoring thrown off or on while
+        /// an input is armed skips or plays again the master's racks**
+        /// (`RoomFade`, the owner's ruling of 2026-10-20).
+        ///
+        /// Two roads' holds part by what one waits for and the other does not
+        /// (`RoomRoad`), and a crossing between them moves the speakers that
+        /// far in the song: ahead, a skip, where the hold shrinks, and back, a
+        /// repeat, where it grows. A ramp on lane 1 reads the move off any
+        /// frame: the speakers less the take, over the ramp's slope, is how
+        /// far ahead of the take the speakers are. With an IR across the
+        /// master (512 frames) and the limiter in circuit (58) the take is held
+        /// 570 frames. An arm with monitoring on moved the speakers 570 frames
+        /// ahead while the heard road skipped the IR, and a disarm 570 back;
+        /// they move 58 now, the lookahead the speakers' own chain does not
+        /// have. Monitoring thrown off while armed moves them 512 ahead, onto
+        /// the withheld road that skips both racks, and thrown on 512 back,
+        /// where they moved none before. An arm with monitoring off, which
+        /// switches at once, and a disarm with it off move them 570, as ever.
+        /// The speakers' hold (`Engine::room_hold`, which a take's mark and a
+        /// record's anchor carry) reads each road's: 570 on the take's mix,
+        /// 512 heard, none withheld.
+        #[test]
+        fn an_arm_or_a_disarm_skips_or_repeats_only_the_limiters_lookahead_in_the_speakers() {
+            use crate::builtin_fx::IR_PATH;
+            const BLOCKS: usize = 120;
+            const MOVE: usize = 60;
+            let frames = BLOCKS * BLOCK;
+            let ramp = Arc::new(tangent_record::decode::Clip {
+                samples: (0..frames)
+                    .flat_map(|t| {
+                        let v = 0.3 * t as f32 / frames as f32;
+                        [v, v]
+                    })
+                    .collect(),
+                rate: 48_000,
+                source: PathBuf::from("ramp.wav"),
+            });
+            // Each move, how far it moves the speakers ahead in the song, and
+            // their hold before it and after.
+            for (what, before, after, ahead, holds) in [
+                ("armed, monitoring on", (false, true), (true, true), 58i64, (570u32, 512u32)),
+                ("disarmed, monitoring on", (true, true), (false, true), -58, (512, 570)),
+                ("monitoring thrown off while armed", (true, true), (true, false), 512, (512, 0)),
+                ("monitoring thrown on while armed", (true, false), (true, true), -512, (0, 512)),
+                ("armed, monitoring off", (false, false), (true, false), 570, (570, 0)),
+                ("disarmed, monitoring off", (true, false), (false, false), -570, (0, 570)),
+            ] {
+                let mut e = wide(42);
+                let [unarmed, armed] = [false, true].map(|a| {
+                    let mut inputs = bus_plan(&e, 42, &[]);
+                    inputs.lanes[3].flags = if a { F::ARMED | F::MIDI_OFF } else { F::MIDI_OFF };
+                    inputs
+                });
+                let plan_of = |a: bool| if a { &armed } else { &unarmed };
+                e.publish_plan(plan_of(before.0)).expect("the plan goes");
+                master_unit(&mut e, 0, 0, IR_PATH, Some(wire_ir()));
+                e.set_effects(crate::effects::Sends { limiter: tangent_ui::recorder::LIMITER_SHIPS_AT, ..crate::effects::Sends::default() });
+                let gen = e.lane_gen(Slot(1)).expect("a lane");
+                e.set_clips_slotted(vec![SlotPlaced {
+                    slot: Slot(1),
+                    gen,
+                    placed: Placed { clip: Arc::clone(&ramp), strip: 0, start: 0, offset: 0, len: frames as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                }]);
+                let mut tx = plug(&mut e, 3);
+                e.set_monitor_on(before.1);
+                let mut tap = e.take_recorder_tap().expect("the take's tap");
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                let (mut room, mut take) = (Vec::new(), Vec::new());
+                let mut was = None;
+                for b in 0..BLOCKS {
+                    if b == MOVE {
+                        was = Some(e.room_hold());
+                        e.publish_plan(plan_of(after.0)).expect("the move goes");
+                        e.set_monitor_on(after.1);
+                    }
+                    for _ in 0..BLOCK {
+                        let _ = tx.push(0.0);
+                    }
+                    e.render_offline(&mut out);
+                    room.extend_from_slice(&out);
+                    tap.drain(&mut take);
+                }
+                assert!(take.len() >= frames * 2 && room.len() >= frames * 2, "fixture: {what}: the render is short");
+                assert_eq!((was, e.room_hold()), (Some(holds.0), holds.1), "{what}: the speakers' hold before the move and after");
+                // The ramp's slope as the take carries it, every gain on the way
+                // included, and how far the speakers lead the take at a frame.
+                let slope = f64::from(take[50_000 * 2] - take[20_000 * 2]) / 30_000.0;
+                assert!(slope > 1e-6, "fixture: {what}: the ramp is flat in the take ({slope})");
+                let lead = |f: usize| (f64::from(room[f * 2] - take[f * 2]) / slope).round() as i64;
+                // Before the move, and well past it: a disarm with monitoring
+                // off leaves the withheld road once the input has faded out of
+                // the take's mix.
+                let (from, to) = (lead(MOVE * BLOCK - 2_000), lead(frames - 2_000));
+                assert_eq!(to - from, ahead, "{what}: the speakers moved {} frames in the song ({from} ahead of the take, then {to})", to - from);
             }
         }
 
@@ -53993,24 +54152,33 @@ mod slot_engine {
         /// (`ClickHold::room_was`).
         ///
         /// An IR across the master holds the take's mix 512 frames, more than
-        /// the fade is long, and the speakers' own road with an input heard
-        /// skips it. The click and a lane playing the click's own samples, the
-        /// same beats at the same level, are one signal through an input armed
-        /// and disarmed while the song plays, each with a beat in flight: at
-        /// the arm (192 frames past beat four) the take's road still held the
-        /// beat and is heard fading out with it, and at the disarm (320 frames
-        /// past beat six) the speakers' road had already played the beat and
-        /// the take's road brings it back as it fades in, the lane's as the
-        /// click's. A click read that moved at once, as a move in the master's
-        /// chain alone does, played the click a road away from the mix through
-        /// each fade: the click held the arm's beat back where the mix let it
-        /// go, and left out the disarm's where the mix played it again.
+        /// the fade is long, and the speakers' road with an input heard as
+        /// much (both racks, `RoomRoad::Tapped`), while their road with it
+        /// withheld skips both racks. The click and a lane playing the click's
+        /// own samples, the same beats at the same level, are one signal
+        /// through an input armed, monitoring thrown off and on again while it
+        /// is armed, and the input disarmed, all while the song plays. The arm
+        /// and the disarm cross between two roads held alike. Monitoring
+        /// thrown off and on crosses a road away from the hold, each with a
+        /// beat in flight: thrown off (192 frames past beat four) the heard
+        /// road still held the beat and is heard fading out with it, and
+        /// thrown on (320 frames past beat six) the withheld road had already
+        /// played the beat and the heard road brings it back as it fades in,
+        /// the lane's as the click's. A click read that moved at once, as a
+        /// move in the master's chain alone does, played the click a road away
+        /// from the mix through each fade: the click held the beat back where
+        /// the mix let it go, and left it out where the mix played it again.
+        /// (These two crossings were the arm and the disarm, when the heard
+        /// road skipped the IR: now an arm and a disarm cross the limiter's
+        /// lookahead alone, which an IR does not have.)
         #[test]
         fn the_click_crosses_roads_with_the_speakers_mix_frame_for_frame() {
-            const FRAMES: usize = 6 * 48_000;
-            const ARMED: usize = 141;
-            const DISARMED: usize = 235;
-            for (b, past) in [(ARMED, 192), (DISARMED, 320)] {
+            const FRAMES: usize = 7 * 48_000;
+            const ARMED: usize = 47;
+            const OFF: usize = 141;
+            const ON: usize = 235;
+            const DISARMED: usize = 300;
+            for (b, past) in [(OFF, 192), (ON, 320)] {
                 assert_eq!((b * BLOCK) % BEAT_TWO, past, "fixture: block {b} is not {past} frames past its beat");
             }
             let track = click_track(FRAMES, 1.0);
@@ -54052,11 +54220,16 @@ mod slot_engine {
                 e.set_rolling(true);
                 let mut heard = Vec::new();
                 for b in 0..FRAMES / BLOCK {
-                    if b == ARMED {
-                        e.publish_plan(&armed).expect("the arm goes");
-                    }
-                    if b == DISARMED {
-                        e.publish_plan(&unarmed).expect("the disarm goes");
+                    match b {
+                        ARMED => {
+                            e.publish_plan(&armed).expect("the arm goes");
+                        }
+                        OFF => e.set_monitor_on(false),
+                        ON => e.set_monitor_on(true),
+                        DISARMED => {
+                            e.publish_plan(&unarmed).expect("the disarm goes");
+                        }
+                        _ => {}
                     }
                     feed(&mut e, &mut out);
                     heard.extend_from_slice(&out);
@@ -54066,10 +54239,11 @@ mod slot_engine {
             let clicked = render(true);
             let laned = render(false);
             assert!(laned.iter().any(|v| v.abs() > 0.05), "fixture: the click track is silent");
-            // The disarm's beat comes back: the lane's own sound, with the
-            // take's road fading in, over the frames the speakers had played.
-            let again = (DISARMED * BLOCK + 512 - 320)..(DISARMED * BLOCK + 480);
-            assert!(again.clone().any(|f| laned[f * 2].abs() > 0.01), "fixture: the disarm brought no beat back");
+            // Thrown back on, the beat comes back: the lane's own sound, with
+            // the heard road fading in, over the frames the speakers had
+            // played on the withheld one.
+            let again = (ON * BLOCK + 512 - 320)..(ON * BLOCK + 480);
+            assert!(again.clone().any(|f| laned[f * 2].abs() > 0.01), "fixture: monitoring thrown back on brought no beat back");
             for (k, (c, l)) in clicked.iter().zip(&laned).enumerate() {
                 assert!((c - l).abs() < 1e-4, "frame {}: the click is {c}, the lane playing its sound {l}", k / 2);
             }
@@ -57260,7 +57434,6 @@ mod sampler_road {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             told: (u64::MAX, 0),
-            tap: None,
         }
     }
 
