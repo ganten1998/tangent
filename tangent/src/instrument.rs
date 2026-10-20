@@ -12111,6 +12111,10 @@ struct Renderer {
     /// the rising edge, where `run_transport` empties the grain rings of what
     /// the stopped chunks stamped into them.
     was_rolling: bool,
+    /// **This chunk rolls and the one before it stood**: the song started on
+    /// it (`render_program`, beside `was_rolling`). An armed lane moves into
+    /// the wait here, and takes it at once (`run_lane_pdc`, `mix_pad_lane`).
+    roll_began: bool,
     /// A loop just wrapped `pos` backward; the NEXT block must flush so the
     /// MIDI clip cursors rewind. Set on the wrap block, consumed on the one
     /// after — and it MUST be the one after, because the wrap block returns
@@ -14059,6 +14063,7 @@ impl Renderer {
                 }
                 self.live_sounding = 0;
             }
+            self.roll_began = rolling && !self.was_rolling;
             self.was_rolling = rolling;
             // **The routing, once a chunk.** A plan's is already ordered:
             // its destinations, buses and route gains come out of the plan
@@ -18478,6 +18483,7 @@ impl Renderer {
             let live = drum_lane.is_some_and(|c| self.plays_live(c));
             let glide = self.live_glide_frames();
             let chunk = self.chunks;
+            let began = self.roll_began;
             let live_ok = self.shared.live_ok.load(Ordering::Relaxed);
             // **Whether the kit fed its line any sound this chunk**: its line
             // then owes the mix its wait's worth of frames, and the kits run
@@ -18505,12 +18511,14 @@ impl Renderer {
             if let Some(line) = line {
                 // As a lane's line (`run_lane_pdc`): only a line that ran last
                 // chunk glides, and a kit is silent between its strikes, when
-                // `mix_pads` returns before it.
+                // `mix_pads` returns before it; and never on the chunk the song
+                // starts, where a glide plays the kit's first hit of its part
+                // twice.
                 let glides = match was {
                     Some((was_live, ran)) => {
                         let awake = ran.wrapping_add(1) == chunk;
                         *ran = chunk;
-                        let glides = awake && live_ok && (live || *was_live || line.gliding());
+                        let glides = awake && !began && live_ok && (live || *was_live || line.gliding());
                         *was_live = live;
                         glides
                     }
@@ -19254,7 +19262,8 @@ impl Renderer {
         // (`plays_live`). The player hears their keys after their own chain
         // and nothing more, the way a monitored input does (`mix_monitor`);
         // while the song plays the lane back it waits with the mix, so its
-        // own clips stay on the beat. Moving in and out GLIDES
+        // own clips stay on the beat. A record's start and a Stop move it
+        // out, a record's end (and Play, below) back in, and a move GLIDES
         // (`DelayLine::run_glide`): its two reads cross over ten
         // milliseconds.
         // **Only a line that ran last chunk glides.** One waking from
@@ -19264,10 +19273,22 @@ impl Renderer {
         // **Only where a lane may stand outside it**: a realtime export
         // takes the line back at once (`Shared::live_ok`), as the full-speed
         // export's line has always been, empty and at its wait.
+        // **And never on the chunk the song starts** (`roll_began`), where
+        // an armed lane moves INTO the wait. A glide there fades the old
+        // read, the frame just made, out under the new: the first ten
+        // milliseconds of the lane's part were heard at once, faded, and
+        // again the hold later, a flam on its first note whenever its line
+        // was awake at Play (a plugin in its rack, a note still ringing).
+        // Play takes the wait at once instead, on the emptying road: the
+        // part is heard once, on the beat, and what the lane still rang when
+        // Play was pressed is silent for the hold.
         let live = self.plays_live(ch);
         let awake = lane.pdc_ran.wrapping_add(1) == self.chunks;
         lane.pdc_ran = self.chunks;
-        let glides = awake && self.shared.live_ok.load(Ordering::Relaxed) && (live || lane.pdc_live || lane.pdc.gliding());
+        let glides = awake
+            && !self.roll_began
+            && self.shared.live_ok.load(Ordering::Relaxed)
+            && (live || lane.pdc_live || lane.pdc.gliding());
         lane.pdc_live = live;
         // **Over the staging pair, which is the lane's CONSUMED stream.**
         // The grains under it may be cut anywhere; what this line sees is
@@ -26071,6 +26092,7 @@ impl Engine {
             pos: 0,
             seen_req: 0,
             was_rolling: false,
+            roll_began: false,
             pad_racks_live: false,
             pending_flush: false,
             pending_wrap_from: None,
@@ -33478,6 +33500,7 @@ mod tests {
             pos: 0,
             seen_req: 0,
             was_rolling: false,
+            roll_began: false,
             pad_racks_live: false,
             pending_flush: false,
             pending_wrap_from: None,
@@ -49930,6 +49953,137 @@ mod slot_engine {
                         assert!(
                             (a - b).abs() < 1e-6,
                             "kind {kind}, recording {recording}: frame {} of the strike after the edge is {a}, a lane that never moved {b}",
+                            k / 2
+                        );
+                    }
+                }
+            }
+        }
+
+        /// **Lane 5 on a desk held 1,200 frames, armed to be played or only
+        /// listening, its line awake when Play is pressed** (`kind` 0: a DX7
+        /// with an EQ in its rack; 1: Keys still ringing a note of its own,
+        /// struck and let go while the song stood; 2: a kit still ringing a
+        /// pad), the song played from `from` with a clip's note on that frame
+        /// when `note` (for the kit, a second pad's impulse): the speakers
+        /// from the press on.
+        fn played_from(kind: u8, armed: bool, note: bool, from: u64) -> Vec<f32> {
+            use crate::builtin_fx::EQ_PATH;
+            let mut e = wide(42);
+            let mut inputs = bus_plan(&e, 42, &[]);
+            for l in inputs.lanes.iter_mut() {
+                l.flags = F::MIDI_OFF;
+            }
+            let own = match kind {
+                0 => F::BUILTIN,
+                1 => F::KEYS,
+                _ => F::DRUM,
+            };
+            inputs.lanes[5].flags = if armed { own | F::ARMED } else { own };
+            e.publish_plan(&inputs).expect("the plan goes");
+            match kind {
+                0 => {
+                    let _ = e.sync_instruments(&[Slot(5)], &[]);
+                    unit(&mut e, 5, 0, 0, EQ_PATH, None);
+                }
+                1 => {
+                    let _ = e.sync_instruments(&[], &[Slot(5)]);
+                }
+                _ => {
+                    let gen = e.lane_gen(Slot(5)).expect("a lane");
+                    e.attach(Slot(5), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                    let mut kit = tone_kit(4.0);
+                    let mut hit = vec![0.0f32; 4_800 * 2];
+                    hit[0] = 0.25;
+                    hit[1] = 0.25;
+                    kit.pads[1] = Some(Arc::new(tangent_record::decode::Clip { samples: hit, rate: 48_000, source: PathBuf::new() }));
+                    e.attach(Slot(5), gen, LanePart::Kit(Box::new(kit))).expect("the kit");
+                }
+            }
+            fake_hold(&mut e, 1_200);
+            e.set_live_play(true);
+            e.set_lane_levels(Slot(5), 1.0, 0.0, 0.0);
+            if note {
+                let key = if kind == 2 { PAD_BASE + 1 } else { 60 };
+                let gen = e.lane_gen(Slot(5)).expect("a lane");
+                e.set_midi_slotted(vec![SlotPlacedMidi {
+                    slot: Slot(5),
+                    gen,
+                    placed: PlacedMidi {
+                        strip: 5,
+                        start: 0,
+                        len: 4 * 48_000,
+                        notes: Arc::new(vec![ClipNote { at: from, dur: 6_000, key, vel: 120 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                }]);
+            }
+            e.set_transport(1, from);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..20 {
+                e.render_offline(&mut out);
+            }
+            match kind {
+                1 => {
+                    e.send_midi(0, &[0x90, 72, 100]);
+                    for _ in 0..4 {
+                        e.render_offline(&mut out);
+                    }
+                    e.send_midi(0, &[0x80, 72, 0]);
+                    e.render_offline(&mut out);
+                }
+                2 => {
+                    e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                    for _ in 0..5 {
+                        e.render_offline(&mut out);
+                    }
+                }
+                _ => {}
+            }
+            assert_eq!(e.shared.max_latency.load(Ordering::Relaxed), 1_200, "fixture: the desk is not held");
+            e.set_rolling(true);
+            let mut heard = Vec::new();
+            for _ in 0..30 {
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+            }
+            heard
+        }
+
+        /// **An armed track's part is heard once, on the beat, when Play is
+        /// pressed on its first note** (a verifier's finding: a flam on that
+        /// note, the first copy a hold early).
+        ///
+        /// An armed lane stands outside the wait while the song is stopped and
+        /// waits with the mix while the song plays it back (`plays_live`), so
+        /// Play moves it into the wait. That move glided, as a record's end
+        /// does, whenever the lane's line had run the chunk before (a plugin
+        /// in its rack, a sound of its own still ringing), and a glide into
+        /// the wait fades its old read, the frame just made, out under the
+        /// new one: the first ten milliseconds of the part were heard at once,
+        /// faded, and again the hold later. A DX7 with an EQ in its rack
+        /// sounded its clip's note from frame 113 at 0.037 and again at 1,310;
+        /// a kit still ringing played its clip's hit at frame 0 at full level,
+        /// and at 1,200 again. Play takes the wait at once now
+        /// (`Renderer::roll_began`), on the emptying road: for a DX7 with an
+        /// EQ, Keys ringing a note and a kit ringing a pad, from 0:00 and from
+        /// a second in, what the clip's note adds to the speakers is, sample
+        /// for sample, what it adds to the same lane unarmed, which has always
+        /// waited with the mix: nothing before the hold, and the note on it.
+        /// (What the lane rang when Play was pressed is silent for the hold:
+        /// the line is emptied, not glided.)
+        #[test]
+        fn an_armed_tracks_first_note_on_the_play_position_is_heard_once_on_the_beat() {
+            for kind in [0u8, 1, 2] {
+                for from in [0u64, 48_000] {
+                    let adds = |armed: bool| less(&played_from(kind, armed, true, from), &played_from(kind, armed, false, from));
+                    let (armed, unarmed) = (adds(true), adds(false));
+                    let first = onset_from(&unarmed, 0, 1e-4).unwrap_or_else(|| panic!("fixture: kind {kind}, from {from}: the clip's note is silent"));
+                    assert!(first >= 1_200, "fixture: kind {kind}, from {from}: the unarmed lane's note is heard at {first}, before the hold");
+                    for (k, (a, u)) in armed.iter().zip(&unarmed).enumerate() {
+                        assert!(
+                            (a - u).abs() < 1e-6,
+                            "kind {kind}, from {from}: frame {} of the armed lane's note is {a}, the unarmed lane's {u}",
                             k / 2
                         );
                     }

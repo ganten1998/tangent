@@ -383,12 +383,27 @@ channels play back their clips and nothing else. "Ready to play" and
       piano: on a held desk that track played its own part 25 ms early. The
       proper fix for a lane both played and played back is to read its
       whole timeline a wait behind the song, which reaches every walk of
-      the render; it is not built.) A lane moves in and out of the wait at
-      a record's start and end, at Play and at Stop, and the move glides
-      over 10 ms, the old read fading under the new one: a steady sound
-      passes without a step, while a sound struck in the last hold before
-      the move is skipped (into the wait) or heard twice, faded (out of
-      it), and a tone the two reads put out of phase dips through the fade.
+      the render; it is not built.) A lane moves out of the wait at a
+      record's start and at Stop, and back into it at a record's end and
+      at Play. A move glides over 10 ms, the old read fading under the new
+      one, and a steady sound passes without a step, but a tone the two
+      reads put out of phase dips through the fade (a DX7's A3 to about a
+      quarter of its level for 4 to 6 ms). Out of the wait, what the lane
+      made in the last hold before the move is skipped after its first
+      10 ms. Into it, that last hold is heard again, and what the lane makes
+      in the first 10 ms after the move is heard early as well, faded: on a
+      held desk a note an armed track plays just after a record ends while
+      the song plays, or just after a loop wraps back before the record's
+      start, is heard once early and faded, then on the beat. **Play does
+      not glide**: the lane takes its wait at once, its line emptied. A
+      glide there played the first 10 ms of the track's part at once,
+      faded, and again on the beat, a flam on the part's first note
+      whenever the track carried a plugin or was still ringing (a DX7 with
+      an EQ in its rack sounded its clip's note from frame 113 at 0.037 and
+      again at 1,310; a kit still ringing a pad played its clip's hit at
+      full level at once, and again 1,200 frames later). The part now starts
+      once, on the beat, and a note still ringing on the track when Play is
+      pressed drops out for the hold.
       A line that did not run in the chunk before (a kit between strikes,
       an instrument whose voices have ended) takes its new wait at once,
       so the first strike after a quiet move is heard once, where it
