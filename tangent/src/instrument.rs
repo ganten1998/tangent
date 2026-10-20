@@ -21176,25 +21176,29 @@ impl Renderer {
 
     /// **A grain stops at the block the next pedal edge lands in.**
     ///
-    /// The pedal is read as a LEVEL once per rendered span, at the span's
+    /// The pedal was read as a LEVEL once per rendered span, at the span's
     /// start, and applied to the instrument as state for the whole of it.
-    /// That is exact while a span is a callback. It is not once a span is a
-    /// GRAIN: an edge part way through one is applied up to a grain early
-    /// or late, and a press and release inside a single grain is never seen
-    /// at all. Measured on four Analog lanes with a held damper: 3.2 dBFS
-    /// of wrong audio, and a real take's pedal moves as fast as six
+    /// That was exact while a span was a callback. It was not once a span
+    /// was a GRAIN: an edge part way through one was applied up to a grain
+    /// early or late, and a press and release inside a single grain was
+    /// never seen at all. Measured on four Analog lanes with a held damper:
+    /// 3.2 dBFS of wrong audio, and a real take's pedal moves as fast as six
     /// milliseconds apart, which a 5 ms grain walks straight over.
     ///
     /// Stopping at the BLOCK the edge lands in rather than at the edge
-    /// itself is what keeps this bit-exact: the chunked desk reads the
-    /// pedal at that same frame, so the grained lane sees the same level
-    /// sequence rather than a better one. Never shorter than the span the
-    /// fold is owed, which bounds the worst case at exactly the
-    /// quantisation a chunked desk already has.
+    /// itself kept that bit-exact: the chunked desk read the pedal at that
+    /// same frame, so the grained lane saw the same level sequence rather
+    /// than a better one. Never shorter than the span the fold is owed,
+    /// which bounds the worst case at exactly the quantisation a chunked
+    /// desk had.
     ///
     /// The DX7 and the keyboard are told each edge on its own frame
-    /// (`Cue::Pedals`), wherever a span begins; the cut is the rack's, which
-    /// still reads the level at a span's head.
+    /// (`Cue::Pedals`), and so is a rack now (`rack_pedals`), wherever a span
+    /// begins, so the cut times no edge for any of them. What it still
+    /// decides is where a grained span ends, and so, on a lane whose voice
+    /// cuts its work on a grid of its own frames (the Analog,
+    /// `Rack::spans_free`), where that work falls: taking it out is a change
+    /// to measure, not a tidy-up.
     #[allow(clippy::too_many_arguments)]
     fn clip_pedal(
         &self,
