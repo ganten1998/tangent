@@ -22602,6 +22602,7 @@ impl Renderer {
                 lane_cues.clear();
                 if is_builtin || is_keys {
                     self.cue_pedals(lane, lane_gen, ch, spans, frames, armed, &mut lane_cues);
+                    let notes_from = lane_cues.len();
                     for (i, n) in lane_notes.iter().enumerate() {
                         let Ok(key) = u8::try_from(n.pitch) else {
                             continue;
@@ -22618,6 +22619,30 @@ impl Renderer {
                         } else {
                             Cue::Off { at, key }
                         });
+                    }
+                    // **An off the walk lists before a strike of its own key
+                    // is told no later than that strike**, so the sort keeps
+                    // it in front of the strike on the strike's frame. The
+                    // walk lists a held note's off ahead of the clips' notes
+                    // at the frame the note ends (the offs first), and a note
+                    // struck again on its key before that frame (two notes of
+                    // one pitch drawn across each other, a length that rounds
+                    // a frame past the next attack) came after it in time:
+                    // the strike re-keyed the pitch and the off behind it let
+                    // the new note up, on the DX7 at once and on the keyboard
+                    // with its damper. The overlap rule the walk keeps for a
+                    // note it still holds at the strike (the choke) is the
+                    // same rule: the old note ends where the new one begins.
+                    // Every note told at the stretch's head kept the list's
+                    // order, and so did this. One pass from the end, each
+                    // key's next strike on its way.
+                    let mut strike = [u32::MAX; 128];
+                    for cue in lane_cues[notes_from..].iter_mut().rev() {
+                        match cue {
+                            Cue::On { at, key, .. } if *key < 128 => strike[usize::from(*key)] = *at,
+                            Cue::Off { at, key } if *key < 128 => *at = (*at).min(strike[usize::from(*key)]),
+                            _ => {}
+                        }
                     }
                     sort_cues(&mut lane_cues);
                 }
@@ -62811,6 +62836,65 @@ mod strikes {
             let played = render(engine(inst, clip(&notes, &[])), how, until);
             assert!(first_sound(&played, PLAY).is_some(), "{inst:?}: the played take is silent");
             assert_same(&played, PLAY, &export, 0, PLAY, until, 0, &format!("{inst:?}: a note in the first grain after Play at {PLAY}, played against the export"));
+        }
+    }
+
+    /// **A key struck again while its last note still sounds lets that note
+    /// up at the strike, and the new note sounds whole**, as the walk's
+    /// overlap rule says (a pitch cannot start while it is already sounding).
+    /// C on key 60 from 23,000 for 1,000 frames and D on it from 23,800: D's
+    /// strike and C's due end both fall in the export's chunk from 23,552, C
+    /// struck in the chunk before; and the same with C running one frame past
+    /// D's strike. The walk lists C's off first, at C's own frame, and the
+    /// cues put it after D's strike in time, so the off let D up: the DX7
+    /// re-keys the pitch's voice at the strike, and in the export D fell
+    /// silent 200 frames in (its energy over 24,300 to 25,700 was 0 against
+    /// the rule's 17.1), and the keyboard damped it there (45.2 against
+    /// 63.2). Playback from 15,100 put the two frames in other stretches and
+    /// played D whole, so it disagreed with the file by a note; a frame apart
+    /// they share a stretch almost always, and every take cut D (the DX7 0,
+    /// the keyboard 39.5). Every take, the export's and playback's at every
+    /// buffer and look-ahead, is now the take with C drawn to end on D's
+    /// strike, to the bit, on both instruments. And sixteen repeated notes on
+    /// one key, each a frame longer than its step (a length that rounds past
+    /// the next attack), are the take of the same notes each ending on the
+    /// next one's strike: 15 of the 16 fell silent on the DX7 by 300 frames
+    /// after their strike, in the export and in playback.
+    #[test]
+    fn a_key_struck_again_before_its_note_ends_lets_it_up_at_the_strike() {
+        let energy = |v: &[f32], start: u64, from: u64, to: u64| -> f32 {
+            v[(from - start) as usize * 2..(to - start) as usize * 2].iter().map(|x| x * x).sum()
+        };
+        let mut hows = vec![EXPORT];
+        hows.extend(playbacks());
+        let until = N0 + 4_096;
+        for inst in BOTH {
+            for over in [200u64, 1] {
+                let notes = [(23_000, 800 + over, 60), (23_800, 2_000, 60)];
+                let drawn = [(23_000, 800, 60), (23_800, 2_000, 60)];
+                for how in &hows {
+                    let take = render(engine(inst, clip(&notes, &[])), *how, until);
+                    let rule = render(engine(inst, clip(&drawn, &[])), *how, until);
+                    let d = energy(&rule, how.start, 24_300, 25_700);
+                    assert!(d > 1.0, "{inst:?} {how:?}: fixture: D is silent in the rule's take too ({d:.3e})");
+                    assert_same(&take, how.start, &rule, how.start, how.start, until, 0, &format!("{inst:?}: C {over} frames past D's strike, {how:?}, against C let up at the strike"));
+                }
+            }
+            // Sixteen notes 1,111 frames apart from 20,000, each 1,112 long:
+            // every strike at another place in its chunk, and every one but
+            // the last let up a frame after the next strike.
+            let step = 1_111u64;
+            let long: Vec<(u64, u64, u8)> = (0..16).map(|i| (20_000 + i * step, step + 1, 60)).collect();
+            let mut drawn = long.clone();
+            for n in drawn.iter_mut().take(15) {
+                n.1 = step;
+            }
+            let until = 20_000 + 16 * step + 2_048;
+            for how in [EXPORT, How { buf: 256, grain_ms: -1.0, start: PLAY, pinned: false }, How { buf: 1024, grain_ms: 0.0, start: PLAY, pinned: false }, How { buf: 64, grain_ms: -1.0, start: PLAY, pinned: true }] {
+                let take = render(engine(inst, clip(&long, &[])), how, until);
+                let rule = render(engine(inst, clip(&drawn, &[])), how, until);
+                assert_same(&take, how.start, &rule, how.start, how.start, until, 0, &format!("{inst:?}: sixteen notes a frame past each next strike, {how:?}, against each let up at the next"));
+            }
         }
     }
 
