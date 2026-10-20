@@ -2905,7 +2905,7 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// **It comes up once on every new version** (`Settings::welcome_seen`), so
 /// its greeting names the version and its middle paragraph says what is new:
 /// `scripts/release.sh` refuses a release whose card greets another version.
-const WELCOME_LINES: [&str; 22] = [
+const WELCOME_LINES: [&str; 25] = [
     "Welcome to Tangent 5.3!",
     "",
     "Tangent is a DAW now. Record audio and MIDI,",
@@ -2913,9 +2913,12 @@ const WELCOME_LINES: [&str; 22] = [
     "with your own plugins or with the instruments",
     "and effects that come with it.",
     "",
-    "New lately: Tangent Tape is a tape machine,",
-    "a new session opens on a grand piano, and the",
-    "click and your takes stay in time on every desk.",
+    "What's new: Tangent Tape Rework - warm analog",
+    "tone, no frills, just results.",
+    "Tangent Keys Rework - A complete upgrade to the",
+    "modeling means a full suite of classic keyboard",
+    "sounds. Try them all, or mess around with the",
+    "bonus instrument: a Nylon Guitar.",
     "",
     "TAB moves between three views: the keyboard,",
     "the arrangement and the mixer. Hold 'H' for",
