@@ -5204,6 +5204,153 @@ enum Backend {
     /// ([`StrayPlugin`]). Appended, and absent from every build that ships.
     #[cfg(test)]
     Stray(StrayPlugin),
+    /// **A hosted plugin's stand-in that takes no block longer than the one
+    /// it was set up for**, for the tests alone. Every hosted plugin is set
+    /// up for a block of `MAX_BLOCK` frames (`Setup::max_block`), and a
+    /// VST3's `Instance::process` refuses a longer one before it delivers a
+    /// single event; so does this ([`CappedPlugin`]). It is an effect, a
+    /// one-pole low-pass, or an instrument, a sine on every key it is told,
+    /// held by the sustain pedal; both run sample by sample and take each
+    /// event on its own frame, so where its blocks are cut moves nothing it
+    /// plays. Appended, and absent from every build that ships.
+    #[cfg(test)]
+    Capped(CappedPlugin),
+}
+
+/// See [`Backend::Capped`]: the block it takes, what it plays, and what it
+/// was asked.
+#[cfg(test)]
+struct CappedPlugin {
+    /// The longest block it takes, as `Setup::max_block` says it.
+    max_block: usize,
+    /// What it was asked, read by the test that seated it.
+    asked: Arc<CappedAsked>,
+    /// The sample rate its keys are tuned at.
+    rate: f64,
+    /// The effect's state, per channel.
+    held: [f32; TAP_CHANNELS],
+    /// The instrument's keys: each one's level while it sounds (zero when it
+    /// does not), whether it is down, and its phase, in cycles.
+    level: [f32; 128],
+    down: [bool; 128],
+    phase: [f64; 128],
+    /// Whether the sustain pedal (CC 64) holds the keys let up.
+    sustain: bool,
+}
+
+/// What a [`CappedPlugin`] was asked: the blocks it refused, the longest
+/// block asked of it, and how many it played.
+#[cfg(test)]
+#[derive(Default)]
+struct CappedAsked {
+    refused: AtomicUsize,
+    longest: AtomicUsize,
+    played: AtomicUsize,
+}
+
+#[cfg(test)]
+impl CappedPlugin {
+    fn new(rate: f64, asked: Arc<CappedAsked>) -> Self {
+        Self {
+            max_block: MAX_BLOCK as usize,
+            asked,
+            rate,
+            held: [0.0; TAP_CHANNELS],
+            level: [0.0; 128],
+            down: [false; 128],
+            phase: [0.0; 128],
+            sustain: false,
+        }
+    }
+
+    /// The door `Instance::process` keeps: a block past the one it was set
+    /// up for is refused, and nothing in it is played or told.
+    fn ask(&self, frames: usize) -> Result<(), String> {
+        self.asked.longest.fetch_max(frames, Ordering::Relaxed);
+        if frames > self.max_block {
+            self.asked.refused.fetch_add(1, Ordering::Relaxed);
+            return Err(format!("asked for {frames} frames but the plugin was set up for {}", self.max_block));
+        }
+        self.asked.played.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn effect(&mut self, planar: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) -> Result<(), String> {
+        self.ask(frames)?;
+        for (c, (dst, src)) in out.iter_mut().zip(planar).enumerate().take(TAP_CHANNELS) {
+            for f in 0..frames.min(dst.len()).min(src.len()) {
+                self.held[c] += 0.25 * (src[f] - self.held[c]);
+                dst[f] = self.held[c];
+            }
+        }
+        Ok(())
+    }
+
+    /// One event, at its frame: a key struck sounds from its first frame, a
+    /// key let up stops unless the pedal holds it, the pedal let up stops
+    /// every key it held.
+    fn tell(&mut self, note: Option<&Note>, control: Option<&Control>) {
+        if let Some(n) = note {
+            let Ok(k) = usize::try_from(n.pitch) else { return };
+            if k >= 128 {
+                return;
+            }
+            if n.on {
+                self.level[k] = 0.1 * n.velocity.clamp(0.0, 1.0);
+                self.phase[k] = 0.0;
+                self.down[k] = true;
+            } else {
+                self.down[k] = false;
+                if !self.sustain {
+                    self.level[k] = 0.0;
+                }
+            }
+        }
+        if let Some(c) = control.filter(|c| c.controller == Control::SUSTAIN) {
+            self.sustain = c.value >= 64;
+            if !self.sustain {
+                for k in 0..128 {
+                    if !self.down[k] {
+                        self.level[k] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn voice(&mut self, notes: &[Note], controls: &[Control], frames: usize, bufs: &mut [Vec<f32>]) -> Result<(), String> {
+        self.ask(frames)?;
+        // Every event in time order, the notes before the controls on one
+        // frame and each kind in the order it was handed over, as the
+        // built-in voices take them (`AnalogUnit::process_voice`); an offset
+        // past the block is told on its last frame.
+        let last = frames.saturating_sub(1) as i32;
+        let mut events: Vec<(i32, usize)> = (0..notes.len() + controls.len())
+            .map(|i| (notes.get(i).map_or_else(|| controls[i - notes.len()].offset, |n| n.offset).clamp(0, last), i))
+            .collect();
+        events.sort_by_key(|e| *e);
+        let mut next = 0;
+        for f in 0..frames {
+            while let Some(&(_, i)) = events.get(next).filter(|e| e.0 as usize <= f) {
+                self.tell(notes.get(i), i.checked_sub(notes.len()).and_then(|j| controls.get(j)));
+                next += 1;
+            }
+            let mut s = 0.0f32;
+            for k in 0..128 {
+                if self.level[k] > 0.0 {
+                    s += self.level[k] * (self.phase[k] * std::f64::consts::TAU).sin() as f32;
+                    let hz = 440.0 * ((k as f64 - 69.0) / 12.0).exp2();
+                    self.phase[k] = (self.phase[k] + hz / self.rate).fract();
+                }
+            }
+            for b in bufs.iter_mut() {
+                if let Some(x) = b.get_mut(f) {
+                    *x = s;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// See [`Backend::Stray`]: the one bad sample, and where it lands.
@@ -5348,6 +5495,8 @@ impl Backend {
                 }
                 Ok(())
             }
+            #[cfg(test)]
+            Backend::Capped(plugin) => plugin.voice(notes, controls, frames, bufs),
         }
     }
 
@@ -5369,6 +5518,8 @@ impl Backend {
             Backend::Builtin(unit) => Some(unit.latency()),
             #[cfg(test)]
             Backend::Stray(_) => Some(0),
+            #[cfg(test)]
+            Backend::Capped(_) => Some(0),
         }
     }
 
@@ -5438,6 +5589,8 @@ impl Backend {
                 plugin.process(planar, frames, out);
                 Ok(())
             }
+            #[cfg(test)]
+            Backend::Capped(plugin) => plugin.effect(planar, frames, out),
         }
     }
 }
@@ -8360,18 +8513,20 @@ impl LaneScratch {
     }
 }
 
-/// **The longest span the grain clock hands a lane**: a look-ahead grain is
-/// a block at most, and its end is pushed out to the next [`GRAIN_GRID`]
-/// line (`Renderer::to_grid`), up to `GRAIN_GRID - 1` frames past it. The
-/// DX7's and the keyboard's scratches are this long, so they render every
-/// span they are handed. They were a block long, and a span past it found no
-/// room and rendered nothing: its instrument silent for it and its clock
-/// stalled by it. A grain begins off the grid wherever Play was pressed off
-/// it and wherever the clock cut the grain before at a clip's pedal edge
-/// (`Renderer::clip_pedal`): measured, 516 silent frames after a pedal edge
-/// under a held note, playing at 256 frames with the look-ahead on AUTO from
-/// 15,100, on both instruments.
-const MAX_SPAN: usize = MAX_BLOCK as usize + GRAIN_GRID as usize;
+/// **The longest span the grain clock hands a lane**: a block. A look-ahead
+/// grain is a block at most, and its end goes out to the next
+/// [`GRAIN_GRID`] line, or back to the one before it where out would pass a
+/// block (`Renderer::to_grid`). The DX7's and the keyboard's scratches are
+/// this long, so they render every span they are handed. Out to the grid
+/// once passed a block by up to `GRAIN_GRID - 1` frames, wherever a grain
+/// began off the grid (Play pressed off it, the clock's cut at a clip's
+/// pedal edge, `Renderer::clip_pedal`), and a span past the scratches found
+/// no room and rendered nothing: its instrument silent for it and its clock
+/// stalled by it, measured as 516 silent frames after a pedal edge under a
+/// held note, playing at 256 frames with the look-ahead on AUTO from 15,100,
+/// on both instruments. The scratches were made that much longer for it;
+/// the grain no longer passes a block, as no hosted plugin takes one past it.
+const MAX_SPAN: usize = MAX_BLOCK as usize;
 
 /// **What the render pass leaves the fold to read.**
 ///
@@ -10237,7 +10392,9 @@ const GRAIN_SLOTS: usize = 3;
 /// rounding the grain's END up to the grid costs 16 frames of look-ahead
 /// and makes the whole thing bit-exact again. The knob keeps saying 5 ms
 /// because 5 ms is what it asks for; what it lands on is the next grid
-/// line after it.
+/// line after it. **Or the last one inside a block**, where the next would
+/// pass one: no span is longer than every plugin is set up for
+/// (`Renderer::to_grid`).
 ///
 /// A boundary the LOOP cuts short is the one exception, and it is left
 /// alone: a grain may not cross `loop_b` under any circumstances, so the
@@ -20990,17 +21147,51 @@ impl Renderer {
         len.min(usize::try_from(block - from).unwrap_or(len)).max(need)
     }
 
-    /// **Push a grain's end out to the next [`GRAIN_GRID`] line.**
+    /// **Push a grain's end out to the next [`GRAIN_GRID`] line, or back to
+    /// the one before it where out would pass a block.**
     ///
-    /// Lengthening only, so a span that has to cover `need` still covers
-    /// it, and the loop clip still gets the last word.
+    /// Out, so a span that has to cover `need` still covers it, and the loop
+    /// clip still gets the last word.
+    ///
+    /// **Never past a block** (`MAX_BLOCK`). Every hosted plugin is set up
+    /// for a block of that many frames (`Setup::max_block`) and refuses a
+    /// longer one before it is told a single event (`Instance::process`), and
+    /// out to the grid passed it whenever a grain of a block began off the
+    /// grid: Play pressed off it, a locate or a loop's wrap landing off it, a
+    /// loop's end falling off it, with a grain past 481 frames: the
+    /// look-ahead on AUTO at every buffer from 61 frames to 511 (64, 128 and
+    /// 256 among them), or set past 10 ms at 48 kHz. The first grain after
+    /// such a start ran to 516 frames from 15,100 and 543 from 15,105, a
+    /// wrap's to 529 and 536, a locate's to 520. Measured on a stand-in that
+    /// refuses as a hosted plugin does (`Backend::Capped`), at 256 frames on
+    /// AUTO: from 15,100 a hosted effect over a tone played the first 516
+    /// frames dry, to the bit, and its state, which had not run, took 62
+    /// frames more to come back; a hosted instrument was silent for them, and
+    /// a key struck 200 frames after Play never sounded, its note's 3,000
+    /// frames missing; and over a loop whose end is off the grid, a note held
+    /// across the wrap was never let up and rang on through the next lap
+    /// where the take with the look-ahead off is silent. Back to the line
+    /// inside the block keeps the end on the grid, so the next grain begins
+    /// on it and is a whole block; it moves no grain that was a block or
+    /// less, so a desk whose grains never passed a block renders what it did.
+    ///
+    /// **The motor's way back is the one road past it** (`regrain_turns`):
+    /// a turn runs to an end of the clock's ring as far as a grain and the
+    /// grid's 31 frames, and it is given only to a lane whose every bay is
+    /// one of Tangent's own effects (`Rack::spans_free`), which takes a block
+    /// of any length through its scratch (`run_planar`), never a DX7, a
+    /// keyboard or a hosted plugin. Held to a block, a desk of one phase at
+    /// 333 frames stayed held for 50 passes at speed, past the two turns a
+    /// lane its test allows.
     fn to_grid(from: u64, len: usize) -> usize {
         let end = from + len as u64;
         let over = end % GRAIN_GRID;
         if over == 0 {
             len
-        } else {
+        } else if len + (GRAIN_GRID - over) as usize <= MAX_BLOCK as usize {
             len + (GRAIN_GRID - over) as usize
+        } else {
+            len - over as usize
         }
     }
 
@@ -62611,8 +62802,10 @@ mod tape_motor {
     /// While the tape changes speed the lanes render their chunks and hold
     /// nothing ahead, so the first block at rest after a start found every
     /// ring cold and rendered a whole grain on every lane at once: here
-    /// sixteen lanes' grains, 8192 frames and more, in one block where one
-    /// at rest renders 1024, the dearest block of every start. Three desks
+    /// sixteen lanes' grains, 8192 frames, in one block where one at rest
+    /// renders 1024, the dearest block of every start (from a playhead off
+    /// the grain grid each grain ends at the grid line inside its block, a
+    /// line less a lane at the most: 7,984 frames). Three desks
     /// play side by side from parked, through the dip and the start and on
     /// at speed: the way back's; the same desk with it shut, which renders
     /// that whole grain; and the desk with the grain off. All three play the
@@ -62672,7 +62865,7 @@ mod tape_motor {
             assert!(at_rest.len() > 200, "{what}: only {} passes at speed, so little was proved", at_rest.len());
             let shut_first = shut_first.unwrap_or(0);
             assert!(
-                shut_first >= BACK_LANES * BACK_GRAIN,
+                shut_first >= BACK_LANES * (BACK_GRAIN + 1 - crate::analog::voice::CHUNK),
                 "{what}: without the way back the first block at rest rendered {shut_first} lane-frames, not every lane's grain"
             );
             assert!(at_rest[0].2, "{what}: the way back held no lane in the first block at rest");
@@ -63723,16 +63916,19 @@ mod strikes {
         }
     }
 
-    /// **A grain longer than a block is played whole.** Play pressed at
-    /// 15,100, off the 32-frame grid, with the look-ahead on AUTO at a
-    /// 256-frame buffer: the first grain runs to the grid line past a block
-    /// on, 516 frames, and a note struck 100 frames into it. The instruments'
-    /// scratches were a block long, so the lane rendered nothing for that
-    /// grain, its instrument's clock stalled 516 frames behind the song, and
-    /// the take was silent where the export sounds (`MAX_SPAN`). Now the
-    /// played take is the export's, to the bit, on both.
+    /// **The first grain after Play off the grid is played whole.** Play
+    /// pressed at 15,100, off the 32-frame grid, with the look-ahead on AUTO
+    /// at a 256-frame buffer, and a note struck 100 frames into the first
+    /// grain. That grain ran to the grid line past a block on, 516 frames,
+    /// and the instruments' scratches were a block long, so the lane rendered
+    /// nothing for it, its instrument's clock stalled 516 frames behind the
+    /// song, and the take was silent where the export sounds; the scratches
+    /// were made longer for it, and the grain now ends at the grid line
+    /// inside the block, 484 frames, as no plugin takes a longer one
+    /// (`MAX_SPAN`, `Renderer::to_grid`). The played take is the export's, to
+    /// the bit, on both.
     #[test]
-    fn a_grain_longer_than_a_block_is_played_whole() {
+    fn the_first_grain_after_play_off_the_grid_is_played_whole() {
         let notes = [(PLAY + 100, 9_000, 60)];
         let until = PLAY + 4_096;
         let how = How { buf: 256, grain_ms: -1.0, start: PLAY, pinned: false };
@@ -64052,8 +64248,13 @@ mod strikes {
     /// takes at the commit before the cues (9e9b1df2), in an export, in
     /// playback at 256 frames with the look-ahead on AUTO from 15,100 and at
     /// 64 with it off from 1,100, and listening at 256 with a live key and a
-    /// live pedal 100 frames into a callback. aarch64 macOS only, like the
-    /// goldens.
+    /// live pedal 100 frames into a callback. But the Analog's playback from
+    /// 15,100: its first grain ran out to the grid line past a block, 516
+    /// frames, and ends at the line inside it now, 484 (`Renderer::to_grid`),
+    /// and the Analog draws its wander on its own frames, so the take moved;
+    /// the engine before that rendered the new hash to the bit with the
+    /// look-ahead at 484 frames, which hands out the same spans. aarch64
+    /// macOS only, like the goldens.
     #[test]
     #[cfg_attr(
         not(all(target_arch = "aarch64", target_os = "macos")),
@@ -64062,7 +64263,7 @@ mod strikes {
     fn the_analog_the_sampler_and_the_kit_render_what_they_did() {
         let takes: [(Other, &str, usize, f64, u64, bool, Option<(usize, u8)>, &str); 12] = [
             (Other::Analog, "export", 1024, 0.0, 0, false, None, "72d979ef73b84e07"),
-            (Other::Analog, "playback 256 AUTO from 15,100", 256, -1.0, 15_100, false, None, "c05019dfb64617db"),
+            (Other::Analog, "playback 256 AUTO from 15,100", 256, -1.0, 15_100, false, None, "a338621cb9e5ddd9"),
             (Other::Analog, "playback 64 off from 1,100", 64, 0.0, 1_100, false, None, "9c01fac2aa252751"),
             (Other::Analog, "listening 256, a live key 100 frames into call 30", 256, -1.0, 15_100, true, Some((30, 100)), "d0151dd86973d3a8"),
             (Other::Sampler, "export", 1024, 0.0, 0, false, None, "f0516660fc2a84d7"),
@@ -64082,5 +64283,301 @@ mod strikes {
             })
             .collect();
         assert!(moved.is_empty(), "these takes are not what they were:\n{}", moved.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod grain_blocks {
+    //! **No lane is handed a span longer than a block** (`Renderer::to_grid`),
+    //! and so a hosted plugin, which takes no longer block than the one it
+    //! was set up for, plays every span of the look-ahead.
+    use super::*;
+
+    /// The lane the plugin is on.
+    const L: usize = 2;
+    /// Where playback is started: 28 frames past a line of the grain grid.
+    const PLAY: u64 = 15_100;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Seat {
+        Effect,
+        Instrument,
+    }
+
+    /// A tone on lane `L` for the whole take.
+    fn tone() -> Placed {
+        let frames = 4 * 48_000usize;
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let x = ((i as f64) * std::f64::consts::TAU * 330.0 / 48_000.0).sin() as f32 * 0.25;
+                [x, x * 0.8]
+            })
+            .collect();
+        let clip = Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::from("tone.wav") });
+        Placed { clip, strip: L, start: 0, offset: 0, len: frames as u64, fade_in: 0, fade_out: 0, gain: 1.0 }
+    }
+
+    /// A part on lane `L` from 0:00: notes `(at, dur, key)`, pedal edges
+    /// `(at, cc, value)`.
+    fn part(notes: &[(u64, u64, u8)], pedal: &[(u64, u8, u8)]) -> PlacedMidi {
+        PlacedMidi {
+            strip: L,
+            start: 0,
+            len: 4 * 48_000,
+            notes: Arc::new(notes.iter().map(|&(at, dur, key)| ClipNote { at, dur, key, vel: 110 }).collect()),
+            pedal: Arc::new(pedal.iter().map(|&(at, cc, value)| ClipPedal { at, cc, value }).collect()),
+        }
+    }
+
+    /// A desk with the hosted stand-in in the first bay of lane `L`'s own
+    /// rack, over a tone or playing a part.
+    fn engine(seat: Seat, asked: &Arc<CappedAsked>, part_of: Option<PlacedMidi>) -> Engine {
+        let mut e = crate::render_golden::offline();
+        e.set_channel_gain(L, 1.0);
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        let r = e.offline.as_mut().expect("a renderer");
+        r.lane_body_mut(L).chains[CHAIN_OWN].slots[0] = PluginBox(Some(Box::new(Hosted {
+            backend: Backend::Capped(CappedPlugin::new(48_000.0, asked.clone())),
+            bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            channels: TAP_CHANNELS,
+            voice: seat == Seat::Instrument,
+            align: None,
+        })));
+        match seat {
+            Seat::Effect => e.set_clips(vec![tone()]),
+            Seat::Instrument => e.set_midi_clips(vec![part_of.unwrap_or_else(|| part(&[], &[]))]),
+        }
+        e
+    }
+
+    /// Song frames `[start, until)` of the speakers, rolled at `buf`-frame
+    /// callbacks with the look-ahead at `grain_ms` (0 off, -1 AUTO), with
+    /// `at_call` run before each callback.
+    fn take(mut e: Engine, buf: usize, grain_ms: f64, start: u64, until: u64, at_call: &dyn Fn(&mut Engine, usize)) -> Vec<f32> {
+        e.set_grain_ms(grain_ms);
+        let mut out = vec![0.0f32; buf * 2];
+        e.set_rolling(false);
+        for _ in 0..(8 * 512 / buf).max(8) {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_transport(1, start);
+        e.set_rolling(true);
+        let frames = (until - start) as usize;
+        let mut heard = Vec::with_capacity(frames * 2 + buf * 2);
+        let mut call = 0usize;
+        while heard.len() < frames * 2 {
+            at_call(&mut e, call);
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard.extend_from_slice(&out);
+            call += 1;
+        }
+        heard.truncate(frames * 2);
+        heard
+    }
+
+    /// The shapes whose first grain passed a block when its end went out to
+    /// the grid alone: Play off the grid at every buffer AUTO makes a grain
+    /// of a block at, and at two grains set past 10 ms; and from on it, a
+    /// loop whose end or head is off it, and a locate off it.
+    fn long_shapes() -> Vec<(String, usize, f64, u64, Option<(u64, u64)>, bool)> {
+        let mut shapes = Vec::new();
+        for buf in [64usize, 128, 256, 448, 480] {
+            for start in [PLAY, PLAY + 5] {
+                shapes.push((format!("AUTO at {buf} from {start}"), buf, -1.0, start, None, false));
+            }
+        }
+        for ms in [10.6667f64, 20.0] {
+            shapes.push((format!("{ms} ms at 256 from {PLAY}"), 256, ms, PLAY, None, false));
+        }
+        for (a, b) in [(0u64, 30_001u64), (100, 30_000)] {
+            shapes.push((format!("AUTO at 256 from 15,104, looping [{a}, {b})"), 256, -1.0, 15_104, Some((a, b)), false));
+        }
+        shapes.push(("AUTO at 256 from 15,104, a locate to 31,000".to_owned(), 256, -1.0, 15_104, None, true));
+        shapes
+    }
+
+    /// **A grain ends on the grid and never past a block.** Over every place
+    /// a grain can begin against the grid and every length up to a block,
+    /// `to_grid` lands on a grid line, never more than a block from where it
+    /// began; and it is what out to the grid always gave wherever that was a
+    /// block or less, and one line back from it wherever that passed a block
+    /// (by up to 31 frames: a grain of 512 frames begun 28 past a line ran to
+    /// 516, one begun a frame past it to 543).
+    #[test]
+    fn a_grain_ends_on_the_grid_and_never_past_a_block() {
+        let block = MAX_BLOCK as usize;
+        let out = |from: u64, len: usize| {
+            let over = (from + len as u64) % GRAIN_GRID;
+            if over == 0 { len } else { len + (GRAIN_GRID - over) as usize }
+        };
+        let mut moved = 0;
+        for from in 0..2 * GRAIN_GRID {
+            for len in 0..=block {
+                let got = Renderer::to_grid(from, len);
+                assert!(got <= block, "a grain of {len} from {from} runs {got} frames, past a block");
+                assert_eq!((from + got as u64) % GRAIN_GRID, 0, "a grain of {len} from {from} ends off the grid");
+                let was = out(from, len);
+                if was <= block {
+                    assert_eq!(got, was, "a grain of {len} from {from} that never passed a block moved");
+                } else {
+                    assert_eq!(got, was - GRAIN_GRID as usize, "a grain of {len} from {from} is not cut back to the line inside the block");
+                    moved += 1;
+                }
+            }
+        }
+        assert!(moved > 0, "no grain passed a block, so nothing was proved");
+    }
+
+    /// **No lane is handed a span longer than a block, so a hosted plugin
+    /// refuses none.** On the shapes whose first grain ran past a block, out
+    /// to the grid alone (`long_shapes`: 516 frames from 15,100, 543 from
+    /// 15,105, 529 and 536 at a loop's wrap, 520 after a locate), a hosted
+    /// effect and a hosted instrument stand-in that refuse a block longer
+    /// than the one they were set up for (`Backend::Capped`), as a VST3 does,
+    /// are asked for a block at most and refuse nothing.
+    #[test]
+    fn no_lane_is_handed_a_span_longer_than_a_block() {
+        for seat in [Seat::Effect, Seat::Instrument] {
+            for (what, buf, grain_ms, start, looped, locate) in long_shapes() {
+                let asked = Arc::new(CappedAsked::default());
+                let e = engine(seat, &asked, Some(part(&[(16_000, 2_000, 60)], &[])));
+                if let Some((a, b)) = looped {
+                    e.set_loop(a, b);
+                }
+                let at_call = move |e: &mut Engine, call: usize| {
+                    if locate && call == 40 {
+                        e.set_transport(2, 31_000);
+                    }
+                };
+                let _ = take(e, buf, grain_ms, start, start + 60_000, &at_call);
+                let (longest, refused, played) = (
+                    asked.longest.load(Ordering::Relaxed),
+                    asked.refused.load(Ordering::Relaxed),
+                    asked.played.load(Ordering::Relaxed),
+                );
+                assert!(played > 0, "{seat:?}, {what}: the plugin was never played, so nothing was proved");
+                assert!(longest <= MAX_BLOCK as usize, "{seat:?}, {what}: the lane was handed {longest} frames, past a block");
+                assert_eq!(refused, 0, "{seat:?}, {what}: the plugin refused {refused} blocks");
+            }
+        }
+    }
+
+    /// **A hosted effect and a hosted instrument play every span of the
+    /// look-ahead**: their takes at 256 frames on AUTO are their takes with
+    /// the look-ahead off, to the bit. From 15,100, the first grain ran 516
+    /// frames and the stand-ins (`Backend::Capped`) refused it as a VST3
+    /// refuses a block past the one it was set up for: the effect over a
+    /// tone played those 516 frames dry, to the bit, and its state took 62
+    /// frames more to come back (0.173 at worst, the tone at 0.25); the
+    /// instrument was silent for them, and a key struck 200 frames after Play
+    /// never sounded, its 3,000 frames missing. From 15,104 over a loop whose
+    /// end is off the grid, [0, 30,001), the grain after the wrap was refused
+    /// and with it the off the wrap owes a note held across it, which then
+    /// rang on through the next lap where the take with the look-ahead off is
+    /// silent (an energy of 145.3 against 0 over the 19,600 frames after it).
+    #[test]
+    fn a_hosted_effect_and_instrument_play_every_span_of_the_look_ahead() {
+        let none = |_: &mut Engine, _: usize| {};
+        let notes = [(14_000u64, 1_300u64, 60u8), (15_300, 3_000, 64), (16_000, 3_000, 67)];
+        let cases: [(&str, Seat, Option<PlacedMidi>, u64, Option<(u64, u64)>, u64); 3] = [
+            ("the effect over a tone from 15,100", Seat::Effect, None, PLAY, None, 8_192),
+            ("the instrument from 15,100", Seat::Instrument, Some(part(&notes, &[])), PLAY, None, 8_192),
+            ("the instrument over a loop of [0, 30,001) from 15,104", Seat::Instrument, Some(part(&[(25_000, 10_000, 60)], &[])), 15_104, Some((0, 30_001)), 60_000),
+        ];
+        for (what, seat, part_of, start, looped, frames) in cases {
+            let render = |grain_ms: f64| {
+                let asked = Arc::new(CappedAsked::default());
+                let e = engine(seat, &asked, part_of.clone());
+                if let Some((a, b)) = looped {
+                    e.set_loop(a, b);
+                }
+                let heard = take(e, 256, grain_ms, start, start + frames, &none);
+                (heard, asked.refused.load(Ordering::Relaxed))
+            };
+            let (grained, refused) = render(-1.0);
+            let (chunked, _) = render(0.0);
+            assert!(chunked.iter().any(|x| *x != 0.0), "{what}: the take is silent, so nothing was proved");
+            assert_eq!(refused, 0, "{what}: the plugin refused {refused} blocks of the look-ahead");
+            if let Some(i) = grained.iter().zip(&chunked).position(|(x, y)| x.to_bits() != y.to_bits()) {
+                panic!("{what}: the take on AUTO first differs from the take with the look-ahead off at frame {}", start + (i / 2) as u64);
+            }
+        }
+    }
+
+    /// **A grain begun off the grid grows nothing on the callback.** Each
+    /// lane renders a span into buffers made a block long; a span past a
+    /// block grew them there, an allocation on the callback the first time
+    /// one came, and a locate off the grid with the look-ahead on AUTO took
+    /// it on every desk: 4 on a lane through a plate, 6 on an Analog lane
+    /// and 2 on a DX7 lane, at 128 and 256 frames alike. Each desk rolls
+    /// from 0:00, stops, rolls again, locates to 31,000, stops and rolls
+    /// from 5,000, all off the grid but the first, and allocates nothing on
+    /// the callback past its first roll.
+    #[test]
+    fn a_grain_begun_off_the_grid_grows_nothing_on_the_callback() {
+        use crate::rt_alloc::count_allocs;
+        let notes: Vec<(u64, u64, u8)> = (0..60).map(|i| (i * 1_000 + 300, 700, 60 + (i % 12) as u8)).collect();
+        for what in ["a plate", "the Analog", "the DX7"] {
+            for buf in [128usize, 256] {
+                let mut e = crate::render_golden::offline();
+                e.set_channel_gain(L, 1.0);
+                match what {
+                    "a plate" => {
+                        e.load_insert(L, 0, Some(Path::new(crate::builtin_fx::PLATE_PATH)), None).expect("the plate loads").expect("and seats");
+                        e.set_clips(vec![tone()]);
+                    }
+                    "the Analog" => {
+                        e.load_insert(L, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None).expect("the Analog loads").expect("and seats");
+                        e.set_midi_clips(vec![part(&notes, &[])]);
+                    }
+                    _ => {
+                        e.set_builtin_strips(1 << L);
+                        let _ = e.sync_instrument_lanes(1 << L, 0);
+                        e.set_midi_clips(vec![part(&notes, &[])]);
+                    }
+                }
+                e.set_grain_ms(-1.0);
+                let mut out = vec![0.0f32; buf * 2];
+                for _ in 0..16 * 512 / buf {
+                    e.render_offline(&mut out);
+                }
+                // The callback's own thread: the engine renders on no hand,
+                // and other tests' hands count into the shared figure.
+                let mut go = |e: &mut Engine, frames: usize| {
+                    count_allocs(|| {
+                        let mut done = 0;
+                        while done < frames {
+                            e.render_offline(&mut out);
+                            done += buf;
+                        }
+                    })
+                    .1
+                    .here
+                };
+                // The first roll, from 0:00 on the grid: whatever a first use
+                // buys is bought here.
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let _ = go(&mut e, 30_000);
+                e.set_rolling(false);
+                let mut phases = vec![("a stop", go(&mut e, 10_000))];
+                e.set_transport(2, 0);
+                e.set_rolling(true);
+                phases.push(("Play from 0:00", go(&mut e, 20_000)));
+                e.set_transport(3, 31_000);
+                phases.push(("a locate to 31,000", go(&mut e, 10_000)));
+                e.set_rolling(false);
+                phases.push(("a stop", go(&mut e, 10_000)));
+                e.set_transport(4, 5_000);
+                e.set_rolling(true);
+                phases.push(("Play from 5,000", go(&mut e, 10_000)));
+                for (phase, n) in phases {
+                    assert_eq!(n, 0, "{what} at {buf} frames: {phase} allocated {n} times on the callback");
+                }
+            }
+        }
     }
 }
