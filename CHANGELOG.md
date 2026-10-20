@@ -9,8 +9,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-10-20
+
 ### Changed
 
+- **The welcome card comes up once on every new version.** It opened only
+  until its "Don't show this again" box was ticked, so nobody who had
+  ticked it would read what a new version brings. Each new version now
+  opens it once, its box as it stands, and the box hides it until the next
+  version. It greets 5.3 and says what is new lately.
 - **A fresh Tape's studio head is brighter than in 5.2.0**, because it now
   keeps its top octave (see Fixed below): white noise through it comes out
   0.4 dB brighter at 10 kHz, 0.9 dB at 12.5 kHz and 1.9 dB at 16 kHz at
@@ -28,10 +35,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Tape costs about half the processor time it did in 5.2.0.** The record
   stage, about three quarters of the cost, now works through each block a
   chunk at a time with its filters' outputs side by side. Measured on a
-  quiet machine, sixteen Tapes cost 188 to 192 microseconds a 128-frame
-  block at 48 kHz, about 12 an insert, where 5.2.0's cost 366 to 403, 23 to
-  25 an insert, and one Tape at its defaults costs about 10 microseconds a
-  block where 5.2.0's cost about 22, well inside the 16 its design allowed.
+  quiet machine, sixteen Tapes cost 181 to 184 microseconds a 128-frame
+  block at 48 kHz, about 11 an insert, where 5.2.0's cost 366 to 403, 23 to
+  25 an insert, and one Tape at its defaults costs 9.7 microseconds a block
+  where 5.2.0's cost about 22, well inside the 16 its design allowed.
   The faster record stage keeps every output's arithmetic, so it changes
   nothing the Tape plays, bit for bit (checked on 1408 renders across every
   control, sample rate, block size and channel layout, on Apple silicon and
@@ -39,6 +46,164 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **While you track with monitoring on, the speakers play the plugins
+  across the master.** As soon as an audio input was armed, the speakers
+  dropped every plugin on the master while the take kept them, so a -12 dB
+  trim on the master sounded 12 dB louder in the speakers than in the take,
+  and a Tape across the master was not heard at all while you tracked. With
+  monitoring on, the speakers now play the master's whole chain exactly as
+  the take does, every plugin on both of its racks, so you hear a Tape or an
+  IR across the master while you play. Only the limiter's lookahead stays
+  out of the speakers. The song and your own playing then come as late as
+  those plugins hold the mix (see Known). The click, a count-in's go and
+  where a recorded part is placed wait with them, so the click stays on the
+  music's beat and a part you record onto a track, played to what you
+  heard, is placed on that beat.
+- **A balance curve on the master moves the speakers as well as the take
+  while you track.** The speakers' own mix took the master's fader but never
+  its balance, so while an audio input was armed, monitored or not, a
+  balance curve off centre panned the take and left the speakers centred:
+  with the balance halfway to the left, a tone at 0.25 played at 0.33 on the
+  left and 0.14 on the right in the take, and at 0.25 on both sides in the
+  speakers. The speakers now take the master's balance exactly as the take
+  does.
+- **Arming or disarming an audio track with monitoring on while the song
+  plays no longer clicks in the speakers.** The speakers jumped between the
+  take's mix and their own, by up to 0.22 on a tone at 0.25 with a trim and
+  an IR across the master, and by up to 0.3 when a disarm with monitoring
+  off finished fading the input out. They now crossfade over 10 ms, and the
+  click crossfades with them, so it stays on the music's beat. A disarm with
+  monitoring off, turning monitoring off or on, and muting the armed track
+  crossfade the same way.
+- **The click's effects stay whole in the take.** With an effect on the
+  click and the click (or its count-in) recorded into the take, the take cut
+  the effect off where the dry click ended, 54 ms after each beat, so a
+  reverb on the click was gated in the file while the speakers played it
+  whole. The take's click now matches the speakers' on every sample it
+  carries.
+- **The click is heard on the beat of the music on a desk that delay
+  compensation holds back.** Every track waits for the longest delay a
+  plugin reports, and the master's own plugins and its limiter hold the mix
+  back further on its way out. The click was never held, so it played ahead
+  of the music by all of that: 25 ms (1,200 samples at 48 kHz) with a Tape
+  in its deep wow range anywhere on the desk, 2 ms in the studio range,
+  about 11 ms with an IR loaded, and 1.2 ms more with the limiter in
+  circuit. It is now held to the music in the speakers, and in the take
+  when it is recorded into it, with its count-in, its reverb send and its
+  sends to buses. On every desk measured (a Tape in either range or an IR
+  on a track, an IR across the master, the limiter in circuit, all of them
+  at once), the click's attack now falls exactly where it does on an empty
+  desk, 30 samples after the beat; with a deep-range Tape it fell 1,170
+  samples ahead of it. With tape start and stop on, the song's click still
+  waits for the tape to reach speed, and a Stop's coast still clicks
+  nothing. The click still never holds the music back.
+- **A recorded part lands on the beat it was played to on a desk that delay
+  compensation holds back.** A part played in time with the backing used to
+  be placed with nothing taken off for the hold, so it landed late by it:
+  25 ms with a deep-range Tape, 2 ms in the studio range, about 11 ms with
+  an IR. Audio and MIDI are now both placed against what the player heard:
+  an impulse played into an armed input exactly when the backing's beat was
+  heard lands on that beat, to the sample, on every desk measured. A record
+  started from a stopped transport no longer lands late by the moment
+  between pressing record and the song starting. What was played in that
+  moment stands before the record's start, and nothing is placed before
+  0:00, so a take recorded from the top starts at 0:00 with that moment
+  trimmed. The interface's own latency (its buffers and converters) is not
+  taken off, as before.
+- **A record or a Play that waits on a count-in starts on the count's last
+  click.** The song used to start a screen refresh or two after the count's
+  go, so the backing's first beat came that much after it. A record begun
+  on the go lost what was played before it opened (up to a refresh, about
+  20 ms, of the first note), and often lost a MIDI note played on the go
+  altogether. The song now starts on the go itself and the take begins on
+  it, so a part played on the go is kept whole and lands on the record's
+  start, on any desk and at any buffer size.
+- **An armed instrument track answers your keys at once on a desk that
+  delay compensation holds back, and its own part stays on the beat.** It
+  waited with the rest of the mix, so with a Tape in its deep wow range on
+  another track a key played into an armed DX7 sounded 1,310 frames after
+  it was pressed instead of 110 (25 ms late at 48 kHz), and a pad on an
+  armed drum track 1,200 frames late. Such a track now plays its own part
+  that hold behind the song and waits for nothing on its way out but the
+  plugins across the master (see Known), whether the song is playing,
+  stopped or recording. Its notes, its sustain pedal,
+  and the position, transport and automation its plugins are given all move
+  with its part, so the part lands with the mix in the speakers and in the
+  take, through loops, locates, punch-ins, a count-in's downbeat, the
+  varispeed dial and tape start and stop, and a DX7, Tangent Keys or a kit
+  on it renders exactly what the same track renders unarmed. Arming one
+  while it sounds crossfades once, over 10 ms. A track that only listens,
+  such as the one open in the MIDI editor, plays in time with the mix, and
+  exports, freezes and bounces are unchanged. A few kinds of track still
+  wait while the song plays them back (see Known).
+- **Short drum hits and the ends of notes are heard on a desk that delay
+  compensation holds back.** A kit's compensation stopped the moment its
+  pads went quiet, and a built-in instrument's the moment its last note
+  ended. Whatever was still on its way was held until the next hit or note
+  and played ahead of it. With a deep-range Tape anywhere on the desk, a
+  drum hit shorter than 25 ms was never heard at all, and every longer hit
+  and every DX7 note lost its last 25 ms. A hit shorter than the delay of
+  its own drum track's effects (a deep-range Tape on the drum track itself)
+  was never heard either. They play out now: a held kit or DX7 track sounds
+  exactly as on an empty desk, the hold later.
+- **The DX7 and Tangent Keys play every note on its own frame.** They struck
+  each clip note at the start of whatever stretch their track rendered at
+  once: the 512-frame chunk of an export or a freeze, the look-ahead in
+  playback, or the device buffer of an armed or listening track. A note on
+  beat two of an export from 0:00 sounded 448 frames (9.3 ms) early.
+  Playback and the exported file disagreed by up to 511 frames depending on
+  where Play was pressed, and a strum inside one stretch played as a block
+  chord. Note-offs moved the same way, a clip's pedal edges waited for the
+  next stretch, and live keys and a live pedal on an armed track landed at
+  the start of their buffer. Every note, off and pedal move now lands on its
+  own frame, in exports, freezes, bounces and playback at any buffer size
+  and look-ahead setting, and playback renders what the export renders, to
+  the bit.
+- **The Analog synth, the sampler, the drum kit and hosted instruments take
+  every note-off and pedal move on its own frame.** A clip's sustain,
+  sostenuto and soft pedal reached them as the level at the start of
+  whatever stretch their track rendered at once, and a live pedal moved at
+  the start of its buffer, so a sustain pressed 100 frames before a note's
+  end inside one stretch let the note go. A key struck twice inside one
+  stretch rang its first note on to the second strike, and a key struck
+  again while its last note still sounded cut the new note at the old one's
+  end: the Analog and a hosted instrument went silent there. Each event now
+  lands on its own frame, and a new strike lets the key's last note go
+  there, as the DX7 and Tangent Keys do. Hosted VST3 instruments get each
+  block's notes and controls in time order. On a desk of more than 256
+  tracks, a track's recorded pedal no longer goes to another track's
+  instrument.
+- **Hosted plugins play every stretch of the look-ahead.** With the
+  look-ahead on AUTO at buffers from 61 to 511 frames (64, 128 and 256 among
+  them), or set past 10 ms, a stretch that began off the engine's 32-frame
+  grid ran up to 31 frames past the 512-frame block every hosted plugin is
+  set up for, and a VST3 refused it whole. That happened when Play was
+  pressed there, when a locate or a loop's wrap landed there, or when a
+  loop's end was there: an effect was bypassed for 516 frames and came back
+  from a stale state, and an instrument fell silent and lost every note and
+  note-off inside, so a key struck 200 frames after Play never sounded and a
+  note held across a loop's wrap rang on through the next lap. The built-in
+  DX7 and Tangent Keys rendered nothing there either, 516 silent frames
+  after a clip's pedal edge. No stretch is longer than a block now, and the
+  look-ahead no longer grows a track's buffers on the audio thread.
+- **Tangent Keys renders a part the same at any buffer size and wherever it
+  is played from.** Three steps that ran once per host call now run on the
+  instrument's own 128-frame grid, which falls on the song's frames: the
+  recount of finished voices, a re-tuned string's glide step and the
+  electric grand's hammer contact. Buffer sizes left differences of -43 to
+  -101 dB re peak, and a part played back from a frame off the grid sounded
+  apart from the export after its first voice ended, by as much as -62 dB
+  re peak with silent presses under the pedal. Every patch now renders the
+  same however its stretches are cut.
+- **The DX7's LFO no longer depends on how the audio is cut.** A patch's LFO
+  stopped at the end of whichever stretch let its last note finish, so a
+  phrase after a silence long enough for every note to die started its
+  vibrato or tremolo at a phase that depended on the buffer: on the factory
+  patches whose LFO is heard (both tremolo pianos and fourteen of the
+  guitars), the same performance rendered whole and cut differed from the
+  second phrase on by -32.9 to -6.0 dB re peak. The LFO now stops on a grid
+  of the instrument's own frames, so a performance renders the same at any
+  buffer size and look-ahead setting, sample and hold included.
 - **Tape's deep wow range reaches the 3 % it was meant to at full Wow, at
   any Rate, and follows the Wow dial in proportion.** It peaked at 2.6 to
   2.9 % at full Wow, depending on Rate. Lower down the dial it swung further
@@ -95,10 +260,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   plays at 15 ips on the studio head. A Denoise preset from before the
   kernel selector plays the kernel it was saved with.
 - **Tape start and stop stays with its project.** Opening a project saved
-  before 5.2, pressing New on a template saved before 5.2, or launching on
-  one kept the switch as the last session left it, so Play could spin up a
-  desk that never asked for it, and the next save wrote it in. These now
-  open with start and stop off. A project saved with it on opens on.
+  before 5.2, or one with no desk saved in it at all, pressing New on a
+  template saved before 5.2, or launching on one kept the switch as the last
+  session left it, so Play could spin up a desk that never asked for it, and
+  the next save wrote it in. These now open with start and stop off. A
+  project saved with it on opens on.
 - **The block where the tape reaches speed no longer renders every track's
   look-ahead at once.** While tape start and stop changes speed, every track
   renders only what it plays, and the first block back at speed used to
@@ -107,21 +273,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   block, the dearest block of every start. Tracks of audio through Tangent's
   own effects now come back a few at a time, each brought back onto the
   look-ahead it would have had, so the dearest block of a start or a stop
-  costs 1.0 to 1.4 times what the varispeed dial's dearest block does, where
-  it cost 2.5 to 5.7 times, measured in two quiet sittings. This changes
-  nothing the desk plays with start and stop off, and after a start the
-  tracks play exactly what they would have without it once every one is
-  back, within about a tenth of a second of the tape reaching speed (just
-  under a fifth of a second at buffers over 256 frames). A stop, a locate,
-  a loop wrap, a dial move or a knob turned on one of Tangent's own effects
-  inside that moment, or a quiet track's effects standing down there after
-  eight silent seconds, finds those tracks' effects up to about 20 ms
-  behind where 5.2 had them: their tails take a slightly different path,
-  nearer what the desk plays with the look-ahead off, and an effect with
-  motion of its own (the plate, Tape's wow and flutter, the chorus) stays
-  that little bit off 5.2's for the rest of the session, the same sound at
-  the same level but not the same bits. Tracks with an instrument or a
-  hosted plugin still come back all at once, as before.
+  costs
+  about 1.3 times what the varispeed dial's dearest block does, where it
+  cost 2.5 to 5.7 times, measured in three quiet sittings. This changes nothing the desk plays with start
+  and stop off, and after a start the tracks play exactly what they would
+  have without it once every one is back, within about a tenth of a second
+  of the tape reaching speed (just under a fifth of a second at buffers over
+  256 frames). A stop, a locate, a loop wrap, a dial move or a knob turned
+  on one of Tangent's own effects inside that moment, or a quiet track's
+  effects standing down there after eight silent seconds, finds those
+  tracks' effects up to about 20 ms behind where 5.2 had them: their tails
+  take a slightly different path, nearer what the desk plays with the
+  look-ahead off, and an effect with motion of its own (the plate, Tape's
+  wow and flutter, the chorus) stays that little bit off 5.2's for the rest
+  of the session, the same sound at the same level but not the same bits.
+  Tracks with an instrument or a hosted plugin still come back all at once,
+  as before.
 - **One bad sample no longer stops the effects after it.** A plugin or an
   audio interface that delivered a single NaN or infinity left every filter,
   compressor, Tape and reverb after it making nothing but invalid samples
@@ -138,70 +305,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   per block, once over the input and once over the kit, and a bypassed Tape,
   Denoise or IR mixed the two signals. While the input is monitored the kit
   now goes past the track's effects, in time with the rest of the mix.
-- **The click is heard on the beat of the music on a desk that delay
-  compensation holds back.** Every track waits for the longest delay a
-  plugin reports, and the master's own plugins and its limiter hold the mix
-  back further on its way out. The click was never held, so it played ahead
-  of the music by all of that: 25 ms (1,200 samples at 48 kHz) with a Tape
-  in its deep wow range anywhere on the desk, 2 ms in the studio range,
-  about 11 ms with an IR loaded, and 1.2 ms more with the limiter in
-  circuit. It is now held to the music in the speakers, and in the take
-  when it is recorded into it, with its count-in, its reverb send and its
-  sends to buses. On every desk measured (a Tape in either range or an IR
-  on a track, an IR across the master, the limiter in circuit, all of them
-  at once), the click's attack now falls exactly where it does on an empty
-  desk, 30 samples after the beat; with a deep-range Tape it fell 1,170
-  samples ahead of it. With tape start and stop on, the song's click still
-  waits for the tape to reach speed, and a Stop's coast still clicks
-  nothing. The click still never holds the music back.
-- **A recorded part lands on the beat it was played to on a desk that delay
-  compensation holds back.** A part played in time with the backing used to
-  be placed with nothing taken off for the hold, so it landed late by it:
-  25 ms with a deep-range Tape, 2 ms in the studio range, about 11 ms with
-  an IR. Audio and MIDI are now both placed against what the player heard:
-  an impulse played into an armed input exactly when the backing's beat was
-  heard lands on that beat, to the sample, on every desk measured. A record
-  started from a stopped transport no longer lands late by the moment
-  between pressing record and the song starting. What was played in that
-  moment stands before the record's start, and nothing is placed before
-  0:00, so a take recorded from the top starts at 0:00 with that moment
-  trimmed. The interface's own latency (its buffers and converters) is not
-  taken off, as before.
-- **A record or a Play that waits on a count-in starts on the count's last
-  click.** The song used to start a screen refresh or two after the count's
-  go, so the backing's first beat came that much after it. A record begun
-  on the go lost what was played before it opened (up to a refresh, about
-  20 ms, of the first note), and often lost a MIDI note played on the go
-  altogether. The song now starts on the go itself and the take begins on
-  it, so a part played on the go is kept whole and lands on the record's
-  start, on any desk and at any buffer size.
-- **An armed instrument track is heard at once while the song is stopped
-  and while it records, on a desk that delay compensation holds back.** It
-  used to wait with the rest of the mix, so with a deep-range Tape on
-  another track a note played into an armed instrument sounded 25 ms late,
-  and so did a pad struck on an armed drum track. While the song is
-  stopped, and while the track records (its own clips are muted then), an
-  armed track that listens to MIDI now stands outside the wait, as a
-  monitored audio input always has. The note sounds after only the track's
-  own effects, 25 ms sooner. While the song plays the track back and it is
-  not recording, it waits with the mix as before, so its own clips stay on
-  the beat and an export sounds the way the playback did. Moving in and out
-  of the wait when a record starts or ends, and at Stop, crossfades over
-  10 ms; at Play the track takes the wait at once, so its part starts on
-  the beat, heard once, and a note still ringing on it when Play is pressed
-  drops out for the hold. A track that only listens, such as the one open
-  in the MIDI editor, still plays in time with the mix, and a realtime
-  export plays every track in time.
-- **Short drum hits and the ends of notes are heard on a desk that delay
-  compensation holds back.** A kit's compensation stopped the moment its
-  pads went quiet, and a built-in instrument's the moment its last note
-  ended. Whatever was still on its way was held until the next hit or note
-  and played ahead of it. With a deep-range Tape anywhere on the desk, a
-  drum hit shorter than 25 ms was never heard at all, and every longer hit
-  and every DX7 note lost its last 25 ms. A hit shorter than the delay of
-  its own drum track's effects (a deep-range Tape on the drum track itself)
-  was never heard either. They play out now: a held kit or DX7 track sounds
-  exactly as on an empty desk, the hold later.
 - **The Windows zip's permanent download link works again from this
   release.** The version-less tangent-windows-x86_64.zip, which the
   supporter emails sent before 3.0.0 hand out, was left off 5.2.0, so that
@@ -210,24 +313,62 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Known
 
+- **While you track with monitoring on, your playing comes as late as the
+  plugins across the master hold the mix, in the speakers and in the take.**
+  That is the price of hearing them. You hear your own playing that much
+  after you play it, and because you hear the song through those plugins
+  too and play to it, the take carries your playing that much late against
+  the song and the click, just as you heard it: at 48 kHz, 2 ms with a Tape
+  in its studio range across the master, 25 ms in its deep wow range,
+  10.7 ms with an IR. Keys played live into an armed instrument track wait
+  for those plugins too, armed audio input or not, and for the limiter's
+  lookahead (1.2 ms) when no audio input is armed. With monitoring off your
+  playing stays on the beat in the
+  take, and a part you record onto a track is placed on the beat you played
+  it to either way. To keep a take tight, or to play with less in the way,
+  take the plugins that add delay off the master while you track.
+- **With monitoring off, the speakers still leave out the plugins across the
+  master while an audio input is armed.** This applies whenever an armed
+  input is kept out of the speakers: monitoring off, or the armed track
+  muted or soloed out, as when you listen through your interface's direct
+  monitoring. The speakers then play the mix without the master's plugins,
+  while the take and exports keep them. Hearing them there needs a second
+  copy of every master plugin, one for the take and one for the speakers,
+  planned for after 5.3.0. Arming an audio track with monitoring off, or
+  arming one that is muted or soloed out, also still switches the speakers
+  to that mix at once. With plugins or the limiter on the master this can
+  click, because a crossfade would play the input you chose not to hear.
+- **Moving between those mixes while the song plays skips or repeats a
+  little of the song in the speakers.** Arming or disarming an audio track
+  with monitoring on skips or repeats only the limiter's lookahead, 1.2 ms
+  at 48 kHz, and nothing with the limiter out. Turning monitoring off while
+  an audio input is armed skips as much of the song as the plugins across
+  the master delay it (10.7 ms with an IR, 25 ms with a Tape in its deep wow
+  range), and turning it back on plays that much again. Each crossfades
+  over 10 ms with the click; a repeat longer than the crossfade plays on at
+  full level past its end.
+- **Some armed instrument tracks still wait with the mix while the song plays
+  them back, so their keys come late by the hold then.** These are a track
+  sending into a bus whose own effects delay it more than the track's own
+  way out (so that send stays aligned), a track that receives another
+  track's audio, a folder, a frozen track, a track holding a hardware loop,
+  and a MIDI track carrying an audio clip from an older session. Stopped,
+  or while they record, they answer at once, and they cross into and out of
+  the wait with a 10 ms crossfade at a record's start and end. Tangent
+  Analog on a live track plays the same notes on the same frames and at the
+  same level as unarmed, with its oscillators at another phase unless the
+  hold is a whole number of its 32-frame steps.
+- **An armed instrument track's plugin automation is up to one buffer off
+  right after the song breaks its run inside that buffer**, at Play, a loop's
+  wrap or a locate: within 1 dB of the unarmed track's in the half second
+  after, and within a hundredth of a decibel everywhere else.
+- **The DX7 does not reset its LFO and its free-running oscillators at
+  Play**, so the second playback of a patch with free-running oscillators,
+  or one after an audition or live playing, can differ from an export of
+  the same part, as on any hardware synth that keeps running between takes.
 - **The interface's own round trip is not compensated.** A part played in
   time with what the speakers play lands late by the interface's input and
   output latency, as on an empty desk.
-- **Keys played along with playback on an armed track wait with the mix.**
-  On a desk that delay compensation holds back, an armed instrument track
-  that plays its own part back waits with the rest of the desk, so that
-  part stays on the beat. Keys played into it then sound as late as the
-  desk is held (25 ms with a deep-range Tape), as before. Stopped, or while
-  the track records, they sound at once.
-- **An armed track's move in and out of the wait is a crossfade, not a
-  seam.** On a desk that delay compensation holds back, a note an armed
-  track plays in the first 10 ms after a record ends while the song plays,
-  or after a loop wraps back before the record's start, is also heard once
-  early, faded. What it played in the hold before a record starts or the
-  song stops (25 ms with a deep-range Tape) is cut short after its first
-  10 ms, and a held note whose two reads fall out of phase dips for a few
-  milliseconds through the fade (a DX7's A3 to about a quarter of its
-  level).
 
 ## [5.2.0] - 2026-10-19
 
