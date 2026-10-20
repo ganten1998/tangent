@@ -40,23 +40,25 @@ bench's sixteen lanes through a plate, grains on, 48 kHz, rolling at rest,
 rolling with the dial at 0.75, and starts and stops at 0.1 s each way, the three
 interleaved a tape cycle at a time over 31 rounds on a user-interactive thread.
 Each ratio is the median of the rounds' own ratios, so the machine's other work,
-which lands on all three alike, falls out; the ranges are seven runs of each
-engine, the two alternated.
+which lands on all three alike, falls out. The ranges are runs of each engine
+in one sitting, alternated: three of 5.2 against three of 5.3, and five more of
+5.3 against five of the way back's first draft (below).
 
 | cycles against | 5.2 (aa94a2be) | 5.3 |
 |---|---|---|
-| the dial's worst block, 64 frames | 4.1 to 6.2x | 1.17 to 1.32x |
-| the dial's worst block, 128 frames | 3.1 to 3.9x | 1.15 to 1.31x |
-| the dial's p99, 64 frames | 1.24 to 1.42x | 1.36 to 1.52x |
-| the dial's p99, 128 frames | 1.29 to 1.39x | 1.22 to 1.36x |
-| rest's worst block, 64 / 128 frames | 4.1 to 5.3x / 2.8 to 3.3x | 0.97 to 1.14x / 1.00 to 1.10x |
-| rest's p99, 64 / 128 frames | 1.03 to 1.11x / 1.05 to 1.17x | 1.14 to 1.23x / 1.05 to 1.13x |
-| the deadline, worst block, 64 / 128 frames | 32 to 35 % / 16 to 25 % | 8 to 16 % / 6 to 11 % |
-| the deadline, p99, 64 / 128 frames | 6.1 to 8.3 % / 8.1 to 9.6 % | 6.2 to 7.4 % / 5.2 to 6.6 % |
+| the dial's worst block, 64 frames | 2.9 to 3.2x | 1.03 to 1.20x |
+| the dial's worst block, 128 frames | 2.2 to 2.3x | 1.05 to 1.23x |
+| the dial's p99, 64 frames | 1.08 to 1.11x | 1.07 to 1.20x |
+| the dial's p99, 128 frames | 1.22 to 1.27x | 1.12 to 1.25x |
+| rest's worst block, 64 / 128 frames | 2.8 to 3.1x / 1.8 to 1.9x | 0.95 to 1.08x / 0.97 to 1.07x |
+| rest's p99, 64 / 128 frames | 0.98 to 1.01x / 1.03 to 1.09x | 0.99 to 1.08x / 0.91 to 1.06x |
+| the deadline, worst block, 64 / 128 frames | 44 to 46 % / 21 to 25 % | 18 to 25 % / 12 to 24 % |
+| the deadline, p99, 64 / 128 frames | 10.4 to 11.3 % / 10.8 to 11.8 % | 9.6 to 12.1 % / 8.4 to 9.6 % |
 
 The worst blocks against the deadline are all rounds pooled, so a stall of the
-machine's lands in them whole: one 5.3 run at 64 frames read 52 %, with rest at
-419 % in the same run, and is left out of that row.
+machine's lands in them whole: one 5.3 run at 64 frames read 47 %, and is left
+out of that row. Earlier the same day, seven runs on a quieter machine read 5.2
+at 4.1 to 6.2 times the dial's worst at 64 frames and 3.1 to 3.9 at 128.
 
 Where the time went, from a throwaway profile that classified every pass:
 
@@ -82,35 +84,67 @@ Where the time went, from a throwaway profile that classified every pass:
   speed's share of program, so it climbs from almost nothing to the cost of a
   block at rest (991 lane-frames, 65 us, between 0.9 and full speed).
 
-**The fix: the motor's way back into the grain render lets the desk in a share
-at a time** (`Renderer::regrain_hold`). After the motor alone has left the
-varispeed path, a lane with something to render and nothing ahead renders its
-chunk until it is let in, a quarter of the desk's work in extra work a chunk
-and at least one lane; a lane let in renders its next grain when its ring runs
-out, so the lanes let in one after another refill one after another. On the
-bench desk that is one lane a chunk: the first block back renders 1486
-lane-frames, 87 us at 64 frames, the desk's chunks and one lane's grain, and
-the excess falls away chunk by chunk until all sixteen are back sixteen chunks
-later. One lane's grain is the least any way back can pay, since some lane has
-to be first; on a wider desk it is a smaller share (a quarter at most).
+**The fix: the motor's way back into the grain render brings the desk back a
+share at a time, and onto the grain clock it would have kept**
+(`Renderer::regrain_hold`). After the motor alone has left the varispeed path,
+a lane with something to render and nothing ahead is held, if no span can
+change its sound: clips through Tangent's own effects. A held lane renders its
+chunk as a lane the clock does not grain does, and beside its ring keeps the
+ring the clock would have given it, advanced by the clock's own decisions and
+never rendered. A turn (`Renderer::regrain_turns`) renders from where its ring
+ends to an end of that ring, never longer than the clock's own catch-up, and
+the turn that reaches its newest end brings the lane level: its ring ends
+where the clock's would and its look-ahead counts from where the clock's
+would (`GrainKey::origin`), so from then on the clock plans it as any lane and
+decides what it would have decided without the way back. Turns go cheapest
+first while a block stays within the desk's chunks and one turn more (a
+quarter of the desk's work on a wide desk). On the bench desk the first block
+back renders the desk's chunks, 1024 lane-frames, where 5.2 rendered 8192 to
+8496; no block of the way back renders more than 1555 to 1664, the clock's own
+lump of two lanes a phase while most of the others are still held; and the
+way back closes 20 to 27 blocks after the hand-back, 27 to 36 ms at 64 frames.
 
-Renders with the motor off, parked or at speed are the same bits as 5.2 over a
-grid of 432 (44.1, 48 and 96 kHz; 32 to 256-frame blocks; grains off, auto and
-240 frames; plate, compressor, drive and Tape). With ramps, the first stop, the
-start and the stretch at speed after it are the same bits too; a later stop's
-tail is as loud (within 0.014 dB, 0.69 dB in the worst tenth of a second) and
-its reverb takes a different path, as every stop on a grained desk already does
-against an ungrained one: how far ahead each lane had rendered when that stop
-came is what changed, for a lane the way back let in never more than a grain
-where it was up to two.
+**A lane with an instrument or a hosted plugin is not held**, and comes back as
+it always did, its whole grain in the first block at rest, so on a desk of
+instruments the start costs what it cost in 5.2. The Analog draws its
+oscillators' wander once a chunk of its own frame count, so a span cut where
+the clock would not cut it plays different dice; a hosted plugin may block
+internally.
+
+**The same sound.** Over a grid of 96 Analog renders (4 and 16 lanes, notes
+held and notes every 700 frames, 64 and 128-frame blocks, grains off, auto
+and 240 frames, and nothing, a locate or a stop after the start) every render
+is the same bits as 5.2. Over a grid of 594 audio renders (16 lanes, 12 of
+them playing, through a plate or Tape; 64, 128 and 333-frame blocks; grains
+off, auto and 240 frames; 4 and 40-lane desks too; a stop, a locate, the
+dial, a loop, the motor or the grain switched 1 to 400 blocks after the motor
+shows it is at speed) every render with nothing happening is the same bits as
+5.2, and so is every event from 60 blocks on. The 80 that differ are events
+inside the way back, 1 to 30 blocks after the tape reached speed: their held
+lanes' racks had been through less of the look-ahead than 5.2's, so the tails
+take another path, at the same level (from the first difference on, 0.003 dB
+on median and 0.20 dB at most; in 0.1 s windows above -40 dB re peak, 0.14 dB
+on median and 3.7 dB at most, a plate's tail), and nearer the desk with the
+look-ahead off in 70 of the 72 renders that have one to compare with (11 dB
+nearer on median; the other two 1.3 dB farther at most).
+
+**The first draft** let each lane in to a grain of its own and never back onto
+the clock: its blocks cost less still (one lane's grain beyond the desk's
+chunks, 1486 lane-frames), but every stop, locate, wrap or dial move after a
+start played its tails along another path until the rings next cleared, and
+an Analog desk played other dice for the rest of the song, 15 to 37 dB under
+its notes, with nothing happening at all. The way back's turns cost about 5 %
+on the worst block against the dial at 64 frames over that draft (1.08 to
+1.20x against 1.04 to 1.15x, alternated in one sitting), and nothing to
+choose between them at 128.
 
 **The design's bar, 1.10 times the dial's p99 and 1.25 times its worst, is half
 out of reach.** The dial at 0.75 renders three quarters of the program a block
-at rest renders, so rest itself runs 1.14 to 1.26 times the dial's p99, and a
+at rest renders, so rest itself runs 1.04 to 1.28 times the dial's p99, and a
 third of a cycle's blocks are at rest (at speed or parked), its dearest ramp
-blocks near full speed. The worst block now sits on the design's bar, either
-side of it from run to run, and at rest's own. The probe holds what was reached,
-with a margin: the median p99 at most 1.75 times the dial's and 1.4 times rest's,
-the median worst at most 1.6 times the dial's and 1.35 times rest's, and the
-deadline bars it had (p99 at most 15 %, worst at most 50 %). The 5.2 engine
-fails the worst-block bars by two to four times in every run.
+blocks near full speed. The worst block meets the design's bar in every run,
+and rest's own. The probe holds what was reached, with a margin: the median
+p99 at most 1.75 times the dial's and 1.4 times rest's, the median worst at
+most 1.6 times the dial's and 1.35 times rest's, and the deadline bars it had
+(p99 at most 15 %, worst at most 50 %). The 5.2 engine fails the worst-block
+bars in every run, by 1.3 to 2.3 times.
