@@ -20651,6 +20651,16 @@ impl Renderer {
                 && lane.keys.is_none()
                 && lane.chains.iter().chain(lane.board.iter()).all(Rack::spans_free);
             let g = &mut lane.grain;
+            // **And let go the moment it is not**: a turn runs past a block
+            // (`MAX_TURN`), which a hosted plugin refuses whole and the DX7's
+            // and the keyboard's scratches have no room for, and one of them
+            // can land on a lane while it is held. Let go here, before this
+            // chunk's turns, the lane is the clock's, which hands it a block
+            // at most (`Renderer::to_grid`).
+            if g.held && !spans_free {
+                g.held = false;
+                continue;
+            }
             if g.held || !spans_free || !lane.folds || g.newest().is_some_and(|k| k.at + u64::from(k.frames) > at) {
                 continue;
             }
@@ -63074,6 +63084,100 @@ mod tape_motor {
                 }
                 assert!(most > MAX_BLOCK as usize, "{lanes} lanes at {pass} frames: no lane rendered a span past a block, so nothing was proved");
                 assert_eq!(allocs, 0, "{lanes} lanes at {pass} frames: the tape's start allocated {allocs} times on the callback, the longest span {most} frames");
+            }
+        }
+    }
+
+    /// **A lane the way back holds is let go the moment it carries what a
+    /// turn past a block would reach, and plays on as if it had never been
+    /// held.** A turn runs as far as a grain and the grid's 31 frames
+    /// (`MAX_TURN`), so the way back holds only a lane of Tangent's own
+    /// effects (`Rack::spans_free`); but it asked that only as it took the
+    /// hold, and a hosted plugin loaded onto a lane in the passes it was held
+    /// was handed a turn past a block, which a VST3 refuses whole. A stand-in
+    /// that refuses as a VST3 does (`Backend::Capped`), seated in the second
+    /// bay of every lane the way back held, on the first pass it held any,
+    /// from a playhead parked at 48,013 on AUTO: on four plate lanes, asked
+    /// for 536 frames at 333 and refusing 2 blocks, asked for 529 at 480 and
+    /// refusing 3; on sixteen, 8 and 15. A refused block went on past the
+    /// plugin: on four lanes at 333 frames the take left the take with the
+    /// look-ahead off for 600 frames from 7,326 after Play, by up to 0.59
+    /// where it peaks at 1.92. Now such a lane is let go on the next chunk,
+    /// to the grain clock, which hands it a block at most: the stand-in plays
+    /// every block it is handed, and the take is the take of the desk with
+    /// the look-ahead off, the stand-in seated on the same lanes after the
+    /// same pass, to the bit, so the lane let go rendered every frame once.
+    #[test]
+    fn a_lane_the_way_back_holds_is_let_go_when_a_hosted_plugin_lands_on_it() {
+        let seat = |r: &mut Renderer, ch: usize, asked: &Arc<CappedAsked>| {
+            r.lane_body_mut(ch).chains[CHAIN_OWN].slots[1] = PluginBox(Some(Box::new(Hosted {
+                backend: Backend::Capped(CappedPlugin::new(f64::from(RATE), asked.clone())),
+                bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+                channels: TAP_CHANNELS,
+                voice: false,
+                align: None,
+            })));
+        };
+        for lanes in [4usize, 16] {
+            for pass in [333usize, 480] {
+                let passes = RATE as usize / pass;
+                let mut out = vec![0.0f32; pass * 2];
+                // The way back's desk: the stand-in on every lane it holds,
+                // on the first pass it holds any.
+                let (mut e, mut t) = plates_desk(lanes, BACK_GRAIN, 48_013);
+                e.set_grain_ms(-1.0);
+                for _ in 0..30 {
+                    t.push(Some(&e));
+                    e.render_offline(&mut out);
+                }
+                t.toggle_play();
+                let asked = Arc::new(CappedAsked::default());
+                let (mut seated, mut after, mut back) = (Vec::new(), None, Vec::new());
+                for k in 0..passes {
+                    t.push(Some(&e));
+                    e.render_offline(&mut out);
+                    back.extend_from_slice(&out);
+                    let r = e.offline.as_mut().expect("an offline renderer");
+                    if after.is_none() {
+                        seated.extend((0..lanes).filter(|&ch| r.lane_body(ch).grain.held));
+                        for &ch in &seated {
+                            seat(r, ch, &asked);
+                        }
+                        after = (!seated.is_empty()).then_some(k);
+                    }
+                }
+                // The desk with the look-ahead off, the stand-in on the same
+                // lanes after the same pass.
+                let (mut c, mut tc) = plates_desk(lanes, 0, 48_013);
+                for _ in 0..30 {
+                    tc.push(Some(&c));
+                    c.render_offline(&mut out);
+                }
+                tc.toggle_play();
+                let also = Arc::new(CappedAsked::default());
+                let mut chunked = Vec::new();
+                for k in 0..passes {
+                    tc.push(Some(&c));
+                    c.render_offline(&mut out);
+                    chunked.extend_from_slice(&out);
+                    if Some(k) == after {
+                        let r = c.offline.as_mut().expect("an offline renderer");
+                        for &ch in &seated {
+                            seat(r, ch, &also);
+                        }
+                    }
+                }
+                let (longest, refused, played) = (
+                    asked.longest.load(Ordering::Relaxed),
+                    asked.refused.load(Ordering::Relaxed),
+                    asked.played.load(Ordering::Relaxed),
+                );
+                assert!(!seated.is_empty() && played > 0, "{lanes} lanes at {pass} frames: the way back held no lane, or the stand-in never played, so nothing was proved");
+                assert!(longest <= MAX_BLOCK as usize, "{lanes} lanes at {pass} frames: a lane the way back held was handed {longest} frames with a hosted plugin on it");
+                assert_eq!(refused, 0, "{lanes} lanes at {pass} frames: the hosted plugin refused {refused} blocks");
+                if let Some(i) = back.iter().zip(&chunked).position(|(x, y)| x.to_bits() != y.to_bits()) {
+                    panic!("{lanes} lanes at {pass} frames: the take first differs from the take with the look-ahead off {} frames after Play", i / 2);
+                }
             }
         }
     }
