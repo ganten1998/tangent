@@ -9788,6 +9788,12 @@ struct Wide {
     /// rest. `was_lagged` is the walk's scratch, last chunk's set.
     lagged: LaneSet,
     was_lagged: LaneSet,
+    /// **Each lagged lane's own position, seconds, for its plugins' curves**
+    /// (`fill_automation_params`), NaN everywhere else: filled for last
+    /// chunk's `lagged` and put back to NaN once the curves are read
+    /// (`Renderer::resolve_automation`). Bought at the spine's capacity; a
+    /// Grow starts it NaN.
+    tl_secs: Box<[f64]>,
     /// The probe's three eligibility classes for the block (strict, loose,
     /// freed), each a subset of the lanes that rendered.
     probe_sets: [LaneSet; 3],
@@ -9945,6 +9951,7 @@ impl Wide {
             pinned: set(),
             lagged: set(),
             was_lagged: set(),
+            tl_secs: vec![f64::NAN; lanes].into_boxed_slice(),
             probe_sets: std::array::from_fn(|_| set()),
             #[cfg(test)]
             route_placed: set(),
@@ -17892,6 +17899,19 @@ impl Renderer {
             return;
         }
         let secs = at as f64 / self.rate.max(1.0);
+        // **A lane reading its part behind the song has its plugins' curves
+        // read where that part is** (the 5.3.1 live lane): its own frame at
+        // this chunk's head (`Renderer::lane_head`), for the lanes lagged
+        // last chunk, which is what `plan_live_lanes`, later in the chunk,
+        // keeps them at unless the lane enters or leaves, when the point is a
+        // chunk off once (a plugin smooths its own parameters).
+        let mut lagged = std::mem::take(&mut self.spine.ext.lagged);
+        for ch in lagged.iter() {
+            let head = self.spine.lanes.get(ch).and_then(Option::as_deref).map(|l| self.lane_head(l.peek()));
+            if let (Some(head), Some(cell)) = (head, self.spine.ext.tl_secs.get_mut(ch)) {
+                *cell = head as f64 / self.rate.max(1.0);
+            }
+        }
         // **The plugin parameters, walked from the CURVES rather than probed.**
         //
         // A song has a handful of automated parameters and a desk has four
@@ -17910,10 +17930,16 @@ impl Renderer {
             master_held,
             &whose,
             secs,
-            &[],
+            &self.spine.ext.tl_secs,
             &mut self.spine.ext.auto_params,
             &mut self.spine.ext.curve_lanes,
         );
+        for ch in lagged.iter() {
+            if let Some(cell) = self.spine.ext.tl_secs.get_mut(ch) {
+                *cell = f64::NAN;
+            }
+        }
+        std::mem::swap(&mut lagged, &mut self.spine.ext.lagged);
         for ch in self.spine.ext.curve_lanes.iter() {
             self.spine.ext.param_lanes.insert(ch);
         }
@@ -21368,6 +21394,15 @@ impl Renderer {
             }
         }
         self.spine.ext.was_lagged = was;
+    }
+
+    /// **Where a lagged lane's part stands at this chunk's head**, by the rule
+    /// `plan_live_lanes` keeps it at (`lane_time`'s position), at its last
+    /// lag and cursor: what its plugins' curves are read at
+    /// (`resolve_automation`), which runs before the chunk's planning, so the
+    /// two cannot drift.
+    fn lane_head(&self, lane: &LaneBody) -> u64 {
+        lane_time(&self.trail, lane.tl_lag as usize, 1, lane.tl_seq, lane.tl_end).pos
     }
 
     /// **Where the part on lane `ch` stands, for its kit's plugins**: its own
@@ -55278,6 +55313,57 @@ mod slot_engine {
                 let back = (1..200).filter(|&b| armed[b].sample < armed[b - 1].sample).collect::<Vec<_>>();
                 assert!(!wrap.is_empty(), "fixture: the song never wrapped or located back");
                 assert_eq!(back, wrap.iter().map(|b| b + 2).collect::<Vec<_>>(), "the armed lane's frame stepped back where its part does not");
+            }
+
+            /// **A lane's plugins' curves move with its part** (the 5.3.1 live
+            /// lane: a lagged lane's plugin curves are read at its own position,
+            /// `Renderer::lane_head`). A Trim on a kit's lane, its gain curve
+            /// stepping from the bottom of its travel to the top at one second,
+            /// the kit struck every 500 frames on the deep Tape's hold. A curve
+            /// is read once a chunk, at the chunk's head, so the strike at 48,000
+            /// shares its chunk with the frames before the step: armed and not,
+            /// the first strike the step lifts (to twice the level of the
+            /// strikes before it, the trim's own slew still rising) is the one
+            /// at 48,500. Read at the song's position instead, the armed lane's
+            /// would be the one at 47,000, its curve a hold early. Held two whole
+            /// passes, the speakers are the unarmed lane's to the bit.
+            #[test]
+            fn an_armed_lanes_plugin_curves_move_with_its_part() {
+                use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+                let render = |armed: bool, hold: Option<u32>| {
+                    let mut e = live_desk(6, Plays::Kit, armed, hold, |_| {});
+                    unit(&mut e, 6, 0, 0, crate::builtin_fx::TRIM_PATH, None);
+                    let trim = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("trim").params[0].id;
+                    let mut curves = Automation::default();
+                    curves.set(Curve::sanitised(
+                        6,
+                        AutoParam::Plugin { bay: 0, id: trim },
+                        vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Hold }, Point { at_s: 1.0, value: 1.0, shape: Shape::Hold }],
+                    ));
+                    let gen = e.lane_gen(Slot(6)).expect("a lane");
+                    e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(6), gen)], master: MASTER_AUTO_LANE });
+                    let hits: Vec<(u64, u64, u8)> = (0..200).map(|k| (k * 500, 10, PAD_BASE)).collect();
+                    e.set_midi_slotted(vec![part(&e, 6, &hits, &[])]);
+                    run(&mut e, 6, BLOCK, 120, play)
+                };
+                // The strike at `k * 500` is heard `wait` frames later; the
+                // ones a second in (the trim's slew from its default long done)
+                // are the quiet ones.
+                let first_lifted = |h: &Heard, wait: usize| -> usize {
+                    let col = h.column(6);
+                    let level = |k: usize| col.get((k * 500 + wait) * 2).map_or(0.0, |v| v.abs());
+                    let quiet = level(80);
+                    assert!(quiet > 0.0 && (level(90) - quiet).abs() < 1e-6, "fixture: the strikes before the step are not steady");
+                    (80..110).find(|&k| level(k) > 2.0 * quiet).map_or(usize::MAX, |k| k * 500)
+                };
+                for armed in [false, true] {
+                    let h = render(armed, None);
+                    assert_eq!(h.lagged[10], armed, "fixture: armed {armed}: the lane read its part behind the song: {}", h.lagged[10]);
+                    assert_eq!(first_lifted(&h, 1_200), 48_500, "armed {armed}: the strike the curve's step lifts first");
+                }
+                let (armed, unarmed) = (render(true, Some(1_024)), render(false, Some(1_024)));
+                assert!(armed.lagged[10], "fixture: the armed lane did not read its part behind the song");
+                assert_eq!(first_difference(&armed.room, &unarmed.room), None, "held two whole passes, the armed lane's curve does not move with its part");
             }
 
             /// **A Stop with a key held ends a lane's part with the mix, and
