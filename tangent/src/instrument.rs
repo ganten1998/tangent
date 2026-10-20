@@ -17920,7 +17920,12 @@ impl Renderer {
         // this chunk's head (`Renderer::lane_head`), for the lanes lagged
         // last chunk, which is what `plan_live_lanes`, later in the chunk,
         // keeps them at unless the lane enters or leaves, when the point is a
-        // chunk off once (a plugin smooths its own parameters).
+        // chunk off once (a plugin smooths its own parameters). One point for
+        // the lane's whole block, as for every lane: where a run of the song
+        // begins inside the block (Play, a loop's wrap, a locate, which fall
+        // on its blocks' heads only at a hold of whole blocks), the run's
+        // first frames are given a point read before it began
+        // (`an_armed_lanes_plugin_curves_keep_to_its_part_but_where_the_song_breaks_inside_its_block`).
         let mut lagged = std::mem::take(&mut self.spine.ext.lagged);
         for ch in lagged.iter() {
             let head = self.spine.lanes.get(ch).and_then(Option::as_deref).map(|l| self.lane_head(l.peek()));
@@ -56267,6 +56272,88 @@ mod slot_engine {
                 let (armed, unarmed) = (render(true, Some(1_024)), render(false, Some(1_024)));
                 assert!(armed.lagged[10], "fixture: the armed lane did not read its part behind the song");
                 assert_eq!(first_difference(&armed.room, &unarmed.room), None, "held two whole passes, the armed lane's curve does not move with its part");
+            }
+
+            /// **A lane's plugins' curves keep to its part but where the song
+            /// breaks inside its block** (`Renderer::lane_head`: a lagged
+            /// lane's curves are read once a block, at its block's head, in
+            /// its own time). A Trim on a kit's lane, its gain curve rising
+            /// from 0.2 to 0.9 over the first second and falling to 0.4 by the
+            /// second, the kit struck every 500 frames: Play from 0:00 on a
+            /// loop of the first 60,000 frames, which wraps twice, and a locate
+            /// to 25,000 between the wraps. Held 1,024 frames, a whole number
+            /// of 512 and of 256-frame passes, every run of the song begins on
+            /// a block of the lane's own, and the speakers and the lane's stem
+            /// are the unarmed lane's to the bit. Held 1,200, a run begins 176
+            /// frames into one of the lane's blocks, and its plugins are given
+            /// the point read at that block's head for the whole block: at Play
+            /// one read 176 frames before its part begins, at a wrap or the
+            /// locate the old run's. The trim's slew carries that on, so at
+            /// 512-frame passes the strikes in the half second after each break
+            /// land on the unarmed lane's frames at another level, within a
+            /// decibel (0.45 dB quieter after Play, 0.87 louder after each
+            /// wrap, 0.29 quieter after the locate), and every other strike is
+            /// within 0.02 dB of it (0.0094 measured, a point read up to a
+            /// block apart from where the waiting lane reads it). Only a split
+            /// of the lane's racks at the break would take the first kind away:
+            /// the built-in units take a block's last point for the whole
+            /// block, so a second point at the break would move the old run's
+            /// frames instead.
+            #[test]
+            fn an_armed_lanes_plugin_curves_keep_to_its_part_but_where_the_song_breaks_inside_its_block() {
+                use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+                const LOCATE: usize = 81_920;
+                let render = |armed: bool, hold: u32, pass: usize| {
+                    let mut e = live_desk(6, Plays::Kit, armed, Some(hold), |_| {});
+                    unit(&mut e, 6, 0, 0, crate::builtin_fx::TRIM_PATH, None);
+                    let trim = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("trim").params[0].id;
+                    let mut curves = Automation::default();
+                    curves.set(Curve::sanitised(
+                        6,
+                        AutoParam::Plugin { bay: 0, id: trim },
+                        vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }, Point { at_s: 1.0, value: 0.9, shape: Shape::Linear }, Point { at_s: 2.0, value: 0.4, shape: Shape::Hold }],
+                    ));
+                    let gen = e.lane_gen(Slot(6)).expect("a lane");
+                    e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(6), gen)], master: MASTER_AUTO_LANE });
+                    let hits: Vec<(u64, u64, u8)> = (0..120).map(|k| (k * 500, 10, PAD_BASE)).collect();
+                    e.set_midi_slotted(vec![part(&e, 6, &hits, &[])]);
+                    e.set_loop(0, 60_000);
+                    run(&mut e, 6, pass, 160_000 / pass, |e, b| {
+                        play(e, b);
+                        if b * pass == LOCATE {
+                            e.set_transport(2, 25_000);
+                        }
+                    })
+                };
+                for pass in [BLOCK, 256] {
+                    let (armed, unarmed) = (render(true, 1_024, pass), render(false, 1_024, pass));
+                    assert!(armed.lagged.iter().all(|l| *l), "fixture: held 1,024 at {pass}-frame passes, the armed lane did not read its part behind the song");
+                    assert_eq!(first_difference(&armed.room, &unarmed.room), None, "held 1,024 at {pass}-frame passes: the speakers against the unarmed lane's");
+                    assert_eq!(first_difference(&armed.column(6), &unarmed.column(6)), None, "held 1,024 at {pass}-frame passes: the lane's stem against the unarmed lane's");
+                }
+                let (armed, unarmed) = (render(true, 1_200, BLOCK), render(false, 1_200, BLOCK));
+                assert!(armed.lagged.iter().all(|l| *l), "fixture: held 1,200, the armed lane did not read its part behind the song");
+                let (a, u) = (onsets(&armed.column(6), 1e-6), onsets(&unarmed.column(6), 1e-6));
+                assert!(a.len() > 300, "fixture: held 1,200, {} strikes", a.len());
+                assert_eq!(a.iter().map(|o| o.0).collect::<Vec<_>>(), u.iter().map(|o| o.0).collect::<Vec<_>>(), "held 1,200: the armed lane's strikes land elsewhere");
+                // Where each run of the song is heard: Play, the run after the
+                // chunk that crosses the loop's end, the locate, and the run
+                // after the next crossing, 35,000 frames on; each a hold late.
+                let breaks = [0, 60_000usize.div_ceil(BLOCK) * BLOCK, LOCATE, (LOCATE + 35_000).div_ceil(BLOCK) * BLOCK].map(|b| b + 1_200);
+                let (mut near, mut far) = ([0f64; 4], 0f64);
+                for (x, y) in a.iter().zip(&u) {
+                    let db = 20.0 * (f64::from(x.1.abs()) / f64::from(y.1.abs())).log10();
+                    match breaks.iter().rposition(|&b| b <= x.0) {
+                        Some(i) if x.0 < breaks[i] + 24_000 => {
+                            if db.abs() > near[i].abs() {
+                                near[i] = db;
+                            }
+                        }
+                        _ => far = far.max(db.abs()),
+                    }
+                }
+                assert!(far < 0.02, "held 1,200: a strike half a second or more from a break differs by {far:.4} dB");
+                assert!(near.iter().all(|d| d.abs() < 1.0), "held 1,200: the strikes after Play, the wraps and the locate differ by {near:?} dB");
             }
 
             /// **A Stop with a key held ends a lane's part with the mix, and
