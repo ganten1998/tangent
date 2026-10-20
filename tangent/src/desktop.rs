@@ -11341,8 +11341,17 @@ impl DesktopApp {
         }
         // **A realtime export starts at once, tape motor or not**, and the
         // pass keeps it off for as long as it runs (`push_monitor_settings`).
+        // **And every armed track goes back into the desk's wait before the
+        // song moves** (`Engine::set_live_play`): one reading its own part
+        // behind the song leaves on the engine's next chunk, its notes ended
+        // and what it had not read dropped, so the export's head is laid down
+        // aligned, as the full-speed one's is. The frame's push says the same
+        // for as long as the pass runs, and today it runs before
+        // `Transport::push` hands the engine the locate below; said here as
+        // well, the order does not hang on where in the frame this is drained.
         if let Some(e) = self.recorder.engine.as_ref() {
             e.park_tape_motor();
+            e.set_live_play(false);
         }
         // From the span's head, rolling before the take opens — the same
         // press-order the transport itself keeps.
@@ -16915,11 +16924,14 @@ impl DesktopApp {
         // off whenever the tape must not move (see `motor_quiet`).
         let ss = self.app.start_stop();
         e.set_tape_motor(ss.on() && !motor_quiet, ss.start_s(), ss.stop_s());
-        // **An armed track played live stands outside the desk's wait**
-        // while its own timeline is silent (the song stopped, or the track
-        // recording), so its player hears their keys at once
-        // (`Renderer::plays_live`): never under a realtime export, which lays
-        // the song down aligned whatever is armed, as the full-speed one does.
+        // **An armed track played live is heard at once**: it reads its own
+        // part a wait behind the song (`Renderer::plan_live_lanes`), or, on a
+        // lane the engine keeps on 5.3.0's rule (a send into a slower bus, a
+        // folder, a lane carrying an audio clip: `plan_live_lanes` names them
+        // all), it stands outside the desk's wait while its own timeline is
+        // silent (`Renderer::plays_live`). Never under a realtime export,
+        // which lays the song down aligned whatever is armed, as the
+        // full-speed one does (`start_bounce` says so before the song moves).
         e.set_live_play(self.recorder.bounce.is_none());
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
@@ -34094,6 +34106,30 @@ mod tests {").expect("the tests module")];
     /// ruling): a take films the desk as the room hears it, the tape's spin
     /// included, so no take term holds the motor and the cassette parks
     /// nothing. A scan, because `DesktopApp` cannot be built in a test.
+    /// **A realtime export takes the armed tracks back into the desk's wait
+    /// before it moves the song** (the 5.3.1 live lane). A track reading its
+    /// own part behind the song leaves when the host's word falls
+    /// (`Engine::set_live_play`), its notes ended and what it had not read
+    /// dropped, and from there the export lays the song down as the
+    /// full-speed one does
+    /// (`a_realtime_export_lays_an_armed_lane_down_as_the_full_speed_one_does`).
+    /// The frame's push says so too, and today before `Transport::push` hands
+    /// the engine the export's locate; `start_bounce` says it itself, before
+    /// its Stop and locate, so the order does not hang on where in the frame
+    /// the request is drained. A scan, because `DesktopApp` cannot be built
+    /// in a test.
+    #[test]
+    fn a_realtime_export_takes_the_lanes_back_before_it_moves_the_song() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let bounce = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let off = bounce.find("e.set_live_play(false);").expect("an export does not take the armed tracks back");
+        let stopped = bounce.find("self.recorder.transport.stop();").expect("the export's stop");
+        let located = bounce.find("self.recorder.transport.locate(from_s);").expect("the export's locate");
+        assert!(off < stopped && off < located, "the export takes the armed tracks back after it moves the song");
+    }
+
     #[test]
     fn the_tape_motor_is_held_off_for_every_road_that_must_not_spin() {
         let whole = include_str!("desktop.rs");
