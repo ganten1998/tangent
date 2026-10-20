@@ -2120,10 +2120,9 @@ fn read_kernel() -> Box<ReadKernel> {
 }
 
 /// **One track of tape**: a ring of samples, newest first, every sample
-/// written twice, `len` apart, as [`History`] writes its own, so the sixteen
-/// samples a read takes are always one slice and no read divides. Made in
-/// [`Tape::new`] at the line's length; writing, reading and clearing it
-/// allocate nothing.
+/// written twice, `len` apart, so the sixteen samples a read takes are
+/// always one slice and no read divides. Made in [`Tape::new`] at the
+/// line's length; writing, reading and clearing it allocate nothing.
 struct Line {
     z: Vec<f32>,
     pos: usize,
