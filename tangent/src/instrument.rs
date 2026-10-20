@@ -7928,6 +7928,17 @@ pub(crate) struct LaneBody {
     /// chunk it changes, and every chunk of the glide after, takes the
     /// gliding road (`DelayLine::run_glide`).
     pdc_live: bool,
+    /// **The chunk its line last ran in** (`Renderer::chunks`): a line that
+    /// did not run in the chunk before (its lane silent, or resting) takes a
+    /// change of wait at once rather than gliding into it.
+    pdc_ran: u64,
+    /// **Frames its line still owes the mix**: what it holds of the last
+    /// chunk it was fed sound, which it plays out over its wait. The lane
+    /// renders silence and folds while it owes (`LanePlan::owes`), as while
+    /// its instrument sounds: a built-in instrument's lane stopped folding
+    /// the moment its last voice ended, and the end of every note stood in
+    /// the line until the next note played it out ahead of itself.
+    pdc_owed: usize,
     /// **The lane's pad bank and kit**, attached when it becomes a drum lane
     /// (`LanePart::Pads`, `LanePart::Kit`) so nothing reloads. `None` on
     /// every other lane, which pays a pointer for the possibility.
@@ -8110,6 +8121,8 @@ impl Lane {
                 kit: None,
                 pdc: DelayLine::new(),
                 pdc_live: false,
+                pdc_ran: 0,
+                pdc_owed: 0,
                 dry_pdc: DelayLine::new(),
                 post: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 node: NodePrep::default(),
@@ -8283,9 +8296,14 @@ pub struct PadBank {
     /// targets every block.
     gain: f32,
     pdc: DelayLine,
-    /// Whether the kit's line last ran outside the wait, as a lane's does
-    /// (`LaneBody::pdc_live`).
+    /// Whether the kit's line last ran outside the wait, and the chunk it
+    /// last ran in, as a lane's (`LaneBody::pdc_live`, `LaneBody::pdc_ran`).
     pdc_live: bool,
+    pdc_ran: u64,
+    /// **Frames the kit's line still owes the mix**: what it holds of the
+    /// last chunk it was fed sound, which it plays out over its wait.
+    /// `mix_pads` runs the kits while any owes, as while any pad sounds.
+    pdc_owed: usize,
     dry_pdc: DelayLine,
     /// **This kit's strikes this chunk**, live and clip both, in the order
     /// they were collected, and its note-offs for the pads that obey them.
@@ -8325,6 +8343,8 @@ impl PadBank {
             gain: 1.0,
             pdc: DelayLine::new(),
             pdc_live: false,
+            pdc_ran: 0,
+            pdc_owed: 0,
             dry_pdc: DelayLine::new(),
             hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
@@ -9834,6 +9854,10 @@ struct LanePlan<'a> {
     board_runs: bool,
     stems_dry: bool,
     keys_live: bool,
+    /// **Its compensation line still owes the mix what it holds**
+    /// (`LaneBody::pdc_owed`): the lane renders and folds silence so the
+    /// fold's line plays it out, though nothing on it sounds.
+    owes: bool,
     notes: &'a [Note],
     controls: &'a [Control],
     sample: Option<&'a SamplerSample>,
@@ -10527,10 +10551,12 @@ fn render_lane(
     // rendered before the walk, summed at the head below.
     let kit = seats.kit;
     voiced |= kit.is_some();
-    if !voiced && !rack_live && !has_audio {
+    if !voiced && !rack_live && !has_audio && !plan.owes {
         // Nothing to play and nothing to play it through: an
         // inactive instrument on a bare lane. The seed above has
         // already left `fx_in` silent, so there is nothing to undo.
+        // **Unless its compensation still owes the mix** (`owes`): then
+        // the silence is folded, so the fold plays out what it holds.
         return false;
     }
     // **The dry copy, taken here: after the source is assembled and
@@ -17628,7 +17654,7 @@ impl Renderer {
             .iter()
             .flatten()
             .filter_map(|l| l.peek().pads.as_deref())
-            .any(|bank| !bank.hits.is_empty() || !bank.offs.is_empty() || bank.voices.iter().any(PadVoice::active))
+            .any(|bank| !bank.hits.is_empty() || !bank.offs.is_empty() || bank.voices.iter().any(PadVoice::active) || bank.pdc_owed > 0)
             && !any_rack
         {
             // **The kit's fader advances even while the kit is silent.**
@@ -18320,7 +18346,19 @@ impl Renderer {
             // never armed.
             let live = drum_lane.is_some_and(|c| self.plays_live(c));
             let glide = self.live_glide_frames();
-            let (line, dry_line, was_live) = match drum_lane {
+            let chunk = self.chunks;
+            let live_ok = self.shared.live_ok.load(Ordering::Relaxed);
+            // **Whether the kit fed its line any sound this chunk**: its line
+            // then owes the mix its wait's worth of frames, and the kits run
+            // until it has played them (`PadBank::pdc_owed`). A hit shorter
+            // than the wait was never heard: its voice ended, `mix_pads`
+            // returned before every line, and the hit stood in its ring.
+            let fed = self.fx_in.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
+            let owes = if live { 0 } else { wait.max(tap.unwrap_or(0)) };
+            if let Some(bank) = self.spine.lanes.get_mut(lane_ix).and_then(Option::as_deref_mut).and_then(|l| l.body_mut().pads.as_deref_mut()) {
+                bank.pdc_owed = if fed { owes } else { bank.pdc_owed.saturating_sub(frames).min(owes) };
+            }
+            let (line, dry_line, was) = match drum_lane {
                 Some(ch) => match self
                     .spine
                     .lanes
@@ -18328,21 +18366,28 @@ impl Renderer {
                     .and_then(Option::as_deref_mut)
                     .and_then(|l| l.body_mut().pads.as_deref_mut())
                 {
-                    Some(bank) => (Some(&mut bank.pdc), Some(&mut bank.dry_pdc), Some(&mut bank.pdc_live)),
+                    Some(bank) => (Some(&mut bank.pdc), Some(&mut bank.dry_pdc), Some((&mut bank.pdc_live, &mut bank.pdc_ran))),
                     None => (None, None, None),
                 },
                 None => (Some(&mut self.bare_pad_pdc), Some(&mut self.bare_pad_dry_pdc), None),
             };
             if let Some(line) = line {
-                let glides = live
-                    || (self.shared.live_ok.load(Ordering::Relaxed)
-                        && (was_live.as_deref().copied().unwrap_or(false) || line.gliding()));
-                if let Some(was) = was_live {
-                    *was = live;
-                }
+                // As a lane's line (`run_lane_pdc`): only a line that ran last
+                // chunk glides, and a kit is silent between its strikes, when
+                // `mix_pads` returns before it.
+                let glides = match was {
+                    Some((was_live, ran)) => {
+                        let awake = ran.wrapping_add(1) == chunk;
+                        *ran = chunk;
+                        let glides = awake && live_ok && (live || *was_live || line.gliding());
+                        *was_live = live;
+                        glides
+                    }
+                    None => false,
+                };
+                let (wait, tap) = if live { (0, None) } else { (wait, tap) };
                 match tap {
                     _ if glides => {
-                        let (wait, tap) = if live { (0, None) } else { (wait, tap) };
                         kit_tapped = line.run_glide(&mut self.fx_in, frames, wait, &mut self.fold_tap, tap, glide);
                     }
                     Some(t) => {
@@ -19072,17 +19117,26 @@ impl Renderer {
             pdc_max.saturating_sub(own).saturating_sub(prep.folder_lat),
         )
         .unwrap_or(0);
-        // **An armed lane played live stands outside the wait** (the owner's
-        // ruling of 2026-10-19), the way a monitored input does (`mix_monitor`):
-        // the player hears their keys after their own chain and nothing more,
-        // and its own clips play with it while it is armed. Moving in and out
-        // GLIDES (`DelayLine::run_glide`), so arming or disarming mid-roll
-        // never steps, repeats a block or opens a hole.
+        // **An armed lane played live stands outside the wait while its own
+        // timeline is silent** (the owner's ruling of 2026-10-19): the song
+        // stopped, or the lane recording, its clips punched out
+        // (`plays_live`). The player hears their keys after their own chain
+        // and nothing more, the way a monitored input does (`mix_monitor`);
+        // while the song plays the lane back it waits with the mix, so its
+        // own clips stay on the beat. Moving in and out GLIDES
+        // (`DelayLine::run_glide`): its two reads cross over ten
+        // milliseconds.
+        // **Only a line that ran last chunk glides.** One waking from
+        // silence takes its new wait at once, on the emptying road, so the
+        // first note after a quiet edge is neither faded in nor heard twice,
+        // and nothing its ring kept from before the quiet is played.
         // **Only where a lane may stand outside it**: a realtime export
         // takes the line back at once (`Shared::live_ok`), as the full-speed
         // export's line has always been, empty and at its wait.
         let live = self.plays_live(ch);
-        let glides = live || (self.shared.live_ok.load(Ordering::Relaxed) && (lane.pdc_live || lane.pdc.gliding()));
+        let awake = lane.pdc_ran.wrapping_add(1) == self.chunks;
+        lane.pdc_ran = self.chunks;
+        let glides = awake && self.shared.live_ok.load(Ordering::Relaxed) && (live || lane.pdc_live || lane.pdc.gliding());
         lane.pdc_live = live;
         // **Over the staging pair, which is the lane's CONSUMED stream.**
         // The grains under it may be cut anywhere; what this line sees is
@@ -19101,9 +19155,15 @@ impl Renderer {
                 usize::try_from(pdc_max.saturating_sub(own).saturating_sub(through)).unwrap_or(0)
             })
             .filter(|t| *t != want);
+        // Outside the wait the line waits nothing, and its send with it.
+        let (want, tap) = if live { (0, None) } else { (want, tap) };
+        // **What the line owes once it is fed no more** (`pdc_owed`): its
+        // wait's worth of frames after the last chunk that brought sound.
+        let fed = self.lane_stage.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
+        let owes = want.max(tap.unwrap_or(0));
+        lane.pdc_owed = if fed { owes } else { lane.pdc_owed.saturating_sub(frames).min(owes) };
         let tapped = match tap {
             _ if glides => {
-                let (want, tap) = if live { (0, None) } else { (want, tap) };
                 let glide = self.live_glide_frames();
                 lane.pdc.run_glide(&mut self.lane_stage, frames, want, &mut self.fold_tap, tap, glide)
             }
@@ -19154,13 +19214,28 @@ impl Renderer {
     /// arms a track to play it (`live_midi_off`), on a live desk whose host
     /// lets a lane stand outside (`Shared::live_ok`: never offline, and never
     /// under a realtime export, which must lay the song down aligned, as the
-    /// full-speed one does). A lane
+    /// full-speed one does), **and only while its own timeline is silent**:
+    /// the song stopped, or the lane recording, its schedule punched out from
+    /// at or before this chunk's first frame (`Wide::punch_now`). A lane
+    /// outside the wait plays its clips as early as it plays its keys, by
+    /// all the wait it skips, and a record mutes them; while the song plays
+    /// the lane back and it is not recording, it waits with the mix, so a
+    /// part it plays back is on the beat, as an export lays it down. A lane
     /// that only listens, the one open in the MIDI editor, waits with the
     /// mix, and so does an armed audio track, whose input the room already
     /// plays outside it.
     fn plays_live(&self, ch: usize) -> bool {
         let desk = &self.spine.ext.desk;
-        desk.armed.contains(ch) && desk.midi_on.contains(ch) && self.shared.live_ok.load(Ordering::Relaxed)
+        // `was_rolling` is this chunk's by now (`render_program`), and the
+        // anchor is this chunk's first frame (`run_transport`).
+        let silent = !self.was_rolling
+            || self
+                .spine
+                .ext
+                .punch_now
+                .get(ch)
+                .is_some_and(|p| *p <= self.shared.transport_anchor.load(Ordering::Relaxed));
+        desk.armed.contains(ch) && desk.midi_on.contains(ch) && silent && self.shared.live_ok.load(Ordering::Relaxed)
     }
 
     /// **How long a lane's wait takes to glide in or out**: ten milliseconds,
@@ -20691,6 +20766,7 @@ impl Renderer {
                     folds,
                     sample,
                     pads,
+                    pdc_owed,
                     ..
                 } = body;
                 let [rack, extra] = chains;
@@ -20736,6 +20812,7 @@ impl Renderer {
                     board_runs: prep.board_runs,
                     stems_dry,
                     keys_live,
+                    owes: *pdc_owed > 0,
                     notes,
                     controls,
                     // The lane's own file, out of its own box.
@@ -49119,11 +49196,12 @@ mod slot_engine {
         }
 
         /// **An instrument on lane 5 and a kit on lane 6, armed to be played
-        /// or only listening, on a desk with a deep-range Tape on silent lane
-        /// 2 or none**: the frame a key or a pad struck before block 8 is heard
+        /// or only listening, recording (its schedule punched out from 0:00)
+        /// or not, on a desk with a deep-range Tape on silent lane 2 or
+        /// none**: the frame a key or a pad struck before block 8 is heard
         /// at, counted from that block, read off the render less its twin with
         /// nothing struck.
-        fn played_live(kit: bool, armed: bool, deep: bool, rolling: bool) -> usize {
+        fn played_live(kit: bool, armed: bool, deep: bool, rolling: bool, recording: bool) -> usize {
             use crate::builtin_fx::TAPE_PATH;
             let render = |strike: bool| -> Vec<f32> {
                 let mut e = wide(42);
@@ -49133,6 +49211,9 @@ mod slot_engine {
                 }
                 let (lane, own) = if kit { (6, F::DRUM) } else { (5, F::BUILTIN) };
                 inputs.lanes[lane].flags = if armed { own | F::ARMED } else { own };
+                if recording {
+                    inputs.lanes[lane].punch = Some(0);
+                }
                 e.publish_plan(&inputs).expect("the plan goes");
                 if kit {
                     let slot = Slot(6);
@@ -49172,30 +49253,126 @@ mod slot_engine {
         }
 
         /// **An armed instrument played live is heard after its own chain
-        /// alone, with a deep-range Tape elsewhere on the desk; a lane that
-        /// only listens still waits with the mix** (the owner's ruling of
-        /// 2026-10-19).
+        /// alone while the song is stopped or the track records, with a
+        /// deep-range Tape elsewhere on the desk; while the song plays it
+        /// back, it waits with the mix, as a lane that only listens does**
+        /// (the owner's ruling of 2026-10-19).
         ///
         /// Every lane waits for the slowest chain (`run_lane_pdc`), and an
         /// armed lane did too: a key played into a DX7 on it with a deep-range
         /// Tape on a silent lane came out 1,200 frames (25 ms) later than on a
         /// bare desk, and a pad struck on an armed drum lane the same. An armed
-        /// lane listening to MIDI is played live, and stands outside the wait
-        /// now, as a monitored input does (`plays_live`): heard on the frame a
-        /// bare desk hears it, rolling or stopped, the DX7's own 110 frames of
-        /// attack and the kit's none. The lane open in the MIDI editor listens
-        /// and is not armed, and waits, as every lane that is not played does.
+        /// lane listening to MIDI stands outside the wait now, as a monitored
+        /// input does (`plays_live`), wherever its own timeline is silent: the
+        /// song stopped, or the lane recording, its clips punched out. There it
+        /// is heard on the frame a bare desk hears it, the DX7's own 110 frames
+        /// of attack and the kit's none. A lane outside the wait plays its
+        /// clips as early as its keys, so while the song plays it back and it
+        /// is not recording it waits, 1,200 frames, and its clips stay on the
+        /// beat (`an_armed_tracks_own_clips_play_on_the_beat_while_it_plays_back`).
+        /// The lane open in the MIDI editor listens and is not armed, and
+        /// waits, as every lane that is not played does.
         #[test]
-        fn an_armed_instrument_played_live_is_heard_at_once_on_a_held_desk() {
+        fn an_armed_instrument_played_live_is_heard_at_once_while_stopped_or_recording() {
             for kit in [false, true] {
-                for rolling in [true, false] {
-                    let bare = played_live(kit, true, false, rolling);
-                    assert_eq!(bare, played_live(kit, false, false, rolling), "kit {kit}, rolling {rolling}: on a bare desk arming moved the strike");
-                    let live = played_live(kit, true, true, rolling);
-                    assert_eq!(live, bare, "kit {kit}, rolling {rolling}: the armed lane played live waited {} frames for a Tape on another lane", live as i64 - bare as i64);
-                    let listens = played_live(kit, false, true, rolling);
-                    assert_eq!(listens, bare + 1_200, "kit {kit}, rolling {rolling}: the lane that only listens is heard at {listens}, not with the mix");
+                let bare = played_live(kit, true, false, true, true);
+                for (rolling, recording) in [(false, false), (false, true), (true, false), (true, true)] {
+                    let on_bare = played_live(kit, true, false, rolling, recording);
+                    assert_eq!(on_bare, bare, "kit {kit}, rolling {rolling}, recording {recording}: on a bare desk the strike moved");
+                    let live = played_live(kit, true, true, rolling, recording);
+                    let want = if rolling && !recording { bare + 1_200 } else { bare };
+                    assert_eq!(
+                        live,
+                        want,
+                        "kit {kit}, rolling {rolling}, recording {recording}: the armed lane played live waited {} frames for a Tape on another lane",
+                        live as i64 - bare as i64
+                    );
+                    let listens = played_live(kit, false, true, rolling, recording);
+                    assert_eq!(listens, bare + 1_200, "kit {kit}, rolling {rolling}, recording {recording}: the lane that only listens is heard at {listens}, not with the mix");
                 }
+            }
+        }
+
+        /// **An armed track's own clips play on the beat while it plays them
+        /// back, and a record punches them out** (a verifier's finding on the
+        /// first draft of the owner's ruling of 2026-10-19).
+        ///
+        /// The shipped default session arms its piano track, and the first
+        /// draft stood every armed lane played live outside the wait whatever
+        /// it was doing: on a desk held by a deep-range Tape, a MIDI clip's
+        /// note on beat two of an armed DX7 lane started 1,538 frames ahead of
+        /// the backing's beat two, where unarmed it starts 338 frames ahead (a
+        /// DX7 note is struck at the start of its chunk), so an armed track
+        /// played its own part 1,200 frames (25 ms) early, in the room and in
+        /// the take, and an export (which lays every lane down aligned)
+        /// sounded other than the playback. Rolling and not recording, an
+        /// armed lane waits with the mix now (`plays_live`): its note starts
+        /// as far ahead of the beat as the unarmed lane's, on a bare desk and
+        /// held. Recording, its clip is punched out from the record's start,
+        /// so no note of it sounds at all where the lane stands outside.
+        #[test]
+        fn an_armed_tracks_own_clips_play_on_the_beat_while_it_plays_back() {
+            use crate::builtin_fx::TAPE_PATH;
+            let render = |armed: bool, deep: bool, recording: bool, note: bool, backing: bool| -> Vec<f32> {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for l in inputs.lanes.iter_mut() {
+                    l.flags = F::MIDI_OFF;
+                }
+                inputs.lanes[5].flags = if armed { F::BUILTIN | F::ARMED } else { F::BUILTIN };
+                if recording {
+                    inputs.lanes[5].punch = Some(0);
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                let _ = e.sync_instruments(&[Slot(5)], &[]);
+                if deep {
+                    unit(&mut e, 2, 0, 0, TAPE_PATH, Some(knobs(TAPE_PATH, &[(9, 1.0)])));
+                }
+                e.set_live_play(true);
+                e.set_lane_levels(Slot(5), 1.0, 0.0, 0.0);
+                if backing {
+                    e.set_clips_slotted(vec![impulse_at(&e, 1, BEAT_TWO)]);
+                }
+                if note {
+                    let gen = e.lane_gen(Slot(5)).expect("a lane");
+                    e.set_midi_slotted(vec![SlotPlacedMidi {
+                        slot: Slot(5),
+                        gen,
+                        placed: PlacedMidi {
+                            strip: 5,
+                            start: 0,
+                            len: 96_000,
+                            notes: Arc::new(vec![ClipNote { at: BEAT_TWO as u64, dur: 12_000, key: 60, vel: 120 }]),
+                            pedal: Arc::new(Vec::new()),
+                        },
+                    }]);
+                }
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..8 {
+                    e.render_offline(&mut out);
+                }
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut heard = Vec::new();
+                for _ in 0..60 {
+                    e.render_offline(&mut out);
+                    heard.extend_from_slice(&out);
+                }
+                heard
+            };
+            for deep in [false, true] {
+                let quiet = render(false, deep, false, false, false);
+                let beat = onset_from(&less(&render(false, deep, false, false, true), &quiet), 0, CROSS).expect("the backing sounds") as i64;
+                let lead = |armed: bool| {
+                    let q = render(armed, deep, false, false, false);
+                    onset_from(&less(&render(armed, deep, false, true, false), &q), 0, 1e-4).expect("the clip's note sounds") as i64 - beat
+                };
+                let unarmed = lead(false);
+                assert_eq!(lead(true), unarmed, "deep {deep}: the armed lane's own note is {} frames off the unarmed lane's", lead(true) - unarmed);
+                assert!((-600..0).contains(&unarmed), "fixture: deep {deep}: the clip's note leads the beat by {unarmed}");
+                let q = render(true, deep, true, false, false);
+                let punched = less(&render(true, deep, true, true, false), &q);
+                assert!(onset_from(&punched, 0, 1e-4).is_none(), "deep {deep}: a recording lane played its punched-out clip");
             }
         }
 
@@ -49206,8 +49383,9 @@ mod slot_engine {
             e.set_seat_latency_for_test(lane_seat(2, CHAIN_OWN), 0, frames);
         }
 
-        /// **A 441 Hz tone at a quarter, both sides, `seconds` long.**
-        fn tone(seconds: f64) -> Arc<tangent_record::decode::Clip> {
+        /// **A kit whose first pad is a 441 Hz tone at a quarter, both sides,
+        /// `seconds` long**: one strike is a continuous signal.
+        fn tone_kit(seconds: f64) -> PadKit {
             let frames = (seconds * 48_000.0) as usize;
             let samples = (0..frames)
                 .flat_map(|k| {
@@ -49215,56 +49393,58 @@ mod slot_engine {
                     [v, v]
                 })
                 .collect();
-            Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::from("tone.wav") })
+            let mut kit = PadKit::default();
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::from("tone.wav") }));
+            kit
         }
 
-        /// **Arming a lane mid-roll moves it out of the wait without a step,
-        /// a repeat or a burst, and disarming it moves it back the same way**
-        /// (the owner's ruling of 2026-10-19).
+        /// **A record starting mid-roll moves an armed lane out of the wait
+        /// without a step, a repeat or a burst, and its end moves it back the
+        /// same way** (the owner's ruling of 2026-10-19).
         ///
-        /// Lane 5 plays a continuous tone on a desk held 1,200 frames. Armed
-        /// to be played it stands outside the wait (`plays_live`), and the
-        /// change GLIDES (`DelayLine::run_glide`): over ten milliseconds the
-        /// line's old read fades out under its new one. So the speakers play
-        /// the tone held back 1,200 frames up to the arm, exactly; then, past
-        /// the glide, exactly the tone as a desk armed from the start plays
-        /// it, at once; and past the disarm's glide exactly the held tone
-        /// again, from the history the line kept while it stood outside. Inside
-        /// each glide every frame is the two reads' straight-line blend, so no
-        /// sample is louder than the tone, and no step from one frame to the
-        /// next is more than a tenth larger than the tone's own largest. The
-        /// line emptied as a plugin swap empties it would leave a hole of
-        /// 1,200 frames and a step to silence.
+        /// Lane 6, an armed kit, rings a continuous tone struck live on a desk
+        /// held 1,200 frames. Played back (rolling, not recording) it waits
+        /// with the mix; the record punching it out at block 40 stands it
+        /// outside the wait (`plays_live`), and the record ending at block 80
+        /// brings it back. Each change GLIDES (`DelayLine::run_glide`): over
+        /// ten milliseconds the line's old read fades out under its new one.
+        /// So the speakers play the tone held back 1,200 frames up to the
+        /// record, exactly; then, past the glide, exactly the tone as a lane
+        /// recording from the start plays it, at once; and past the end's
+        /// glide exactly the held tone again, from the history the line kept
+        /// while it stood outside. Inside each glide every frame is the two
+        /// reads' straight-line blend, so no sample is louder than the tone,
+        /// and no step from one frame to the next is more than a tenth larger
+        /// than the tone's own largest. The line emptied as a plugin swap
+        /// empties it would leave a hole of 1,200 frames and a step to
+        /// silence. (A tone these two reads put out of phase would dip
+        /// through the blend; at 441 Hz they are a fortieth of a cycle apart.)
         #[test]
-        fn arming_and_disarming_a_lane_mid_roll_glides_its_wait() {
+        fn a_record_starting_and_ending_mid_roll_glides_an_armed_lanes_wait() {
             const ARM: usize = 40;
             const DISARM: usize = 80;
             const BLOCKS: usize = 120;
             let glide = (48_000.0 * LIVE_GLIDE_S) as usize;
             let render = |arm_at: Option<usize>, disarm_at: Option<usize>| -> Vec<f32> {
                 let mut e = wide(42);
-                let [unarmed, armed] = [false, true].map(|armed| {
+                let [played, recording] = [false, true].map(|recording| {
                     let mut inputs = bus_plan(&e, 42, &[]);
                     for l in inputs.lanes.iter_mut() {
                         l.flags = F::MIDI_OFF;
                     }
-                    if armed {
-                        inputs.lanes[5].flags = F::ARMED;
+                    inputs.lanes[6].flags = F::DRUM | F::ARMED;
+                    if recording {
+                        inputs.lanes[6].punch = Some(0);
                     }
                     inputs
                 });
-                e.publish_plan(if arm_at == Some(0) { &armed } else { &unarmed }).expect("the plan goes");
+                e.publish_plan(if arm_at == Some(0) { &recording } else { &played }).expect("the plan goes");
+                let gen = e.lane_gen(Slot(6)).expect("a lane");
+                e.attach(Slot(6), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                e.attach(Slot(6), gen, LanePart::Kit(Box::new(tone_kit(4.0)))).expect("the kit");
                 fake_hold(&mut e, 1_200);
                 e.set_live_play(true);
-                let gen = e.lane_gen(Slot(5)).expect("a lane");
-                let clip = tone(3.0);
-                let len = clip.frames() as u64;
-                e.set_clips_slotted(vec![SlotPlaced {
-                    slot: Slot(5),
-                    gen,
-                    placed: Placed { clip, strip: 0, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 1.0 },
-                }]);
-                e.set_lane_levels(Slot(5), 1.0, 0.0, 0.0);
+                e.set_lane_levels(Slot(6), 1.0, 0.0, 0.0);
                 let mut out = vec![0.0f32; BLOCK * 2];
                 // Every slew settled before the roll.
                 for _ in 0..40 {
@@ -49272,13 +49452,14 @@ mod slot_engine {
                 }
                 e.set_transport(1, 0);
                 e.set_rolling(true);
+                e.send_midi(0, &[0x99, PAD_BASE, 127]);
                 let mut heard = Vec::new();
                 for b in 0..BLOCKS {
                     if arm_at == Some(b) && b > 0 {
-                        e.publish_plan(&armed).expect("the arm goes");
+                        e.publish_plan(&recording).expect("the record goes");
                     }
                     if disarm_at == Some(b) {
-                        e.publish_plan(&unarmed).expect("the disarm goes");
+                        e.publish_plan(&played).expect("the record ends");
                     }
                     e.render_offline(&mut out);
                     heard.extend_from_slice(&out);
@@ -49289,10 +49470,10 @@ mod slot_engine {
             let held = render(None, None);
             let live = render(Some(0), None);
             let moved = render(Some(ARM), Some(DISARM));
-            // Armed from the start, the lane plays at once; unarmed, the
-            // target late.
+            // Recording from the start, the lane plays at once; played back,
+            // the target late.
             let starts = |v: &[f32]| onset_from(v, 0, 0.01).expect("the tone sounds");
-            assert_eq!(starts(&held), starts(&live) + 1_200, "the armed lane does not stand outside the wait");
+            assert_eq!(starts(&held), starts(&live) + 1_200, "the recording lane does not stand outside the wait");
             let frame = |v: &[f32], k: usize| [v[k * 2], v[k * 2 + 1]];
             // The tone at its steadiest, and its own largest step.
             let step = |v: &[f32], from: usize, to: usize| (from..to - 1).map(|k| (v[(k + 1) * 2] - v[k * 2]).abs()).fold(0.0f32, f32::max);
@@ -49332,6 +49513,261 @@ mod slot_engine {
             assert!(worst <= own * 1.1, "a step of {worst} where the tone's own largest is {own}");
             let loud = moved[span.0 * 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(loud <= top * 1.0001, "a burst to {loud} over a tone of {top}");
+        }
+
+        /// **A kit that rings to nothing, or a DX7 lane parked by silence, on a
+        /// desk held 1,200 frames**: lane 5 armed, and recording (punched out)
+        /// when `recording`; struck live `quiet` blocks after a first strike,
+        /// with the record started or ended `edge` blocks before the second
+        /// strike when one is given (the lane quiet then). Answers the second
+        /// strike's 3,000 frames.
+        fn struck_after_a_quiet_edge(kind: u8, recording: bool, edge: Option<usize>, quiet: usize) -> Vec<f32> {
+            let mut e = wide(42);
+            let [played, punched] = [false, true].map(|punch| {
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for l in inputs.lanes.iter_mut() {
+                    l.flags = F::MIDI_OFF;
+                }
+                let own = if kind == 0 { F::BUILTIN } else { F::DRUM };
+                inputs.lanes[5].flags = own | F::ARMED;
+                if punch {
+                    inputs.lanes[5].punch = Some(0);
+                }
+                inputs
+            });
+            // Before the edge, the state the edge leaves.
+            let before = recording != edge.is_some();
+            e.publish_plan(if before { &punched } else { &played }).expect("the plan goes");
+            match kind {
+                0 => {
+                    let _ = e.sync_instruments(&[Slot(5)], &[]);
+                }
+                k => {
+                    let gen = e.lane_gen(Slot(5)).expect("a lane");
+                    e.attach(Slot(5), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                    let kit = if k == 1 {
+                        impulse_kit()
+                    } else {
+                        let mut kit = PadKit::default();
+                        let samples = (0..4_800)
+                            .flat_map(|k| {
+                                let v = (k as f64 * std::f64::consts::TAU * 1_000.0 / 48_000.0).sin() as f32 * 0.5 * (-(k as f32) / 600.0).exp();
+                                [v, v]
+                            })
+                            .collect();
+                        kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::new() }));
+                        kit
+                    };
+                    e.attach(Slot(5), gen, LanePart::Kit(Box::new(kit))).expect("the kit");
+                }
+            }
+            fake_hold(&mut e, 1_200);
+            e.set_live_play(true);
+            e.set_lane_levels(Slot(5), 1.0, 0.0, 0.0);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let strike = |e: &Engine| {
+                if kind == 0 {
+                    e.send_midi(0, &[0x90, 57, 120]);
+                } else {
+                    e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                }
+            };
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..10 {
+                e.render_offline(&mut out);
+            }
+            strike(&e);
+            for _ in 0..20 {
+                e.render_offline(&mut out);
+            }
+            if kind == 0 {
+                e.send_midi(0, &[0x80, 57, 0]);
+            }
+            for b in 0..quiet {
+                if edge.is_some_and(|d| d == quiet - b) {
+                    e.publish_plan(if recording { &punched } else { &played }).expect("the edge goes");
+                }
+                e.render_offline(&mut out);
+            }
+            strike(&e);
+            let mut heard = Vec::new();
+            for _ in 0..6 {
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+            }
+            heard.truncate(3_000 * 2);
+            heard
+        }
+
+        /// **A drum hit shorter than the desk's hold is heard where it was
+        /// struck, whole, every time** (found pinning the quiet edges below: a
+        /// fault of the kit's line since kits were compensated).
+        ///
+        /// A kit's line runs only while `mix_pads` does, and `mix_pads` rested
+        /// the moment every pad's voice had ended, so what a line held of a hit
+        /// stood in its ring unheard: a 10 ms hit (480 frames) struck on a desk
+        /// held 1,200 frames never sounded, struck once or twice, and a hit
+        /// longer than the hold lost its last 1,200 frames to the head of the
+        /// next. The kits run on now while a line owes the mix what it holds
+        /// (`PadBank::pdc_owed`): held, each strike is the bare desk's own,
+        /// sample for sample, 1,200 frames later, and nothing sounds before.
+        #[test]
+        fn a_drum_hit_shorter_than_the_desks_hold_is_heard_where_it_was_struck() {
+            let render = |hold: u32| -> Vec<f32> {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for l in inputs.lanes.iter_mut() {
+                    l.flags = F::MIDI_OFF;
+                }
+                inputs.lanes[6].flags = F::DRUM;
+                e.publish_plan(&inputs).expect("the plan goes");
+                let gen = e.lane_gen(Slot(6)).expect("a lane");
+                e.attach(Slot(6), gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the pads");
+                let samples = (0..480)
+                    .flat_map(|k| {
+                        let v = (k as f64 * std::f64::consts::TAU * 1_000.0 / 48_000.0).sin() as f32 * 0.5 * (-(k as f32) / 120.0).exp();
+                        [v, v]
+                    })
+                    .collect();
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::new() }));
+                e.attach(Slot(6), gen, LanePart::Kit(Box::new(kit))).expect("the kit");
+                if hold > 0 {
+                    fake_hold(&mut e, hold);
+                }
+                e.set_lane_levels(Slot(6), 1.0, 0.0, 0.0);
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..10 {
+                    e.render_offline(&mut out);
+                }
+                let mut heard = Vec::new();
+                for b in 0..20 {
+                    if b == 0 || b == 10 {
+                        e.send_midi(0, &[0x99, PAD_BASE, 127]);
+                    }
+                    e.render_offline(&mut out);
+                    heard.extend_from_slice(&out);
+                }
+                heard
+            };
+            let bare = render(0);
+            let held = render(1_200);
+            let loud = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(loud(&bare) > 0.1, "fixture: the bare kit is silent");
+            assert!(loud(&held[..1_200 * 2]) == 0.0, "the held kit sounded before its hold");
+            for k in 0..bare.len() / 2 - 1_200 {
+                for c in 0..2 {
+                    let (h, b) = (held[(k + 1_200) * 2 + c], bare[k * 2 + c]);
+                    assert!((h - b).abs() < 1e-6, "frame {k} of the bare desk's hits is {b}, the held desk's {h}");
+                }
+            }
+        }
+
+        /// **A built-in instrument's notes end whole on a held desk, and no
+        /// note's end is heard again at the next** (found with the kit's,
+        /// below the same pins).
+        ///
+        /// A DX7 lane with nothing in its bays stops folding the moment its
+        /// last voice ends (`render_lane`), and its compensation line ran only
+        /// in the fold, so the line's last 1,200 frames of every note, its
+        /// release, stood in the ring: the note was cut off 25 ms short, and
+        /// that 25 ms played out ahead of the next note, whenever it came. The
+        /// lane folds silence now while its line owes the mix
+        /// (`LaneBody::pdc_owed`): two notes from a clip on a desk held 1,200
+        /// frames are the bare desk's, sample for sample, 1,200 frames later,
+        /// and nothing sounds before them.
+        #[test]
+        fn a_built_in_instruments_notes_end_whole_on_a_held_desk() {
+            let render = |hold: u32| -> Vec<f32> {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[]);
+                for l in inputs.lanes.iter_mut() {
+                    l.flags = F::MIDI_OFF;
+                }
+                inputs.lanes[5].flags = F::BUILTIN;
+                e.publish_plan(&inputs).expect("the plan goes");
+                let _ = e.sync_instruments(&[Slot(5)], &[]);
+                if hold > 0 {
+                    fake_hold(&mut e, hold);
+                }
+                e.set_lane_levels(Slot(5), 1.0, 0.0, 0.0);
+                let gen = e.lane_gen(Slot(5)).expect("a lane");
+                e.set_midi_slotted(vec![SlotPlacedMidi {
+                    slot: Slot(5),
+                    gen,
+                    placed: PlacedMidi {
+                        strip: 5,
+                        start: 0,
+                        len: 96_000,
+                        notes: Arc::new(vec![
+                            ClipNote { at: 4_096, dur: 6_000, key: 60, vel: 120 },
+                            ClipNote { at: 40_960, dur: 6_000, key: 64, vel: 120 },
+                        ]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                }]);
+                let mut out = vec![0.0f32; BLOCK * 2];
+                for _ in 0..8 {
+                    e.render_offline(&mut out);
+                }
+                e.set_transport(1, 0);
+                e.set_rolling(true);
+                let mut heard = Vec::new();
+                for _ in 0..140 {
+                    e.render_offline(&mut out);
+                    heard.extend_from_slice(&out);
+                }
+                heard
+            };
+            let bare = render(0);
+            let held = render(1_200);
+            let loud = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(loud(&bare) > 0.05, "fixture: the DX7 is silent");
+            assert!(loud(&held[..(4_096 + 1_000) * 2]) == 0.0, "the held lane sounded before its first note was heard");
+            for k in 0..bare.len() / 2 - 1_200 {
+                for c in 0..2 {
+                    let (h, b) = (held[(k + 1_200) * 2 + c], bare[k * 2 + c]);
+                    assert!((h - b).abs() < 1e-6, "frame {k} of the bare desk's notes is {b}, the held desk's {h}");
+                }
+            }
+        }
+
+        /// **The first strike after a record starts or ends while the lane is
+        /// quiet is heard once, whole, where a lane that never changed hears
+        /// it** (a verifier's finding: a quiet line glided at its first sound).
+        ///
+        /// A kit is silent between its strikes, when `mix_pads` returns before
+        /// its line, and a DX7 lane silent for 30 s parks; neither line runs,
+        /// so a change of wait made while it was quiet used to reach the line
+        /// at its first sound, and glide there: the first hit after the record
+        /// began was faded in or lost (an impulse kit's hit, 0.25 from the
+        /// start of a record, absent; a decaying 1 kHz hit at 0.036 for its
+        /// first millisecond where it is 0.490), a parked DX7's note faded in
+        /// behind stale ring audio, and the first hit after the record ended
+        /// sounded at once and again 1,200 frames later. A line that did not
+        /// run in the chunk before takes its new wait at once now, on the
+        /// emptying road: each strike here is, sample for sample, the strike
+        /// on a lane that was in that state all along.
+        #[test]
+        fn the_first_strike_after_a_quiet_edge_is_heard_once_where_it_belongs() {
+            for (kind, quiet) in [(1u8, 400usize), (2, 400), (0, 3_000)] {
+                for recording in [true, false] {
+                    let steady = struck_after_a_quiet_edge(kind, recording, None, quiet);
+                    let edged = struck_after_a_quiet_edge(kind, recording, Some(40), quiet);
+                    let loud = steady.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    assert!(loud > 0.05, "fixture: kind {kind}, recording {recording}: the strike is silent ({loud})");
+                    for (k, (a, b)) in edged.iter().zip(&steady).enumerate() {
+                        assert!(
+                            (a - b).abs() < 1e-6,
+                            "kind {kind}, recording {recording}: frame {} of the strike after the edge is {a}, a lane that never moved {b}",
+                            k / 2
+                        );
+                    }
+                }
+            }
         }
 
         /// **A count-in's go is heard with the mix's first beat on a held
@@ -49786,19 +50222,23 @@ mod slot_engine {
         /// the callback** (the owner's ruling of 2026-10-19). A desk held 1,200
         /// frames by a deep-range Tape, the click on, in the take and sent
         /// into a bus, a captured input whose record starts (so the tee writes
-        /// the take's mark), and lane 5 playing noise, armed on a live host's
-        /// word and then disarmed: every road is a ring the renderer or the
-        /// lane was built with.
+        /// the take's mark), and lane 5 armed and recording on a live host's
+        /// word (so it stands outside the wait) and then disarmed with its
+        /// record over: every road is a ring the renderer or the lane was
+        /// built with. The steady window counts the callback's own thread:
+        /// an offline engine has no lane hands, and the hands the counter
+        /// names are whichever test's pool runs beside this one.
         #[test]
         #[cfg(feature = "recorder")]
         fn the_held_click_a_takes_mark_and_a_gliding_lane_allocate_nothing() {
-            use crate::rt_alloc::{count_allocs, least_of, Counted};
+            use crate::rt_alloc::{count_allocs, least_of};
             let mut e = wide(42);
             let [armed, unarmed] = [true, false].map(|live| {
                 let mut inputs = bus_plan(&e, 42, &[40]);
                 inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
                 if live {
                     inputs.lanes[5].flags = F::ARMED;
+                    inputs.lanes[5].punch = Some(0);
                 }
                 inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 0.5, pre: false }];
                 inputs
@@ -49844,7 +50284,7 @@ mod slot_engine {
                     e.render_offline(&mut out);
                 }
             });
-            assert_eq!(after, Counted::default(), "a held desk recording allocated");
+            assert_eq!(after.here, 0, "a held desk recording allocated on the callback: {after:?}");
             assert!(out.iter().all(|s| s.is_finite()) && out.iter().any(|s| *s != 0.0), "fixture: the desk rendered garbage or silence");
         }
 
