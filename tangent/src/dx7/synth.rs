@@ -617,6 +617,12 @@ impl Dx7 {
             return;
         }
         let n = frames.min(out.len() / channels);
+        // A call of no frames renders nothing and retires nothing: retiring
+        // a note that died between two events on one frame would end the
+        // LFO's run there, where the same frames called whole carry it on.
+        if n == 0 {
+            return;
+        }
         let algo = usize::from(self.voice.algorithm.min(31));
         let dest = DEST[algo];
         let pms = f32::from(self.voice.pitch_mod_sens) / 7.0;
@@ -1585,6 +1591,10 @@ mod tests {
     /// engine on its way past. The piano's hash is the one it has always
     /// had: it lost its name, not its sound.
     #[test]
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        ignore = "the hashes are aarch64 macOS floats"
+    )]
     fn a_first_strike_from_silence_is_unchanged() {
         for (name, v, want) in [
             ("INIT VOICE", Voice::default(), 16_651_629_613_891_984_392),
@@ -1829,6 +1839,10 @@ mod tests {
     /// LFO is heard, so this is the pin that says such an export of one is
     /// the file it was.
     #[test]
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "macos")),
+        ignore = "the hashes are aarch64 macOS floats"
+    )]
     fn a_render_in_an_exports_chunks_is_the_one_it_was() {
         const CHUNK: usize = 512;
         let (events, _, frames) = three_phrases();
