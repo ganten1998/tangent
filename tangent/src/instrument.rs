@@ -288,11 +288,11 @@ const MAX_CONTROLS_PER_BLOCK: usize = 32;
 /// span began before the moves had frames of their own.
 const MAX_CUES_PER_BLOCK: usize = MAX_EVENTS_PER_BLOCK * 2 + 2 * MAX_CONTROLS_PER_BLOCK;
 
-/// **How many re-struck keys' offs one span's cues take on their own frame**
-/// (`Cue`): a note that begins and ends inside one span on a key struck again
-/// later in it, which takes a key repeated inside 10.7 ms. Past these the off
-/// is told at the strike that follows it, where it always was.
-const EARLY_OFFS: usize = 16;
+/// **What one lane's rack may be told in one span** (`LaneBody::controls`):
+/// the chunk's live controls whole, and its pedals where they stand at the
+/// span's head and at each move inside it (`rack_pedals`), all three at each,
+/// for every move the pedal walk keeps (`Renderer::pedal_moves`).
+const MAX_LANE_CONTROLS: usize = MAX_CONTROLS_PER_BLOCK + 3 * (1 + 2 * MAX_CONTROLS_PER_BLOCK);
 
 /// The recorder tap is **always stereo**, whatever the instrument renders.
 ///
@@ -732,9 +732,9 @@ const fn pedal_slot(cc: u8) -> Option<usize> {
 /// The pedals went the other way: a clip's pedal was read as the level at
 /// the stretch's head, so an edge inside it waited for the next stretch, and
 /// a live pedal took the whole callback's last level at its head. The Analog
-/// synth, the sampler, the kit and hosted instruments are handed the same
-/// notes with their offsets and always played each on its frame; they are
-/// handed exactly what they were.
+/// synth, the sampler, the kit and hosted instruments are handed the note
+/// list with its offsets, which they always played each on its frame, and
+/// the pedal as controls on their own frames (`rack_pedals`).
 ///
 /// Gathered by the decide walk, pedals first and then the notes in the order
 /// the walk delivered them, and put in time order keeping that order on a
@@ -767,6 +767,57 @@ fn sort_cues(cues: &mut [Cue]) {
         let mut j = i;
         while j > 0 && cues[j - 1].at() > cues[j].at() {
             cues.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
+/// **The rack's pedal, each move on its own frame**: the level a lane's
+/// pedals stand at on the head of its span (`head`) where it is not what
+/// its rack was last told (`sent`), and then every move inside the span its
+/// DX7 and keyboard are told (`Cue::Pedals`, from `Renderer::cue_pedals`), a
+/// control on the move's frame for each pedal it moves; `sent` is left at
+/// what was told last, so a move that found no room is told at the next
+/// span's head. Channel 0: a clip has no wire and so no channel of its own,
+/// and the live messages go in whole beside these, on theirs.
+///
+/// The rack was told the level after all of the chunk's moves at its span's
+/// head, as one control a pedal: a clip's edge inside the span waited for
+/// the next span, up to a chunk or a grain late, and a press and release
+/// inside one span was never told at all; a live pedal moved at its head.
+/// So an Analog, a sampler or a hosted instrument held or let go of a note
+/// at another frame than the DX7 and the keyboard did, and than the export
+/// did where its chunks fell elsewhere. Told on the frame the clip or the
+/// foot moves it, the rack hears what the DX7 and the keyboard hear.
+fn rack_pedals(sent: &mut [u8; 3], head: [u8; 3], moves: &[Cue], out: &mut Vec<Control>) {
+    let mut say = |at: u32, level: [u8; 3], out: &mut Vec<Control>| {
+        for (slot, cc) in PEDAL_CCS.into_iter().enumerate() {
+            if sent[slot] != level[slot] && out.len() < out.capacity() {
+                sent[slot] = level[slot];
+                out.push(Control::cc(at as i32, 0, i16::from(cc), level[slot]));
+            }
+        }
+    };
+    say(0, head, out);
+    for m in moves {
+        if let Cue::Pedals { at, cc } = *m {
+            say(at, cc, out);
+        }
+    }
+}
+
+/// **A lane's controls in time order, each frame's in the order they were
+/// gathered**: an insertion sort, stable and allocation-free, over the live
+/// controls whole and then the pedal's (`rack_pedals`). A hosted instrument
+/// takes each control as a point on its parameter's queue, and a queue is a
+/// line through the block that only goes forward; the built-in voices sort
+/// what they are handed themselves and keep the order on a shared frame,
+/// which this keeps too.
+fn sort_controls(controls: &mut [Control]) {
+    for i in 1..controls.len() {
+        let mut j = i;
+        while j > 0 && controls[j - 1].offset > controls[j].offset {
+            controls.swap(j - 1, j);
             j -= 1;
         }
     }
@@ -2461,8 +2512,8 @@ fn live_lag(want: usize, tap: Option<usize>) -> Option<usize> {
 }
 
 /// **Where one block of a lane's own timeline stands**, read off the song's
-/// trail a wait behind (`lane_time`): its spans, and what the walks, its
-/// plugins and its rack's pedal read from them.
+/// trail a wait behind (`lane_time`): its spans, and what the walks and its
+/// plugins read from them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct LaneTime {
     spans: [TlSpan; 2],
@@ -2473,9 +2524,6 @@ struct LaneTime {
     /// The run at the block's head rolls: whether its plugins are told the
     /// song plays.
     playing: bool,
-    /// The block's first lane frame that rolls, floored at the cursor on one
-    /// run: where its rack's clip pedal is read. `None` where nothing rolls.
-    pedal: Option<u64>,
     /// The cursor after the block, and the run it stands in.
     end: u64,
     seq: u64,
@@ -2547,7 +2595,6 @@ fn lane_time(trail: &SongTrail, lag: usize, frames: usize, seq: u64, end: u64) -
         n: if b.is_some() { 2 } else { 1 },
         pos: if a.off == 0 { floored(&a) } else { end },
         playing: r.rolling,
-        pedal: if a.rolls { Some(floored(&a)) } else { b.filter(|b| b.rolls).map(|b| b.t0) },
         end: match reached {
             Some(x) if last.seq == seq => end.max(x),
             Some(x) => x,
@@ -8702,10 +8749,9 @@ pub(crate) struct LaneBody {
     live_pedal: [u8; 3],
     /// **Where the live pedals stood before this chunk's messages moved
     /// them**, and the chunk (`Renderer::chunks`) whose first pedal message
-    /// took it. The DX7 and the keyboard begin a chunk at this level and are
-    /// told each of the chunk's pedal messages on its own frame (`Cue`);
-    /// `live_pedal` is the level after all of them, which the rack's control
-    /// stream states at the chunk's head as it always has.
+    /// took it. The DX7, the keyboard and the rack begin a chunk at this
+    /// level and are told each of the chunk's pedal messages on its own frame
+    /// (`Cue`, `rack_pedals`); `live_pedal` is the level after all of them.
     live_head: [u8; 3],
     live_head_chunk: u64,
     /// **What this lane was last TOLD its pedal was**, so an unmoved level
@@ -8851,9 +8897,6 @@ pub(crate) struct LaneBody {
     /// This block's spans of its own timeline (`TlSpan`), `tl_n` of them.
     tl_spans: [TlSpan; 2],
     tl_n: u8,
-    /// The lane frame its clips' pedal is read at for its rack this block:
-    /// its first frame that rolls, `None` where nothing does.
-    tl_pedal: Option<u64>,
     /// Where its part stands at the block's head, never behind its cursor on
     /// one run, and the transport its plugins are told around it.
     tl_pos: u64,
@@ -8945,7 +8988,7 @@ impl Lane {
                 dry: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 dry_paid: 0,
                 notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
-                controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+                controls: Vec::with_capacity(MAX_LANE_CONTROLS),
                 cues: Vec::with_capacity(MAX_CUES_PER_BLOCK),
                 keys_grid: [(0, 0); 2],
                 keys_grid_n: 0,
@@ -8993,7 +9036,6 @@ impl Lane {
                 tl_flush: false,
                 tl_spans: [TlSpan::default(); 2],
                 tl_n: 0,
-                tl_pedal: None,
                 tl_pos: 0,
                 tl_clock: TransportSnap::default(),
             }),
@@ -13191,15 +13233,6 @@ struct Renderer {
     /// Where a lane's pedals may move inside its span: a scratch the decide
     /// walk fills and reads for one lane at a time (`Renderer::cue_pedals`).
     pedal_moves: Vec<u32>,
-    /// This block's pedal MOVES, as `(lane, control)` — filled by the pass
-    /// that decides each lane's level and drained by the lane loop that
-    /// builds `lane_controls`.
-    ///
-    /// A queue rather than a direct push because the two passes are far
-    /// apart on purpose: the first needs `&mut` on the instruments, the
-    /// second needs the buffers borrowed, and the block's worth of pedal
-    /// moves is at most three per lane.
-    lane_pedal_out: Vec<(u8, Control)>,
     /// The transport's position in frames, advanced by `run_transport` and
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
@@ -20276,15 +20309,16 @@ impl Renderer {
     }
 
     /// **The pedals' moves inside lane `ch`'s block, as its DX7's and its
-    /// keyboard's cues** (`Cue::Pedals`), pushed onto `cues`.
+    /// keyboard's cues** (`Cue::Pedals`), pushed onto `cues`, and the level
+    /// the block begins at, answered: its rack is told both (`rack_pedals`).
     ///
     /// The block begins at the level the pedal walk told them (the live
     /// pedal before this chunk's messages, `LaneBody::live_head`, against the
     /// clips' at its head); every frame a live pedal message arrived on, and
     /// every frame a clip's pedal moves or a clip begins or ends, is a cue
     /// when the level there, the live messages up to it against the clips'
-    /// level at it, is another. Live and clip combine by `max`, as
-    /// `pedal_now` combines them. The clips are read through the block's
+    /// level at it, is another. Live and clip combine by `max`, as the pedal
+    /// walk combines them at the head. The clips are read through the block's
     /// `spans` of its own timeline (`spans_pedal_level`), and a span that
     /// starts inside the block is a frame the level may move on.
     #[allow(clippy::too_many_arguments)]
@@ -20297,9 +20331,18 @@ impl Renderer {
         frames: usize,
         armed: bool,
         cues: &mut Vec<Cue>,
-    ) {
+    ) -> [u8; 3] {
+        let head_live = if lane.live_head_chunk == self.chunks { lane.live_head } else { lane.live_pedal };
+        let head = {
+            let clip = Self::spans_pedal_level(&self.midi_clips, &self.midi_gens, self.spine.ext.midi_first.table(), gen, ch, spans, 0);
+            if armed {
+                std::array::from_fn(|i| head_live[i].max(clip[i]))
+            } else {
+                clip
+            }
+        };
         if frames == 0 {
-            return;
+            return head;
         }
         let mut moves = std::mem::take(&mut self.pedal_moves);
         moves.clear();
@@ -20365,7 +20408,6 @@ impl Renderer {
                     t,
                 )
             };
-            let head_live = if lane.live_head_chunk == self.chunks { lane.live_head } else { lane.live_pedal };
             let level_at = |t: u32| -> [u8; 3] {
                 let clip = clip_at(t);
                 if !armed {
@@ -20381,12 +20423,7 @@ impl Renderer {
                 }
                 std::array::from_fn(|i| held[i].max(clip[i]))
             };
-            let mut now = if armed {
-                let clip = clip_at(0);
-                std::array::from_fn(|i| head_live[i].max(clip[i]))
-            } else {
-                clip_at(0)
-            };
+            let mut now = head;
             for &t in &moves {
                 let level = level_at(t);
                 if level != now && cues.len() < cues.capacity() {
@@ -20396,6 +20433,7 @@ impl Renderer {
             }
         }
         self.pedal_moves = moves;
+        head
     }
 
     /// **Record one chunk for the eligibility probe.** See [`ProbeCells`].
@@ -21553,7 +21591,6 @@ impl Renderer {
                 lane.tl_lag = lag as u32;
                 lane.tl_spans = time.spans;
                 lane.tl_n = time.n;
-                lane.tl_pedal = time.pedal;
                 lane.tl_pos = time.pos;
                 lane.tl_end = time.end;
                 lane.tl_seq = time.seq;
@@ -22087,9 +22124,6 @@ impl Renderer {
             self.spine.ext.grain_free = free;
         }
 
-        // This block's pedal moves, refilled from scratch: it is a list of
-        // CHANGES and last block's are not this block's.
-        self.lane_pedal_out.clear();
         // Per-lane state, applied on the thread that owns the instruments: a
         // compare per block for the patch (`set_patch` returns immediately on
         // a match), two plain stores for the panel knobs — and CC 64, live
@@ -22128,19 +22162,26 @@ impl Renderer {
             // damper out of somebody's recording, and a clip's pedal must not
             // strand a live one.
             //
-            // Asked once per lane per block and used by all three consumers
-            // below — the modelled keyboard, the DX7, and the rack.
+            // Asked here once per lane per block for the modelled keyboard and
+            // the DX7, at the span's head. The rack is told the same level
+            // there, and every move inside the span on its own frame, by the
+            // decide walk (`rack_pedals`).
             //
             // **A lane reading its own part behind the song** (`plan_live_lanes`)
-            // reads its clips at its own frame: its rack at its block's first
-            // frame that rolls (`LaneBody::tl_pedal`), its DX7 and keyboard at
-            // its head through its spans, and both up where its timeline
-            // stands still.
+            // reads its clips at its own frames, through its spans, and up
+            // where its timeline stands still.
             let lagged = lane.tl_lag > 0;
-            let clip_pedal = if lagged {
-                lane.tl_pedal.map_or([0; 3], |f| {
-                    Self::clip_pedal_level(&self.midi_clips, &self.midi_gens, self.spine.ext.midi_first.table(), lane_gen, ch, f)
-                })
+            let clip_head = if lagged {
+                let spans = lane.tl_spans;
+                Self::spans_pedal_level(
+                    &self.midi_clips,
+                    &self.midi_gens,
+                    self.spine.ext.midi_first.table(),
+                    lane_gen,
+                    ch,
+                    &spans[..usize::from(lane.tl_n)],
+                    0,
+                )
             } else if rolling {
                 Self::clip_pedal_level(
                     &self.midi_clips,
@@ -22153,34 +22194,11 @@ impl Renderer {
             } else {
                 [0; 3]
             };
-            let clip_head = if lagged {
-                let spans = lane.tl_spans;
-                Self::spans_pedal_level(
-                    &self.midi_clips,
-                    &self.midi_gens,
-                    self.spine.ext.midi_first.table(),
-                    lane_gen,
-                    ch,
-                    &spans[..usize::from(lane.tl_n)],
-                    0,
-                )
-            } else {
-                clip_pedal
-            };
-            let pedal_now: [u8; 3] = std::array::from_fn(|i| {
-                if armed_here {
-                    lane.live_pedal[i].max(clip_pedal[i])
-                } else {
-                    clip_pedal[i]
-                }
-            });
-            // **Where the DX7 and the keyboard begin the span**, which is
-            // `pedal_now` with the live pedal as it stood before this chunk's
-            // messages moved it (`LaneBody::live_head`): they are told each
-            // of those messages, and each of the clips' edges inside the
-            // span, on its own frame (`Cue::Pedals`). `pedal_now`, the level
-            // after all of them, is the rack's, which takes the live messages
-            // whole and the level at the span's head, as it always has.
+            // **Where the DX7 and the keyboard begin the span**: the clips'
+            // level at its head against the live pedal as it stood before this
+            // chunk's messages moved it (`LaneBody::live_head`). They are told
+            // each of those messages, and each of the clips' edges inside the
+            // span, on its own frame (`Cue::Pedals`).
             let live_head = if lane.live_head_chunk == self.chunks { lane.live_head } else { lane.live_pedal };
             let pedal_head: [u8; 3] = std::array::from_fn(|i| {
                 if armed_here {
@@ -22230,35 +22248,6 @@ impl Renderer {
             if self.spine.ext.desk.builtins.contains(ch) {
                 if let Some(d) = lane.dx7.as_mut() {
                     d.set_pedal(pedal_head[0] >= 64);
-                }
-            }
-            // **And the same level as a CONTROL, for whatever is in the
-            // rack.** A VST3 instrument has no `set_pedal`; the only door
-            // VST3 leaves open for a CC is a parameter change, which is what
-            // `Control` is. Stated only when it MOVES, because unlike
-            // `set_pedal` a control queue is a stream and a pedal restated
-            // every block would be five thousand parameter changes a minute.
-            //
-            // Channel 0: a clip has no wire and so no channel of its own. The
-            // live path keeps the channel it arrived on, and those events go
-            // in whole, further down.
-            for (slot, cc) in PEDAL_CCS.into_iter().enumerate() {
-                if lane.pedal_sent[slot] == pedal_now[slot] {
-                    continue;
-                }
-                lane.pedal_sent[slot] = pedal_now[slot];
-                #[cfg(test)]
-                if ch == 0 && std::env::var_os("TANGENT_PEDALTRACE").is_some() {
-                    eprintln!(
-                        "PT lane {ch} cc {cc} -> {} at frame {at} (span {} frames)",
-                        pedal_now[slot], lane.len
-                    );
-                }
-                if self.lane_pedal_out.len() < self.lane_pedal_out.capacity() {
-                    self.lane_pedal_out.push((
-                        ch as u8,
-                        Control::cc(0, 0, i16::from(cc), pedal_now[slot]),
-                    ));
                 }
             }
         }
@@ -22403,17 +22392,6 @@ impl Renderer {
                 // whenever the transport stands on them — playback does not ask
                 // the arm, which is the whole point of the arm ──
                 lane_notes.clear();
-                // **The offs its DX7 and keyboard take on an earlier frame
-                // than the list says** (a re-struck key's, below): the note's
-                // place in the list and its own frame in the span.
-                let mut early = [(0u32, 0u32); EARLY_OFFS];
-                let mut early_n = 0usize;
-                // **The offs whose own strike was told before this block**,
-                // by their place in the list: the only ones the overlap rule
-                // of the DX7's and the keyboard's cues may move (below). A
-                // held note's off the walk lists first, and a live key let up
-                // that was not struck earlier in the buffer.
-                let mut struck_before = [0u64; (MAX_EVENTS_PER_BLOCK * 2).div_ceil(64)];
                 if armed {
                     // **This lane's OWN live notes**, not the block's. `armed`
                     // says whether the lane is listening; `note_lanes` says
@@ -22428,25 +22406,9 @@ impl Renderer {
                             lane_notes.push(*n);
                         }
                     }
-                    // In the order they were played: a key let up that was
-                    // not struck before it in the buffer was struck in an
-                    // earlier one.
-                    let mut struck = 0u128;
-                    for (i, n) in lane_notes.iter().enumerate() {
-                        let Some(key) = usize::try_from(n.pitch).ok().filter(|k| *k < 128) else {
-                            continue;
-                        };
-                        if n.on {
-                            struck |= 1u128 << key;
-                        } else if struck & (1u128 << key) == 0 {
-                            if let Some(w) = struck_before.get_mut(i / 64) {
-                                *w |= 1u64 << (i % 64);
-                            }
-                        }
-                    }
                 }
-                // **This lane's controls: the live ones while armed, plus the
-                // pedal its clips moved this block.**
+                // **This lane's controls: the live ones while armed, plus its
+                // pedal, each move on its own frame.**
                 //
                 // The live events go in WHOLE rather than as the level computed
                 // earlier — they carry their own offset within the block and
@@ -22462,13 +22424,18 @@ impl Renderer {
                         }
                     }
                 }
-                for (lane, c) in &self.lane_pedal_out {
-                    if usize::from(*lane) == ch
-                        && lane_controls.len() < lane_controls.capacity()
-                    {
-                        lane_controls.push(*c);
-                    }
-                }
+                // **The pedal, live and its clips' together** (`cue_pedals`):
+                // where it stands at the span's head and on each frame inside
+                // it that moves it, told to the DX7 and the keyboard as cues
+                // (below) and to the rack as controls on those frames
+                // (`rack_pedals`). Every lane, whatever it holds, as the level
+                // at the head was: a rack is where a hosted instrument is
+                // handed its pedal, and a control wakes a parked lane. The
+                // pedals' moves lead the lane's cues.
+                lane_cues.clear();
+                let head = self.cue_pedals(lane, lane_gen, ch, spans, frames, armed, &mut lane_cues);
+                rack_pedals(&mut lane.pedal_sent, head, &lane_cues, &mut lane_controls);
+                sort_controls(&mut lane_controls);
                 let mut lane_has_clips = false;
                 // The park a block owes from, taken by its first span that
                 // rolls, as the one span always took it.
@@ -22530,10 +22497,6 @@ impl Renderer {
                                 continue;
                             }
                             if lane_notes.len() < lane_notes.capacity() {
-                                let i = lane_notes.len();
-                                if let Some(w) = struck_before.get_mut(i / 64) {
-                                    *w |= 1u64 << (i % 64);
-                                }
                                 lane_notes.push(Note {
                                     offset: span.at_off(due) as i32,
                                     pitch: pitch as i16,
@@ -22625,19 +22588,18 @@ impl Renderer {
                                 if key < 128 && lane.told & (1u128 << key) != 0 {
                                     if lane_notes.len() < lane_notes.capacity() {
                                         // **A key let up before this strike is let
-                                        // up on its own frame** for the DX7 and the
-                                        // keyboard (`Cue`): a note that began and
-                                        // ended inside this span is still told, so
-                                        // its off falls due here, at the strike, in
-                                        // the list. The rack is handed the list as
-                                        // it always was.
+                                        // up on its own frame**, for every
+                                        // instrument: a note that began and ended
+                                        // inside this span is still told here, its
+                                        // off due before the strike. It was let up
+                                        // at the strike, and the Analog, the
+                                        // sampler, the kit and hosted instruments
+                                        // rang it on to there; the DX7 and the
+                                        // keyboard took it on its frame from a
+                                        // table of sixteen a span beside the list.
                                         let due = lane.told_off[key];
-                                        if due < on_f && early_n < early.len() {
-                                            early[early_n] = (lane_notes.len() as u32, span.at_off(due) as u32);
-                                            early_n += 1;
-                                        }
                                         lane_notes.push(Note {
-                                            offset,
+                                            offset: if due < on_f { span.at_off(due) as i32 } else { offset },
                                             pitch: nt.key.into(),
                                             velocity: 0.0,
                                             on: false,
@@ -22746,6 +22708,36 @@ impl Renderer {
                 }
                 let auditioning = lane.audition_rang;
 
+                // **An off the walk lists before a strike of its own key is
+                // told no later than that strike**, for every instrument the
+                // lane plays, so an instrument that takes a frame's events in
+                // the list's order lets the old note up before the new one
+                // speaks. The walk lists a held note's off ahead of the clips'
+                // notes at the frame the note ends (the offs first), and a
+                // note struck again on its key before that frame (two notes of
+                // one pitch drawn across each other, a length that rounds a
+                // frame past the next attack) came after it in time: the
+                // strike re-keyed the pitch and the off behind it let the new
+                // note up, on the DX7 at once and on the keyboard with its
+                // damper, and cut it on the Analog, the sampler, a kit's pad
+                // that obeys its offs and a hosted instrument. The overlap rule
+                // the walk keeps for a note it still holds at the strike (the
+                // choke) is the same rule: the old note ends where the new one
+                // begins. Every note told at the stretch's head kept the list's
+                // order, and so does this. One pass from the end, each key's
+                // next strike on its way.
+                let mut strike = [i32::MAX; 128];
+                for n in lane_notes.iter_mut().rev() {
+                    let Some(key) = usize::try_from(n.pitch).ok().filter(|k| *k < 128) else {
+                        continue;
+                    };
+                    if n.on {
+                        strike[key] = n.offset;
+                    } else {
+                        n.offset = n.offset.min(strike[key]);
+                    }
+                }
+
                 // The DRUMPAD lane: every note here is a pad strike — the same
                 // sixteen one-shots the drumpad window plays, so the editor's
                 // roll and a MIDI keyboard trigger exactly what a finger does.
@@ -22817,82 +22809,32 @@ impl Renderer {
                 // ── THIS lane's DX7 and keyboard, fed by THIS lane's notes, live
                 // and clip both, each on its own frame (`Cue`) ──
                 //
-                // The pedals' moves inside the span first, then the notes as
-                // the walk delivered them, each with its frame (a re-struck
-                // key's early off at its own), put in time order keeping that
-                // order on a shared frame. The render plays them
-                // (`play_cues`); nothing is told here any more.
-                lane_cues.clear();
+                // The pedals' moves inside the span first (`cue_pedals`, with
+                // the controls above), then the notes as the walk delivered
+                // them, each on its frame, put in time order keeping that
+                // order on a shared frame: an off the walk lists before a
+                // strike of its key is on the strike's frame at the latest
+                // (the overlap rule, above), so it stays in front of it. The
+                // render plays them (`play_cues`); nothing is told here any
+                // more.
                 if is_builtin || is_keys {
-                    self.cue_pedals(lane, lane_gen, ch, spans, frames, armed, &mut lane_cues);
-                    let notes_from = lane_cues.len();
-                    // The offs struck before this block, by their place among
-                    // the note cues.
-                    let mut may_move = [0u64; MAX_CUES_PER_BLOCK.div_ceil(64)];
-                    for (i, n) in lane_notes.iter().enumerate() {
+                    for n in &lane_notes {
                         let Ok(key) = u8::try_from(n.pitch) else {
                             continue;
                         };
                         if lane_cues.len() == lane_cues.capacity() {
                             break;
                         }
-                        let at = early[..early_n]
-                            .iter()
-                            .find(|e| e.0 as usize == i)
-                            .map_or(n.offset.max(0) as u32, |e| e.1);
-                        if struck_before.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0) {
-                            let j = lane_cues.len() - notes_from;
-                            if let Some(w) = may_move.get_mut(j / 64) {
-                                *w |= 1u64 << (j % 64);
-                            }
-                        }
+                        let at = n.offset.max(0) as u32;
                         lane_cues.push(if n.on {
                             Cue::On { at, key, vel: n.velocity }
                         } else {
                             Cue::Off { at, key }
                         });
                     }
-                    // **An off the walk lists before a strike of its own key
-                    // is told no later than that strike**, so the sort keeps
-                    // it in front of the strike on the strike's frame. The
-                    // walk lists a held note's off ahead of the clips' notes
-                    // at the frame the note ends (the offs first), and a note
-                    // struck again on its key before that frame (two notes of
-                    // one pitch drawn across each other, a length that rounds
-                    // a frame past the next attack) came after it in time:
-                    // the strike re-keyed the pitch and the off behind it let
-                    // the new note up, on the DX7 at once and on the keyboard
-                    // with its damper. The overlap rule the walk keeps for a
-                    // note it still holds at the strike (the choke) is the
-                    // same rule: the old note ends where the new one begins.
-                    // Every note told at the stretch's head kept the list's
-                    // order, and so did this. One pass from the end, each
-                    // key's next strike on its way.
-                    //
-                    // **Only an off whose own strike was told before this
-                    // block moves** (`struck_before`): a held note's, and a
-                    // live key's struck in an earlier buffer, which a clip's
-                    // strike of its key in this one ends the same way. The
-                    // list is the live keys and then the walk's notes, each
-                    // in its own time, so the next strike listed after an off
-                    // struck in this block can come before that off's own
-                    // strike in time: a key played live and let up after a
-                    // short clip note on it, inside one buffer, had its off
-                    // moved to the clip note's strike, in front of its own,
-                    // and the DX7 and the keyboard kept the key down until
-                    // its next message, through a Stop (whose flush ends the
-                    // notes the walk told and the live keys still down, and
-                    // this key was neither).
-                    let mut strike = [u32::MAX; 128];
-                    for (j, cue) in lane_cues[notes_from..].iter_mut().enumerate().rev() {
-                        let moves = may_move.get(j / 64).is_some_and(|w| w & (1u64 << (j % 64)) != 0);
-                        match cue {
-                            Cue::On { at, key, .. } if *key < 128 => strike[usize::from(*key)] = *at,
-                            Cue::Off { at, key } if *key < 128 && moves => *at = (*at).min(strike[usize::from(*key)]),
-                            _ => {}
-                        }
-                    }
                     sort_cues(&mut lane_cues);
+                } else {
+                    lane_cues.clear();
                 }
                 // **And where the keyboard's timeline stands at the head of
                 // each span that rolls** (`Keys::set_grid`): its grid falls on
@@ -28653,10 +28595,9 @@ impl Engine {
             midi_gens: Vec::new(),
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
-            lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+            lane_controls: Vec::with_capacity(MAX_LANE_CONTROLS),
             lane_cues: Vec::with_capacity(MAX_CUES_PER_BLOCK),
             pedal_moves: Vec::with_capacity(2 * MAX_CONTROLS_PER_BLOCK),
-            lane_pedal_out: Vec::with_capacity(LEGACY_LANES * 3),
             pos: 0,
             seen_req: 0,
             was_rolling: false,
@@ -36078,10 +36019,9 @@ mod tests {
             midi_gens: Vec::new(),
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
-            lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+            lane_controls: Vec::with_capacity(MAX_LANE_CONTROLS),
             lane_cues: Vec::with_capacity(MAX_CUES_PER_BLOCK),
             pedal_moves: Vec::with_capacity(2 * MAX_CONTROLS_PER_BLOCK),
-            lane_pedal_out: Vec::with_capacity(LEGACY_LANES * 3),
             pos: 0,
             seen_req: 0,
             was_rolling: false,
@@ -48701,6 +48641,70 @@ mod slot_engine {
             }
         }
     }
+
+    /// **A lane past 255 is told its own pedal, and no other lane is.** A
+    /// rack was told its pedal through a queue of the renderer's that named
+    /// its lane by a byte, with room for the three pedals of 32 lanes a
+    /// chunk, so on a desk of 301 lanes lane 300's clip pedal went to lane
+    /// 44's rack and never to its own. Both lanes' clips hold the same note
+    /// let up at 23,852, and lane 300's the sustain pedal down from 23,552,
+    /// the head of the export's chunk; one lane at a time plays a hosted
+    /// instrument's stand-in (`Backend::Capped`), the other nothing: lane
+    /// 300's take is the note never let up, and lane 44's is the note let go.
+    #[test]
+    fn a_lane_past_255_is_told_its_own_pedal_and_no_other_lane_is() {
+        const FAR: usize = 300;
+        const NEAR: usize = FAR - 256;
+        const OFF: u64 = 23_852;
+        const UNTIL: u64 = 27_648;
+        // The note on both lanes, let up at `off`; lane FAR's pedal down at
+        // 23,552 when `pedal`; the stand-in on lane `heard` alone.
+        let take = |off: u64, pedal: bool, heard: usize| -> Vec<f32> {
+            let mut e = wide(FAR + 1);
+            e.publish_plan(&plan(&e, FAR + 1, &|_| LaneFlags::default())).expect("the plan goes");
+            let mut out = vec![0.0f32; BLOCK * 2];
+            e.render_offline(&mut out);
+            let r = e.offline.as_mut().expect("a renderer");
+            r.lane_body_mut(heard).chains[CHAIN_OWN].slots[0] = PluginBox(Some(Box::new(Hosted {
+                backend: Backend::Capped(CappedPlugin::new(48_000.0, Arc::new(CappedAsked::default()))),
+                bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+                channels: TAP_CHANNELS,
+                voice: true,
+                align: None,
+            })));
+            let part = |lane: usize, pedal: bool| SlotPlacedMidi {
+                slot: Slot(lane as u32),
+                gen: e.lane_gen(Slot(lane as u32)).expect("a lane"),
+                placed: PlacedMidi {
+                    strip: lane,
+                    start: 0,
+                    len: 4 * 48_000,
+                    notes: Arc::new(vec![ClipNote { at: 17_017, dur: off - 17_017, key: 60, vel: 110 }]),
+                    pedal: Arc::new(if pedal {
+                        vec![ClipPedal { at: 23_552, cc: 64, value: 127 }, ClipPedal { at: UNTIL + 1_000, cc: 64, value: 0 }]
+                    } else {
+                        Vec::new()
+                    }),
+                },
+            };
+            let parts = vec![part(NEAR, false), part(FAR, pedal)];
+            e.set_midi_slotted(parts);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut heard_out = Vec::new();
+            while heard_out.len() < UNTIL as usize * 2 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard_out.extend_from_slice(&out);
+            }
+            heard_out
+        };
+        let far_held = take(UNTIL + 2_000, false, FAR);
+        let far_free = take(OFF, false, FAR);
+        assert!(far_held != far_free, "the off changes nothing on lane {FAR}, so its pedal proves nothing");
+        assert!(take(OFF, true, FAR) == far_held, "lane {FAR}'s rack was not told its own clip's pedal");
+        assert!(take(OFF, true, NEAR) == take(OFF, false, NEAR), "lane {NEAR}'s rack was told lane {FAR}'s pedal");
+    }
     /// **Several instruments on one track** (see [`Layer`]): every one of
     /// them is handed the same notes, live and from the clips, and they sum
     /// on the track's channel. Lane 45, past the frozen map, throughout.
@@ -55141,8 +55145,8 @@ mod slot_engine {
             /// are pulled at. `run_rack` reads both its transports through the
             /// chain's own clock when it has one. A kit's chain and its pads'
             /// racks are told the place of its lane's part (`part_clock`), and
-            /// the pedal walk reads a lane's clips at its own frame
-            /// (`LaneBody::tl_pedal`).
+            /// the pedal walk and the rack's pedal (`cue_pedals`) read a lane's
+            /// clips at its own frames, through its spans.
             #[test]
             fn a_lagged_lane_reads_nothing_on_the_song_clock() {
                 let src = include_str!("instrument.rs");
@@ -55198,8 +55202,13 @@ mod slot_engine {
                 assert!(!kit.contains("u64::MAX,\n"), "render_kit tells a pad's rack the sentinel");
                 let pour = body("    fn pour_kits(", "\n    }\n");
                 assert!(pour.contains("let part = self.part_clock(Some(ch));"), "pour_kits' pads are not told where the kit's part is");
-                let pedals = body("        // This block's pedal moves, refilled from scratch", "        // The folder tree, taken out of `self`");
-                assert!(pedals.contains("lane.tl_pedal.map_or("), "the pedal walk reads a lagged lane's clips at the song's frame");
+                let pedals = body("        // Per-lane state, applied on the thread that owns the instruments", "        // The folder tree, taken out of `self`");
+                assert!(pedals.contains("&spans[..usize::from(lane.tl_n)],"), "the pedal walk reads a lagged lane's clips at the song's frame");
+                let controls = body("                lane_controls.clear();\n", "                let mut lane_has_clips");
+                assert!(
+                    controls.contains("self.cue_pedals(lane, lane_gen, ch, spans, frames, armed, &mut lane_cues);"),
+                    "the rack's pedal is not read off the lane's own spans"
+                );
             }
 
             /// What lane `lane` plays on a live-lane desk (`live_desk`).
@@ -63609,8 +63618,10 @@ mod strikes {
     //! (`Cue`, `play_cues`): a clip's notes, their offs and its pedal's moves,
     //! and the live keys and pedal of an armed track, in an export and in
     //! playback at any buffer and look-ahead. Each was told at the head of
-    //! the stretch its track rendered at once. The Analog synth, the sampler
-    //! and the kit play what they played.
+    //! the stretch its track rendered at once. And the rack, the Analog
+    //! synth, the sampler, the kit and a hosted instrument, is told the same
+    //! notes, each off on its own frame and under the same overlap rule, and
+    //! its pedal as controls on their own frames (`rack_pedals`).
     //!
     //! Two kinds of proof, both to the bit. A note moved `k` frames is the
     //! same note `k` frames later. And a take rendered in the engine's own
@@ -64243,18 +64254,24 @@ mod strikes {
 
     /// **The Analog synth, the sampler and the kit render what they rendered
     /// before the DX7 and the keyboard were told their cues on their own
-    /// frames.** They are handed the same note list and the same controls
-    /// as before, and always played each on its frame; the hashes are their
-    /// takes at the commit before the cues (9e9b1df2), in an export, in
-    /// playback at 256 frames with the look-ahead on AUTO from 15,100 and at
-    /// 64 with it off from 1,100, and listening at 256 with a live key and a
-    /// live pedal 100 frames into a callback. But the Analog's playback from
+    /// frames, each pedal move on its own frame.** The hashes are their takes
+    /// at the commit before the cues (9e9b1df2), in an export, in playback at
+    /// 256 frames with the look-ahead on AUTO from 15,100 and at 64 with it
+    /// off from 1,100, and listening at 256 with a live key and a live pedal
+    /// 100 frames into a callback, but three. The Analog's playback from
     /// 15,100: its first grain ran out to the grid line past a block, 516
     /// frames, and ends at the line inside it now, 484 (`Renderer::to_grid`),
-    /// and the Analog draws its wander on its own frames, so the take moved;
-    /// the engine before that rendered the new hash to the bit with the
-    /// look-ahead at 484 frames, which hands out the same spans. aarch64
-    /// macOS only, like the goldens.
+    /// and the Analog draws its wander on its own frames; the engine before
+    /// that rendered the new hash to the bit with the look-ahead at 484
+    /// frames, which hands out the same spans. And the Analog's export and
+    /// its playback at 64 frames: the rack was told the clip's pedal as its
+    /// level at a stretch's head, so the note held under it from 6,000 was
+    /// let go at the head of the stretch after the pedal's release at 20,222,
+    /// and it is told the release on its frame now (`rack_pedals`); the
+    /// engine before that rendered both new hashes to the bit with its calls
+    /// cut at the pedal's two moves. The sampler's and the kit's did not
+    /// move: the sampler's burst has died by the release, and a kit takes no
+    /// pedal. aarch64 macOS only, like the goldens.
     #[test]
     #[cfg_attr(
         not(all(target_arch = "aarch64", target_os = "macos")),
@@ -64262,9 +64279,9 @@ mod strikes {
     )]
     fn the_analog_the_sampler_and_the_kit_render_what_they_did() {
         let takes: [(Other, &str, usize, f64, u64, bool, Option<(usize, u8)>, &str); 12] = [
-            (Other::Analog, "export", 1024, 0.0, 0, false, None, "72d979ef73b84e07"),
+            (Other::Analog, "export", 1024, 0.0, 0, false, None, "d96f2f13a441db10"),
             (Other::Analog, "playback 256 AUTO from 15,100", 256, -1.0, 15_100, false, None, "a338621cb9e5ddd9"),
-            (Other::Analog, "playback 64 off from 1,100", 64, 0.0, 1_100, false, None, "9c01fac2aa252751"),
+            (Other::Analog, "playback 64 off from 1,100", 64, 0.0, 1_100, false, None, "d753c8d99b76b84c"),
             (Other::Analog, "listening 256, a live key 100 frames into call 30", 256, -1.0, 15_100, true, Some((30, 100)), "d0151dd86973d3a8"),
             (Other::Sampler, "export", 1024, 0.0, 0, false, None, "f0516660fc2a84d7"),
             (Other::Sampler, "playback 256 AUTO from 15,100", 256, -1.0, 15_100, false, None, "ef21339aa62b43da"),
@@ -64283,6 +64300,250 @@ mod strikes {
             })
             .collect();
         assert!(moved.is_empty(), "these takes are not what they were:\n{}", moved.join("\n"));
+    }
+
+    // ── the rack: every note, off and pedal move on its own frame ───────
+
+    /// What a rack plays in these takes: the Analog, the sampler over a
+    /// steady tone, a hosted instrument's stand-in (`Backend::Capped`), and a
+    /// kit whose first pad, the steady tone, obeys its offs. The kit takes no
+    /// pedal.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Rack {
+        Analog,
+        Sampler,
+        Hosted,
+        Kit,
+    }
+
+    const RACKS: [Rack; 4] = [Rack::Analog, Rack::Sampler, Rack::Hosted, Rack::Kit];
+
+    /// The racks a pedal holds a note on.
+    const PEDALLED: [Rack; 3] = [Rack::Analog, Rack::Sampler, Rack::Hosted];
+
+    /// Four seconds of a steady 220 Hz tone, so a note it plays sounds
+    /// until it is let go.
+    fn steady() -> Arc<tangent_record::decode::Clip> {
+        let frames = 4 * 48_000usize;
+        let samples = (0..frames)
+            .flat_map(|t| {
+                let v = ((t as f64) * std::f64::consts::TAU * 220.0 / 48_000.0).sin() as f32 * 0.25;
+                [v, v * 0.9]
+            })
+            .collect();
+        Arc::new(tangent_record::decode::Clip { samples, rate: 48_000, source: PathBuf::from("pin-steady.wav") })
+    }
+
+    /// The key `rack` sounds a note on: the sampler's root, the kit's first
+    /// pad, middle C.
+    fn rack_key(rack: Rack) -> u8 {
+        match rack {
+            Rack::Sampler => SAMPLER_ROOT_KEY,
+            Rack::Kit => PAD_BASE,
+            Rack::Analog | Rack::Hosted => 60,
+        }
+    }
+
+    fn rack_engine(rack: Rack, clip: PlacedMidi) -> Engine {
+        let mut e = crate::render_golden::offline();
+        match rack {
+            Rack::Analog => {
+                e.load_insert(L, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None).expect("the analog loads").expect("and seats");
+            }
+            Rack::Sampler => {
+                e.load_insert(L, 0, Some(Path::new(crate::builtin_fx::SAMPLER_PATH)), None).expect("the sampler loads").expect("and seats");
+                assert!(e.set_sampler_sample(
+                    Slot(L as u32),
+                    Some(SamplerSample { clip: steady(), name: "pin.wav".to_owned(), source: PathBuf::from("pin.wav"), root_key: SAMPLER_ROOT_KEY })
+                ));
+            }
+            Rack::Hosted => {
+                let mut out = vec![0.0f32; 512 * 2];
+                e.render_offline(&mut out);
+                let r = e.offline.as_mut().expect("a renderer");
+                r.lane_body_mut(L).chains[CHAIN_OWN].slots[0] = PluginBox(Some(Box::new(Hosted {
+                    backend: Backend::Capped(CappedPlugin::new(48_000.0, Arc::new(CappedAsked::default()))),
+                    bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+                    channels: TAP_CHANNELS,
+                    voice: true,
+                    align: None,
+                })));
+            }
+            Rack::Kit => {
+                let mut kit = PadKit::default();
+                kit.pads[0] = Some(steady());
+                assert!(e.set_pad_kit(L, kit));
+                e.set_drum_strips(1 << L);
+                e.shared.lanes.get(L).pads.obey[0].store(1, Ordering::Relaxed);
+            }
+        }
+        e.set_channel_gain(L, 1.0);
+        e.set_midi_clips(vec![clip]);
+        e
+    }
+
+    /// **The rack is told a clip's pedal on its own frame.** A note held from
+    /// before the stretch and let up 300 frames into it, the clip's sustain
+    /// pedal going down 0, 1, 200, 299, 300, 301 and 511 frames in: on the
+    /// Analog, the sampler and a hosted instrument, the export's take is the
+    /// take with its calls cut at the pedal and the off. The rack was told
+    /// the pedal as the level at a stretch's head, so this pedal reached it
+    /// at the next stretch, past the off, and the note was let go however
+    /// early the pedal came. The hosted stand-in shows it whole: a pedal
+    /// down before the off holds the note to the bit as if it had never been
+    /// let up, and one on the off's frame or after it lets it go as if there
+    /// were no pedal (the rack takes a frame's notes before its controls, as
+    /// at a stretch's head); and playback at 256 frames on AUTO is the
+    /// export.
+    #[test]
+    fn the_rack_is_told_a_clips_pedal_on_its_own_frame() {
+        let how = How { buf: 256, grain_ms: -1.0, start: PLAY, pinned: false };
+        let off = N0 + 300;
+        let until = N0 + 4_096;
+        for rack in PEDALLED {
+            let key = rack_key(rack);
+            let notes = [(17_017, off - 17_017, key)];
+            let held = render(rack_engine(rack, clip(&[(17_017, until, key)], &[])), EXPORT, until);
+            let free = render(rack_engine(rack, clip(&notes, &[])), EXPORT, until);
+            assert!(held != free, "{rack:?}: the off changes nothing, so its pedal proves nothing");
+            for k in [0u64, 1, 200, 299, 300, 301, 511] {
+                let down = N0 + k;
+                let pedal = [(down, 64, 127), (until + 1_000, 64, 0)];
+                let export = render(rack_engine(rack, clip(&notes, &pedal)), EXPORT, until);
+                let cut = render_cut(rack_engine(rack, clip(&notes, &pedal)), &[down, off], until);
+                assert_same(&export, 0, &cut, 0, 0, until, 0, &format!("{rack:?}: the pedal at {down} against it on a chunk's first frame"));
+                if rack == Rack::Hosted {
+                    let (like, what) = if down < off { (&held, "never let up") } else { (&free, "with no pedal") };
+                    assert_same(&export, 0, like, 0, 0, until, 0, &format!("Hosted: the pedal down at {down} with the off at {off} against the note {what}"));
+                    let played = render(rack_engine(rack, clip(&notes, &pedal)), how, until);
+                    assert_same(&played, PLAY, &export, 0, PLAY, until, 0, &format!("Hosted: the pedal at {down} played against the export"));
+                }
+            }
+        }
+    }
+
+    /// **A key struck twice inside one stretch is let up on its own frame
+    /// in between**, on every rack. C4 from 23,562 to 23,662, and again from
+    /// 23,852, all inside the export's chunk from 23,552: the take is the
+    /// take with the calls cut at each move. The walk told the first note's
+    /// off at the second strike, so the Analog, the sampler, the kit's pad
+    /// that obeys its offs and a hosted instrument rang the first note on to
+    /// it; the DX7 and the keyboard were told it on its frame from a table
+    /// beside the list. The hosted stand-in's playback at 256 frames on AUTO
+    /// is the export.
+    #[test]
+    fn a_key_struck_twice_in_one_stretch_is_let_up_on_its_own_frame_on_every_rack() {
+        let until = N0 + 4_096;
+        let how = How { buf: 256, grain_ms: -1.0, start: PLAY, pinned: false };
+        for rack in RACKS {
+            let key = rack_key(rack);
+            let notes = [(N0 + 10, 100, key), (N0 + 300, 2_000, key)];
+            let export = render(rack_engine(rack, clip(&notes, &[])), EXPORT, until);
+            let cut = render_cut(rack_engine(rack, clip(&notes, &[])), &[N0 + 10, N0 + 110, N0 + 300], until);
+            assert!(first_sound(&export, 0).is_some(), "{rack:?}: the take is silent, so nothing was proved");
+            assert_same(&export, 0, &cut, 0, 0, until, 0, &format!("{rack:?}: a key struck twice in one stretch against each move on a chunk's first frame"));
+            if rack == Rack::Hosted {
+                let played = render(rack_engine(rack, clip(&notes, &[])), how, until);
+                assert_same(&played, PLAY, &export, 0, PLAY, until, 0, "Hosted: a key struck twice in one stretch, played against the export");
+            }
+        }
+    }
+
+    /// **A key struck again while its last note sounds lets that note up at
+    /// the strike, and the new note sounds whole, on every rack**: the
+    /// overlap rule the DX7 and the keyboard follow (a pitch cannot start
+    /// while it is already sounding). C on the key from 23,000 for 1,000
+    /// frames, and one frame past D's strike, D on it from 23,800: the take
+    /// is the take with C drawn to end on D's strike, to the bit, in the
+    /// export, and for the hosted stand-in in playback at every buffer and
+    /// look-ahead too. The walk listed C's off first, at C's own frame, after
+    /// D's strike in time, so it let D up: the Analog, the sampler, the
+    /// kit's obeying pad and a hosted instrument cut D 200 frames in, or a
+    /// frame. And sixteen repeated notes, each a frame longer than its step,
+    /// are each let up at the next one's strike.
+    #[test]
+    fn a_key_struck_again_lets_its_last_note_up_at_the_strike_on_every_rack() {
+        let until = N0 + 4_096;
+        for rack in RACKS {
+            let key = rack_key(rack);
+            let mut hows = vec![EXPORT];
+            if rack == Rack::Hosted {
+                hows.extend(playbacks());
+            }
+            for over in [200u64, 1] {
+                let notes = [(23_000, 800 + over, key), (23_800, 2_000, key)];
+                let drawn = [(23_000, 800, key), (23_800, 2_000, key)];
+                for how in &hows {
+                    let take = render(rack_engine(rack, clip(&notes, &[])), *how, until);
+                    let rule = render(rack_engine(rack, clip(&drawn, &[])), *how, until);
+                    assert!(first_sound(&rule, how.start).is_some(), "{rack:?}: the take is silent, so nothing was proved");
+                    assert_same(&take, how.start, &rule, how.start, how.start, until, 0, &format!("{rack:?}: C {over} frames past D's strike, {how:?}, against C let up at the strike"));
+                }
+            }
+            let step = 1_111u64;
+            let long: Vec<(u64, u64, u8)> = (0..16).map(|i| (20_000 + i * step, step + 1, key)).collect();
+            let mut drawn = long.clone();
+            for n in drawn.iter_mut().take(15) {
+                n.1 = step;
+            }
+            let until = 20_000 + 16 * step + 2_048;
+            let take = render(rack_engine(rack, clip(&long, &[])), EXPORT, until);
+            let rule = render(rack_engine(rack, clip(&drawn, &[])), EXPORT, until);
+            assert_same(&take, 0, &rule, 0, 0, until, 0, &format!("{rack:?}: sixteen notes a frame past each next strike against each let up at the next"));
+        }
+    }
+
+    /// A rack's lane listening and rolling at a 256-frame buffer from
+    /// `PLAY`, 24 callbacks, with live messages `(call, offset, bytes)` sent
+    /// before their call; each `cuts` entry renders its call in pieces cut at
+    /// those frames, each message sent for its own frame in its own piece.
+    fn live_rack_take(rack: Rack, sends: &[(usize, u64, [u8; 3])], cuts: &[(usize, u64)]) -> Vec<f32> {
+        let mut e = rack_engine(rack, clip(&[], &[]));
+        prepare(&mut e, How { buf: 256, grain_ms: -1.0, start: PLAY, pinned: true });
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut heard = Vec::new();
+        for call in 0..24usize {
+            let mut edges: Vec<u64> = cuts.iter().filter(|c| c.0 == call && c.1 > 0 && c.1 < 256).map(|c| c.1).collect();
+            edges.sort_unstable();
+            edges.dedup();
+            let mut from = 0u64;
+            for to in edges.into_iter().chain([256]) {
+                for &(c, offset, bytes) in sends {
+                    if c == call && offset >= from && offset < to {
+                        let stamp = ((offset - from) as f64 * 1e9 / 48_000.0).ceil() as Nanos;
+                        e.send_midi(stamp, &bytes);
+                    }
+                }
+                let n = (to - from) as usize;
+                let out = &mut out[..n * 2];
+                out.fill(0.0);
+                e.render_offline(out);
+                heard.extend_from_slice(out);
+                from = to;
+            }
+        }
+        heard
+    }
+
+    /// **A live pedal reaches the rack on its frame.** On a listening
+    /// Analog, sampler or hosted lane rolling at a 256-frame buffer: a key
+    /// struck 100 frames into one callback, and in a later one let up 30
+    /// frames in and the sustain pedal pressed 200 frames in, then let go 50
+    /// frames into the next. The take is the take with each of those
+    /// callbacks cut where its messages fall. The rack was told the live
+    /// pedal's level after all of a callback's messages at its head, so the
+    /// pedal pressed after the key was let up held the note from the head,
+    /// before it was let up, and rang it on to the pedal's release.
+    #[test]
+    fn a_live_pedal_reaches_the_rack_on_its_frame() {
+        for rack in PEDALLED {
+            let key = rack_key(rack);
+            let sends = [(4usize, 100u64, [0x90, key, 110]), (9, 30, [0x80, key, 0]), (9, 200, [0xB0, 64, 127]), (12, 50, [0xB0, 64, 0])];
+            let whole = live_rack_take(rack, &sends, &[]);
+            assert!(first_sound(&whole, 0).is_some(), "{rack:?}: the take is silent, so nothing was proved");
+            let cut = live_rack_take(rack, &sends, &[(4, 100), (9, 30), (9, 200), (12, 50)]);
+            assert_same(&whole, 0, &cut, 0, 0, (whole.len() / 2) as u64, 0, &format!("{rack:?}: the live messages against each on its own call"));
+        }
     }
 }
 
