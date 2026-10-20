@@ -19,7 +19,10 @@
 //!
 //! Not implemented: portamento and the mono modes, which are performance
 //! controls rather than part of a patch, and pitch bend, which nothing sends
-//! here yet.
+//! here yet. Nor the LFO's delay and key sync, which are part of one: the
+//! cartridge keeps both and the editor shows both, and here the LFO comes
+//! in at once and a phrase after a silence finds it where the last run left
+//! it (see `RUN_GRID`).
 //!
 //! # The rules this file lives by
 //!
@@ -63,6 +66,34 @@ const RATE_HALVING: f32 = 7.76;
 /// Headroom before the limiter. Six carriers at full level is the loudest a
 /// DX7 patch can be, and that has to leave room rather than clip.
 const GAIN: f32 = 0.11;
+
+/// **The grid a run's LFO stops on: every 512 of the instrument's own
+/// frames, counted from the note that woke it.**
+///
+/// The LFO runs while the instrument sounds and stands still through a
+/// silence, one LFO for every note. It stopped at the end of whichever
+/// render call retired the last voice, so where a phrase after a silence
+/// found it was the host's choice: an export's 512-frame chunks left it in
+/// one place, a device buffer or the look-ahead's grain in another, calls
+/// cut at every event in a third. Exact under any cut while it sounded,
+/// the instrument was not after a silence: on the factory voices whose LFO
+/// is heard, the same three phrases called whole and cut differed from the
+/// second on by -32.9 to -6.0 dB re peak.
+///
+/// A run now ends at the first of its own lines with every voice through
+/// (`Note::through`), wherever the calls fall: a call that crosses the line
+/// stops its LFO there, and a call that retires the last voice short of it
+/// carries the LFO on to it at once (`Dx7::render`). The retiring itself is
+/// untouched, so `active` answers what it always did, call by call.
+///
+/// **512, counted from the wake, because that is an export's chunk.** An
+/// export calls the instrument 512 frames at a time from its start, so a
+/// run woken on a chunk's head, as every run is when every note is told at
+/// the head of its chunk, has the chunks' ends for its lines: the only
+/// places its last voice was ever retired, so its LFO stops where it always
+/// stopped and such an export is the file it was. Any other length would
+/// move those files.
+const RUN_GRID: usize = 512;
 
 // ── the parts of a voice ────────────────────────────────────────────────────
 
@@ -283,6 +314,14 @@ impl Note {
         pitch_eg: Eg::SILENT,
         pitch_bias: 0.0,
     };
+
+    /// **Nothing left to say**: let go, and every envelope at silence for
+    /// good (`Eg::finished`). What `Dx7::render` retires a note for, and
+    /// what ends a run at one of its lines (`RUN_GRID`). An empty slot is
+    /// through.
+    fn through(&self) -> bool {
+        !self.on && self.eg.iter().all(Eg::finished)
+    }
 }
 
 // ── the instrument ──────────────────────────────────────────────────────────
@@ -302,6 +341,13 @@ pub struct Dx7 {
     /// Sample-and-hold's current value, and the phase it last changed at.
     lfo_sh: f32,
     lfo_rng: u32,
+    /// **Where the run is on its grid** (`RUN_GRID`): frames since the
+    /// note that woke the instrument, modulo the grid's 512.
+    run_at: usize,
+    /// **No run, so the LFO stands still**: from the line, the retiring
+    /// call or the all-notes-off that ended the last run, to the note that
+    /// wakes the next.
+    still: bool,
     feedback_gain: f32,
     feedback_op: usize,
 }
@@ -320,6 +366,8 @@ impl Dx7 {
             lfo_value: 0.0,
             lfo_sh: 0.0,
             lfo_rng: 0x1234_5678,
+            run_at: 0,
+            still: true,
             feedback_gain: 0.0,
             feedback_op: 5,
         };
@@ -495,6 +543,12 @@ impl Dx7 {
         if self.notes[slot].age == 0 {
             self.sounding += 1;
         }
+        // **A note wakes a still LFO**: a new run, its grid counted from
+        // this frame (`RUN_GRID`).
+        if self.still {
+            self.still = false;
+            self.run_at = 0;
+        }
         self.notes[slot] = n;
     }
 
@@ -540,6 +594,8 @@ impl Dx7 {
         self.notes = [Note::SILENT; VOICES];
         self.sounding = 0;
         self.pedal = false;
+        // The run ends where it stands, as the LFO always stopped here.
+        self.still = true;
     }
 
     fn next_random(&mut self) -> f32 {
@@ -552,6 +608,10 @@ impl Dx7 {
     }
 
     /// Add `frames` of interleaved audio into `out`.
+    ///
+    /// **Called whole or cut anywhere, the same frames render the same**,
+    /// LFO and all: a run of the LFO ends on a grid of the instrument's own
+    /// frames, not at the end of a call (`RUN_GRID`).
     pub fn render(&mut self, out: &mut [f32], frames: usize, channels: usize) {
         if self.sounding == 0 || channels == 0 {
             return;
@@ -564,6 +624,12 @@ impl Dx7 {
         let amd = f32::from(self.voice.lfo_amp_depth) / 99.0;
 
         for f in 0..n {
+            // **The run ended at one of its lines**: the LFO stopped there,
+            // and the rest of the call is the silence an idle instrument
+            // leaves, the buffer as it was handed in.
+            if self.still {
+                break;
+            }
             self.advance_lfo();
             // Pitch modulation is in semitones, and seven is the most a DX7
             // will bend with the wheel wide open.
@@ -625,14 +691,31 @@ impl Dx7 {
             for c in 0..channels {
                 out[base + c] += s;
             }
+            // One of the run's lines: with every voice through, it ends here.
+            self.run_at += 1;
+            if self.run_at == RUN_GRID {
+                self.run_at = 0;
+                self.still = self.notes.iter().all(Note::through);
+            }
         }
 
         // Retire finished notes once per block.
         for note in &mut self.notes {
-            if !note.on && note.eg.iter().all(Eg::finished) && note.age != 0 {
+            if note.age != 0 && note.through() {
                 *note = Note::SILENT;
                 self.sounding = self.sounding.saturating_sub(1);
             }
+        }
+        // **The last voice retired short of the run's next line**: the LFO
+        // runs on to the line, where the same frames called whole stop it,
+        // and the run is over. At most a line's 512 frames of LFO, once a
+        // silence.
+        if self.sounding == 0 && !self.still {
+            for _ in self.run_at..RUN_GRID {
+                self.advance_lfo();
+            }
+            self.run_at = 0;
+            self.still = true;
         }
     }
 
@@ -1483,6 +1566,18 @@ mod tests {
         }
     }
 
+    /// FNV-1a over the samples' bits, so one ulp anywhere is another hash.
+    fn fnv(x: &[f32]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for s in x {
+            for b in s.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
     /// **The first-strike pin.** One hash per shape of a strike from
     /// silence — the INIT VOICE that is the default, the tine piano that
     /// used to be, a percussive sync patch with feedback, a free-running pad
@@ -1491,16 +1586,6 @@ mod tests {
     /// had: it lost its name, not its sound.
     #[test]
     fn a_first_strike_from_silence_is_unchanged() {
-        fn fnv(x: &[f32]) -> u64 {
-            let mut h = 0xcbf2_9ce4_8422_2325_u64;
-            for s in x {
-                for b in s.to_bits().to_le_bytes() {
-                    h ^= u64::from(b);
-                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                }
-            }
-            h
-        }
         for (name, v, want) in [
             ("INIT VOICE", Voice::default(), 16_651_629_613_891_984_392),
             ("TANGENT EP", Voice::electric_piano(), 15_203_663_575_639_289_799),
@@ -1514,5 +1599,349 @@ mod tests {
             );
             assert_eq!(fnv(&x), want, "{name} first strike moved");
         }
+    }
+
+    // ── the LFO across a silence ────────────────────────────────────────
+
+    /// **The factory bank's thirty-two voices**, unpacked from the bytes the
+    /// app ships, as the cartridge reader unpacks them. Not through the
+    /// reader itself: the keys bench compiles this file by `#[path]` with
+    /// only the algorithms and the voice beside it (`tools/keysrig`).
+    fn factory_voices() -> Vec<Voice> {
+        const BANK: &[u8] = include_bytes!("../../assets/Tangent-01-Tines-and-Boxes.syx");
+        BANK[6..6 + 32 * 128]
+            .chunks_exact(128)
+            .map(|p| Voice::unpack(p.try_into().expect("a packed voice is 128 bytes")))
+            .collect()
+    }
+
+    /// **The factory voices whose LFO is heard**: a pitch depth the voice's
+    /// own sensitivity lets through, or an amplitude depth one of its
+    /// operators listens to. Sixteen of the thirty-two, both tremolo pianos
+    /// and fourteen of the guitars, every one a sine at a few hertz.
+    fn heard_lfo() -> Vec<(String, Voice)> {
+        factory_voices()
+            .into_iter()
+            .filter(|v| {
+                (v.lfo_pitch_depth > 0 && v.pitch_mod_sens > 0)
+                    || (v.lfo_amp_depth > 0 && v.ops.iter().any(|o| o.amp_mod_sens > 0))
+            })
+            .map(|v| (v.display_name(), v))
+            .collect()
+    }
+
+    /// **Every wave the LFO has, each with its key sync on and off**: the
+    /// factory's vibraphone piano, its tremolo given a vibrato beside it and
+    /// the LFO sped up to 38 Hz, so a sample and hold draws about every
+    /// 1,260 frames and a silence's last stretch of a run can hold one. One
+    /// of each pair runs its oscillators free, so a strike draws its phases
+    /// from the generator the sample and hold draws from.
+    fn every_lfo_wave() -> Vec<(String, Voice)> {
+        const WAVES: [&str; 6] =
+            ["triangle", "saw down", "saw up", "square", "sine", "sample and hold"];
+        let base = factory_voices()
+            .into_iter()
+            .find(|v| v.display_name() == "VIBE KEYS")
+            .expect("the factory bank has its vibraphone piano");
+        let mut out = Vec::new();
+        for (w, wave) in WAVES.into_iter().enumerate() {
+            for free in [false, true] {
+                let mut v = base;
+                v.lfo_wave = w as u8;
+                v.lfo_speed = 90;
+                v.lfo_pitch_depth = 40;
+                v.pitch_mod_sens = 4;
+                v.lfo_sync = (w % 2 == 0) != free;
+                v.osc_sync = !free;
+                let sync = if v.lfo_sync { "on" } else { "off" };
+                let osc = if free { ", oscillators free" } else { "" };
+                out.push((format!("VIBE KEYS, {wave}, key sync {sync}{osc}"), v));
+            }
+        }
+        out
+    }
+
+    /// **Three phrases, each after a silence that retires every voice**: a
+    /// chord with a note held by the pedal, a two-note figure, a single
+    /// note, on frames no export or device grid would put them on. The
+    /// script, the frames the second and third phrases wake the instrument
+    /// at, and the length.
+    fn three_phrases() -> (Vec<(usize, Ev)>, [usize; 2], usize) {
+        let events = vec![
+            (101, Ev::On(60)),
+            (307, Ev::Pedal(true)),
+            (1_733, Ev::On(67)),
+            (2_903, Ev::On(72)),
+            (9_001, Ev::Off(60)),
+            (14_011, Ev::Pedal(false)),
+            (15_503, Ev::Off(67)),
+            (16_127, Ev::Off(72)),
+            (61_007, Ev::On(64)),
+            (61_559, Ev::On(71)),
+            (69_443, Ev::Off(64)),
+            (71_001, Ev::Off(71)),
+            (117_013, Ev::On(76)),
+            (124_999, Ev::Off(76)),
+        ];
+        (events, [61_007, 117_013], 160_000)
+    }
+
+    /// One event of a script, told.
+    fn tell(d: &mut Dx7, e: Ev) {
+        match e {
+            Ev::On(p) => d.note_on(p, 0.8),
+            Ev::Off(p) => d.note_off(p),
+            Ev::Pedal(x) => d.set_pedal(x),
+        }
+    }
+
+    /// **Mono render of a script, each event told on its own frame**, the
+    /// calls cut at every event and at every frame of `cuts` besides; no
+    /// cuts is the performance called whole, one call from each event to
+    /// the next. With `empty`, a call of no frames goes either side of every
+    /// event as well. Answers too whether the instrument had gone quiet at
+    /// every frame of `asleep`, so a script whose silences retire nothing
+    /// cannot pass for one that tries a silence.
+    fn cut_render(
+        v: Voice,
+        events: &[(usize, Ev)],
+        frames: usize,
+        cuts: &[usize],
+        empty: bool,
+        asleep: &[usize],
+    ) -> (Vec<f32>, bool) {
+        let mut d = Dx7::new(SR);
+        d.set_voice(v);
+        let mut events = events.to_vec();
+        events.sort_by_key(|e| e.0);
+        let mut edges: Vec<usize> = events
+            .iter()
+            .map(|e| e.0)
+            .chain(cuts.iter().copied())
+            .filter(|&f| f < frames)
+            .collect();
+        edges.push(frames);
+        edges.sort_unstable();
+        edges.dedup();
+        let mut out = vec![0.0_f32; frames * 2];
+        let (mut from, mut next, mut slept) = (0, 0, true);
+        for to in edges {
+            if asleep.contains(&from) {
+                slept &= !d.active();
+            }
+            while next < events.len() && events[next].0 <= from {
+                if empty {
+                    d.render(&mut out[from * 2..from * 2], 0, 2);
+                }
+                tell(&mut d, events[next].1);
+                next += 1;
+                if empty {
+                    d.render(&mut out[from * 2..from * 2], 0, 2);
+                }
+            }
+            if to > from {
+                d.render(&mut out[from * 2..to * 2], to - from, 2);
+                from = to;
+            }
+        }
+        (out.chunks_exact(2).map(|f| f[0]).collect(), slept)
+    }
+
+    /// **The calls a host might make**: a fixed length from frame 0, as a
+    /// device buffer, the look-ahead's grain or an export's chunk falls, and
+    /// two runs of random lengths from 1 to 700 frames, the second with a
+    /// call of no frames either side of every event.
+    fn host_cuts(frames: usize, seed: u32) -> Vec<(String, Vec<usize>, bool)> {
+        let mut out: Vec<(String, Vec<usize>, bool)> = [1usize, 7, 64, 333, 512]
+            .into_iter()
+            .map(|k| (format!("{k}-frame calls"), (k..frames).step_by(k).collect(), false))
+            .collect();
+        let mut x = seed | 1;
+        for empty in [false, true] {
+            let (mut at, mut cuts) = (0, Vec::new());
+            loop {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                at += 1 + (x % 700) as usize;
+                if at >= frames {
+                    break;
+                }
+                cuts.push(at);
+            }
+            let how = if empty { "random cuts and empty calls" } else { "random cuts" };
+            out.push((how.to_owned(), cuts, empty));
+        }
+        out
+    }
+
+    /// **A phrase after a silence renders the same called whole or cut
+    /// anywhere, its LFO and all.** The instrument was exact under any cut
+    /// while it sounded, but its LFO stopped at the end of whichever call
+    /// retired its last voice, so the phase the next phrase began at was
+    /// the host's choice: an export's 512-frame chunks put it in one place,
+    /// a device buffer or the look-ahead's grain in another, calls cut at
+    /// every event in a third. A run now ends on a grid of the instrument's
+    /// own frames from the note that woke it (`RUN_GRID`), and a call that
+    /// retires the last voice between two lines carries the LFO on to the
+    /// next, so where the calls fall cannot reach the sound.
+    ///
+    /// Every factory voice the LFO is heard on and every wave with its key
+    /// sync on and off, through three phrases and two silences that retire
+    /// every voice, rendered whole and at 1, 7, 64, 333 and 512-frame calls
+    /// and two runs of random cuts, one with empty calls: the same to the
+    /// bit. Bits, not a floor: an LFO a frame out is a pitch a frame out,
+    /// and nothing about a cut should be audible at any level.
+    #[test]
+    fn a_phrase_after_a_silence_renders_the_same_called_whole_or_cut_anywhere() {
+        let (events, wakes, frames) = three_phrases();
+        let heard = heard_lfo();
+        assert!(heard.len() >= 8, "the factory bank's LFO voices went missing: {}", heard.len());
+        let mut moved = Vec::new();
+        for (i, (name, v)) in heard.into_iter().chain(every_lfo_wave()).enumerate() {
+            let (whole, slept) = cut_render(v, &events, frames, &[], false, &wakes);
+            assert!(slept, "{name} still sounded when a phrase began, so no silence was tried");
+            let peak = whole.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(peak > 0.01, "{name} is silent: {peak}");
+            for (how, cuts, empty) in host_cuts(frames, 0x2545_f491 ^ i as u32) {
+                let (got, _) = cut_render(v, &events, frames, &cuts, empty, &[]);
+                let first = whole.iter().zip(&got).position(|(a, b)| a.to_bits() != b.to_bits());
+                if let Some(first) = first {
+                    let worst =
+                        whole.iter().zip(&got).fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+                    let db = 20.0 * (worst / peak).log10();
+                    moved.push(format!("{name}, {how}: from frame {first}, {db:.1} dB re peak"));
+                }
+            }
+        }
+        let moved = moved.join("\n");
+        assert!(moved.is_empty(), "the render depends on where its calls fall:\n{moved}");
+    }
+
+    /// **In an export's chunks the instrument renders what it did, its LFO
+    /// and all.** An export calls it 512 frames at a time from its start;
+    /// with every event told on the head of its chunk, every run starts on
+    /// a chunk's head, its lines are chunk ends, and a chunk end is where
+    /// the last voice was always retired and the LFO always stopped. The
+    /// three phrases with each event moved to the head of its chunk, every
+    /// voice of both sets, hashed: the values the instrument rendered before
+    /// its run had a grid. None of the release goldens strikes a voice whose
+    /// LFO is heard, so this is the pin that says such an export of one is
+    /// the file it was.
+    #[test]
+    fn a_render_in_an_exports_chunks_is_the_one_it_was() {
+        const CHUNK: usize = 512;
+        let (events, _, frames) = three_phrases();
+        let headed: Vec<(usize, Ev)> =
+            events.iter().map(|&(f, e)| (f / CHUNK * CHUNK, e)).collect();
+        let frames = frames / CHUNK * CHUNK;
+        let chunks: Vec<usize> = (CHUNK..frames).step_by(CHUNK).collect();
+        let moved: Vec<String> = [
+            ("the factory voices whose LFO is heard", heard_lfo(), 2_993_835_644_951_626_885),
+            ("every wave, key sync on and off", every_lfo_wave(), 2_536_928_010_614_568_686),
+        ]
+        .into_iter()
+        .filter_map(|(set, voices, want)| {
+            let all: Vec<f32> = voices
+                .iter()
+                .flat_map(|(_, v)| cut_render(*v, &headed, frames, &chunks, false, &[]).0)
+                .collect();
+            let got = fnv(&all);
+            (got != want).then(|| format!("{set}: {got}, where it was {want}"))
+        })
+        .collect();
+        assert!(moved.is_empty(), "an export's chunks render another file: {moved:#?}");
+    }
+
+    /// **A sample and hold that falls due while the LFO is carried on to
+    /// the run's line draws there**, as the same frames called whole draw
+    /// it inside the call. The generator it draws from is the one free
+    /// oscillators take their phases from, so a draw skipped or doubled in
+    /// the carry moves every strike after it, not the LFO alone, and the
+    /// phrases above happen never to put a draw in a carry.
+    ///
+    /// So one is found: the fast sample and hold with its oscillators free,
+    /// a note let go at the first of a sweep of frames from 8,000 whose
+    /// retiring call, at 1-frame calls, wraps the LFO in the carry and not
+    /// in the frame it renders. Then a second note after the silence, the
+    /// performance rendered whole and at 1, 7, 64, 333 and 512-frame calls
+    /// and at random cuts: the same to the bit.
+    #[test]
+    fn a_sample_and_hold_due_in_the_carry_draws_there() {
+        let (name, v) = every_lfo_wave()
+            .into_iter()
+            .find(|(n, _)| n.contains("sample and hold") && n.contains("free"))
+            .expect("a free-running sample and hold");
+        let release = (8_000..10_600).step_by(37).find(|&off| {
+            let mut d = Dx7::new(SR);
+            d.set_voice(v);
+            d.note_on(64, 0.8);
+            for frame in 0..off + SR as usize {
+                if frame == off {
+                    d.note_off(64);
+                }
+                let (phase, step) = (d.lfo_phase, d.lfo_step);
+                d.render(&mut [0.0_f32; 2], 1, 2);
+                if !d.active() {
+                    // At most one wrap in a call this short: it fell in the
+                    // carry when the phase came back below where it began
+                    // and the frame's own step had not taken it past 1.
+                    return d.lfo_phase < phase && phase + step < 1.0;
+                }
+            }
+            false
+        });
+        let off = release.expect("no release in the sweep puts a draw in the carry");
+        let again = off + 40_000;
+        let events = [
+            (0, Ev::On(64)),
+            (off, Ev::Off(64)),
+            (again, Ev::On(67)),
+            (again + 5_000, Ev::Off(67)),
+        ];
+        let frames = off + 70_000;
+        let (whole, slept) = cut_render(v, &events, frames, &[], false, &[again]);
+        assert!(slept, "{name} still sounded when the second note came");
+        for (how, cuts, empty) in host_cuts(frames, 0x6c8e_9cf5) {
+            let (got, _) = cut_render(v, &events, frames, &cuts, empty, &[]);
+            let first = whole.iter().zip(&got).position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(first, None, "{name}, let go at {off}, {how}: it moved from that frame");
+        }
+    }
+
+    /// **A note still retires at the end of the call it finishes in, and
+    /// `active` says so there.** Only the LFO waits for the run's line
+    /// (`RUN_GRID`): the engine parks a lane, rests it and ends an audition
+    /// by `active`, and those answers come call by call as they always did,
+    /// so the LFO's grid moves no lane's rest. The three phrases in 64-frame
+    /// calls: after every call the instrument is active exactly while a note
+    /// is not through, and at least one silence begins off its run's grid,
+    /// where the LFO is carried on to the line.
+    #[test]
+    fn a_note_still_retires_with_the_call_it_finishes_in() {
+        const CALL: usize = 64;
+        let (events, _, frames) = three_phrases();
+        let (name, v) = heard_lfo().into_iter().next().expect("a factory voice whose LFO is heard");
+        let mut d = Dx7::new(SR);
+        d.set_voice(v);
+        let (mut next, mut woke, mut off_grid) = (0, None, 0);
+        for start in (0..frames).step_by(CALL) {
+            while next < events.len() && events[next].0 < start + CALL {
+                if !d.active() && woke.is_none() {
+                    woke = Some(start);
+                }
+                tell(&mut d, events[next].1);
+                next += 1;
+            }
+            d.render(&mut [0.0_f32; CALL * 2], CALL, 2);
+            let keyed = d.notes.iter().any(|n| !n.through());
+            assert_eq!(d.active(), keyed, "{name}: after the call ending at {}", start + CALL);
+            if !d.active() {
+                if let Some(w) = woke.take() {
+                    off_grid += usize::from((start + CALL - w) % RUN_GRID != 0);
+                }
+            }
+        }
+        assert!(off_grid > 0, "{name}: every silence began on its run's grid, so no carry ran");
     }
 }
