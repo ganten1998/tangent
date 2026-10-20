@@ -2915,7 +2915,7 @@ const WELCOME_LINES: [&str; 25] = [
     "",
     "What's new: Tangent Tape Rework - warm analog",
     "tone, no frills, just results.",
-    "Tangent Keys Rework - A complete upgrade to the",
+    "Tangent Keys Rework - a complete upgrade to the",
     "modeling means a full suite of classic keyboard",
     "sounds. Try them all, or mess around with the",
     "bonus instrument: a Nylon Guitar.",
