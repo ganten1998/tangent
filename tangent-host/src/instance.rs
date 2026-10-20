@@ -1746,6 +1746,9 @@ impl Instance {
                 }
             }
         }
+        // **In time order**, each frame's events in the order they were
+        // filed (`EventList::sort_by_offset`).
+        self.scratch.events.sort_by_offset();
 
         // ── the buffers ─────────────────────────────────────────────────────
         //
@@ -2046,14 +2049,15 @@ pub struct Rendered {
 
 /// Events this list can carry in one block.
 ///
-/// The app's renderer caps itself at 128 notes and 32 controls per block
-/// (`MAX_EVENTS_PER_BLOCK` and `MAX_CONTROLS_PER_BLOCK` in
-/// `tangent/src/instrument.rs`), and each control can add one legacy CC event, so
-/// 160 is the most that can ever arrive from there and 256 is comfortably past
-/// it. The 257th event of a block is **dropped and counted** in
-/// [`Rendered::dropped_events`] rather than allocated for: this list is filled
-/// on the audio thread.
-const MAX_EVENTS: usize = 256;
+/// The app's renderer hands a lane's rack at most 256 notes a block (twice
+/// `MAX_EVENTS_PER_BLOCK` in `tangent/src/instrument.rs`, the walk's offs and
+/// its strikes) and 227 controls (`MAX_LANE_CONTROLS`: the live ones, and its
+/// pedal at the head and at every move inside the block), and each control
+/// can add one legacy CC event, so 483 is the most that can ever arrive from
+/// there and 512 is past it. The 513th event of a block is **dropped and
+/// counted** in [`Rendered::dropped_events`] rather than allocated for: this
+/// list is filled on the audio thread.
+const MAX_EVENTS: usize = 512;
 
 /// The `IEventList` the plugin reads this block's notes out of.
 ///
@@ -2101,6 +2105,34 @@ impl EventList {
 
     fn dropped(&self) -> usize {
         self.dropped.get()
+    }
+
+    /// **The block's events in time order, each frame's in the order they
+    /// were filed**: an insertion sort, stable and allocation-free, over the
+    /// cells in use.
+    ///
+    /// They were handed over as the caller listed them, the notes and then
+    /// the controls: the app's walk lists a held note's off at its own frame
+    /// ahead of the notes struck from the block's head, and a pedal moved on
+    /// its own frame after every note. A plugin that renders up to each
+    /// event in turn, as the event list's order invites, takes an event
+    /// behind one it has already rendered to at that later frame, so a strike
+    /// or a pedal landed late. On a shared frame the filing order stands, the
+    /// notes before the controls, as at a block's head.
+    fn sort_by_offset(&self) {
+        let n = self.len.get().min(self.events.len());
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 {
+                let (a, b) = (self.events[j - 1].get(), self.events[j].get());
+                if a.sampleOffset <= b.sampleOffset {
+                    break;
+                }
+                self.events[j - 1].set(b);
+                self.events[j].set(a);
+                j -= 1;
+            }
+        }
     }
 
     /// Append, or count it as dropped. `bool` for the caller that cares.
@@ -3871,8 +3903,11 @@ mod tests {
     /// read through the pointer INSIDE its own `process`, which is the only
     /// place a plugin ever reads it. One stereo output, no inputs, and a
     /// VST 3.7 `IProcessContextRequirements` answer the host should keep.
+    /// And the events it is handed, `(sampleOffset, type)`, read through
+    /// the list's own interface in the order `getEvent` gives them.
     struct TimeProbe {
         seen: std::sync::Arc<std::sync::Mutex<Vec<Option<(u32, f64, i64, i64, f64, f64, f64, i32, i32)>>>>,
+        heard: std::sync::Arc<std::sync::Mutex<Vec<(i32, u16)>>>,
     }
 
     /// What the probe answers `getProcessContextRequirements` with: tempo,
@@ -4000,6 +4035,20 @@ mod tests {
             if let Ok(mut seen) = self.seen.lock() {
                 seen.push(row);
             }
+            // SAFETY: the host hands a valid event list for the call, or
+            // none, and every index read is below the count it answers.
+            if let Some(list) = unsafe { vst3::ComRef::from_raw((*data).inputEvents) } {
+                for i in 0..unsafe { list.getEventCount() } {
+                    // SAFETY: as in `EventList::new`, a zeroed `Event` is a
+                    // valid value, and `getEvent` writes it whole.
+                    let mut e: Event = unsafe { std::mem::zeroed() };
+                    if unsafe { list.getEvent(i, &mut e) } == kResultOk {
+                        if let Ok(mut heard) = self.heard.lock() {
+                            heard.push((e.sampleOffset, e.r#type));
+                        }
+                    }
+                }
+            }
             kResultOk
         }
         unsafe fn getTailSamples(&self) -> uint32 {
@@ -4013,6 +4062,43 @@ mod tests {
         }
     }
 
+    /// **A block's events reach the plugin in time order, each frame's in
+    /// the order they were handed over.** The app's walk lists a held note's
+    /// off at its own frame ahead of the notes struck from the block's head,
+    /// an off falling due behind them, and the pedal after every note, at
+    /// the head and on the frame it moves; the list went to the plugin in
+    /// that order, so one that renders up to each event in turn met a strike
+    /// at 100 after rendering to 300, and the pedal's move at 250 after the
+    /// last note. Through the real `process_through` into a double that reads
+    /// the list from inside its `process`: every event at its offset, in time
+    /// order, the off at 300 before the strike on its frame as it was handed
+    /// over.
+    #[test]
+    fn a_blocks_events_reach_the_plugin_in_time_order() {
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let component = ComWrapper::new(TimeProbe { seen: Default::default(), heard: heard.clone() })
+            .to_com_ptr::<IComponent>()
+            .expect("the wrapper exposes IComponent");
+        let setup = Setup { sample_rate: 48_000.0, max_block: 512 };
+        let mut inst = Instance::from_component(component, setup).expect("the double assembles");
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        let note = |offset: i32, pitch: i16, on: bool| Note { offset, pitch, velocity: if on { 0.8 } else { 0.0 }, on };
+        let notes = [note(300, 60, false), note(100, 64, true), note(300, 60, true), note(200, 64, false)];
+        let controls = [Control::cc(0, 0, 64, 127), Control::cc(250, 0, 64, 0)];
+        inst.process_with_controls(&notes, &controls, 512, &mut out).expect("a block");
+        let (on, off, cc) = (
+            Event_::EventTypes_::kNoteOnEvent as u16,
+            Event_::EventTypes_::kNoteOffEvent as u16,
+            Event_::EventTypes_::kLegacyMIDICCOutEvent as u16,
+        );
+        let heard = heard.lock().expect("the probe's log").clone();
+        assert_eq!(
+            heard,
+            vec![(0, cc), (100, on), (200, off), (250, cc), (300, off), (300, on)],
+            "the block's events reached the plugin out of time order"
+        );
+    }
+
     /// **The context reaches the plugin's own `process` call.** Every block
     /// before `set_transport` existed went out with a null pointer, and a
     /// builder that filled a struct nobody pointed at would pass every test
@@ -4021,7 +4107,7 @@ mod tests {
     #[test]
     fn the_plugin_reads_the_filled_context_inside_its_own_process() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let component = ComWrapper::new(TimeProbe { seen: seen.clone() })
+        let component = ComWrapper::new(TimeProbe { seen: seen.clone(), heard: Default::default() })
             .to_com_ptr::<IComponent>()
             .expect("the wrapper exposes IComponent");
         let setup = Setup { sample_rate: 44_100.0, max_block: 128 };
