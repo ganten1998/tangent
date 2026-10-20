@@ -492,9 +492,10 @@ channels play back their clips and nothing else. "Ready to play" and
         leave its plugins' points are a chunk off once. What a shrinking
         hold or a closing rule hands a lane at a block's head sounds there
         whole when it is a strike, and from there when it is a note still
-        held; a DX7's or Tangent Keys' note shorter than the stretch skipped,
-        and inside it, is told and let up on that one frame and does not
-        speak (a waiting lane loses what its line held there).
+        held. A note shorter than the stretch skipped, and inside it, is
+        told and let up on that one frame: a DX7 does not speak it at all,
+        and Tangent Keys strikes it there as a short note (a waiting lane
+        loses what its line held there).
     - **A held line plays out what it holds.** A kit's line ran only while
       one of its pads sounded, and a built-in instrument's only while its
       lane had a voice, so whatever a line held when its source fell silent
