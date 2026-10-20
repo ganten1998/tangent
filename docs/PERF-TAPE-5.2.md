@@ -256,13 +256,26 @@ internally.
   tape reaches speed): every render the same bits but events 1 or 3 blocks
   after it, and a stop pressed just as the tape reached speed.
 
-The renders that differ are events inside the way back, up to 30 blocks after
-the tape reached speed: their held lanes' racks had been through less of the
-look-ahead than 5.2's, so the tails take another path, at the same level (in
-the 594-render grid, 0.002 dB on median from the first difference on and 0.03
-dB at most; in 0.1 s windows above -40 dB re peak 0.07 dB on median and 1.9 dB
-at most), and nearer the desk with the look-ahead off in all 74 that have one
-to compare with (5.6 dB nearer on median).
+The renders that differ are events inside the way back: up to 30 blocks after
+the tape reached speed in these grids, and over a sweep of seventeen desk
+shapes (4 to 128 lanes, 32 to 480-frame blocks, the auto grain and 240 frames)
+the last that differs lands 6 to 40 blocks in, 8 to 53 ms at 32 to 256-frame
+blocks on the auto grain, 107 ms at 128 frames on a 240-frame grain, 125 ms at
+333 and 150 ms at 480. They are a stop, a locate, a loop's wrap, the dial and a
+knob moved on a built-in bay, and a held lane parking there (its eighth second
+of quiet) with nothing pressed at all; a grain or motor switch there plays
+5.2's bits. Each finds a held lane's rack up to about two grains short of the
+look-ahead 5.2's had been through, and from then on that rack runs from
+another state. Its tails take another path at the same level (in the
+594-render grid 0.002 dB on median from the first difference on and 0.03 dB at
+most, in 0.1 s windows above -40 dB re peak 0.07 dB on median and 1.9 dB at
+most; over the sweep up to 1.4 dB in the 0.4 s after a stop and 3.3 dB in its
+worst 0.1 s, at 480-frame blocks), nearer the desk with the look-ahead off in
+all 74 that have one to compare with (5.6 dB nearer on median); and a unit
+with a clock of its own (the plate, Tape, the chorus) stays off 5.2's bits for
+the rest of the song, -11 to -29 dB against the signal eight seconds on at the
+same level within 0.04 dB, where a compressor's difference is gone within half
+a second.
 
 **The first draft** let each lane in to a grain of its own and never back onto
 the clock: its blocks cost a little less (the dearest of a probe cycle 1484
