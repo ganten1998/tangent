@@ -572,16 +572,39 @@ channels play back their clips and nothing else. "Ready to play" and
     look ahead. Your own playing reaches the speakers that much later than
     it would through a bare master: at 48 kHz, 25 ms with a Tape in its
     deep wow range across the master, 2 ms in its studio range, 10.7 ms
-    with an IR. The backing comes as late, and the click and where a part
-    lands follow it, so the click stays on the music's beat and a part
-    played to what was heard lands on it. (The 2026-10-19 rule left out
-    every master unit from the first that reports a delay while an input
-    was heard, so the input waited for none of them and a Tape or an IR
-    across the master was not heard while tracking.) With the input
-    withheld (monitoring off, or its track muted or soloed out), as when
-    you listen through an interface's direct monitoring, the speakers skip
-    both racks: hearing them there needs a second copy of every master
-    plugin.
+    with an IR. The backing comes as late, and the click and where a
+    recorded part is placed follow it, so the click stays on the music's
+    beat and a part recorded onto a track, played to what was heard, is
+    placed on the beat it was played to (the take is another matter: the
+    next entry). (The 2026-10-19 rule left out every master unit from the
+    first that reports a delay while an input was heard, so the input
+    waited for none of them and a Tape or an IR across the master was not
+    heard while tracking.) With the input withheld (monitoring off, or its
+    track muted or soloed out), as when you listen through an interface's
+    direct monitoring, the speakers skip both racks: hearing them there
+    needs a second copy of every master plugin.
+  - **Still known: with monitoring on, the take carries what you play as
+    late against the song and the click as the master's plugins hold the
+    mix.** The take the cassette records is the desk's one mix: an armed
+    input is summed with the song ahead of the master's racks, and the two
+    pass them together, through the one copy of each plugin there. You
+    hear the song through those racks (`RoomRoad::Tapped`), so you play to
+    it that much later, and the take holds your playing that much after
+    the beat it was played to, as the speakers played it: at 48 kHz, 2 ms
+    with a Tape in its studio range across the master, 25 ms in its deep
+    wow range, 10.7 ms with an IR. Measured offline, an impulse played
+    into an armed input on the frame the speakers play beat two is in the
+    take 96, 1,200 and 512 frames after the take's beat two and its click.
+    With monitoring off it is on the beat, and a delay on a track or the
+    limiter's lookahead holds your playing and the song alike, so neither
+    moves it. A part recorded onto a track is still placed on the beat it
+    was played to (above). The 2026-10-19 rule kept the take tight, since
+    the speakers left out every master plugin from the first that reports
+    a delay while an input was heard; the master heard while tracking and
+    the take tight at once needs a second copy of every master plugin, one
+    for the speakers alone (after 5.3.0). To keep a take tight now, take
+    the plugins that add delay off the master while you record it, or
+    turn monitoring off and listen through the interface.
   - **Still known: moving between those roads while the song plays skips,
     in the speakers, what their holds part by, or plays it again, over the
     10 ms crossfade, the click with the mix.** The take's mix waits for the
