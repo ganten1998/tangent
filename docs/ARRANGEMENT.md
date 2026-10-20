@@ -285,8 +285,11 @@ channels play back their clips and nothing else. "Ready to play" and
     further on its way out: a Tape in its deep wow range holds it 1,200
     frames (25 ms at 48 kHz), a Tape in the studio range 96 frames (2 ms),
     an IR with an impulse loaded 512 frames (about 11 ms); an IR across the
-    master holds the take, and the speakers while they share the take's
-    mix, 512 more, and the limiter in circuit 58. Four things follow it now.
+    master holds the take 512 more, and the speakers as much while they
+    share the take's mix or an armed input is heard (the owner's ruling of
+    2026-10-20: master plugins work while inputs are armed), and the
+    limiter in circuit holds the take 58 more, and the speakers only while
+    they share its mix. Four things follow it now.
     - **The click is heard on the mix's beat.** It is still a cue: made on
       the song's clock (a count-in on the keypress's), summed after the
       master and its ceiling, never ducked, never in an export, a freeze or
@@ -556,24 +559,46 @@ channels play back their clips and nothing else. "Ready to play" and
     tee has run, so if the speakers take their own mix or the take's in
     the very chunk a take's first rolling frame is marked (an input armed
     within a callback of the record's start), the take is placed off by
-    the master chain's delay (58 frames with the limiter, 512 with an IR
-    across the master).
-  - **Still known: arming an audio input while the song plays skips, in
-    the speakers, as much of the song as the master's chain holds the take
-    back, and disarming it plays that much again, crossfaded.** While an
-    audio input is armed the speakers take a mix of their own, through
+    what the two holds part by: with monitoring on, the limiter's
+    lookahead alone (58 frames with the limiter in circuit, none with it
+    out); with monitoring off, the master chain's whole delay (58 frames
+    with the limiter, 512 more with an IR across the master).
+  - **Still known: while an audio input is armed and heard, what you hear
+    of it comes as late as the master's plugins hold the mix (the owner's
+    choice, 2026-10-20).** With monitoring on, the speakers take the mix
+    after both of the master's racks, every plugin in them as the take has
+    it, so a Tape across the master is heard while you track, and then
     their own copy of the master's built-in chain, whose limiter does not
-    look ahead: with the input heard, the master's racks up to their first
-    unit that adds delay; with it withheld (monitoring off, or its track
-    muted or soloed out), neither rack. Neither waits for the master's
-    delay, so an arm moves the speakers that far ahead in the song and a
-    disarm moves them back, each over the 10 ms crossfade, the click with
-    the mix: at 48 kHz, 10.7 ms with an IR across the master, 25 ms with a
-    Tape in its deep wow range there, 1.2 ms with the limiter alone. A
-    repeat longer than the fade plays on at full level past the fade's
-    end. An arm with the input withheld switches at once instead, which
-    with plugins or the limiter on the master can click: a fade out of the
-    take's mix would play the input the speakers may not hear.
+    look ahead. Your own playing reaches the speakers that much later than
+    it would through a bare master: at 48 kHz, 25 ms with a Tape in its
+    deep wow range across the master, 2 ms in its studio range, 10.7 ms
+    with an IR. The backing comes as late, and the click and where a part
+    lands follow it, so the click stays on the music's beat and a part
+    played to what was heard lands on it. (The 2026-10-19 rule left out
+    every master unit from the first that reports a delay while an input
+    was heard, so the input waited for none of them and a Tape or an IR
+    across the master was not heard while tracking.) With the input
+    withheld (monitoring off, or its track muted or soloed out), as when
+    you listen through an interface's direct monitoring, the speakers skip
+    both racks: hearing them there needs a second copy of every master
+    plugin.
+  - **Still known: moving between those roads while the song plays skips,
+    in the speakers, what their holds part by, or plays it again, over the
+    10 ms crossfade, the click with the mix.** The take's mix waits for the
+    master's racks and the limiter's lookahead, the heard road for the
+    racks alone, the withheld road for neither. So arming or disarming an
+    audio input with monitoring on skips or plays again only the
+    lookahead, 1.2 ms at 48 kHz with the limiter in circuit and nothing
+    with it out; throwing monitoring off while an input is armed skips as
+    much of the song as the master's racks hold it (10.7 ms with an IR
+    across the master, 25 ms with a deep-range Tape there), and throwing
+    it back on plays that much again; disarming with monitoring off plays
+    the racks and the lookahead again. A repeat longer than the fade plays
+    on at full level past the fade's end. Arming with the input withheld
+    (monitoring off, or a muted or soloed-out track) skips the racks and
+    the lookahead and switches at once, which with plugins or the limiter
+    on the master can click: a fade out of the take's mix would play the
+    input the speakers may not hear.
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip
