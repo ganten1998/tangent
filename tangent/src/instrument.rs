@@ -2192,10 +2192,20 @@ impl HoldRead {
 ///   deep wow range there: that is the owner's choice, made over the
 ///   2026-10-19 rule, which left out every master unit from the first that
 ///   adds delay so the input waited for none of them, and left a Tape
-///   across the master out of the speakers while an input was heard. Then
-///   the speakers' own copy of the built-in chain, whose limiter does not
-///   look ahead (`Effects::new_live`): the speakers wait for everything the
-///   take waits for but the lookahead.
+///   across the master out of the speakers while an input was heard. **So
+///   the take carries what the player plays that late against the song and
+///   the click**: the take is the one mix, the input summed with the song
+///   ahead of the racks, and the player plays to the song as the racks hand
+///   it to the speakers, so a part played to the heard beat is in the take
+///   as late as both racks hold the mix (2 ms at 48 kHz with a Tape in its
+///   studio range across the master, 25 ms in its deep wow range, 10.7 ms
+///   with an IR), as the speakers played it. With one instance of each
+///   master plugin the take cannot stay tight while the speakers wait for
+///   it; a part recorded onto a track is still placed on the beat it was
+///   played to (`capture_mark`). Then the speakers' own copy of the
+///   built-in chain, whose limiter does not look ahead
+///   (`Effects::new_live`): the speakers wait for everything the take
+///   waits for but the lookahead.
 /// - **`Withheld`**: some of an armed input is withheld from the speakers
 ///   (monitoring off, its track muted or soloed out), as with an
 ///   interface's direct monitoring. The take's mix less that input, taken
@@ -51495,6 +51505,28 @@ mod slot_engine {
                 }
             }
 
+            /// **The desk's alignment target**: what a unit on a lane holds
+            /// every lane back by.
+            fn target(self) -> usize {
+                match self {
+                    Held::Studio => 96,
+                    Held::Deep => 1_200,
+                    Held::Ir => 512,
+                    _ => 0,
+                }
+            }
+
+            /// **What the master's two racks hold the mix back by**, every
+            /// unit in them, on the take's way out and on the heard road's.
+            fn racks(self) -> usize {
+                match self {
+                    Held::MasterIr | Held::MasterChain => 512,
+                    Held::MasterStudio => 96,
+                    Held::MasterDeep => 1_200,
+                    _ => 0,
+                }
+            }
+
             /// **Where beat two of the song is heard**: in the take, and in
             /// the speakers while the two are one mix, the target and the
             /// master's whole chain; in the speakers' own mix with an input
@@ -51502,20 +51534,8 @@ mod slot_engine {
             /// racks, every unit, and no lookahead (the owner's ruling of
             /// 2026-10-20). These are the numbers the CHANGELOG quotes.
             fn beat_two(self, split: bool, take: bool) -> usize {
-                let target = match self {
-                    Held::Studio => 96,
-                    Held::Deep => 1_200,
-                    Held::Ir => 512,
-                    _ => 0,
-                };
-                let racks = match self {
-                    Held::MasterIr | Held::MasterChain => 512,
-                    Held::MasterStudio => 96,
-                    Held::MasterDeep => 1_200,
-                    _ => 0,
-                };
                 let ahead = if self == Held::Limiter { 58 } else { 0 };
-                BEAT_TWO + target + racks + if split && !take { 0 } else { ahead }
+                BEAT_TWO + self.target() + self.racks() + if split && !take { 0 } else { ahead }
             }
         }
 
@@ -51548,15 +51568,22 @@ mod slot_engine {
         /// Roll `blocks` from 0:00, silence into the input if one is plugged:
         /// the speakers' output and the take.
         fn roll_held(e: &mut Engine, tx: &mut Option<Producer<f32>>, blocks: usize) -> (Vec<f32>, Vec<f32>) {
+            roll_struck(e, tx, blocks, None)
+        }
+
+        /// [`roll_held`], with an impulse of 0.5 played into the plugged
+        /// input on frame `strike` of the roll when one is asked for, and
+        /// silence on every other frame.
+        fn roll_struck(e: &mut Engine, tx: &mut Option<Producer<f32>>, blocks: usize, strike: Option<usize>) -> (Vec<f32>, Vec<f32>) {
             let mut tap = e.take_recorder_tap().expect("the take's tap");
             e.set_transport(1, 0);
             e.set_rolling(true);
             let mut out = vec![0.0f32; BLOCK * 2];
             let (mut room, mut take) = (Vec::new(), Vec::new());
-            for _ in 0..blocks {
+            for b in 0..blocks {
                 if let Some(tx) = tx.as_mut() {
-                    for _ in 0..BLOCK {
-                        let _ = tx.push(0.0);
+                    for f in b * BLOCK..(b + 1) * BLOCK {
+                        let _ = tx.push(if Some(f) == strike { 0.5 } else { 0.0 });
                     }
                 }
                 e.render_offline(&mut out);
@@ -51819,6 +51846,83 @@ mod slot_engine {
                     at * RATE_HZ
                 );
                 assert_eq!(e.record_anchor(gen + 1), None, "{held:?}: an anchor answered a press it was not asked by");
+            }
+        }
+
+        /// **With monitoring on, the take holds a part played to the beat the
+        /// speakers play as late against the backing and the click as both of
+        /// the master's racks hold the mix; with monitoring off, on the beat**
+        /// (what the owner's ruling of 2026-10-20 costs the take, pinned so it
+        /// cannot move unseen).
+        ///
+        /// The take is the desk's one mix: an armed input is summed with the
+        /// song ahead of the master's racks, and the two pass them together,
+        /// through the one instance of each unit there. With the input heard
+        /// the speakers take that mix after both racks (`RoomRoad::Tapped`),
+        /// so the player hears the backing's beat two that much after the mix
+        /// makes it and plays to it then, and what they play reaches the mix
+        /// that much after the beat. An impulse played into lane 3's input on
+        /// the frame the speakers play beat two is in the take 512 frames
+        /// after the backing's beat with an IR, or a trim and an IR, across
+        /// the master, 96 with a Tape there in its studio range and 1,200 in
+        /// its deep wow range, and as far after the click's, which waits for
+        /// the racks in the take as the music does (`ClickHold`). The speakers
+        /// play it as late against the beat they play: the take is what was
+        /// heard, less the lookahead. Under the 2026-10-19 rule, whose heard
+        /// road left out every master unit from the first that adds delay, it
+        /// was on the beat, and a Tape across the master was not heard while
+        /// an input was. With the input withheld (monitoring off) the speakers
+        /// skip both racks, and the impulse played to the beat they play is on
+        /// the take's beat. A delay on a lane, or the limiter's lookahead,
+        /// holds the input and the song alike in the take, so neither parts
+        /// them. A take tight against the song while the speakers hear the
+        /// master's racks needs a second instance of every master plugin, one
+        /// for the speakers alone, which is for after 5.3.0. A part recorded
+        /// onto a track is placed on the beat it was played to either way
+        /// (`a_take_played_to_the_backing_is_placed_on_the_beat_it_was_played_to`).
+        #[test]
+        fn with_monitoring_on_the_take_holds_a_part_played_to_the_heard_beat_as_late_as_the_masters_racks() {
+            const BLOCKS: usize = 60;
+            for held in Held::ALL {
+                for monitoring in [true, false] {
+                    // Lane 3's input armed and plugged, heard or withheld.
+                    let render = |click: bool, backing: bool, strike: Option<usize>| {
+                        let (mut e, mut tx) = held_desk(held, click, backing, true);
+                        e.set_monitor_on(monitoring);
+                        roll_struck(&mut e, &mut tx, BLOCKS, strike)
+                    };
+                    let (quiet_room, quiet_take) = render(false, false, None);
+                    let (back_room, back_take) = render(false, true, None);
+                    let heard = loudest(&less(&back_room, &quiet_room)).0;
+                    let beat = loudest(&less(&back_take, &quiet_take)).0;
+                    // The player strikes on the frame the speakers play the beat.
+                    let (struck_room, struck_take) = render(false, false, Some(heard));
+                    let (played, peak) = loudest(&less(&struck_take, &quiet_take));
+                    assert!(peak > CROSS, "{held:?}, monitoring {monitoring}: the impulse never reached the take");
+                    let late = if monitoring { held.racks() } else { 0 };
+                    assert_eq!(
+                        played as i64 - beat as i64,
+                        late as i64,
+                        "{held:?}, monitoring {monitoring}: the impulse played to beat two as the speakers played it (frame {heard}) is in the take on frame {played}, {} frames after the take's beat two (frame {beat})",
+                        played as i64 - beat as i64
+                    );
+                    assert_eq!(beat, held.beat_two(false, true), "{held:?}, monitoring {monitoring}: the take heard beat two at {beat}");
+                    let road = if monitoring { held.beat_two(true, false) } else { BEAT_TWO + held.target() };
+                    assert_eq!(heard, road, "{held:?}, monitoring {monitoring}: the speakers played beat two at {heard}");
+                    let (_, click_take) = render(true, false, None);
+                    let tick = onset_from(&less(&click_take, &quiet_take), BEAT_TWO - 100, CROSS)
+                        .unwrap_or_else(|| panic!("{held:?}, monitoring {monitoring}: the click never reached the take"));
+                    assert_eq!(tick, beat + ATTACK, "{held:?}, monitoring {monitoring}: the take's click attacks at {tick}, off its beat two at {beat}");
+                    if monitoring {
+                        let (echo, _) = loudest(&less(&struck_room, &quiet_room));
+                        assert_eq!(
+                            echo as i64 - heard as i64,
+                            late as i64,
+                            "{held:?}: the speakers play the impulse on frame {echo}, {} frames after the beat two they play (frame {heard})",
+                            echo as i64 - heard as i64
+                        );
+                    }
+                }
             }
         }
 
