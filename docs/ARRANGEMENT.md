@@ -286,7 +286,7 @@ channels play back their clips and nothing else. "Ready to play" and
     frames (25 ms at 48 kHz), a Tape in the studio range 96 frames (2 ms),
     an IR with an impulse loaded 512 frames (about 11 ms); an IR across the
     master holds the take, and the speakers while they share the take's
-    mix, 512 more, and the limiter in circuit 58. Three things follow it now.
+    mix, 512 more, and the limiter in circuit 58. Four things follow it now.
     - **The click is heard on the mix's beat.** It is still a cue: made on
       the song's clock (a count-in on the keypress's), summed after the
       master and its ceiling, never ducked, never in an export, a freeze or
@@ -298,17 +298,36 @@ channels play back their clips and nothing else. "Ready to play" and
       (frame 24,000): the click's attack crosses where it does on a bare
       desk, 30 frames past the beat, on every desk, in the speakers and in
       the take; it used to cross at 24,030 whatever the desk, 1,170 frames
-      ahead of the beat with a deep-range Tape (it led by the hold). A
-      count-in's go and the mix's first beat are heard together when the
-      transport rolls on the go, and the go the engine publishes for a
-      take's T0 and the count's end is the instant it is heard. The song's
-      click still waits for the tape: with tape start and stop on, the
-      first click is the first beat at full speed, the hold after it.
-      A change of hold (a plugin added, the deep range thrown) loses the
-      beats inside the old hold, as the lanes lose the music there, and
-      doubles none. The click's own rack's latency counts against its hold;
-      past what the rings can hold (32,256 frames) the click is early by the
-      excess.
+      ahead of the beat with a deep-range Tape (it led by the hold). With
+      its sends on, on a desk holding every term at once, the click is the
+      same signal as a lane playing the click's own samples, to a
+      ten-thousandth. The go a count-in publishes for a take's T0 and the
+      count's end is the instant it is heard.
+      - A move of the target (a plugin added, the deep range thrown) loses
+        the click's beats inside the old hold, as the lanes lose the music
+        there, and doubles none. A move in the master's chain alone (the
+        limiter thrown in or out, the speakers taking their own mix or the
+        take's, a master plugin's delay) keeps every beat not yet heard, as
+        the lanes keep theirs: a longer hold is silence for what it grew
+        by, a shorter one skips what it shrank by. Where the speakers go
+        back to the take's mix the lanes repeat the master chain's frames;
+        the click is silent for them instead, and never sounds a beat twice.
+      - The song's click still waits for the tape (the owner's tape-motor
+        ruling): with tape start and stop on, the first click is the first
+        beat made at full speed, the hold after it, and a Stop's coast
+        clicks nothing: the beats the hold caught when the tape left speed
+        are hushed (`HoldRead::hush`), from the first of them to the next
+        beat made at speed. A click already sounding when the tape leaves
+        speed rings out, as it does on a desk that holds nothing. Held
+        1,200 frames and stopped just after a beat, the coast clicked at
+        0.98 (pitched down with the tape) before this; it is silent now. A
+        beat crossed while the tape ramps up is still dropped where it is
+        made, so on a held desk the mix's first beat heard at speed can be
+        one whose click was dropped, when it fell inside the hold before the
+        tape reached speed.
+      - The click's own rack's latency counts against its hold; past what
+        the rings can hold (32,256 frames) the click is early by the
+        excess.
     - **A part lands where it was played against what was heard.** The
       tee marks a take's first rolling frame in its capture ring with the
       song frame it was captured on and the hold the speakers played at,
@@ -319,7 +338,9 @@ channels play back their clips and nothing else. "Ready to play" and
       25,200 with a deep-range Tape, 24,096 with the studio range and
       24,512 with an IR. The frames the tee takes between the press and
       the transport rolling stand before the roll in the file, as they did
-      in time, where they used to push the whole take late by as much.
+      in time, where they used to push the whole take late by as much; on
+      a punch from a stopped transport they and the hold stand before the
+      press, and the carve follows them (a few tens of milliseconds).
       Nothing lands before the song's start: a record from 0:00 on a held
       desk starts at 0:00 with those frames and the hold cut off its head.
       MIDI is placed by the engine's anchor (the song frame and the instant
@@ -328,27 +349,72 @@ channels play back their clips and nothing else. "Ready to play" and
       before 0:00 goes, one that would begin before it begins on it. A hold
       that moves during a take moves nothing already placed: the hold at the
       take's first rolling frame places all of it. A punch carves from where
-      the take lands. The varispeed dial changes nothing here: the tee,
-      the hold and the mark are all in the program's frames.
-    - **An armed track played live is heard at once.** A lane armed and
-      listening to MIDI stands outside the wait while it is armed, the way
-      a monitored input does: a key into a DX7 on it with a deep-range Tape
-      on another lane is heard 110 frames after it is pressed, as on a bare
-      desk, where it was 1,310; a pad struck on an armed drum lane at once,
-      where it was 1,200 frames late. Its own clips play with it while it
-      is armed, as an armed monitored audio lane's do. Arming and disarming
-      mid-roll glide the lane's wait over 10 ms, the old read fading under
-      the new one, so nothing steps, repeats a block or opens a hole; under
-      a realtime export every lane waits with the mix, as in the full-speed
-      one. A lane that only listens (the one open in the MIDI editor) waits
-      as before.
+      the take lands. The varispeed dial changes nothing for audio: the
+      tee, the hold and the mark are all in the program's frames. MIDI is
+      stamped on the host's clock, so under the dial a part drifts by the
+      speed's difference from 1 over its length, as it always has.
+      - **A record begun on a count-in's go starts on the go.** The engine
+        rolls the song on the go's own frame (`Engine::set_roll_on_go`,
+        asked by the host while a record or a Play waits on the count),
+        where the host used to roll it when it saw the count end, a UI frame
+        or two later: the backing's first beat followed the go by that much
+        on every desk, and a part played on the go landed that much early,
+        its head cut from 0:00 (1,792 frames on a desk held 1,200, in an
+        emulation of the host at 60 Hz). The record waiting on its count
+        opens its inputs' tees when the count starts, writing nothing until
+        the song rolls (`Engine::set_capturing_from_roll`), so the take
+        begins on the go; and the tap's last second of MIDI is replayed into
+        a record begun on a go, from the instant the go was made, where a
+        note played on the go was drained to nobody before the record
+        existed. A tone played from the heard go now lands whole on the song
+        frame the record began on, on a bare desk and a held one.
+    - **An armed track played live is heard at once while its own timeline
+      is silent.** A lane armed and listening to MIDI stands outside the
+      wait while the song is stopped and while it records (its clips are
+      punched out then), the way a monitored input does: a key into a DX7
+      on it with a deep-range Tape on another lane is heard 110 frames after
+      it is pressed, as on a bare desk, where it was 1,310; a pad struck on
+      an armed drum lane at once, where it was 1,200 frames late. While the
+      song plays the track back and it is not recording, it waits with the
+      mix, so its own clips stay on the beat and an export lays down what
+      was heard; keys played along with playback then come late by the hold,
+      as in 5.2. (A first draft stood every armed lane outside the wait
+      whatever it was doing, and the shipped default session arms its
+      piano: on a held desk that track played its own part 25 ms early. The
+      proper fix for a lane both played and played back is to read its
+      whole timeline a wait behind the song, which reaches every walk of
+      the render; it is not built.) A lane moves in and out of the wait at
+      a record's start and end, at Play and at Stop, and the move glides
+      over 10 ms, the old read fading under the new one: a steady sound
+      passes without a step, while a sound struck in the last hold before
+      the move is skipped (into the wait) or heard twice, faded (out of
+      it), and a tone the two reads put out of phase dips through the fade.
+      A line that did not run in the chunk before (a kit between strikes,
+      an instrument whose voices have ended) takes its new wait at once,
+      so the first strike after a quiet move is heard once, where it
+      belongs. Under a realtime export every lane waits with the mix, as in
+      the full-speed one. A lane that only listens (the one open in the
+      MIDI editor) waits as before.
+    - **A held line plays out what it holds.** A kit's line ran only while
+      one of its pads sounded, and a built-in instrument's only while its
+      lane had a voice, so whatever a line held when its source fell silent
+      stood in its ring: on a desk held 1,200 frames a drum hit shorter
+      than that was never heard, and every longer hit and every DX7 note
+      lost its last 1,200 frames, which played out ahead of the next hit or
+      note. Each line now runs on until it has played out its wait's worth
+      after the last sound it was fed, and a held kit or DX7 lane is the
+      bare desk's, sample for sample, the hold later.
   - **Still known: the interface's own round trip is not compensated.**
     Its input and output buffers and its converters are the device's, not
     the desk's, so a part played in time with what was heard lands late by
-    them, on a bare desk as on a held one. And when a count-in ends, the
-    host rolls the transport a UI frame or two after the go (it watches the
-    count end rather than being told), so the backing's first beat comes
-    that long after the go on every desk, held or not.
+    them, on a bare desk as on a held one.
+  - **Still known: a take's mark carries the speakers' hold of the chunk
+    before it.** The speakers' hold is worked out with the click, after the
+    tee has run, so if the speakers take their own mix or the take's in
+    the very chunk a take's first rolling frame is marked (an input armed
+    within a callback of the record's start), the take is placed off by
+    the master chain's delay (58 frames with the limiter, 512 with an IR
+    across the master).
 - **The sustain pedal is no longer on that list.** It was — "not written
   into recorded MIDI clips, it rides the live path only" — and the symptom
   was a part played with the damper down coming back dry, because the clip

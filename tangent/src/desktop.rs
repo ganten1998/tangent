@@ -16896,10 +16896,11 @@ impl DesktopApp {
         // off whenever the tape must not move (see `motor_quiet`).
         let ss = self.app.start_stop();
         e.set_tape_motor(ss.on() && !motor_quiet, ss.start_s(), ss.stop_s());
-        // **An armed track played live stands outside the desk's wait**, so
-        // its player hears their keys at once (`Renderer::plays_live`): never
-        // under a realtime export, which lays the song down aligned whatever
-        // is armed, as the full-speed one does.
+        // **An armed track played live stands outside the desk's wait**
+        // while its own timeline is silent (the song stopped, or the track
+        // recording), so its player hears their keys at once
+        // (`Renderer::plays_live`): never under a realtime export, which lays
+        // the song down aligned whatever is armed, as the full-speed one does.
         e.set_live_play(self.recorder.bounce.is_none());
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());

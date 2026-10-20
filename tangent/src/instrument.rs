@@ -2184,7 +2184,10 @@ struct BarClock {
     /// transport is. The handover doubled that go. The transport does not
     /// roll during a count-in; the host starts it a UI poll after the
     /// downbeat FROM WHEREVER THE PLAYHEAD STANDS - `start_arr_record` and
-    /// `play_on_go` both just toggle play, and neither locates. From 0:00, or
+    /// `play_on_go` both just toggle play, and neither locates. (While a
+    /// record or a Play waits on the count the engine rolls it itself, on the
+    /// go's own frame, `Renderer::go_split`; from where it stands, too, and
+    /// the go is handed over the same way.) From 0:00, or
     /// any playhead parked on a beat line, the first beat this clock reaches
     /// is the one the go just was, and it sounded it a frame or two behind
     /// the count-in's: measured at 96000 and 96001. Parked between beats the
@@ -14362,8 +14365,9 @@ impl Renderer {
                         self.shared.count_in_done.store(true, Ordering::Relaxed);
                         // **And the bar clock must not sound it again.** The
                         // host starts the transport a poll from now, from
-                        // wherever the playhead stands; on a beat line, that
-                        // beat is the one this "go" just was. See
+                        // wherever the playhead stands (or the engine rolled
+                        // it on this very frame, `go_split`); on a beat line,
+                        // that beat is the one this "go" just was. See
                         // `BarClock::already_sounded`.
                         //
                         // **Only if it is not rolling ALREADY.** A go over a
