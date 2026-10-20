@@ -22212,6 +22212,12 @@ impl Renderer {
                 // place in the list and its own frame in the span.
                 let mut early = [(0u32, 0u32); EARLY_OFFS];
                 let mut early_n = 0usize;
+                // **The offs whose own strike was told before this block**,
+                // by their place in the list: the only ones the overlap rule
+                // of the DX7's and the keyboard's cues may move (below). A
+                // held note's off the walk lists first, and a live key let up
+                // that was not struck earlier in the buffer.
+                let mut struck_before = [0u64; (MAX_EVENTS_PER_BLOCK * 2).div_ceil(64)];
                 if armed {
                     // **This lane's OWN live notes**, not the block's. `armed`
                     // says whether the lane is listening; `note_lanes` says
@@ -22224,6 +22230,22 @@ impl Renderer {
                     for (n, m) in self.notes.iter().zip(&self.note_lanes) {
                         if m.reaches(route) {
                             lane_notes.push(*n);
+                        }
+                    }
+                    // In the order they were played: a key let up that was
+                    // not struck before it in the buffer was struck in an
+                    // earlier one.
+                    let mut struck = 0u128;
+                    for (i, n) in lane_notes.iter().enumerate() {
+                        let Some(key) = usize::try_from(n.pitch).ok().filter(|k| *k < 128) else {
+                            continue;
+                        };
+                        if n.on {
+                            struck |= 1u128 << key;
+                        } else if struck & (1u128 << key) == 0 {
+                            if let Some(w) = struck_before.get_mut(i / 64) {
+                                *w |= 1u64 << (i % 64);
+                            }
                         }
                     }
                 }
@@ -22312,6 +22334,10 @@ impl Renderer {
                                 continue;
                             }
                             if lane_notes.len() < lane_notes.capacity() {
+                                let i = lane_notes.len();
+                                if let Some(w) = struck_before.get_mut(i / 64) {
+                                    *w |= 1u64 << (i % 64);
+                                }
                                 lane_notes.push(Note {
                                     offset: span.at_off(due) as i32,
                                     pitch: pitch as i16,
@@ -22604,6 +22630,9 @@ impl Renderer {
                 if is_builtin || is_keys {
                     self.cue_pedals(lane, lane_gen, ch, spans, frames, armed, &mut lane_cues);
                     let notes_from = lane_cues.len();
+                    // The offs struck before this block, by their place among
+                    // the note cues.
+                    let mut may_move = [0u64; MAX_CUES_PER_BLOCK.div_ceil(64)];
                     for (i, n) in lane_notes.iter().enumerate() {
                         let Ok(key) = u8::try_from(n.pitch) else {
                             continue;
@@ -22615,6 +22644,12 @@ impl Renderer {
                             .iter()
                             .find(|e| e.0 as usize == i)
                             .map_or(n.offset.max(0) as u32, |e| e.1);
+                        if struck_before.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0) {
+                            let j = lane_cues.len() - notes_from;
+                            if let Some(w) = may_move.get_mut(j / 64) {
+                                *w |= 1u64 << (j % 64);
+                            }
+                        }
                         lane_cues.push(if n.on {
                             Cue::On { at, key, vel: n.velocity }
                         } else {
@@ -22637,11 +22672,27 @@ impl Renderer {
                     // Every note told at the stretch's head kept the list's
                     // order, and so did this. One pass from the end, each
                     // key's next strike on its way.
+                    //
+                    // **Only an off whose own strike was told before this
+                    // block moves** (`struck_before`): a held note's, and a
+                    // live key's struck in an earlier buffer, which a clip's
+                    // strike of its key in this one ends the same way. The
+                    // list is the live keys and then the walk's notes, each
+                    // in its own time, so the next strike listed after an off
+                    // struck in this block can come before that off's own
+                    // strike in time: a key played live and let up after a
+                    // short clip note on it, inside one buffer, had its off
+                    // moved to the clip note's strike, in front of its own,
+                    // and the DX7 and the keyboard kept the key down until
+                    // its next message, through a Stop (whose flush ends the
+                    // notes the walk told and the live keys still down, and
+                    // this key was neither).
                     let mut strike = [u32::MAX; 128];
-                    for cue in lane_cues[notes_from..].iter_mut().rev() {
+                    for (j, cue) in lane_cues[notes_from..].iter_mut().enumerate().rev() {
+                        let moves = may_move.get(j / 64).is_some_and(|w| w & (1u64 << (j % 64)) != 0);
                         match cue {
                             Cue::On { at, key, .. } if *key < 128 => strike[usize::from(*key)] = *at,
-                            Cue::Off { at, key } if *key < 128 => *at = (*at).min(strike[usize::from(*key)]),
+                            Cue::Off { at, key } if *key < 128 && moves => *at = (*at).min(strike[usize::from(*key)]),
                             _ => {}
                         }
                     }
@@ -56269,6 +56320,81 @@ mod slot_engine {
                 let key = energy(&a6, STOP * BLOCK - 4_800, STOP * BLOCK);
                 let tail = energy(&a6, STOP * BLOCK + 2_400, STOP * BLOCK + 7_200);
                 assert!(key > 1e-3 && tail < 0.5 * key, "the key's release on lane 6 did not begin in the Stop's pass ({key}, {tail})");
+            }
+
+            /// **A key played live on a clip note's key comes up when it is
+            /// let up** (the cues' overlap rule moves only the offs whose
+            /// strike was told before the block). Lane 5, an armed DX7 or
+            /// Tangent Keys listening, on a desk that holds nothing and on one
+            /// held 1,200 frames, where it reads its part behind the song and
+            /// its clip's notes fall in the pass its keys are played in. Pass
+            /// 40's stretch of its part holds a clip note on key 60, and the
+            /// same key is played live: struck 240 frames into that pass and
+            /// let up at 500, after the clip note from 20 to 220 (tapped); or
+            /// struck 200 frames into the pass before and let up 150 into
+            /// this one, under a clip note from 50 to 450 (held). Each take,
+            /// in the speakers, in the take and on the lane's stem, is the
+            /// take with the key drawn as a clip note on the frames it was
+            /// played, to the bit: the tapped key comes up at 500, and the
+            /// held one ends at the clip note's strike, as a held clip note
+            /// does. The list holds the live keys first and the walk's notes
+            /// after them, and the rule ended every off at the next strike of
+            /// its key listed after it, so the tapped key's off went to the
+            /// clip note's strike at 20, in front of its own strike, and the
+            /// key stayed down to the end of the take (its last second's
+            /// energy 580 on the DX7 and 44.2 on the keyboard held 1,200,
+            /// against none and 1.0e-4 with the key up). Held, the key's off
+            /// must still move: left where it was played, it let the clip
+            /// note up at 150, and the take differs from the clip's strike.
+            #[test]
+            fn a_key_played_live_on_a_clip_notes_key_comes_up_when_it_is_let_up() {
+                const PASS: usize = 40;
+                let stamp = |off: u64| (off as f64 * 1e9 / 48_000.0).ceil() as Nanos;
+                let energy = |v: &[f32], from: usize, to: usize| v[from * 2..to * 2].iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+                for plays in [Plays::Dx7, Plays::Keys] {
+                    for hold in [0u32, 1_200] {
+                        // Where the lane's part stands at the head of pass 40.
+                        let head = (PASS * BLOCK) as u64 - u64::from(hold);
+                        // The clip note `(from, frames)` after that head, and
+                        // the live key's strike and key-up, each `(pass, offset)`.
+                        for (case, clip, on, off) in [("tapped", (20u64, 200u64), (PASS, 240u64), (PASS, 500u64)), ("held", (50, 400), (PASS - 1, 200), (PASS, 150))] {
+                            let frame = |(pass, k): (usize, u64)| head + k - ((PASS - pass) * BLOCK) as u64;
+                            let render = |live: bool| {
+                                let mut e = live_desk(5, plays, true, Some(hold), |_| {});
+                                let mut notes = vec![(head + clip.0, clip.1, 60)];
+                                if !live {
+                                    notes.push((frame(on), frame(off) - frame(on), 60));
+                                    notes.sort_unstable();
+                                }
+                                e.set_midi_slotted(vec![part(&e, 5, &notes, &[])]);
+                                run(&mut e, 5, BLOCK, PASS + 160, |e, b| {
+                                    play(e, b);
+                                    if live && b == on.0 {
+                                        e.send_midi(stamp(on.1), &[0x90, 60, 100]);
+                                    }
+                                    if live && b == off.0 {
+                                        e.send_midi(stamp(off.1), &[0x80, 60, 0]);
+                                    }
+                                })
+                            };
+                            let (live, drawn) = (render(true), render(false));
+                            let what = format!("{plays:?} held {hold}, {case}");
+                            assert_eq!(live.lagged[PASS], hold > 0, "fixture: {what}: whether the lane read its part behind the song");
+                            let (l5, d5) = (live.column(5), drawn.column(5));
+                            let (n, at) = (d5.len() / 2, PASS * BLOCK);
+                            let (sounded, after) = (energy(&d5, at - BLOCK, at + 4_800), energy(&d5, n - 48_000, n));
+                            assert!(sounded > 1e-2 && after < 1e-4 * sounded, "fixture: {what}: the drawn take ({sounded:.3e} as the keys sound, {after:.3e} over its last second)");
+                            assert_eq!(
+                                first_difference(&l5, &d5),
+                                None,
+                                "{what}: the lane's stem with the key played live against it drawn (the last second's energy {:.3e} against {after:.3e})",
+                                energy(&l5, n - 48_000, n)
+                            );
+                            assert_eq!(first_difference(&live.room, &drawn.room), None, "{what}: the speakers with the key played live against it drawn");
+                            assert_eq!(first_difference(&live.take, &drawn.take), None, "{what}: the take with the key played live against it drawn");
+                        }
+                    }
+                }
             }
 
             /// **A count's go rolls a lane's part the wait late, its keys at
