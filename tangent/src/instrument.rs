@@ -19359,8 +19359,12 @@ impl Renderer {
         let (want, tap) = if live { (0, None) } else { (want, tap) };
         // **What the line owes once it is fed no more** (`pdc_owed`): its
         // wait's worth of frames after the last chunk that brought sound.
-        let fed = self.lane_stage.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
+        // Looked for only where the line waits: on a desk that holds
+        // nothing, and outside the wait, it owes nothing whatever it was
+        // fed, and every lane that folds scanned its staging (a racked lane
+        // folding silence all 1,024 samples of it, each chunk) for nothing.
         let owes = want.max(tap.unwrap_or(0));
+        let fed = owes > 0 && self.lane_stage.iter().take(TAP_CHANNELS).any(|c| c.iter().take(frames).any(|v| *v != 0.0));
         lane.pdc_owed = if fed { owes } else { lane.pdc_owed.saturating_sub(frames).min(owes) };
         let tapped = match tap {
             _ if glides => {
