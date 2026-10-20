@@ -21434,6 +21434,17 @@ impl Renderer {
                     // the end owes nothing older.
                     lane.tl_flush = true;
                     lane.park_from = newest.wrap_from.unwrap_or(newest.at);
+                } else {
+                    // **The song stands stopped**, and the lane may not have
+                    // reached its Stop: inside the hold after it (a rule
+                    // closing a pass after a Stop) its own time is still in the
+                    // run before, and the Stop's flush it would have taken
+                    // there never comes once it reads the song's stopped time.
+                    // What it told ends at its next block's head, as the song's
+                    // own Stop ended a waiting lane's; a lane that had reached
+                    // its Stop has told nothing since, and ends nothing.
+                    lane.tl_flush = true;
+                    lane.park_from = u64::MAX;
                 }
             }
         }
@@ -55170,6 +55181,58 @@ mod slot_engine {
                             "{plays:?} {edge:?}: entering on the break's own chunk differs from entering a pass before it"
                         );
                         assert_eq!(on_holds, (0, false), "{plays:?} {edge:?}: the lane still holds what it told (notes told, its DX7 sounding)");
+                    }
+                }
+            }
+
+            /// **A lane that leaves its part behind the song while the song
+            /// stands stopped ends what it told** (`plan_live_lanes`' leave). A
+            /// lane behind the song takes the Stop's flush the hold after the
+            /// song does, in its own time, so one that leaves inside that hold
+            /// (a rule closing one pass after a Stop: the hold falling to
+            /// nothing, the bus it sends into turned slower than its way out)
+            /// has not reached the Stop, and back on the song's time, which
+            /// stands still, it reads no more of its part: nothing ended what
+            /// it had told, and a note held across the Stop rang until the next
+            /// Play. Now what it told ends at its next block's head, as the
+            /// song's own Stop ended a waiting lane's. A DX7 and the keyboard
+            /// on lane 5, held 1,200 frames, a note from 20,000 held across a
+            /// Stop on pass 60, the rule closing on pass 61, 320 passes: the
+            /// lane leaves on pass 61, and at the end it has told nothing it
+            /// did not let up, its DX7 is quiet, and the speakers' last second
+            /// is silence: its energy 0 on the DX7 and under 3e-7 on the
+            /// keyboard, where on the old road the note was still told at the
+            /// end and it was 580 and 1,305 on the DX7 (the hold, the bus) and
+            /// 3.1 and 7.0 on the keyboard.
+            #[test]
+            fn a_lane_leaving_its_part_behind_a_stop_ends_what_it_told() {
+                for plays in [Plays::Dx7, Plays::Keys] {
+                    for slow in [false, true] {
+                        let mut e = live_desk(5, plays, true, Some(1_200), |p| {
+                            if slow {
+                                slow_send(p, 5);
+                            }
+                        });
+                        e.set_midi_slotted(vec![part(&e, 5, &[(20_000, 200_000, 60)], &[])]);
+                        let h = run(&mut e, 5, BLOCK, 320, |e, b| {
+                            play(e, b);
+                            if b == 60 {
+                                e.set_rolling(false);
+                            }
+                            if b == 61 {
+                                if slow {
+                                    slow_bus(e);
+                                } else {
+                                    fake_hold(e, 0);
+                                }
+                            }
+                        });
+                        assert!(h.lagged[..61].iter().all(|l| *l), "{plays:?} slow {slow}: fixture: the lane did not read its part behind the song up to the rule's close");
+                        assert!(h.lagged[61..].iter().all(|l| !*l), "{plays:?} slow {slow}: the lane did not leave on the pass its rule closed");
+                        assert_eq!(holds(&e, 5), (0, false), "{plays:?} slow {slow}: the lane still holds what it told (notes told, its DX7 sounding)");
+                        let n = h.room.len() / 2;
+                        let last: f32 = h.room[(n - 48_000) * 2..].iter().map(|x| x * x).sum();
+                        assert!(last < 1e-4, "{plays:?} slow {slow}: the speakers' last second holds {last:.3e} of energy");
                     }
                 }
             }
