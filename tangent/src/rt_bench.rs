@@ -3192,16 +3192,16 @@ const START_STOP_ROUNDS: usize = 31;
 /// the dial at 0.75 renders three quarters of the program a pass at rest
 /// renders, so rest itself runs about 1.2 times the dial's p99, and a third
 /// of the cycles' passes are at rest (at speed or parked), their dearest
-/// ramp passes near full speed. Measured on a shared machine, eight runs:
-/// the cycles run 1.07 to 1.20 times the dial's p99 at 64 frames and 1.12
-/// to 1.25 at 128, and 1.03 to 1.23 times its worst; against rest, 0.91 to
-/// 1.08 times its p99 and 0.95 to 1.08 its worst. 5.2, alternated with them,
-/// ran 2.9 to 3.2 times the dial's worst at 64 frames and 2.2 to 2.3 at 128,
-/// every lane's whole grain in the first block at rest after each start; the
-/// motor's way back into the grain render (`Renderer::regrain_hold`) brings
-/// the desk back a share at a time and onto the clock it would have kept,
-/// and the clock's own lump of a phase's grains, while most lanes are still
-/// held, is what is left of it (`docs/PERF-TAPE-5.2.md`).
+/// ramp passes near full speed. Measured on a quiet machine, three runs:
+/// the cycles run 1.46 to 1.52 times the dial's p99 at 64 frames and 1.41
+/// to 1.42 at 128, and 1.30 to 1.37 times its worst; against rest, 1.16 to
+/// 1.28 times its p99 and 1.13 to 1.19 its worst. 5.2, alternated with them,
+/// ran 5.7 times the dial's worst at 64 frames and 3.7 at 128, every lane's
+/// whole grain in the first block at rest after each start; the motor's way
+/// back into the grain render (`Renderer::regrain_hold`) brings the desk
+/// back a share at a time and onto the clock it would have kept, and the
+/// clock's own lump of a phase's grains, while most lanes are still held,
+/// is what is left of it (`docs/PERF-TAPE-5.2.md`).
 ///
 /// `cargo test --release -p tangent --bin tangent -- tape_start_and_stop_costs --ignored --nocapture`
 #[test]

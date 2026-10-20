@@ -19027,9 +19027,9 @@ impl Renderer {
     /// phase from where it would have (`GrainKey::origin`). From then on the
     /// clock plans it as any lane and decides, chunk for chunk, what it would
     /// have decided without the way back. On the bench desk the first block
-    /// back renders the desk's chunks, 1024 lane-frames, where the clock
-    /// alone renders 8192 to 8496; no block of the way back renders more than
-    /// 1555 to 1664, and it closes 20 to 27 blocks after the hand-back.
+    /// back renders 1472 to 1491 lane-frames where the clock alone renders
+    /// 8192 to 8496, no block of the way back more than 1728, and it closes
+    /// 17 to 19 blocks after the hand-back.
     ///
     /// **Why that is the same sound at speed, bit for bit.** A lane is held
     /// only when no span can change its sound (`Rack::spans_free`): clips
@@ -19115,21 +19115,46 @@ impl Renderer {
     /// clock's own catch-up, so it is a span the clock itself could render,
     /// and to the newest end it can reach: that brings the lane level when
     /// the clock's whole look-ahead is in reach, and else leaves it a grain
-    /// or less short for a second turn to finish. A lane whose phase refills
-    /// at the head of every grain is always more than a grain ahead on the
-    /// clock, so it needs the two.
+    /// short for a second turn to finish. A lane whose phase refills at the
+    /// head of every grain is always more than a grain ahead on the clock,
+    /// so it needs the two, and the second has to come in the very next
+    /// chunk, before the clock moves on.
     ///
-    /// Turns go to the lanes they bring level first, cheapest first, while
-    /// the chunk's renders stay within the desk's chunks plus the larger of
-    /// one turn and a quarter of the desk's work. A chunk the clock already
-    /// loads past that gives none, unless a grain's worth of chunks went by
-    /// without a turn, so every held lane comes level. On the bench desk the
-    /// dearest block is then the clock's own: two lanes of one phase
-    /// refilling while most of the rest are still held, at most 1664
-    /// lane-frames.
-    fn regrain_turns(&mut self, at: u64, frames: usize, grain: usize) {
+    /// So the turns go in that order: one second half a chunk whatever the
+    /// desk is doing; then the turns that bring a lane level; then one first
+    /// half, and only when the clock will not have moved past a turn's reach
+    /// of it by the next chunk. Within each, the lane whose phase the clock
+    /// refills fewest lanes at goes first, and then the cheapest. Every turn
+    /// but the second half fits the chunk, within the desk's chunks plus the
+    /// larger of one turn and a quarter of the desk's work, and fits the
+    /// block its lane's phase next refills on too: the lanes a phase brings
+    /// level refill together, so four of one phase let in on the block
+    /// before their refill, where each was cheapest, rendered four grains
+    /// beside twelve chunks on the next. A chunk the desk loads past that
+    /// gives no turn, unless a grain's worth of chunks went by without one,
+    /// so every held lane comes level; and before the second half went
+    /// whatever the desk was doing, a desk of few phases, whose clock's own
+    /// lump fills every other chunk, could hold a lane at its first half for
+    /// ever. On the bench desk the dearest block of the way back is 1664 to
+    /// 1728 lane-frames at 64 frames, and through the start and stop probe's
+    /// cycles 2688 to 2816 at 128 frames, where the clock alone renders
+    /// 8192 to 8672.
+    fn regrain_turns(&mut self, at: u64, frames: usize, grain: usize, loop_b: Option<u64>) {
         let end_of = |k: GrainKey| k.at + u64::from(k.frames);
         let (mut work, mut load, mut held) = (0usize, 0usize, 0usize);
+        // **How many lanes the clock already refills at each phase**: a lane
+        // brought level refills at its own (`grain_span`), and two of one
+        // phase brought level while most lanes still render their chunks
+        // put two grains on a block that has only the chunks' room. So a
+        // turn goes to the least crowded phase first, and the clock's lumps
+        // grow in step with the chunks they replace.
+        let phases = Self::grain_phases(grain, frames) as usize;
+        let mut crowd = [0usize; GRAIN_PHASE_CAP as usize];
+        // And how many lanes each phase will refill once the way back is
+        // done, held or not, and what the lanes neither held nor on the
+        // clock render a chunk.
+        let mut bound = [0usize; GRAIN_PHASE_CAP as usize];
+        let mut other = 0usize;
         for walk_at in 0..self.walk_len() {
             let ch = self.walk_lane(walk_at);
             if self.spine.ext.buses.contains(ch) {
@@ -19139,11 +19164,21 @@ impl Renderer {
                 continue;
             };
             held += usize::from(b.grain.held);
-            if b.folds || b.grain.newest().is_some_and(|k| end_of(k) > at) {
+            let ahead = b.grain.newest().is_some_and(|k| end_of(k) > at);
+            if b.folds || ahead {
                 work += 1;
+            }
+            if ahead && !b.grain.held {
+                crowd[ch % phases] += 1;
+            }
+            if ahead || b.grain.held {
+                bound[ch % phases] += 1;
             }
             if !b.skip {
                 load += b.len;
+                if !ahead && !b.grain.held {
+                    other += b.len;
+                }
             }
         }
         if held == 0 {
@@ -19152,12 +19187,16 @@ impl Renderer {
         }
         let reach = grain + GRAIN_GRID as usize - 1;
         let cap = work * frames + reach.max(work * frames / 4);
-        let mut gave = false;
+        let (mut gave, mut finished, mut shorted) = (false, false, false);
         loop {
-            // The cheapest turn left: whether it brings its lane level, the
-            // frames it adds to the chunk, the lane, and the span with the
-            // origin its grain is stamped with.
-            let mut best: Option<(bool, usize, usize, u64, u64, u64)> = None;
+            // The best turn left that fits, and the best of all for a chunk
+            // that must give one: its kind (0 finishes a lane its last turn
+            // left a grain short, 1 brings a lane level, 2 leaves one a grain
+            // short), how crowded its phase is, the frames it adds to the
+            // chunk, the lane, and the span with the origin its grain is
+            // stamped with.
+            type Turn = (u8, usize, usize, usize, u64, u64, u64);
+            let (mut fit, mut any): (Option<Turn>, Option<Turn>) = (None, None);
             for walk_at in 0..self.walk_len() {
                 let ch = self.walk_lane(walk_at);
                 let Some(l) = self.spine.lanes.get(ch).and_then(Option::as_deref) else {
@@ -19183,18 +19222,55 @@ impl Renderer {
                     continue;
                 };
                 let to = end_of(k);
-                let level = g.shadow.newest().is_some_and(|n| end_of(n) == to);
+                let kind = if g.shadow.newest().is_some_and(|n| end_of(n) == to) {
+                    // Level, and from where one of the clock's grains ends:
+                    // the second half of a turn already taken.
+                    if g.shadow.keys.iter().any(|s| s.frames > 0 && end_of(*s) == from) { 0 } else { 1 }
+                } else {
+                    // **Short only when the next chunk can finish it**: one
+                    // a chunk, and not when the clock's ring will have moved
+                    // past a turn's reach of it by then. A lane whose phase
+                    // refills at the head of every grain is never in a turn's
+                    // reach of level from the block it is let in on, so it
+                    // goes in two turns, and a second turn the clock has
+                    // already outrun is a turn spent for nothing.
+                    let next = self.grain_span(ch, l.gen, &g.shadow, at + frames as u64, frames, grain, loop_b);
+                    if shorted || next.is_some_and(|(f, n)| f + n as u64 > to + reach as u64) {
+                        continue;
+                    }
+                    2
+                };
                 let extra = ((to - from) as usize).saturating_sub(if b.skip { 0 } else { b.len });
-                if best.is_none_or(|(l, x, ..)| (!level, extra) < (!l, x)) {
-                    best = Some((level, extra, ch, from, to, k.at));
+                let crowded = crowd[ch % phases];
+                let turn = (kind, crowded, extra, ch, from, to, k.at);
+                // **It fits this chunk, and the block its lane's phase next
+                // refills on**: that phase's grains, one more, beside the
+                // chunks of the lanes still held. Turns that only fitted the
+                // chunk let the four lanes of one phase in on the block
+                // before their refill, where each was cheapest, and the
+                // refill then rendered four grains beside twelve chunks.
+                // Never below the lump the clock itself refills that phase
+                // with once every lane is on it: a desk of one phase refills
+                // every lane on one block, and a way back held under that
+                // took two chunks a turn to come level. One finishing turn a
+                // chunk goes whatever the desk is doing: on a desk of few
+                // phases the clock's own lump fills the chunk every other
+                // block, and the half a turn left would be outrun.
+                let lump = (crowded + 1) * reach + held.saturating_sub(1) * frames + other;
+                let ceiling = cap.max(bound[ch % phases] * reach + other);
+                let fits = (kind == 0 && !finished) || (load + extra <= cap && lump <= ceiling);
+                let better = |t: &Option<Turn>| t.is_none_or(|(c, n, x, ..)| (kind, crowded, extra) < (c, n, x));
+                if fits && better(&fit) {
+                    fit = Some(turn);
+                }
+                if better(&any) {
+                    any = Some(turn);
                 }
             }
-            let Some((level, extra, ch, from, to, origin)) = best else {
+            let forced = !gave && self.regrain_wait >= Self::grain_phases(grain, frames);
+            let Some((kind, _, extra, ch, from, to, origin)) = fit.or(any.filter(|_| forced)) else {
                 break;
             };
-            if load + extra > cap && (gave || self.regrain_wait < Self::grain_phases(grain, frames)) {
-                break;
-            }
             let Some(b) = self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut).map(Lane::body_mut) else {
                 break;
             };
@@ -19202,9 +19278,15 @@ impl Renderer {
             b.len = (to - from) as usize;
             b.skip = false;
             b.grain.phase_from = Some(origin);
-            b.grain.held = !level;
+            b.grain.held = kind == 2;
+            if kind != 2 {
+                crowd[ch % phases] += 1;
+                held -= 1;
+            }
             load += extra;
             gave = true;
+            finished |= kind == 0;
+            shorted |= kind == 2;
         }
         if gave {
             self.regrain_wait = 0;
@@ -19472,7 +19554,7 @@ impl Renderer {
             }
         }
         if self.regrain {
-            self.regrain_turns(at, frames, grain);
+            self.regrain_turns(at, frames, grain, loop_b);
         }
     }
 
@@ -57570,7 +57652,12 @@ mod tape_motor {
     /// own, every lane's grain in the first block at rest, which is the desk
     /// the way back must sound like.
     fn passes<const N: usize>(desks: &mut [(Engine, Transport); N]) -> [Pass; N] {
-        let p = desks.each_mut().map(|(e, t)| one(e, t, BACK_PASS));
+        passes_of(desks, BACK_PASS)
+    }
+
+    /// [`passes`], of `frames` a pass.
+    fn passes_of<const N: usize>(desks: &mut [(Engine, Transport); N], frames: usize) -> [Pass; N] {
+        let p = desks.each_mut().map(|(e, t)| one(e, t, frames));
         if let Some(r) = desks.get_mut(1).and_then(|d| d.0.offline.as_mut()) {
             r.regrain = false;
         }
@@ -57700,6 +57787,81 @@ mod tape_motor {
                 chunked_apart |= !same(&back, &chunked);
             }
             assert!(chunked_apart, "{what}: the stop's tails were the grain-off desk's too, so the stop proved nothing about the look-ahead");
+        }
+    }
+
+    /// **On a desk of few phases the way back still comes level, and no block
+    /// of it renders more than the desk's chunks and two turns.**
+    ///
+    /// At 128-frame passes the clock spreads a 512-frame grain over four
+    /// phases, four lanes to a phase, at 256 over two and at 333 over one,
+    /// and a 240-frame grain over three phases at 64 and one at 128. Two
+    /// things went wrong there and not on the bench desk
+    /// (`Renderer::regrain_turns`). Cheapest-first turns let the four lanes
+    /// of one phase in on the block before their refill, where each was
+    /// cheapest, and the refill then rendered four grains beside twelve
+    /// chunks: 3456 lane-frames where the desk's chunks are 2048, at every
+    /// start of the start and stop probe. And a lane whose clock refills at
+    /// the head of every grain takes two turns, the second in the very next
+    /// chunk; wherever the clock's own lump filled that chunk, the clock had
+    /// moved on by the one after, and the way back never closed. Every shape,
+    /// from a playhead off the grain grid: the way back's desk plays the shut
+    /// desk's bits through the start, at speed and through a stop; it closes
+    /// within two turns a lane at one a pass, every lane's ring the shut
+    /// desk's from then on; and no block of it renders more than the desk's
+    /// chunks, the room its turns are given and the one second half a chunk
+    /// that goes whatever the desk is doing, or than the clock's own lump of
+    /// a phase's lanes where that is more, as on a desk of one phase.
+    #[test]
+    fn the_way_back_comes_level_on_a_desk_of_few_phases_and_never_stacks_one() {
+        let from = u64::from(RATE) + 13;
+        // The pass, the grain as the setting says it and as the clock renders it.
+        for (pass, grain_ms, grain) in [(128usize, -1.0f64, 512usize), (256, -1.0, 512), (333, -1.0, 512), (128, 5.0, 240), (64, 5.0, 240)] {
+            let reach = grain + crate::analog::voice::CHUNK - 1;
+            let mut desks = [plate_desk(BACK_GRAIN, from), plate_desk(BACK_GRAIN, from)];
+            for (e, _) in &mut desks {
+                e.set_grain_ms(grain_ms);
+            }
+            for _ in 0..20 {
+                passes_of(&mut desks, pass);
+            }
+            for (_, t) in &mut desks {
+                t.toggle_play();
+            }
+            let engaged = |e: &Engine| e.offline.as_ref().is_some_and(|r| r.vs_now.engaged);
+            let (mut open, mut worst, mut at_speed) = (0usize, 0usize, 0usize);
+            for k in 0..2 * RATE as usize / pass {
+                let [back, shut] = passes_of(&mut desks, pass);
+                assert!(same(&back, &shut), "{pass} frames, pass {k}: the way back played other audio than the desk without it ({:?})", back.show);
+                if back.show == MotorShow::Running && !engaged(&desks[0].0) {
+                    at_speed += 1;
+                    worst = worst.max(rendered(&desks[0].0).1);
+                    open += usize::from(desks[0].0.offline.as_ref().is_some_and(|r| r.regrain));
+                }
+            }
+            assert!(at_speed > 200, "{pass} frames: only {at_speed} passes at speed, so little was proved");
+            assert!(open > 0, "{pass} frames: the way back held no lane");
+            assert!(
+                open <= 2 * BACK_LANES,
+                "{pass} frames: the way back was open {open} passes at speed, more than two turns a lane at one a pass"
+            );
+            assert_eq!(clocks(&desks[0].0), clocks(&desks[1].0), "{pass} frames: once the way back closed, the lanes' rings were not the grain clock's");
+            // Or the clock's own lump, on a desk of one phase: there every
+            // lane refills on the one block, and so it does without the way
+            // back.
+            let room = BACK_LANES * pass + reach.max(BACK_LANES * pass / 4);
+            let lump = BACK_LANES.div_ceil((grain / pass).clamp(1, GRAIN_PHASE_CAP as usize)) * reach;
+            assert!(
+                worst <= (room + reach).max(lump),
+                "{pass} frames: a block at speed rendered {worst} lane-frames, more than the {room} its turns are given and one turn, and than the clock's own {lump}"
+            );
+            for (_, t) in &mut desks {
+                t.toggle_play();
+            }
+            for k in 0..RATE as usize / pass {
+                let [back, shut] = passes_of(&mut desks, pass);
+                assert!(same(&back, &shut), "{pass} frames, stop pass {k}: the way back's tails were not the desk's without it ({:?})", back.show);
+            }
         }
     }
 
