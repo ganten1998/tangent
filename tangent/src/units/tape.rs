@@ -9130,15 +9130,22 @@ mod tests {
     /// sitting, over its bar in two runs of three**, and that is the
     /// sitting's tail more than the Tape's: 5.2.0 read 38.3 to 62.4 in it,
     /// against 34.7 to 35.8 in the quiet sitting the day it shipped, and 5.3
-    /// read 17.5 to 20.3 on a machine two other builds were sharing. This
-    /// bench's thread runs at the default class, where the start and stop
-    /// probe runs at the audio thread's. The p99's bar stays the shared
-    /// reading with a margin until a quieter run says what the Tape's own
-    /// tail is; `docs/PERF-TAPE-5.2.md` has the numbers. Lower the bars as
-    /// it gets cheaper, never raise them.
+    /// read 17.5 to 20.3 on a machine two other builds were sharing. That
+    /// sitting ran this bench's thread at the default class; it now runs at
+    /// the audio thread's (user-interactive on macOS), as the start and stop
+    /// probe does, so a busy machine's other work is not put ahead of it.
+    /// The p99's bar stays the shared reading with a margin until a quieter
+    /// run says what the Tape's own tail is; `docs/PERF-TAPE-5.2.md` has the
+    /// numbers. Lower the bars as it gets cheaper, never raise them.
     #[test]
     #[ignore = "a bench: run it by hand in release with --ignored --nocapture"]
     fn the_tape_costs_what_its_budget_says() {
+        #[cfg(target_os = "macos")]
+        // SAFETY: sets the calling thread's own scheduling class and nothing
+        // else; the call takes no pointer.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        }
         let sr = 48_000.0_f32;
         let block = 128;
         let blocks = (10.0 * sr) as usize / block;
