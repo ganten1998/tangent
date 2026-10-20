@@ -395,8 +395,10 @@ channels play back their clips and nothing else. "Ready to play" and
       loop, a locate and Stop. Tangent Keys does because its grid (the
       recount that hands a finished voice's string back to the harp, the
       harp's payments, the reed amp's flush) falls on the frames of the
-      timeline it is played on (`Keys::set_grid`, told at the head of every
-      stretch that rolls); it fell every 128 of the instrument's own frames,
+      timeline it is played on (`Keys::set_grid`, told at the head of each
+      stretch it plays that rolls; a stretch it only idles through, nothing
+      sounding, has nothing a recount could move, and the next it plays is
+      told); it fell every 128 of the instrument's own frames,
       so a part read behind the song by a hold off that grid, or played back
       from a frame off it, sounded apart from the unarmed track or the
       export from the first voice that ended (as much as -62 dB re peak on
