@@ -54850,6 +54850,18 @@ mod slot_engine {
             /// at 39,000 and 40,000 heard together at 40,960 (one onset of twice
             /// the level), and the one at 41,000 at 41,600. Every strike is
             /// heard, and none twice: the speakers' sum is 51 strikes'.
+            ///
+            /// A DX7 on the same moves, ten notes of 300 frames every 6,000 from
+            /// 0:00 and a live key held from pass 20 to pass 100: each note is
+            /// heard once, the hold behind it (1,200, then 2,400, then 600), and
+            /// the key plays on through both moves without a break (no 32 frames
+            /// under 1e-4 from its attack to its off; a lane waiting with the
+            /// mix stops it for 2,400 frames where the hold grows), and two
+            /// seconds after the last off no voice sounds. A note held across
+            /// the shrink (39,000 for 3,000 frames) is heard from the pass's head
+            /// at 40,960. (A note shorter than the stretch the shrink skips,
+            /// inside it, is told and let up together at that head and does not
+            /// speak; a waiting lane loses it as well.)
             #[test]
             fn a_hold_that_moves_mid_roll_neither_repeats_nor_drops_a_note() {
                 let mut e = live_desk(6, Plays::Kit, true, Some(1_200), |_| {});
@@ -54873,6 +54885,61 @@ mod slot_engine {
                 assert!((at(22_400) - one).abs() < 1e-6, "the strike at 20,000 is not heard at 22,400 ({})", at(22_400));
                 assert!((at(40_960) - 2.0 * one).abs() < 1e-6, "the strikes at 39,000 and 40,000 are not heard together at 40,960 ({})", at(40_960));
                 assert!((at(41_600) - one).abs() < 1e-6, "the strike at 41,000 is not heard at 41,600 ({})", at(41_600));
+                // The DX7, with a live key and without.
+                let dx7 = |key: bool, extra: Option<(u64, u64, u8)>| {
+                    let mut e = live_desk(5, Plays::Dx7, true, Some(1_200), |_| {});
+                    let mut notes: Vec<(u64, u64, u8)> = (0..10).map(|k| (k * 6_000, 300, 60 + (k % 5) as u8)).collect();
+                    notes.extend(extra);
+                    notes.sort_unstable();
+                    e.set_midi_slotted(vec![part(&e, 5, &notes, &[])]);
+                    let h = run(&mut e, 5, BLOCK, 320, |e, b| {
+                        play(e, b);
+                        match b {
+                            20 if key => e.send_midi(0, &[0x90, 72, 100]),
+                            40 => fake_hold(e, 2_400),
+                            80 => fake_hold(e, 600),
+                            100 if key => e.send_midi(0, &[0x80, 72, 0]),
+                            _ => {}
+                        }
+                    });
+                    let sounding = e.offline.as_ref().is_some_and(|r| r.lane_body(5).dx7.as_ref().is_some_and(|d| d.active()));
+                    (h, sounding)
+                };
+                // Where each note begins to be heard: past 1e-4 after 2,000
+                // frames under it.
+                let heard = |col: &[f32]| -> Vec<usize> {
+                    let (mut out, mut quiet) = (Vec::new(), usize::MAX);
+                    for (i, f) in col.chunks_exact(2).enumerate() {
+                        if f[0].abs() > 1e-4 {
+                            if quiet >= 2_000 {
+                                out.push(i);
+                            }
+                            quiet = 0;
+                        } else {
+                            quiet = quiet.saturating_add(1);
+                        }
+                    }
+                    out
+                };
+                let ((with, sounding), (twin, _)) = (dx7(true, None), dx7(false, None));
+                let notes = twin.column(5);
+                let key: Vec<f32> = with.column(5).iter().zip(&notes).map(|(a, b)| a - b).collect();
+                let attack = key.chunks_exact(2).position(|f| f[0].abs() > 1e-3).expect("the key sounds");
+                let (mut gap, mut quiet) = (0usize, 0usize);
+                for f in key[attack * 2..100 * BLOCK * 2].chunks_exact(2) {
+                    quiet = if f[0].abs() < 1e-4 { quiet + 1 } else { 0 };
+                    gap = gap.max(quiet);
+                }
+                assert!(gap < 32, "the live key stopped for {gap} frames while the hold moved");
+                assert!(with.lagged[10..140].iter().all(|l| *l), "fixture: the DX7 did not read its part behind the song");
+                assert!(!sounding, "a DX7 voice still sounds two seconds after the last off");
+                assert_eq!(
+                    heard(&notes),
+                    [1_310, 7_307, 13_304, 19_301, 26_499, 32_510, 38_507, 42_704, 48_701, 54_699],
+                    "the DX7's notes are not each heard once, the hold behind them"
+                );
+                let (long, _) = dx7(false, Some((39_000, 3_000, 67)));
+                assert_eq!(heard(&long.column(5)).get(7), Some(&41_057), "the note held across the shrink is not heard from the pass's head");
             }
 
             /// **A rule that closes under a lane reading its part behind the
@@ -55275,7 +55342,7 @@ mod slot_engine {
             /// ahead and never rests while its part rolls** (the grain clock
             /// pins it, `pinned_lanes`; the rest asks it, `rest_blocked`). A
             /// DX7 lane reading its part behind the song, the look-ahead on
-            /// (two-millisecond grains at 64-frame passes), disarmed mid-song
+            /// (ten-millisecond grains at 64-frame passes), disarmed mid-song
             /// so it is neither armed nor listening: while its part rolls it is
             /// in the pin set every pass, its ring never runs ahead of the
             /// playhead, and it is never put to rest.
