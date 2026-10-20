@@ -1034,6 +1034,12 @@ impl Bank {
     /// draft stepped every mode a sample at a time, every group through
     /// memory and a horizontal sum each sample, at 0.6 to 0.7 G
     /// mode-samples per second; `tests::timing_of_the_bank` has this one's.
+    ///
+    /// **A block whole, which only the tests render.** Both voices begin a
+    /// contact with their control block and render it a piece at a time
+    /// (`begin_contact`, `render_contact_part`), so a block a host's call
+    /// cuts is still this block to the bit.
+    #[cfg(test)]
     pub fn render_contact(
         &mut self,
         l: &mut [f32],

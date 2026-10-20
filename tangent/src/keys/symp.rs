@@ -1700,6 +1700,12 @@ struct Glide {
     fade: u16,
     old_back: u32,
     old_frac: Ap,
+    /// **Where the three stood at the last run's end that stepped** (`cool`):
+    /// what a stall is judged against, over the whole run between two
+    /// steps however many pieces the host cut it into.
+    at_rel: f32,
+    at_tau: f32,
+    at_pole: f32,
 }
 
 impl Glide {
@@ -1725,6 +1731,7 @@ impl Glide {
         (self.rel, self.rel_to) = (rel, allpass_delay(c.d.frac));
         (self.tau, self.tau_to) = (tau, allpass_delay(c.d.disp));
         (self.pole, self.pole_to) = (pole, 1.0 - c.d.loss);
+        (self.at_rel, self.at_tau, self.at_pole) = (rel, tau, pole);
         self.on = true;
     }
 
@@ -1750,11 +1757,18 @@ impl Glide {
 
     /// After loop `l`'s run (and its `Loop::cool`, which keeps the line's and
     /// the Thiran's state): the glide's own state and the coefficients it
-    /// moved kept, its line stepped (`step_line`), and once it has arrived the
-    /// design's own coefficients set and the glide over.
-    fn cool(&mut self, l: &mut Loop, h: &Hot, g: &GlideHot, buf: &[f32]) {
-        // Which of the three the run left where it found them (`arrived`).
-        let still = (g.rel == self.rel, g.tau == self.tau, g.pole == self.pole);
+    /// moved kept, and at a run's `end` its line stepped (`step_line`), and
+    /// once it has arrived the design's own coefficients set and the glide
+    /// over.
+    ///
+    /// **A run ends where the harp's frame does or where the keyboard's
+    /// block does** (`Harp::render_piece`), never where a host's call cut
+    /// the block: the line stepped and the arrival was judged at every piece,
+    /// so a call cut inside a block stepped a gliding string's line once
+    /// more there, and the repeats under STRETCH were -79 to -92 dB re peak
+    /// off the whole take on Piano 1 at calls cut off the grid
+    /// (`keys::tests::a_stretch_renders_the_same_called_whole_or_split_anywhere`).
+    fn cool(&mut self, l: &mut Loop, h: &Hot, g: &GlideHot, buf: &[f32], end: bool) {
         (self.rel, self.tau, self.pole, self.fade) = (g.rel, g.tau, g.pole, g.fade);
         if g.ofx1.is_finite() && g.ofy1.is_finite() {
             (self.old_frac.x1, self.old_frac.y1) = (g.ofx1, g.ofy1);
@@ -1764,6 +1778,12 @@ impl Glide {
             (self.old_frac.x1, self.old_frac.y1, self.fade) = (0.0, 0.0, 0);
         }
         (l.frac.a, l.loss.a, l.disp.a) = (h.fa, h.la, h.da);
+        if !end {
+            return;
+        }
+        // Which of the three the run left where it found them (`arrived`).
+        let still = (self.rel == self.at_rel, self.tau == self.at_tau, self.pole == self.at_pole);
+        (self.at_rel, self.at_tau, self.at_pole) = (self.rel, self.tau, self.pole);
         self.step_line(l, buf);
         // **Near its target, or stopped short of it.** Each sample moves a
         // glide by `k` of what is left, and once that is under half an `f32`
@@ -1918,7 +1938,7 @@ fn run_glide<const RAMP: bool>(h: &mut Hot, g: &mut GlideHot, buf: &mut [f32], x
 /// One string over a run on its own, `l` with its glide `g` and its line
 /// `buf`: `run_one`, or `run_glide` while it glides to a re-tuned design.
 #[allow(clippy::too_many_arguments)] // a run's pieces, borrowed apart from the harp by `render_part`
-fn run_alone(l: &mut Loop, g: &mut Glide, buf: &mut [f32], feed: &Feed, m: usize, out: &mut [f32], ramp: f32, tail: f32, glide: f32) {
+fn run_alone(l: &mut Loop, g: &mut Glide, buf: &mut [f32], feed: &Feed, m: usize, out: &mut [f32], ramp: f32, tail: f32, glide: f32, end: bool) {
     let [x, xs] = feeds(feed, l, m);
     let mut h = l.hot();
     if g.on {
@@ -1929,7 +1949,7 @@ fn run_alone(l: &mut Loop, g: &mut Glide, buf: &mut [f32], feed: &Feed, m: usize
             run_glide::<false>(&mut h, &mut gh, buf, x, xs, out, ramp, tail);
         }
         l.cool(&h, buf);
-        g.cool(l, &h, &gh, buf);
+        g.cool(l, &h, &gh, buf, end);
     } else {
         if l.ramping {
             run_one::<true>(&mut h, buf, x, xs, out, ramp, tail);
@@ -2472,8 +2492,17 @@ impl Harp {
     /// (`a_block_is_its_samples`). Costs the feed's filters and a sum of
     /// squares while nothing ticks.
     pub fn render(&mut self, drive: &[f32], out: &mut [f32]) {
+        self.render_piece(drive, out, true);
+    }
+
+    /// **`render` for a piece of a block**, which `ends` its block or is
+    /// one a host's call cut short: a gliding string's line steps, and its
+    /// arrival is judged, where a run ends (`Glide::cool`), which is the
+    /// harp's frame's end or the block's, and not a cut. `render` is a
+    /// piece that ends its block.
+    pub fn render_piece(&mut self, drive: &[f32], out: &mut [f32], ends: bool) {
         if self.gliding {
-            self.render_gliding(drive, out);
+            self.render_gliding(drive, out, ends);
             return;
         }
         let n = drive.len().min(out.len());
@@ -2497,12 +2526,13 @@ impl Harp {
     /// held pedalled chord at 16-frame calls, and the stress score).
     #[inline(never)]
     #[cold]
-    fn render_gliding(&mut self, drive: &[f32], out: &mut [f32]) {
+    fn render_gliding(&mut self, drive: &[f32], out: &mut [f32], ends: bool) {
         let n = drive.len().min(out.len());
         let mut at = 0;
         while at < n {
             let m = (FRAME - self.phase).min(n - at);
-            self.render_part_gliding(&drive[at..at + m], &mut out[at..at + m]);
+            let end = self.phase + m == FRAME || (at + m == n && ends);
+            self.render_part_gliding(&drive[at..at + m], &mut out[at..at + m], end);
             self.phase += m;
             at += m;
             if self.phase == FRAME {
@@ -2579,7 +2609,7 @@ impl Harp {
     /// (`render_gliding`): the same part, its pairs as there, and a string
     /// that glides on its own (`run_alone`), so that a pair is the pair it
     /// always was (`Glide`).
-    fn render_part_gliding(&mut self, drive: &[f32], out: &mut [f32]) {
+    fn render_part_gliding(&mut self, drive: &[f32], out: &mut [f32], end: bool) {
         let m = drive.len();
         let send = self.send;
         for (u, &d) in self.u.iter_mut().zip(drive) {
@@ -2602,7 +2632,7 @@ impl Harp {
                 for j in [ia, ib] {
                     let l = &mut loops[j];
                     let buf = &mut arena[l.off as usize..(l.off + l.n) as usize];
-                    run_alone(l, &mut glides[j], buf, feed, m, out, ramp, tail, glide);
+                    run_alone(l, &mut glides[j], buf, feed, m, out, ramp, tail, glide, end);
                 }
                 i += 2;
                 continue;
@@ -2639,7 +2669,7 @@ impl Harp {
             let j = usize::from(live[i]);
             let l = &mut loops[j];
             let buf = &mut arena[l.off as usize..(l.off + l.n) as usize];
-            run_alone(l, &mut glides[j], buf, feed, m, out, ramp, tail, glide);
+            run_alone(l, &mut glides[j], buf, feed, m, out, ramp, tail, glide, end);
         }
     }
 

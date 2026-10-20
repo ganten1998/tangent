@@ -1536,6 +1536,7 @@ pub struct Keys {
     /// moved with the host's call size (up to 896 frames early at
     /// 1024-frame calls: the electric grand -65 dB re peak off the
     /// 128-frame take, `every_patch_renders_the_same_at_any_host_call`).
+    /// The frame's recount falls on the same grid (`count_block`).
     harp_due: usize,
     /// How many times the shared side has been cleared (`clear_shared`):
     /// what the tests hold a repeated all notes off's cost to.
@@ -2612,7 +2613,8 @@ impl Keys {
         // Whether this block is under the hush (`render_blocks`).
         let mut hushed = false;
         let (mut at, mut m) = (0, 0);
-        for f in 0..n {
+        let mut f = 0;
+        while f < n {
             // **Every voice is rendered a block at a time**: into the
             // accumulators once per `modal::BLOCK` frames (`render_blocks`),
             // read back here a sample at a time through the shared side and
@@ -2622,6 +2624,16 @@ impl Keys {
             // beside this until every family had one, and a patch left out
             // of its list would have played silence.
             if f == at + m {
+                // **A block that ended on the grid is counted there**
+                // (`count_block`), and the instrument fallen silent there
+                // renders nothing more of the call, as a call begun on that
+                // frame would not.
+                if m > 0 && self.harp_due == 0 {
+                    self.count_block();
+                    if self.sounding == 0 {
+                        break;
+                    }
+                }
                 at = f;
                 // The harp's payment falls on its grid (`harp_due`), before
                 // the block's voices and strings, and a block ends where the
@@ -2630,24 +2642,28 @@ impl Keys {
                     self.follow_harp(modal::BLOCK);
                     self.harp_due = modal::BLOCK;
                 }
-                m = (n - f).min(modal::BLOCK).min(self.harp_due);
+                let mut whole = modal::BLOCK.min(self.harp_due);
                 // A block ends where the hush's fade or rise does, so its
                 // clear and its rise's end fall on the same frame at every
                 // host call (they waited for the next block: up to a block
                 // later at longer calls).
                 for to_go in [self.hush_left, self.hush_rise] {
                     if to_go > 0 {
-                        m = m.min(to_go as usize);
+                        whole = whole.min(to_go as usize);
                     }
                 }
+                m = (n - f).min(whole);
                 self.harp_due -= m;
                 hushed = self.render_blocks(m);
                 // The harp hears the block's bridge drive at once, string
                 // by string: `symp::Harp::render` is its samples ticked
-                // one at a time, to the bit, at a block's cost.
+                // one at a time, to the bit, at a block's cost. Told whether
+                // the block reached its own end or the call's end cut it,
+                // which is not where a gliding string steps
+                // (`symp::Harp::render_piece`).
                 self.acc_h[..m].fill(0.0);
                 if harp {
-                    self.harp.render(&self.acc_d[..m], &mut self.acc_h[..m]);
+                    self.harp.render_piece(&self.acc_d[..m], &mut self.acc_h[..m], m == whole);
                 }
             }
             let i = f - at;
@@ -2741,9 +2757,37 @@ impl Keys {
                     out[base + c] += (left + right) * 0.5;
                 }
             }
+            f += 1;
         }
-        // Frames asked for that `out` had no room for still went by.
-        self.pass_harp_grid(frames - n);
+        // The call's last block, when it ended on the grid; one cut short by
+        // the call's end is counted where the next call finishes it.
+        if f == at + m && m > 0 && self.harp_due == 0 && self.sounding > 0 {
+            self.count_block();
+        }
+        // Frames the instrument was silent for, and frames asked for that
+        // `out` had no room for, still went by.
+        self.pass_harp_grid(frames - f);
+    }
+
+    /// **The end of a block on the grid**: the reed amp's flush, and the
+    /// recount that says which voices are done, whether anything still
+    /// sounds, and with nothing sounding makes the amp side a new one's.
+    ///
+    /// **On the grid, never at a call's end.** It ran once a call, after
+    /// the call's last frame, so the host's calls were part of the sound:
+    /// a voice that finished inside a 512-frame call was handed back to the
+    /// harp and its slot freed at that call's end, and at 128-frame calls up
+    /// to 384 frames sooner; the frame fell silent at the end of whichever
+    /// call it went quiet in, rendering a longer call's tail and dropping a
+    /// shorter one's; and the reed amp's denormal flush ran once a call.
+    /// A host that plays the keyboard in pieces cut at its notes moved all
+    /// three by where each note fell. Counted where the
+    /// harp's payments fall (`harp_due`), every `modal::BLOCK` frames of the
+    /// timeline and nowhere else, they fall on the same frames whatever the
+    /// calls (`a_stretch_renders_the_same_called_whole_or_split_anywhere`).
+    fn count_block(&mut self) {
+        let patch = self.patch;
+        let harp = self.has_harp();
         if patch == Patch::Wurli140 {
             self.reed_amp.end_block();
         }
@@ -4497,44 +4541,40 @@ mod tests {
     /// 1e-9, left wherever the call ended, put -135.6 dB re peak under the
     /// next note at 1024-frame calls.
     /// Now every voice runs its control on a grid of its own (each one's
-    /// `Ctl`), so does the fretboard (`guitar::BoardCtl`), and a block ends
-    /// where the hush's fade or rise does. The bounds, against these
-    /// measurements:
-    /// - the tine pianos, the dry clav, the Reed 200 and the guitar:
-    ///   identical.
-    /// - the Clav Wah: -90 dB (measured -100.8), and the Reed Amp: -80
-    ///   (-87.1): the frame falls silent at the end of a call, so a longer
-    ///   call renders more of the wah's resonance or the room's tail, both
-    ///   already under the frame's floor.
-    /// - the electric grand: -85 (-91.1, the six strikes at 1-frame calls):
-    ///   the hammer's contact is solved a block at a time by superposition,
-    ///   and a block a call cuts sums the same forces in another order; the
-    ///   bank flushes what is under 1e-20 a part at a time; and the harp
-    ///   takes a string back at the end of the call its voice ended in.
-    /// These performances do not reach every residual: the electric grand's
-    /// velocity ladder differs by -68 at 4096-frame calls (-72 at 1024 and
-    /// under; the frame-2 verifier's, not held here).
+    /// `Ctl`), so does the fretboard (`guitar::BoardCtl`), a block ends where
+    /// the hush's fade or rise does, and what the frame itself still ran once
+    /// a call is the grid's too. Its recount let the frame fall silent at the
+    /// end of a call, so a longer call rendered more of the wah's resonance
+    /// or the room's tail (the Clav Wah -100.8 dB re peak, the Reed Amp
+    /// -87.1), and handed the electric grand's strings back to its harp
+    /// there; it falls where the harp's payments do (`Keys::count_block`).
+    /// And the electric grand's contact was solved afresh at every call, a
+    /// block a call cut summing the same forces in another order (-91.1, the
+    /// six strikes at 1-frame calls); it is begun with its control block and
+    /// rendered a piece at a time (`egrand::EGrandVoice::contact`). Every
+    /// patch is the same to the bit at every call size here, and a stretch
+    /// cut anywhere holds the same, the electric grand's velocity ladder
+    /// among its performances
+    /// (`a_stretch_renders_the_same_called_whole_or_split_anywhere`).
     /// The two grands are held apart, at 64-frame calls too:
     /// `the_grands_render_the_same_at_any_host_call`.
     #[test]
     fn every_patch_renders_the_same_at_any_host_call() {
         let calls = [1usize, 16, 37, 1024];
-        for (patch, bound) in [
-            (Patch::EpMk1, None),
-            (Patch::EpSuitcase, None),
-            (Patch::Clav, None),
-            (Patch::Wurli200, None),
-            (Patch::ClavWah, Some(-90.0)),
-            (Patch::Wurli140, Some(-80.0)),
-            (Patch::ElectricGrand, Some(-85.0)),
-            (Patch::Guitar, None),
+        for patch in [
+            Patch::EpMk1,
+            Patch::EpSuitcase,
+            Patch::Clav,
+            Patch::Wurli200,
+            Patch::ClavWah,
+            Patch::Wurli140,
+            Patch::ElectricGrand,
+            Patch::Guitar,
         ] {
             let worst = call_size_difference(patch, &calls);
             println!("{patch:?}: at calls of 1, 16, 37 and 1024 frames, {}", worst.map_or("identical to the 128-frame takes".to_string(), |(w, name, call)| format!("at most {w:+.1} dB re peak off the 128-frame takes ({name}, {call}-frame calls)")));
-            match (worst, bound) {
-                (None, _) => {}
-                (Some((w, name, call)), None) => panic!("{patch:?}: {name} at {call}-frame calls moved {w:+.1} dB re peak off the 128-frame take; it was the same to the bit"),
-                (Some((w, name, call)), Some(b)) => assert!(w <= b, "{patch:?}: {name} at {call}-frame calls moved {w:+.1} dB re peak off the 128-frame take (bound {b:+.1})"),
+            if let Some((w, name, call)) = worst {
+                panic!("{patch:?}: {name} at {call}-frame calls moved {w:+.1} dB re peak off the 128-frame take; it is the same to the bit");
             }
         }
     }
@@ -4549,10 +4589,10 @@ mod tests {
     /// calls of 1 to 64 frames (0d20e3d1). It runs on a grid of its own now
     /// (`grand::GrandVoice`'s `Ctl`) and the voice renders the same to the bit
     /// at any call (`grand::tests::a_voice_renders_the_same_at_any_host_call`).
-    /// At calls of 1, 16, 37, 64 and 1024 frames the takes are now at most
+    /// At calls of 1, 16, 37, 64 and 1024 frames the takes were then at most
     /// -74.1 dB re peak off the 128-frame take on Piano 1 and -74.8 on Piano
-    /// 2 (-80.6 and -85.2 at 64), the stop identical on both. What differs
-    /// is the frame's and the harp's, each measured by taking it out:
+    /// 2 (-80.6 and -85.2 at 64), the stop identical on both. What differed
+    /// was the frame's and the harp's, each measured by taking it out:
     /// - STRETCH moved under ringing strings, and the harp's strings glide
     ///   to it a line step a run (`symp`'s `Glide::step_line`), a run ending
     ///   where a call does: the repeats -74.1 at 1-frame calls on Piano 1,
@@ -4565,26 +4605,151 @@ mod tests {
     /// - the harp takes a string back at the end of the call its voice
     ///   ended in: the gap -85.4 at 1024-frame calls on Piano 1, the chord
     ///   -95.7 (handed back after one-frame blocks instead: identical).
-    /// With all three taken out the takes are the same to the bit but for
-    /// the tail a frame falling silent at the end of a longer call renders,
-    /// -148 dB. The bound is -70.
-    /// These performances do not reach every residual. Every knob taken to
-    /// 0, to 1 and back to its default under a pedalled chord struck at each
-    /// differs by -61.1 dB re peak at 1-frame calls on Piano 2 at 44.1 kHz
-    /// (-65.1 at 48 kHz; the harp's glide, identical with its following
-    /// switched off), and silent presses under a pedalled C2 by -44.3 at
-    /// 1024-frame calls (the string handed back at the end of the call;
-    /// -66.6 handed back after each frame block instead). Measured by the
-    /// verifier, not held here; the voice itself renders the same to the bit
-    /// in both.
+    /// The verifier measured two more: every knob taken to 0, to 1 and back
+    /// under a pedalled chord, -61.1 dB re peak at 1-frame calls on Piano 2 at
+    /// 44.1 kHz (the glide), and silent presses under a pedalled C2, -44.3 at
+    /// 1024-frame calls (the string handed back).
+    /// All three are the grid's now: a gliding string steps and arrives where
+    /// its run ends, at the harp's frame's end or the block's and never at a
+    /// call's cut (`symp::Glide::cool`), and the frame's recount, the frame
+    /// falling silent and the string handed back with it, falls where the
+    /// harp's payments do (`Keys::count_block`). The takes are the same to
+    /// the bit at every call size, and the verifier's two performances are
+    /// held, cut anywhere, beside the rest
+    /// (`a_stretch_renders_the_same_called_whole_or_split_anywhere`).
     #[test]
     fn the_grands_render_the_same_at_any_host_call() {
         for patch in [Patch::Piano1, Patch::Piano2] {
             let worst = call_size_difference(patch, &[1, 16, 37, 64, 1024]);
             println!("{patch:?}: at calls of 1, 16, 37, 64 and 1024 frames, {}", worst.map_or("identical to the 128-frame takes".to_string(), |(w, name, call)| format!("at most {w:+.1} dB re peak off the 128-frame takes ({name}, {call}-frame calls)")));
             if let Some((w, name, call)) = worst {
-                assert!(w <= -70.0, "{patch:?}: {name} at {call}-frame calls moved {w:+.1} dB re peak off the 128-frame take (bound -70.0)");
+                panic!("{patch:?}: {name} at {call}-frame calls moved {w:+.1} dB re peak off the 128-frame take; it is the same to the bit");
             }
+        }
+    }
+
+    /// `at_calls` with the calls cut at `cuts` (ascending) and at every
+    /// event, and nowhere else: no cut at all is the stretch called whole,
+    /// one call from each event to the next.
+    fn at_cuts(patch: Patch, events: &[(usize, PedalEv)], frames: usize, cuts: &[usize]) -> Vec<f32> {
+        let mut k = Keys::new(SR);
+        k.set_patch(patch);
+        let mut cc = [0u8; 3];
+        let mut out = vec![0.0_f32; 2 * frames];
+        let (mut next, mut f, mut cut) = (0, 0, 0);
+        while f < frames {
+            while next < events.len() && events[next].0 <= f {
+                match events[next].1 {
+                    PedalEv::On(p, v) => k.note_on(p, f32::from(v) / 127.0),
+                    PedalEv::Off(p) => k.note_off(p),
+                    PedalEv::Cc(slot, v) => {
+                        cc[slot] = v;
+                        k.set_pedals(cc);
+                    }
+                    PedalEv::Knob(i, v) => k.set_param(i, v),
+                    PedalEv::Patch(p) => k.set_patch(p),
+                    PedalEv::AllOff => k.all_notes_off(),
+                }
+                next += 1;
+            }
+            while cut < cuts.len() && cuts[cut] <= f {
+                cut += 1;
+            }
+            let mut end = cuts.get(cut).copied().unwrap_or(frames).min(frames);
+            if next < events.len() {
+                end = end.min(events[next].0);
+            }
+            k.render(&mut out[2 * f..2 * end], end - f, 2);
+            f = end;
+        }
+        out
+    }
+
+    /// **A stretch renders the same called whole or split anywhere.** The
+    /// engine plays the keyboard in pieces cut at its own notes, its pedals
+    /// and its stretch's end, and where a stretch ends is the host's: an
+    /// export's 512-frame chunk from its start, a look-ahead grain from where
+    /// Play was pressed, a pinned lane's device buffer. So every patch, on
+    /// the six performances `call_scores` holds and three more (every knob
+    /// taken to 0, to 1 and back to its default under a pedalled chord, the
+    /// harp's glide and its following; silent presses under a pedalled C2,
+    /// the strings handed back; a velocity ladder on one key, the hammer's
+    /// contact on every strike), each rendered with its calls cut only at
+    /// its events (the stretch whole), at 333-frame calls from frame 77 and
+    /// at 64 cuts drawn at random, must give the same bits all three ways.
+    ///
+    /// It did not, by three roads, each a control run once a call: the
+    /// frame's recount, which hands a finished voice's string back to the
+    /// harp and lets the frame fall silent (`Keys::count_block`); a gliding
+    /// harp string's line step and arrival (`symp::Glide::cool`); and the
+    /// electric grand's contact solve, begun afresh at every piece
+    /// (`egrand::EGrandVoice::render`). Measured here before the fix, the
+    /// worst take of each patch against its stretch whole: the silent
+    /// presses -51.6 dB re peak on Piano 1, -45.0 on Piano 2 and -43.4 on
+    /// the electric grand (their strings handed back where a call ended),
+    /// the Clav Wah's gap -100.8 and the Reed Amp's -87.7 (the frame fallen
+    /// silent where a call ended); the tine pianos, the dry clav, the Reed
+    /// 200 and the guitar were the same to the bit already.
+    #[test]
+    fn a_stretch_renders_the_same_called_whole_or_split_anywhere() {
+        let mut seed = 0x6a09_e667_u32;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as usize) % n
+        };
+        for patch in Patch::ALL {
+            let key = |k: u8| if patch == Patch::Guitar { k.clamp(40, 83) } else { k };
+            let f = |t: f32| (t * SR).round() as usize;
+            let mut scores = call_scores(patch);
+            let mut knobs = vec![(0, PedalEv::Cc(0, 127))];
+            for (i, k) in [43u8, 50, 59, 62].into_iter().enumerate() {
+                knobs.push((f(0.0109 + 0.0041 * i as f32), PedalEv::On(key(k), 70 + 12 * i as u8)));
+            }
+            let defaults = patch.defaults();
+            for (i, d) in defaults.iter().enumerate() {
+                let t = 0.2003 + 0.0937 * i as f32;
+                knobs.extend([
+                    (f(t), PedalEv::Knob(i, 0.0)),
+                    (f(t + 0.0311), PedalEv::Knob(i, 1.0)),
+                    (f(t + 0.0623), PedalEv::Knob(i, *d)),
+                ]);
+            }
+            knobs.extend([(f(1.0007), PedalEv::On(key(55), 96)), (f(1.4011), PedalEv::Cc(0, 0))]);
+            let mut silent = vec![(0, PedalEv::Cc(0, 127)), (f(0.0101), PedalEv::On(key(36), 110))];
+            for (i, k) in [43u8, 48, 52, 55, 60].into_iter().enumerate() {
+                let t = 0.1003 + 0.0611 * i as f32;
+                silent.extend([(f(t), PedalEv::On(key(k), 0)), (f(t + 0.0233), PedalEv::Off(key(k)))]);
+            }
+            silent.extend([(f(0.7013), PedalEv::Off(key(36))), (f(1.1009), PedalEv::Cc(0, 0))]);
+            let mut ladder = Vec::new();
+            for i in 0..8u8 {
+                let t = 0.0107 + 0.1013 * f32::from(i);
+                ladder.extend([(f(t), PedalEv::On(key(64), 10 + 16 * i + i / 7)), (f(t + 0.0517), PedalEv::Off(key(64)))]);
+            }
+            scores.extend([("knobs under the pedal", knobs, f(2.0)), ("silent presses", silent, f(1.6)), ("a ladder", ladder, f(1.2))]);
+            for (name, mut events, frames) in scores {
+                events.sort_by_key(|e| e.0);
+                let whole = at_cuts(patch, &events, frames, &[]);
+                let peak = whole.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+                assert!(peak > 1.0e-3, "{patch:?}: {name} is silent, so its splits prove nothing");
+                let mut random: Vec<usize> = (0..64).map(|_| rnd(frames)).collect();
+                random.sort_unstable();
+                let calls: Vec<usize> = (77..frames).step_by(333).collect();
+                for (how, cuts) in [("333-frame calls from frame 77", &calls), ("64 random cuts", &random)] {
+                    let take = at_cuts(patch, &events, frames, cuts);
+                    if let Some(i) = take.iter().zip(&whole).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                        let d = take.iter().zip(&whole).fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+                        panic!(
+                            "{patch:?}: {name} at {how} first differs from the stretch whole at frame {}, at most {:+.1} dB re peak",
+                            i / 2,
+                            20.0 * (d / peak).log10()
+                        );
+                    }
+                }
+            }
+            println!("{patch:?}: nine performances, whole, at 333-frame calls and at 64 random cuts: the same to the bit");
         }
     }
 

@@ -46,7 +46,7 @@
 //! of either instrument a change to the other.
 
 use super::egrand_hammer::{CoreHammer, FeltCore};
-use super::modal::{Bank, ModeSpec, BLOCK, C64, CULL_FLOOR};
+use super::modal::{Bank, Contact, ModeSpec, BLOCK, C64, CULL_FLOOR};
 use super::{MAX_PARAMS, P_VOICING, P_WIDTH};
 
 /// The keyboard, A0 to C8.
@@ -928,6 +928,15 @@ pub struct EGrandVoice {
     done: bool,
     /// The control block being rendered (see [`Ctl`]).
     ctl: Ctl,
+    /// **The contact's solve for the block being rendered**, begun with the
+    /// block (`modal::Bank::begin_contact`) and rendered a piece at a time,
+    /// so a block a host's call cuts is the block rendered whole to the bit.
+    /// Begun again at each piece, the readings and the forces were solved
+    /// afresh at the cut, and summed in another order: one note, a chord, a
+    /// stop and three keys let up were -106 to -128 dB re peak off the whole
+    /// take at calls cut off the grid
+    /// (`keys::tests::a_stretch_renders_the_same_called_whole_or_split_anywhere`).
+    contact: Contact,
     /// Test-only: a twin that keeps every mode, and one with no phantoms.
     #[cfg(test)]
     never_cull: bool,
@@ -980,6 +989,7 @@ impl EGrandVoice {
             exited: true,
             done: true,
             ctl: Ctl::default(),
+            contact: Contact::default(),
             #[cfg(test)]
             never_cull: false,
             #[cfg(test)]
@@ -1674,8 +1684,8 @@ impl EGrandVoice {
             let (l, r, d) = (&mut l[at..at + m], &mut r[at..at + m], &mut drive[at..at + m]);
             if self.ctl.contact {
                 let dt = 1.0 / self.rate;
-                let (bank, hammer) = (&mut self.bank, &mut self.hammer);
-                bank.render_contact(l, r, d, &mut |now, next, c| hammer.tick_implicit(now, next, c, dt));
+                let (bank, hammer, c) = (&mut self.bank, &mut self.hammer, &mut self.contact);
+                bank.render_contact_part(c, l, r, d, &mut |now, next, c| hammer.tick_implicit(now, next, c, dt));
             } else {
                 self.bank.render(l, r, d);
             }
@@ -1695,7 +1705,11 @@ impl EGrandVoice {
             let x = ((self.fall_t + n as f32 / self.rate) / self.fall_secs).min(1.0);
             self.bank.set_damper(x * x * (3.0 - 2.0 * x));
         }
-        self.ctl = Ctl { len: n, done: 0, contact: !self.hammer.idle() };
+        let contact = !self.hammer.idle();
+        if contact {
+            self.bank.begin_contact(&mut self.contact, n);
+        }
+        self.ctl = Ctl { len: n, done: 0, contact };
     }
 
     /// A control block ends, full or cut short by an event after `done` of
