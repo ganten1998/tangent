@@ -49962,9 +49962,16 @@ mod slot_engine {
 
         /// **A unit impulse as an IR's file**: the convolver is then an
         /// honest wire, 512 frames late (`units::convolver`), wherever it is
-        /// put. Written once per process, as the IR bay's own test writes its
-        /// fixture.
+        /// put. One path per process, as the IR bay's own test writes its
+        /// fixture, and **never written in place**: each call writes a file of
+        /// its own and renames it over the path, so a bay that reads the path
+        /// finds a whole impulse, the one before or this one, the same bytes
+        /// either way. Tests run in parallel, and written in place the file
+        /// was truncated and refilled under another test's bay as it read it,
+        /// which then held a short impulse or none: a verifier's parallel
+        /// probes hashed desks apart that way.
         fn wire_ir() -> Vec<u8> {
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
             let spec = crate::builtin_fx::spec_for(crate::builtin_fx::IR_PATH).expect("the IR");
             let mut frames = vec![0.0f32; 512 * 2];
             frames[0] = 1.0;
@@ -49986,8 +49993,48 @@ mod slot_engine {
                 wav.extend_from_slice(&s.to_le_bytes());
             }
             let path = std::env::temp_dir().join(format!("tangent-pdc-wire-{}.wav", std::process::id()));
-            std::fs::write(&path, &wav).expect("the temp WAV writes");
+            let part = path.with_extension(format!("{}.part", CALLS.fetch_add(1, Ordering::Relaxed)));
+            std::fs::write(&part, &wav).expect("the temp WAV writes");
+            std::fs::rename(&part, &path).expect("and takes the fixture's place whole");
             crate::builtin_fx::state_text(spec, &spec.defaults(), &[("ir_path".to_owned(), path.display().to_string())]).into_bytes()
+        }
+
+        /// **The wire IR's file is never written in place, so no bay reads
+        /// half an impulse** (`wire_ir`).
+        ///
+        /// Tests run in parallel and the fixture is one path per process.
+        /// Written in place, a call truncated and refilled the file under
+        /// another test's bay as it read it, and that bay held a short impulse
+        /// or none. Each call writes a file of its own now and renames it over
+        /// the path, so a file a reader holds open is never written again:
+        /// after a second call the path names another file, and the first,
+        /// read through a handle held across the call, is a whole impulse. A
+        /// fixture that wrote in place keeps one file under the path, and
+        /// fails here on every run, not on the run whose timing happens to
+        /// land a read inside a write.
+        #[test]
+        #[cfg(unix)]
+        fn the_wire_irs_file_is_never_written_in_place_so_no_bay_reads_half_an_impulse() {
+            use std::os::unix::fs::MetadataExt;
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::IR_PATH).expect("the IR");
+            let path_of = |state: &[u8]| {
+                crate::builtin_fx::extra_from_state(spec, state)
+                    .into_iter()
+                    .find(|(s, _)| s == "ir_path")
+                    .map(|(_, v)| PathBuf::from(v))
+                    .expect("the state names its file")
+            };
+            let path = path_of(&wire_ir());
+            let mut held = std::fs::File::open(&path).expect("the impulse's file opens");
+            let was = held.metadata().expect("its metadata").ino();
+            assert_eq!(path_of(&wire_ir()), path, "fixture: a second call named another path");
+            let now = std::fs::metadata(&path).expect("the path names a file").ino();
+            assert_ne!(now, was, "a second call wrote the file a reader held open, in place");
+            // Through the handle, not the path: the file the reader holds.
+            let mut bytes = Vec::new();
+            std::io::copy(&mut held, &mut bytes).expect("the held file reads");
+            assert_eq!(bytes.len(), 44 + 512 * 2 * 4, "the file a reader held is {} bytes, not a whole impulse", bytes.len());
+            assert_eq!(bytes.get(44..48), Some(&1.0f32.to_le_bytes()[..]), "the file a reader held starts on no impulse");
         }
 
         /// **The desks the mix is held back on**, and what holds it.
