@@ -34,6 +34,9 @@ The single-unit bench now holds the mean at the defaults to the design's
 16 us and the p99 fully engaged to 30 us (the shared-machine reading with
 a margin); tighten them with quiet numbers, never raise them.
 
+5.2 shipped with this cost as an open issue, to be optimized later; for
+the Tape itself, 5.3 closes it.
+
 ## What 5.3 changed
 
 **The record stage runs a chunk at a time** (`units::tape::record`). It
