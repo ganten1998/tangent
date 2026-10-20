@@ -1,38 +1,47 @@
 # Tape's processor cost in 5.3
 
 Measured 2026-10-19 on the M-series Mac the project is built on, release
-build, each bench run alone with `--test-threads=1`. **Every 5.3 figure in
-microseconds here was taken on a shared machine**: two other lanes were
-compiling and running their suites at the same time, so each is a
-ceiling, not the final word, and a quiet machine will read lower. What
-decided each change is an interleaved A/B ratio (see "How it was
-measured"), which a busy machine moves far less.
+builds, in the release's quiet sitting: nothing else building or testing,
+Tangent closed, each bench run alone with `--test-threads=1`, each build
+warmed with one untimed run, and 5.3 alternated run by run with 5.2.0's
+own code (c90c0a49: the 5.2.0 tag with only the version bumped). The
+desktop's own work (the window server, a chat client, audio) still ran,
+and it shows in the tails: the p99s and the worst blocks below are that
+sitting's, where the means held to a few per cent from run to run. What
+decided each change of the kernel is an interleaved A/B ratio (see "How
+it was measured"), which a busy machine moves far less.
 
 ## Tangent Tape
 
-| | 5.1 (main 825a91c3) | 5.2 (quiet, the day it shipped) | aa94a2be, where 5.3 started (shared) | 5.3 (shared) |
-|---|---|---|---|---|
-| `rt_bench` row "16 lanes x Tape", mean per block | 370.5 us (23.2 per insert) | 470.6 us (29.4 per insert) | 372.0 us (23.3 per insert) | 194.8 to 195.1 us (12.2 per insert) |
-| `the_tape_costs_what_its_budget_says`, defaults, mean (warmed) | | 20.7 to 20.8 us | 22.5 to 22.8 us | 9.8 to 11.4 us |
-| the same, fully engaged, p99 | | 34.7 to 35.8 us | 32.5 to 34.3 us | 17.5 to 20.3 us |
+| | 5.1 (main 825a91c3, 2026-10-18) | 5.2.0 (c90c0a49) | 5.3 |
+|---|---|---|---|
+| `rt_bench` row "16 lanes x Tape", mean per block | 370.5 us (23.2 per insert) | 366.1 to 402.5 us (22.9 to 25.2 per insert) | 188.1 to 191.5 us (11.8 to 12.0 per insert) |
+| `the_tape_costs_what_its_budget_says`, defaults, mean (warmed) | | 21.65 to 22.55 us | 10.04 to 10.22 us |
+| the same, fully engaged, mean | | 25.66 to 27.04 us | 13.69 to 14.06 us |
+| the same, fully engaged, p99 | | 38.25 to 62.38 us | 28.17 to 40.92 us |
 
 The design's budget was 16 us at the defaults (the bench's bars were 21
-and 24 us) and never above 5.1's cost. 5.3 is under all of it: the
-sixteen-lane row is 0.53 of 5.1's and 0.52 of the kernel this work
-started from, the defaults are under the budget, and the p99 fully
-engaged is under its 24 us bar. The base this
-work started from (aa94a2be: 5.2 with the sixteen-tap play head and the
-filters that glide while a control moves) was measured on the same
-machine in the same hour, and that column is the one to compare with: the
-5.2 row read 470.6 us the day it shipped, on a quiet machine and another
-build of the engine, and the kernel this work started from reads 372.0
-here today. The machine was a little slower when 5.3's rows were taken:
-the Drive's row, which nothing here touches, read 572.1 us beside the
-372.0 and 593.1 and 603.8 beside 5.3's two.
+and 24 us) and never above 5.1's cost. 5.3 is under all of it but the
+p99: run for run, the sixteen-lane row is 0.48 to 0.51 of 5.2.0's (and
+about half of 5.1's, measured the day before), the defaults 0.45 to 0.47
+of 5.2.0's, well under the budget, and the mean fully engaged 0.51 to
+0.55. The kernel alone, 5.2.0's against 5.3's on one thread at the audio
+thread's class (the harness below, run while other builds were going):
+0.447 and 0.498 of 5.2.0's at the defaults, 0.562 and 0.586 fully
+engaged.
 
-The single-unit bench now holds the mean at the defaults to the design's
-16 us and the p99 fully engaged to 30 us (the shared-machine reading with
-a margin); tighten them with quiet numbers, never raise them.
+The p99 fully engaged is the sitting's tail more than the Tape's: 5.2.0
+read 38.3 to 62.4 us in it, against 34.7 to 35.8 in the quiet sitting the
+day it shipped, and 5.3 read 17.5 to 20.3 on a machine two other lanes
+were building on. The bench's thread runs at the default class, where the
+harness and the start and stop probe run at the audio thread's.
+
+The single-unit bench now holds the mean at the defaults to 13 us, the
+quiet reading with about 30 % over it (a bar for a quiet machine: with
+some ninety other compiles running, the defaults read 15.7 us), and the
+p99 fully engaged to 30 us, the shared reading with a margin, which two
+of this sitting's three runs were over; tighten them with quieter
+numbers, never raise them.
 
 5.2 shipped with this cost as an open issue, to be optimized later; for
 the Tape itself, 5.3 closes it.
@@ -106,6 +115,7 @@ aligned to 64 bytes in both, to keep where the code lands out of it.
 | the record stage a chunk at a time, against aa94a2be | 0.446 (IQR 0.443 to 0.451) | 0.523 (0.519 to 0.527) |
 | the dot product as two halves, against the line above | 0.982 (0.976 to 0.988) | 0.992 (0.986 to 0.997) |
 | 5.3, against aa94a2be (two runs of 100 rounds) | 0.436 and 0.447 (IQR 0.432 to 0.443, 0.435 to 0.457) | 0.543 and 0.535 (0.535 to 0.573, 0.521 to 0.544) |
+| 5.3, against 5.2.0's own kernel (c90c0a49; two runs of 60 rounds, other builds going) | 0.447 and 0.498 (IQR 0.441 to 0.456, 0.479 to 0.515) | 0.562 and 0.586 (0.544 to 0.602, 0.561 to 0.609) |
 
 ## Measured and not kept
 
@@ -139,31 +149,37 @@ single part left, and only a different `tanh` would make it cheaper.
 
 ## Tape start and stop
 
-Measured 2026-10-19, release build, `tape_start_and_stop_costs_what_the_dial_costs_probe`:
+Measured 2026-10-19, release builds, `tape_start_and_stop_costs_what_the_dial_costs_probe`:
 the bench's sixteen lanes through a plate, grains on, 48 kHz, rolling at rest,
 rolling with the dial at 0.75, and starts and stops at 0.1 s each way, the three
 interleaved a tape cycle at a time over 31 rounds on a user-interactive thread.
 Each ratio is the median of the rounds' own ratios, so the machine's other work,
-which lands on all three alike, falls out. The ranges are three runs of each
-engine in one sitting on a quiet machine (load about 4.5), alternated with the
-way back's first draft (below).
+which lands on all three alike, falls out. Two quiet sittings: the motor lane's
+(load about 4.5; three runs of each engine, alternated with the way back's first
+draft, below; aa94a2be standing for 5.2, whose motor and grain render it shares)
+and the release's (two runs of each engine after a warm one, alternated; 5.2.0's
+own engine, c90c0a49, with this probe built into it).
 
-| cycles against | 5.2 (aa94a2be) | 5.3 |
-|---|---|---|
-| the dial's worst block, 64 frames | 5.7x | 1.30 to 1.37x |
-| the dial's worst block, 128 frames | 3.7x | 1.33 to 1.37x |
-| the dial's p99, 64 frames | 1.21 to 1.27x | 1.46 to 1.52x |
-| the dial's p99, 128 frames | 1.29 to 1.32x | 1.41 to 1.42x |
-| rest's worst block, 64 / 128 frames | 5.0x / 2.9 to 3.1x | 1.17 to 1.19x / 1.13 to 1.14x |
-| rest's p99, 64 / 128 frames | 1.00 to 1.06x / 1.05 to 1.09x | 1.25 to 1.28x / 1.16 to 1.17x |
-| the deadline, worst block, 64 / 128 frames | 32 to 34 % / 17 % | 8 to 15 % / 7 to 9 % |
-| the deadline, p99, 64 / 128 frames | 6.3 to 6.6 % / 8.3 to 8.5 % | 6.9 % / 5.6 to 5.7 % |
+| cycles against | 5.2, motor sitting (aa94a2be) | 5.3, motor sitting | 5.2.0, release sitting (c90c0a49) | 5.3, release sitting |
+|---|---|---|---|---|
+| the dial's worst block, 64 frames | 5.7x | 1.30 to 1.37x | 3.35 to 3.45x | 1.06 to 1.16x |
+| the dial's worst block, 128 frames | 3.7x | 1.33 to 1.37x | 2.49 to 3.19x | 1.01 to 1.23x |
+| the dial's p99, 64 frames | 1.21 to 1.27x | 1.46 to 1.52x | 1.25 to 1.32x | 1.29 to 1.33x |
+| the dial's p99, 128 frames | 1.29 to 1.32x | 1.41 to 1.42x | 1.34 to 1.39x | 1.28 to 1.29x |
+| rest's worst block, 64 / 128 frames | 5.0x / 2.9 to 3.1x | 1.17 to 1.19x / 1.13 to 1.14x | 3.17 to 3.44x / 2.15 to 2.34x | 0.86 to 1.00x / 0.94 to 0.97x |
+| rest's p99, 64 / 128 frames | 1.00 to 1.06x / 1.05 to 1.09x | 1.25 to 1.28x / 1.16 to 1.17x | 1.09 to 1.19x / 1.07 to 1.20x | 1.11 to 1.12x / 1.02 to 1.04x |
+| the deadline, worst block, 64 / 128 frames | 32 to 34 % / 17 % | 8 to 15 % / 7 to 9 % | 50 to 136 % / 18 to 21 % | 17 to 20 % / 9 to 11 % |
+| the deadline, p99, 64 / 128 frames | 6.3 to 6.6 % / 8.3 to 8.5 % | 6.9 % / 5.6 to 5.7 % | 8.7 to 9.3 % / 8.8 to 9.4 % | 7.9 to 8.0 % / 6.4 to 6.5 % |
 
 The worst blocks against the deadline are all rounds pooled, so a stall of the
-machine's lands in them whole. The same probe's desk counted in lane-frames,
-which no machine moves: the dearest block of a cycle renders 8384 at 64 frames
-and 8448 at 128 in 5.2, against desk chunks of 1024 and 2048; 1664 and 2688 in
-5.3.
+machine's lands in them whole. The two sittings differ in their tails: in the
+release's, the desktop's own work (the window server, a chat client, audio)
+made the dial's and rest's worst blocks about twice as dear (14 to 25 % of the
+deadline at 64 frames, where the motor lane's read 6 to 10 %), so its ratios to
+them read lower: 5.3's worst block under the design's 1.25, and 5.2.0's 2.5 to
+3.5 times the dial's. The same probe's desk counted in lane-frames, which no
+machine moves: the dearest block of a cycle renders 8384 at 64 frames and 8448
+at 128 in 5.2, against desk chunks of 1024 and 2048; 1664 and 2688 in 5.3.
 
 Where the time went, from a throwaway profile that classified every pass:
 
@@ -260,9 +276,10 @@ rest renders, so rest itself runs about 1.1 to 1.3 times the dial's p99, and a
 third of a cycle's blocks are at rest (at speed or parked), its dearest ramp
 blocks near full speed; and the probe's cycle is at speed for about 0.05 s, so
 most of it is the way back. The worst block sits a little over the design's
-1.25, where the first draft sat on it, and near rest's own. The probe holds
-what was reached, with a margin: the median p99 at most 1.75 times the dial's
-and 1.4 times rest's, the median worst at most 1.6 times the dial's and 1.35
-times rest's, and the deadline bars it had (p99 at most 15 %, worst at most 50
-%). The 5.2 engine fails the worst-block bars in every run, by 2.2 to 3.7
-times.
+1.25 in the motor lane's sitting, where the first draft sat on it, and near
+rest's own; in the release's it sits under it. The probe holds the motor lane's
+sitting, the higher of the two, with 9 to 17 % over it: the median p99 at most
+1.75 times the dial's and 1.4 times rest's, the median worst at most 1.6 times
+the dial's and 1.35 times rest's, and the deadline bars it had (p99 at most 15
+%, worst at most 50 %). The 5.2 engine fails the worst-block bars in every run
+of both sittings, by 1.6 to 3.7 times.

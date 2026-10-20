@@ -9109,20 +9109,28 @@ mod tests {
     /// at the top, the deep head, the speed thrown between 15 and 3.75 ips
     /// every half second, the range every second, Rate and Bias swept end to
     /// end). Prints the mean, p99 and the worst block, and holds the mean at
-    /// the defaults to 16 µs and the p99 fully engaged to 30 µs.
+    /// the defaults to 13 µs and the p99 fully engaged to 30 µs.
     ///
     /// **5.3 brought the cost under the design's budget**, 16 µs at the
     /// defaults: the record stage runs a chunk at a time with its filters'
     /// outputs side by side ([`record`]), the same arithmetic to the bit.
-    /// Warmed, on a machine two other builds were sharing, the defaults
-    /// measured 9.8 to 11.4 µs and the p99 fully engaged 17.5 to 20.3 µs,
-    /// where the kernel 5.3 started from read 22.5 to 22.8 and 32.5 to 34.3
-    /// on the same machine (5.2 read 20.7 and 35.8 on a quiet one); the
-    /// sixteen-lane `rt_bench` row read 195 µs a block against that
-    /// kernel's 372.0 and 5.1's 370.5. The mean's bar is the design's budget
-    /// and the p99's is the reading with a margin, both for a quiet machine
-    /// to tighten; `docs/PERF-TAPE-5.2.md` has the numbers. Lower the bars
-    /// as it gets cheaper, never raise them.
+    /// In the release's quiet sitting (nothing else building, each build
+    /// warmed, alternated run by run with 5.2.0's), the defaults measured
+    /// 10.0 to 10.2 µs against 5.2.0's 21.7 to 22.6, and the mean fully
+    /// engaged 13.7 to 14.1 µs against 25.7 to 27.0; the sixteen-lane
+    /// `rt_bench` row read 188 to 192 µs a block against 5.2.0's 366 to 403.
+    /// The mean's bar is that reading with about 30 % over it, a bar for a
+    /// quiet machine: with some ninety other compiles running, the defaults
+    /// read 15.7. **The p99 fully engaged read 28.2 to 40.9 µs in the
+    /// sitting, over its bar in two runs of three**, and that is the
+    /// sitting's tail more than the Tape's: 5.2.0 read 38.3 to 62.4 in it,
+    /// against 34.7 to 35.8 in the quiet sitting the day it shipped, and 5.3
+    /// read 17.5 to 20.3 on a machine two other builds were sharing. This
+    /// bench's thread runs at the default class, where the start and stop
+    /// probe runs at the audio thread's. The p99's bar stays the shared
+    /// reading with a margin until a quieter run says what the Tape's own
+    /// tail is; `docs/PERF-TAPE-5.2.md` has the numbers. Lower the bars as
+    /// it gets cheaper, never raise them.
     #[test]
     #[ignore = "a bench: run it by hand in release with --ignored --nocapture"]
     fn the_tape_costs_what_its_budget_says() {
@@ -9176,7 +9184,7 @@ mod tests {
                 ..TapeParams::default()
             }
         });
-        assert!(mean <= 16.0, "a Tape at its defaults costs {mean:.2} us a block, over its 16 us ceiling");
+        assert!(mean <= 13.0, "a Tape at its defaults costs {mean:.2} us a block, over its 13 us ceiling");
         assert!(p99 <= 30.0, "a Tape fully engaged costs {p99:.2} us at p99, over its 30 us");
     }
 
