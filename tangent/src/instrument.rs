@@ -8552,7 +8552,8 @@ struct LaneScratch {
 impl LaneScratch {
     fn new() -> Self {
         Self {
-            fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            // A turn of the way back renders through it (`MAX_TURN`).
+            fx_out: turn_rows(MAX_BLOCK as usize),
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             builtin: vec![0.0; MAX_SPAN * TAP_CHANNELS],
             keys: vec![0.0; MAX_SPAN * TAP_CHANNELS],
@@ -8574,6 +8575,37 @@ impl LaneScratch {
 /// on both instruments. The scratches were made that much longer for it;
 /// the grain no longer passes a block, as no hosted plugin takes one past it.
 const MAX_SPAN: usize = MAX_BLOCK as usize;
+
+/// **The longest span a lane renders at all**: a turn of the motor's way back
+/// (`Renderer::regrain_turns`), which runs from where a held lane's ring ends
+/// to an end of the clock's ring for it, as far as a grain and the grid's 31
+/// frames, and so past a block wherever that ring ended off the grid. Only a
+/// lane of Tangent's own effects is given one (`Rack::spans_free`), and they
+/// take a block of any length through their scratches (`run_planar`); what
+/// the turn needs beside that is room in the rows it renders into, its grain
+/// slot's (`LaneGrains::hold`) and its hand's `fx_out` (`run_rack`). Those
+/// are built with room for this many frames at their own length
+/// (`turn_rows`), so a turn past a block writes a length and a short zero
+/// fill and never goes to the allocator. Built a block long, they grew on the
+/// callback the first time each lane was given a turn past a block: at a
+/// first tape start from a playhead parked at 48,013 with the look-ahead on
+/// AUTO, 6 allocations on four plate lanes at 333 frames and 8 at 480, 18 and
+/// 32 on sixteen, the turns 529 to 536 frames long.
+const MAX_TURN: usize = MAX_BLOCK as usize + GRAIN_GRID as usize - 1;
+
+/// **[`TAP_CHANNELS`] rows of `frames` frames, each with room for
+/// [`MAX_TURN`]**, so the longest span a lane renders grows one with a
+/// length write. `vec![row; n]` would not do: a clone has only the room its
+/// length needs.
+fn turn_rows(frames: usize) -> Vec<Vec<f32>> {
+    (0..TAP_CHANNELS)
+        .map(|_| {
+            let mut row = Vec::with_capacity(frames.max(MAX_TURN));
+            row.resize(frames, 0.0);
+            row
+        })
+        .collect()
+}
 
 /// **What the render pass leaves the fold to read.**
 ///
@@ -10687,7 +10719,8 @@ struct LaneGrains {
 impl LaneGrains {
     fn new(frames: usize) -> Self {
         Self {
-            slots: std::array::from_fn(|_| vec![vec![0.0; frames]; TAP_CHANNELS]),
+            // A turn of the way back renders into them (`MAX_TURN`).
+            slots: std::array::from_fn(|_| turn_rows(frames)),
             ring: GrainRing::default(),
             held: false,
             shadow: GrainRing::default(),
@@ -12430,7 +12463,9 @@ fn run_rack(
     // GROWN rather than clamped at the copy, because a buffer shorter than
     // the block is a block with samples missing however it is sliced, and
     // growing is what makes it whole again. Allocation-free: the capacity is
-    // still `MAX_BLOCK`, so this is a length write and a short zero fill.
+    // still `MAX_BLOCK`, so this is a length write and a short zero fill. A
+    // lane's own pass is the one road a span past a block comes in by, a turn
+    // of the motor's way back, and its rows have room for that (`MAX_TURN`).
     for b in planar.iter_mut().chain(out.iter_mut()) {
         if b.len() < frames {
             b.resize(frames, 0.0);
@@ -20639,14 +20674,15 @@ impl Renderer {
     /// `plan_grains` has planned every lane, the ones it holds included.
     ///
     /// A turn is one render from where a held lane's ring ends to an end of
-    /// the clock's ring for it (`LaneGrains::shadow`), no longer than the
-    /// clock's own catch-up, so it is a span the clock itself could render,
-    /// and to the newest end it can reach: that brings the lane level when
-    /// the clock's whole look-ahead is in reach, and else leaves it a grain
-    /// short for a second turn to finish. A lane whose phase refills at the
-    /// head of every grain is always more than a grain ahead on the clock,
-    /// so it needs the two, and the second has to come in the very next
-    /// chunk, before the clock moves on.
+    /// the clock's ring for it (`LaneGrains::shadow`), at most a grain and
+    /// the grid's 31 frames long (`MAX_TURN`): the one span a lane is handed
+    /// past a block, and only a lane of Tangent's own effects is handed one
+    /// (`Rack::spans_free`). And it runs to the newest end it can reach: that
+    /// brings the lane level when the clock's whole look-ahead is in reach,
+    /// and else leaves it a grain short for a second turn to finish. A lane
+    /// whose phase refills at the head of every grain is always more than a
+    /// grain ahead on the clock, so it needs the two, and the second has to
+    /// come in the very next chunk, before the clock moves on.
     ///
     /// So the turns go in that order: one second half a chunk whatever the
     /// desk is doing; then the turns that bring a lane level; then one first
@@ -21218,9 +21254,11 @@ impl Renderer {
     /// grid's 31 frames, and it is given only to a lane whose every bay is
     /// one of Tangent's own effects (`Rack::spans_free`), which takes a block
     /// of any length through its scratch (`run_planar`), never a DX7, a
-    /// keyboard or a hosted plugin. Held to a block, a desk of one phase at
-    /// 333 frames stayed held for 50 passes at speed, past the two turns a
-    /// lane its test allows.
+    /// keyboard or a hosted plugin; and the rows a turn renders into are
+    /// built with room for it (`MAX_TURN`), so it grows nothing on the
+    /// callback. Held to a block, a desk of one phase at 333 frames stayed
+    /// held for 50 passes at speed, past the two turns a lane its test
+    /// allows.
     fn to_grid(from: u64, len: usize) -> usize {
         let end = from + len as u64;
         let over = end % GRAIN_GRID;
@@ -62704,6 +62742,11 @@ mod tape_motor {
     /// `from`, the motor on at 0.1 s each way, at a grain of `grain` frames
     /// (zero: none).
     fn plate_desk(grain: usize, from: u64) -> (Engine, Transport) {
+        plates_desk(BACK_LANES, grain, from)
+    }
+
+    /// [`plate_desk`] of `lanes` lanes.
+    fn plates_desk(lanes: usize, grain: usize, from: u64) -> (Engine, Transport) {
         let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
         e.set_armed(0);
         e.set_midi_off(u64::MAX);
@@ -62715,11 +62758,11 @@ mod tape_motor {
         let clip = tone(500.0, 12.0, RATE);
         let len = clip.frames() as u64;
         e.set_clips(
-            (0..BACK_LANES)
+            (0..lanes)
                 .map(|strip| Placed { clip: Arc::clone(&clip), strip, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 })
                 .collect(),
         );
-        for lane in 0..BACK_LANES {
+        for lane in 0..lanes {
             e.load_insert(lane, 0, Some(Path::new(crate::builtin_fx::PLATE_PATH)), None)
                 .expect("the plate loads")
                 .expect("and is seated");
@@ -62980,6 +63023,57 @@ mod tape_motor {
             for k in 0..RATE as usize / pass {
                 let [back, shut] = passes_of(&mut desks, pass);
                 assert!(same(&back, &shut), "{pass} frames, stop pass {k}: the way back's tails were not the desk's without it ({:?})", back.show);
+            }
+        }
+    }
+
+    /// The longest span a lane the last chunk rendered was handed.
+    fn longest(e: &Engine) -> usize {
+        let r = e.offline.as_ref().expect("an offline renderer");
+        r.spine.lanes.iter().enumerate().fold(0, |most, (ch, l)| match l.as_deref().map(Lane::peek) {
+            Some(b) if !r.spine.ext.resting.contains(ch) && b.wants && !b.skip => most.max(b.len),
+            _ => most,
+        })
+    }
+
+    /// **A first tape start grows nothing on the callback, though the way
+    /// back's turns run past a block.** A turn renders a held lane from where
+    /// its ring ends to an end of the clock's ring for it, as far as a grain
+    /// and the grid's 31 frames (`Renderer::regrain_turns`), and a lane
+    /// of Tangent's own effects takes that whole; but the rows it renders
+    /// into, its grain slot's and its hand's `fx_out`, were built a block
+    /// long and grew there, on the callback, the first time the session gave
+    /// each lane a turn past a block. From a playhead parked at 48,013 with
+    /// the look-ahead on AUTO: 6 allocations on four plate lanes at 333
+    /// frames and 8 at 480, and 18 and 32 on sixteen, turns of 529 to 536
+    /// frames among their spans. Built with room for a turn (`MAX_TURN`),
+    /// every one of those desks renders its start and the second after it
+    /// allocating nothing, a span past a block among the ones its lanes
+    /// rendered, so the room was used.
+    #[test]
+    fn a_first_tape_start_grows_nothing_on_the_callback() {
+        use crate::rt_alloc::count_allocs;
+        for lanes in [4usize, 16] {
+            for pass in [333usize, 480] {
+                let (mut e, mut t) = plates_desk(lanes, BACK_GRAIN, 48_013);
+                e.set_grain_ms(-1.0);
+                let mut out = vec![0.0f32; pass * 2];
+                for _ in 0..30 {
+                    t.push(Some(&e));
+                    e.render_offline(&mut out);
+                }
+                t.toggle_play();
+                let (mut allocs, mut most) = (0usize, 0usize);
+                for _ in 0..RATE as usize / pass {
+                    t.push(Some(&e));
+                    // The callback's own thread: an offline engine renders
+                    // its lanes on no hand, and other tests' hands count into
+                    // the shared figure.
+                    allocs += count_allocs(|| e.render_offline(&mut out)).1.here;
+                    most = most.max(longest(&e));
+                }
+                assert!(most > MAX_BLOCK as usize, "{lanes} lanes at {pass} frames: no lane rendered a span past a block, so nothing was proved");
+                assert_eq!(allocs, 0, "{lanes} lanes at {pass} frames: the tape's start allocated {allocs} times on the callback, the longest span {most} frames");
             }
         }
     }
