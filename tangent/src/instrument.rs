@@ -50637,6 +50637,103 @@ mod slot_engine {
             assert_eq!(onsets.len(), beats, "the click sounded {} beats of {beats}: {onsets:?}", onsets.len());
         }
 
+        /// **The click and a lane playing the click's own samples are one
+        /// signal on a desk that holds every term, sends and all** (a
+        /// verifier's gaps: nothing pinned the click's Return 0 send on a held
+        /// desk, or the master's second rack in its hold).
+        ///
+        /// A deep-range Tape on a silent lane holds the target 1,200 frames, a
+        /// bus that looks ahead takes a send, an IR is a wire across both of
+        /// the master's racks (512 frames each) and the limiter is in circuit
+        /// (58). The click sends into Return 0, with the reverb up, and into
+        /// the bus; lane 1 plays the click's own samples on the same beats at
+        /// the same level, with the same two sends. Each term of the click's
+        /// hold is the code that pays it (`aim_click`): the Return 0 send
+        /// waits the target where the lanes' sends arrive (`ClickHold::fx`),
+        /// the bus's send what the bus's way out does not pay, the speakers
+        /// and the take the target, both racks and the lookahead, and the
+        /// speakers' own mix (an input armed and heard) the target alone. So
+        /// the click less the quiet desk is the lane less the quiet desk, in
+        /// the room and the take, the speakers sharing the take's mix and on
+        /// their own, to a ten-thousandth (the click's gain and the lane's
+        /// fader each glide to the level and stall a hair short of it).
+        #[test]
+        fn the_click_is_a_lane_playing_its_samples_on_a_desk_that_holds_every_term() {
+            use crate::builtin_fx::{DENOISE_PATH, IR_PATH, TAPE_PATH};
+            const FRAMES: usize = 3 * 48_000;
+            let track = click_track(FRAMES, 1.0);
+            for split in [false, true] {
+                // 0 the quiet desk, 1 the click, 2 the lane.
+                let render = |who: u8| -> (Vec<f32>, Vec<f32>) {
+                    let mut e = wide(42);
+                    let mut inputs = bus_plan(&e, 42, &[40]);
+                    inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+                    match who {
+                        1 => inputs.sends = vec![InSend { from: SendFrom::Click, to: SendTo::Lane(Slot(40)), level: 0.7, pre: false }],
+                        2 => inputs.sends = vec![send(1, 40, 0.7, false)],
+                        _ => {}
+                    }
+                    e.publish_plan(&inputs).expect("the plan goes");
+                    unit(&mut e, 2, 0, 0, TAPE_PATH, Some(knobs(TAPE_PATH, &[(9, 1.0)])));
+                    unit(&mut e, 40, 0, 0, DENOISE_PATH, Some(lookahead()));
+                    for rack in [0u16, 1] {
+                        e.load_insert_at(RackAddr { owner: RackOwner::Master, rack }, 0, Some(Path::new(IR_PATH)), Some(&wire_ir()))
+                            .expect("the IR loads")
+                            .expect("and seats");
+                    }
+                    e.set_effects(crate::effects::Sends {
+                        reverb: 0.3,
+                        limiter: tangent_ui::recorder::LIMITER_SHIPS_AT,
+                        ..crate::effects::Sends::default()
+                    });
+                    e.set_tempo(120.0);
+                    e.set_metronome_gain(0.25);
+                    e.set_metronome_enabled(who == 1);
+                    e.set_metronome_in_take(true);
+                    if who == 1 {
+                        e.set_special_sends(0.0, 0.5);
+                    }
+                    if who == 2 {
+                        let gen = e.lane_gen(Slot(1)).expect("a lane");
+                        e.set_clips_slotted(vec![SlotPlaced {
+                            slot: Slot(1),
+                            gen,
+                            placed: Placed { clip: Arc::clone(&track), strip: 0, start: 0, offset: 0, len: FRAMES as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                        }]);
+                        e.set_lane_levels(Slot(1), 0.25, 0.0, 0.5);
+                    }
+                    let mut tx = split.then(|| {
+                        let tx = plug(&mut e, 3);
+                        e.set_monitor_on(true);
+                        tx
+                    });
+                    let mut out = vec![0.0f32; BLOCK * 2];
+                    // Every slew settled before the roll.
+                    for _ in 0..100 {
+                        if let Some(tx) = tx.as_mut() {
+                            for _ in 0..BLOCK {
+                                let _ = tx.push(0.0);
+                            }
+                        }
+                        e.render_offline(&mut out);
+                    }
+                    let held = e.shared.max_latency.load(Ordering::Relaxed);
+                    assert_eq!(held, 1_200, "fixture: the target is {held}");
+                    roll_held(&mut e, &mut tx, FRAMES / BLOCK - 4)
+                };
+                let (quiet_room, quiet_take) = render(0);
+                let (click_room, click_take) = render(1);
+                let (lane_room, lane_take) = render(2);
+                for (dest, quiet, click, lane) in [("room", &quiet_room, &click_room, &lane_room), ("take", &quiet_take, &click_take, &lane_take)] {
+                    let (c, l) = (less(click, quiet), less(lane, quiet));
+                    assert!(c.iter().any(|v| v.abs() > 0.05), "fixture: split {split}: the click is silent in the {dest}");
+                    for (k, (a, b)) in c.iter().zip(&l).enumerate() {
+                        assert!((a - b).abs() < 1e-4, "split {split}, {dest}: frame {}: the click is {a}, the lane playing its samples {b}", k / 2);
+                    }
+                }
+            }
+        }
+
         /// **Holding the click to the mix, marking a take's first frame and
         /// gliding a played lane out of the wait and back allocate nothing on
         /// the callback** (the owner's ruling of 2026-10-19). A desk held 1,200
