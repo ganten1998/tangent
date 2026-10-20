@@ -1407,6 +1407,12 @@ pub struct Keys {
     /// which is what makes an unloaded-but-present Keys cost nothing.
     sounding: usize,
     strikes: u32,
+    /// The strike count when an all notes off last cleared the shared side
+    /// with nothing sounding, until a key, a key-up, a pedal or a patch
+    /// could have put sound back into it: a host repeating its force-quiet
+    /// before every call, between two recounts on the grid (`count_block`),
+    /// finds it silent still and clears it once, not once a call.
+    quiet_since: Option<u32>,
     /// The shared body: the soundboard for the piano, the harp of undamped
     /// strings that answers a pedalled note. One per instrument, not one per
     /// voice, because in the real thing there is one soundboard.
@@ -1579,6 +1585,7 @@ impl Keys {
             paid: true,
             sounding: 0,
             strikes: 0,
+            quiet_since: None,
             body: string::Body::new(rate),
             harp,
             fretboard: guitar::Fretboard::new(rate),
@@ -1658,6 +1665,7 @@ impl Keys {
         if patch == self.patch {
             return;
         }
+        self.quiet_since = None;
         self.patch = patch;
         for n in &mut self.notes {
             n.pitch = None;
@@ -2064,6 +2072,7 @@ impl Keys {
     /// Let a key up. Under the pedal the string keeps ringing, which is the
     /// whole point of the pedal.
     pub fn note_off(&mut self, pitch: u8) {
+        self.quiet_since = None;
         // A key the sostenuto caught keeps its damper up: released as if the
         // sustain pedal were down, until the sostenuto comes up.
         let caught = self.sost_keys.get(usize::from(pitch)).copied().unwrap_or(false);
@@ -2195,6 +2204,7 @@ impl Keys {
     /// their dampers up until it comes up; the soft pedal shifts the grand's
     /// action for the strikes to come.
     pub fn set_pedals(&mut self, cc: [u8; 3]) {
+        self.quiet_since = None;
         let sustain = f32::from(cc[0].min(127)) / 127.0;
         let sost = cc[1] >= 64;
         let soft = f32::from(cc[2].min(127)) / 127.0;
@@ -2363,7 +2373,10 @@ impl Keys {
             return;
         }
         if self.sounding.saturating_sub(usize::from(self.hush_counted)) == 0 {
-            self.clear_shared();
+            if self.quiet_since != Some(self.strikes) {
+                self.clear_shared();
+                self.quiet_since = Some(self.strikes);
+            }
             self.hush_left = 0;
             self.hush_due = false;
             self.hush_rise = 0;
@@ -4243,11 +4256,17 @@ mod tests {
     /// host's force-quiet, all notes off before every call for as long as
     /// the instrument is active: the pedalled six-note chord on every patch,
     /// stopped that way at 1.2 s, at calls of 1, 7, 37 and 128 frames. A
-    /// patch with a shared side clears it at most three times (the hush's
-    /// clear; the clear when the voices it then held out for are done; and
-    /// the hush's end, which finds nothing left on the guitar: measured 2,
-    /// 2, 2 and 3 on Piano 1, Piano 2, the electric grand and the guitar),
-    /// and one with none never does. At 0d20e3d1 each call in the rise
+    /// patch with a shared side clears it at most four times (the hush's
+    /// clear; the clear when the voices it then held out for are done; the
+    /// hush's end, which finds nothing left on the guitar; and, at calls
+    /// shorter than the grid, one more where the recount on the grid falls
+    /// between the voices' end and the call that finds them done: measured
+    /// 2 to 3 on Piano 1, Piano 2 and the electric grand and 3 to 4 on the
+    /// guitar), and one with none never does. Once cleared with nothing
+    /// sounding it is not cleared again until a key, a key-up, a pedal or a
+    /// patch could have put sound back (`Keys::quiet_since`): with the
+    /// recount on the grid, every call between the voices' end and the next
+    /// recount cleared it again, 129 times at 1-frame calls. At 0d20e3d1 each call in the rise
     /// turned it into a fade that cleared the shared side and rose again,
     /// about every second call, on every patch: at 1-frame calls 12659 /
     /// 21129 / 40273 / 2862 clears on those four, 46740 on the Reed Amp,
@@ -4280,7 +4299,7 @@ mod tests {
                 let clears = k.shared_clears - before;
                 line += &format!(" {clears} times at {call}-frame calls ({:.3} s to sleep);", (calls * call) as f32 / SR);
                 assert!(!k.active(), "{patch:?} at {call}-frame calls: the force-quiet held the instrument awake 5 s");
-                let most = if k.has_shared() { 3 } else { 0 };
+                let most = if k.has_shared() { 4 } else { 0 };
                 assert!(clears <= most, "{patch:?} at {call}-frame calls: the force-quiet cleared the shared side {clears} times (at most {most})");
             }
             println!("{line}");
