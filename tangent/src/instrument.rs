@@ -1330,6 +1330,30 @@ impl Beats {
         self.count_in_left > 0 || self.awaiting_downbeat
     }
 
+    /// **How many frames from the next one the count's go falls**, if it
+    /// falls within `within`: the frame [`Beats::tick`] would answer the
+    /// downbeat on, by the same arithmetic, without moving the clock.
+    fn frames_to_go(&self, within: usize) -> Option<usize> {
+        if !self.counting_in() {
+            return None;
+        }
+        let (mut to_next, mut left, mut awaiting) = (self.to_next, self.count_in_left, self.awaiting_downbeat);
+        for f in 0..within {
+            if to_next > 0.0 {
+                to_next -= 1.0;
+                continue;
+            }
+            to_next += self.period - 1.0;
+            if left > 0 {
+                left -= 1;
+                awaiting = left == 0;
+                continue;
+            }
+            return awaiting.then_some(f);
+        }
+        None
+    }
+
     /// Restart the phase so the next frame is beat 1.
     fn restart(&mut self, count_in: u32) {
         self.to_next = 0.0;
@@ -3315,6 +3339,10 @@ struct Shared {
     /// was heard (`take_placement`). One per press: a take marked once is
     /// placed by that mark, however its hold moves after.
     arr_mark: Box<[AtomicU64]>,
+    /// **Which picks' tees wait for the song to roll** (`Engine::set_capturing_from_roll`):
+    /// a bit per pick, raised with its flag for a record that waits on its
+    /// count, taken down with the take's mark on the first rolling chunk.
+    arr_wait: Box<[AtomicU64]>,
     /// **Whether a lane played live may stand outside the wait**
     /// (`Renderer::plays_live`): false until a live host says so
     /// (`Engine::set_live_play`), which it does every frame unless a realtime
@@ -3340,6 +3368,21 @@ struct Shared {
     rec_frame: AtomicU64,
     rec_ns: AtomicI64,
     rec_hold: AtomicU32,
+    /// **A count's go rolls the transport itself** (`Engine::set_roll_on_go`):
+    /// the host's word, every frame, while an arrangement record or a Play
+    /// waits on the count. The chunk loop then ends a chunk where the go
+    /// falls and rolls the next from it (`Renderer::go_split`), so the
+    /// backing's first beat is made on the go's own frame and heard with
+    /// it, where the host's toggle came a UI frame or two later.
+    roll_on_go: AtomicBool,
+    /// **The transport rolled on a go and the engine still holds that
+    /// roll** (the host has not taken it over): Release after the two below,
+    /// the song frame it rolled from and the host instant that frame was
+    /// made for, which a record begun on the go starts from
+    /// (`Engine::rolled_on_go`).
+    go_rolled: AtomicBool,
+    go_frame: AtomicU64,
+    go_ns: AtomicI64,
     /// The DRUM BUS fader and pan — the pads sum through this strip.
     drums_gain: AtomicU32,
     drums_pan: AtomicU32,
@@ -4241,6 +4284,7 @@ impl Shared {
             arr_capture: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             cap_dropped: AtomicU64::new(0),
             arr_mark: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
+            arr_wait: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             live_ok: AtomicBool::new(false),
             room_hold: AtomicU32::new(0),
             rec_req: AtomicU64::new(0),
@@ -4248,6 +4292,10 @@ impl Shared {
             rec_frame: AtomicU64::new(0),
             rec_ns: AtomicI64::new(0),
             rec_hold: AtomicU32::new(0),
+            roll_on_go: AtomicBool::new(false),
+            go_rolled: AtomicBool::new(false),
+            go_frame: AtomicU64::new(0),
+            go_ns: AtomicI64::new(0),
             drums_gain: AtomicU32::new(1.0f32.to_bits()),
             drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
@@ -12233,6 +12281,13 @@ struct Renderer {
     /// The record anchor's generation this renderer last wrote
     /// (`Shared::rec_req`).
     rec_seen: u64,
+    /// **The transport rolls on a count's go, by the engine's own hand**
+    /// (`Shared::roll_on_go`), until the host's level takes it over: what
+    /// `run_transport` reads beside the host's level.
+    go_rolls: bool,
+    /// **This chunk began on the go and rolled on it**: the go stands in for
+    /// the song's first beat (`BarClock::sounded_elsewhere`).
+    go_rolled_now: bool,
     /// A user effect ACROSS the effects bus, if one is loaded.
     ///
     /// **On the bus rather than on every channel**, and that is a design
@@ -13882,6 +13937,10 @@ impl Renderer {
         let mut done = 0usize;
         while done < frames {
             let n = chunk.min(frames - done);
+            // **A count's go rolls the transport on its own frame**, when the
+            // host asks (`Shared::roll_on_go`): a chunk ends where the go
+            // falls, and the next begins on it, rolling.
+            let n = self.go_split(n);
             self.chunks += 1;
             self.gain_coeff = desk_coeff;
             let mut landed = false;
@@ -14229,6 +14288,7 @@ impl Renderer {
             // speakers' hold is known.
             let go_late = self.aim_click(landed);
             self.note_record_anchor(at, rolling, block_start);
+            self.note_go_roll(at, rolling, block_start);
             let mark = self.click_hold.written;
             let mut click_peak = 0.0f32;
             for i in 0..n {
@@ -14314,6 +14374,13 @@ impl Renderer {
                         // downbeat while a count runs, but the rule belongs
                         // here, where the two clocks meet.
                         if !rolling {
+                            self.bar_clock.sounded_elsewhere();
+                        }
+                        // **Nor a go the transport rolled ON** (`go_split`):
+                        // the song starts on the go's own frame, so the go is
+                        // its first beat, rolling or not, and the bar clock
+                        // steps past it as it does a beat a go stood in for.
+                        if rolling && self.go_rolled_now {
                             self.bar_clock.sounded_elsewhere();
                         }
                     }
@@ -15964,10 +16031,15 @@ impl Renderer {
                 let mark = rolling
                     && n > 0
                     && self.shared.arr_mark.get(word).is_some_and(|w| w.load(Ordering::Acquire) & bit != 0);
+                // **A tee opened for a record that waits on its count writes
+                // nothing until the song rolls** (`Engine::set_capturing_from_roll`):
+                // the count is not the take, and the take's first frame is the
+                // go's, which the engine rolls the song on (`go_split`).
+                let waits = self.shared.arr_wait.get(word).is_some_and(|w| w.load(Ordering::Acquire) & bit != 0);
                 // **The pick's ring on the spine** (design 7.4, `Capture`):
                 // the host swaps it by `Engine::set_capture_ring`, which the
                 // callback refuses while this pick's capture runs.
-                if let Some(tx) = self.spine.captures.get_mut(input).and_then(Option::as_mut) {
+                if let Some(tx) = self.spine.captures.get_mut(input).and_then(Option::as_mut).filter(|_| rolling || !waits) {
                     let need = n * 2 + if mark { CAPTURE_MARK_LEN } else { 0 };
                     if tx.slots() >= need {
                         if mark {
@@ -15975,6 +16047,9 @@ impl Renderer {
                                 let _ = tx.push(v);
                             }
                             if let Some(w) = self.shared.arr_mark.get(word) {
+                                w.fetch_and(!bit, Ordering::AcqRel);
+                            }
+                            if let Some(w) = self.shared.arr_wait.get(word) {
                                 w.fetch_and(!bit, Ordering::AcqRel);
                             }
                         }
@@ -17078,6 +17153,56 @@ impl Renderer {
         self.click_hold.room.hold.saturating_add(own)
     }
 
+    /// **Where a count's go falls in this chunk, when the host asked the
+    /// engine to roll on it** (`Shared::roll_on_go`), and the chunk cut to
+    /// end on it.
+    ///
+    /// The host used to roll the transport itself when it saw the count end
+    /// (`after_frame`), a UI frame or two after the go was made: the backing's
+    /// first beat followed the go by that much, on every desk, and a part
+    /// played on the go was placed early by it (the mark and the record's
+    /// anchor are the first rolling frame). So while the host's word stands,
+    /// a chunk that would run past the go ends just before it, and the chunk
+    /// that begins on it rolls (`go_rolls`, which `run_transport` reads
+    /// beside the host's level) from wherever the transport stands. The go
+    /// is then the song's first beat, made on the same frame and held to
+    /// the mix with it. The roll is held until the host's word goes, which it
+    /// takes down once its own level says play (or the count is called off).
+    fn go_split(&mut self, n: usize) -> usize {
+        self.go_rolled_now = false;
+        if !self.shared.roll_on_go.load(Ordering::Acquire) {
+            if self.go_rolls {
+                self.go_rolls = false;
+                self.shared.go_rolled.store(false, Ordering::Release);
+            }
+            return n;
+        }
+        if self.go_rolls || self.was_rolling {
+            return n;
+        }
+        match self.beats.frames_to_go(n) {
+            Some(0) => {
+                self.go_rolls = true;
+                self.go_rolled_now = true;
+                n
+            }
+            Some(k) => k,
+            None => n,
+        }
+    }
+
+    /// **The song frame and the host instant the transport rolled from on a
+    /// go** (`go_split`), published once the chunk's transport has run, the
+    /// flag last (Release), for a record begun on the go to start from
+    /// (`Engine::rolled_on_go`).
+    fn note_go_roll(&mut self, at: u64, rolling: bool, block_start: Nanos) {
+        if self.go_rolled_now && rolling {
+            self.shared.go_frame.store(at, Ordering::Relaxed);
+            self.shared.go_ns.store(block_start, Ordering::Relaxed);
+            self.shared.go_rolled.store(true, Ordering::Release);
+        }
+    }
+
     /// **A record's anchor, written by the first chunk that rolls after the
     /// host asked for one** (`Shared::rec_req`): the song frame the chunk
     /// starts on, the instant on the host's clock the chunk's first frame
@@ -17157,7 +17282,9 @@ impl Renderer {
         let first = self.shared.transport_req.load(Ordering::Acquire);
         #[cfg(test)]
         meet_transport(&self.shared, 1);
-        let level = self.shared.rolling.load(Ordering::Acquire);
+        // **Or the engine's own roll on a count's go** (`go_split`), held
+        // until the host's level takes it over.
+        let level = self.shared.rolling.load(Ordering::Acquire) || self.go_rolls;
         #[cfg(test)]
         meet_transport(&self.shared, 2);
         let req = self.shared.transport_req.load(Ordering::Acquire);
@@ -26021,6 +26148,8 @@ impl Engine {
             click_taped: vec![0.0; MAX_BLOCK as usize],
             click_hold: ClickHold::new(),
             rec_seen: 0,
+            go_rolls: false,
+            go_rolled_now: false,
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -28930,6 +29059,7 @@ impl Engine {
             let (w, b) = bit(p);
             self.shared.arr_capture[w].fetch_and(!b, Ordering::Release);
             self.shared.arr_mark[w].fetch_and(!b, Ordering::Release);
+            self.shared.arr_wait[w].fetch_and(!b, Ordering::Release);
         }
         for &p in want.difference(&on) {
             let (w, b) = bit(p);
@@ -28945,8 +29075,21 @@ impl Engine {
         *on = want;
     }
 
+    /// **As [`Engine::set_capturing`], but each newly raised tee writes
+    /// nothing until the song rolls**, then the take's mark and on (the
+    /// take's first frame is the first rolling one): for a record that waits
+    /// on its count, opened when the count starts so its take begins on the
+    /// go the engine rolls the song on (`Engine::set_roll_on_go`), where the
+    /// host only sees the go a UI frame later.
+    pub fn set_capturing_from_roll(&self, picks: &[PickId]) {
+        let on = self.capturing.borrow().clone();
+        for p in picks.iter().map(|p| p.0).filter(|p| (*p as usize) < CAPTURE_WORDS * 64 && !on.contains(p)) {
+            self.shared.arr_wait[p as usize / 64].fetch_or(1u64 << (p % 64), Ordering::Release);
+        }
+        self.set_capturing(picks);
+    }
+
     /// Whether `pick`'s capture flag is set.
-    #[cfg_attr(not(test), allow(dead_code, reason = "asked by the record-under-shape-changes tests"))]
     pub fn is_capturing(&self, pick: PickId) -> bool {
         self.capturing.borrow().contains(&pick.0)
     }
@@ -29017,6 +29160,24 @@ impl Engine {
     /// `Renderer::plays_live`.
     pub fn set_live_play(&self, on: bool) {
         self.shared.live_ok.store(on, Ordering::Relaxed);
+    }
+
+    /// **Roll the transport on the running count's go** (`Renderer::go_split`):
+    /// the host's word, every frame, while an arrangement record or a Play
+    /// waits on the count, and taken down once its own level says play.
+    pub fn set_roll_on_go(&self, on: bool) {
+        self.shared.roll_on_go.store(on, Ordering::Release);
+    }
+
+    /// **The song frame the transport rolled from on a count's go, and the
+    /// host instant that frame was made for**, while the engine still holds
+    /// that roll (the host has not yet taken it over). What a record begun on
+    /// the go starts from.
+    pub fn rolled_on_go(&self) -> Option<(u64, Nanos)> {
+        self.shared
+            .go_rolled
+            .load(Ordering::Acquire)
+            .then(|| (self.shared.go_frame.load(Ordering::Relaxed), self.shared.go_ns.load(Ordering::Relaxed)))
     }
 
     /// **Frames the capture tee had to drop** because a pick's ring was full:
@@ -33299,6 +33460,8 @@ mod tests {
             click_taped: vec![0.0; MAX_BLOCK as usize],
             click_hold: ClickHold::new(),
             rec_seen: 0,
+            go_rolls: false,
+            go_rolled_now: false,
             fx_return_gain: 1.0,
             clips: Vec::new(),
             midi_clips: Vec::new(),
@@ -49835,6 +49998,263 @@ mod slot_engine {
                 let want = (GO + hold as usize) as f64 / RATE_HZ * 1e9;
                 let got = go_ns.unwrap_or_else(|| panic!("hold {hold}: no go was published"));
                 assert!((got as f64 - want).abs() <= 1.0, "hold {hold}: the published go {got} is not the instant it is heard, {want}");
+            }
+        }
+
+        /// **A count's go rolls the song on its own frame when the host asks,
+        /// so the go and the mix's first beat are heard together wherever the
+        /// go falls in a pass** (a verifier's finding: the host rolled the
+        /// song a UI frame or two after the go).
+        ///
+        /// The count belongs to the keypress (`Beats`) and the song to the bar
+        /// clock. The host rolled the transport when it saw the count end, a UI
+        /// frame or more after the go was made, so the backing's first beat
+        /// came that long after the go on every desk, and a part played on the
+        /// go was placed that much early (the take's mark and the record's
+        /// anchor are the first rolling frame). With the host's word up
+        /// (`Engine::set_roll_on_go`) the engine ends a chunk where the go
+        /// falls and rolls the next one from it (`Renderer::go_split`): with
+        /// 448-frame passes, so the go lands mid-pass, the transport has rolled
+        /// exactly the frames since the go, the backing's first beat is heard
+        /// on the frame the go is (the hold after it is made, on a bare desk
+        /// and held 1,200 frames), the published go is that heard instant,
+        /// and the frame and the instant the song rolled from are published
+        /// for the record begun on it (`Engine::rolled_on_go`). The host then
+        /// takes the roll over (its level up, its word down) and the song plays
+        /// on without a step. The go is the song's first beat: with the click
+        /// on, the next click is the song's next beat, from 0:00 and from 10 ms
+        /// before a beat line (which the go stands in for), never a second go.
+        #[test]
+        fn a_counts_go_rolls_the_song_on_its_own_frame_when_the_host_asks() {
+            const PASS: usize = 448;
+            const RATE_HZ: f64 = 48_000.0;
+            let render = |count: bool, backing: bool, click: bool, hold: u32, from: u64| -> (Vec<f32>, Engine, Option<usize>) {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                fake_hold(&mut e, hold);
+                e.set_tempo(120.0);
+                e.set_metronome_enabled(click);
+                e.set_metronome_gain(1.0);
+                if backing {
+                    e.set_clips_slotted(vec![impulse_at(&e, 1, 0)]);
+                }
+                e.set_transport(1, from);
+                let mut out = vec![0.0f32; PASS * 2];
+                let ns = |frame: usize| (frame as f64 / RATE_HZ * 1e9) as Nanos;
+                e.offline.as_mut().expect("a renderer").render(&mut out, 0, 0);
+                if count {
+                    e.start_count_in(4, 120.0);
+                    e.set_roll_on_go(true);
+                }
+                let mut heard = Vec::new();
+                let mut taken = None;
+                for k in 1..(5 * BEAT_TWO + 3 * BEAT_TWO) / PASS {
+                    // The host's next UI frame after the go: its level up,
+                    // then its word down.
+                    if taken.is_none() && e.count_in_done() {
+                        e.set_rolling(true);
+                        e.set_roll_on_go(false);
+                        taken = Some(k * PASS);
+                    }
+                    let at = ns(k * PASS);
+                    e.offline.as_mut().expect("a renderer").render(&mut out, at, at);
+                    heard.extend_from_slice(&out);
+                }
+                (heard, e, taken)
+            };
+            // The count's go, made one pass in plus four beats.
+            let go = PASS + 4 * BEAT_TWO;
+            assert_ne!(go % PASS, 0, "fixture: the go falls on a pass's edge");
+            for hold in [0u32, 1_200] {
+                let (back, e, taken) = render(true, true, false, hold, 0);
+                let (count, _, _) = render(true, false, false, hold, 0);
+                let taken = taken.expect("the count never ended");
+                assert!(taken > go, "fixture: the host took the roll over before the go");
+                // The backing alone: the count with it, less the count. Frame
+                // 0 of each render is its second pass's.
+                let beat = onset_from(&less(&back, &count), 0, CROSS).expect("the backing's first beat") + PASS;
+                assert_eq!(beat, go + hold as usize, "hold {hold}: the backing's first beat is heard at {beat}, the go at {}", go + hold as usize);
+                let rolled = (8 * BEAT_TWO / PASS) * PASS - go;
+                assert_eq!(e.transport_position(), rolled as u64, "hold {hold}: the song has not rolled exactly the frames since the go");
+                // To the nanoseconds two truncations round to: the chunk's
+                // first instant and the go's frames after it.
+                let want = (go + hold as usize) as f64 / RATE_HZ * 1e9;
+                let got = e.count_in_downbeat_ns().expect("no go was published");
+                assert!((got as f64 - want).abs() <= 2.0, "hold {hold}: the published go {got} is not the instant it is heard, {want}");
+                assert_eq!(e.rolled_on_go(), None, "hold {hold}: the engine still holds a roll the host took over");
+                let go_heard = onset_from(&count, go - PASS - 100, CROSS).expect("the go") + PASS;
+                assert!((0..40).contains(&(go_heard as i64 - beat as i64)), "hold {hold}: the go attacks at {go_heard}, the mix's first beat at {beat}");
+            }
+            // What the record begun on the go starts from, while the engine
+            // holds the roll.
+            {
+                let mut e = wide(42);
+                let inputs = bus_plan(&e, 42, &[]);
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_tempo(120.0);
+                e.set_transport(1, 5_000);
+                let mut out = vec![0.0f32; PASS * 2];
+                e.offline.as_mut().expect("a renderer").render(&mut out, 0, 0);
+                e.start_count_in(4, 120.0);
+                e.set_roll_on_go(true);
+                let mut k = 1;
+                while !e.count_in_done() {
+                    let at = (k as f64 * PASS as f64 / RATE_HZ * 1e9) as Nanos;
+                    e.offline.as_mut().expect("a renderer").render(&mut out, at, at);
+                    k += 1;
+                }
+                let made = go as f64 / RATE_HZ * 1e9;
+                let (frame, ns) = e.rolled_on_go().expect("the engine holds no roll on the go");
+                assert_eq!(frame, 5_000, "the song did not roll from where it stood");
+                assert!((ns as f64 - made).abs() <= 2.0, "the go's roll was made at {ns}, not at {made}");
+            }
+            // The click on: the go, then the song's own beats, never a second
+            // go, from 0:00 and from ten milliseconds before a beat line.
+            for (from, next) in [(0u64, BEAT_TWO), (BEAT_TWO as u64 - 480, 2 * BEAT_TWO - (BEAT_TWO - 480))] {
+                let (clicked, _, _) = render(true, false, true, 0, from);
+                let mut onsets = Vec::new();
+                let mut at = 0;
+                while let Some(o) = onset_from(&clicked, at, CROSS) {
+                    onsets.push(o + PASS);
+                    at = o + BEAT_TWO / 2;
+                }
+                let after: Vec<usize> = onsets.iter().copied().filter(|o| *o >= go).collect();
+                assert!(after.len() >= 2, "fixture: from {from}: {onsets:?}");
+                assert!((0..40).contains(&(after[0] - go)), "from {from}: the go is not the first click at {go}: {after:?}");
+                assert!(
+                    (0..40).contains(&(after[1] as i64 - (go + next) as i64)),
+                    "from {from}: the click after the go is at {}, not the song's next beat at {}",
+                    after[1],
+                    go + next
+                );
+            }
+        }
+
+        /// **A part played on a count-in's go lands on the song frame the go
+        /// began, whole, on the host's own road** (a verifier's finding: the
+        /// first note of a record begun on a go landed a UI frame or two
+        /// early, and from 0:00 its head was cut out of the file).
+        ///
+        /// The host's road, emulated: 256-frame callbacks, a UI frame every
+        /// 800 frames (60 Hz). The red button pressed with a count makes the
+        /// count, asks the engine to roll on its go and opens the armed
+        /// input's tee to write from the song's roll
+        /// (`DesktopApp::reconcile_count_tee`); the first UI frame that sees
+        /// the count done makes the record (it adopts the tee and starts
+        /// draining it), and the next takes the song's roll over (its level
+        /// up, its word down), as `after_frame` does, the push coming before
+        /// the record in each frame. A tone is played into the input from the
+        /// instant the go is heard (`count_in_downbeat_ns`). The engine rolled
+        /// the song on the go's own frame
+        /// (`a_counts_go_rolls_the_song_on_its_own_frame_when_the_host_asks`)
+        /// and the tee wrote from it, so the take's mark is the song where the
+        /// go began, and through `take_placement` every frame of the tone
+        /// lands on the song frame it was played against, its first on the
+        /// frame the record began (0:00 and two beats in), whole, on a bare
+        /// desk and one held 1,200 frames, whether the record was made before
+        /// the go was heard or after. Before, the song rolled at the second UI
+        /// frame and the tee opened at the first: the tone landed that much
+        /// early, and from 0:00 its first 1,792 frames were cut.
+        #[test]
+        #[cfg(feature = "recorder")]
+        fn a_part_played_on_a_counts_go_lands_on_the_song_frame_the_go_began() {
+            const CB: usize = 256;
+            const UI: usize = 800;
+            const RATE_HZ: f64 = 48_000.0;
+            let tone = |j: usize| ((j as f32) * 0.0577).sin() * 0.3 + 0.3;
+            for hold in [0u32, 1_200] {
+                for from in [0u64, 2 * BEAT_TWO as u64] {
+                    let mut e = wide(42);
+                    let mut inputs = bus_plan(&e, 42, &[]);
+                    inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+                    e.publish_plan(&inputs).expect("the plan goes");
+                    fake_hold(&mut e, hold);
+                    let mut tx = plug(&mut e, 3);
+                    e.set_monitor_on(true);
+                    e.sync_capture_rings(&[PickId(0)]).expect("a ring");
+                    e.set_tempo(120.0);
+                    e.set_metronome_gain(1.0);
+                    e.set_metronome_enabled(false);
+                    e.set_transport(1, from);
+                    let ns = |frame: usize| (frame as f64 / RATE_HZ * 1e9) as Nanos;
+                    let mut out = vec![0.0f32; CB * 2];
+                    let mut frame = 0usize;
+                    for _ in 0..40 {
+                        for _ in 0..CB {
+                            let _ = tx.push(0.0);
+                        }
+                        e.offline.as_mut().expect("a renderer").render(&mut out, ns(frame), ns(frame));
+                        frame += CB;
+                    }
+                    let _ = e.drain_capture(PickId(0), &mut Vec::new());
+                    e.start_count_in(4, 120.0);
+                    e.set_roll_on_go(true);
+                    e.set_capturing_from_roll(&[PickId(0)]);
+                    // The count restarts on the next pass's first frame, and
+                    // its go is heard the hold after it is made, four beats on:
+                    // the player plays from there (checked below against the
+                    // go the engine publishes).
+                    let heard = Some(frame + 4 * BEAT_TWO + hold as usize);
+                    let (mut published, mut pressed, mut taken) = (None::<usize>, None::<usize>, false);
+                    let (mut took, mut mark) = (Vec::new(), None);
+                    let mut next_ui = frame + UI;
+                    while pressed.is_none_or(|p| frame < p + 2 * 48_000) {
+                        for k in 0..CB {
+                            let v = heard.filter(|g| frame + k >= *g).map_or(0.0, |g| tone(frame + k - g));
+                            let _ = tx.push(v);
+                        }
+                        e.offline.as_mut().expect("a renderer").render(&mut out, ns(frame), ns(frame));
+                        frame += CB;
+                        // The record drains its tee from its press on.
+                        if pressed.is_some() {
+                            if let Some(m) = e.drain_capture(PickId(0), &mut took) {
+                                mark.get_or_insert(m);
+                            }
+                        }
+                        if published.is_none() && e.count_in_done() {
+                            let d = e.count_in_downbeat_ns().expect("the go");
+                            published = Some((d as f64 / 1e9 * RATE_HZ).round() as usize);
+                        }
+                        if frame >= next_ui {
+                            next_ui += UI;
+                            // `after_frame`: the push, then the record.
+                            if pressed.is_some() && !taken {
+                                e.set_rolling(true);
+                                e.set_roll_on_go(false);
+                                taken = true;
+                            }
+                            if pressed.is_none() && e.count_in_done() {
+                                // The record adopts the tee its count opened.
+                                e.set_capturing(&[PickId(0)]);
+                                pressed = Some(frame);
+                            }
+                        }
+                        assert!(frame < 40 * 48_000, "fixture: the count never ended");
+                    }
+                    e.set_capturing(&[]);
+                    if let Some(m) = e.drain_capture(PickId(0), &mut took) {
+                        mark.get_or_insert(m);
+                    }
+                    let (go, press) = (heard.expect("the go"), pressed.expect("the press"));
+                    assert_eq!(published, Some(go), "fixture: hold {hold}: the go is not heard where the player plays from");
+                    assert_eq!(press < go, hold > 0, "fixture: hold {hold}: the press at {press} against the go heard at {go}");
+                    let mark = mark.unwrap_or_else(|| panic!("hold {hold}, from {from}: the take was never marked"));
+                    // The take begins on the go: nothing of the count is in it.
+                    assert_eq!((mark.frame, mark.at), (from, 0), "hold {hold}, from {from}: the take does not begin on the go");
+                    let place = take_placement(Some(mark), took.len() / 2).expect("a mark places");
+                    let kept = &took[place.trim * 2..];
+                    // Where the tone's first captured frame lands, and each
+                    // frame of it against the tone the player played there.
+                    let first = onset_from(kept, 0, 0.01).unwrap_or_else(|| panic!("hold {hold}, from {from}: the tone is not in the take"));
+                    let lands = place.start + first as u64;
+                    assert_eq!(lands, from, "hold {hold}, from {from}: the tone's first frame in the take lands on song frame {lands}");
+                    assert!((kept[first * 2] - tone(0)).abs() < 1e-4, "hold {hold}, from {from}: the tone's head is cut ({})", kept[first * 2]);
+                    for (k, f) in kept.chunks_exact(2).enumerate().skip(first).take(4_000) {
+                        let j = (place.start + k as u64 - from) as usize;
+                        assert!((f[0] - tone(j)).abs() < 1e-4, "hold {hold}, from {from}: song frame {} holds {}, the tone played there {}", place.start + k as u64, f[0], tone(j));
+                    }
+                }
             }
         }
 

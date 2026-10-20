@@ -502,6 +502,19 @@ struct Recorder {
     /// begins by restating whatever this says. Indexed by
     /// `ArrRec::pedal_slot`.
     pedal_live: [u8; 3],
+    /// **The always-on MIDI tap's last second**, three-byte messages with
+    /// their stamps: what a record begun on a count's go was played since
+    /// the go, before the frame that saw the go made the record. The tap
+    /// is drained at the top of the frame and the record begins further
+    /// down it, so a note played on the go was pumped to nobody and lost
+    /// (`ArrRec::replay_since`).
+    recent_midi: std::collections::VecDeque<(u8, i64, [u8; 3])>,
+    /// **The picks a record waiting on its count opened its tee for**
+    /// (`DesktopApp::reconcile_count_tee`), each writing nothing until the
+    /// song rolls on the go (`Engine::set_capturing_from_roll`), so the take
+    /// begins on the go and not a UI frame after it. `None` while no count
+    /// is waiting; the record begun on the go adopts them (`ArrRec::open_tee`).
+    count_tee: Option<Vec<crate::desk_plan::PickId>>,
     /// An EXPORT in flight: the arrangement playing start-to-end into an
     /// audio-only take that lands in the project's `export/`.
     bounce: Option<Bounce>,
@@ -1309,6 +1322,12 @@ impl ArrRec {
         if let Some(e) = e {
             let mut stale = Vec::new();
             for p in &picks {
+                // **A tee its count opened is the take's already**
+                // (`DesktopApp::reconcile_count_tee`): what it holds is the
+                // take from the go, not a tail to throw away.
+                if e.is_capturing(*p) {
+                    continue;
+                }
                 let _ = e.arm_capture(*p);
                 let _ = e.drain_capture(*p, &mut stale);
                 stale.clear();
@@ -1380,7 +1399,25 @@ impl ArrRec {
             lane.note_event(rel, status, data1, data2);
         }
     }
+
+    /// **The tap's recent messages from this record's T0 on, into it**, in
+    /// the order they came: a record begun on a count's go is made a UI
+    /// frame after the go, and what was played since then had already been
+    /// drained (`Recorder::recent_midi`). Nothing stamped before T0 is the
+    /// take's.
+    fn replay_since(&mut self, recent: &std::collections::VecDeque<(u8, i64, [u8; 3])>) {
+        for (src, t, bytes) in recent {
+            if *t >= self.start_ns {
+                self.note_event(*src, *t, bytes);
+            }
+        }
+    }
 }
+
+/// **How long the always-on MIDI tap's history runs** (`Recorder::recent_midi`):
+/// a second, many UI frames past the longest a count's go waits to be seen.
+#[cfg(feature = "recorder")]
+const RECENT_MIDI_NS: i64 = 1_000_000_000;
 
 #[cfg(feature = "recorder")]
 impl ArrRecLane {
@@ -6436,7 +6473,12 @@ impl DesktopApp {
         // a mutable borrow of `self.recorder`, and three bytes copied twice a
         // frame is cheaper than restructuring the drain around it.
         let mut pedal_live = self.recorder.pedal_live;
+        let recent = &mut self.recorder.recent_midi;
         self.recorder.session.pump_midi(|src, t, bytes| {
+            // The last second of it, for a record begun on a count's go.
+            if let [status, data1, data2] = *bytes {
+                recent.push_back((src, t, [status, data1, data2]));
+            }
             // Where the pedals stand, kept whether or not a take is running —
             // so the NEXT press knows what it inherits. See `pedal_live`.
             if let [status, data1, data2] = *bytes {
@@ -6453,6 +6495,11 @@ impl DesktopApp {
             }
         });
         self.recorder.pedal_live = pedal_live;
+        if let Some(newest) = self.recorder.recent_midi.back().map(|e| e.1) {
+            while self.recorder.recent_midi.front().is_some_and(|e| e.1 < newest - RECENT_MIDI_NS) {
+                self.recorder.recent_midi.pop_front();
+            }
+        }
         // The capture rings, drained every frame a record is running — four
         // seconds of room in the engine, emptied sixty times a second.
         if let Some(rec) = self.recorder.arr_rec.as_mut() {
@@ -6615,6 +6662,14 @@ impl DesktopApp {
             if self.recorder.motor_hold && engine.is_none_or(|e| self.recorder.transport.caught_up(e)) {
                 self.recorder.motor_hold = false;
             }
+            // **A count's go rolls the song itself** while a record or a
+            // Play waits on the count (`Engine::set_roll_on_go`): the engine
+            // knows the go's frame, and the backing's first beat is made on
+            // it. Asked after the push, so the frame that hands the song to
+            // the play switch has stored its level before the word goes.
+            if let Some(e) = engine {
+                e.set_roll_on_go((self.recorder.arr_rec_wait || self.recorder.play_on_go) && !self.recorder.transport.playing());
+            }
             // **The loop region, pushed every frame from the time
             // selection.** Frames off the engine's own rate; cleared to
             // (0,0) when there is no selection. Suppressed during a realtime
@@ -6632,6 +6687,9 @@ impl DesktopApp {
                 }
             }
         }
+        // A record waiting on its count, its tee opened for the go, or
+        // closed again if the count was called off.
+        self.reconcile_count_tee();
         // The frames the transport, the take, the meters and the camera
         // need are asked for in ONE place, `host_frame_due`, at the end of
         // `update`. Two arms used to live here, and one of them was `|| open`:
@@ -10760,8 +10818,16 @@ impl DesktopApp {
         // before the start is read: a press during a coast pins the record's
         // start below.
         let coasting = e.motor_coasting();
-        let start_s = self.recorder.transport.position_s(Some(e), rate);
-        let start_ns = e.timebase().now();
+        // **Begun on a count's go, it starts on the go** (`Engine::rolled_on_go`):
+        // the engine rolled the song on the go's own frame, a UI frame or
+        // two before this, and the song frame and the instant it rolled from
+        // are the record's place and its T0.
+        let go = e.rolled_on_go();
+        let start_s = match go {
+            Some((frame, _)) => frame as f64 / rate,
+            None => self.recorder.transport.position_s(Some(e), rate),
+        };
+        let start_ns = go.map_or_else(|| e.timebase().now(), |(_, ns)| ns);
         // **Where the record lands, asked now**: the engine answers with the
         // first chunk that rolls from here (`midi_take_span`), and the hold
         // the speakers play at is kept for a record that never rolls.
@@ -10771,6 +10837,12 @@ impl DesktopApp {
         // sees the park (`Renderer::motor_plan`).
         e.park_tape_motor();
         ArrRec::open_tee(&audio, &mut self.bridge, self.recorder.engine.as_mut());
+        // The count's tee is this record's now, held by it (`open_tee`).
+        if let Some(picks) = self.recorder.count_tee.take() {
+            let kept: Vec<crate::desk_plan::PickId> = audio.iter().map(|a| a.pick).collect();
+            let gone: Vec<crate::desk_plan::PickId> = picks.into_iter().filter(|p| !kept.contains(p)).collect();
+            self.bridge.release_picks(&gone);
+        }
         // **Pressed while the tape coasts**: the record starts where it was
         // pressed, and the engine applies that seek as the motor snaps to
         // speed. The playhead alone: the edit cursor stays where the hand
@@ -10802,7 +10874,7 @@ impl DesktopApp {
         // the live path pushes into the engine, so a note that sounded on
         // this track is a note recorded on it.
         let routes = self.app.midi_routes();
-        self.recorder.arr_rec = Some(ArrRec {
+        let mut rec = ArrRec {
             start_s,
             start_ns,
             anchor,
@@ -10822,7 +10894,15 @@ impl DesktopApp {
                 })
                 .collect(),
             audio,
-        });
+        };
+        // **What was played since the go**, which the tap drained to nobody
+        // earlier in this frame (`Recorder::recent_midi`). Only for a record
+        // begun on a go: a press is its own T0, and nothing before it is
+        // the take's.
+        if go.is_some() {
+            rec.replay_since(&self.recorder.recent_midi);
+        }
+        self.recorder.arr_rec = Some(rec);
     }
 
     /// The record ending, by whichever door: the red button again, Stop, or
@@ -11068,6 +11148,54 @@ impl DesktopApp {
         }
     }
 
+    /// **A record waiting on its count opens its tee before the go**, and
+    /// one called off closes it again.
+    ///
+    /// The record begins on the go, and the engine rolls the song on the
+    /// go's own frame (`Engine::set_roll_on_go`), but this host only sees the
+    /// go a UI frame later, when it makes the record: a tee opened there
+    /// missed what was played on the go, the head of the first note, on a
+    /// desk that holds the mix back less than a UI frame. So while a record
+    /// waits on its count its armed inputs' tees are open already, each
+    /// writing nothing until the song rolls (`Engine::set_capturing_from_roll`),
+    /// and the record adopts them (`ArrRec::open_tee`); a track armed during
+    /// the count joins at the record's press, as every take did. Asked every
+    /// frame, so a count called off by any door closes it.
+    fn reconcile_count_tee(&mut self) {
+        let waiting = self.recorder.arr_rec_wait && self.recorder.arr_rec.is_none() && self.recorder.bounce.is_none();
+        match (waiting, self.recorder.count_tee.is_some()) {
+            (true, false) => {
+                let PressTakes { audio, .. } = ArrRec::press_takes(&self.app, &self.bridge);
+                let picks: Vec<crate::desk_plan::PickId> = audio.iter().map(|a| a.pick).collect();
+                self.bridge.hold_picks(&picks);
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    let mut stale = Vec::new();
+                    for p in &picks {
+                        let _ = e.arm_capture(*p);
+                        let _ = e.drain_capture(*p, &mut stale);
+                        stale.clear();
+                    }
+                    e.set_capturing_from_roll(&picks);
+                }
+                self.recorder.count_tee = Some(picks);
+            }
+            (false, true) if self.recorder.arr_rec.is_none() => {
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_capturing(&[]);
+                    let mut stale = Vec::new();
+                    for p in self.recorder.count_tee.iter().flatten() {
+                        let _ = e.drain_capture(*p, &mut stale);
+                        stale.clear();
+                    }
+                }
+                if let Some(picks) = self.recorder.count_tee.take() {
+                    self.bridge.release_picks(&picks);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// **The song has just started on the downbeat a take was counting on**
     /// (`take_downbeat`): the take is told where from, so its manifest
     /// places it - see `Session::song_started_at_head`. Called by the two
@@ -11080,7 +11208,12 @@ impl DesktopApp {
         }
         let engine = self.recorder.engine.as_ref();
         let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
-        let from_s = self.recorder.transport.position_s(engine, rate);
+        // From the frame the engine rolled it on, when the go rolled it
+        // (`Engine::rolled_on_go`): the playhead has moved on since.
+        let from_s = match engine.and_then(crate::instrument::Engine::rolled_on_go) {
+            Some((frame, _)) if rate > 0.0 => frame as f64 / rate,
+            _ => self.recorder.transport.position_s(engine, rate),
+        };
         self.recorder.session.song_started_at_head(from_s);
     }
 
@@ -15499,6 +15632,10 @@ impl DesktopApp {
         self.recorder.count_from = None;
         self.recorder.take_count_pending = false;
         self.recorder.play_on_go = false;
+        // The count's tee was that engine's; its picks are the desk's again.
+        if let Some(picks) = self.recorder.count_tee.take() {
+            self.bridge.release_picks(&picks);
+        }
         // And the motor's latch: the edge it waited on was that engine's.
         self.recorder.motor_hold = false;
     }
@@ -16530,7 +16667,16 @@ impl DesktopApp {
             Some(e) => {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
                 let app = &self.app;
-                self.bridge.punch_at(live_punches(self.recorder.arr_rec.as_ref(), rate, |id| app.row_of(id)));
+                // **A record waiting on its count punches its lanes out from
+                // where it will begin**, so the song its go rolls (`Engine::
+                // set_roll_on_go`) plays none of their clips there, and an
+                // armed lane played live stays outside the desk's wait across
+                // the go (`Renderer::plays_live`).
+                let punches = match (self.recorder.arr_rec.as_ref(), self.recorder.arr_rec_wait) {
+                    (None, true) => count_punches(&ArrRec::press_takes(app, &self.bridge), e.transport_position(), |id| app.row_of(id)),
+                    (rec, _) => live_punches(rec, rate, |id| app.row_of(id)),
+                };
+                self.bridge.punch_at(punches);
                 // **A lane whose track has gone is written down first**: every
                 // bay its plugins sit in, to the live shelf under the track's
                 // own bays, while the plugins are alive, and forgotten by the
@@ -18970,6 +19116,27 @@ impl MidiSpan {
     }
 }
 
+/// **Where a record waiting on its count will replace each lane's
+/// schedule**, by row: every lane it will capture, from `at`, the frame the
+/// engine's stopped transport stands on, which its go rolls the song from
+/// (`Engine::set_roll_on_go`). See `live_punches`, which says the same of a
+/// record under way.
+#[cfg(feature = "recorder")]
+fn count_punches(
+    takes: &PressTakes,
+    at: u64,
+    row_of: impl Fn(tangent_ui::desk_id::TrackId) -> Option<usize>,
+) -> Vec<Option<u64>> {
+    let mut punches = Vec::new();
+    for row in takes.midi.iter().map(|(id, _)| *id).chain(takes.audio.iter().map(|a| a.id)).filter_map(&row_of) {
+        if punches.len() <= row {
+            punches.resize(row + 1, None);
+        }
+        punches[row] = Some(at);
+    }
+    punches
+}
+
 /// **Where the arrangement record is replacing each lane's schedule**, in
 /// frames at `rate`, by ROW: from the record start on every lane it
 /// captures, MIDI and audio alike, and nowhere when nothing records. Handed
@@ -21324,6 +21491,8 @@ impl DesktopApp {
                 input_names: Vec::new(),
                 arr_rec: None,
             pedal_live: [0; 3],
+                recent_midi: std::collections::VecDeque::new(),
+                count_tee: None,
                 bounce: None,
                 offline_bounce: None,
                 arr_rec_wait: false,
@@ -39941,6 +40110,51 @@ mod arr_place {
 
     fn note(at_s: f64, dur_s: f64, key: u8) -> ArrNote {
         ArrNote { at_s, dur_s, key, vel: 100, muted: false }
+    }
+
+    /// **A record begun on a count's go keeps what was played since the go**
+    /// (`ArrRec::replay_since`). The always-on tap is drained at the top of
+    /// a frame and the frame that sees the go makes the record further down
+    /// it, so a note played on the go (the instant the player heard it) was
+    /// pumped to nobody and lost, as was anything else played before that
+    /// frame's press. The record begun on a go starts from the instant the
+    /// go was made (`Engine::rolled_on_go`), and the tap's last second is
+    /// replayed into it from there: the note on the go, 25 ms after it was
+    /// made, is its first, at 25 ms; a note held from the count, struck
+    /// before the go, is not the take's; and a press with no go replays
+    /// nothing (`start_arr_record` asks only for a go's record).
+    #[test]
+    fn a_record_begun_on_a_go_keeps_what_was_played_since_the_go() {
+        use std::collections::VecDeque;
+        const SEC: i64 = 1_000_000_000;
+        let go = 10 * SEC;
+        let mut r = ArrRec {
+            start_s: 0.0,
+            start_ns: go,
+            anchor: 0,
+            hold: 0,
+            midi: vec![ArrRecLane {
+                id: tangent_ui::desk_id::TrackId(0),
+                route: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                notes: Vec::new(),
+                pedal: Vec::new(),
+                pedal_at: [0; 3],
+                open: std::collections::HashMap::new(),
+            }],
+            audio: Vec::new(),
+        };
+        let recent: VecDeque<(u8, i64, [u8; 3])> = [
+            (0u8, go - SEC / 4, [0x90, 50, 90]),
+            (0, go + SEC / 40, [0x90, 60, 100]),
+            (0, go + SEC / 10, [0x80, 60, 0]),
+        ]
+        .into_iter()
+        .collect();
+        r.replay_since(&recent);
+        let lane = &r.midi[0];
+        assert_eq!(lane.notes.len(), 1, "{:?}", lane.notes);
+        assert!((lane.notes[0].at_s - 0.025).abs() < 1e-9 && lane.notes[0].key == 60, "{:?}", lane.notes[0]);
+        assert!(lane.open.is_empty(), "a note struck before the go was kept: {:?}", lane.open);
     }
 
     /// **A MIDI part lands where it was played against what was heard, and
