@@ -1,15 +1,20 @@
 # Tape's processor cost in 5.3
 
 Measured 2026-10-19 on the M-series Mac the project is built on, release
-builds, in the release's quiet sitting: nothing else building or testing,
-Tangent closed, each bench run alone with `--test-threads=1`, each build
-warmed with one untimed run, and 5.3 alternated run by run with 5.2.0's
-own code (c90c0a49: the 5.2.0 tag with only the version bumped). The
-desktop's own work (the window server, a chat client, audio) still ran,
-and it shows in the tails: the p99s and the worst blocks below are that
-sitting's, where the means held to a few per cent from run to run. What
-decided each change of the kernel is an interleaved A/B ratio (see "How
-it was measured"), which a busy machine moves far less.
+builds, in the release's quiet sitting: Tangent closed, each bench run
+alone with `--test-threads=1`, each build warmed with one untimed run,
+and 5.3 alternated run by run with 5.2.0's own code (c90c0a49: the 5.2.0
+tag with only the version bumped). The single-unit bench and the start
+and stop probe ran with nothing else building or testing from their
+first run to their last. Other lanes' builds ran under part of three of
+the four timed `rt_bench` runs, which take 85 s each (only 5.2.0's first
+was clear of them); the rows nothing here touches read alike in both
+builds all the same. The desktop's own work (the window server, a chat
+client, audio) still ran, and it shows in the tails: the p99s and the
+worst blocks below are that sitting's, where the means held to a few
+per cent from run to run. What decided each change of the kernel is an
+interleaved A/B ratio (see "How it was measured"), which a busy machine
+moves far less.
 
 ## Tangent Tape
 
