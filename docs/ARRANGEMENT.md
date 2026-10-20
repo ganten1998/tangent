@@ -388,9 +388,20 @@ channels play back their clips and nothing else. "Ready to play" and
       at all reach it the hold after the song plays them, which is where its
       line would have put them, and nothing after the line moves. So its
       part lands with the mix, sample for sample, in the speakers and the
-      take: at a hold of whole blocks a DX7, Tangent Keys and a kit armed
-      render what the same track unarmed renders, to the bit, over Play,
-      three laps of a loop, a locate and Stop. And a key into it is heard
+      take: a DX7, Tangent Keys and a kit armed render what the same track
+      unarmed renders, to the bit, at any hold, whole blocks or not (pinned
+      at 1,024 and 1,200 frames for all three, and for Tangent Keys at 1,201
+      and at 1,344 with 448-frame callbacks), over Play, three laps of a
+      loop, a locate and Stop. Tangent Keys does because its grid (the
+      recount that hands a finished voice's string back to the harp, the
+      harp's payments, the reed amp's flush) falls on the frames of the
+      timeline it is played on (`Keys::set_grid`, told at the head of every
+      stretch that rolls); it fell every 128 of the instrument's own frames,
+      so a part read behind the song by a hold off that grid, or played back
+      from a frame off it, sounded apart from the unarmed track or the
+      export from the first voice that ended (as much as -62 dB re peak on
+      the electric grand with silent presses under the pedal, under -100 dB
+      on plain note ends). And a key into it is heard
       after its own chain alone, playing, stopped or recording: a key into a
       DX7 on it with a deep-range Tape on another lane is heard 110 frames
       after it is pressed, as on a bare desk, where it was 1,310; a pad
@@ -414,16 +425,28 @@ channels play back their clips and nothing else. "Ready to play" and
         that shrinks hands it what it skipped at its next block's head
         (from 2,400 to 600 at 40,960, the strikes at 39,000 and 40,000
         sound together there, and the one at 41,000 at 41,600); and its
-        plugins are never told an earlier place on one run. A loop's seam,
-        a record's punch and a count's go fall on its part where they fall
-        on a waiting lane's: a record punching from 48,000 on a desk held
-        1,200 keeps the strike at 47,900, heard at 49,100, and the one at
-        48,100 never sounds. The varispeed dial and the tape motor's start
-        and coast move its part with the mix, and a realtime export lays it
-        down as the full-speed one does.
+        plugins are never told an earlier place on one run. A desk held past
+        the lines' ceiling (8,192 frames, 171 ms at 48 kHz: a plugin
+        reporting more, stacked lookaheads) holds every waiting lane at the
+        ceiling, and the lane reads its part the ceiling behind and lands
+        with them, its keys still at once; it landed the rest of the wait
+        later, up to the ceiling again. A loop's seam, a record's punch and
+        a count's go fall on its part where they fall on a waiting lane's: a
+        record punching from 48,000 on a desk held 1,200 keeps the strike at
+        47,900, heard at 49,100, and the one at 48,100 never sounds. The
+        varispeed dial and the tape motor's start and coast move its part
+        with the mix, and a realtime export started from a stopped song
+        lays it down as the full-speed one does (started while the song
+        plays, what was sounding before it still rings into its head, as in
+        5.3.0).
       - **Its edges.** A lane enters once the look-ahead has nothing of it
         left to serve, and stays while its own timeline rolls or its line
-        ran the chunk before. Armed while quiet it moves nothing: its part
+        ran the chunk before. One that enters on the very chunk the song
+        begins a run (armed as a loop wraps, the hold or the host's word
+        rising on a Stop's or a locate's chunk) stands in the run before and
+        takes the new run's flush and the loop head it owes the hold later,
+        as it takes every break; it took neither flush, and a note it held
+        across the break rang on. Armed while quiet it moves nothing: its part
         steps back the hold and pauses on the frame it reached. Armed while
         it sounds, its line glides out of the wait once (as the moves below
         do), and the hold's worth of the sound it is making is not heard. A
@@ -435,7 +458,11 @@ channels play back their clips and nothing else. "Ready to play" and
         song) its notes end and what it had not read is dropped; when a
         rule below closes on it mid-song, what it had not read is squeezed
         to its next block's head and its line glides back into the wait, so
-        no strike and no note still held is lost. On a desk held 1,200
+        no strike and no note still held is lost; one that closes while the
+        song stands stopped, inside the hold after its Stop, before the lane
+        has reached the Stop in its own time, ends what it told at its next
+        block's head, as the Stop ended a waiting lane's (it ended nothing,
+        and a note held across the Stop rang on). On a desk held 1,200
         frames, with the hold thrown to nothing at frame 20,480 a strike at
         20,000 is heard at 20,480 and every other on its own frame; with the
         bus it sends into turned slower than its way out there, the last
@@ -484,11 +511,18 @@ channels play back their clips and nothing else. "Ready to play" and
       - **Still known.** Tangent Analog renders to the bit only on its own
         32-frame grid: it computes its coefficients in 32-frame chunks on an
         absolute grid and cuts a chunk where a note lands, so a part read
-        off that grid plays the same notes on the same frames a little
-        apart (on its lane the deep Tape's hold leaves 1,132 frames, and the
-        speakers are -14.7 dB off the waiting lane's), as it renders 0.126
-        apart at 287- and 448-frame passes on a desk that lags nothing. A
-        curve is read once a chunk, at its head, so at a lane's entry or
+        off that grid plays the same notes on the same frames and at the
+        same level with its oscillators at another phase, a difference as
+        loud as the sound itself (on its lane the deep Tape's hold leaves
+        1,132 frames, and the speakers are -14.7 dB off the waiting lane's),
+        as it renders 0.126 apart at 287- and 448-frame passes on a desk that
+        lags nothing. A DX7 voice whose LFO is heard stops the LFO at the end
+        of whichever stretch retired its last voice, so a phrase after a
+        silence begins it at a phase that depends on where that stretch
+        ended: after a silence such a voice can differ between a track armed
+        and unarmed, and between playback and the export (-1 to -61 dB re
+        peak on the factory voices that use one).
+        A curve is read once a chunk, at its head, so at a lane's entry or
         leave its plugins' points are a chunk off once. What a shrinking
         hold or a closing rule hands a lane at a block's head sounds there
         whole when it is a strike, and from there when it is a note still
