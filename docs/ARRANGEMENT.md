@@ -407,10 +407,19 @@ channels play back their clips and nothing else. "Ready to play" and
       export from the first voice that ended (as much as -62 dB re peak on
       the electric grand with silent presses under the pedal, under -100 dB
       on plain note ends). And a key into it is heard
-      after its own chain alone, playing, stopped or recording: a key into a
-      DX7 on it with a deep-range Tape on another lane is heard 110 frames
-      after it is pressed, as on a bare desk, where it was 1,310; a pad
-      struck on an armed drum lane at once, where it was 1,200 frames late.
+      after its own chain and no other track's, playing, stopped or
+      recording: a key into a DX7 on it with a deep-range Tape on another
+      lane is heard 110 frames after it is pressed, as on a bare desk, where
+      it was 1,310; a pad struck on an armed drum lane at once, where it was
+      1,200 frames late. It still waits for the delay of the plugins across
+      the master and the limiter's lookahead while no audio input is armed,
+      when the speakers play the take's own mix (`RoomRoad::OneMix`) and
+      everything in it waits as long: at 48 kHz 512 frames with an IR across
+      the master, 58 with the limiter, and with a Tape in its deep range
+      there its 1,200 (a key's first sound came 1,116 to 1,136 frames late).
+      With an input armed the speakers' own road leaves out every master unit
+      from the first that adds delay, and the limiter's lookahead, and a key
+      waits for none of them.
       5.3.0 stood the lane outside the wait only while its timeline was
       silent (the song stopped, or the track recording) and made it wait
       with the mix while it played back, so keys played along with playback
@@ -467,7 +476,8 @@ channels play back their clips and nothing else. "Ready to play" and
         song stands stopped, inside the hold after its Stop, before the lane
         has reached the Stop in its own time, ends what it told at its next
         block's head, as the Stop ended a waiting lane's (it ended nothing,
-        and a note held across the Stop rang on). On a desk held 1,200
+        and a note held across the Stop rang on), and drops what it had not
+        yet read, which a waiting lane's line plays out. On a desk held 1,200
         frames, with the hold thrown to nothing at frame 20,480 a strike at
         20,000 is heard at 20,480 and every other on its own frame; with the
         bus it sends into turned slower than its way out there, the last
@@ -521,14 +531,37 @@ channels play back their clips and nothing else. "Ready to play" and
         loud as the sound itself (on its lane the deep Tape's hold leaves
         1,132 frames, and the speakers are -14.7 dB off the waiting lane's),
         as it renders 0.126 apart at 287- and 448-frame passes on a desk that
-        lags nothing. A DX7 voice whose LFO is heard stops the LFO at the end
-        of whichever stretch retired its last voice, so a phrase after a
-        silence begins it at a phase that depends on where that stretch
-        ended: after a silence such a voice can differ between a track armed
-        and unarmed, and between playback and the export (-1 to -61 dB re
-        peak on the factory voices that use one).
-        A curve is read once a chunk, at its head, so at a lane's entry or
-        leave its plugins' points are a chunk off once. What a shrinking
+        lags nothing. A DX7 voice whose LFO is heard keeps the LFO's phase,
+        and its sample and hold's draws, from one playback to the next:
+        played again, or after live keys or an audition on it, it can begin
+        the LFO where a full-speed export, which starts on a fresh
+        instrument, does not (a first playback on a freshly loaded
+        instrument agrees with the export).
+        What a lane's plugins are told (its place and transport, and its
+        curves' points) is told once a block, at the head of the lane's
+        block. So at a lane's entry or leave its plugins' points are a block
+        off once; and where the song begins a run inside the lane's block
+        (Play, a loop's wrap, a locate, which fall on the heads of its blocks
+        only at a hold of a whole number of them), the run's first frames
+        are given what was read before it began: the old run's place and
+        point at a wrap or a locate, and at Play a point read up to a block
+        before its part begins. A plugin that smooths a parameter carries
+        that on: a Trim whose curve rises from 0.2 to 0.9 over a second, on a
+        kit held 1,200 frames at 512-frame passes, puts the strikes in the
+        half second after a wrap 0.87 dB above the unarmed track's, 0.29 dB
+        below after a locate and 0.45 dB below after Play (0.21, 0.07 and
+        0.45 at 256-frame passes; held 68, 1.15 dB after a wrap), on the same
+        frames, and every other strike within 0.01 dB of it; held 1,024, a
+        whole number of 512 and of 256-frame passes, they are the unarmed
+        track's to the bit. Only a split of the lane's racks at the break
+        would take that away: a built-in unit takes a block's last point for
+        the whole block. A lane that stops listening mid-song (a disarm, or
+        the MIDI editor opened on another track) reads its part behind the
+        song until it leaves, and a loop's wrap, a locate or a Stop while
+        another track holds a live key cuts it short, up to a hold early:
+        the blanket that then ends every built-in's notes passes only a lane
+        that listens (held 1,200, a note's tail ended at 30,207 where the
+        unarmed track's ends at 30,354). What a shrinking
         hold or a closing rule hands a lane at a block's head sounds there
         whole when it is a strike, and from there when it is a note still
         held. A note shorter than the stretch skipped, and inside it, is
