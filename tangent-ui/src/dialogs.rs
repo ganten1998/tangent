@@ -2905,7 +2905,7 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// **It comes up once on every new version** (`Settings::welcome_seen`), so
 /// its greeting names the version and its middle paragraph says what is new:
 /// `scripts/release.sh` refuses a release whose card greets another version.
-const WELCOME_LINES: [&str; 25] = [
+const WELCOME_LINES: [&str; 23] = [
     "Welcome to Tangent 5.3!",
     "",
     "Tangent is a DAW now. Record audio and MIDI,",
@@ -2929,9 +2929,43 @@ const WELCOME_LINES: [&str; 25] = [
     "a take can still film the window as you go.",
     "",
     "Thanks for trying it,",
-    "",
-    "Ganten",
 ];
+
+/// **The owner's signature, under the Welcome card's last line**, where his
+/// name was typed: his own hand, in its own colours, read off
+/// `assets/signature/ganten.png` by `scripts/make-signature.py` into a bare
+/// block of premultiplied RGBA, [`SIGNATURE_PX`] wide and high, typed to its
+/// exact length so a file of the wrong size fails to compile.
+const SIGNATURE: &[u8; SIGNATURE_PX[0] * SIGNATURE_PX[1] * 4] = include_bytes!("../../assets/signature/ganten.rgba");
+const SIGNATURE_PX: [usize; 2] = [276, 110];
+/// How tall the signature is drawn, in points; its width follows.
+const SIGNATURE_H: f32 = 44.0;
+/// The space between the card's last line and the signature, in points.
+const SIGNATURE_GAP: f32 = 2.0;
+
+/// Draw the signature at [`SIGNATURE_H`], its texture built once per
+/// context and kept in the context's memory, as `icons::draw` keeps its own.
+fn draw_signature(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::new("tangent::welcome_signature");
+    let handle = match ctx.data_mut(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        Some(h) => h,
+        None => {
+            let image = egui::ColorImage::from_rgba_premultiplied(SIGNATURE_PX, SIGNATURE);
+            let h = ctx.load_texture("welcome-signature", image, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, h.clone()));
+            h
+        }
+    };
+    let size = Vec2::new(SIGNATURE_H * SIGNATURE_PX[0] as f32 / SIGNATURE_PX[1] as f32, SIGNATURE_H);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().image(
+        handle.id(),
+        rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
 
 /// The Audio Status window. Two device blocks, a round-trip line, and a row of
 /// buffer sizes — measured by `the_audio_status_card_fits_its_own_text`.
@@ -13093,17 +13127,14 @@ fn show_on(
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
                             for (i, line) in WELCOME_LINES.iter().enumerate() {
-                                // The header and the signature carry the
-                                // weight; the body reads in the plain hand.
-                                let font = if i == 0 {
-                                    bold(14.0)
-                                } else if i == WELCOME_LINES.len() - 1 {
-                                    bold(12.0)
-                                } else {
-                                    FontId::new(12.0, fonts::courier())
-                                };
+                                // The greeting carries the weight; the body
+                                // reads in the plain hand, and the owner's own
+                                // hand signs it.
+                                let font = if i == 0 { bold(14.0) } else { FontId::new(12.0, fonts::courier()) };
                                 ui.label(RichText::new(*line).font(font).color(t.text));
                             }
+                            ui.add_space(SIGNATURE_GAP);
+                            draw_signature(ui);
                             ui.add_space(8.0);
                             let mut hide = *dont_show_again;
                             if ui
@@ -17458,8 +17489,9 @@ at: None,
         // Two more gaps the layout adds under the text: one before the
         // checkbox's own row and one before the button row.
         const MARGIN: f32 = 14.0 * 2.0;
-        let needed_h = total_h + CHROME_H + MARGIN;
-        let needed_w = widest + MARGIN;
+        // The signature under the last line, and the gap egui puts before it.
+        let needed_h = total_h + SIGNATURE_GAP + SIGNATURE_H + CHROME_H + MARGIN;
+        let needed_w = widest.max(SIGNATURE_H * SIGNATURE_PX[0] as f32 / SIGNATURE_PX[1] as f32) + MARGIN;
         assert!(
             needed_h + WELCOME_SLACK <= WELCOME_H,
             "the welcome card needs {needed_h:.0} points of measurable height plus \
