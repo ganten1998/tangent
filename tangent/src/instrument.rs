@@ -15070,6 +15070,9 @@ impl Renderer {
                 Some(pos) => pan_gains(pos * 2.0 - 1.0),
                 None => (1.0, 1.0),
             };
+            // The fader and the balance together, a gain a side, for the
+            // take's mix and the speakers' own alike (`master_fader`).
+            let (ml, mr) = (master * bal_l, master * bal_r);
             let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 // **No lamp here, INTO the limiter.** It latched on this mix
@@ -15091,15 +15094,7 @@ impl Renderer {
                 // **The master, last on the bus and after the limiter.** A
                 // master that fed the limiter would be a second drive control;
                 // this one is what leaves, which is what a master fader is.
-                let (ml, mr) = (master * bal_l, master * bal_r);
-                if (ml - 1.0).abs() > 1.0e-6 || (mr - 1.0).abs() > 1.0e-6 {
-                    for fr in mix.chunks_exact_mut(TAP_CHANNELS) {
-                        fr[0] *= ml;
-                        if let Some(r) = fr.get_mut(1) {
-                            *r *= mr;
-                        }
-                    }
-                }
+                master_fader(mix, ml, mr);
                 fold_mono(mix, mono);
             }
             // The speakers' own insert, the same settings, its own state —
@@ -15115,11 +15110,12 @@ impl Renderer {
                         &self.effect_params,
                         bpm,
                     );
-                    if (master - 1.0).abs() > 1.0e-6 {
-                        for v in room.iter_mut() {
-                            *v *= master;
-                        }
-                    }
+                    // **The master's fader and its balance, as the take's mix
+                    // has them.** The fader alone reached the speakers' own
+                    // mix, so while an input was armed a balance curve off
+                    // centre moved the file's image and left the speakers'
+                    // where it was.
+                    master_fader(room, ml, mr);
                     fold_mono(room, mono);
                 }
                 // And across from the take's own mix, or back to it, while
@@ -17563,7 +17559,8 @@ impl Renderer {
 
     /// **The speakers' mix across from the take's own, or back to it**,
     /// while they cross between `RoomRoad::OneMix` and a road of their own
-    /// (`RoomFade`): both finished, the master's fader and fold on each.
+    /// (`RoomFade`): both finished, the master's fader, its balance and the
+    /// fold on each.
     fn room_with_the_take(&mut self, road: RoomRoad, leaving: Option<RoomRoad>, n: usize) {
         let end = n * TAP_CHANNELS;
         let Some(fade) = self.room_fade else {
@@ -26336,6 +26333,25 @@ fn fold_mono(buf: &mut [f32], on: bool) {
         let m = (f[0] + f[1]) * 0.5;
         f[0] = m;
         f[1] = m;
+    }
+}
+
+/// **The master's fader and balance onto a finished mix**, in place: `ml`
+/// on the left and `mr` on the right, the fader's gain and the balance
+/// curve's equal-power one together.
+///
+/// The take's mix and the speakers' own take them here alike, after the
+/// limiter and before the mono fold, so a balance curve moves both: the
+/// speakers' own mix once took the fader alone. A no-op at unity, which is
+/// the fader at rest with no balance curve.
+fn master_fader(buf: &mut [f32], ml: f32, mr: f32) {
+    if (ml - 1.0).abs() > 1.0e-6 || (mr - 1.0).abs() > 1.0e-6 {
+        for fr in buf.chunks_exact_mut(TAP_CHANNELS) {
+            fr[0] *= ml;
+            if let Some(r) = fr.get_mut(1) {
+                *r *= mr;
+            }
+        }
     }
 }
 
@@ -52282,6 +52298,78 @@ mod slot_engine {
             assert!(held > 0.1, "fixture: the take does not hold the input armed with monitoring off ({held})");
             for (k, (p, s)) in played.iter().zip(&silent).enumerate() {
                 assert!((p - s).abs() < 1e-6, "armed with monitoring off: frame {}: the speakers played the input ({p} against {s})", k / 2);
+            }
+        }
+
+        /// **The master's balance moves the speakers as it moves the take,
+        /// with an input heard and with one withheld** (`master_fader`).
+        ///
+        /// The master's balance is a curve on its lane, ridden with its fader
+        /// after the limiter, and the take's mix has taken the two together
+        /// since the lane learned it; the speakers' own mix took the fader
+        /// alone, so while an audio input was armed a balance curve off centre
+        /// moved the file's image and left the speakers' where it was. A curve
+        /// at a quarter, half way to the left, on a 1 kHz tone at 0.25: the
+        /// take's left side peaks at 0.327 and its right at 0.135, and the
+        /// speakers kept 0.25 on both, the input heard or withheld. They take
+        /// the fader and the balance as the take's mix does now, on both roads
+        /// of their own: with the input heard (`RoomRoad::Tapped`) and with it
+        /// withheld (`RoomRoad::Withheld`), the speakers' left and right are
+        /// the take's, frame for frame, past the start-up crossing from the
+        /// take's mix; with no input armed they are the take's mix.
+        #[test]
+        fn the_masters_balance_moves_the_speakers_as_it_moves_the_take_with_an_input_heard_or_withheld() {
+            use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+            const BLOCKS: usize = 40;
+            // Past the start-up crossing from the take's mix, 10 ms.
+            const SETTLED: usize = 4 * BLOCK;
+            let (bal_l, bal_r) = pan_gains(-0.5);
+            for input in [None, Some(true), Some(false)] {
+                let mut e = wide(LEGACY_LANES);
+                let mut inputs = bus_plan(&e, LEGACY_LANES, &[]);
+                if input.is_some() {
+                    inputs.lanes[3].flags = F::ARMED | F::MIDI_OFF;
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                // A quarter on the master's balance curve: half way to the left.
+                e.set_automation(Automation::from_curves(vec![Curve::sanitised(
+                    MASTER_AUTO_LANE,
+                    AutoParam::Pan,
+                    vec![Point { at_s: 0.0, value: 0.25, shape: Shape::Linear }],
+                )]));
+                let gen = e.lane_gen(Slot(1)).expect("a lane");
+                e.set_clips_slotted(vec![SlotPlaced {
+                    slot: Slot(1),
+                    gen,
+                    placed: Placed { clip: tone(BLOCKS * BLOCK, 1_000.0, 0.25), strip: 0, start: 0, offset: 0, len: (BLOCKS * BLOCK) as u64, fade_in: 0, fade_out: 0, gain: 1.0 },
+                }]);
+                let mut tx = input.map(|monitoring| {
+                    let tx = plug(&mut e, 3);
+                    e.set_monitor_on(monitoring);
+                    tx
+                });
+                let (room, take) = roll_held(&mut e, &mut tx, BLOCKS);
+                let frames = room.len().min(take.len()) / 2;
+                assert!(frames > 2 * SETTLED, "fixture: input {input:?}: the take is {frames} frames");
+                let side = |col: &[f32], c: usize| (SETTLED..frames).map(|f| col[f * 2 + c].abs()).fold(0.0f32, f32::max);
+                let (tl, tr) = (side(&take, 0), side(&take, 1));
+                assert!(
+                    (tl - 0.25 * bal_l).abs() < 1e-3 && (tr - 0.25 * bal_r).abs() < 1e-3,
+                    "fixture: input {input:?}: the take's sides peak at {tl} and {tr}, not {} and {}",
+                    0.25 * bal_l,
+                    0.25 * bal_r
+                );
+                let (sl, sr) = (side(&room, 0), side(&room, 1));
+                assert!(
+                    (sl - tl).abs() < 1e-6 && (sr - tr).abs() < 1e-6,
+                    "input {input:?}: the speakers' sides peak at {sl} and {sr}, the take's at {tl} and {tr}: the master's balance never reached the speakers"
+                );
+                for f in SETTLED..frames {
+                    for (c, name) in ["left", "right"].into_iter().enumerate() {
+                        let (s, t) = (room[f * 2 + c], take[f * 2 + c]);
+                        assert!((s - t).abs() < 1e-6, "input {input:?}: frame {f}, the {name} side: the speakers {s}, the take {t}");
+                    }
+                }
             }
         }
 
