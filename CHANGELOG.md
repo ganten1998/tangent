@@ -13,6 +13,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Tape start and stop runs while you track.** In 5.2 it stood aside
+  whenever an armed input was monitored through Tangent, so with a vocal
+  armed and monitoring on, Play and Stop were instant and the tape never
+  moved. It now spins the desk up and winds it down there too. What you play
+  keeps its own pitch through a start or a stop, but it dulls with the tape
+  as it slows and fades in the last moments before the tape halts, and
+  whatever was still ringing when the tape stops is heard at once, since you
+  are playing, rather than held quiet. Arrangement recording, count-ins and
+  exports are still instant.
 - **The welcome card comes up once on every new version.** It opened only
   until its "Don't show this again" box was ticked, so nobody who had
   ticked it would read what a new version brings. Each new version now

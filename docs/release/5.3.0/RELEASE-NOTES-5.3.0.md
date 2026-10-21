@@ -96,6 +96,11 @@ placement wait with the master's plugins, so both stay on the beat.
   insert, where 5.2.0's cost 366 to 403, and one Tape at its defaults costs
   9.7 microseconds against about 22. What it plays is unchanged, bit for
   bit.
+- **Tape start and stop runs while you track.** In 5.2 it stood aside
+  whenever an armed input was monitored, so Play and Stop were instant on a
+  desk with a vocal armed. It now spins up and winds down there too. What you
+  play keeps its pitch through a start or a stop, dulling and fading with the
+  tape near the halt. Recording, count-ins and exports are still instant.
 - **Tape start and stop costs less.** The block where the tape reaches
   speed rendered every track's look-ahead at once, eight times an ordinary
   block's work; tracks now come back a few at a time, and the dearest block
@@ -185,8 +190,8 @@ start takes half a second and the stop 0.7 s; either can be set from 0.1 to
 10 s. As the tape slows the treble dulls and the low end sinks, and the
 click joins on the first beat the tape reaches at full speed. A take films
 the tape as the room hears it; arrangement recording, count-ins, exports
-and freezes never use it, and while an armed input is monitored it stands
-aside, so Play and Stop stay instant on a tracking desk. It is saved with
+and freezes never use it. (In 5.2 it also stood aside while an armed input
+was monitored; 5.3.0 spins the desk while you track too.) It is saved with
 the project and off until you switch it on.
 
 ### A new session plays a grand piano

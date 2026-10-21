@@ -208,7 +208,7 @@ impl Transport {
     /// engine has not applied it, a tape that coasts, or that the host lets
     /// move and is not at rest, is drawn where it is. With the motor off a
     /// Stop draws the cursor at once, as it always has; on a desk where the
-    /// engine keeps the motor down itself (a tracking desk, a hardware loop)
+    /// engine keeps the motor down itself (a hardware loop, an IR capture)
     /// the line waits at the stopped tape for the frame before the ack. Any
     /// other locate, a ruler click during a coast among them, is drawn where
     /// it was asked at once, which is the lag `position_s` was built to
