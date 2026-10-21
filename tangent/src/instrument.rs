@@ -63610,6 +63610,14 @@ mod tape_motor {
         let passes = d.run(&mut t, 4, PASS);
         assert!(d.tracking(), "the switch did not make a tracking desk, so nothing was proved");
         assert!(passes.iter().all(|p| p.show == MotorShow::SpinningUp), "a monitoring switch mid-start snapped the tape");
+        // Heard is the room's: monitoring on and the armed track muted, the
+        // take still records it (the arm beats the mute there) but the room
+        // plays nobody's input, so it is no player and a hold keeps its tails.
+        let mut d = Tracking::new(1, true, true, false);
+        d.mute_track();
+        let mut t = Transport::new();
+        d.run(&mut t, 4, PASS);
+        assert!(!d.tracking(), "a muted armed input is a tracking desk");
         // The player's pitch through a stop, against the song's.
         let stop = |level: f64| -> Vec<f32> {
             let mut d = Tracking::new(1, true, true, false);
