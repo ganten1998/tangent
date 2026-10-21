@@ -2937,9 +2937,12 @@ const WELCOME_LINES: [&str; 23] = [
 /// block of premultiplied RGBA, [`SIGNATURE_PX`] wide and high, typed to its
 /// exact length so a file of the wrong size fails to compile.
 const SIGNATURE: &[u8; SIGNATURE_PX[0] * SIGNATURE_PX[1] * 4] = include_bytes!("../../assets/signature/ganten.rgba");
-const SIGNATURE_PX: [usize; 2] = [276, 110];
-/// How tall the signature is drawn, in points; its width follows.
-const SIGNATURE_H: f32 = 44.0;
+const SIGNATURE_PX: [usize; 2] = [415, 165];
+/// How tall the signature is drawn, in points; its width follows. 56
+/// since the owner asked for it a bit bigger (2026-10-20; it was 44), its
+/// pixels baked at half the drawing's size so a Retina screen still has
+/// more of them than it draws.
+const SIGNATURE_H: f32 = 56.0;
 /// The space between the card's last line and the signature, in points.
 const SIGNATURE_GAP: f32 = 2.0;
 
@@ -3179,8 +3182,9 @@ const WELCOME_W: f32 = 470.0;
 /// its em than the two before it: the card's measured text went from under
 /// 426 points to 465, and with [`WELCOME_SLACK`] on top that no longer fits
 /// 486. Sized for the largest of the three, because the card is a fixed
-/// window and the font can change under it.
-const WELCOME_H: f32 = 560.0;
+/// window and the font can change under it. 572 since the signature grew
+/// from 44 points to 56 ([`SIGNATURE_H`]): the measured card came to 511.
+const WELCOME_H: f32 = 572.0;
 /// How much more than the measurable text the Welcome card must have.
 ///
 /// The chrome this test cannot see: a checkbox's real height against the 22 it

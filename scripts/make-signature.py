@@ -24,7 +24,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "assets", "signature", "ganten.png")
 DST = os.path.join(HERE, "..", "assets", "signature", "ganten.rgba")
-FACTOR = 3
+FACTOR = 2
 
 
 def decode_rgba8(path):
